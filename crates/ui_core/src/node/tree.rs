@@ -744,7 +744,11 @@ impl NodeTree {
     pub fn hit_test_skips(&self) -> u64 {
         content::hit_test_skips(self)
     }
-    fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+    /// `ancestor` 是否是 `node` 的（严格）祖先。
+    ///
+    /// 消费者：纯滚动帧的快路径判定（`window::paint::sync_scroll_offsets`：本次偏移变化
+    /// 的容器子树里是否还有别的滚动槽）。
+    pub(crate) fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
         traverse::is_ancestor(self, ancestor, node)
     }
     pub(crate) fn hoisted_clear(&mut self, node: NodeId) {

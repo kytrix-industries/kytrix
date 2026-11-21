@@ -4,6 +4,8 @@
 //! 移 + 几何描述）与 damage。编码与载荷构造在 `render::compose::WindowComposer`（inline 模式，
 //! 无 GPU 线程的窗口）或合成线程（真实窗口）里完成 —— 见 `render/compositor_thread.rs`。
 
+use smallvec::SmallVec;
+
 use super::Window;
 #[cfg(feature = "test-support")]
 use crate::paint::instance::InstanceBuffer;
@@ -12,6 +14,7 @@ use crate::test_support::record::{DeltaRecord, PaintLog};
 use crate::{
     error::EngineError,
     math::Rect,
+    node::id::NodeId,
     paint::{
         pass::{PaintPass, PaintReport},
         primitive::Primitive,
@@ -322,7 +325,8 @@ fn refresh_scroll_offsets(window: &mut Window) -> Option<crate::render::damage::
 
 /// 把每个滚动容器的当前偏移刷进槽位表（不改 lane、不结算 damage）。
 ///
-/// 返回 `false` = 槽位表与树不再一致（容器已卸载 / 不再是滚动容器）⇒ 调用方必须走全量路径。
+/// 返回 `false` = 槽位表与树不再一致（容器已卸载 / 不再是滚动容器）**或偏移变化会改变后代
+/// lane 的烘焙偏移**（见 [`has_nested_scroll_slot`]）⇒ 调用方必须走完整遍历。
 ///
 /// 消费者有两个：纯滚动帧的快路径（本帧唯一工作是刷偏移）与**有 paint 工作的滚动帧**
 /// （偏移变化不会让脏闭包覆盖所有滚动容器，必须在这里统一刷新，否则未被访问的容器的
@@ -333,16 +337,53 @@ fn sync_scroll_offsets(window: &mut Window) -> bool {
         window.scroll_slot_nodes.len() + 1,
         "槽位表与节点表必须平行（哨兵之外一一对应）"
     );
+    // 先只读地找出「本帧偏移真的变了」的容器：它们的子树可能含内层滚动槽，那种帧不能只刷
+    // 偏移（`has_nested_scroll_slot` 的文档）。
+    let mut changed: SmallVec<[NodeId; 4]> = SmallVec::new();
     for (index, node) in window.scroll_slot_nodes.iter().copied().enumerate() {
         let Some(state) = window.tree.scroll_slot(node) else {
             return false;
         };
-        let Some(slot) = window.scroll_slots.get_mut(index + 1) else {
+        let Some(slot) = window.scroll_slots.get(index + 1) else {
             return false;
         };
-        slot.0 = state.offset;
+        if slot.0 != state.offset {
+            changed.push(node);
+        }
+    }
+    if changed
+        .iter()
+        .any(|&container| has_nested_scroll_slot(window, container))
+    {
+        return false;
+    }
+    for (index, node) in window.scroll_slot_nodes.iter().copied().enumerate() {
+        // 上面已逐项校验过（表与节点表平行、节点仍是滚动容器），这里只剩写入。
+        let Some(state) = window.tree.scroll_slot(node) else {
+            return false;
+        };
+        if let Some(slot) = window.scroll_slots.get_mut(index + 1) {
+            slot.0 = state.offset;
+        }
     }
     true
+}
+
+/// `container` 的子树里还有**别的滚动槽**（内层滚动容器 / 虚拟列表）吗？
+///
+/// 有 ⇒ 本轮偏移变化不能只刷槽位表：内层槽位里 lane 的烘焙偏移是
+/// `bake = total − 本槽偏移`（**含外层位移**），槽位的屏幕裁剪区也随外层移动 —— 两者都只有
+/// 遍历才能更新。不遍历的话页面一滚，内层内容就按旧坐标烘焙、又被首帧的旧裁剪区剪掉：
+/// 整块空白（gallery ⑥⑦⑧⑨ 的列表 / 表格 / 树 / 自绘滚动条行，`mounted_rows` 并未丢）。
+///
+/// 槽位表（`scroll_slot_nodes`）就是「本窗口已登记滚动槽」的全集，比
+/// `NodeTree::scroll_containers` 更准（虚拟列表容器不在后者里）。
+fn has_nested_scroll_slot(window: &Window, container: NodeId) -> bool {
+    window
+        .scroll_slot_nodes
+        .iter()
+        .copied()
+        .any(|other| other != container && window.tree.is_ancestor(container, other))
 }
 
 /// inline 合成（`composer` 在 UI 线程时）：返回 `None` = 本帧没有可发布的载荷（threaded 模式）。

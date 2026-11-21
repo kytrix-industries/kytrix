@@ -11,7 +11,7 @@ use crate::{
         AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
         OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
     },
-    math::{Point, Rect, Scale, Size},
+    math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{
         color::Color,
@@ -733,6 +733,213 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
         view.scene().lane_scroll(lane),
         1,
         "滚动容器内的 lane 必须登记槽位 1"
+    );
+}
+
+/// 内层滚动容器（外层内容坐标 `y = 300`、高 100）：外层视口只有 150 高，所以它首帧在
+/// 外层视口之外 —— 与 gallery 页面里 ⑥⑦⑧⑨ 的列表/表格/树一致。
+fn mount_nested_scroll_container(app: &mut App, window: WindowId, outer: NodeId) -> NodeId {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(200.0),
+        height: taffy::style::Dimension::length(100.0),
+    };
+    style.inner.margin = taffy::geometry::Rect {
+        left: taffy::style::LengthPercentageAuto::length(0.0),
+        right: taffy::style::LengthPercentageAuto::length(0.0),
+        top: taffy::style::LengthPercentageAuto::length(300.0),
+        bottom: taffy::style::LengthPercentageAuto::length(0.0),
+    };
+    style.clip = Clip::Bounds;
+    NodeBuilder::boxed()
+        .style(style)
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount inner")
+}
+
+/// 一个容器的合成端槽位条目（偏移 + 屏幕裁剪区）；未登记 ⇒ `None`。
+fn scroll_slot_of(app: &App, window: WindowId, node: NodeId) -> Option<(Point, PhysicalRect)> {
+    let view = app.window(window).expect("window");
+    let slot = view.tree().scroll_slot_cached(node) as usize;
+    view.scroll_slots().get(slot).copied()
+}
+
+/// 登记两个滚动容器的槽位（`make_scroll` 不标脏、不请求帧；`scroll_reg_epoch` 会让下一帧
+/// 走全量路径，因此这里用一次 `mark_paint` 把帧要出来）。
+fn register_slots(app: &mut App, window: WindowId, nodes: [NodeId; 2]) {
+    for node in nodes {
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(node);
+    }
+    frame(app, window);
+}
+
+/// **P2-6a G1 回归（真实窗口暴露）**：外层滚动容器内嵌内层滚动容器时，外层滚动必须让内层
+/// 内容跟着移动，并重算内层槽位的屏幕裁剪区。
+///
+/// 旧实现把「没有节点脏、只有偏移变了」的帧当纯滚动帧（`window/paint.rs` 的快路径）：
+/// 只把偏移刷进槽位表、**不遍历树**。但内层槽位的图元烘焙偏移里含**外层**位移
+/// （`bake = total − 本槽偏移`），内层槽位的屏幕裁剪区也随外层移动 —— 两者都只有遍历才能
+/// 更新。于是页面一滚，内层内容按旧坐标烘焙、又被旧裁剪区剪掉：整块空白（gallery 的
+/// ⑥⑦⑧⑨ 列表/表格/树/自绘滚动条行，`mounted_rows` 并未丢）。
+#[test]
+fn a_nested_scroll_container_follows_the_outer_container_scroll() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    let inner = mount_nested_scroll_container(&mut app, window, outer);
+    let row = mount_override(&mut app, window, inner, Rect::new(0.0, 0.0, 200.0, 40.0));
+    frame(&mut app, window);
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("outer scroll");
+    app.set_scroll_content(&outer_handle, Size::new(200.0, 800.0))
+        .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("inner scroll");
+    app.set_scroll_content(&inner_handle, Size::new(200.0, 400.0))
+        .expect("inner content");
+    register_slots(&mut app, window, [outer, inner]);
+    assert!(
+        scroll_slot_of(&app, window, inner).is_some(),
+        "前置条件：内层滚动容器必须已登记槽位"
+    );
+
+    // 外层滚 320：内层容器屏幕 y = 300 − 320 = −20（首帧时它在视口外）。
+    app.scroll_to(&outer_handle, Point::new(0.0, 320.0))
+        .expect("outer scroll");
+    frame(&mut app, window);
+
+    // 内层槽位的屏幕裁剪区 = 内层 padding box ∩ 外层 clip（都在屏幕坐标）：
+    // (0, −20, 200, 100) ∩ (0, 0, 200, 150) = (0, 0, 200, 80)。
+    let (offset, viewport) = scroll_slot_of(&app, window, inner).expect("inner slot");
+    assert_eq!(offset, Point::new(0.0, 0.0), "内层自身未滚动");
+    assert_eq!(
+        viewport,
+        PhysicalRect::new(0, 0, 200, 80),
+        "内层槽位的屏幕裁剪区必须随外层滚动重算（旧裁剪区 = 首帧的空交集）"
+    );
+    // 内层行的图元必须重烘焙：屏幕 = 烘焙 + 槽位偏移 ⇒ 烘焙 = (0, 300) − 320 = (0, −20)。
+    assert_eq!(
+        lane_quad_bounds(&app, window, row),
+        vec![Rect::new(0.0, -20.0, 200.0, 40.0)],
+        "内层行的烘焙偏移必须含外层位移（否则它停在旧坐标、被旧裁剪区剪掉）"
+    );
+}
+
+/// **P2-6a G1 回归（虚拟列表形态）**：页面滚动容器里嵌一个虚拟列表（gallery ⑥⑦⑧⑨ 的
+/// 真实形态），外层滚动后已挂载行的图元与内层槽位裁剪区必须一起跟上。
+#[test]
+fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() {
+    let (_rt, mut app, window) = setup();
+    let page = mount_scroll_container(&mut app, window, 150.0);
+    let inner = mount_nested_scroll_container(&mut app, window, page);
+    frame(&mut app, window);
+    // `make_virtual_list` 要求 `position: relative`（内层容器在 `setup` 里还是 static）。
+    {
+        let mut style = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(inner)
+            .expect("inner")
+            .style()
+            .clone();
+        style.inner.position = taffy::style::Position::Relative;
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_for_test(inner, style);
+    }
+    let list = app
+        .make_virtual_list(
+            window,
+            inner,
+            VirtualListConfig {
+                extent: 25.0,
+                extents: None,
+                overscan: 0,
+            },
+        )
+        .expect("virtual list");
+    app.set_virtual_items(&list, 100, |index| {
+        NodeBuilder::boxed()
+            .paint(background())
+            .id(format!("row{index}"))
+    })
+    .expect("items");
+    let page_handle = app
+        .make_scroll(
+            window,
+            page,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("page scroll");
+    app.set_scroll_content(&page_handle, Size::new(200.0, 800.0))
+        .expect("page content");
+    register_slots(&mut app, window, [page, inner]);
+    let rows = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .virtual_slot(inner)
+        .expect("virtual slot")
+        .mounted
+        .clone();
+    assert!(!rows.is_empty(), "前置条件：虚拟列表已挂载可见行");
+
+    app.scroll_to(&page_handle, Point::new(0.0, 320.0))
+        .expect("page scroll");
+    frame(&mut app, window);
+
+    // 行仍在（G1 的关键事实：`mounted_rows` 没丢，只是不绘制）。
+    let still_mounted = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .virtual_slot(inner)
+        .expect("virtual slot")
+        .mounted
+        .len();
+    assert_eq!(still_mounted, rows.len(), "外层滚动不得丢行");
+    // 内层视口（内层容器高 100，屏幕 y = −20..80）∩ 外层视口 ⇒ (0, 0, 200, 80)。
+    let (_, viewport) = scroll_slot_of(&app, window, inner).expect("inner slot");
+    assert_eq!(
+        viewport,
+        PhysicalRect::new(0, 0, 200, 80),
+        "虚拟列表槽位的屏幕裁剪区必须随页面滚动重算"
+    );
+    // 第 0 行在内容坐标 y = 0（绝对 y = 300）⇒ 烘焙偏移 = 300 − 320 = −20。
+    let first_row = rows
+        .iter()
+        .find(|(index, _)| *index == 0)
+        .map(|(_, row)| *row)
+        .expect("第 0 行已挂载");
+    assert_eq!(
+        lane_quad_bounds(&app, window, first_row)[0],
+        Rect::new(0.0, -20.0, 200.0, 25.0),
+        "行图元的烘焙偏移必须含页面位移"
     );
 }
 
