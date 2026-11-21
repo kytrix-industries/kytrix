@@ -54,8 +54,9 @@
 //! # 嵌套层
 //!
 //! 浮层嵌套由引擎的 `opener` 链表达（模态里的下拉 / 菜单仍属于该模态的焦点作用域，
-//! `interaction::overlay::in_modal_scope`）。层带保证子菜单（ContextMenu）画在菜单（Popup）
-//! 之上、提示（Tooltip）画在菜单之上；opener 链保证它们的 Tab 序仍在父模态之内。
+//! `interaction::overlay::in_modal_scope`）。子菜单**继承父菜单的层带**并以 [`LayerSlot::Nested`]
+//! 登记（同带叠放，后登记在上）—— 因此 `Popup` 菜单的子菜单画在菜单之上、`ContextMenu` 的
+//! 子菜单画在父面板之上；提示（`Tooltip`）永远最高。opener 链保证它们的 Tab 序仍在父模态之内。
 
 use std::{
     cell::{Cell, RefCell},
@@ -96,6 +97,20 @@ impl Band {
             Self::Tooltip => 50,
         }
     }
+}
+
+/// 层带槽位规则（旧 `layer.rs` 的「至多一个」槽位是否适用）。
+///
+/// 子菜单**继承父菜单的层带**（审查 P1-1：写死 `Popup` 会让 `ContextMenu` 父面板反盖子菜单），
+/// 但它不是「另一个上下文菜单」：同一菜单链的根 + 子菜单可以同带叠放。`Nested` 因此跳过
+/// `Alert` / `ContextMenu` 的独占槽位替换，只按登记序排队（后登记 = 更上）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerSlot {
+    /// 独占槽位（`ContextMenu` / `Alert` 至多一个；后登记替换先登记）。
+    #[default]
+    Exclusive,
+    /// 嵌套层（子菜单）：同带可叠放，不做槽位替换。
+    Nested,
 }
 
 /// 一个已登记的层：引擎浮层句柄 + 层带 + 模态标记。
@@ -169,13 +184,25 @@ impl Layer {
     /// 顺序对齐（浮层通常是刚由 `App::create_overlay` 挂到 root 末尾的，所以这一帧往往已经
     /// 在正确位置，`enforce` 会零成本早退）。跨窗口登记的浮层不参与本窗口的槽位不变量。
     pub fn register(&self, app: &mut App, band: Band, overlay: EngineOverlay, modal: bool) -> u64 {
+        self.register_with(app, band, overlay, modal, LayerSlot::Exclusive)
+    }
+
+    /// [`Layer::register`] 的槽位规则可变版本（子菜单用 `LayerSlot::Nested`）。
+    pub(crate) fn register_with(
+        &self,
+        app: &mut App,
+        band: Band,
+        overlay: EngineOverlay,
+        modal: bool,
+        slot: LayerSlot,
+    ) -> u64 {
         let window = overlay.window();
         if matches!(band, Band::Dialog | Band::Alert) {
             while self.top_of(window, Band::ContextMenu).is_some() {
                 let _ = self.close_top_of(app, window, Band::ContextMenu);
             }
         }
-        if matches!(band, Band::Alert | Band::ContextMenu) {
+        if slot == LayerSlot::Exclusive && matches!(band, Band::Alert | Band::ContextMenu) {
             while self.top_of(window, band).is_some() {
                 let _ = self.close_top_of(app, window, band);
             }

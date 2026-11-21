@@ -135,6 +135,10 @@ pub struct Interactive {
     selected: bool,
     force_hover: bool,
     label: Option<SmolStr>,
+    /// 动态可访问名（信号；优先于 `label`）。
+    a11y_label_signal: Option<Signal<SmolStr>>,
+    /// 展开态来源（`aria-expanded`）。
+    a11y_expanded: Option<Signal<bool>>,
     a11y_role: A11yRole,
     checked: Option<Signal<bool>>,
     a11y_set: Option<(usize, usize)>,
@@ -209,6 +213,8 @@ impl Interactive {
             selected: false,
             force_hover: false,
             label: None,
+            a11y_label_signal: None,
+            a11y_expanded: None,
             a11y_role: A11yRole::Button,
             checked: None,
             a11y_set: None,
@@ -288,6 +294,23 @@ impl Interactive {
     #[must_use]
     pub fn a11y_set(mut self, index: usize, count: usize) -> Self {
         self.a11y_set = Some((index, count));
+        self
+    }
+
+    /// 动态可访问名来源（信号变化即 a11y 失效；优先于 [`Interactive::label`] 的静态值）。
+    ///
+    /// 下拉 / 选择的触发器用：可访问名 = 当前选中项的文本（`None` 时是占位文本），不能是构造期
+    /// 固定的静态字符串。
+    #[must_use]
+    pub fn a11y_label_signal(mut self, label: Signal<SmolStr>) -> Self {
+        self.a11y_label_signal = Some(label);
+        self
+    }
+
+    /// 展开态来源（写进 `A11yPatch.expanded`，即 `aria-expanded`）。
+    #[must_use]
+    pub fn a11y_expanded(mut self, expanded: Signal<bool>) -> Self {
+        self.a11y_expanded = Some(expanded);
         self
     }
 
@@ -505,6 +528,8 @@ impl Interactive {
         let selected = inner.selected;
         let focused = inner.focused;
         let a11y_label = self.label.clone();
+        let a11y_label_signal = self.a11y_label_signal;
+        let a11y_expanded = self.a11y_expanded;
         let a11y_role = self.a11y_role;
         let checked = self.checked;
         let a11y_set = self.a11y_set;
@@ -571,7 +596,11 @@ impl Interactive {
                 }
             })
             .bind_a11y(move |cx| A11yPatch {
-                label: a11y_label.clone(),
+                label: match a11y_label_signal {
+                    Some(signal) => Some(cx.read(&signal).clone()),
+                    None => a11y_label.clone(),
+                },
+                expanded: a11y_expanded.map(|signal| *cx.read(&signal)),
                 disabled: Some(*cx.read(&disabled) || *cx.read(&loading)),
                 busy: Some(*cx.read(&loading)),
                 selected: Some(*cx.read(&selected)),

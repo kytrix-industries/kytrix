@@ -121,7 +121,7 @@ use ui_core::{
 };
 
 use crate::{
-    kit::layer::{Band, Layer},
+    kit::layer::{Band, Layer, LayerSlot},
     style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
 };
@@ -783,6 +783,8 @@ pub struct OverlayOptions {
     pub restore_focus: bool,
     /// 固定层带（与其它浮层的 z 次序）。
     pub band: Band,
+    /// 层带槽位规则（`ContextMenu` / `Alert` 的独占槽位是否适用；子菜单用 `Nested`）。
+    pub slot: LayerSlot,
     /// 面板表面。
     pub surface: OverlaySurface,
     /// 模态遮罩（只在 `modal` 时生效；`None` = 模态但无遮罩）。
@@ -807,6 +809,7 @@ impl Default for OverlayOptions {
             modal: false,
             restore_focus: true,
             band: Band::Popup,
+            slot: LayerSlot::Exclusive,
             surface: OverlaySurface::menu(),
             scrim: None,
             a11y: OverlayA11y::default(),
@@ -1097,11 +1100,12 @@ impl Overlay {
             state.scrim_geometry = scrim.map(|_| (initial_origin, viewport));
             state.closing = false;
         }
-        self.inner.layer.register(
+        self.inner.layer.register_with(
             app,
             self.inner.options.band,
             engine_overlay,
             self.inner.options.modal,
+            self.inner.options.slot,
         );
         let _ = app.write(&self.inner.open, true);
         self.start_fade(app, window, group, 1.0);

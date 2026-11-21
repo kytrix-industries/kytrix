@@ -853,6 +853,7 @@ impl ColorPicker {
                 modal: false,
                 restore_focus: true,
                 band: Band::Popup,
+                slot: crate::kit::layer::LayerSlot::Exclusive,
                 surface: OverlaySurface {
                     padding: PANEL_PADDING,
                     ..OverlaySurface::menu()

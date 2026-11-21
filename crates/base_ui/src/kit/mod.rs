@@ -48,6 +48,10 @@
 //! | [`layer`] | 固定 z 层带（View < Dialog < Alert < Popup < ContextMenu < Tooltip）与 root 子节点排序仲裁 | `crate::layer` |
 //! | [`tooltip`] | hover / focus 触发 + E10 一次性定时器延迟 + 12 向定位 + 文本 / 快捷键 + 不可交互 + 模态抑制 / 显式 a11y | `crate::tooltip` |
 //! | [`color_picker`] | 颜色选择器：HEX / 色板 / HSLA 滑条（Canvas 自绘 + 拖拽 + 悬停预览）+ 浮层弹出 + HEX 校验 + 受控/非受控 | `crate::color_picker` |
+//! | [`menu`] | 菜单条目（分组 / 分隔线 / 快捷键 / 子菜单 / 危险项）+ **共享条目面板**（浮层 + E3 虚拟化行 + 键盘 + a11y） | `crate::menu` |
+//! | [`dropdown`] | 触发器按钮 + 扁平条目面板（选中项 / 图标 / 键盘 / 宽度下限对齐触发器 / 长列表虚拟化） | `crate::dropdown` |
+//! | [`select`] | 单选 / 多选 / 标签（badge 等价视觉）/ 清空 / 占位 / 禁用 / 图标 / 键盘（`ListBox` 语义行） | `crate::select` |
+//! | [`context_menu`] | 右键坐标 → 浮层锚点、窗口级单例、关闭语义与上报顺序 | `crate::context_menu` |
 //! | `test_support` | 基于 `ui_core::test_support` 的测试断言辅助（TestApp/Probe/FrameRecord） | 无（新基建） |
 //!
 //! # 组件形态（与引擎模型对齐）
@@ -86,7 +90,9 @@ pub mod badge;
 pub mod brand;
 pub mod button;
 pub mod color_picker;
+pub mod context_menu;
 pub mod dialog;
+pub mod dropdown;
 pub mod empty_state;
 pub mod format;
 pub mod icon;
@@ -96,10 +102,12 @@ pub mod join;
 pub mod layer;
 pub mod list;
 pub mod markdown;
+pub mod menu;
 pub mod motion;
 pub mod overlay;
 pub mod progress;
 pub mod scroll_bar;
+pub mod select;
 pub mod separator;
 pub mod size;
 pub mod spinner;

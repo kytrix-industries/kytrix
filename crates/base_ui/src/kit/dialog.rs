@@ -463,6 +463,7 @@ impl DialogBuilder {
                 modal: true,
                 restore_focus: true,
                 band: self.config.band(),
+                slot: crate::kit::layer::LayerSlot::Exclusive,
                 surface: OverlaySurface::dialog(),
                 scrim: Some(Scrim::default()),
                 a11y: self.config.a11y(),
