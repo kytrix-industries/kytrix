@@ -1527,18 +1527,30 @@ impl App {
         focus::validate_focus(self, window)
     }
 
-    /// 当前的**焦点作用域根**（R02-12）：最上层带 `trap_focus` 的模态浮层子树根。
+    /// 当前窗口的**模态作用域根**（最上层带 `trap_focus` 的浮层子树根）。
     ///
-    /// `None` = 没有模态浮层，整棵树都在作用域内。
+    /// `None` = 没有模态浮层，整棵树都可交互 / 可读。`Some(scope)` 时引擎把作用域外的一切
+    /// 当作 `inert`（Blink `<dialog showModal>` 的 top layer + inert 背景、Qt 模态对话框、
+    /// GTK modal 的同一语义）：
+    /// - 指针按下 / 滚动 / hover 被挡住（[`App::hovered`] 返回 `None`，背景不产生 `:hover`）；
+    /// - 焦点陷阱：[`App::set_focus`] / Tab 序只在作用域内；
+    /// - a11y 树把作用域外节点标 `hidden`（AT 读不到背景）；
+    /// - 作用域 = 模态子树 **∪** 经 `opener` 链属于该模态的弹出层（对话框里的下拉/菜单）。
+    ///
+    /// 调用方可以据此判断「某个交互是否属于当前模态」（例如应用自己的 tooltip / 快捷键
+    /// 路由）。作用域在模态浮层打开/关闭 / 提层时变化。
     #[must_use]
-    pub(crate) fn focus_scope(&self, window: WindowId) -> Option<NodeId> {
+    pub fn modal_scope(&self, window: WindowId) -> Option<NodeId> {
         focus::focus_scope(self, window)
     }
 
-    /// 指针当前悬停的节点（R02-4；`None` = 空白处 / 窗口外 / 节点已卸载）。
+    /// 指针当前悬停的节点（R02-4；`None` = 空白处 / 窗口外 / 节点已卸载 / **模态作用域外**）。
     ///
     /// 悬停变化时引擎会派生 [`Event::HoverChanged`]、给变化节点标 `PAINT` 并请求一帧，因此
     /// 应用可以在 `bind_style` 里读一个由悬停事件驱动的信号来实现 `:hover` 高亮。
+    ///
+    /// 模态浮层（`trap_focus`）打开后，落在作用域外的悬停读作 `None`（E12）：背景的
+    /// `:hover` / tooltip 不得出现在模态之上；模态内部的悬停（含属于该模态的弹出层）照常。
     #[must_use]
     pub fn hovered(&self, window: WindowId) -> Option<NodeId> {
         focus::hovered(self, window)

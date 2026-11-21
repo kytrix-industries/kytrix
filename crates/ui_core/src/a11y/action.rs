@@ -59,7 +59,7 @@ pub(crate) fn dispatch(app: &mut App, window: WindowId, request: ActionRequest) 
     // ∪ 属于该模态的浮层链）。`Click` 与 `Focus` 在下面还会各自经过 `dispatch_action` /
     // `set_focus` 的校验，但本入口是**唯一**能让 `SetValue` / `Increment` / `Custom` /
     // `Scroll*` 落地的地方，所以校验必须在这里做一次。
-    let scope = app.focus_scope(window);
+    let scope = app.modal_scope(window);
     let allowed = app
         .window(window)
         .is_some_and(|target| in_scope(target.tree(), engine, scope));

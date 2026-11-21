@@ -1084,6 +1084,7 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("打开模态浮层");

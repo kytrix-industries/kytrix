@@ -710,4 +710,109 @@ mod tests {
         );
         assert!(snapshot.contains("clips_children"), "{snapshot}");
     }
+
+    /// E12：模态作用域变化的 a11y 增量必须**合法**，且背景 `hidden` 真的随增量送达。
+    ///
+    /// 走 `TestApp::drain` 的真实顺序（帧 → a11y 交付），用 `ShadowTree` 逐笔校验 AccessKit
+    /// 契约（父先于子 / children 一致 / 焦点恒在）：模态打开与关闭各是一笔增量，不靠全树重发
+    /// 兜底。变异守卫：不标全树 `A11Y`（背景节点没有脏位）⇒ 本笔里找不到背景节点 ⇒ 红。
+    #[test]
+    fn a_modal_scope_change_is_delivered_as_a_legal_incremental_update() {
+        use crate::{
+            a11y::{A11yOverride, A11yRole},
+            interaction::{OverlayDismiss, OverlayOptions, OverlayPlacement},
+            math::{Point, Rect},
+            node::builder::NodeBuilder,
+            test_support::app::TestApp,
+        };
+
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let background = NodeBuilder::boxed()
+            .layout_override(Rect::new(0.0, 0.0, 100.0, 40.0))
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(smol_str::SmolStr::new_static("下单")),
+                ..A11yOverride::default()
+            })
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                root,
+            )
+            .expect("background");
+        let _ = app.drain().expect("首帧");
+        app.assert_a11y_contract();
+        assert!(
+            app.a11y_update().expect("首笔 a11y 交付").tree.is_some(),
+            "首笔必须带 TreeInfo"
+        );
+
+        let modal = app
+            .app_mut()
+            .create_overlay(
+                window,
+                OverlayOptions {
+                    placement: OverlayPlacement::Point(Point::new(150.0, 50.0)),
+                    dismiss: OverlayDismiss::Explicit,
+                    trap_focus: true,
+                    a11y: A11yOverride {
+                        role: Some(A11yRole::Dialog),
+                        label: Some(smol_str::SmolStr::new_static("确认下单")),
+                        ..A11yOverride::default()
+                    },
+                    ..OverlayOptions::default()
+                },
+            )
+            .expect("modal");
+        NodeBuilder::boxed()
+            .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+            .on_click(crate::event::Action::custom("modal.ok"))
+            .build(
+                app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                modal.node(),
+            )
+            .expect("confirm");
+        let _ = app.drain().expect("模态帧");
+        app.assert_a11y_contract();
+
+        let update = app.a11y_update().expect("模态打开必须产生 a11y 增量");
+        let snapshot = app.a11y().expect("本帧快照");
+        let background_id =
+            accesskit::NodeId(snapshot.node_for(background).expect("背景记录").id.get());
+        let background_node = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == background_id)
+            .map(|(_, node)| node)
+            .expect("背景的 hidden 变化必须在本笔增量里（模态作用域变化要标全树 A11Y）");
+        assert!(background_node.is_hidden(), "模态外背景必须 hidden");
+        let wrapper = snapshot.node_for(modal.node()).expect("模态包装记录");
+        assert_eq!(wrapper.role, A11yRole::Dialog);
+        assert!(wrapper.modal, "a11y modal 必须跟 trap_focus 走");
+        let wrapper_id = accesskit::NodeId(wrapper.id.get());
+        let wrapper_ak = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == wrapper_id)
+            .map(|(_, node)| node)
+            .expect("模态包装必须在本笔增量里");
+        assert!(wrapper_ak.is_modal());
+
+        app.app_mut().close_overlay(&modal);
+        let _ = app.drain().expect("关闭帧");
+        app.assert_a11y_contract();
+        let update = app.a11y_update().expect("模态关闭必须产生 a11y 增量");
+        let snapshot = app.a11y().expect("关闭帧快照");
+        let background_id =
+            accesskit::NodeId(snapshot.node_for(background).expect("背景记录").id.get());
+        let background_node = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == background_id)
+            .map(|(_, node)| node)
+            .expect("背景恢复可见必须在增量里（对称标全树 A11Y）");
+        assert!(!background_node.is_hidden(), "模态关闭后背景必须恢复可见");
+    }
 }

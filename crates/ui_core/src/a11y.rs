@@ -115,9 +115,25 @@ pub enum A11yRole {
     /// 菜单项。
     MenuItem,
     /// 对话框（浮层）。
+    ///
+    /// **不再由引擎按「浮层槽」自动推导**（E12）：浮层包装节点只是布局容器，角色必须由应用在
+    /// 创建时显式声明（`OverlayOptions::a11y`）或对子树节点声明；对话框语义落在真正承载内容的
+    /// 节点上。默认动作表**不含** `Expand` / `Collapse`（ARIA 的 `aria-expanded` 属于展开
+    /// 触发器，不属于对话框本身）。
     Dialog,
+    /// 警告对话框（需要用户确认的模态浮层；`role="alertdialog"`）。
+    ///
+    /// 与 [`Self::Dialog`] 的区别在 AT 侧：警告对话框的可访问名 / 描述会被立即播报。模态语义
+    /// 仍由 `OverlayOptions::trap_focus` 决定（a11y `modal` 状态跟着引擎的模态作用域走）。
+    AlertDialog,
     /// 工具提示。
     Tooltip,
+    /// 标签页列表（`role="tablist"`；子节点角色是 [`Self::Tab`]）。
+    TabList,
+    /// 标签页（`role="tab"`；选中态走 `A11yPatch::selected`，展开态走 `A11yPatch::expanded`）。
+    Tab,
+    /// 分隔符（`role="separator"`；菜单 / 工具条分组）。
+    Separator,
 }
 
 impl A11yRole {
@@ -127,7 +143,7 @@ impl A11yRole {
     /// （`a11y::mapping`）用一个**穷举 `match`** 给每个变体计数并与本数组求和比对 ——
     /// 少列一个变体 ⇒ 求和偏小 ⇒ 测试红；加一个变体忘了加进 `ALL` ⇒ 编译期
     /// `non-exhaustive patterns` 先报错。这正是 R13-11 要求的"手写数组不再假绿"。
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 38] = [
         Self::Window,
         Self::Application,
         Self::GenericContainer,
@@ -161,7 +177,11 @@ impl A11yRole {
         Self::MenuBar,
         Self::MenuItem,
         Self::Dialog,
+        Self::AlertDialog,
         Self::Tooltip,
+        Self::TabList,
+        Self::Tab,
+        Self::Separator,
     ];
 }
 

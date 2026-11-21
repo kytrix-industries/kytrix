@@ -16,6 +16,7 @@ pub mod virtual_list;
 use std::time::{Duration, Instant};
 
 use crate::{
+    a11y::A11yOverride,
     app::App,
     event::{Action, ActionSource, Modifiers, PointerButton},
     layout::hit_test::HitResult,
@@ -508,7 +509,7 @@ pub enum OverlayPlacement {
 }
 
 /// 浮层参数。
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OverlayOptions {
     /// 定位。
     pub placement: OverlayPlacement,
@@ -520,10 +521,10 @@ pub struct OverlayOptions {
     /// `QDialog` 的对话框焦点作用域、GTK `GtkWindow` 的 modal）：
     /// - Tab / Shift+Tab 只在作用域内循环（含**属于该模态的弹出层**）；
     /// - [`crate::app::App::set_focus`] 拒绝作用域外的节点；
-    /// - 浮层外的指针按下 / 滚动被**消费**（不抢焦点、不触发下层动作、不滚背景）；
+    /// - 浮层外的指针**按下 / 滚动 / 悬停**都被挡住：按下与滚动被消费（不抢焦点、不触发下层
+    ///   动作、不滚背景），悬停被过滤成 `None`（背景 `:hover` 与 tooltip 不会在模态之上出现）；
     /// - Enter / Space 激活与 a11y 动作（`ActionRequest`，**全部**动作类型）拒绝作用域外目标；
-    ///   注意作用域只约束**动作**：a11y 树本身仍向外暴露背景节点（读屏可以读到它们，只是
-    ///   操作会被拒绝）—— 把背景置 `inert`（accesskit `hidden`）尚未实现（AR1b N2）；
+    /// - a11y 树把作用域外节点标 `hidden`（`inert` / `aria-hidden` 语义，E12），AT 读不到背景；
     /// - 作用域外的焦点在下一次输入/焦点操作时移入模态内第一个可聚焦节点（子节点在
     ///   `create_overlay` 返回之后才挂载，创建瞬间求值不到候选）；**完全没有焦点**时同样
     ///   补一个落点（AR1b N1b）。
@@ -532,6 +533,8 @@ pub struct OverlayOptions {
     /// 内（可嵌套递归）就仍属于作用域（[`crate::interaction::overlay::in_modal_scope`]）。
     /// 这是 Qt 模态对话框的「子窗口/弹窗归属」与 Chrome top layer 的同一语义；旧实现只认
     /// 子树，于是对话框里的下拉菜单永远点不动（AR1 探针 1）。
+    ///
+    /// 查询面：[`crate::app::App::modal_scope`]（当前作用域根）。
     pub trap_focus: bool,
     /// 关闭时是否把焦点还给**打开者**（R02-12）。
     ///
@@ -539,6 +542,19 @@ pub struct OverlayOptions {
     /// 外部点击）后若该节点仍存在且可聚焦就恢复。平台与 a11y 的惯例是「焦点回到 opener」：
     /// Blink 的 `<dialog>` 关闭、Qt `QDialog::done`、GTK `GtkPopover` 的 `autohide` 都这样做。
     pub restore_focus: bool,
+    /// 浮层**包装节点**的 a11y 声明（E12；角色 / 可访问名 / 动作 / 显式 hidden）。
+    ///
+    /// 包装节点只是布局/命中容器：**没有 `role` 时按 `GenericContainer` 处理**（平台
+    /// `common_filter` 透明上提），引擎不再猜测成 `Dialog`。真实语义有两种声明方式：
+    /// - 在包装节点上声明（适合「整个浮层就是一个对话框/菜单」）：`A11yOverride { role:
+    ///   Some(A11yRole::Dialog | AlertDialog | Menu | Tooltip), label: …, .. }`；
+    /// - 或在子树里放语义节点（适合包装层还需要承载遮罩等结构时），包装保持默认。
+    ///
+    /// `modal` 不需要（也不应该）在这里声明：浮层包装的 a11y `aria-modal` 跟引擎真值
+    /// `trap_focus` 走（动态 `A11yPatch::modal` 可覆盖，用于测试/特例）。
+    ///
+    /// 注意 `hidden = true` 会沿 a11y 子树隐藏**整个浮层内容**（与普通节点的 hidden 同义）。
+    pub a11y: A11yOverride,
 }
 
 impl Default for OverlayOptions {
@@ -548,6 +564,7 @@ impl Default for OverlayOptions {
             dismiss: OverlayDismiss::OutsideClick,
             trap_focus: false,
             restore_focus: false,
+            a11y: A11yOverride::default(),
         }
     }
 }

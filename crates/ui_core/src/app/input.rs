@@ -70,7 +70,7 @@ pub(crate) fn dispatch_action(
         action,
         Action::FocusNext | Action::FocusPrev | Action::Dismiss
     ) {
-        let scope = app.focus_scope(window);
+        let scope = app.modal_scope(window);
         let in_scope = app
             .windows
             .get(&window)
@@ -276,7 +276,7 @@ pub(crate) fn on_pointer_down(
     //    作用域 = 模态子树 **∪ 属于该模态的浮层链**：`create_overlay` 恒把浮层挂 root，所以
     //    对话框里的下拉/菜单必然落在模态子树之外；它们的 `opener` 在模态内（可嵌套递归），
     //    因此仍属于可交互范围（`in_modal_scope`）。旧实现只认子树 ⇒ 菜单项永远点不动。
-    if let Some(scope) = app.focus_scope(window) {
+    if let Some(scope) = app.modal_scope(window) {
         let inside = app.windows.get(&window).is_some_and(|target| {
             hit.is_some_and(|result| {
                 overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
@@ -547,7 +547,7 @@ pub(crate) fn on_scroll(
     };
     // 模态作用域（R02-12）：作用域外的滚动整体消费 —— `inert` 的背景不得被滚轮/触控板滚动
     //（与按下同一条判定，含「属于该模态的弹出层」）。
-    if let Some(scope) = app.focus_scope(window) {
+    if let Some(scope) = app.modal_scope(window) {
         let inside = app.windows.get(&window).is_some_and(|target| {
             overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
         });
@@ -692,7 +692,7 @@ pub(crate) fn on_key(
         //    背景按钮收不到 Enter；这里再显式校验一次作用域，防止焦点在两次读取之间变化。
         if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
             let focused = app.focused(window);
-            let scope = app.focus_scope(window);
+            let scope = app.modal_scope(window);
             let activation = app.windows.get(&window).and_then(|target| {
                 focused
                     .filter(|node| focus::in_scope(target.tree(), *node, scope))
@@ -984,12 +984,21 @@ fn hover_chain(tree: &crate::node::tree::NodeTree, node: Option<NodeId>) -> Smal
 }
 
 /// 更新悬停节点；有迁移时派生 [`Event::HoverChanged`]、标 `PAINT` 并请求一帧。
-fn update_hover(app: &mut App, window: WindowId, next: Option<NodeId>) {
+///
+/// **受模态作用域约束**（E12）：作用域外的命中视为「没有悬停」。旧 `BlockMouse` 的 hitbox
+/// 同时挡住命中与 hover；引擎的模态作用域必须给出同一语义，否则对话框打开时背景的
+/// `:hover` 与 tooltip 仍会亮起、并画在对话框之上（P2-4b R07）。
+fn update_hover(app: &mut App, window: WindowId, mut next: Option<NodeId>) {
     let (left, entered) = {
         let Some(target) = app.windows.get(&window) else {
             return;
         };
         let tree = target.tree();
+        // 模态作用域外 ⇒ 无悬停；作用域内（模态子树 / 属于模态的弹出层）照常。
+        let scope = overlay_util::focus_scope_root(tree, tree.root());
+        next = next.filter(|node| {
+            tree.get(*node).is_ok() && overlay_util::in_modal_scope(tree, *node, scope)
+        });
         // 陈旧节点（已被卸载）视为「无悬停」：虚拟列表回收行之后旧 id 会留在槽里。
         let previous = target
             .pointer()
@@ -1048,10 +1057,28 @@ fn update_hover(app: &mut App, window: WindowId, next: Option<NodeId>) {
     app.request_frame();
 }
 
+/// 模态作用域变化（模态浮层打开 / 关闭 / 提层）后重算悬停。
+///
+/// 作用域外的悬停必须**立刻结束**：应用可能用 `App::hovered` 驱动 tooltip / `:hover`
+/// 样式，而指针没有移动就不会有新的 `PointerMove` —— 不重算的话背景 tooltip 会一直显示到
+/// 用户移动鼠标（P2-4b R07 的「tooltip 画在模态之上」）。消费者：`create_overlay` /
+/// `bring_overlay_to_front`（只在 `trap_focus` 浮层发生变化时调用）。
+pub(crate) fn revalidate_hover(app: &mut App, window: WindowId) {
+    let next = app
+        .windows
+        .get(&window)
+        .and_then(|target| target.pointer().hovered);
+    update_hover(app, window, next);
+}
+
 /// 悬停变化后重新解析光标（只有变化时才推给平台）。
 fn update_cursor(app: &mut App, window: WindowId, hit: Option<HitResult>) {
     let cursor = app.windows.get(&window).map_or(Cursor::Default, |target| {
-        focus::resolve_cursor(target.tree(), hit.map(|result| result.node))
+        let tree = target.tree();
+        // 模态作用域外不解析指针形状：背景的手型/缩放光标不得在对话框上显示（与 hover 同源）。
+        let scope = overlay_util::focus_scope_root(tree, tree.root());
+        let hit = hit.filter(|result| overlay_util::in_modal_scope(tree, result.node, scope));
+        focus::resolve_cursor(tree, hit.map(|result| result.node))
     });
     let mut changed = false;
     if let Some(target) = app.windows.get_mut(&window) {

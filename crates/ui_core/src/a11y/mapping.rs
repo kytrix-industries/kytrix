@@ -61,7 +61,15 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::MenuBar => Role::MenuBar,
         R::MenuItem => Role::MenuItem,
         R::Dialog => Role::Dialog,
+        // E12：警告对话框 / 标签页 / 分隔符（AccessKit 0.25 同名同义）。
+        R::AlertDialog => Role::AlertDialog,
         R::Tooltip => Role::Tooltip,
+        R::TabList => Role::TabList,
+        R::Tab => Role::Tab,
+        // AccessKit 0.25 **没有** `Role::Separator`：ARIA `separator` 的等价角色是 `Splitter`
+        // （`accesskit_windows` 映射 `UIA_SeparatorControlTypeId`、`accesskit_atspi_common`
+        // 映射 `AtspiRole::Separator`、`accesskit_macos` 映射 `NSAccessibilitySplitterRole`）。
+        R::Separator => Role::Splitter,
     }
 }
 
@@ -197,6 +205,13 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         R::TextInput | R::MultilineTextInput => vec![A::SetValue],
         // 文本运行：选区是它唯一的原生动作（选择不改变数据，`read_only` 不剔除）。
         R::TextRun => vec![A::SetTextSelection],
+        // E12：`Dialog` / `Menu` **不再**默认宣告 `Expand`/`Collapse`。
+        //
+        // `aria-expanded` 属于「展开触发器」（combo box / menu button / tree item），不属于
+        // 被展开的对话框或菜单本身；旧表让每个浮层包装节点都暴露 Expand/Collapse，AT 会为
+        // 任何浮层读出「可展开」的死动作（P2-4b R12）。真实的展开能力由节点声明
+        // `on_click`/`on_action` 或显式 `A11yOverride::actions` 给出。
+        R::Dialog | R::AlertDialog | R::Menu => Vec::new(),
         R::ScrollView => vec![
             A::ScrollUp,
             A::ScrollDown,
@@ -205,7 +220,6 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
             A::ScrollIntoView,
             A::SetScrollOffset,
         ],
-        R::Dialog | R::Menu => vec![A::Expand, A::Collapse],
         // 表格/网格的 `ScrollIntoView` 由 `effective_actions` 按「是否真的有滚动容器」补
         // （无滚动祖先时该动作必然失败）。
         R::Table | R::Grid => Vec::new(),
@@ -241,8 +255,15 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
     if tree.scroll_slot(node).is_some() {
         return R::ScrollView;
     }
+    // 浮层包装节点**不推导语义角色**（E12）：它只是布局/命中容器，真实语义由应用在创建时
+    // 显式声明（`OverlayOptions::a11y`）或落在子树的语义节点上。旧实现把所有浮层包装推导成
+    // `Dialog`，连菜单 / tooltip 都被 AT 读成对话框（P2-4b R12）。无声明 ⇒ `GenericContainer`
+    // （平台 `common_filter` 会把纯泛型容器透明上提，不会多出一层噪声）。
+    //
+    // 注意 `hidden` 是另一条通道：包装节点若显式 `hidden = true` 会沿 a11y 子树隐藏**整个
+    // 浮层内容**（AccessKit 的 hidden 向下继承）——「透明容器」不等于「隐藏容器」。
     if tree.overlay_slot(node).is_some() {
-        return R::Dialog;
+        return R::GenericContainer;
     }
     if is_virtual_row(tree, node) {
         return R::ListBoxOption;
@@ -730,7 +751,11 @@ mod tests {
                 | A11yRole::MenuBar
                 | A11yRole::MenuItem
                 | A11yRole::Dialog
-                | A11yRole::Tooltip => 1,
+                | A11yRole::AlertDialog
+                | A11yRole::Tooltip
+                | A11yRole::TabList
+                | A11yRole::Tab
+                | A11yRole::Separator => 1,
             }
         }
 
@@ -786,6 +811,33 @@ mod tests {
             A11yRole::ALL.contains(&A11yRole::TreeItem),
             "A11yRole::ALL 必须包含 TreeItem"
         );
+        // E12 浮层 / 标签页角色：AccessKit 0.25 同名映射（`Separator` 对应 0.25 的
+        // `Splitter` —— 见 `role_to_accesskit` 的注释）。
+        assert_eq!(
+            role_to_accesskit(A11yRole::AlertDialog),
+            accesskit::Role::AlertDialog
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::TabList),
+            accesskit::Role::TabList
+        );
+        assert_eq!(role_to_accesskit(A11yRole::Tab), accesskit::Role::Tab);
+        assert_eq!(
+            role_to_accesskit(A11yRole::Separator),
+            accesskit::Role::Splitter,
+            "ARIA separator → AccessKit 0.25 Splitter（UIA Separator/AT-SPI separator）"
+        );
+        for role in [
+            A11yRole::AlertDialog,
+            A11yRole::TabList,
+            A11yRole::Tab,
+            A11yRole::Separator,
+        ] {
+            assert!(
+                A11yRole::ALL.contains(&role),
+                "A11yRole::ALL 必须包含 E12 新增角色 {role:?}"
+            );
+        }
     }
 
     /// `aria-sort` 的三个状态都必须有映射（UIA/AT-SPI 靠它播报"按价格升序"）。
@@ -844,7 +896,21 @@ mod tests {
         assert_eq!(default_actions(A11yRole::Button), vec![A11yAction::Click]);
         assert!(default_actions(A11yRole::TextInput).contains(&A11yAction::SetValue));
         assert!(default_actions(A11yRole::ScrollView).contains(&A11yAction::ScrollIntoView));
-        assert!(default_actions(A11yRole::Dialog).contains(&A11yAction::Expand));
+        // E12：对话框 / 菜单 / 警告对话框**不再**默认宣告 Expand/Collapse —— `aria-expanded`
+        // 属于展开触发器，不属于被展开的容器本身（P2-4b R12）。真实能力由节点声明补。
+        for role in [
+            A11yRole::Dialog,
+            A11yRole::AlertDialog,
+            A11yRole::Menu,
+            A11yRole::TabList,
+            A11yRole::Tab,
+            A11yRole::Separator,
+        ] {
+            assert!(
+                default_actions(role).is_empty(),
+                "{role:?} 的默认动作表必须为空（不暴露死 Expand/Collapse）"
+            );
+        }
         assert!(default_actions(A11yRole::Label).is_empty());
     }
 
