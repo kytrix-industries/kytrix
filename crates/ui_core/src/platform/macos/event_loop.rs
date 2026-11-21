@@ -1009,10 +1009,13 @@ unsafe extern "C-unwind" fn observer_callback(
 /// # Safety
 ///
 /// 同 [`pump_callback`]：`info` 是 `run` 安装的 `LoopState` 指针，调用只在主线程发生。
-unsafe extern "C-unwind" fn timer_callback(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+unsafe extern "C-unwind" fn timer_callback(timer: *mut CFRunLoopTimer, info: *mut c_void) {
     if info.is_null() {
         return;
     }
+    // E10c-R06：一次性定时器触发后 CF 会把它失效；先标记槽，泵末尾的 `set_deadline` 才会
+    // 重建（提前触发 + target 仍在未来时，不复用已失效的表，否则这次唤醒丢失）。
+    wake::note_deadline_fired(timer);
     // SAFETY: 同 `pump_callback`。
     let state = unsafe { &mut *(info as *mut LoopState) };
     pump_and_stop(state, true);

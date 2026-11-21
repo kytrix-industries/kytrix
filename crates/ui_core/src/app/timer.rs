@@ -16,11 +16,12 @@
 //!
 //! # 时钟与精度
 //!
-//! 到期判定用**引擎时钟**（平台泵每轮 `sync_clock`；测试用 `TestApp::advance`）。
+//! 到期判定用**引擎时钟**（平台泵每轮 `sync_clock_live`；测试用 `TestApp::advance`）。
 //!
-//! **登记基准**（E10c）：生产构建（平台泵已经把引擎时钟同步为**活时钟**，`App::clock_live`）
-//! 用**登记瞬间的真实时间** `Instant::now()` 作基准；测试构建用引擎时钟（`TestApp::advance`
-//! 是唯一推进源，deadline 必须精确等于 `clock + delay` 才可断言）。
+//! **登记基准**（E10c）：生产构建（`App::new` 即活时钟，`App::clock_live`）用**登记瞬间的
+//! 真实时间** `Instant::now()` 作基准 —— 包括**首次泵启动之前**登记的定时器（E10c-R01：
+//! `Application::run` 之前的建窗/初始化耗时不折算进 `delay`）；测试宿主 `TestApp` 用引擎时钟
+//! （`TestApp::advance` 是唯一推进源，deadline 必须精确等于 `clock + delay` 才可断言）。
 //!
 //! 为什么不能用泵起点同步的引擎时钟当基准：泵在**开始**同步时钟，之后还有事件派发、窗口状态
 //! 同步、渲染器轮询等本帧前置工作；应用在 `on_frame` 里登记定时器时，引擎时钟已经落后真实
@@ -74,8 +75,9 @@ pub(crate) fn after(
     }
     let id = app.next_timer;
     app.next_timer = app.next_timer.wrapping_add(1);
-    // E10c：登记基准 = 生产（活时钟）取**登记瞬间**真实时间；测试取引擎时钟（可 `advance`
-    // 精确断言）。见模块文档「时钟与精度」。
+    // E10c：登记基准 = 生产（活时钟，`App::new` 即置位 ⇒ 首次泵启动前登记同样成立）取
+    // **登记瞬间**真实时间；测试宿主取引擎时钟（可 `advance` 精确断言）。见模块文档
+    // 「时钟与精度」。
     let reference = if app.clock_live {
         Instant::now()
     } else {

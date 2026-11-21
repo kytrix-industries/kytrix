@@ -21,7 +21,7 @@ use crate::{
         style::{PaintSpec, StylePatch},
     },
     test_support::app::TestApp,
-    window::{FrameOutcome, WindowId},
+    window::{FrameOutcome, WindowId, WindowOptions},
 };
 
 /// 一轮真实泵的**测试投影**：消费一次「有一帧要画」唤醒位（平台泵的 `take_frame_wake`）→
@@ -1032,11 +1032,57 @@ fn a_timer_registered_on_a_live_clock_is_anchored_to_the_registration_instant() 
     );
 }
 
+/// **E10c-R01 回归**：`Application::run` **之前**（首次泵启动前）登记的定时器同样只能晚不能早。
+///
+/// 审查探针（Windows 真机）：App 构造 → 建窗 → 80 ms 初始化 → 登记 1500 ms 定时器，修复前
+/// 触发于 `+1430.42 ms`（**提前 69.58 ms**）—— deadline 用了 `App::new` 的时钟，构造 → 登记
+/// 之间的初始化耗时被算进了 `delay`。修复后 `App::new` 就是活时钟 ⇒ 基准 = 登记瞬间。
+///
+/// 变异守卫：`App::new` 的 `clock_live` 改回 false ⇒ 第一条断言变红（`App::new` 与登记之间
+/// 的初始化耗时被算进 delay，deadline 落在 `登记瞬间 + delay` 之前）。
+#[test]
+fn a_timer_registered_before_the_first_pump_is_not_early() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let mut app = App::new(runtime.handle().clone());
+    let window = app.create_window(WindowOptions::default());
+    // 模拟 `Application::run` 之前的初始化（建窗 / 建树 / 资源准备）耗时。
+    std::thread::sleep(Duration::from_millis(50));
+    let registered_at = Instant::now();
+    let first = app
+        .after(window, Duration::from_millis(1500), |_app| {})
+        .expect("timer");
+    let deadline = app.next_wake_deadline().expect("pending timer");
+    assert!(
+        deadline >= registered_at + Duration::from_millis(1500),
+        "首次泵启动前登记也必须以登记瞬间为基准（E10c-R01；修复前 Windows 真机探针提前 69.58 ms）"
+    );
+
+    // 泵启动之后的登记保持同一语义（活时钟由泵每轮刷新）。
+    assert!(app.cancel_timer(&first));
+    app.sync_clock_live();
+    std::thread::sleep(Duration::from_millis(2));
+    let after_pump = Instant::now();
+    app.after(window, Duration::from_millis(400), |_app| {})
+        .expect("timer");
+    let deadline = app.next_wake_deadline().expect("pending timer");
+    assert!(
+        deadline >= after_pump + Duration::from_millis(400),
+        "泵启动后登记同样以登记瞬间为基准"
+    );
+}
+
 /// **E10c 的 I3 断言**：等待一次性定时器期间，泵轮不提交帧、不请求帧、不派发未到期的定时器
 /// （Windows 同代码 1 轮；macOS 修复前被 display link 的 vsync tick 空转 54 轮）。
 ///
+/// E10c2-R05：等待期只推进**引擎时钟**（`TestApp::advance`，可控、无真实 sleep），断言与真实
+/// 时间无关 —— 高负载 CI 上不会因为一次调度停顿就让定时器在断言前到期（旧版真实
+/// `sleep(10ms)×3` 的 flake 风险）。
+///
 /// 变异守卫（E10c M2）：让 macOS 泵的空闲轮判定恒为真（`platform::macos_pump::app_round`
-/// 恒 true）⇒ 真机 `timer_smoke` 的「等待期轮数」失败；本用例守护引擎侧的同一条不变量
+/// 恒 true）⇒ 真机 `timer_smoke` 的「等待期应用轮数」失败；本用例守护引擎侧的同一条不变量
 /// （等待期间 `App::frame` 恒 `Idle`、`FrameIndex` 不变、无帧请求）。
 #[test]
 fn waiting_for_a_one_shot_timer_produces_no_frames_or_wakeups() {
@@ -1047,9 +1093,6 @@ fn waiting_for_a_one_shot_timer_produces_no_frames_or_wakeups() {
     let frame_index = app.app().window(window).expect("window").frame_index();
     let requests = app.app().frame_requests();
 
-    app.app_mut().sync_clock_live();
-    std::thread::sleep(Duration::from_millis(2));
-    app.app_mut().sync_clock_live();
     let fired = Rc::new(Cell::new(false));
     let sink = Rc::clone(&fired);
     app.app_mut()
@@ -1059,10 +1102,9 @@ fn waiting_for_a_one_shot_timer_produces_no_frames_or_wakeups() {
         .expect("timer");
     assert_eq!(app.app().timer_count_for_test(), 1);
 
-    // 等待期：模拟平台泵的若干轮（轮首同步活时钟 → 帧入口）。定时器未到期 ⇒ 恒 Idle。
+    // 等待期：只推进引擎时钟（确定性），未到期 ⇒ 恒 Idle。
     for _ in 0..3 {
-        std::thread::sleep(Duration::from_millis(10));
-        app.app_mut().sync_clock_live();
+        app.advance(Duration::from_millis(10));
         let outcome = app.app_mut().frame(window);
         assert!(
             matches!(outcome, Some(Ok(FrameOutcome::Idle))),
@@ -1083,8 +1125,7 @@ fn waiting_for_a_one_shot_timer_produces_no_frames_or_wakeups() {
     }
 
     // 到点后由下一轮的钩子步骤派发一次；表清空、不重复。
-    std::thread::sleep(Duration::from_millis(90));
-    app.app_mut().sync_clock_live();
+    app.advance(Duration::from_millis(90));
     app.app_mut().run_frame_hook();
     assert!(fired.get(), "到点必须派发");
     assert_eq!(app.app().timer_count_for_test(), 0);

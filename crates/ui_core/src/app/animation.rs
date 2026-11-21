@@ -384,8 +384,10 @@ pub(crate) fn sync_clock(app: &mut App) {
 
 /// 平台泵的轮首时钟同步：推进到真实时间并标记活时钟（E10c；`App::sync_clock_live`）。
 ///
-/// `clock_live` 只由平台泵置位：一次性定时器的登记基准在活时钟下取登记瞬间真实时间，否则
-/// 取引擎时钟（测试的 `TestApp::advance` 必须保持 deadline 可精确断言）。
+/// `clock_live` 由 `App::new` 的生产默认置位（首次泵启动前登记也必须只晚不早，E10c-R01），
+/// 测试宿主 `TestApp` 构造后关闭；平台泵每轮调用本方法刷新时钟并保持置位。一次性定时器的
+/// 登记基准在活时钟下取登记瞬间真实时间，否则取引擎时钟（测试的 `TestApp::advance` 必须保持
+/// deadline 可精确断言）。
 pub(crate) fn sync_clock_live(app: &mut App) {
     app.clock = Instant::now();
     app.clock_live = true;

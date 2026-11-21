@@ -20,6 +20,8 @@ use objc2_core_foundation::{
     CFRunLoopSourceContext, CFRunLoopTimer, CFRunLoopTimerContext, kCFRunLoopCommonModes,
 };
 
+use crate::platform::macos_pump::keep_armed_deadline;
+
 /// 泵回调（`event_loop::pump_callback`）。
 pub(crate) type PerformFn = unsafe extern "C-unwind" fn(*mut c_void);
 /// 定时器回调（`event_loop::timer_callback`）。
@@ -32,6 +34,14 @@ struct StatePtr(*mut c_void);
 // 定时器回调（`event_loop::timer_callback`）里；放进 `Mutex` 只是为了满足 `static` 的 `Send`。
 unsafe impl Send for StatePtr {}
 
+/// 已挂的一次性平台定时器（`set_deadline` 的槽）。
+struct ArmedDeadline {
+    timer: CFRetained<CFRunLoopTimer>,
+    target: Instant,
+    /// 平台定时器已经触发过（一次性 CF timer 触发后自动失效，槽必须重建 —— E10c-R06）。
+    fired: bool,
+}
+
 /// 句柄表（`run` 的主线程安装，任意线程 `signal`，退出前主线程 `uninstall`）。
 struct Wake {
     run_loop: CFRetained<CFRunLoop>,
@@ -40,7 +50,7 @@ struct Wake {
     state: StatePtr,
     timer: RefCell<Option<CFRetained<CFRunLoopTimer>>>,
     /// E10：一次性定时器（`App::after` 的最早到期时刻；`None` = 没有挂）。
-    deadline: RefCell<Option<(CFRetained<CFRunLoopTimer>, Instant)>>,
+    deadline: RefCell<Option<ArmedDeadline>>,
 }
 
 // SAFETY: 所有访问都经由 `WAKE` 的互斥锁；`CFRunLoop` / `CFRunLoopSource` 是 CF 文档保证
@@ -123,9 +133,10 @@ pub(crate) fn uninstall() {
         wake.run_loop.remove_timer(Some(&timer), common_mode());
         timer.invalidate();
     }
-    if let Some((timer, _)) = wake.deadline.borrow_mut().take() {
-        wake.run_loop.remove_timer(Some(&timer), common_mode());
-        timer.invalidate();
+    if let Some(armed) = wake.deadline.borrow_mut().take() {
+        wake.run_loop
+            .remove_timer(Some(&armed.timer), common_mode());
+        armed.timer.invalidate();
     }
     // `wake` 在**仍持锁**时 drop：并发的 `signal()` 要么已经完成、要么拿到 `None`。
     drop(wake);
@@ -197,6 +208,9 @@ pub(crate) fn set_animating(active: bool, interval: f64) {
 /// 失效，不会重排），到点与连续帧定时器共用 `event_loop::timer_callback` → 同一份泵。等待期间
 /// 不进入连续帧模式、不轮询（I3）；目标时刻变化（更早 / 更晚 / 取消）时就地重建。
 ///
+/// 已挂的表只在「未触发 + 目标不变 + 仍在未来」时复用（判定见 `macos_pump::keep_armed_deadline`，
+/// E10c-R06）：提前触发的一次性 timer 已被 CF 失效，**必须**重建，否则这次唤醒丢失。
+///
 /// 挂在 `common modes` 上：live resize / 滚动跟踪等嵌套 run loop 里也会到点。
 pub(crate) fn set_deadline(deadline: Option<Instant>) {
     let Some(guard) = lock() else {
@@ -207,19 +221,14 @@ pub(crate) fn set_deadline(deadline: Option<Instant>) {
     };
     let mut slot = wake.deadline.borrow_mut();
     let now = Instant::now();
-    // 已挂的表正好对得上、且仍在未来 ⇒ 不动（每轮重建 CF 对象是纯浪费）。目标已经过去
-    // （一轮里被别的唤醒提前叫醒）⇒ 重建，fireDate 在过去时 CF 会立即触发。
-    let keep = match (deadline, slot.as_ref()) {
-        (None, None) => true,
-        (Some(target), Some((_, armed))) => *armed == target && *armed > now,
-        _ => false,
-    };
-    if keep {
+    let armed = slot.as_ref().map(|armed| (armed.target, armed.fired));
+    if keep_armed_deadline(deadline, armed, now) {
         return;
     }
-    if let Some((timer, _)) = slot.take() {
-        wake.run_loop.remove_timer(Some(&timer), common_mode());
-        timer.invalidate();
+    if let Some(armed) = slot.take() {
+        wake.run_loop
+            .remove_timer(Some(&armed.timer), common_mode());
+        armed.timer.invalidate();
     }
     let Some(target) = deadline else {
         return;
@@ -246,6 +255,31 @@ pub(crate) fn set_deadline(deadline: Option<Instant>) {
     };
     if let Some(created) = created {
         wake.run_loop.add_timer(Some(&created), common_mode());
-        *slot = Some((created, target));
+        *slot = Some(ArmedDeadline {
+            timer: created,
+            target,
+            fired: false,
+        });
+    }
+}
+
+/// 一次性平台定时器已触发（`event_loop::timer_callback` 在泵之前调用）。
+///
+/// 标记槽里的 `fired`（而不是直接丢弃槽）：`set_deadline` 的复用判定据此强制重建
+/// （E10c-R06）。只标记**确实触发的那只** timer —— 连续帧定时器与一次性定时器共用同一回调，
+/// 动画期间每帧的 tick 不能把已挂的一次性表误标成触发过。
+pub(crate) fn note_deadline_fired(fired: *mut CFRunLoopTimer) {
+    let Some(guard) = lock() else {
+        return;
+    };
+    let Some(wake) = guard.as_ref() else {
+        return;
+    };
+    let mut slot = wake.deadline.borrow_mut();
+    let Some(armed) = slot.as_mut() else {
+        return;
+    };
+    if std::ptr::eq(&*armed.timer, fired.cast_const()) {
+        armed.fired = true;
     }
 }

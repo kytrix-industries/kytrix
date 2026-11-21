@@ -11,9 +11,12 @@
 //!    「泵起点同步的引擎时钟」，会把泵前置工作算进 delay ⇒ macOS 真机实测
 //!    `398.648 ms < 400 ms`（提前触发）。
 //! 2. 第一只定时器等待期间**没有输入、没有 `AppHandle::wake` 节拍**，只靠平台定时器唤醒；
-//! 3. 等待期间的**空闲应用轮**很少：这里统计「`on_frame` 被调用但 `FrameIndex` 没有推进」的
-//!    轮数（真正的按刷新率空转），而不是总轮数 —— 首帧收尾的合法补帧不计入（它会推进
-//!    `FrameIndex`）。E10c 前 macOS 实测 54 个空闲轮 / 400 ms；修复后与 Windows 同口径 ≤1。
+//! 3. 等待期间的**空闲应用轮**很少：只统计「`on_frame` 被调用但 `FrameIndex` 没有推进」的
+//!    **应用轮**（macOS 修复前实测 54 轮 / 400 ms；修复后 1 轮，Windows 0–1）。首帧收尾的
+//!    合法补帧会推进 `FrameIndex`，不计入。该指标**不是 OS 唤醒计数**：macOS 的 display link
+//!    在最后一次工作后仍按刷新率唤醒主 run loop ≤`IDLE_GRACE`（250 ms，R06-8 的渲染器取舍，
+//!    已登记为残余）；这些 vsync 心跳只做 pacing / 状态预扫描，不调用应用回调。本冒烟没有
+//!    能耗 / 泵入口计数，因此 PASS 只声明「等待期无周期性**应用轮**唤醒」，不声明 OS 级零唤醒。
 //! 4. 回调里再注册的 200 ms 定时器同样触发（链式一次性定时器）；
 //! 5. 关窗后事件循环干净退出（退出码 0）。
 //!
@@ -46,14 +49,18 @@ const WATCHDOG: Duration = Duration::from_secs(20);
 /// WM_TIMER ~15.6 ms），M1 的 ired_at < 基准 + delay 断言才能稳定变红；修复后（登记瞬间
 /// 取基准则）不受影响。
 const REGISTRATION_ROUND_WORK: Duration = Duration::from_millis(20);
-/// 第一次等待期允许的**空闲应用轮**上限（安全余量；实测值见输出）。
+/// 第一次等待期允许的**空闲应用轮**上限。
 ///
-/// 空闲轮 = `on_frame` 被调用但 `FrameIndex` 没有推进的轮次：合法补帧（图集 / a11y / 首帧
-/// 收尾 / Wayland 合成器回调）会推进 `FrameIndex`，不计入；真正按刷新率空转才会（E10c 前
-/// macOS 实测 54 个空闲轮 / 400 ms，Windows 0）。macOS 修复后实测 1，Windows 0；Linux 的
-/// Wayland 事件循环在首帧后有既有的启动补轮（基线 b3e98dd 旧冒烟实测 6 轮），登记为本批
-/// 之外的残余、不作为阈值依据。8 = 旧冒烟的门槛，远低于「按刷新率空转」（54）。
-const MAX_FIRST_IDLE_ROUNDS: u32 = 8;
+/// 口径（E10c2-R03）：只数**应用轮** —— `on_frame` 被调用但 `FrameIndex` 没有推进。合法补帧
+/// （图集 / a11y / 首帧收尾 / Wayland 合成器回调）会推进 `FrameIndex`，不计入；真正按刷新率
+/// 空转才会（E10c 前 macOS 实测 54 个空闲轮 / 400 ms）。它**不**是 OS 唤醒计数：macOS 的
+/// display link 仍会在 `IDLE_GRACE`（250 ms）内唤醒 run loop（R06-8 已登记残余），只是不再
+/// 调用应用回调 —— PASS 文案按此口径写明。
+///
+/// 阈值：macOS 修复后实测 1、Windows 0–1 ⇒ 非 Linux 端按「应用轮 ≤1」判定。Linux 的 Wayland
+/// 事件循环在首帧后有**既有**的启动补轮（基线 b3e98dd 旧冒烟实测 6 轮），登记为本批之外的
+/// 残余，沿用旧门槛 8（远低于「按刷新率空转」的 54）。
+const MAX_FIRST_IDLE_ROUNDS: u32 = if cfg!(target_os = "linux") { 8 } else { 1 };
 /// 链式第二次等待期允许的空闲应用轮上限。
 ///
 /// 比第一次多 1：第一次回调本身占一轮（回调在 `on_frame` 之前派发，该轮 `FrameIndex` 不变），
@@ -62,9 +69,10 @@ const MAX_SECOND_IDLE_ROUNDS: u32 = 2;
 
 #[derive(Default)]
 struct Report {
-    /// `on_frame` 调用次数（泵轮数，含首帧收尾的合法帧）。
+    /// 应用轮数：`on_frame` 调用次数（含首帧收尾的合法补帧）。
     rounds: u32,
-    /// 「`on_frame` 被调用但 `FrameIndex` 没有推进」的累计轮数（按刷新率空转的判据）。
+    /// 应用轮中「`on_frame` 被调用但 `FrameIndex` 没有推进」的累计轮数（应用级空转判据；
+    /// **不是** OS 唤醒计数，见模块文档口径）。
     idle_rounds: u32,
     /// 上一次 `on_frame` 看到的 `FrameIndex`。
     last_frame_index: Option<u32>,
@@ -90,7 +98,7 @@ fn idle_rounds(report: &Arc<Mutex<Report>>) -> u32 {
     report.lock().expect("report lock").idle_rounds
 }
 
-/// 一次 `on_frame`（泵轮）的记账：总轮数 +「本帧有没有推进 FrameIndex」。
+/// 一次 `on_frame`（应用轮）的记账：总应用轮数 +「本帧有没有推进 FrameIndex」。
 fn note_round(report: &Arc<Mutex<Report>>, frame_index: u32) {
     let mut report = report.lock().expect("report lock");
     report.rounds = report.rounds.saturating_add(1);
@@ -245,7 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let report = report.lock().expect("report lock");
     println!(
-        "smoke: loop exited after {} rounds / {} idle rounds (task={}, failures={:?})",
+        "smoke: loop exited after {} app rounds / {} idle app rounds (task={}, failures={:?})",
         report.rounds, report.idle_rounds, report.first_task_ran, report.failures
     );
     let Some((registered_at, _, registered_idle, _)) = report.registered else {
@@ -267,9 +275,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first_idle_delta = first_idle.saturating_sub(registered_idle);
     let second_idle_delta = second_idle.saturating_sub(first_idle);
     println!(
-        "smoke: first fire +{first_wait:?} ({first_idle_delta} idle rounds after registration, \
-         frame_index {first_index}), second fire +{second_wait:?} ({second_idle_delta} idle \
-         rounds after the first, frame_index {second_index})"
+        "smoke: first fire +{first_wait:?} ({first_idle_delta} idle app rounds after \
+         registration, frame_index {first_index}), second fire +{second_wait:?} \
+         ({second_idle_delta} idle app rounds after the first, frame_index {second_index})"
     );
     if first_wait < Duration::from_millis(FIRST_DELAY_MS) {
         println!("smoke: FAIL first timer fired early: {first_wait:?} < {FIRST_DELAY_MS} ms");
@@ -277,19 +285,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if first_idle_delta > MAX_FIRST_IDLE_ROUNDS {
         println!(
-            "smoke: FAIL the pump ran {first_idle_delta} idle rounds during the wait (periodic \
-             wake?)"
+            "smoke: FAIL the application ran {first_idle_delta} idle app rounds during the wait \
+             (application-level periodic wake?; OS display-link vsync wake is a separate \
+             registered residual, not this metric)"
         );
         failed = true;
     }
     if second_idle_delta > MAX_SECOND_IDLE_ROUNDS {
-        println!("smoke: FAIL the pump ran {second_idle_delta} idle rounds during the second wait");
+        println!(
+            "smoke: FAIL the application ran {second_idle_delta} idle app rounds during the \
+             second wait"
+        );
         failed = true;
     }
     if failed {
         println!("smoke: FAIL {:?}", report.failures);
         std::process::exit(3);
     }
-    println!("smoke: PASS both one-shot timers woke the idle pump (no input, no periodic wake)");
+    println!(
+        "smoke: PASS both one-shot timers woke the idle pump (no input; idle app rounds ≤1 on \
+         macOS/Windows — Linux keeps its pre-existing startup rounds ≤8; OS display-link vsync \
+         wake ≤250 ms is a registered residual)"
+    );
     Ok(())
 }
