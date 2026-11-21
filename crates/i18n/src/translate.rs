@@ -18,6 +18,21 @@ use crate::{language::codes::LanguageCode, translator::types::I18n};
 /// handle is the replacement for the GPUI globals [`t!`](crate::t) reads: a renderer
 /// receives it as an argument instead of reaching into application state.
 ///
+/// # Thread affinity
+///
+/// The handle is neither `Send` nor `Sync`: it shares the catalogue through an `Rc` and
+/// the language through a `Cell`. It belongs to the UI thread that built it — clone it
+/// there, and never capture it in a future that requires `Send` (such as the engine's
+/// spawn). Work that runs elsewhere hands its result back to the UI thread, which renders
+/// it.
+///
+/// # Language
+///
+/// The selected language is pushed explicitly through [`Translate::set_language`]; the
+/// handle observes no signal and does not follow one by itself. A host that keeps the
+/// language in an engine signal must update this handle whenever it writes that signal:
+/// the two are kept in step by the composition root, not by the type system.
+///
 /// # Examples
 ///
 /// ```

@@ -2499,7 +2499,7 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 |---|---|---|---|---|
 | **P0 规格与门禁基座** | P0-1 | 本文 v2.1 回写（22+6 事实修正、§5.9、§1.3、E1–E6 规格、§6.8/§6.9/§6.10、§8.6、§9.2、§10.2） | 文档 diff + `design-changes.md` + 独立审查 | ✅ 已完成（本批；审查修复见台账）；v2.2 在 P1-E6 合入后回写 E1–E6 实现规格（§11） |
 | | P0-2 | `xtask gates`（`--platform win\|mac\|linux\|all --scope <crates> --step fast\|quick\|layer`；远端共享 target + 锁）；**不新增 CI** | `cargo xtask gates --help` + Windows fast + 两端 quick | ✅ 已完成（合入 `ee2a80f`；`xtask/src/gates.rs` + `gates/remote.rs`） |
-| | P0-3 | 基线确认（只读）：三端 fast/层末门禁、`widget_tokio_runtime` 42/43、`WIDGET_NOTICE_SOURCES`、`cargo test -p kytrix` | `.review/mig-baseline-*` 日志 + 台账 | ✅ 已完成（`assess/10-baseline.md`） |
+| | P0-3 | 基线确认（只读）：三端 fast/层末门禁、`widget_tokio_runtime` 42/43、`WIDGET_NOTICE_SOURCES`（P3-0 按 D4 删除、P3-3 按 registry ID 重建）、`cargo test -p kytrix` | `.review/mig-baseline-*` 日志 + 台账 | ✅ 已完成（`assess/10-baseline.md`） |
 | **P1 引擎扩展** | P1-E1 | 文本 shaping 公开面（§11.1） | L0/L1/L2 + Windows fast + 两端 quick | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
 | | P1-E2 | 富文本（§11.2；**D-03 已裁决必做**） | 同上 + golden 重建 + 合并点三端 layer | ✅ 已完成（P1 各批合入 `e1e4ff6`） |
 | | P1-E3 | 变高虚拟列表（§11.3） | 同上 | ✅ 已完成（P1 各批合入 `e1e4ff6`） |

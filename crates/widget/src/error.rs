@@ -47,6 +47,9 @@ use crate::{
 ///
 /// Widgets surface these strings directly, so every implementation must map the
 /// failure to a message key instead of formatting the `Display` text.
+///
+/// P3-1 deletes this trait and the GPUI globals it reads; new code implements
+/// [`TranslatedError`] instead.
 pub trait LocalizedError {
     fn localized_message(&self, cx: &App) -> SharedString;
 }
@@ -3391,11 +3394,25 @@ mod tests {
     /// length of that name.
     ///
     /// `t_smol!(` does not contain `t!(` (the `t` is followed by `_`), so each name is searched
-    /// for on its own and the earliest one wins.
+    /// for on its own and the earliest one wins. A match only counts where the name starts a
+    /// token: `t!(` is a substring of `assert!(` and `debug_assert!(` (and `t_smol!(` of any
+    /// name ending in `_t_smol`), so a match preceded by an identifier character is not an
+    /// invocation — reading a condition's message as a translation would fail the locale guard
+    /// on a key no mapping names.
     fn next_translation_call(source: &str) -> Option<(usize, usize)> {
         TRANSLATION_CALLS
             .iter()
-            .filter_map(|call| source.find(call).map(|offset| (offset, call.len())))
+            .flat_map(|call| {
+                source
+                    .match_indices(call)
+                    .filter(|(offset, _)| {
+                        !source[..*offset]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|previous| previous.is_alphanumeric() || previous == '_')
+                    })
+                    .map(|(offset, found)| (offset, found.len()))
+            })
             .min_by_key(|(offset, _)| *offset)
     }
 
@@ -3405,7 +3422,9 @@ mod tests {
     /// it: the keys a test writes for itself are not messages the interface renders. An
     /// invocation is written both on one line and one argument per line, so the literal is
     /// looked for after the context the macro is given rather than assumed to follow it on
-    /// the same line.
+    /// the same line. The context is whatever expression the call site hands the macro — a bare
+    /// translator or a path such as `services.translate` — which is also what
+    /// [`message_arguments`] accepts.
     fn message_keys(source: &str) -> Vec<String> {
         let production = production_source(source);
         let mut keys = Vec::new();
@@ -3441,6 +3460,11 @@ mod tests {
     /// where the first `#[cfg(test)]` would cut the mappings after an accessor a test drives
     /// short — and the invocations are read out of it rather than listed beside it, so an arm
     /// that binds a new argument is covered by the arm that binds it.
+    ///
+    /// The first argument is the context the macro renders through: any non-empty expression
+    /// resolves it — a bare `translate`, `&translate`, or the `services.translate` field path
+    /// a widget is handed. That is the same rule [`message_keys`] reads, so both readers
+    /// accept and skip the same call sites.
     fn message_arguments(source: &str) -> Vec<(String, Vec<String>)> {
         let production = production_source(source);
         let mut mappings = Vec::new();
@@ -3452,18 +3476,12 @@ mod tests {
             };
             rest = after;
             let arguments = top_level_arguments(body);
-            // The context the macro is given comes first, and it is a value rather than a
-            // literal: an invocation written without one is not a mapping of this module.
-            if arguments
-                .first()
-                .and_then(|context| bound_name(context))
-                .is_none()
-            {
+            // The context the macro is given comes first, and it is an expression rather than
+            // a literal: an invocation written without one is not a mapping of this module.
+            if arguments.len() < 2 || arguments[0].trim().is_empty() {
                 continue;
             }
-            let Some(key) = arguments.get(1).map(|key| key.trim().trim_matches('"')) else {
-                continue;
-            };
+            let key = arguments[1].trim().trim_matches('"');
             let bound = arguments[2..]
                 .iter()
                 .filter_map(|argument| bound_name(argument))
@@ -3524,6 +3542,58 @@ mod tests {
                 ("widget.panel.waiting".to_owned(), vec!["market".to_owned()]),
                 ("widget.panel.queued".to_owned(), vec!["market".to_owned()])
             ]
+        );
+    }
+
+    /// Both readers accept the context of a translation call as any expression — the bare
+    /// translator, a borrow of it, or the `services.translate` field path a widget is handed —
+    /// and neither reads an assertion's message as a translation.
+    ///
+    /// The key reader always took any expression as the context, but the placeholder reader
+    /// required a single identifier and skipped the field-path form: a `services.translate`
+    /// call site was checked by one guard and silently by neither placeholder check, so a
+    /// mapping could lose a placeholder with both guards green. The macro name was also
+    /// searched as a plain substring, which made `assert!(` and `debug_assert!(` read as
+    /// translation calls. Both cases are pinned here.
+    #[test]
+    fn both_readers_accept_any_translation_context_and_ignore_assertions() {
+        let source = concat!(
+            "fn label(cx: &App) -> SharedString {\n",
+            "    t!(cx, \"widget.panel.waiting\", market = joined_names(cx, &markets))\n",
+            "}\n",
+            "\n",
+            "fn caption(translate: &Translate) -> SmolStr {\n",
+            "    t_smol!(translate, \"widget.panel.queued\", market = markets)\n",
+            "}\n",
+            "\n",
+            "fn body(services: &WidgetServices) -> SmolStr {\n",
+            "    t_smol!(services.translate, \"widget.panel.queued\", market = markets)\n",
+            "}\n",
+            "\n",
+            "fn checked(ready: bool) -> bool {\n",
+            "    assert!(ready, \"widget.panel.unread\");\n",
+            "    debug_assert!(ready, \"widget.panel.unread\");\n",
+            "    ready\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            message_keys(source),
+            [
+                "widget.panel.waiting".to_owned(),
+                "widget.panel.queued".to_owned(),
+                "widget.panel.queued".to_owned()
+            ],
+            "the field-path context is read like the bare translator, and the assertions are not"
+        );
+        assert_eq!(
+            message_arguments(source),
+            [
+                ("widget.panel.waiting".to_owned(), vec!["market".to_owned()]),
+                ("widget.panel.queued".to_owned(), vec!["market".to_owned()]),
+                ("widget.panel.queued".to_owned(), vec!["market".to_owned()])
+            ],
+            "the placeholder reader accepts the field-path context instead of skipping it"
         );
     }
 

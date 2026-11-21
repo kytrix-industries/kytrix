@@ -11396,6 +11396,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "ui_core",
 ]
 
 [[package]]

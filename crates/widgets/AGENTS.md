@@ -774,9 +774,5 @@ cargo build -p kytrix
 - [ ] 没有持久化选项：不实现 `config()`；布局里那个 pane 的 `config` 是 `null`。
 - [ ] 测试覆盖：状态上报、有/无内容两种失败出口、迟到消息、恢复动作、容量与裁剪、取消与替换；有配置的还要覆盖
   「改动会写回」「不支持的项回默认并上报」「取不到数时不动」「订阅的是修正后的配置」。
-- [ ] 有 `Notice` 调用点（`Notice::message(..)` / `Notice::MarketNotLoaded { .. }`）的 widget，把它那个生产源文件加进
-  `crates/widget/src/error.rs` 的 `WIDGET_NOTICE_SOURCES`：这份清单是手写的（13 条），`include_str!` 只吃字面量，路径
-  写错就是编译错误；覆盖率守卫按 `production_source` 递归扫 `crates/widgets` 与清单双向核对（漏登与多登都会失败），
-  key 覆盖断言则要求扫出来的每个 key 在每种 locale 都定义且非空。
 
 文档或静态检查通过不等于性能已测量。未执行的在线、运行时 UI 与 release profile 验证必须明确说明。

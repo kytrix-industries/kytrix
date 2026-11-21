@@ -24,6 +24,7 @@ kytrix_service_provider.workspace = true
 market_participants_connector.workspace = true
 market_participants_model.workspace = true
 network.workspace = true
+ui_core.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
