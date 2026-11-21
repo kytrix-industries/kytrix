@@ -51,6 +51,14 @@
 //! - **多输入同窗的 IME 开关**：引擎的 `set_ime_enabled` 是**窗口级**状态。本模块只在
 //!   「本输入框失焦」时关闭、在聚焦时打开，因此同窗多个输入框时以**最后同步者**为准；外壳应
 //!   在焦点转移的那一轮按「先同步失焦者、后同步得焦者」调用 `sync`（或只同步聚焦控件）。
+//!
+//! # P2-3c 复核修复
+//!
+//! - **caret/选区画布用屏幕坐标**：`Window::text_caret_rect` 已含祖先滚动偏移（屏幕绝对坐标），
+//!   Canvas 图元的契约也是绝对坐标 —— 不再 `.translate(-scroll_x)` 重复减一次。
+//! - **程序化写值契约**：[`InputNode::update_value`] 走旧 `set_value` 语义（绕过 `readonly` /
+//!   `disabled`、清空撤销历史、光标到末尾），[`InputState::set_text`] 保持用户输入受限语义；
+//!   两者差异见 `kit-text.md` §4.2.13。
 
 use std::{
     ops::Range,
@@ -557,7 +565,8 @@ impl InputState {
         self.error = error;
     }
 
-    /// 程序化替换整个值（旧 `update_value` 的语义入口）。
+    /// 用户级替换整个值（旧 `replace_all` 的语义入口；程序化写值走
+    /// [`InputNode::update_value`]）。
     ///
     /// - 单行输入先清洗换行/制表符（与 [`InputState::insert`] 同一条规则）；
     /// - 超过 `max_length` 的值按字符裁剪，并写入 [`InputError::TooLong`]（**非法值错误语义**：
@@ -571,6 +580,11 @@ impl InputState {
         if spec.disabled || spec.readonly {
             return false;
         }
+        self.replace_text(spec, text)
+    }
+
+    /// [`InputState::set_text`] 的实际替换（调用方负责用户输入限制）。
+    fn replace_text(&mut self, spec: &InputSpec, text: &str) -> bool {
         let before = self.snapshot();
         let sanitized = clean_single_line(text, spec.multiline);
         let total = sanitized.chars().count();
@@ -1628,24 +1642,35 @@ impl InputNode {
         });
     }
 
-    /// 运行时更新值（旧 `update_value` 的替代；生产调用点在 P2-5 接线时直接换过来）。
+    /// 运行时写值（旧 `set_value` 的**程序化契约**；生产调用点在 P2-5 接线时直接换过来）。
     ///
-    /// 语义见 [`InputState::set_text`]：单行清洗、`max_length` 裁剪并置 [`InputError::TooLong`]、
-    /// 光标到末尾、取消组合、一步撤销；`readonly` / `disabled` 拒绝（`false`，状态不变）。
-    /// 改值会让 `Signal<InputState>` 失效并重绘（`bind_text` / `bind_a11y` 依赖它）。
+    /// 与用户级 [`InputState::set_text`] 的差别（对照旧 gpui-base `input/base/state.rs`）：
+    /// - **绕过 `readonly` / `disabled`**：这两种模式只拒绝**用户**编辑，程序化写值必须能更新
+    ///   （旧 `replace_text` 在 `with_edits_allowed` 里执行；旧测试
+    ///   `test_readonly_rejects_user_edits_only` 明确「程序化 API 不受只读限制」）；
+    /// - **清空撤销/重做历史**（旧 `undo_manager.clear()`）：程序化写值不可撤销；
+    /// - 单行清洗、`max_length` 裁剪并置 [`InputError::TooLong`]、取消组合、光标/选区落在末尾
+    ///   与 `set_text` 相同（旧 `reset_selection` 的单行分支也是末尾）。
+    ///
+    /// 与旧实现的两处已登记差异（kit-text §4.2.13）：旧 `set_value` 会把单行滚动复位到开头
+    /// （长值显示头部），本实现每帧 `sync` 都 reveal 光标 ⇒ 显示尾部；旧实现多行把选区复位成
+    /// `0..0`，本实现同样落在末尾（当前没有多行生产输入）。
+    ///
+    /// 返回正文/选区/错误态是否变化（清空历史本身不算变化，但状态仍会写回）。
     pub fn update_value(&self, app: &mut App, value: &str) -> bool {
-        if self.spec.disabled || self.spec.readonly {
-            return false;
-        }
-        let mut next = app.read(&self.state).clone();
-        if !next.set_text(&self.spec, value) {
+        let before = app.read(&self.state).clone();
+        let mut next = before.clone();
+        let changed = next.replace_text(&self.spec, value);
+        next.undo.clear();
+        next.redo.clear();
+        if next == before {
             return false;
         }
         app.write(&self.state, next);
         if let Some(window) = self.root.window() {
             let _ = app.request_repaint(window);
         }
-        true
+        changed
     }
 
     /// 运行时更新占位符（旧 `update_placeholder` 的替代）：写占位符信号并请求重绘。
@@ -1693,24 +1718,14 @@ impl InputNode {
             }
         }
         let scroll_changed = self.sync_horizontal_scroll(app, window, &next);
-        let scroll_x = self.scroll_x(app);
         let canvas = app
             .window(window)
-            .and_then(|window_ref| self.caret_canvas(window_ref, &next, scroll_x));
+            .and_then(|window_ref| self.caret_canvas(window_ref, &next));
         if state_changed {
             app.write(&self.state, next);
         }
         let canvas_changed = canvas.is_some_and(|canvas| self.apply_canvas(app, window, canvas));
         state_changed || scroll_changed || canvas_changed
-    }
-
-    /// 当前单行水平滚动偏移（多行/未登记滚动容器 = 0）。
-    fn scroll_x(&self, app: &App) -> f32 {
-        self.scroll
-            .get()
-            .copied()
-            .and_then(|handle| app.scroll_state(&handle))
-            .map_or(0.0, |state| state.offset.x)
     }
 
     /// 单行 caret 可见性滚动：把文本内容宽 + 当前 caret 的几何交给引擎横向滚动容器。
@@ -1825,19 +1840,19 @@ impl InputNode {
 
     /// 构造当前帧的 caret + 选区画布（`None` = 文本尚未 shape，保留旧画布）。
     ///
-    /// `scroll_x` 是单行水平滚动偏移：`Window::text_caret_rect` 给的是布局坐标（内容空间），
-    /// 实际绘制要减去滚动偏移；根节点的 `overflow_hidden` 负责把超出的部分裁掉。
-    fn caret_canvas(&self, window: &Window, state: &InputState, scroll_x: f32) -> Option<Canvas> {
+    /// 坐标：Canvas 图元是**窗口绝对（屏幕）坐标**，`paint/canvas.rs` 的契约也这么写。因此：
+    /// - caret 直接用 [`Window::text_caret_rect`]（引擎已补上节点原点、内容偏移与祖先滚动偏移）；
+    /// - 选区矩形来自 `NodeTree::text_selection_rects`（文本盒**局部**坐标），补上「窗口绝对 −
+    ///   局部」的原点差即得屏幕坐标——这个差里已经包含滚动偏移。
+    ///
+    /// 单行水平滚动**不要**在这里再减一次 `scroll.offset.x`：引擎给的已经是屏幕坐标。
+    fn caret_canvas(&self, window: &Window, state: &InputState) -> Option<Canvas> {
         if !window.focus().is_focused(self.root) {
             return Some(Canvas::new(Rect::default()));
         }
         let masked = self.spec.masked;
-        let shift = Point::new(-scroll_x, 0.0);
         let caret_byte = state.display_caret_byte(masked);
-        let caret_rect = window
-            .text_caret_rect(self.text, caret_byte)
-            .ok()?
-            .translate(shift);
+        let caret_rect = window.text_caret_rect(self.text, caret_byte).ok()?;
         // 选区矩形是文本盒局部坐标；`Window::text_caret_rect` 是窗口绝对坐标。两者在字节 0
         // 处的差就是「节点原点 + 内容偏移 + 祖先滚动偏移」。
         let local_zero = window.tree().text_caret_rect(self.text, 0).ok()?;
@@ -1855,7 +1870,7 @@ impl InputNode {
                 .ok()?;
             for rect in rects {
                 quads.push(Quad {
-                    bounds: rect.translate(origin).translate(shift),
+                    bounds: rect.translate(origin),
                     corner_radius: [0.0; 4],
                     paint: QuadPaint::Solid {
                         fill: self.selection_color,
@@ -3277,30 +3292,131 @@ mod tests {
         );
         let viewport = harness.node.viewport.expect("单行视口");
         let viewport_bounds = harness.app.probe().bounds(viewport).expect("视口布局");
+        // `Window::text_caret_rect` 已经是屏幕坐标（含滚动偏移），直接和视口的屏幕矩形比。
         let caret = harness
             .window_ref()
             .text_caret_rect(harness.node.text, 200)
             .expect("caret 几何");
-        let caret_screen_right = caret.origin.x - scroll.offset.x + caret.size.width;
         assert!(
-            caret_screen_right <= viewport_bounds.origin.x + viewport_bounds.size.width + 1.0,
-            "滚动后 caret 必须落在视口内：caret 右缘 {caret_screen_right}，视口右缘 {}",
+            caret.origin.x >= viewport_bounds.origin.x - 0.5,
+            "滚动不得把 caret 推到视口左侧之外：caret={}，视口左缘={}",
+            caret.origin.x,
+            viewport_bounds.origin.x
+        );
+        assert!(
+            caret.origin.x <= viewport_bounds.origin.x + viewport_bounds.size.width + 0.5,
+            "滚动后 caret 必须落在视口内：caret={}，视口右缘={}",
+            caret.origin.x,
             viewport_bounds.origin.x + viewport_bounds.size.width
         );
+        // Canvas 图元是绝对屏幕坐标：caret quad 必须与引擎的屏幕 caret 矩形同源，不能再减滚动偏移。
+        let caret_quad = harness
+            .caret_quads()
+            .last()
+            .copied()
+            .expect("caret 画布至少有一个 quad");
         assert!(
-            caret.origin.x - scroll.offset.x >= viewport_bounds.origin.x - 1.0,
-            "滚动不得把 caret 推到视口左侧之外"
+            (caret_quad.origin.x - caret.origin.x).abs() <= 0.5
+                && (caret_quad.origin.y - caret.origin.y).abs() <= 0.5,
+            "滚动后 caret 画布必须等于引擎屏幕坐标：quad={caret_quad:?}，caret={caret:?}，offset={:?}",
+            scroll.offset
         );
-        // 渲染偏移：caret Canvas 的 quad 必须同样减去滚动偏移（否则光标画在框外）。
+    }
+
+    /// 滚动后的 caret 与选区画布都用**屏幕坐标**（不能再减一次滚动偏移）。
+    ///
+    /// 真值：`Window::text_caret_rect`（caret）与 `text_selection_rects` + 「绝对 − 局部」原点
+    /// （选区）。回归症状：旧实现再 `.translate(-scroll_x)` 一次，quad 被画到视口外。
+    #[test]
+    fn scrolled_caret_and_selection_canvases_use_screen_coordinates() {
+        let mut harness = harness(spec(), state(&"a".repeat(200)));
+        harness.focus();
+        let mut state = harness.state();
+        state.set_caret(120, false);
+        state.set_caret(140, true);
+        harness.write_state(state);
+        for _ in 0..3 {
+            harness.sync();
+            harness.drain();
+        }
+        let handle = harness
+            .scroll_handle()
+            .expect("单行输入必须登记横向滚动容器");
+        let scroll = harness
+            .app
+            .app()
+            .scroll_state(&handle)
+            .expect("滚动容器状态");
+        assert!(
+            scroll.offset.x > 0.0,
+            "选区末端在视口外，必须横向滚动才看得见：{:?}",
+            scroll.offset
+        );
+        let viewport = harness.node.viewport.expect("单行视口");
+        let viewport_bounds = harness.app.probe().bounds(viewport).expect("视口布局");
+        let caret = harness
+            .window_ref()
+            .text_caret_rect(harness.node.text, 140)
+            .expect("caret 几何");
+        assert!(
+            caret.origin.x >= viewport_bounds.origin.x - 0.5
+                && caret.origin.x + caret.size.width
+                    <= viewport_bounds.origin.x + viewport_bounds.size.width + 0.5,
+            "滚动后 caret 必须完整落在视口内：caret={caret:?}，视口={viewport_bounds:?}"
+        );
+
+        let window_ref = harness.window_ref();
+        let local_zero = window_ref
+            .tree()
+            .text_caret_rect(harness.node.text, 0)
+            .expect("局部原点");
+        let absolute_zero = window_ref
+            .text_caret_rect(harness.node.text, 0)
+            .expect("屏幕原点");
+        let origin = Point::new(
+            absolute_zero.origin.x - local_zero.origin.x,
+            absolute_zero.origin.y - local_zero.origin.y,
+        );
+        let expected_selection = window_ref
+            .tree()
+            .text_selection_rects(harness.node.text, 120, 140)
+            .expect("选区矩形");
+        assert!(
+            !expected_selection.is_empty(),
+            "140 字节的选区至少要有一个矩形"
+        );
+
         let quads = harness.caret_quads();
-        let caret_quad = quads.last().expect("caret 画布至少有一个 quad");
-        assert!(
-            (caret_quad.origin.x - (caret.origin.x - scroll.offset.x)).abs() < 1.0,
-            "caret 画布的 x 必须 = 布局坐标 - 滚动偏移：quad={}，布局={}，offset={}",
-            caret_quad.origin.x,
-            caret.origin.x,
-            scroll.offset.x
+        assert_eq!(
+            quads.len(),
+            expected_selection.len() + 1,
+            "选区矩形 + caret：{quads:?}"
         );
+        let caret_quad = *quads.last().expect("caret quad");
+        assert!(
+            (caret_quad.origin.x - caret.origin.x).abs() <= 0.5
+                && (caret_quad.origin.y - caret.origin.y).abs() <= 0.5,
+            "caret quad 必须是屏幕坐标：quad={caret_quad:?}，caret={caret:?}，offset={:?}",
+            scroll.offset
+        );
+        for (quad, rect) in quads[..quads.len() - 1]
+            .iter()
+            .zip(expected_selection.iter())
+        {
+            let expected = rect.translate(origin);
+            assert!(
+                (quad.origin.x - expected.origin.x).abs() <= 0.5
+                    && (quad.origin.y - expected.origin.y).abs() <= 0.5
+                    && (quad.size.width - expected.size.width).abs() <= 0.5
+                    && (quad.size.height - expected.size.height).abs() <= 0.5,
+                "选区 quad 必须是局部矩形 + 屏幕原点：quad={quad:?}，expected={expected:?}"
+            );
+            assert!(
+                quad.origin.x >= viewport_bounds.origin.x - 0.5
+                    && quad.origin.x <= viewport_bounds.origin.x + viewport_bounds.size.width,
+                "滚动后选区高亮的左缘必须在视口内（不能被裁到视口外）：quad={quad:?}，视口={viewport_bounds:?}"
+            );
+        }
     }
 
     #[test]
@@ -3495,7 +3611,7 @@ mod tests {
         );
     }
 
-    // ── P2-3b：InputSpec 运行时更新（M7）───────────────────────────────────
+    // ── P2-3c：InputSpec 运行时更新（M7 程序化契约）────────────────────────
 
     #[test]
     fn update_value_rewrites_the_signal_and_reports_invalid_values() {
@@ -3508,6 +3624,11 @@ mod tests {
         );
         assert!(harness.node.update_value(harness.app.app_mut(), "new"));
         assert_eq!(harness.state().text(), "new");
+        assert_eq!(harness.state().caret(), 3, "程序化写值后光标在末尾");
+        assert!(
+            harness.state().selection().is_empty(),
+            "程序化写值后没有选区"
+        );
         harness.drain();
         assert_eq!(
             harness.node_text(harness.node.text),
@@ -3533,26 +3654,71 @@ mod tests {
         assert_eq!(harness.state().error(), None, "合法值清空错误态");
     }
 
+    /// 旧 `set_value` 契约：`readonly` / `disabled` 只拒绝**用户**编辑，程序化写值必须能更新
+    /// （旧 gpui-base `test_readonly_rejects_user_edits_only` + `with_edits_allowed`）。
     #[test]
-    fn update_value_respects_readonly_and_disabled() {
-        let mut harness = harness(
+    fn update_value_bypasses_readonly_and_disabled() {
+        let mut readonly = harness(
             InputSpec {
                 readonly: true,
                 ..spec()
             },
             state("locked"),
         );
-        assert!(!harness.node.update_value(harness.app.app_mut(), "changed"));
-        assert_eq!(harness.state().text(), "locked");
-        let mut harness = self::harness(
+        assert!(
+            readonly
+                .node
+                .update_value(readonly.app.app_mut(), "changed")
+        );
+        assert_eq!(readonly.state().text(), "changed");
+        readonly.drain();
+        assert_eq!(readonly.node_text(readonly.node.text), "changed");
+
+        let mut disabled = harness(
             InputSpec {
                 disabled: true,
                 ..spec()
             },
             state("locked"),
         );
-        assert!(!harness.node.update_value(harness.app.app_mut(), "changed"));
-        assert_eq!(harness.state().text(), "locked");
+        assert!(
+            disabled
+                .node
+                .update_value(disabled.app.app_mut(), "changed")
+        );
+        assert_eq!(disabled.state().text(), "changed");
+
+        // 用户级入口保持受限语义（`set_text` 不绕过 readonly/disabled）。
+        let mut state = state("locked");
+        let readonly_spec = InputSpec {
+            readonly: true,
+            ..spec()
+        };
+        assert!(!state.set_text(&readonly_spec, "changed"));
+        assert!(!state.insert(&readonly_spec, "x"));
+        let disabled_spec = InputSpec {
+            disabled: true,
+            ..spec()
+        };
+        assert!(!state.set_text(&disabled_spec, "changed"));
+        assert_eq!(state.text(), "locked");
+    }
+
+    /// 程序化写值清空撤销/重做历史（旧 `set_value` 的 `undo_manager.clear()`）。
+    #[test]
+    fn update_value_clears_the_undo_history() {
+        let mut harness = harness(spec(), state(""));
+        harness.focus();
+        harness.type_text("a");
+        harness.drain();
+        assert!(harness.state().can_undo(), "用户编辑进入撤销历史");
+        assert!(harness.node.update_value(harness.app.app_mut(), "reset"));
+        assert_eq!(harness.state().text(), "reset");
+        assert!(!harness.state().can_undo(), "程序化写值必须清空撤销历史");
+        assert!(!harness.state().can_redo(), "重做历史同样清空");
+        let mut after = harness.state();
+        assert!(!after.undo(), "程序化写值不可撤销");
+        assert_eq!(after.text(), "reset");
     }
 
     #[test]

@@ -354,18 +354,33 @@ impl BuildCtx<'_> {
         index
     }
 
-    /// 一列块：块间距由"上一块是不是空行"决定（与旧 `MarkdownState::render` 同一规则）。
+    /// 一列块：块间距与旧 `MarkdownState::render` 同一规则。
     ///
-    /// 空行本身不占间距（它自己画一行空行），但**标题的额外上间距与空行无关**：旧实现里空行
-    /// 之后的非首块标题仍然拿 `BLOCK_GAP + HEADING_SPACE_ABOVE`，这里保持一致。
+    /// - 空行自己就是间距：空行两侧**不再**叠 `BLOCK_GAP`（`previous_blank` 抑制）；
+    /// - 非空行相邻的两块留 `BLOCK_GAP`；
+    /// - 非首块的标题在以上间距之上**再加** `HEADING_SPACE_ABOVE`——空行之后也是 +8，
+    ///   与旧实现一致（空行不吞标题的额外上间距，也不额外放大段落间距）。
+    ///
+    /// `index` 是枚举下标（含空行，只用于空行节点 id 的稳定性）；首/非首看的是**非空块**计数。
     fn build_blocks(&mut self, tree: &mut NodeTree, parent: NodeId, blocks: &[MarkdownBlock]) {
+        let mut previous_blank = false;
+        let mut block_index = 0usize;
         for (index, block) in blocks.iter().enumerate() {
-            let gap = match block {
-                MarkdownBlock::BlankLine => 0.0,
-                _ if index == 0 => 0.0,
-                MarkdownBlock::Heading { .. } => BLOCK_GAP + HEADING_SPACE_ABOVE,
-                _ => BLOCK_GAP,
+            if matches!(block, MarkdownBlock::BlankLine) {
+                self.build_block(tree, parent, block, 0.0, index);
+                previous_blank = true;
+                continue;
+            }
+            let mut gap = if block_index > 0 && !previous_blank {
+                BLOCK_GAP
+            } else {
+                0.0
             };
+            if block_index > 0 && matches!(block, MarkdownBlock::Heading { .. }) {
+                gap += HEADING_SPACE_ABOVE;
+            }
+            block_index += 1;
+            previous_blank = false;
             self.build_block(tree, parent, block, gap, index);
         }
     }
@@ -1097,10 +1112,11 @@ mod tests {
         assert_eq!(by_id, handles.root);
     }
 
-    /// 空行之后的非首块标题仍然拿到额外上间距（旧实现语义；P2-3 审查 M4 的回归）。
+    /// 间距规则（旧 `MarkdownState::render` 语义；P2-3 复核 M4）。
     ///
-    /// 几何：空白行 wrapper 自己高度 = 一行；标题的 `margin_top` 必须是
-    /// `BLOCK_GAP + HEADING_SPACE_ABOVE`，而普通段落只有 `BLOCK_GAP` —— 空行不吞掉标题的额外间距。
+    /// 空行自己就是间距，两侧**不再叠** `BLOCK_GAP`；非首块标题在之上再加
+    /// `HEADING_SPACE_ABOVE`。因此空行之后：段落 +0、标题 +8（不是 8/16）。
+    /// 源码里没有空行的相邻块保留 `BLOCK_GAP`：段落 +8、标题 +16。
     #[test]
     fn a_heading_after_a_blank_line_keeps_the_extra_space_above_it() {
         let heading = || MarkdownBlock::Heading {
@@ -1129,10 +1145,9 @@ mod tests {
         );
         let heading_gap = second.origin.y - (blank_bounds.origin.y + blank_bounds.size.height);
         assert!(
-            (heading_gap - (super::BLOCK_GAP + super::HEADING_SPACE_ABOVE)).abs() < 0.01,
-            "空行后标题的上间距 = {}，期望 {}",
-            heading_gap,
-            super::BLOCK_GAP + super::HEADING_SPACE_ABOVE
+            (heading_gap - super::HEADING_SPACE_ABOVE).abs() < 0.01,
+            "空行后标题的上间距 = {heading_gap}，期望 {}（空行抑制 BLOCK_GAP，只留标题额外间距）",
+            super::HEADING_SPACE_ABOVE
         );
 
         let paragraph_doc = document(vec![
@@ -1157,13 +1172,51 @@ mod tests {
         let body_gap =
             body.origin.y - (paragraph_blank_bounds.origin.y + paragraph_blank_bounds.size.height);
         assert!(
-            (body_gap - super::BLOCK_GAP).abs() < 0.01,
-            "空行后普通段落的上间距 = {body_gap}，期望 {}",
-            super::BLOCK_GAP
+            body_gap.abs() < 0.01,
+            "空行后普通段落的上间距 = {body_gap}，期望 0（空行自己就是间距）"
         );
         assert!(
             heading_gap > body_gap,
             "标题的额外上间距必须大于普通段落：{heading_gap} vs {body_gap}"
+        );
+
+        // 无空行的相邻块：BLOCK_GAP 仍然生效。
+        let adjacent_heading = document(vec![heading(), paragraph(vec![text("Body")])]);
+        let adjacent_view = MarkdownView::new(adjacent_heading, style());
+        let (adjacent_app, adjacent_handles) = mount(&adjacent_view);
+        let heading_bounds = adjacent_app
+            .probe()
+            .bounds(adjacent_handles.text_blocks[0].node)
+            .expect("标题");
+        let body_bounds = adjacent_app
+            .probe()
+            .bounds(adjacent_handles.text_blocks[1].node)
+            .expect("正文");
+        let gap_after_heading =
+            body_bounds.origin.y - (heading_bounds.origin.y + heading_bounds.size.height);
+        assert!(
+            (gap_after_heading - super::BLOCK_GAP).abs() < 0.01,
+            "无空行时段落上间距 = {gap_after_heading}，期望 {}",
+            super::BLOCK_GAP
+        );
+
+        let adjacent_paragraph = document(vec![paragraph(vec![text("Intro")]), heading()]);
+        let paragraph_view = MarkdownView::new(adjacent_paragraph, style());
+        let (paragraph_app, paragraph_handles) = mount(&paragraph_view);
+        let intro_bounds = paragraph_app
+            .probe()
+            .bounds(paragraph_handles.text_blocks[0].node)
+            .expect("段落");
+        let heading_bounds = paragraph_app
+            .probe()
+            .bounds(paragraph_handles.text_blocks[1].node)
+            .expect("标题");
+        let gap_after_paragraph =
+            heading_bounds.origin.y - (intro_bounds.origin.y + intro_bounds.size.height);
+        assert!(
+            (gap_after_paragraph - (super::BLOCK_GAP + super::HEADING_SPACE_ABOVE)).abs() < 0.01,
+            "无空行时标题上间距 = {gap_after_paragraph}，期望 {}",
+            super::BLOCK_GAP + super::HEADING_SPACE_ABOVE
         );
     }
 }
