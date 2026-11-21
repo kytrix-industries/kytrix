@@ -78,6 +78,13 @@ pub(crate) fn make_virtual_list(
 /// `set_virtual_extents` 里改变；应用随后应调用 `set_virtual_extents` 提供新高度）。
 /// 回落时**已挂载行同步按 `extent` 重排**，不会把旧逐项布局的 top/height 留到中间帧。
 ///
+/// **条目数变化同时是 a11y 集合语义的失效点（E9c）**：`row_count` / `row_index` /
+/// `pos_in_set` / `size_of_set` 都是 a11y 交付时按 `slot.count` 与行窗口基址现算的，而写点只
+/// 标行窗口自己（增量笔会带上物理祖先链，但集合根下的兄弟分支 —— 表头行/单元格 —— 不会重发）。
+/// 因此 count 真的变化时，从窗口向上找最近的声明集合根（`Table` / `Grid` / `Tree`），把它的整棵
+/// 子树标 `A11Y`：下一次增量交付按新 count 重建派生字段，且不做全树重建、不产生像素工作。
+/// 无集合根（裸虚拟列表）维持原行为，只标窗口节点。
+///
 /// # Errors
 /// `NotVirtualList`（未 `make_virtual_list`）。
 /// 消费者：`App::set_virtual_items`。
@@ -97,6 +104,7 @@ pub(crate) fn set_virtual_items(
         return Err(EngineError::NotVirtualList { node });
     };
     let old_count = slot.count;
+    let count_changed = count != old_count;
     let Some(scroll_slot) = target.tree().scroll_slot(node) else {
         return Err(EngineError::NotVirtualList { node });
     };
@@ -129,7 +137,15 @@ pub(crate) fn set_virtual_items(
         }
         slot.builder = Some(Box::new(build));
         let content = virtual_list::content_height(slot);
-        target.tree_mut().mark_a11y(node);
+        let tree = target.tree_mut();
+        tree.mark_a11y(node);
+        // E9c：count 变化 ⇒ 集合派生字段整体失效。只标窗口节点不够：增量笔只补物理祖先链，
+        // 集合根下的兄弟分支（表头行/单元格）不会重进本笔，AT 会继续读旧 `row_count`。
+        if count_changed
+            && let Some(root) = crate::a11y::tree::nearest_collection_ancestor(tree, node)
+        {
+            tree.mark_subtree_a11y(root);
+        }
         if anchored.is_some()
             && let Some(scroll) = target.tree_mut().scroll_slot_mut(node)
         {
@@ -1052,5 +1068,345 @@ mod tests {
             Err(EngineError::InvalidVirtualExtent { index: 1, .. }) => {}
             other => panic!("预置高度非法必须是 InvalidVirtualExtent：{other:?}"),
         }
+    }
+
+    // ── E9c：count 变化 ⇒ 集合 a11y 派生字段失效 ─────────────────────────────
+
+    /// E9c 夹具：`Table → 表头行 → 列头` + `Table → 虚拟行窗口`，外加 20 个无关填充节点
+    /// （证明「count 变化只重发集合子树」而不是整棵树）。
+    #[cfg(feature = "test-support")]
+    struct TableFixture {
+        _runtime: tokio::runtime::Runtime,
+        app: App,
+        window: WindowId,
+        table: NodeId,
+        header_row: NodeId,
+        header_cell: NodeId,
+        viewport: NodeId,
+        list: VirtualList,
+        fillers: Vec<NodeId>,
+    }
+
+    #[cfg(feature = "test-support")]
+    fn table_fixture() -> TableFixture {
+        use crate::a11y::{A11yOverride, A11yRole};
+
+        fn fixed_style(width: f32, height: f32) -> Style {
+            let mut style = Style::default();
+            style.inner.size = taffy::geometry::Size {
+                width: taffy::style::Dimension::length(width),
+                height: taffy::style::Dimension::length(height),
+            };
+            style
+        }
+        fn role(role: A11yRole) -> A11yOverride {
+            A11yOverride {
+                role: Some(role),
+                ..A11yOverride::default()
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: "e9c".into(),
+            size: Size::new(400.0, 300.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("window").tree().root();
+        let (table, header_row, header_cell, viewport, fillers) = {
+            let tree = app.window_mut(window).expect("window").tree_mut();
+            let mut table_style = fixed_style(200.0, 200.0);
+            table_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+            let table = NodeBuilder::boxed()
+                .a11y(role(A11yRole::Table))
+                .style(table_style)
+                .build(tree, root)
+                .expect("table");
+            let header_box = NodeBuilder::boxed()
+                .style(fixed_style(200.0, 20.0))
+                .build(tree, table)
+                .expect("header box");
+            let header_row = NodeBuilder::boxed()
+                .a11y(role(A11yRole::Row))
+                .style(fixed_style(200.0, 20.0))
+                .build(tree, header_box)
+                .expect("header row");
+            let header_cell = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::ColumnHeader),
+                    label: Some(smol_str::SmolStr::new_static("价格")),
+                    ..A11yOverride::default()
+                })
+                .style(fixed_style(100.0, 20.0))
+                .build(tree, header_row)
+                .expect("header cell");
+            let mut viewport_style = fixed_style(200.0, 60.0);
+            viewport_style.inner.position = taffy::style::Position::Relative;
+            viewport_style.clip = Clip::Bounds;
+            let viewport = NodeBuilder::boxed()
+                .style(viewport_style)
+                .build(tree, table)
+                .expect("viewport");
+            let fillers = (0..20)
+                .map(|index| {
+                    NodeBuilder::boxed()
+                        .layout_override(Rect::new(0.0, 240.0 + index as f32 * 2.0, 10.0, 2.0))
+                        .build(tree, root)
+                        .expect("filler")
+                })
+                .collect();
+            (table, header_row, header_cell, viewport, fillers)
+        };
+        frame(&mut app, window);
+        let list = app
+            .make_virtual_list(
+                window,
+                viewport,
+                VirtualListConfig {
+                    extent: 20.0,
+                    overscan: 0,
+                    extents: None,
+                },
+            )
+            .expect("virtual list");
+        app.set_virtual_items(&list, 2, row_item_builder)
+            .expect("items");
+        frame(&mut app, window);
+        TableFixture {
+            _runtime: runtime,
+            app,
+            window,
+            table,
+            header_row,
+            header_cell,
+            viewport,
+            list,
+            fillers,
+        }
+    }
+
+    /// 数据行工厂：声明 `Row`，让虚拟行窗口被表格索引识别为**行窗口**（而不是普通包裹层）。
+    #[cfg(feature = "test-support")]
+    fn row_item_builder(index: usize) -> NodeBuilder {
+        NodeBuilder::boxed()
+            .id(format!("row{index}"))
+            .a11y(crate::a11y::A11yOverride {
+                role: Some(crate::a11y::A11yRole::Row),
+                ..crate::a11y::A11yOverride::default()
+            })
+    }
+
+    /// 取干全部 a11y 交付（分批首树也一次取完）。
+    #[cfg(feature = "test-support")]
+    fn take_a11y(app: &mut App, window: WindowId) -> Vec<crate::a11y::A11yTreeSnapshot> {
+        let mut batches = Vec::new();
+        while let Some(snapshot) = app.a11y_take(window) {
+            batches.push(snapshot);
+        }
+        batches
+    }
+
+    #[cfg(feature = "test-support")]
+    fn a11y_record(
+        batches: &[crate::a11y::A11yTreeSnapshot],
+        node: NodeId,
+    ) -> Option<&crate::a11y::A11yNode> {
+        batches.iter().find_map(|snapshot| snapshot.node_for(node))
+    }
+
+    /// E9c：`set_virtual_items` 的条目数变化必须把**集合根以下整棵 a11y 子树**标脏。
+    ///
+    /// 表头行/单元格的 `row_count` 由引擎按 `slot.count` 推导，但它们不在行窗口的物理祖先链上：
+    /// 修复前增量笔只带窗口 + 祖先 ⇒ 表头行永远停在旧总数（P2-2e 审查 §4.2 独立复现）。
+    /// 断言：count 2→10 后增量笔里表头行/单元格 `row_count = 11`、集合容器 `size_of_set = 10`、
+    /// 新挂载数据行 `row_index` 含表头偏移；逐笔 `ShadowTree` 契约（含父唯一）；不出现全树笔、
+    /// 无关填充子树不被重发。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn count_change_marks_the_collection_subtree_a11y_dirty() {
+        use crate::{
+            a11y::adapter::to_tree_update,
+            test_support::a11y::{ShadowTree, assert_contract_holds},
+        };
+
+        let TableFixture {
+            _runtime,
+            mut app,
+            window,
+            table,
+            header_row,
+            header_cell,
+            viewport,
+            list,
+            fillers,
+        } = table_fixture();
+
+        let mut shadow = ShadowTree::new();
+        let full = take_a11y(&mut app, window);
+        assert!(
+            full.first().is_some_and(|snapshot| snapshot.full),
+            "首笔必须是全树"
+        );
+        for snapshot in &full {
+            assert_contract_holds(&mut shadow, &to_tree_update(snapshot));
+        }
+        assert_eq!(
+            a11y_record(&full, header_row).expect("表头行").row_count,
+            Some(3),
+            "1 表头行 + 2 条目"
+        );
+        assert_eq!(
+            a11y_record(&full, header_cell)
+                .expect("表头单元格")
+                .row_count,
+            Some(3),
+            "表头单元格的行数同样来自集合推导"
+        );
+        assert_eq!(a11y_record(&full, table).expect("表").row_count, Some(3));
+        assert_eq!(
+            a11y_record(&full, viewport).expect("行窗口").size_of_set,
+            Some(2),
+            "集合容器的 size_of_set = slot.count"
+        );
+
+        // 2 → 10：集合派生字段整体失效；只产增量笔（不全树重建、不重发无关填充子树）。
+        let requests = app.frame_requests();
+        app.set_virtual_items(&list, 10, row_item_builder)
+            .expect("items");
+        assert!(app.frame_requests() > requests, "条目数变化必须唤醒一帧");
+        frame(&mut app, window);
+        let incremental = take_a11y(&mut app, window);
+        assert!(!incremental.is_empty(), "条目数变化必须产出 a11y 交付");
+        assert!(
+            incremental.iter().all(|snapshot| !snapshot.full),
+            "count 变化只该产生增量笔，不得全树重建"
+        );
+        for snapshot in &incremental {
+            assert_contract_holds(&mut shadow, &to_tree_update(snapshot));
+        }
+
+        assert_eq!(
+            a11y_record(&incremental, header_row)
+                .expect("表头行必须重进增量笔（集合子树脏标记）")
+                .row_count,
+            Some(11),
+            "1 表头行 + 10 条目"
+        );
+        assert_eq!(
+            a11y_record(&incremental, header_cell)
+                .expect("表头单元格必须重进增量笔")
+                .row_count,
+            Some(11)
+        );
+        assert_eq!(
+            a11y_record(&incremental, table).expect("表").row_count,
+            Some(11)
+        );
+        assert_eq!(
+            a11y_record(&incremental, viewport)
+                .expect("行窗口")
+                .size_of_set,
+            Some(10)
+        );
+
+        let tree_len = app.window(window).expect("window").tree().len();
+        let delivered: usize = incremental
+            .iter()
+            .map(|snapshot| snapshot.nodes.len())
+            .sum();
+        assert!(
+            delivered < tree_len,
+            "增量笔不得退化为全树：重发 {delivered} / 共 {tree_len}"
+        );
+        assert!(
+            fillers
+                .iter()
+                .all(|filler| a11y_record(&incremental, *filler).is_none()),
+            "无关填充子树不得被重发"
+        );
+
+        // 新挂载的数据行：逻辑行号 = 表头 1 + 条目下标；总数 = 11。
+        let (index, row) = mounted_rows(&app, window, &list)
+            .into_iter()
+            .find(|(index, _)| *index == 2)
+            .expect("count=10、视口 60/行高 20 ⇒ 挂载第 0..3 行");
+        let record = a11y_record(&incremental, row).expect("新挂载行必须进增量笔");
+        assert_eq!(
+            record.row_index,
+            Some(1 + index),
+            "数据行逻辑行号含表头偏移"
+        );
+        assert_eq!(record.row_count, Some(11));
+    }
+
+    /// E9c 回归（I3 + 最小脏集）：条目数不变时既不唤醒帧，也不把集合子树标脏 —— 只有窗口
+    /// 节点自身按既有语义重发一次（`size_of_set` 等直接落在窗口节点上的字段）。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn an_unchanged_count_keeps_the_collection_a11y_dirty_set_minimal() {
+        let TableFixture {
+            _runtime,
+            mut app,
+            window,
+            header_row,
+            viewport,
+            list,
+            ..
+        } = table_fixture();
+        let _ = take_a11y(&mut app, window);
+        assert!(
+            take_a11y(&mut app, window).is_empty(),
+            "交付后不得残留 a11y 工作"
+        );
+
+        let requests = app.frame_requests();
+        app.set_virtual_items(&list, 2, row_item_builder)
+            .expect("items");
+        assert_eq!(app.frame_requests(), requests, "条目数不变 ⇒ 不出帧（I3）");
+
+        let incremental = take_a11y(&mut app, window);
+        assert!(
+            !incremental.is_empty(),
+            "窗口节点自身仍会标 A11Y（既有语义）"
+        );
+        assert!(incremental.iter().all(|snapshot| !snapshot.full));
+        assert!(
+            a11y_record(&incremental, header_row).is_none(),
+            "条目数不变不得把集合子树标脏"
+        );
+        assert_eq!(
+            a11y_record(&incremental, viewport)
+                .expect("窗口节点")
+                .size_of_set,
+            Some(2)
+        );
+    }
+
+    /// E9c：没有声明集合根（裸虚拟列表）时维持原行为 —— 只标窗口节点 + 新挂载行，不整树标脏。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn count_change_without_a_collection_root_does_not_dirty_the_whole_tree() {
+        let (_runtime, mut app, window, _container, list) = fixture(20.0, 0, None);
+        set_items(&mut app, &list, 2);
+        frame(&mut app, window);
+        let _ = take_a11y(&mut app, window);
+
+        set_items(&mut app, &list, 10);
+        frame(&mut app, window);
+        let incremental = take_a11y(&mut app, window);
+        assert!(!incremental.is_empty());
+        let tree_len = app.window(window).expect("window").tree().len();
+        let delivered: usize = incremental
+            .iter()
+            .map(|snapshot| snapshot.nodes.len())
+            .sum();
+        assert!(
+            delivered <= 6,
+            "裸列表只标窗口 + 新挂载行，不得整树标脏（重发 {delivered} / 共 {tree_len}）"
+        );
     }
 }

@@ -700,6 +700,17 @@ fn nearest_ancestor_where(
     None
 }
 
+/// 最近的**集合根**祖先（`Table` / `Grid` / `Tree`，不含自身）。
+///
+/// 集合派生字段（行数 / 行号 / 集合位置）由引擎在 a11y 交付时按集合结构现算，写点（虚拟列表
+/// 条目数变化）因此必须把集合根以下整棵子树重进增量笔（E9c）。没有集合根时返回 `None`
+/// （裸虚拟列表维持既有行为：只标行窗口自己）。
+pub(crate) fn nearest_collection_ancestor(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+    nearest_ancestor_where(tree, node, |role| {
+        matches!(role, A11yRole::Table | A11yRole::Grid | A11yRole::Tree)
+    })
+}
+
 /// a11y 树里的**逻辑父**：集合语义把节点挂到最近的集合祖先下、跳过布局包裹层；其它角色就是
 /// 物理父节点（`None` = 根）。
 ///
@@ -2262,5 +2273,62 @@ mod tests {
         );
         assert_eq!(nested_record.parent, Some(inner_item_record.id));
         assert_single_parent_per_node(&tree, &mut ids, &mut tables);
+    }
+
+    /// E9c：写点向上找**最近的声明集合根**（`Table` / `Grid` / `Tree`）——`set_virtual_items`
+    /// 的条目数变化要把集合根以下整棵子树标 `A11Y`，集合边界内最近的根才是派生字段的重算范围
+    /// （嵌套集合的派生字段由内层根自己的索引给出，不得越界标到外层）。
+    #[test]
+    fn nearest_collection_ancestor_finds_the_closest_declared_collection() {
+        fn collection(tree: &mut NodeTree, parent: NodeId, role: A11yRole) -> NodeId {
+            NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(role),
+                    ..A11yOverride::default()
+                })
+                .build(tree, parent)
+                .expect("collection")
+        }
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let plain = NodeBuilder::boxed().build(&mut tree, root).expect("plain");
+        let leaf = NodeBuilder::boxed().build(&mut tree, plain).expect("leaf");
+        assert_eq!(
+            super::nearest_collection_ancestor(&tree, leaf),
+            None,
+            "没有集合根 ⇒ None（裸虚拟列表维持既有行为）"
+        );
+
+        let table = collection(&mut tree, plain, A11yRole::Table);
+        let wrapper = NodeBuilder::boxed()
+            .build(&mut tree, table)
+            .expect("wrapper");
+        let inner = NodeBuilder::boxed()
+            .build(&mut tree, wrapper)
+            .expect("inner");
+        assert_eq!(
+            super::nearest_collection_ancestor(&tree, inner),
+            Some(table),
+            "跳过布局包裹层，返回最近的 Table"
+        );
+
+        let grid = collection(&mut tree, inner, A11yRole::Grid);
+        let cell = NodeBuilder::boxed().build(&mut tree, grid).expect("cell");
+        assert_eq!(
+            super::nearest_collection_ancestor(&tree, cell),
+            Some(grid),
+            "嵌套集合：最近的 Grid 胜出"
+        );
+
+        let tree_root = collection(&mut tree, root, A11yRole::Tree);
+        let item = NodeBuilder::boxed()
+            .build(&mut tree, tree_root)
+            .expect("item");
+        assert_eq!(
+            super::nearest_collection_ancestor(&tree, item),
+            Some(tree_root),
+            "Tree 同样是集合根"
+        );
     }
 }

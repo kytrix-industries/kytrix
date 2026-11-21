@@ -11,7 +11,7 @@
 //! | [`DirtyFlags::BIND`] | `App::invalidate`（写信号）/ `App::tick_animations` / `NodeTree::mark_bind` | `App::refresh_styles` | `NodeTree::clear_bind`（求值完一个节点后） | `dirty_bind` |
 //! | [`DirtyFlags::LAYOUT`] | `mark_layout` / `mark_structure` / `invalidate_layout` / `touch_layout_only` | taffy 布局 pass（读写回本地盒） | `set_local_layout`（taffy 写回该节点的 `Layout` 时） | `dirty_layout` |
 //! | [`DirtyFlags::PAINT`] | `mark_paint` / 任何 `touch(LAYOUT\|PAINT)` | `PaintPass`（`rebuild_lane` / `hide_subtree`） | `NodeTree::clear_paint`（paint pass 消费 lane 后） | `dirty_paint` |
-//! | [`DirtyFlags::A11Y`] | `mark_a11y` / `mark_layout` / `mark_structure` / `mark_moved_a11y` / 新建节点 | `A11yBridge::take`（a11y 交付） | `NodeTree::clear_a11y` | `dirty_a11y` |
+//! | [`DirtyFlags::A11Y`] | `mark_a11y` / `mark_subtree_a11y` / `mark_layout` / `mark_structure` / `mark_moved_a11y` / 新建节点 | `A11yBridge::take`（a11y 交付） | `NodeTree::clear_a11y` | `dirty_a11y` |
 //! | [`DirtyFlags::REUSABLE`] | `PaintPass`（重建/隐藏后）/ `settle_frame` | 不是待办位：`PaintPass` 的整桶复用判据 | `touch`（含 `LAYOUT\|PAINT`）/ `place_subtree`（移动） | —（位本身即状态） |
 //!
 //! **帧尾结算集合**（不是位，是"本帧动过、需要把 damage 归零 / 置 `REUSABLE`"的节点）：
