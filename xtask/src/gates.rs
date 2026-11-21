@@ -34,12 +34,15 @@ const KYTRIX: &str = "kytrix";
 /// The gate runner's own crate: like `ui_core` it does not link `gpui-pre`.
 const XTASK: &str = "xtask";
 
-/// The build-script switch the local Windows gates set while the migration is in
-/// flight: `ui_core`'s process manifest and `gpui-pre`'s manifest both carry
-/// `RT_MANIFEST` ID 1, so an exe that links both dies with
-/// `CVT1100: duplicate resource. type:MANIFEST, name:1`. A scope that stays
-/// inside the migration engine (`ui_core`, `xtask`) keeps the manifest link
-/// under test; every other crate still pulls `gpui-pre` in.
+/// The build-script switch the local Windows gates set for the commands that build
+/// a crate still linking `gpui-pre`, while the migration is in flight: `ui_core`'s
+/// process manifest and `gpui-pre`'s manifest both carry `RT_MANIFEST` ID 1, so an
+/// exe that links both dies with `CVT1100: duplicate resource. type:MANIFEST, name:1`.
+///
+/// Injected per command ([`CargoCommand::injects_manifest_switch`]), never per run:
+/// `--scope ui_core,base_ui` (and `all`) contains both kinds, and the `ui_core`
+/// commands must keep the manifest link under test. The migration engine
+/// (`ui_core`, `xtask`) is the only part of the workspace free of `gpui-pre`.
 ///
 /// Transitional: removed together with `gpui-kit` in P5
 /// (`.docs/gui-migration/spec-deltas/build-transition.md`).
@@ -236,6 +239,23 @@ enum PackageSelection {
 }
 
 impl PackageSelection {
+    /// Whether this selection may include a crate that still links `gpui-pre`.
+    ///
+    /// The migration engine (`ui_core`, `xtask`) has no `gpui-pre` dependency, so a
+    /// command that builds only those keeps `ui_core`'s manifest link. Everything
+    /// else is treated as linking it: some fully migrated crates (`i18n`,
+    /// `network`) do not, but they do not depend on `ui_core` either, so the switch
+    /// is a no-op there. Injecting conservatively keeps the crates that do link it
+    /// buildable, while the engine-only commands stay under the manifest link test.
+    fn links_gpui_pre(&self) -> bool {
+        match self {
+            Self::WorkspaceExceptUiCore => true,
+            Self::Crates(crates) => crates
+                .iter()
+                .any(|name| name.as_str() != UI_CORE && name.as_str() != XTASK),
+        }
+    }
+
     fn push_args(&self, args: &mut Vec<String>) {
         match self {
             // `ui_core` has its own command with the feature sets, so the
@@ -257,6 +277,11 @@ struct CargoCommand {
     label: String,
     /// Arguments after `cargo`; `+nightly` comes first for fmt and clippy.
     args: Vec<String>,
+    /// Whether the local Windows run sets [`TRANSITION_MANIFEST_ENV`] for this
+    /// command. Only a command that builds a crate still linking `gpui-pre` may set
+    /// it; the `ui_core`/`xtask` commands must keep the manifest link, because
+    /// their own test binaries need the PerMonitorV2 process manifest.
+    injects_manifest_switch: bool,
 }
 
 impl CargoCommand {
@@ -464,7 +489,7 @@ pub fn run(root: &Path, config: &GatesConfig) -> Result<bool, GateError> {
     let mut results: Vec<GateResult> = Vec::with_capacity(plans.len());
     for plan in &plans {
         let platform_results = match plan.platform {
-            Platform::Win => run_local_plan(root, plan, &config.scope, &output)?,
+            Platform::Win => run_local_plan(root, plan, &output)?,
             Platform::Mac | Platform::Linux => {
                 let names = remote_names
                     .as_ref()
@@ -497,59 +522,53 @@ fn all_passed(results: &[GateResult]) -> bool {
     !results.is_empty() && results.iter().all(|result| result.exit_code == Some(0))
 }
 
-/// Whether the local Windows run must skip `ui_core`'s manifest link.
-///
-/// The transition flag exists because an exe linking both `ui_core` and
-/// `gpui-pre` gets two `RT_MANIFEST` ID 1 resources (`CVT1100`). Only `ui_core`
-/// and this runner are free of `gpui-pre`; a workspace-style scope certainly is
-/// not, because it includes the product crates that still do.
-fn skips_ui_core_manifest(scope: &Scope) -> bool {
-    match scope {
-        Scope::Workspace => true,
-        Scope::Crates(crates) => crates
-            .iter()
-            .any(|name| name.as_str() != UI_CORE && name.as_str() != XTASK),
-    }
-}
-
 /// Executes the local Windows plan.
+///
+/// The transition manifest switch goes to the commands that build a crate still
+/// linking `gpui-pre`, one `Command::env` per such command. The plan's own stdout
+/// line for a command names the switch, so the log shows exactly which commands ran
+/// with it and which kept the manifest link under test.
 fn run_local_plan(
     root: &Path,
     plan: &PlatformPlan,
-    scope: &Scope,
     output: &Output,
 ) -> Result<Vec<GateResult>, GateError> {
-    let transition_env: &[(&str, &str)] = if skips_ui_core_manifest(scope) {
+    if plan
+        .commands
+        .iter()
+        .any(|command| command.injects_manifest_switch)
+    {
         output.line(
             StreamKind::Stdout,
             &format!(
-                "   transition: {TRANSITION_MANIFEST_ENV}=0（过渡期跳过 ui_core 进程清单：与 gpui-pre manifest 冲突，P5 后移除）"
+                "   transition: {TRANSITION_MANIFEST_ENV}=0（仅注入仍链接 gpui-pre 的 crate 命令；ui_core/xtask 命令保留清单链接验证，P5 后移除）"
             ),
         );
-        &[(TRANSITION_MANIFEST_ENV, "0")]
-    } else {
-        &[]
-    };
+    }
     let mut results = Vec::with_capacity(plan.commands.len());
     for (index, command) in plan.commands.iter().enumerate() {
+        let manifest_switch = if command.injects_manifest_switch {
+            format!("（{TRANSITION_MANIFEST_ENV}=0）")
+        } else {
+            String::new()
+        };
         output.line(
             StreamKind::Stdout,
             &format!(
-                "---- [{}] {}/{} {}",
+                "---- [{}] {}/{} {}{manifest_switch}",
                 plan.platform.name(),
                 index + 1,
                 plan.commands.len(),
                 command.render()
             ),
         );
-        let process = stream_command_with_env(
-            "cargo",
-            &command.args,
-            root,
-            Stdio::null(),
-            output,
-            transition_env,
-        )?;
+        let envs: &[(&str, &str)] = if command.injects_manifest_switch {
+            &[(TRANSITION_MANIFEST_ENV, "0")]
+        } else {
+            &[]
+        };
+        let process =
+            stream_command_with_env("cargo", &command.args, root, Stdio::null(), output, envs)?;
         results.push(GateResult {
             platform: plan.platform,
             label: command.label.clone(),
@@ -636,9 +655,11 @@ fn commands_for(step: Step, platform: Platform, scope: &Scope) -> Vec<CargoComma
             // Plan §2.4: a layer run that involves the product crate also checks
             // that it still builds in release mode.
             if scope.includes(KYTRIX) {
+                let packages = PackageSelection::Crates(vec![KYTRIX.to_owned()]);
                 commands.push(CargoCommand {
                     label: format!("release({KYTRIX})"),
-                    args: release_args(&PackageSelection::Crates(vec![KYTRIX.to_owned()]), false),
+                    args: release_args(&packages, false),
+                    injects_manifest_switch: packages.links_gpui_pre(),
                 });
             }
         }
@@ -656,6 +677,7 @@ fn check_commands(scope: &Scope) -> Vec<CargoCommand> {
         commands.push(CargoCommand {
             label: "check".to_owned(),
             args: check_args(&packages, false),
+            injects_manifest_switch: packages.links_gpui_pre(),
         });
     }
     if scope.includes(UI_CORE) {
@@ -667,6 +689,7 @@ fn check_commands(scope: &Scope) -> Vec<CargoCommand> {
         commands.push(CargoCommand {
             label: "check(ui_core,all-features)".to_owned(),
             args: check_args(&ui_core, true),
+            injects_manifest_switch: ui_core.links_gpui_pre(),
         });
     }
     commands
@@ -677,16 +700,21 @@ fn gate_commands(scope: &Scope, gui_smoke: bool) -> Vec<CargoCommand> {
     let mut commands = vec![CargoCommand {
         label: "fmt".to_owned(),
         args: fmt_args(scope),
+        // `fmt` formats sources and runs no build script, so the manifest switch
+        // has nothing to affect.
+        injects_manifest_switch: false,
     }];
 
     if let Some(packages) = scope.default_feature_packages() {
         commands.push(CargoCommand {
             label: "clippy".to_owned(),
             args: clippy_args(&packages, false),
+            injects_manifest_switch: packages.links_gpui_pre(),
         });
         commands.push(CargoCommand {
             label: "test".to_owned(),
             args: test_args(&packages, None),
+            injects_manifest_switch: packages.links_gpui_pre(),
         });
     }
 
@@ -695,10 +723,12 @@ fn gate_commands(scope: &Scope, gui_smoke: bool) -> Vec<CargoCommand> {
         commands.push(CargoCommand {
             label: "clippy(ui_core,all-features)".to_owned(),
             args: clippy_args(&ui_core, true),
+            injects_manifest_switch: ui_core.links_gpui_pre(),
         });
         commands.push(CargoCommand {
             label: format!("test(ui_core,{UI_CORE_TEST_FEATURES})"),
             args: test_args(&ui_core, Some(UI_CORE_TEST_FEATURES)),
+            injects_manifest_switch: ui_core.links_gpui_pre(),
         });
         let mut snapshot = test_args(&ui_core, Some(UI_CORE_TEST_SUPPORT));
         snapshot.push("--test".to_owned());
@@ -706,6 +736,7 @@ fn gate_commands(scope: &Scope, gui_smoke: bool) -> Vec<CargoCommand> {
         commands.push(CargoCommand {
             label: "snapshot".to_owned(),
             args: snapshot,
+            injects_manifest_switch: ui_core.links_gpui_pre(),
         });
 
         if gui_smoke {
@@ -716,6 +747,7 @@ fn gate_commands(scope: &Scope, gui_smoke: bool) -> Vec<CargoCommand> {
             commands.push(CargoCommand {
                 label: "gui-smoke".to_owned(),
                 args: gui_smoke,
+                injects_manifest_switch: ui_core.links_gpui_pre(),
             });
         }
     }
@@ -730,6 +762,7 @@ fn release_commands(scope: &Scope) -> Vec<CargoCommand> {
         commands.push(CargoCommand {
             label: "release".to_owned(),
             args: release_args(&packages, false),
+            injects_manifest_switch: packages.links_gpui_pre(),
         });
     }
     if scope.includes(UI_CORE) {
@@ -739,6 +772,7 @@ fn release_commands(scope: &Scope) -> Vec<CargoCommand> {
         commands.push(CargoCommand {
             label: "release(ui_core,all-features)".to_owned(),
             args: release_args(&ui_core, true),
+            injects_manifest_switch: ui_core.links_gpui_pre(),
         });
     }
     commands
@@ -749,6 +783,8 @@ fn bench_commands() -> Vec<CargoCommand> {
     vec![CargoCommand {
         label: "bench(ui_core,perf)".to_owned(),
         args: bench_args(),
+        // `ui_core` only: the bench keeps the manifest link like its other tests.
+        injects_manifest_switch: false,
     }]
 }
 
@@ -766,6 +802,8 @@ fn accept_commands() -> Vec<CargoCommand> {
             "--".to_owned(),
             "cpu".to_owned(),
         ],
+        // `ui_core` only: the harness keeps the manifest link like its tests.
+        injects_manifest_switch: false,
     }]
 }
 
@@ -1053,8 +1091,9 @@ fn stream_command(
 /// [`stream_command`] with extra environment variables for the child.
 ///
 /// Only the local Windows plan needs this: the transition manifest switch must
-/// reach `ui_core`'s build script, and it is set per run instead of in the gate
-/// runner's own environment (the remote hosts have no manifest conflict).
+/// reach `ui_core`'s build script for the commands that link `gpui-pre`, and it is
+/// set per command instead of in the gate runner's own environment (the remote
+/// hosts have no manifest conflict).
 fn stream_command_with_env(
     program: &str,
     args: &[String],
@@ -1369,6 +1408,16 @@ mod tests {
             .collect()
     }
 
+    /// The manifest-switch decision of every command of the first plan, by label.
+    fn manifest_switch_decisions(config: &GatesConfig) -> Vec<(String, bool)> {
+        let plans = build_plan(config).expect("build the gate plan");
+        let plan = plans.first().expect("a plan");
+        plan.commands
+            .iter()
+            .map(|command| (command.label.clone(), command.injects_manifest_switch))
+            .collect()
+    }
+
     fn fast_scope(scope: &str) -> GatesConfig {
         parse(&["--platform", "win", "--scope", scope, "--step", "fast"])
             .expect("parse the fast run")
@@ -1450,19 +1499,103 @@ mod tests {
     }
 
     #[test]
-    fn only_a_scope_inside_the_migration_engine_keeps_the_manifest_link() {
+    fn only_a_command_that_builds_a_gpui_linking_crate_gets_the_manifest_switch() {
+        // A scope that stays inside the migration engine keeps every command's
+        // manifest link under test.
         for scope in ["ui_core", "xtask", "ui_core,xtask"] {
-            assert!(
-                !skips_ui_core_manifest(&fast_scope(scope).scope),
-                "`--scope {scope}` does not link `gpui-pre`: its Windows run keeps the ui_core manifest link under test"
-            );
+            for (label, injects_manifest_switch) in manifest_switch_decisions(&fast_scope(scope)) {
+                assert!(
+                    !injects_manifest_switch,
+                    "`--scope {scope}` does not link `gpui-pre`, so `{label}` must keep the ui_core manifest link"
+                );
+            }
         }
-        for scope in ["base_ui", "kytrix", "ui_core,base_ui", "all"] {
-            assert!(
-                skips_ui_core_manifest(&fast_scope(scope).scope),
-                "`--scope {scope}` still links `gpui-pre`: its Windows build scripts must skip the ui_core manifest link"
-            );
+
+        // A mixed scope splits the decision per command: the `base_ui` command
+        // links both manifests and must skip one, while the `ui_core` commands of
+        // the same run keep it — injecting them costs their own test binaries the
+        // PerMonitorV2 process manifest (the `--scope ui_core,base_ui` regression).
+        assert_eq!(
+            manifest_switch_decisions(&fast_scope("ui_core,base_ui")),
+            [
+                ("fmt".to_owned(), false),
+                ("clippy".to_owned(), true),
+                ("test".to_owned(), true),
+                ("clippy(ui_core,all-features)".to_owned(), false),
+                ("test(ui_core,hud,test-support)".to_owned(), false),
+                ("snapshot".to_owned(), false),
+            ]
+        );
+
+        // `all` is the same split: `--workspace --exclude ui_core` still links
+        // `gpui-pre`, the extracted `ui_core` commands do not.
+        assert_eq!(
+            manifest_switch_decisions(&fast_scope("all")),
+            [
+                ("fmt".to_owned(), false),
+                ("clippy".to_owned(), true),
+                ("test".to_owned(), true),
+                ("clippy(ui_core,all-features)".to_owned(), false),
+                ("test(ui_core,hud,test-support)".to_owned(), false),
+                ("snapshot".to_owned(), false),
+            ]
+        );
+
+        // A single non-engine crate gets the switch on every build command.
+        assert_eq!(
+            manifest_switch_decisions(&fast_scope("base_ui")),
+            [
+                ("fmt".to_owned(), false),
+                ("clippy".to_owned(), true),
+                ("test".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_manifest_switch_never_reaches_a_ui_core_harness_command() {
+        for step in ["layer", "release", "bench", "accept"] {
+            let config = parse(&["--platform", "win", "--scope", "ui_core", "--step", step])
+                .expect("parse the ui_core-only run");
+            for (label, injects_manifest_switch) in manifest_switch_decisions(&config) {
+                assert!(
+                    !injects_manifest_switch,
+                    "step `{step}` builds only `ui_core`, so `{label}` must keep the manifest link"
+                );
+            }
         }
+
+        // A layer run that includes the product crate injects on its release build.
+        let layer = parse(&["--platform", "win", "--scope", "kytrix", "--step", "layer"])
+            .expect("parse the layer run");
+        assert_eq!(
+            manifest_switch_decisions(&layer),
+            [
+                ("fmt".to_owned(), false),
+                ("clippy".to_owned(), true),
+                ("test".to_owned(), true),
+                (format!("release({KYTRIX})"), true),
+            ]
+        );
+
+        // `release` on a mixed scope: the non-engine build injects, the `ui_core`
+        // build keeps the link.
+        let release = parse(&[
+            "--platform",
+            "win",
+            "--scope",
+            "ui_core,base_ui",
+            "--step",
+            "release",
+        ])
+        .expect("parse the release run");
+        assert_eq!(
+            manifest_switch_decisions(&release),
+            [
+                ("release".to_owned(), true),
+                ("release(ui_core,all-features)".to_owned(), false),
+            ]
+        );
     }
 
     #[test]

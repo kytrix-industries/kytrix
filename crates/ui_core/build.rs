@@ -9,8 +9,9 @@
 //!   R07-1）编进 `.res` 并链接到每个链接本 crate 的可执行文件 —— 不再依赖 `gpui-pre` 之类
 //!   依赖的资源合并副作用；清单内容与 `1 RT_MANIFEST` 锚点在构建期静态校验。
 //! - **迁移过渡措施**（P5 删除 `gpui-kit` 后连同开关一起删除）：设置
-//!   `KYTRIX_UI_CORE_MANIFEST=0` 时只跳过清单的**链接**（校验照旧），供仍依赖
-//!   `gpui-pre`（自带 manifest）的 crate 在 Windows 上链接测试二进制；见
+//!   `KYTRIX_UI_CORE_MANIFEST=0` 时跳过清单的 **rc 编译与链接**（清单存在性、XML/RC
+//!   锚点、MSVC 目标与 rerun 校验照旧），供仍依赖 `gpui-pre`（自带 manifest）的 crate
+//!   在 Windows 上链接测试二进制；见
 //!   `.docs/gui-migration/spec-deltas/build-transition.md`。
 
 use std::{
@@ -181,12 +182,12 @@ const MANIFEST_XML_ANCHORS: [&str; 2] = [">true/pm</dpiAware>", ">PerMonitorV2</
 /// ID 不对时资源不会生效，但构建仍然成功 —— 所以必须静态校验。
 const MANIFEST_RC_ANCHOR: &str = "1 RT_MANIFEST";
 
-/// 迁移过渡开关：值为 `0` 时不把进程清单链接进下游可执行文件（其它值/未设置 = 不启用）。
+/// 迁移过渡开关：值为 `0` 时跳过清单的 **rc 编译与链接**（其它值/未设置 = 不启用）。
 ///
 /// 迁移期 `base_ui` / `widgets/*_ui` 仍依赖 `gpui-pre`，而它的 `gpui.lib` 也带
 /// `RT_MANIFEST` ID 1；同一个 exe 拿到两份清单时 `link.exe` 报
-/// `CVT1100: duplicate resource. type:MANIFEST, name:1`。本开关只跳过**链接**，
-/// rc/xml 存在性、锚点校验与 `rerun-if-changed` 一律照旧。
+/// `CVT1100: duplicate resource. type:MANIFEST, name:1`。本开关只影响 `.res` 的
+/// 编译与 `rustc-link-*` 指令；rc/xml 存在性、锚点、MSVC 与 rerun 校验一律照旧。
 ///
 /// **迁移过渡措施**：P5 删除 `gpui-kit` / `gpui-pre` 后，连同开关与
 /// `xtask` 的注入规则一起删除（`.docs/gui-migration/spec-deltas/build-transition.md`）。
