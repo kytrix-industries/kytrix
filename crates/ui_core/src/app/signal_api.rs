@@ -213,8 +213,11 @@ pub(crate) fn update_with<T: 'static, R>(
 
 /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
 ///
+/// 与普通信号的写路径不同：失效句柄**不**走 no-op，而是与读一样确定性 panic（瞬态值没有
+/// 「返回 false」的第二形态）。
+///
 /// # Panics
-/// 存在活跃读守卫 / 槽位不是瞬态值。
+/// 存在活跃读守卫 / 槽位不是瞬态值 / 句柄已失效（所属作用域已释放）。
 /// 消费者：`App::write_transient`。
 pub(crate) fn write_transient<T: 'static>(app: &mut App, transient: &Transient<T>, value: T) {
     app.store.set_transient(transient.id(), value);

@@ -318,11 +318,16 @@ impl ScrollBar {
         });
     }
 
-    /// 释放本组件的信号作用域（动态创建 / 销毁的滚动条调用；先卸载节点再释放）。
+    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的滚动条调用；先卸载节点再释放）。
     ///
+    /// 清理面：轨道 / 滑块 / 拖拽三个 Action handler（[`App::off_action`]）+ 本组件的信号作用域。
+    /// 只释放信号不摘 handler 会让 `App` 永久持有 `Rc<ScrollBar>` 闭包（P2-2 复核 R2.2 的泄漏）。
     /// 返回被释放的槽位数（悬停 / 可滚动 / 淡出不透明度 / 拖拽快照）；引用淡出瞬态值的动画
     /// 由引擎在释放时同批取消。重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
+        app.off_action(&self.inner.track_action);
+        app.off_action(&self.inner.thumb_action);
+        app.off_action(&self.inner.drag_action);
         app.release_scope(self.inner.scope)
     }
 
@@ -1094,6 +1099,74 @@ mod ui_tests {
             .offset
             .y;
         assert!(offset > 150.0, "点击轨道下部后偏移过半：{offset}");
+    }
+
+    /// `release` 必须摘掉轨道 / 滑块 / 拖拽三个 Action handler。
+    ///
+    /// E8 审查 F1：这三个 handler 只写引擎滚动状态，泄漏后的「重放点击」不会 panic，
+    /// 因此必须直接观察 handler 表项 + `InputOutcome::action`（= handler 真的被调用）。
+    #[test]
+    fn releasing_the_scrollbar_removes_its_three_action_handlers() {
+        let mut harness = harness(ScrollbarMode::Always);
+        let actions = [
+            harness.bar.inner.track_action.clone(),
+            harness.bar.inner.thumb_action.clone(),
+            harness.bar.inner.drag_action.clone(),
+        ];
+        for action in &actions {
+            assert!(
+                harness.app.app().has_action_handler(action),
+                "attach 必须注册轨道 / 滑块 / 拖拽 handler"
+            );
+        }
+
+        let (track, _) = harness.bar.nodes();
+        let track = track.expect("track");
+        let bounds = harness.app.probe().bounds(track).expect("track bounds");
+        // 点轨道下部（避开滑块）触发页面跳转；释放前这次点击必须由 track handler 消费。
+        let point = ui_core::math::Point::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height * 0.75,
+        );
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let click0 = harness.app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        assert_eq!(
+            click0.action,
+            Some(actions[0].clone()),
+            "释放前点击轨道必须由 track handler 消费"
+        );
+
+        assert!(harness.bar.release(harness.app.app_mut()) > 0);
+        for action in &actions {
+            assert!(
+                !harness.app.app().has_action_handler(action),
+                "release 必须摘掉滚动条 handler"
+            );
+        }
+
+        // 不卸载节点直接释放：重放同一次点击不得再命中已摘除的 handler。
+        let _ = harness.app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        let click1 = harness.app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        assert_eq!(
+            click1.action, None,
+            "释放后重放点击不得再命中滚动条 handler"
+        );
     }
 
     #[test]

@@ -16,12 +16,11 @@
 //! 2. 内核在 [`List::sync`] 里给还没有子节点的行容器补一个**内容容器**
 //!    （`"{key}:row:{index}:content"`），再调用应用的行内容回调把子树建进内容容器。
 //!
-//! `sync` 与重建路径（`set_items` / `set_count` / `push`）都**同步**补内容，因此非滚动重建
-//! 后首帧就有行内容。仍有两类晚一帧：①**首帧**——`attach` 时视口尚未布局，引擎只挂行容器，
-//! 下一帧 `rewindow_virtuals` 才挂行；②**帧内挂载的新行**——`scroll_to_item` / 树选中滚动
-//! 把行挂进当帧，内容在下一帧 `sync` 补（滚动时 overscan 的新行多在视口外，影响小）。这是
-//! 引擎行工厂（`FnMut(usize) -> NodeBuilder` 单节点）的限制，登记为残余；替代方案是行工厂
-//! 返回子树 / rewindow 后回调。
+//! `sync` 与重建路径（`set_items` / `set_count` / `push`）都**同步**补内容；`attach` 末尾还会
+//! 主动跑一次布局并按真实视口重挂（[`List::attach`] 的「首帧同步建行」），因此**首帧与重建
+//! 路径首帧都有行内容**。唯一残留：`scroll_to_item` / 树选中滚动在**帧内**挂载的新行，内容在
+//! 下一帧 `sync` 补（滚动时 overscan 的新行多在视口外，影响小）。定义「行工厂返回单个节点」
+//! 的引擎形态决定了内容子树只能由调用方在行容器挂载后补建。
 //!
 //! # 生命周期
 //!
@@ -650,12 +649,14 @@ impl List {
         &self.inner.key
     }
 
-    /// 释放本组件的信号作用域（动态创建 / 销毁的列表必须调用一次）。
+    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的列表必须调用一次）。
     ///
-    /// 返回被释放的槽位数（选中 / 悬停 / 条目数 + 滚动条的状态）。**先卸载节点再释放**：
-    /// `bind_style` / `bind_a11y` 闭包捕获了这些句柄，释放后一次求值就会读死句柄 panic。
-    /// 重复调用返回 0（幂等）。
+    /// 清理面：点击 Action handler（[`App::off_action`]）+ 滚动条的 handler / 信号作用域 + 本
+    /// 列表的信号作用域。只释放信号不摘 handler 会让 `App` 永久持有 `Rc<List>` 闭包（P2-2
+    /// 复核 R2.2 的泄漏）。**先卸载节点再释放**：`bind_style` / `bind_a11y` 闭包捕获了这些
+    /// 句柄，释放后一次求值就会读死句柄 panic。重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
+        app.off_action(&self.inner.select_action);
         self.inner.scrollbar.release(app) + app.release_scope(self.inner.scope)
     }
 
@@ -729,10 +730,19 @@ impl List {
 
     /// 接进引擎：`make_virtual_list` + 行工厂 + 点击 Action + 滚动条。
     ///
-    /// 必须先 [`List::build`]；未 build 时是 no-op（`Ok(())`）。
+    /// 必须先 [`List::build`]；未 build 时是 no-op（`Ok(())`）。成功返回时首帧的可见行内容
+    /// 已经建好（见 [`List::populate_first_frame`]）。
     ///
     /// # Errors
-    /// `NotVirtualList` / `InvalidVirtualExtent`（引擎侧校验）。
+    ///
+    /// - [`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]：窗口已关闭，或 `build`
+    ///   时的节点已不在该窗口（`make_virtual_list` / `set_virtual_items` / `fill_row_contents`
+    ///   的引擎校验）；
+    /// - [`EngineError::NotVirtualList`] / [`EngineError::InvalidVirtualExtent`]：`viewport`
+    ///   不是可虚拟化容器 / 行高预置非法；
+    /// - [`EngineError::InvalidMeasure`]：首帧同步建行时跑一次
+    ///   `Window::compute_layout`，measure 闭包返回非有限 / 负尺寸时从这里冒泡；
+    /// - 行工厂（`content`）建树失败时原样传播（通常是 `StaleNode`）。
     pub fn attach(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
         let (Some(viewport), Some(outer)) = (
             self.inner.geometry.borrow().viewport,
@@ -768,6 +778,8 @@ impl List {
         app.on_action(self.inner.select_action.clone(), move |ctx| {
             select.on_click(ctx);
         });
+        // 首帧同步建行（P2-2 复核遗留）：让首帧就有行内容，而不是空行容器。
+        self.populate_first_frame(app, window)?;
         Ok(())
     }
 
@@ -1089,9 +1101,10 @@ impl List {
 
     /// 给「已挂载但还没有子节点」的行补内容容器 + 应用行内容；返回本次补了内容的下标。
     ///
-    /// 同步建树（不是帧驱动）：`sync` 与 `rebuild`（`set_items` / `set_count` / `push`）都调它，
-    /// 因此重建路径首帧就有行内容。只有**引擎在帧内挂载**的新行（首帧、`scroll_to_item` 跳跃）
-    /// 要等下一帧的 `sync` 才补 —— 见模块文档〈行内容的挂载时机〉。
+    /// 同步建树（不是帧驱动）：`sync`、`rebuild`（`set_items` / `set_count` / `push`）与
+    /// `attach` 的首帧建行（[`List::populate_first_frame`]）都调它，因此首帧与重建路径首帧
+    /// 就有行内容。只有**引擎在帧内挂载**的新行（`scroll_to_item` 跳跃）要等下一帧的 `sync` 才
+    /// 补 —— 见模块文档〈行内容的挂载时机〉。
     fn fill_row_contents(
         &self,
         app: &mut App,
@@ -1324,6 +1337,52 @@ impl List {
         if let Some(window) = window {
             let _ = self.fill_row_contents(app, window)?;
         }
+        Ok(())
+    }
+
+    /// 首帧同步建行（P2-2 复核遗留）：让**首帧**就有行内容，而不是空行容器。
+    ///
+    /// # 前置条件依赖（重要）
+    ///
+    /// 本方法在帧外调用 [`Window::compute_layout`]，而该 API 的文档要求「文本节点必须先在本帧
+    /// 调用 `App::refresh_text`（shape）后再测量，否则文本测量为 0×0」。这里的正确性**不是**
+    /// 靠满足那个前置条件，而是靠两个已成立的性质，改动其中任一个都可能把未 shape 的文本冻结
+    /// 成 0 高度：
+    ///
+    /// 1. `set_text_shaped`（`node::tree::content`）无条件清掉 `node..root` 的 taffy 缓存 ——
+    ///    首帧 `refresh_text` 把真实文本 shape 完之后，缓存已失效，布局会重新测量；
+    /// 2. 本次 `set_virtual_items` 新挂的行容器 / 内容子树带 `LAYOUT` 脏位 —— 首帧一定重跑
+    ///    布局，不会沿用这次冷路径布局的 0 高度结果。
+    ///
+    /// 若未来把本路径改成引擎级 `App::settle_layout(window)`（E8.md §9.3 的候选），这些依赖由
+    /// 引擎入口承担，这里的注释随之更新。
+    ///
+    /// 引擎在视口未知（首次布局前）时按「挂首行 + overscan」处理可见窗口
+    /// （`interaction::virtual_list` 的「视口未知」分支），其余可见行要等首帧
+    /// `rewindow_virtuals`（布局之后）才挂 —— 而列表只能在 `sync` 里补内容，于是首帧画出来
+    /// 是空行。`attach` 是冷路径，这里主动 measure-then-place：
+    ///
+    /// 1. `Window::compute_layout` 跑一次布局拿到真实视口尺寸（幂等；尚未 shape 的文本测量为 0，
+    ///    但只影响文本自身，不影响外层 / 行容器几何）；
+    /// 2. 再 `set_virtual_items` 让引擎按真实视口重挂可见窗口（**同步**挂载行容器）；
+    /// 3. `fill_row_contents` 同步建内容子树。
+    ///
+    /// 新挂的内容子树是 `LAYOUT` 脏节点：首帧的 `refresh_text` + 布局会正常处理它们（内容文本
+    /// 在强制布局时还不存在，因此不会被 0 测量冻结）。程序化 `scroll_to_item` 在**帧内**挂载的
+    /// 新行仍要等下一帧 `sync`（引擎行工厂形态的残余，见模块文档〈行内容的挂载时机〉）。
+    fn populate_first_frame(&self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
+        {
+            let Some(target) = app.window_mut(window) else {
+                return Ok(());
+            };
+            target.compute_layout()?;
+        }
+        let count = self.count(app);
+        let Some(list) = self.inner.geometry.borrow().list else {
+            return Ok(());
+        };
+        app.set_virtual_items(&list, count, self.row_builder())?;
+        let _ = self.fill_row_contents(app, window)?;
         Ok(())
     }
 }
@@ -1619,6 +1678,23 @@ mod ui_tests {
         ));
     }
 
+    /// 点击并返回抬起事件的 outcome（`action = Some(..)` ⇔ 点击真的调用了 handler）。
+    fn click_outcome(
+        app: &mut TestApp,
+        point: ui_core::math::Point,
+    ) -> ui_core::event::InputOutcome {
+        let _ = app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ))
+    }
+
     fn collect_texts(tree: &NodeTree, node: NodeId, out: &mut Vec<SmolStr>) {
         let Ok(target) = tree.get(node) else {
             return;
@@ -1629,6 +1705,23 @@ mod ui_tests {
         for child in target.children() {
             collect_texts(tree, *child, out);
         }
+    }
+
+    /// 子树里第一个文本节点（首帧测量断言用）。
+    fn first_text_node(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
+        let target = tree.get(node).ok()?;
+        for child in target.children() {
+            let Ok(child_target) = tree.get(*child) else {
+                continue;
+            };
+            if matches!(child_target.kind(), ui_core::node::tree::NodeKind::Text(_)) {
+                return Some(*child);
+            }
+            if let Some(found) = first_text_node(tree, *child) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     fn row_texts(
@@ -1644,6 +1737,125 @@ mod ui_tests {
         let mut out = Vec::new();
         collect_texts(tree, row, &mut out);
         out
+    }
+
+    /// P2-2 复核遗留：初始 `mount` 的**首帧**就有行内容。
+    ///
+    /// `attach` 末尾按真实视口同步建行（先 `compute_layout` 拿到视口尺寸，再按视口重挂可见
+    /// 窗口并补内容），因此 `mount` 返回时/首帧 `drain` 后都不存在空行容器。
+    #[test]
+    fn mounting_populates_row_contents_before_the_first_frame() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let list = List::new(
+            app.app_mut(),
+            theme,
+            "first-frame",
+            ListOptions::fixed(ROW_EXTENT),
+            text_row,
+        );
+        list.set_initial_count(app.app_mut(), 20);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let parent = {
+            let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .width(BOX_WIDTH)
+                        .height(BOX_HEIGHT)
+                        .build(),
+                )
+                .build(tree, root)
+                .expect("parent")
+        };
+        list.mount(app.app_mut(), window, parent).expect("mount");
+
+        // mount 返回时（任何帧 / sync 之前）可见窗口已按**真实视口**挂满：视口 120 / 行高 30
+        // + overscan 2 ⇒ 6 行；如果 `attach` 不主动布局，引擎只能按「视口未知」挂首行+overscan。
+        let mounted = list.mounted_rows(app.app());
+        assert_eq!(mounted.len(), 6, "首帧前必须按真实视口挂满可见窗口");
+        for (index, _) in &mounted {
+            assert_eq!(
+                row_texts(app.app(), window, &list, *index),
+                vec![format_smolstr!("row{index}")],
+                "第 {index} 行内容必须在首帧前同步建好"
+            );
+        }
+
+        let first = app.drain().expect("frame");
+        assert!(first.rendered, "首帧必须渲染");
+        assert_eq!(
+            list.mounted_rows(app.app()).len(),
+            6,
+            "首帧不得再靠 rewindow 补挂新行（否则这些行首帧是空的）"
+        );
+        for (index, _) in list.mounted_rows(app.app()) {
+            assert!(
+                !row_texts(app.app(), window, &list, index).is_empty(),
+                "首帧第 {index} 行不得是空行"
+            );
+        }
+
+        // 一次渲染即 Idle：首帧之后没有新脏位 / 帧请求，不得持续出帧。
+        for frame_number in 0..5 {
+            let record = app.drain().expect("frame");
+            assert!(
+                !record.rendered,
+                "首帧之后第 {} 帧不得再渲染（出帧循环）",
+                frame_number + 2
+            );
+        }
+
+        // 首帧行文本必须已 shape + 布局（不是 0×0 的空文本节点）。
+        let row0 = list.row_node(app.app(), 0).expect("row 0");
+        let text = first_text_node(app.app().window(window).expect("window").tree(), row0)
+            .expect("第 0 行必须有文本节点");
+        let bounds = app.probe().bounds(text).expect("行文本 bounds");
+        assert!(
+            bounds.size.width > 0.0 && bounds.size.height > 0.0,
+            "首帧行文本必须已布局（bounds 非零）：{bounds:?}"
+        );
+    }
+
+    /// 组件 release 必须摘掉点击 Action handler。
+    ///
+    /// 「重放点击不 panic」不足以证明清理生效：`List` 的指针路径对死句柄只做 `ctx.update`
+    /// （no-op，不 panic）。这里直接观察 handler 表项，并用 `InputOutcome::action`（= handler
+    /// 真的被调用）验证重放点击不再命中。
+    #[test]
+    fn releasing_the_list_removes_its_click_handler() {
+        let mut harness = harness(5);
+        let select_action = harness.list.inner.select_action.clone();
+        assert!(
+            harness.app.app().has_action_handler(&select_action),
+            "attach 必须注册点击 handler"
+        );
+        let row0 = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let point0 = center(&harness.app, row0);
+        let click0 = click_outcome(&mut harness.app, point0);
+        assert_eq!(
+            click0.action,
+            Some(select_action.clone()),
+            "释放前点击必须由列表 handler 消费"
+        );
+        assert_eq!(
+            harness.list.selection(harness.app.app()).first(),
+            Some(0),
+            "释放前点击正常选中"
+        );
+
+        assert!(harness.list.release(harness.app.app_mut()) > 0);
+        assert!(
+            !harness.app.app().has_action_handler(&select_action),
+            "release 必须摘掉点击 handler（否则 App 永久持有 Rc<List>）"
+        );
+
+        // 不卸载节点直接释放（正常契约是先卸载再 release）：重放点击不得再调用已摘除的 handler。
+        let row1 = harness.list.row_node(harness.app.app(), 1).expect("row 1");
+        let point1 = center(&harness.app, row1);
+        let click1 = click_outcome(&mut harness.app, point1);
+        assert_eq!(click1.action, None, "释放后重放点击不得再命中列表 handler");
     }
 
     /// 重建路径（`set_items` / `set_count` / `push`）同步补行内容：调用返回时行内容已经挂好。

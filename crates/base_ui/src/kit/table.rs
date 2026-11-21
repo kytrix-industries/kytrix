@@ -506,10 +506,14 @@ impl Table {
         &self.inner.list
     }
 
-    /// 释放本组件的信号作用域（动态创建 / 销毁的表格必须调用；先卸载节点再释放）。
+    /// 释放本组件的信号作用域与引擎侧注册（动态创建 / 销毁的表格必须调用；先卸载节点再释放）。
     ///
+    /// 清理面：排序 Action handler（[`App::off_action`]）+ 行体列表（含滚动条）的 handler /
+    /// 信号作用域 + 本表格的信号作用域。只释放信号不摘 handler 会让 `App` 永久持有
+    /// `Rc<Table>` 闭包（P2-2 复核 R2.2 的泄漏）。
     /// 返回被释放的槽位数（排序状态 + 行体列表 / 滚动条的状态）；重复调用返回 0（幂等）。
     pub fn release(&self, app: &mut App) -> usize {
+        app.off_action(&self.inner.sort_action);
         self.inner.list.release(app) + app.release_scope(self.inner.scope)
     }
 
@@ -1078,6 +1082,23 @@ mod tests {
         ));
     }
 
+    /// 点击并返回抬起事件的 outcome（`action = Some(..)` ⇔ 点击真的调用了 handler）。
+    fn click_outcome(
+        app: &mut TestApp,
+        point: ui_core::math::Point,
+    ) -> ui_core::event::InputOutcome {
+        let _ = app.inject(InputEvent::pointer_down(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ));
+        app.inject(InputEvent::pointer_up(
+            point,
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ))
+    }
+
     /// 行虚拟化：只挂可见行；单元格按列宽摆放（固定列 120、弹性列占剩余）。
     #[test]
     fn rows_are_virtualized_and_columns_align() {
@@ -1155,6 +1176,40 @@ mod tests {
             Some((0, SortOrder::Descending)),
             "再点切到降序"
         );
+    }
+
+    /// `release` 必须摘掉表头排序 handler。
+    ///
+    /// 两条证据：handler 表项直接消失（`App::has_action_handler`）+ 重放点击的 `InputOutcome`
+    /// 不再带 action（没有 handler 可调用）。泄漏的 handler 会在释放后读已回收的排序信号 ⇒ panic。
+    #[test]
+    fn releasing_the_table_removes_its_sort_handler() {
+        let mut app = TestApp::new();
+        let table = table_with_rows(&mut app, 3);
+        mount(&mut app, &table);
+        let sort_action = table.inner.sort_action.clone();
+        assert!(
+            app.app().has_action_handler(&sort_action),
+            "attach 必须注册排序 handler"
+        );
+        let header = table.header_node(app.app(), 0).expect("header cell");
+        let point = center(&app, header);
+        let click0 = click_outcome(&mut app, point);
+        assert_eq!(
+            click0.action,
+            Some(sort_action.clone()),
+            "释放前点击表头必须由排序 handler 消费"
+        );
+        assert_eq!(table.sort(app.app()), Some((0, SortOrder::Ascending)));
+
+        assert!(table.release(app.app_mut()) > 0);
+        assert!(
+            !app.app().has_action_handler(&sort_action),
+            "release 必须摘掉排序 handler"
+        );
+        // 不卸载节点直接释放：重放点击不得再调用已摘除的 handler（否则读死信号 panic）。
+        let click1 = click_outcome(&mut app, point);
+        assert_eq!(click1.action, None, "释放后重放点击不得再命中排序 handler");
     }
 
     /// 空态：行数为 0 时提示可见、行体没有行；加行后提示消失。
