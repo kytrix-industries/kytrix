@@ -1,187 +1,113 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+//! The Kytrix application shell.
+//!
+//! The binary is the composition root and nothing else: it builds the one tokio runtime,
+//! the one [`Composition`] (settings, translation, theme, the three application-level
+//! registries, the widget catalogue and the services aggregate), opens the main window,
+//! mounts the [`shell::Shell`] into it and runs the engine's event loop.
+//!
+//! # Startup order
+//!
+//! The order is a dependency order (see [`Composition::new`]): the settings are read
+//! first because every later step projects from them, the translator renders the text the
+//! rest publishes, the three registries exist before any component can register with
+//! them, and the window is created last — a composition that failed has no window to
+//! close. Nothing here installs a process global: the aggregate is handed down.
+//!
+//! # Frame ownership
+//!
+//! `App::on_frame` is a single slot. [`FrameRouter`] owns it (created exactly once, by
+//! the composition root) and fans a tick out to the shell's route, the settings pages'
+//! routes and every mounted widget's route; no module here calls `App::on_frame`, and
+//! `App::on_animation_complete` is registered only by the composition root's
+//! [`AnimationRouter`].
+
+mod composition;
 mod language;
+mod shell;
+#[cfg(test)]
+mod test_support;
 #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 mod translation;
-mod windows;
 
-use std::sync::Arc;
-
-use app_config_provider::{
-    manager::{self as config_manager, ConfigManager},
-    notification::ConfigNotification,
-    store::ConfigRecovery,
-};
-use kytrix_service_provider::{auth::model::AuthError, service::connector::KytrixServiceConnector};
-use market_participants_connector::connector::{
-    MarketParticipantsConnector, MarketParticipantsConnectorError,
-};
-use network::transport::hub::{TransportHub, TransportPolicy};
+use app_config_provider::store::ConfigStore;
 use thiserror::Error;
-use updater_ui::global::UpdaterDeps;
+use ui_core::app::{App, Application};
+
+use crate::composition::Composition;
 
 fn main() {
-    gpui_kit::application()
-        .with_assets(base_ui::assets::Assets)
-        .run(|cx| match initialize(cx) {
-            Ok(recovery) => windows::root::window::open(cx, recovery),
-            Err(error) => {
-                log::error!("failed to initialize the application: {error}");
-                cx.quit();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("kytrix: failed to build the application runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut app = App::new(runtime.handle().clone());
+    let composition = match Composition::new(&mut app, runtime.handle().clone()) {
+        Ok(composition) => composition,
+        Err(error) => {
+            log::error!("failed to initialize the application: {error}");
+            eprintln!("kytrix: failed to initialize the application: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    match shell::root::Shell::open(&mut app, std::rc::Rc::clone(&composition)) {
+        Ok(shell) => {
+            if let Err(error) = shell::root::Shell::install(&mut app, shell).map(|_| ()) {
+                log::error!("failed to install the application shell: {error}");
+                eprintln!("kytrix: failed to install the application shell: {error}");
+                std::process::exit(1);
             }
-        });
-}
-
-/// Installs every global the UI reads before the first window opens.
-///
-/// The order is a dependency order: the translator renders the text every later
-/// step publishes, the shared runtime drives the services built from the
-/// persisted settings, and then the market participants root is built — it owns the
-/// catalogue, the venues and the runtime projection itself. Installing it is
-/// wiring and nothing else: no venue is loaded at startup, because the only
-/// action that loads a market is the user's own, through the market-participants
-/// menu. The download manager is installed on the service transport and the shared
-/// runtime, and the two features that fetch through it — the translation page and
-/// the updater — are installed after it so they are handed the manager rather than
-/// looking it up. The updater is the last of them: nothing else reads it, and its
-/// first check is a delay rather than work this call does.
-///
-/// Returns the settings recovery, if the stored file was unusable and had to be
-/// replaced with defaults. Starting up is never blocked by a damaged file, and the
-/// window is what tells the user about it.
-fn initialize(cx: &mut gpui_kit::App) -> Result<Option<ConfigRecovery>, InitializationError> {
-    gpui_kit::base::init(cx);
-    base_ui::style::theme::install(cx);
-    i18n::global::embedded::install(cx)?;
-    widget_tokio_runtime::global::install(cx)?;
-    widget_registry::catalogue::install(cx)?;
-    let recovery = config_manager::install(cx);
-    language::apply_startup(cx);
-    language::install(cx);
-    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
-    translation::install(cx)?;
-    MarketParticipantsConnector::install(cx)?;
-    let transport = install_kytrix_service(cx)?;
-    let runtime = widget_tokio_runtime::global::try_handle(cx)
-        .ok_or(InitializationError::RuntimeUnavailable)?;
-    let downloads = download_provider::global::install(
-        cx,
-        download_provider::global::DownloadProviderDeps {
-            transport: Arc::clone(&transport),
-            runtime: runtime.clone(),
-        },
-    );
-    settings_ui::translation_downloads::install(
-        cx,
-        settings_ui::translation_downloads::TranslationDownloadsDeps {
-            provider: downloads.clone(),
-            runtime: runtime.clone(),
-            unload: translation_unload(),
-        },
-    );
-    updater_ui::global::install(
-        cx,
-        UpdaterDeps {
-            transport,
-            runtime,
-            provider: downloads,
-        },
-    );
-
-    Ok(recovery)
-}
-
-/// Connects the application to the Kytrix service.
-///
-/// Every Kytrix-backed widget reads this one connector, and it is built here
-/// rather than lazily because the login it carries is a property of the process:
-/// the account a user signed in as is what those widgets are scoped to. Building
-/// it does not fetch anything — a request is what opens the connection.
-///
-/// The transport comes back because it is the process's, not the connector's: the
-/// download manager and the updater take the same one, so an update request leaves
-/// along the route the user configured for it, under the same lifecycle barrier as
-/// everything else.
-fn install_kytrix_service(
-    cx: &mut gpui_kit::App,
-) -> Result<Arc<TransportHub>, InitializationError> {
-    let runtime = widget_tokio_runtime::global::try_handle(cx)
-        .ok_or(InitializationError::RuntimeUnavailable)?;
-    let manager = cx
-        .try_global::<ConfigManager>()
-        .ok_or(InitializationError::ConfigurationUnavailable)?;
-    let notification = ConfigNotification::new(Arc::new(manager.read().network_config()));
-    let transport = Arc::new(TransportHub::new(transport_policy()));
-    let connector = KytrixServiceConnector::install(cx, &runtime, notification, transport.clone())?;
-    cx.set_global(connector);
-
-    Ok(transport)
-}
-
-/// The transport policy the build calls for.
-///
-/// A development build talks to the service on the loopback, which is plaintext: the
-/// account origin is `http://127.0.0.1:18010` and the service socket is `ws://`, so a
-/// TLS-only transport would refuse every request — including the token exchange that
-/// finishes a sign-in. A production build talks to `https://account.kytrix.xyz` and
-/// `wss://api.kytrix.xyz` and never sends plaintext anywhere.
-///
-/// The policy is derived from the same `production` switch as those origins, so the two
-/// cannot disagree about which environment this build is for.
-const fn transport_policy() -> TransportPolicy {
-    TransportPolicy {
-        allow_plaintext: !cfg!(feature = "production"),
-        extra_root_certificates: Vec::new(),
+        }
+        Err(error) => {
+            log::error!("failed to open the main window: {error}");
+            eprintln!("kytrix: failed to open the main window: {error}");
+            std::process::exit(1);
+        }
     }
-}
 
-/// Drops the translation engine that may hold a model file before the download manager deletes
-/// it. Windows ARM64 has no llama.cpp build, so there the engine cannot have loaded a file.
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
-fn translation_unload() -> Arc<
-    dyn Fn(&std::path::Path) -> Result<(), settings_ui::translation_downloads::UnloadFailure>
-        + Send
-        + Sync,
-> {
-    Arc::new(|path| {
-        ai_translator::translator::unload_model(path).map_err(|error| match error {
-            ai_translator::error::TranslationError::UnloadTimeout { .. } => {
-                settings_ui::translation_downloads::UnloadFailure::TimedOut
-            }
-            _ => settings_ui::translation_downloads::UnloadFailure::Engine,
-        })
-    })
-}
-
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-fn translation_unload() -> Arc<
-    dyn Fn(&std::path::Path) -> Result<(), settings_ui::translation_downloads::UnloadFailure>
-        + Send
-        + Sync,
-> {
-    Arc::new(|_: &std::path::Path| Ok(()))
+    if let Err(error) = Application::new().run(app) {
+        log::error!("the application event loop failed: {error}");
+        eprintln!("kytrix: the application event loop failed: {error}");
+        std::process::exit(1);
+    }
 }
 
 /// Failure to bring the application into a runnable state.
 #[derive(Debug, Error)]
-enum InitializationError {
+pub(crate) enum InitializationError {
     #[error(transparent)]
     Translations(#[from] i18n::error::types::Error),
+    #[error(transparent)]
+    Engine(#[from] ui_core::error::EngineError),
+    #[error(transparent)]
+    MarketParticipants(
+        #[from] market_participants_connector::connector::MarketParticipantsConnectorError,
+    ),
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     #[error(transparent)]
     AiTranslation(#[from] ai_translator::error::TranslationError),
-    #[error(transparent)]
-    TokioRuntime(#[from] widget_tokio_runtime::global::TokioRuntimeError),
-    #[error(transparent)]
-    WidgetRegistry(#[from] widget_registry::registry::WidgetRegistryError),
-    #[error(transparent)]
-    MarketParticipants(#[from] MarketParticipantsConnectorError),
-    #[error(transparent)]
-    Auth(#[from] AuthError),
-    #[error("a Tokio runtime is required for the Kytrix service connection")]
-    RuntimeUnavailable,
-    #[error("the application settings are not installed")]
-    ConfigurationUnavailable,
+    #[error("the widget catalogue could not be assembled: {0}")]
+    Catalogue(#[from] widget_registry::registry::WidgetRegistryError),
+}
+
+/// The store the composition root opens before anything else exists.
+///
+/// Startup never fails on a damaged file: the store replaces it with defaults and reports
+/// the recovery, which the shell announces to the user once the window is up.
+pub(crate) fn open_config_store() -> (
+    ConfigStore,
+    Option<app_config_provider::store::ConfigRecovery>,
+) {
+    ConfigStore::load_default()
 }
 
 #[cfg(test)]
@@ -194,14 +120,8 @@ mod tests {
 
     #[test]
     fn persisted_languages_should_map_to_the_translator_languages() {
-        assert_eq!(
-            crate::language::language_code(Language::ZhCn),
-            LanguageCode::ZhCn
-        );
-        assert_eq!(
-            crate::language::language_code(Language::En),
-            LanguageCode::En
-        );
+        assert_eq!(crate::language::code(Language::ZhCn), LanguageCode::ZhCn);
+        assert_eq!(crate::language::code(Language::En), LanguageCode::En);
     }
 
     /// The two halves of one switch: where this build sends requests, and whether the
@@ -209,16 +129,14 @@ mod tests {
     ///
     /// They are decided in different crates — the origins by
     /// `kytrix_service_provider`'s `production` feature, the policy here — and a build
-    /// that picks a plaintext origin while refusing plaintext cannot sign a user in:
-    /// the browser authorizes, the callback arrives, and the token exchange is refused
-    /// by the TLS-only client. That is exactly what this test exists to prevent.
+    /// that picks a plaintext origin while refusing plaintext cannot sign a user in.
     #[test]
     fn the_transport_policy_should_match_the_origins_the_build_uses() {
         let plaintext_origins =
             ACCOUNT_ORIGIN.starts_with("http://") && API_RESOURCE.starts_with("http://");
 
         assert_eq!(
-            transport_policy().allow_plaintext,
+            composition::transport_policy().allow_plaintext,
             plaintext_origins,
             "account origin {ACCOUNT_ORIGIN}, resource {API_RESOURCE}"
         );

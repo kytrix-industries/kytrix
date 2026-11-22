@@ -1,37 +1,18 @@
-//! The process-wide projection of the configured language.
+//! The projection of the configured language onto the translator and the engine signal.
+//!
+//! The language is one stored preference with two consumers: [`Translate`] renders the
+//! catalogue text, and [`Signal<LanguageCode>`] is the engine dependency a drawn node
+//! registers when its text must follow the language. The two are written together by the
+//! composition root — translator first, signal second — because a node that reads the new
+//! language from the signal must find the translator already rendering it.
+//!
+//! [`Signal<LanguageCode>`]: ui_core::node::signal::Signal
 
 use app_config::settings::Language;
-use app_config_provider::{events::LanguageChanged, manager::ConfigManager};
-use gpui_kit::{App, Global, Subscription};
 use i18n::language::codes::LanguageCode;
 
-/// Holds the subscription that keeps `LanguageCode` in step with the settings.
-struct LanguageProjection {
-    _subscription: Subscription,
-}
-
-impl Global for LanguageProjection {}
-
-/// Applies the persisted language once, before the first window is built.
-pub fn apply_startup(cx: &mut App) {
-    let language = cx.global::<ConfigManager>().read().language;
-
-    cx.set_global(language_code(language));
-}
-
-/// Subscribes the language global to `LanguageChanged`.
-pub fn install(cx: &mut App) {
-    let events = cx.global::<ConfigManager>().events().clone();
-    let subscription = cx.subscribe(&events, |_, event: &LanguageChanged, cx| {
-        cx.set_global(language_code(event.0));
-        cx.refresh_windows();
-    });
-    cx.set_global(LanguageProjection {
-        _subscription: subscription,
-    });
-}
-
-pub(crate) const fn language_code(language: Language) -> LanguageCode {
+/// The translator language a stored language preference names.
+pub(crate) const fn code(language: Language) -> LanguageCode {
     match language {
         Language::ZhCn => LanguageCode::ZhCn,
         Language::En => LanguageCode::En,
@@ -40,53 +21,23 @@ pub(crate) const fn language_code(language: Language) -> LanguageCode {
 
 #[cfg(test)]
 mod tests {
-    use app_config::settings::Config;
-    use gpui_kit::{BorrowAppContext as _, TestAppContext};
-
     use super::*;
 
-    /// A language write reaches the global the translator reads, without the
-    /// writing side touching it.
-    ///
-    /// The catalogue installs `En`, and the global is then reset to `ZhCn` so the
-    /// startup assertion cannot pass on the value the catalogue left behind. The
-    /// persisted setting is `En`, so only a startup projection that reads it
-    /// installs `En`; the write afterwards then moves the global to `ZhCn`, which
-    /// only the subscription does.
-    #[gpui_kit::test]
-    fn a_language_write_should_update_the_language_global(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-            cx.set_global(LanguageCode::ZhCn);
-
-            let mut config = Config::default();
-            config.language = Language::En;
-            let manager = ConfigManager::in_memory(config, cx);
-            cx.set_global(manager);
-            apply_startup(cx);
-            install(cx);
-        });
-
-        cx.update(|cx| {
+    /// Every stored language has exactly one translator language, and every translator
+    /// language has exactly one stored preference: the projection is a bijection, so a
+    /// settings write can never name a language the translator does not have.
+    #[test]
+    fn the_projection_should_cover_every_language_on_both_sides() {
+        assert_eq!(Language::ALL.len(), 2);
+        for language in Language::ALL {
+            let registered = code(language);
             assert_eq!(
-                *cx.global::<LanguageCode>(),
-                LanguageCode::En,
-                "the startup projection should install the persisted language"
+                registered,
+                match language {
+                    Language::ZhCn => LanguageCode::ZhCn,
+                    Language::En => LanguageCode::En,
+                }
             );
-        });
-
-        cx.update(|cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(|config| config.language = Language::ZhCn, cx);
-            });
-        });
-
-        cx.update(|cx| {
-            assert_eq!(
-                *cx.global::<LanguageCode>(),
-                LanguageCode::ZhCn,
-                "the subscription should follow the written language"
-            );
-        });
+        }
     }
 }
