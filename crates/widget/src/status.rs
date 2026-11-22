@@ -107,9 +107,20 @@ impl WidgetState {
 /// arguments are here, and the surface resolves them on the frame that draws them,
 /// in the language showing then. That is why no language is stored with the state,
 /// and why nothing has to be re-reported when the language moves.
+///
+/// The catalogue does not mark which values are plain sentences and which are
+/// fragments of markdown/HTML: the product authors some of a widget's own messages
+/// as aligned paragraphs (`widget.news.logged_out` is one), and
+/// [`common.market_not_loaded`](Self::MarketNotLoaded) as a paragraph with a
+/// `<kbd>` icon and a markdown line per venue. [`Notice::is_markdown`] answers the
+/// question from the resolved value, so a message is drawn richly in one language
+/// and as a sentence in another exactly as the catalogue authors it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Notice {
     /// One message of the catalogue that takes no arguments.
+    ///
+    /// The value may be a plain sentence or rich text; the surface asks
+    /// [`Notice::is_markdown`] rather than assuming either.
     Message(&'static str),
     /// `common.market_not_loaded`: this widget needs the metadata of these
     /// markets loaded first.
@@ -142,13 +153,20 @@ impl Notice {
 
     /// Whether [`resolve`](Self::resolve) answers rich text rather than plain text.
     ///
-    /// `common.market_not_loaded` is authored as an aligned HTML paragraph with a
-    /// `<kbd>` icon and one markdown line per venue, so the placeholder draws it
-    /// through `base_ui::kit::markdown`; a plain [`Notice::Message`] is drawn as a
-    /// sentence. The distinction is a property of the catalogue entry, not of the
-    /// state, so it lives here beside the variant that carries it.
-    pub const fn is_markdown(&self) -> bool {
-        matches!(self, Self::MarketNotLoaded { .. })
+    /// The catalogue has no markup flag, so the question is asked of the resolved
+    /// value: a notice is rich when the value the catalogue holds in `translate`
+    /// carries an HTML tag, a markdown link/image, strong emphasis or inline code.
+    /// That covers both shapes the product ships — `common.market_not_loaded`'s
+    /// aligned paragraph with a `<kbd>` icon and one markdown line per venue, and a
+    /// widget's own message such as `widget.news.logged_out`, whose value is a
+    /// `<p align="center">` paragraph. A plain sentence answers `false` and stays a
+    /// sentence.
+    ///
+    /// The question is asked where the notice is drawn, in the language showing
+    /// then, because the same key can be rich in one language and plain in another.
+    /// See [`is_rich_text`] for the markers.
+    pub fn is_markdown(&self, translate: &Translate) -> bool {
+        is_rich_text(&self.resolve(translate))
     }
 
     /// Resolves the reference into the sentence the catalogue holds in the language
@@ -161,6 +179,43 @@ impl Notice {
             }
         }
     }
+}
+
+/// Whether a resolved catalogue value is authored as rich text.
+///
+/// The product's copy uses four kinds of marker, and a value carrying any of them
+/// is a fragment of markdown/HTML rather than one sentence:
+///
+/// - an HTML tag (`<p align="center">`, `</p>`, `<kbd>`), which is how the aligned
+///   paragraphs and the keyboard icons are written;
+/// - a markdown link or image (`[text](target)`, `![](file://…)`);
+/// - strong emphasis (`**bold**`);
+/// - inline code (`` `code` ``).
+///
+/// Everything else — every ordinary sentence of the catalogue — answers `false` and
+/// is drawn by the empty state. The test deliberately works on the resolved text
+/// rather than on a key list: which values are rich is the catalogue's business, and
+/// a key list would have to be kept in step with the locales.
+fn is_rich_text(source: &str) -> bool {
+    has_html_tag(source) || source.contains("](") || source.contains("**") || source.contains('`')
+}
+
+/// Whether the text contains an HTML tag: `<name …>` or `</name>`.
+///
+/// A `<` is a tag when it is followed by an ASCII letter (an element name) or by
+/// `/` and an ASCII letter (a closing tag), and a `>` follows somewhere after it.
+/// That keeps a sentence that happens to compare numbers (`3 < 5`) plain text.
+fn has_html_tag(source: &str) -> bool {
+    source.match_indices('<').any(|(index, _)| {
+        let rest = &source[index + 1..];
+        let mut characters = rest.chars();
+        let named = match characters.next() {
+            Some('/') => characters.next().is_some_and(|c| c.is_ascii_alphabetic()),
+            Some(c) => c.is_ascii_alphabetic(),
+            None => false,
+        };
+        named && rest.contains('>')
+    })
 }
 
 /// The state cell of one widget instance: the single point of reading and writing.
@@ -367,6 +422,7 @@ mod tests {
       failure: Sample failure
     test:
       waiting: Waiting for orders
+      rich: '<p align="center">Click the <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> button.</p>'
     "#;
 
     const MESSAGES_ZH: &str = r#"
@@ -377,6 +433,7 @@ mod tests {
       failure: 示例失败
     test:
       waiting: 正在等待订单
+      rich: '<p align="center">点击 <kbd>![](file://icons/phosphoricons/puzzle-piece.svg)</kbd> 按钮</p>'
     "#;
 
     /// A typed error whose text is resolved in the language the context renders.
@@ -569,6 +626,24 @@ mod tests {
             notice.resolve(&zh).as_str(),
             "正在等待订单",
             "the same reference resolves in the language showing now"
+        );
+    }
+
+    /// The rich/plain question is asked of the resolved value, not of the variant
+    /// a widget reported: one `Message` can be a sentence and another can be the
+    /// catalogue's aligned paragraph with a `<kbd>` icon, and the surface has to
+    /// know which before it decides how to draw it.
+    #[test]
+    fn a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup() {
+        let translate = translate();
+
+        assert!(
+            !Notice::message("test.waiting").is_markdown(&translate),
+            "a plain sentence is drawn by the empty state"
+        );
+        assert!(
+            Notice::message("test.rich").is_markdown(&translate),
+            "a message whose value carries a tag is rich text"
         );
     }
 

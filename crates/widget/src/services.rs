@@ -19,6 +19,13 @@
 //! ([`WidgetCx::config_ref`](crate::cx::WidgetCx::config_ref)) or the signal (inside a
 //! `bind_*` closure that must follow a setting).
 //!
+//! The framework's surface root reads the signal while it renders, like the language
+//! and the directory generation: **one settings write schedules exactly one frame**,
+//! and every mounted widget's `sync` runs on it — including a widget that has no body
+//! yet, whose own tree therefore has no node that could carry the edge. A widget that
+//! follows a setting compares it in `sync` (or derives its drawing from it inside a
+//! `bind_*`); it never schedules the frame itself. See `crates/widgets/AGENTS.md` §8.1.
+//!
 //! # The directory generation
 //!
 //! [`WidgetServices::catalog_generation`] is the published market-directory generation
@@ -125,7 +132,9 @@ pub struct WidgetServices {
     /// The current settings snapshot as an engine signal.
     ///
     /// The composition root writes it when `ConfigManager`'s snapshot moves; a
-    /// `bind_*` closure that reads it follows the setting it reads.
+    /// `bind_*` closure that reads it follows the setting it reads. The framework's
+    /// surface root reads it too, so a write schedules a frame even for a widget
+    /// with no body (see the module documentation).
     pub config: Signal<Config>,
     /// The theme service: colours are read through it inside `bind_style` closures.
     pub theme: ThemeHandle,
@@ -165,6 +174,11 @@ pub struct WidgetServices {
     /// animating widget reads it and lands on the final value when it is set.
     pub reduce_motion: Signal<bool>,
     /// The tokio runtime the widget's streams and RPC calls are driven on.
+    ///
+    /// The composition root hands over the application runtime; the framework's test
+    /// host owns a current-thread runtime and drives it through
+    /// [`WidgetTestApp::drain_runtime`](crate::test_support::WidgetTestApp::drain_runtime)
+    /// / [`run_until_idle`](crate::test_support::WidgetTestApp::run_until_idle).
     pub runtime: Handle,
 }
 
