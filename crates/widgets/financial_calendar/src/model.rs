@@ -26,7 +26,6 @@
 
 use std::sync::Arc;
 
-use gpui_kit::SharedString;
 use kytrix_proto::types::v1 as proto_types;
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
@@ -388,20 +387,16 @@ fn local_date(at: i64, zone: UtcOffset) -> Option<Date> {
 /// An all-day event has no clock to draw: the page gave it a date, and the protocol
 /// wrote that date as midnight UTC. Showing midnight — moved into the display zone,
 /// no less — would invent a time the page never stated.
-pub(crate) fn format_time(event: &CalendarEvent, zone: UtcOffset) -> SharedString {
+pub(crate) fn format_time(event: &CalendarEvent, zone: UtcOffset) -> SmolStr {
     if event.all_day {
-        return SharedString::default();
+        return SmolStr::default();
     }
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(event.at) * 1_000_000)
         .ok()
         .and_then(|datetime| datetime.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--:--"),
-            |datetime| {
-                SharedString::new(
-                    format_smolstr!("{:02}:{:02}", datetime.hour(), datetime.minute()).as_str(),
-                )
-            },
+            || SmolStr::new_static("--:--"),
+            |datetime| format_smolstr!("{:02}:{:02}", datetime.hour(), datetime.minute()),
         )
 }
 
@@ -711,9 +706,9 @@ mod tests {
         let at = utc(Month::October, 25, 13);
         let event = event(at, "US");
 
-        assert_eq!(format_time(&event, UtcOffset::UTC).as_ref(), "13:00");
-        assert_eq!(format_time(&event, zone(8)).as_ref(), "21:00");
-        assert_eq!(format_time(&event, zone(-5)).as_ref(), "08:00");
+        assert_eq!(format_time(&event, UtcOffset::UTC).as_str(), "13:00");
+        assert_eq!(format_time(&event, zone(8)).as_str(), "21:00");
+        assert_eq!(format_time(&event, zone(-5)).as_str(), "08:00");
     }
 
     /// An all-day event is a date the page gave, not a clock: midnight UTC is the
@@ -724,14 +719,14 @@ mod tests {
         let all_day = all_day_event(utc(Month::October, 25, 0));
 
         for zone in [UtcOffset::UTC, zone(8), zone(-5)] {
-            assert_eq!(format_time(&all_day, zone).as_ref(), "");
+            assert_eq!(format_time(&all_day, zone).as_str(), "");
         }
     }
 
     #[test]
     fn an_instant_the_calendar_does_not_hold_should_be_a_timed_out_cell() {
         assert_eq!(
-            format_time(&event(i64::MIN, "US"), UtcOffset::UTC).as_ref(),
+            format_time(&event(i64::MIN, "US"), UtcOffset::UTC).as_str(),
             "--:--"
         );
     }
@@ -814,7 +809,7 @@ mod tests {
             "an event at midnight has a clock, and it is zero"
         );
         assert_eq!(
-            format_time(&snapshot.events()[1], UtcOffset::UTC).as_ref(),
+            format_time(&snapshot.events()[1], UtcOffset::UTC).as_str(),
             "00:00"
         );
         assert!(!snapshot.events()[2].all_day);

@@ -618,7 +618,6 @@ widget:
     country: Country
     day_label: '%{weekday}, %{month} %{day}, %{year}'
     filter_choice: '%{filter}: %{value}'
-    filter_tooltip: Filter by %{filter}
     importance: Importance
     importance_level:
       high: High
