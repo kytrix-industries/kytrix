@@ -19,6 +19,13 @@
 //! **同一份** `Style` 计算，所以两处列宽严格对齐）。引擎滚动容器是单轴纵向的，因此
 //! 「横向滚动的冻结列」不在本批范围（需要横向滚动容器 + 表头/行体两份窗口，属后续批次）。
 //!
+//! # 表头文案（P2-10）
+//!
+//! [`Column::header`] 是构建期静态文案；[`Column::header_binding`] 给同一处文本加绑定面
+//! （[`TextValue::Bound`] = `Signal<SmolStr>`，写信号即更新表头文本，**不重建**表头节点 /
+//! 整张表）。迁移批（W3/W4/W5）在语言切换时只能「摘表头 → 重建表格」；绑定后调用方把语言
+//! 文案写进信号即可，重建代价消失。`Static` 形态与直接给 `header` 等价（不注册动态依赖）。
+//!
 //! # 排序
 //!
 //! 表头可排序列点击后把 [`SortOrder`] 写进 `Signal` 并调用 [`Table::on_sort`] 注册的回调
@@ -102,7 +109,10 @@ use ui_core::{
 };
 
 use crate::{
-    kit::list::{List, ListOptions, RowHeight, Selection, SelectionMode},
+    kit::{
+        list::{List, ListOptions, RowHeight, Selection, SelectionMode},
+        text_value::TextValue,
+    },
     style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
@@ -168,8 +178,14 @@ pub fn next_sort_order(current: SortState, column: usize) -> SortState {
 /// 一列的定义。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Column {
-    /// 列头文案。
+    /// 列头静态文案（构建期值；`None` 绑定态下仍作为回退文本）。
     pub header: SmolStr,
+    /// 列头文案的绑定面：`Some(Bound(信号))` 时写信号即更新表头文本，**不重建表格**。
+    ///
+    /// 用 [`Column::header_binding`] 设置；`Some` 覆盖 `header`（`Static` 形态等价于改
+    /// `header`，`Bound` 形态的首帧前文本为空串、由首帧 `bind_text` 求出真值）。
+    /// 语言切换因此不再需要「摘表头节点 → 重建整张表」。
+    pub header_binding: Option<TextValue>,
     /// 宽度策略。
     pub width: ColumnWidth,
     /// 单元格对齐。
@@ -189,6 +205,7 @@ impl Column {
     pub fn fixed(header: impl Into<SmolStr>, width: f32) -> Self {
         Self {
             header: header.into(),
+            header_binding: None,
             width: ColumnWidth::Fixed(width.max(1.0)),
             align: ColumnAlign::Start,
             sortable: false,
@@ -201,11 +218,19 @@ impl Column {
     pub fn flex(header: impl Into<SmolStr>, weight: f32) -> Self {
         Self {
             header: header.into(),
+            header_binding: None,
             width: ColumnWidth::Flex(weight.max(0.0)),
             align: ColumnAlign::Start,
             sortable: false,
             column_span: 1,
         }
+    }
+
+    /// 列头文案的绑定面（写信号即更新，不重建表格；见 [`Column::header_binding`] 字段）。
+    #[must_use]
+    pub fn header_binding(mut self, header: TextValue) -> Self {
+        self.header_binding = Some(header);
+        self
     }
 
     /// 对齐。
@@ -713,11 +738,21 @@ impl Table {
             };
             let cell = cell.build(tree, header_row)?;
             let label_theme = theme.clone();
-            NodeBuilder::text(
-                column.header.clone(),
+            // 列头文案：绑定态优先（`Static` 等价于静态 `header`，`Bound` 首帧前为空串）。
+            let label = column
+                .header_binding
+                .clone()
+                .unwrap_or_else(|| TextValue::Static(column.header.clone()));
+            let initial = label.initial_text();
+            let mut text = NodeBuilder::text(
+                initial,
                 TextStyle::new(inner.theme.tokens().medium.font_size),
-            )
-            .bind_style(move |cx| StylePatch {
+            );
+            if label.is_bound() {
+                // 语言切换 = 写信号 ⇒ 表头文本原地更新（不重建表格 / 不重挂表头节点）。
+                text = text.bind_text(move |cx| label.read(cx));
+            }
+            text.bind_style(move |cx| StylePatch {
                 foreground: Some(label_theme.role(cx, Role::FgMuted)),
                 ..StylePatch::default()
             })
@@ -965,6 +1000,7 @@ mod tests {
         kit::{
             list::{RowHeight, SelectionMode},
             test_support::{a11y_of, assert_single_parent_per_node, frame_a11y, full_a11y},
+            text_value::TextValue,
         },
         style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
@@ -1012,6 +1048,61 @@ mod tests {
 
         let variable = TableOptions::variable(40.0);
         assert_eq!(variable.row_height, RowHeight::Variable { estimate: 40.0 });
+    }
+
+    /// **P2-10**（W3/W4/W5 共同钉住的缺口）：表头文案的绑定面。
+    ///
+    /// 旧迁移批的列头是构建期 `SmolStr`，语言切换只能「摘表头 → 重建整张表格」；
+    /// [`Column::header_binding`] 把 `TextValue` 接到列头文本节点上：写信号即更新文本，
+    /// 表头节点（以及整张表）**不重建**。同一张表里静态列与绑定列可以共存。
+    ///
+    /// 变异防线：`header_binding` 不注册 `bind_text`（首帧仍画 `header`）⇒ 写信号后文本不变，红。
+    #[test]
+    fn a_bound_header_text_updates_without_rebuilding_the_table() {
+        let mut app = TestApp::new();
+        let language = app.app_mut().signal(SmolStr::new_static("金额"));
+        let table = table_with(
+            &mut app,
+            vec![
+                Column::flex("value", 1.0),
+                Column::flex("", 1.0).header_binding(TextValue::bound(language)),
+            ],
+            TableOptions::fixed(28.0),
+            4,
+            text_cell,
+        );
+        mount_in(&mut app, &table, 320.0, 200.0);
+        let header_static = table.header_node(app.app(), 0).expect("header 0");
+        let header_bound = table.header_node(app.app(), 1).expect("header 1");
+        assert_eq!(
+            texts(&app, header_bound),
+            vec![SmolStr::new_static("金额")],
+            "绑定列的首帧文本来自信号（首个 text pass 求出真值）"
+        );
+        assert_eq!(
+            texts(&app, header_static),
+            vec![SmolStr::new_static("value")],
+            "静态列不受绑定面影响"
+        );
+
+        app.app_mut()
+            .write(&language, SmolStr::new_static("Amount"));
+        let _ = app.drain().expect("frame");
+        assert_eq!(
+            texts(&app, header_bound),
+            vec![SmolStr::new_static("Amount")],
+            "写语言信号即更新表头文本"
+        );
+        assert_eq!(
+            table.header_node(app.app(), 1),
+            Some(header_bound),
+            "表头节点没有被重建（同一 NodeId）"
+        );
+        assert_eq!(
+            texts(&app, header_static),
+            vec![SmolStr::new_static("value")],
+            "静态列仍不受影响"
+        );
     }
 
     fn text_cell(
