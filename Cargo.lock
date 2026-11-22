@@ -7505,23 +7505,21 @@ name = "perpetual_statistics"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
+ "bytes",
  "i18n",
  "instrument_selector_ui",
  "log",
  "market_participants_connector",
  "market_participants_model",
- "network",
  "serde",
  "serde_json",
  "smol_str",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
