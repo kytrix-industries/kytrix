@@ -17,7 +17,7 @@ use std::{
 };
 
 use ahash::{HashMap, HashSet};
-use base_ui::theme::components::InteractiveState;
+use base_ui::{kit::list::SelectionMode, theme::components::InteractiveState};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::{
     catalog::{batch::CatalogEntry, error::CatalogError, store::Catalog, test_support},
@@ -38,12 +38,18 @@ use market_participants_model::{
         selection::{InstrumentSelection, ListingTicker},
         units::{MarketQuantity, QuantityUnit},
     },
+    outcome::{OutcomeGroupId, OutcomeMemberId, OutcomeSideId},
     routing::CapabilityId,
 };
 use serde_json::json;
 use smol_str::SmolStr;
 use tokio::sync::{Mutex, mpsc};
-use ui_core::node::{builder::NodeBuilder, id::NodeId};
+use ui_core::{
+    event::{Action, ActionSource},
+    interaction::ItemAlign,
+    math::Size,
+    node::{builder::NodeBuilder, id::NodeId},
+};
 use widget::{
     config::WidgetConfigChange,
     protocol::RequestId,
@@ -58,7 +64,7 @@ use crate::{
     directory::WatchListDirectory,
     model::{WatchListEntry, WatchListStreamEvent},
     service::{TickerEventSubscription, TickerSource},
-    table::MISSING_VALUE,
+    table::{ACTIONS_COLUMN, COLUMN_COUNT, MISSING_MARKET_COLUMN, MISSING_VALUE},
 };
 
 // ------------------------------------------------------------------- vocabulary
@@ -662,6 +668,17 @@ fn service_refused() -> WidgetRpcResult<WatchListProtocol> {
     Err(refused())
 }
 
+/// The laid-out box of one drawn node.
+fn bounds(fixture: &Fixture, node: NodeId) -> ui_core::math::Rect {
+    fixture
+        .harness
+        .tree()
+        .get(node)
+        .expect("the node is drawn")
+        .layout()
+        .bounds
+}
+
 // ------------------------------------------------------------------- lifecycle
 
 #[test]
@@ -951,7 +968,12 @@ fn a_row_waiting_for_its_market_should_be_one_cell_where_its_values_would_be() {
     assert_eq!(fixture.rows(WatchListMarket::Continuous), 1);
     assert_eq!(fixture.rows(WatchListMarket::Session), 1);
     let session = fixture.table_pane(WatchListMarket::Session);
-    let sentence = fixture.harness.text_of(session.node);
+    let app = fixture.harness.app();
+    let cells: Vec<Option<NodeId>> = (0..COLUMN_COUNT)
+        .map(|column| session.table.cell_node(app, 0, column))
+        .collect();
+    let merged = cells[MISSING_MARKET_COLUMN].expect("the row draws the cell that stands in");
+    let sentence = fixture.harness.text_of(merged);
     let market_name = unloaded
         .route
         .venue
@@ -964,26 +986,54 @@ fn a_row_waiting_for_its_market_should_be_one_cell_where_its_values_would_be() {
         !sentence.contains("<p") && !sentence.contains("!["),
         "the catalogue's markup is not drawn: {sentence}"
     );
+    for (column, cell) in cells.iter().enumerate() {
+        let expected = column <= MISSING_MARKET_COLUMN || column == ACTIONS_COLUMN;
+        assert_eq!(
+            cell.is_some(),
+            expected,
+            "column {column} is {} of a row waiting for its market",
+            if expected { "a cell" } else { "covered" }
+        );
+    }
+
+    // The one cell stands in for every column but the route and the controls, so its
+    // width is the six columns it replaces rather than any one of them.
+    let route = bounds(&fixture, cells[0].expect("the route keeps its own cell"));
+    let merged = bounds(&fixture, merged);
+    let actions = bounds(
+        &fixture,
+        cells[ACTIONS_COLUMN].expect("the controls keep their own cell"),
+    );
+    let spanned: f32 = (MISSING_MARKET_COLUMN..ACTIONS_COLUMN)
+        .map(|column| {
+            bounds(
+                &fixture,
+                session
+                    .table
+                    .header_node(app, column)
+                    .expect("every column keeps its header cell"),
+            )
+            .size
+            .width
+        })
+        .sum();
     assert!(
-        session
-            .table
-            .cell_node(fixture.harness.app(), 0, 1)
-            .is_some(),
-        "the row draws its one cell where its values would be"
+        merged.size.width > route.size.width * 2.0,
+        "the waiting cell is wider than any one column it replaces: {merged:?} vs {route:?}"
     );
     assert!(
-        session
-            .table
-            .cell_node(fixture.harness.app(), 0, 2)
-            .is_none(),
-        "the covered columns have no cells"
+        (merged.size.width - spanned).abs() <= spanned * 0.05 + 1.0,
+        "the waiting cell is as wide as the six columns it replaces: {} vs {spanned}",
+        merged.size.width
     );
     assert!(
-        session
-            .table
-            .cell_node(fixture.harness.app(), 0, 7)
-            .is_some(),
-        "the controls keep their own column"
+        (actions.origin.x - (merged.origin.x + merged.size.width)).abs() <= 1.0,
+        "the controls sit in their own column right beside the waiting cell: \
+         merged {merged:?}, controls {actions:?}"
+    );
+    assert!(
+        route.origin.x < merged.origin.x,
+        "the route keeps the column before it: {route:?} vs {merged:?}"
     );
 }
 
@@ -1074,6 +1124,32 @@ fn the_two_tables_should_offer_their_own_column_sets() {
 }
 
 #[test]
+fn the_tables_should_draw_rows_to_read_rather_than_rows_to_pick() {
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following));
+    fixture.start();
+    fixture.frame();
+
+    // The kit table selects rows when it is clicked unless it is told not to, and a
+    // selected row paints in the selection palette for a selection nothing acts on.
+    assert_eq!(
+        crate::table::table_options(28.0).selection,
+        SelectionMode::None,
+        "a watch list draws read-only rows"
+    );
+    for market in [WatchListMarket::Continuous, WatchListMarket::Session] {
+        assert!(
+            fixture
+                .table_pane(market)
+                .table
+                .selection(fixture.harness.app())
+                .is_empty(),
+            "no row of {market:?} is selected"
+        );
+    }
+}
+
+#[test]
 fn the_first_column_should_state_the_route_the_row_follows() {
     let following = vec![key("BTCUSDT")];
     let mut fixture = Fixture::new(config(following));
@@ -1096,8 +1172,63 @@ fn the_traded_columns_should_show_the_unit_their_listing_publishes() {
         .quote(&following[0], ticker(&following[0], 100, 120));
     fixture.start();
     let text = fixture.table_text(WatchListMarket::Continuous);
-    assert!(text.contains("BTC"), "the traded quantity's unit: {text}");
-    assert!(text.contains("USDT"), "the traded notional's asset: {text}");
+    assert!(
+        text.contains("10.00 ETH"),
+        "the traded quantity is counted in the asset it came with: {text}"
+    );
+    assert!(
+        text.contains("1.00K USDT"),
+        "the traded notional is counted in its own asset: {text}"
+    );
+}
+
+#[test]
+fn the_traded_quantity_should_be_counted_in_contracts_when_the_listing_publishes_them() {
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following.clone()));
+    let mut contracts = ticker(&following[0], 100, 120);
+    contracts.traded_quantity = Some(MarketQuantity {
+        value: Quantity::from(10_u64),
+        unit: QuantityUnit::Contracts,
+    });
+    fixture.source.quote(&following[0], contracts);
+    fixture.start();
+    let text = fixture.table_text(WatchListMarket::Continuous);
+    let unit = t_smol!(fixture.pane.widget.translate, "widget.watch_list.contracts");
+    assert!(
+        text.contains(&format!("10.00 {unit}")),
+        "the quantity is counted in contracts rather than in the asset: {text}"
+    );
+}
+
+#[test]
+fn the_traded_quantity_should_be_counted_in_outcome_tokens_when_the_listing_publishes_them() {
+    let identity = |digits: char| format!("v1/{}", digits.to_string().repeat(64));
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following.clone()));
+    let mut tokens = ticker(&following[0], 100, 120);
+    tokens.traded_quantity = Some(MarketQuantity {
+        value: Quantity::from(10_u64),
+        unit: QuantityUnit::OutcomeTokens {
+            group: OutcomeGroupId::from_identity_value(&identity('1'))
+                .expect("a published group identity"),
+            member: OutcomeMemberId::from_identity_value(&identity('2'))
+                .expect("a published member identity"),
+            side: OutcomeSideId::from_identity_value(&identity('3'))
+                .expect("a published side identity"),
+        },
+    });
+    fixture.source.quote(&following[0], tokens);
+    fixture.start();
+    let text = fixture.table_text(WatchListMarket::Continuous);
+    let unit = t_smol!(
+        fixture.pane.widget.translate,
+        "widget.watch_list.outcome_tokens"
+    );
+    assert!(
+        text.contains(&format!("10.00 {unit}")),
+        "the quantity is counted in outcome tokens: {text}"
+    );
 }
 
 #[test]
@@ -1190,7 +1321,96 @@ fn a_row_should_name_the_market_to_load_in_the_language_showing() {
     assert_ne!(english, chinese, "the language moved");
 }
 
-// ------------------------------------------------------------------- controls
+// ---------------------------------------------------------------- the header control
+
+#[test]
+fn the_header_should_be_rebuilt_in_the_language_showing() {
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following));
+    fixture.start();
+    fixture.build_header();
+    fixture.frame();
+    let header = fixture
+        .pane
+        .widget
+        .header
+        .as_ref()
+        .expect("the header control");
+    let built = header.node;
+    let english = header
+        .button
+        .a11y_label_text()
+        .expect("the control is named")
+        .to_owned();
+    assert_eq!(
+        english,
+        t_smol!(fixture.pane.widget.translate, "widget.watch_list.add"),
+        "the control says what it does in the language it was built in"
+    );
+
+    fixture.switch_language(LanguageCode::ZhCn);
+    fixture.sync();
+    fixture.harness.drain();
+
+    let header = fixture
+        .pane
+        .widget
+        .header
+        .as_ref()
+        .expect("the control is still there");
+    assert_ne!(
+        header.node, built,
+        "a language switch rebuilds the control rather than leaving its copy behind"
+    );
+    assert_eq!(
+        header.button.a11y_label_text(),
+        Some(t_smol!(fixture.pane.widget.translate, "widget.watch_list.add").as_str()),
+        "and the rebuilt one is named in the language showing"
+    );
+    assert!(
+        fixture.harness.visible(header.node),
+        "the rebuilt control is drawn"
+    );
+}
+
+#[test]
+fn a_new_generation_should_rebuild_the_header_picker() {
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following));
+    fixture.start();
+    fixture.build_header();
+    fixture.frame();
+    let built = fixture
+        .pane
+        .widget
+        .header
+        .as_ref()
+        .expect("the header control")
+        .node;
+
+    // The picker offers the venues the directory has loaded, resolved when the control
+    // is built: a generation that loads one has to rebuild it, or the new venue is never
+    // offered.
+    fixture.directory.load(stock_route());
+    fixture.publish_generation(11);
+    fixture.settle();
+
+    let header = fixture
+        .pane
+        .widget
+        .header
+        .as_ref()
+        .expect("the control is still there");
+    assert_ne!(
+        header.node, built,
+        "the generation moved the picker's filters and rebuilt the control"
+    );
+    assert_eq!(
+        header.built.generation, fixture.pane.widget.seen_generation,
+        "the rebuilt control recorded the generation it was built for"
+    );
+    assert_eq!(header.built.generation, 11);
+}
 
 #[test]
 fn the_header_should_offer_adding_a_listing() {
@@ -1251,6 +1471,91 @@ fn quiet(fixture: &mut Fixture) {
     if let Some(binding) = fixture.pane.widget.binding.as_mut() {
         binding.cancel();
     }
+}
+
+#[test]
+fn a_click_on_the_waiting_add_control_should_open_nothing() {
+    let mut fixture = Fixture::with(config(vec![key("BTCUSDT")]), Vec::new());
+    fixture.load();
+    fixture.build_header();
+    fixture.frame();
+    let header = fixture
+        .pane
+        .widget
+        .header
+        .as_ref()
+        .expect("the header control");
+    let action = header
+        .button
+        .action_identity()
+        .expect("the control carries its click");
+    let node = header.node;
+    let window = fixture.with_cx(|_, cx| cx.window());
+    let nodes = fixture.harness.node_count();
+
+    // The control is disabled, and a disabled control that only paints its state would
+    // still dispatch: the handler's own guard is what refuses. The kit's control also
+    // refuses, so this test drives the click both of them sit on.
+    let dispatched =
+        fixture
+            .harness
+            .app_mut()
+            .dispatch_action(window, node, action, ActionSource::Programmatic);
+    fixture.sync();
+    fixture.harness.drain();
+
+    assert!(dispatched, "the click reached the control");
+    let requests = fixture.pane.widget.selection_requests;
+    assert_eq!(
+        fixture
+            .harness
+            .app()
+            .read_with(&requests, |request| request.clone()),
+        None,
+        "a pane waiting for its market opens no picker"
+    );
+    assert_eq!(
+        fixture.harness.node_count(),
+        nodes,
+        "and builds no dialog for it"
+    );
+    assert!(fixture.pane.widget.awaiting_market);
+}
+
+#[test]
+fn a_confirmation_that_lands_while_the_pane_waits_should_be_refused() {
+    // A picker confirmed after the pane started waiting: the dialog is not the gate, the
+    // pane's own entry is. Neither the followed set nor the service may move.
+    let mut fixture = Fixture::with(config(vec![stock("AAPL")]), Vec::new());
+    fixture.load();
+    fixture.frame();
+    assert!(
+        fixture.pane.widget.awaiting_market,
+        "the route of the followed listing is not loaded"
+    );
+
+    let added = key("ETHUSDT");
+    let requests = fixture.pane.widget.selection_requests;
+    fixture.harness.app_mut().write(
+        &requests,
+        Some(InstrumentSelection {
+            listing: added.clone(),
+        }),
+    );
+    fixture.sync();
+    fixture.frame();
+
+    assert!(
+        !fixture.pane.widget.config.entries.contains(&added),
+        "a listing confirmed into a waiting pane is not followed"
+    );
+    assert!(!fixture.pane.widget.entries.contains_key(&added));
+    assert_eq!(fixture.config_changes.get(), 0, "nothing is reported");
+    assert!(
+        fixture.pane.widget.pending.is_empty(),
+        "and nothing is asked of the service"
+    );
+    assert_eq!(fixture.source.subscriptions_made(), 0);
 }
 
 #[test]
@@ -1470,6 +1775,178 @@ fn the_row_controls_should_follow_the_row_state() {
         .expect("the row has controls");
     assert!(controls.retry, "a failed row is retried");
     assert_eq!(controls.buttons.len(), 2, "retry and removal are offered");
+}
+
+// ------------------------------------------------------------- the row window
+//
+// A table mounts only the rows its viewport shows and recycles that window as it
+// scrolls or the pane resizes. The controls of a row are built into the slot its row
+// factory builds, so a window that moved is a pairing that has to be rebuilt — no
+// widget state changes when it does, which is what let the pairing go stale.
+
+/// The row indices one table has mounted right now.
+fn mounted_rows(fixture: &Fixture, market: WatchListMarket) -> Vec<usize> {
+    let mut rows: Vec<usize> = fixture
+        .table_pane(market)
+        .table
+        .list()
+        .mounted_rows(fixture.harness.app())
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// The row indices one table has controls for right now.
+fn controlled_rows(fixture: &Fixture, market: WatchListMarket) -> Vec<usize> {
+    let controls = match market {
+        WatchListMarket::Continuous => &fixture.pane.widget.continuous_controls,
+        WatchListMarket::Session => &fixture.pane.widget.session_controls,
+    };
+    controls.keys().copied().collect()
+}
+
+/// Every click handler the row controls of one table hold, with the row it belongs to.
+fn control_actions(fixture: &Fixture, market: WatchListMarket) -> Vec<(usize, Action)> {
+    let controls = match market {
+        WatchListMarket::Continuous => &fixture.pane.widget.continuous_controls,
+        WatchListMarket::Session => &fixture.pane.widget.session_controls,
+    };
+    controls
+        .iter()
+        .flat_map(|(row, controls)| {
+            controls
+                .buttons
+                .iter()
+                .filter_map(|button| button.action_identity().map(|action| (*row, action)))
+        })
+        .collect()
+}
+
+/// A list long enough that its table mounts only part of it.
+fn long_list() -> Vec<VenueListingKey> {
+    (0..40)
+        .map(|index| key(&format!("SYM{index:02}")))
+        .collect()
+}
+
+/// Pairs every mounted row with its controls on the frame the window moved.
+fn pair_window(fixture: &mut Fixture) {
+    fixture.harness.drain();
+    fixture.sync();
+    fixture.harness.drain();
+}
+
+#[test]
+fn scrolling_should_pair_the_row_controls_with_the_rows_the_table_mounts() {
+    let mut fixture = Fixture::new(config(long_list()));
+    fixture.start();
+    let before = mounted_rows(&fixture, WatchListMarket::Continuous);
+    assert!(
+        before.len() < 40,
+        "the table mounts a window of the long list, got {before:?}"
+    );
+    assert_eq!(
+        controlled_rows(&fixture, WatchListMarket::Continuous),
+        before,
+        "every mounted row has its controls"
+    );
+    let mut scrolled_out = control_actions(&fixture, WatchListMarket::Continuous);
+
+    fixture.with_cx(|widget, cx| {
+        widget
+            .continuous
+            .as_ref()
+            .expect("the table exists")
+            .table
+            .list()
+            .scroll_to_item(cx.app_mut(), 30, ItemAlign::Start)
+            .expect("the table scrolls");
+    });
+    pair_window(&mut fixture);
+
+    let after = mounted_rows(&fixture, WatchListMarket::Continuous);
+    assert!(
+        after.iter().any(|row| *row >= 30),
+        "the scroll moved the mounted window: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|row| before.contains(row)),
+        "and recycled the rows it drew before: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        controlled_rows(&fixture, WatchListMarket::Continuous),
+        after,
+        "the controls follow the rows the table mounts"
+    );
+
+    scrolled_out.retain(|(row, _)| !after.contains(row));
+    assert!(!scrolled_out.is_empty(), "rows left the window");
+    for (row, action) in scrolled_out {
+        assert!(
+            !fixture.harness.app().has_action_handler(&action),
+            "the controls of row {row} were released with the row"
+        );
+    }
+}
+
+#[test]
+fn resizing_should_pair_the_row_controls_with_the_rows_the_table_mounts() {
+    let mut fixture = Fixture::new(config(long_list()));
+    fixture.start();
+    let window = fixture.with_cx(|_, cx| cx.window());
+    let roomy = mounted_rows(&fixture, WatchListMarket::Continuous);
+    assert_eq!(
+        controlled_rows(&fixture, WatchListMarket::Continuous),
+        roomy,
+        "every mounted row has its controls"
+    );
+    let mut left = control_actions(&fixture, WatchListMarket::Continuous);
+
+    fixture
+        .harness
+        .app_mut()
+        .window_mut(window)
+        .expect("the host's window")
+        .set_size(Size::new(800.0, 220.0));
+    pair_window(&mut fixture);
+    let narrow = mounted_rows(&fixture, WatchListMarket::Continuous);
+    assert!(
+        narrow.len() < roomy.len(),
+        "a shorter pane mounts fewer rows: {roomy:?} -> {narrow:?}"
+    );
+    assert_eq!(
+        controlled_rows(&fixture, WatchListMarket::Continuous),
+        narrow,
+        "the controls of the rows that left the window are gone"
+    );
+
+    fixture
+        .harness
+        .app_mut()
+        .window_mut(window)
+        .expect("the host's window")
+        .set_size(Size::new(800.0, 600.0));
+    pair_window(&mut fixture);
+    let back = mounted_rows(&fixture, WatchListMarket::Continuous);
+    assert_eq!(
+        back, roomy,
+        "the pane back at its own size mounts the window it drew before"
+    );
+    assert_eq!(
+        controlled_rows(&fixture, WatchListMarket::Continuous),
+        back,
+        "and the rows it mounts again get their controls"
+    );
+
+    left.retain(|(row, _)| !back.contains(row));
+    for (row, action) in left {
+        assert!(
+            !fixture.harness.app().has_action_handler(&action),
+            "the controls of row {row} were released with the row"
+        );
+    }
 }
 
 #[test]
@@ -1782,6 +2259,252 @@ fn a_row_whose_market_has_no_catalog_should_stop_being_read() {
     );
 }
 
+// ------------------------------------------------------- dropped streams and late answers
+
+/// The error a stream reports for a listing whose catalogue is not in memory.
+fn catalog_not_loaded() -> WatchListStreamError {
+    WatchListStreamError::MarketParticipant(MarketError::Catalog(Box::new(
+        CatalogError::CatalogNotLoaded { route: route() },
+    )))
+}
+
+#[test]
+fn a_confirmation_that_lands_after_the_market_is_gone_should_not_report_values() {
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following.clone()));
+    fixture
+        .source
+        .quote(&following[0], ticker(&following[0], 100, 120));
+    fixture.start();
+    fixture.frame();
+
+    // The replacement the pane asked for while it still had the market...
+    fixture.load();
+    fixture.sync();
+    assert!(!fixture.pane.widget.pending.is_empty());
+    // ...is answered only now, after the listing's market went away underneath it.
+    fixture.with_cx(|widget, cx| {
+        widget.apply_event(
+            &following[0],
+            &WatchListStreamEvent::Error(catalog_not_loaded()),
+            cx,
+        );
+    });
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&following[0]),
+        "the market went away underneath the row"
+    );
+    fixture.with_cx(|widget, cx| {
+        widget.apply_rpc(RequestId::new(2), Ok(WatchListResponse::Applied), cx)
+    });
+    fixture.sync();
+    fixture.frame();
+
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&following[0]),
+        "an answer about a market that is gone does not make the pane read again"
+    );
+    assert_eq!(
+        fixture
+            .row(WatchListMarket::Continuous, 0)
+            .display()
+            .map(|display| display.price.clone()),
+        None,
+        "the row it drew from that market carries no values any more"
+    );
+    assert!(
+        matches!(fixture.status(), WidgetState::Ready),
+        "waiting for a market is a wait, not a failure"
+    );
+    assert!(
+        fixture.pane.widget.pending.is_empty(),
+        "the answer settles the operation it belonged to"
+    );
+}
+
+#[test]
+fn a_catalog_error_should_not_take_a_retry_with_it() {
+    let first = key("BTCUSDT");
+    let second = key("ETHUSDT");
+    let mut fixture = Fixture::new(config(vec![first.clone(), second.clone()]));
+    fixture.source.quote(&first, ticker(&first, 100, 120));
+    fixture.source.quote(&second, ticker(&second, 10, 12));
+    fixture.start();
+    fixture
+        .source
+        .send(&second, Err(MarketError::ServiceClosed));
+    fixture.settle();
+    assert_eq!(
+        fixture.row(WatchListMarket::Continuous, 1).status(),
+        WatchListStatus::Error
+    );
+
+    // The user asks for the failed row to be read again: that is the operation in flight.
+    let requests = fixture.pane.widget.row_requests;
+    fixture
+        .harness
+        .app_mut()
+        .write(&requests, Some(RowRequest::Retry(second)));
+    fixture.sync();
+    assert!(
+        !fixture.pane.widget.pending.is_empty(),
+        "the retry is the operation in flight"
+    );
+
+    // The other row's catalogue goes away while that retry is still unanswered.
+    fixture.with_cx(|widget, cx| {
+        widget.apply_event(
+            &first,
+            &WatchListStreamEvent::Error(catalog_not_loaded()),
+            cx,
+        );
+    });
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&first),
+        "the row that says what is missing stopped being read"
+    );
+    assert!(
+        !fixture.pane.widget.pending.is_empty(),
+        "and it did not cancel the retry the user asked for"
+    );
+    assert!(
+        !fixture.pane.widget.awaiting_market,
+        "the pane is still reading the market both rows are on"
+    );
+
+    // The retry is answered as the user's own answer.
+    fixture.with_cx(|widget, cx| {
+        widget.apply_rpc(RequestId::new(2), Ok(WatchListResponse::Applied), cx)
+    });
+    assert!(fixture.pane.widget.pending.is_empty());
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&first),
+        "while the listing whose catalogue went away stays a row that waits"
+    );
+}
+
+#[test]
+fn a_listing_whose_catalog_went_away_should_be_read_by_a_new_stream() {
+    let following = vec![key("BTCUSDT")];
+    let mut fixture = Fixture::new(config(following.clone()));
+    fixture
+        .source
+        .quote(&following[0], ticker(&following[0], 100, 120));
+    fixture.start();
+    let subscriptions = fixture.source.subscriptions_made();
+
+    fixture.with_cx(|widget, cx| {
+        widget.apply_event(
+            &following[0],
+            &WatchListStreamEvent::Error(catalog_not_loaded()),
+            cx,
+        );
+    });
+    fixture.sync();
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&following[0]),
+        "the listing stopped being read"
+    );
+    assert!(fixture.pane.widget.dropped.contains(&following[0]));
+
+    // The market is refreshed with a catalogue that restates the listing, which is what
+    // brings the listing back into reading — by a stream the service opens now rather
+    // than by handing it back the parked one it left behind.
+    fixture
+        .source
+        .rearm(&following[0], ticker(&following[0], 100, 130));
+    fixture.publish_generation(1);
+    fixture.settle();
+    fixture.frame();
+
+    assert!(
+        fixture.pane.widget.entries.contains_key(&following[0]),
+        "the listing is read again"
+    );
+    assert!(
+        fixture.source.subscriptions_made() > subscriptions,
+        "and the stream it is read by is one the service opened after the parked one"
+    );
+    assert!(
+        fixture
+            .table_text(WatchListMarket::Continuous)
+            .contains("130.00 USDT")
+    );
+}
+
+#[test]
+fn a_listing_should_be_addable_while_another_row_waits_for_its_catalog() {
+    let first = key("BTCUSDT");
+    let second = key("ETHUSDT");
+    let mut fixture = Fixture::new(config(vec![first.clone()]));
+    // The route also publishes the listing the user is about to pick.
+    test_support::publish_fixture_route(
+        &fixture.directory.catalog,
+        &route(),
+        vec![
+            test_support::entry(&route(), instrument_for(&first), symbol_of(&first).as_str()),
+            test_support::entry(
+                &route(),
+                instrument_for(&second),
+                symbol_of(&second).as_str(),
+            ),
+        ],
+    )
+    .expect("the route republishes its listings");
+    fixture.source.quote(&first, ticker(&first, 100, 120));
+    fixture.start();
+
+    fixture.with_cx(|widget, cx| {
+        widget.apply_event(
+            &first,
+            &WatchListStreamEvent::Error(catalog_not_loaded()),
+            cx,
+        );
+    });
+    fixture.sync();
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&first),
+        "the followed listing stopped being read"
+    );
+    assert!(
+        !fixture.pane.widget.awaiting_market,
+        "and the pane is still reading, so it is not waiting for a market"
+    );
+
+    let requests = fixture.pane.widget.selection_requests;
+    fixture.harness.app_mut().write(
+        &requests,
+        Some(InstrumentSelection {
+            listing: second.clone(),
+        }),
+    );
+    fixture.sync();
+    assert!(
+        fixture.pane.widget.config.entries.contains(&second),
+        "the listing the user picked joined the followed set"
+    );
+    assert!(
+        fixture.pane.widget.entries.contains_key(&second),
+        "and it is read, because the venue its route is on is in memory"
+    );
+
+    fixture
+        .source
+        .send(&first, Ok(Arc::new(ticker(&first, 100, 120))));
+    fixture.settle();
+    fixture.frame();
+
+    assert!(
+        !fixture.pane.widget.entries.contains_key(&first),
+        "a ticker for a listing the pane stopped reading fills nothing"
+    );
+    assert_eq!(
+        fixture.rows(WatchListMarket::Continuous),
+        2,
+        "and both listings are still drawn: the one being read and the one waiting"
+    );
+}
+
 #[test]
 fn a_recovery_with_no_market_loaded_should_wait_rather_than_stay_failed() {
     let following = vec![key("BTCUSDT")];
@@ -2063,6 +2786,108 @@ fn two_panes_should_keep_their_own_row_controls() {
         "and leaves the other pane's handler alone"
     );
 }
+
+#[test]
+fn two_panes_should_keep_their_own_header_controls() {
+    let listing = key("BTCUSDT");
+    let catalog = catalog_over(std::slice::from_ref(&listing));
+    let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+    let mut panes = Vec::new();
+    for _ in 0..2 {
+        let source = FakeSource::new();
+        source.quote(&listing, ticker(&listing, 100, 120));
+        let directory = FixtureDirectory::new(Arc::clone(&catalog), vec![route()]);
+        let scope = harness.app_mut().signal_scope();
+        let status = WidgetStatus::new(harness.app_mut(), scope);
+        let header_parent = harness.placeholder_parent();
+        let directory_handle: Rc<dyn WatchListDirectory> = Rc::new(directory);
+        let mut widget = {
+            let services = Rc::clone(harness.services_rc());
+            let window = harness.window();
+            let cx = &mut WidgetCx::new(harness.app_mut(), window, &services, scope);
+            WatchListWidget::with_source(
+                config(vec![listing.clone()]),
+                source,
+                directory_handle,
+                status,
+                WidgetConfigChange::default(),
+                WidgetAction::new("common.retry", |_| {}),
+                cx,
+            )
+        };
+        {
+            let services = Rc::clone(harness.services_rc());
+            let window = harness.window();
+            let cx = &mut WidgetCx::new(harness.app_mut(), window, &services, scope);
+            widget.load(cx);
+        }
+        for _ in 0..8 {
+            let services = Rc::clone(harness.services_rc());
+            let window = harness.window();
+            let cx = &mut WidgetCx::new(harness.app_mut(), window, &services, scope);
+            widget.sync(cx).expect("the widget syncs");
+            harness.run_until_idle();
+            harness.drain();
+        }
+        {
+            let services = Rc::clone(harness.services_rc());
+            let window = harness.window();
+            let cx = &mut WidgetCx::new(harness.app_mut(), window, &services, scope);
+            widget
+                .header(HeaderGroup::Left, header_parent, cx)
+                .expect("the header builds");
+        }
+        panes.push((widget, scope));
+    }
+
+    let keys: Vec<SmolStr> = panes
+        .iter()
+        .map(|(widget, _)| {
+            widget
+                .header
+                .as_ref()
+                .expect("a header control")
+                .button
+                .key()
+                .into()
+        })
+        .collect();
+    assert_ne!(
+        keys[0], keys[1],
+        "each pane mints its own kit key for its header control"
+    );
+    let actions: Vec<Action> = panes
+        .iter()
+        .map(|(widget, _)| {
+            widget
+                .header
+                .as_ref()
+                .expect("a header control")
+                .button
+                .action_identity()
+                .expect("the control carries its click")
+        })
+        .collect();
+    assert!(harness.app().has_action_handler(&actions[0]));
+    assert!(harness.app().has_action_handler(&actions[1]));
+
+    {
+        let (widget, scope) = &mut panes[0];
+        let services = Rc::clone(harness.services_rc());
+        let window = harness.window();
+        let cx = &mut WidgetCx::new(harness.app_mut(), window, &services, *scope);
+        widget.release(cx);
+    }
+    assert!(
+        !harness.app().has_action_handler(&actions[0]),
+        "the released pane takes its header handler down"
+    );
+    assert!(
+        harness.app().has_action_handler(&actions[1]),
+        "and leaves the other pane's header handler alone"
+    );
+}
+
 #[test]
 fn releasing_a_pane_should_reclaim_every_value_slot() {
     let listing = key("BTCUSDT");
