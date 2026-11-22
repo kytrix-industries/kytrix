@@ -3,9 +3,9 @@
 //! The map is largely fixed — a coastline and thirty-eight labels — and the only part
 //! that moves is the vessel layer. This module owns the fixed half of that picture
 //! (bounds, projection, label anchors), the flag-state table, the camera and its
-//! clamping, and the store one AIS subscription fills. None of it needs a GPUI context:
-//! a push is applied without notifying anything. The frames those changes are drawn in
-//! belong to the view.
+//! clamping, and the store one AIS subscription fills. None of it needs an application
+//! context: a push is applied without notifying anything. The frames those changes are
+//! drawn in belong to the view.
 //!
 //! # A picture held between pushes
 //!
@@ -3561,16 +3561,18 @@ mod tests {
     ///
     /// 1.0 is the ideal. The 0.006° tier measures 1.1996 px at its 911 m/px switch —
     /// 20% over — and that is accepted: forcing it under 1.0 would mean switching to
-    /// the 0.003° tier there, which costs about 4,000 more triangles and pushes the
-    /// frame back into GPUI's 2^17 instance-buffer step, doubling that memory.
+    /// the 0.003° tier there, which costs about 4,000 more triangles and crosses a
+    /// power-of-two instance-buffer step of the renderer that predated the engine,
+    /// doubling that memory.
     const LAND_TIER_WORST_CASE_AT_THRESHOLD_PX: f32 = 1.2;
 
     /// The most the tier drawn at the design pane's fitted zoom may be off, in pixels.
     ///
     /// 1.0 is the ideal. The 0.006° tier measures 1.089 px at 1,004 m/px — the 9% the
     /// plan's one-pixel rule gives up so the fitted frame stays in the 2^16
-    /// instance-buffer step; the 0.003° tier would cost ~4,000 more triangles for that
-    /// 9%. It is a worst-case single point, not typical displacement.
+    /// instance-buffer step of the renderer that predated the engine; the 0.003° tier
+    /// would cost ~4,000 more triangles for that 9%. It is a worst-case single point, not
+    /// typical displacement.
     const LAND_TIER_WORST_CASE_AT_FIT_PX: f32 = 1.1;
 
     /// The measured error of every tier at the two scales that matter: where it is

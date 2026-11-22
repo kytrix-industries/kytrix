@@ -1,3 +1,5 @@
+mod colors;
+mod map;
 mod model;
 mod paint;
 mod scene;
