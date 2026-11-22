@@ -41,7 +41,7 @@ pub trait VenueDisplay {
     /// A venue's logo is a fact about the venue rather than about the language it is read
     /// in, so it is stated here beside the name and read by the one sentence that draws it
     /// (through [`listed_names`]). The paths themselves live in `base_ui::brand`, which is
-    /// what [`base_ui::brand::Brand`] draws from: a logo has one path, however it is used.
+    /// what [`base_ui::kit::brand::Brand`] draws from: a logo has one path, however it is used.
     fn asset_path(&self) -> &'static str;
 
     /// The name, in the language the translation context renders.
@@ -61,11 +61,11 @@ impl VenueDisplay for VenueId {
 
     fn asset_path(&self) -> &'static str {
         match self {
-            Self::Binance => base_ui::brand::BINANCE,
-            Self::Hyperliquid => base_ui::brand::HYPERLIQUID,
-            Self::Longbridge => base_ui::brand::LONGBRIDGE,
-            Self::Okx => base_ui::brand::OKX,
-            Self::Polymarket => base_ui::brand::POLYMARKET,
+            Self::Binance => base_ui::kit::brand::BINANCE,
+            Self::Hyperliquid => base_ui::kit::brand::HYPERLIQUID,
+            Self::Longbridge => base_ui::kit::brand::LONGBRIDGE,
+            Self::Okx => base_ui::kit::brand::OKX,
+            Self::Polymarket => base_ui::kit::brand::POLYMARKET,
         }
     }
 
@@ -320,10 +320,10 @@ mod tests {
     #[test]
     fn every_venue_should_state_the_logo_its_brand_draws() {
         for (venue, path) in [
-            (VenueId::Binance, base_ui::brand::BINANCE),
-            (VenueId::Okx, base_ui::brand::OKX),
-            (VenueId::Hyperliquid, base_ui::brand::HYPERLIQUID),
-            (VenueId::Longbridge, base_ui::brand::LONGBRIDGE),
+            (VenueId::Binance, base_ui::kit::brand::BINANCE),
+            (VenueId::Okx, base_ui::kit::brand::OKX),
+            (VenueId::Hyperliquid, base_ui::kit::brand::HYPERLIQUID),
+            (VenueId::Longbridge, base_ui::kit::brand::LONGBRIDGE),
         ] {
             assert_eq!(venue.asset_path(), path, "{venue} states its own logo");
             assert_eq!(
@@ -347,12 +347,12 @@ mod tests {
             (
                 LanguageCode::En,
                 ["Binance", "OKX"],
-                base_ui::brand::BINANCE,
+                base_ui::kit::brand::BINANCE,
             ),
             (
                 LanguageCode::ZhCn,
                 ["币安", "欧易"],
-                base_ui::brand::BINANCE,
+                base_ui::kit::brand::BINANCE,
             ),
         ] {
             let notice = Notice::MarketNotLoaded {

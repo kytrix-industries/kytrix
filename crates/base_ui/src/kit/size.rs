@@ -1,4 +1,4 @@
-//! 控件尺寸阶梯（旧 `crate::size::UnifiedSize` 的引擎化移植）。
+//! 控件尺寸阶梯（旧 `UnifiedSize` 的引擎化移植）。
 //!
 //! # 数值来源
 //!
@@ -28,7 +28,7 @@ use crate::{
     theme::components::{ComponentTokens, ControlSize, SizeTokens},
 };
 
-/// 统一尺寸档（旧 `crate::size::UnifiedSize`）。
+/// 统一尺寸档（旧 `UnifiedSize`）。
 pub type UnifiedSize = ControlSize;
 
 impl ControlSize {
@@ -68,7 +68,7 @@ impl ControlSize {
     }
 }
 
-/// 可设置统一尺寸的组件 builder（旧 `crate::size::UnifiedSizable`）。
+/// 可设置统一尺寸的组件 builder（旧 `UnifiedSizable`）。
 ///
 /// 新引擎的组件是挂载期 builder（P2-4 落地），本 trait 只固定**语义**：`small/medium/large`
 /// 是 `with_unified_size` 的三个具名快捷方式。
@@ -92,7 +92,7 @@ pub trait UnifiedSizable: Sized {
     }
 }
 
-/// 把尺寸档写进引擎样式（旧 `crate::size::UnifiedSizeStyle`）。
+/// 把尺寸档写进引擎样式（旧 `UnifiedSizeStyle`）。
 pub trait UnifiedSizeStyle {
     /// 应用高度 / 间隙 / 水平内边距（字号见模块文档：由组件写进 `TextStyle`）。
     fn unified_sized(self, size: UnifiedSize) -> Self;
@@ -111,29 +111,23 @@ mod tests {
     use super::{UnifiedSizable, UnifiedSize, UnifiedSizeStyle};
     use crate::style_builder::StyleBuilder;
 
-    /// 三档 × 五个属性与旧实现逐值等价（旧实现还在 crate 里，直接现场读，不硬编码期望）。
+    /// 冻结基线：旧 `UnifiedSize` 的三档阶梯（P5-2 在旧模块删除前抄录）。
+    /// (档位, 高, 间隙, 水平内边距, 字号, 图标尺寸)。
+    const FROZEN_LADDER: [(UnifiedSize, f32, f32, f32, f32, f32); 3] = [
+        (UnifiedSize::Small, 20.0, 4.0, 4.0, 12.0, 8.0),
+        (UnifiedSize::Medium, 30.0, 6.0, 6.0, 14.0, 12.0),
+        (UnifiedSize::Large, 40.0, 8.0, 10.0, 18.0, 16.0),
+    ];
+
+    /// 三档 × 五个属性与旧实现冻结值逐值一致（字号是旧 rems × 16 px 根字号换算后的像素）。
     #[test]
-    fn every_size_ladder_value_matches_the_legacy_implementation() {
-        let pairs = [
-            (UnifiedSize::Small, crate::size::UnifiedSize::Small),
-            (UnifiedSize::Medium, crate::size::UnifiedSize::Medium),
-            (UnifiedSize::Large, crate::size::UnifiedSize::Large),
-        ];
-        for (new, old) in pairs {
-            assert_eq!(new.h(), f32::from(old.h()), "{new:?} 的高度漂移");
-            assert_eq!(new.gap(), f32::from(old.gap()), "{new:?} 的间隙漂移");
-            assert_eq!(new.px(), f32::from(old.px()), "{new:?} 的水平内边距漂移");
-            assert_eq!(
-                new.icon_size(),
-                f32::from(old.icon_size()),
-                "{new:?} 的图标尺寸漂移"
-            );
-            // 旧的 `text_size` 是 rem，按 16 px 根字号换算（theme spec-delta §6 的同一口径）。
-            assert_eq!(
-                new.text_size(),
-                old.text_size().0 * 16.0,
-                "{new:?} 的字号漂移"
-            );
+    fn every_size_ladder_value_matches_the_frozen_legacy_ladder() {
+        for (size, height, gap, padding_x, font_size, icon_size) in FROZEN_LADDER {
+            assert_eq!(size.h(), height, "{size:?} 的高度漂移");
+            assert_eq!(size.gap(), gap, "{size:?} 的间隙漂移");
+            assert_eq!(size.px(), padding_x, "{size:?} 的水平内边距漂移");
+            assert_eq!(size.icon_size(), icon_size, "{size:?} 的图标尺寸漂移");
+            assert_eq!(size.text_size(), font_size, "{size:?} 的字号漂移");
         }
     }
 

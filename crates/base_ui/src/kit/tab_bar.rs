@@ -1,6 +1,6 @@
 //! 标签栏（旧 `crate::tab_bar` 的引擎化重建，P2-4a）。
 //!
-//! 旧实现依赖 gpui-base 的 `Tabs` / `Tab`：轨道（`surface.sunken`）里放标签，`Fade` 模式给每个
+//! 旧实现依赖 旧输入组件库 的 `Tabs` / `Tab`：轨道（`surface.sunken`）里放标签，`Fade` 模式给每个
 //! 标签做背景色过渡，`Slide` 模式用 `on_prepaint` 量每个标签的 bounds 再驱动一条 `spring` 指示条。
 //! 新引擎没有布局后量测钩子，也没有 spring；本实现用**帧同步**取几何、用 `Transient<f32>` +
 //! `App::animate` 做插值：

@@ -28,7 +28,7 @@
 //!
 //! # 布局边框 vs 绘制边框
 //!
-//! 引擎把旧 gpui `.border_1()` 的两件事拆成两条通道：**占位**与**画线**。
+//! 引擎把旧实现 `.border_1()` 的两件事拆成两条通道：**占位**与**画线**。
 //!
 //! - 占位（参与布局）：[`StyleBuilder::border`] 写 `taffy::Style::border`，盒子四周各留出线宽，
 //!   内容区被挤进去——这正是旧 `border_widths` 的行为；
@@ -217,7 +217,7 @@ impl StyleBuilder {
     /// **布局**边框：taffy 在盒子四周各留出 `width`（CSS `border-width`），内容区被挤进去。
     ///
     /// 它只占位、**不画任何像素**。要看得见的边缘，另用 [`PaintBuilder::border`] 写绘制宽度与
-    /// 颜色：旧 gpui `.border_1()` 同时做这两件事，迁移时必须成对写（模块文档「布局边框 vs
+    /// 颜色：旧实现 `.border_1()` 同时做这两件事，迁移时必须成对写（模块文档「布局边框 vs
     /// 绘制边框」）。动态边框（按下变宽/变色）属于 `StylePatch`，不在 builder 里。
     #[must_use]
     pub fn border(mut self, width: f32) -> Self {

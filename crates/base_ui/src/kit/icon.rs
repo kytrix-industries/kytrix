@@ -20,7 +20,7 @@
 //!
 //! # 颜色调制
 //!
-//! 旧实现是 `svg().path(..).text_color(..)`：GPUI 渲染 SVG 时把 `currentColor` 换成文本色。
+//! 旧实现是 `svg().path(..).text_color(..)`：旧 UI 层渲染 SVG 时把 `currentColor` 换成文本色。
 //! 图标因此烘成**白色**字形，运行期 `Color` 走 E7 图片节点的调制通道（`texel * modulation`，
 //! 预乘空间），`Color::WHITE` = 原样（白色），`Color::TRANSPARENT` = 不画（paint 跳过透明调制）。
 //!
@@ -33,7 +33,7 @@
 //! | `<= 1.0` | 48 px | 16 → 16（48→16 下采样，3× 余量） |
 //! | `> 1.0` | 96 px | 16 → 32（96→32 下采样，3× 余量） |
 //!
-//! 旧实现的图标逻辑尺寸只有 8 / 12 / 16 px（`crate::size::UnifiedSize::icon_size` 与
+//! 旧实现的图标逻辑尺寸只有 8 / 12 / 16 px（`UnifiedSize::icon_size` 与
 //! `.size_4()`；统计见 spec-delta §2），所以两档足够覆盖 1× / 2× 且图集不会无谓膨胀。
 //!
 //! **DPI 变化时 E7 只重解析内在尺寸，不替应用换资产变体**（`spec-deltas/E7.md` §3.2）：tile 的
@@ -46,7 +46,7 @@
 //! `IconKind` 是编译期完备的枚举，**不存在**未知变体；「未知 kind」只出现在按名字反查
 //! （[`IconKind::from_name`]：接受 [`IconKind::name()`] 的文件 stem，供 markdown / 配置数据用），
 //! 失败是强类型 [`IconError::UnknownKind`]。注意它**不**接受旧 `IconKind::path()` 的全路径
-//! （`icons/phosphoricons/x.svg`）：路径是旧 GPUI 资产系统的寻址方式，新实现按 stem 取构建期
+//! （`icons/phosphoricons/x.svg`）：路径是旧实现 资产系统的寻址方式，新实现按 stem 取构建期
 //! PNG；从旧配置迁字符串时需要在调用点取文件名（见 spec-delta §6 第 2 条）。挂载 / 解码失败
 //! 保留引擎的强类型 `EngineError`。
 
@@ -73,7 +73,7 @@ use crate::theme::{handle::ThemeHandle, role::Role};
 /// 构造图标时的默认逻辑边长（旧用法里最常见的 16 px；`UnifiedSize::icon_size` 的 Large 档）。
 pub const DEFAULT_ICON_SIZE: f32 = 16.0;
 
-/// 一个 Phosphor 图标（55 个，顺序与旧 `crate::icon::IconKind` 一致）。
+/// 一个 Phosphor 图标（55 个，顺序与旧 `IconKind` 一致）。
 ///
 /// 名字就是旧 `IconKind::path()` 里的文件名 stem（`x.svg` → `x`、`x-bold.svg` → `x-bold`），
 /// 构建期清单与枚举的一一对应由测试锁定（`build.rs` 写 `OUT_DIR/icons/built.rs`）。
@@ -725,11 +725,14 @@ mod tests {
                 "{kind:?}（{}）没有构建期产物",
                 kind.name()
             );
-            // 旧模块的嵌入资产里必须有同名 SVG —— 构建期产物就是从它来的。
-            let svg_path = format!("icons/phosphoricons/{}.svg", kind.name());
+            // 构建期产物的源 SVG 必须随 crate 提交（`build.rs` 从它光栅化）。
+            let svg_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/icons/phosphoricons")
+                .join(format!("{}.svg", kind.name()));
             assert!(
-                crate::assets::Assets::get(&svg_path).is_some(),
-                "{kind:?} 的源 SVG `{svg_path}` 不在嵌入资产里（映射写错了名字？）"
+                svg_path.is_file(),
+                "{kind:?} 的源 SVG `{}` 不存在（映射写错了名字？）",
+                svg_path.display()
             );
         }
         // 名字 ⇄ 变体是双向可逆的（旧 `path()` 的字符串语义）。
@@ -835,8 +838,8 @@ mod tests {
     /// （旧缺陷），缩放会把覆盖率的边缘拉向黑色：实测 `check-circle-48 → 16` 最坏暗边
     /// **96/255**（38%）。white matte ⇒ RGB 通道是常量 255 ⇒ 缩放后仍恒 255 ⇒ 暗边恒为 0。
     ///
-    /// 与旧 GPUI 渲染的差异（**已登记**，`spec-deltas/kit-assets.md` §11）：旧 `svg()` 由
-    /// GPUI 的 `SvgRenderer` 在 paint 期用 resvg/tiny-skia 按元素尺寸的 2× 光栅化（矢量 AA，
+    /// 与旧实现 渲染的差异（**已登记**，`spec-deltas/kit-assets.md` §11）：旧 `svg()` 由
+    /// 旧 UI 层的 `SvgRenderer` 在 paint 期用 resvg/tiny-skia 按元素尺寸的 2× 光栅化（矢量 AA，
     /// 单一缩放级）；新路径是构建期 resvg 光栅化（48/96）再经引擎 `CatmullRom` 下采样（两级
     /// 滤波）。差异只剩 AA 细节（覆盖率被近似两次，边缘可能略微更软），不存在颜色偏置；
     /// 本用例锁定的正是「不存在颜色偏置」这一可机器验证的部分。

@@ -873,7 +873,7 @@ mod tests {
     /// 旧（sRGB 编码空间混合）与新（引擎线性预乘合成）tonal 洗色的逐值差异表。
     ///
     /// 这张表就是 P2-1a 审查 F1-2 的登记：用户裁决保留线性合成，因此差异是**已知且被接受的
-    /// 视觉变化**，不是移植缺陷。表里同时锁旧值（从旧实现现场计算）与新值，任一侧改动都会红。
+    /// 视觉变化**，不是移植缺陷。表里同时锁旧值（P5-2 在旧实现删除前冻结）与新值，任一侧改动都会红。
     #[test]
     fn the_tonal_washes_register_the_old_srgb_versus_new_linear_difference() {
         // (外观, 状态, 旧 [u8;3], 新 [u8;3], 逐通道差)。
@@ -910,21 +910,16 @@ mod tests {
 
         for (appearance, state, old_expected, new_expected, registered) in cases {
             let theme = Theme::of(appearance);
-            let old_washes = old_tonal_washes(appearance);
             let new_washes = theme.components().interactive.tonal;
-            let (old_color, new_color) = match state {
-                "hover" => (old_washes.hover.background, new_washes.hover.background),
-                "active" => (old_washes.active.background, new_washes.active.background),
+            let new_color = match state {
+                "hover" => new_washes.hover.background,
+                "active" => new_washes.active.background,
                 other => panic!("未知状态 {other}"),
             };
 
-            let old = old_srgb8(old_color);
+            // 旧值是从旧实现冻结的登记表（P5-2 删除旧实现前抄录）。
+            let old = old_expected;
             let new = crate::theme::color::to_srgb8(new_color);
-            assert_eq!(
-                [old[0], old[1], old[2]],
-                old_expected,
-                "{appearance:?} tonal {state} 的旧 sRGB 合成值（登记表）"
-            );
             assert_eq!(
                 [new[0], new[1], new[2]],
                 new_expected,
@@ -939,63 +934,26 @@ mod tests {
         }
     }
 
-    /// 旧 `style/components.rs` 的 tonal 配方（sRGB 编码空间合成）。
-    fn old_tonal_washes(
-        appearance: Appearance,
-    ) -> crate::style::components::InteractiveStateColors {
-        use crate::style::{
-            components::ComponentColors, palette::Palette as OldPalette, roles::Roles,
-        };
+    /// 冻结基线：旧 `size.rs::UnifiedSize` 的三档阶梯（P5-2 在旧模块删除前抄录）。
+    /// (档位, 高, 间隙, 水平内边距, 字号, 图标)。
+    const FROZEN_SIZE_LADDER: [(ControlSize, f32, f32, f32, f32, f32); 3] = [
+        (ControlSize::Small, 20.0, 4.0, 4.0, 12.0, 8.0),
+        (ControlSize::Medium, 30.0, 6.0, 6.0, 14.0, 12.0),
+        (ControlSize::Large, 40.0, 8.0, 10.0, 18.0, 16.0),
+    ];
 
-        let palette = match appearance {
-            Appearance::Light => OldPalette::light(),
-            Appearance::Dark => OldPalette::dark(),
-        };
-
-        ComponentColors::resolve(&Roles::resolve(&palette))
-            .interactive
-            .tonal
-    }
-
-    /// 旧 `ResolvedColor` 的 8 位 sRGB（旧实现渲染的像素）。
-    fn old_srgb8(color: crate::style::color::ResolvedColor) -> [u8; 4] {
-        let rgba = gpui_kit::Rgba::from(color.hsla);
-
-        [
-            (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgba.a.clamp(0.0, 1.0) * 255.0).round() as u8,
-        ]
-    }
-
-    /// token 阶梯的数值必须与旧 `size.rs::UnifiedSize` 现场对齐（20/30/40 高、4/6/8 间隙、
-    /// 4/6/10 内边距、12/14/18 字号、8/12/16 图标）。
-    ///
-    /// 旧值从 `crate::size` 读，而不是抄一份硬编码期望：P2-5 删旧模块之前，旧值一改这里就会红。
+    /// token 阶梯的数值与旧 `UnifiedSize` 的冻结值一致（20/30/40 高、4/6/8 间隙、4/6/10 内边距、
+    /// 12/14/18 字号、8/12/16 图标）。
     #[test]
-    fn the_size_token_ladder_matches_the_old_unified_size() {
-        use crate::size::UnifiedSize;
-
-        /// 旧 gpui 的 `Rems` 在布局里按 16 px 根字号换算。
-        const ROOT_FONT_SIZE: f32 = 16.0;
-
+    fn the_size_token_ladder_matches_the_frozen_legacy_ladder() {
         let tokens = ComponentTokens::standard();
-        for (size, old) in [
-            (ControlSize::Small, UnifiedSize::Small),
-            (ControlSize::Medium, UnifiedSize::Medium),
-            (ControlSize::Large, UnifiedSize::Large),
-        ] {
+        for (size, height, gap, padding_x, font_size, icon_size) in FROZEN_SIZE_LADDER {
             let token = tokens.for_size(size);
-            assert_eq!(token.height, f32::from(old.h()), "高度");
-            assert_eq!(token.gap, f32::from(old.gap()), "间隙");
-            assert_eq!(token.padding_x, f32::from(old.px()), "水平内边距");
-            assert_eq!(
-                token.font_size,
-                old.text_size().0 * ROOT_FONT_SIZE,
-                "字号（rems × 根字号）"
-            );
-            assert_eq!(token.icon_size, f32::from(old.icon_size()), "图标边长");
+            assert_eq!(token.height, height, "高度");
+            assert_eq!(token.gap, gap, "间隙");
+            assert_eq!(token.padding_x, padding_x, "水平内边距");
+            assert_eq!(token.font_size, font_size, "字号（旧 rems × 16 px 根字号）");
+            assert_eq!(token.icon_size, icon_size, "图标边长");
         }
 
         assert_eq!(tokens.border_width, 1.0);

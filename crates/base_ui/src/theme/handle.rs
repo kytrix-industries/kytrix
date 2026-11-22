@@ -1,6 +1,6 @@
 //! 应用层主题服务：一个 `Signal<Appearance>` + 两套已加载的 [`Theme`]。
 //!
-//! 这是旧 `style/theme.rs` 的 gpui `Global` + `refresh_windows()`（整窗重绘）的引擎化替代：主题版本
+//! 这是旧 `style/theme.rs` 的 `Global` + `refresh_windows()`（整窗重绘）的引擎化替代：主题版本
 //! 是依赖图里的一等信号，`role(&mut ReadCtx, ..)` 读它并登记依赖，因此运行时切换深浅色**只失效读过
 //! 主题的节点**（设计 §3.4 / §4.9.4 的 I6/I17 验收面）。没有读主题的节点（静态绘制、只读其它信号
 //! 的节点）不会被写信号触达，也不会产生一帧。

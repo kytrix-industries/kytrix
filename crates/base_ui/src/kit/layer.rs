@@ -4,14 +4,14 @@
 //!
 //! 旧 `Layer` 是**每个窗口唯一的根 view 实体**，不是多窗口 / 多 Pane 栈：`view` 在最底下，
 //! 之上依次是 `dialogs`（旧→新）、`alert`（至多一个，恒高于所有 dialog）、`context_menu`
-//! （恒高于 alert），普通弹层（dropdown / select / tooltip 等）由 GPUI 的 `deferred(priority)`
+//! （恒高于 alert），普通弹层（dropdown / select / tooltip 等）由 旧 UI 层的 `deferred(priority)`
 //! 画在开它的层之上。它自己的职责只有三件：**层序**、**遮罩**（dialog / alert 的
 //! `BlockMouse`）、**每层的内容所有权**（dialog / alert / menu 的实体栈）。
 //!
 //! # 引擎化后的塌缩
 //!
 //! 新引擎把「一个浮层」做成 root 的**末尾子节点**（[`ui_core::app::App::create_overlay`]）：
-//! 绘制序 = DFS 先序末尾，命中优先级 = 逆序命中 —— 于是**创建序就是 z 序**，没有 GPUI 的
+//! 绘制序 = DFS 先序末尾，命中优先级 = 逆序命中 —— 于是**创建序就是 z 序**，没有 旧 UI 层的
 //! deferred / priority / BlockMouse。旧实现里「alert 恒高于所有 dialog **含后开的**」这条
 //! 固定层序（评估 G6）无法用创建序表达，本模块就是补丁：用 [`Band`] 给每个浮层标一个固定
 //! 层带，[`Layer::enforce`] 按「(层带, 登记序)」把 root 子节点顺序对齐到层带表。

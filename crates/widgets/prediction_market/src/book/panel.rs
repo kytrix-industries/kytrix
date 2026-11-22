@@ -75,8 +75,8 @@ use base_ui::{
     kit::{
         empty_state::EmptyState,
         list::{List, ListOptions, SelectionMode},
+        motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
     },
-    motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
     style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };

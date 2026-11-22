@@ -18,7 +18,7 @@
 //! # 禁用行
 //!
 //! `TreeItem::disabled` 的行不可点击 / 不可键盘导航 / 不可程序化选中（列表内核的 disabled
-//! 集 + [`TreeState::apply_key`] 跳过）；渲染仍是弱化色（旧 gpui `Button::disabled` 语义）。
+//! 集 + [`TreeState::apply_key`] 跳过）；渲染仍是弱化色（旧实现 `Button::disabled` 语义）。
 //!
 //! # a11y（E9 集合语义）
 //!

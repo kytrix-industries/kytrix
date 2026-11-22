@@ -1,7 +1,7 @@
 //! 语义色角色：组件只报"这是画布/次要文字/分隔线"，不报"这是第几阶灰"。
 //!
 //! 这是旧 `style/roles.rs` 角色集合的**完整移植**（64 个角色，名称与语义逐个保留）：旧实现把角色
-//! 分成 `Surfaces`/`Lines`/`Foregrounds`/... 等结构体，是因为 GPUI 的世界里逐帧读一个字段；引擎
+//! 分成 `Surfaces`/`Lines`/`Foregrounds`/... 等结构体，是因为旧实现逐帧读一个字段；引擎
 //! 的依赖追踪要求角色是**可枚举、可作 Signal 依赖粒度**的键，因此这里摊平成扁平枚举
 //! （`SurfaceCanvas`、`FgMuted`、`ChartSeries0`…）。分组只保留在文档里：同一前缀就是一个组，
 //! [`Role::name`] 返回旧实现的点号路径（`surface.canvas`、`fg.muted`、`chart.series[0]`），

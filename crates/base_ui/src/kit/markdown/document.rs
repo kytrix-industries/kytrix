@@ -1,13 +1,13 @@
-//! 解析后的 markdown 文档 IR（只读模型，无 gpui / 无引擎类型）。
+//! 解析后的 markdown 文档 IR（只读模型，无 UI 框架类型 / 无引擎类型）。
 //!
 //! IR 分三层：块（[`MarkdownBlock`]）→ 行内片段（[`MarkdownPiece`]）→ 链接表。块之间保留
 //! 源码里的空行（[`MarkdownBlock::BlankLine`]），行内片段保留 strong / emphasis / strike /
 //! code / link / kbd 六种标记与行内图片。
 //!
-//! 与旧实现（`crate::markdown::document`）的差别（P2-3 交付的**扩展**，见
+//! 与旧实现（`markdown/document.rs`）的差别（P2-3 交付的**扩展**，见
 //! `.docs/gui-migration/spec-deltas/kit-text.md`）：
 //!
-//! - 字符串从 gpui `SharedString` 换成 `SmolStr`、尺寸从 `Size<Pixels>` 换成引擎的
+//! - 字符串从 旧 UI 层的 `SharedString` 换成 `SmolStr`、尺寸从 `Size<Pixels>` 换成引擎的
 //!   [`ui_core::math::Size`]（逻辑像素 `f32`）；
 //! - 新增 `CodeBlock` / `Quote` / `List` / `Table` / `ThematicBreak` 五种块与行内 `code` /
 //!   `strike` 两种标记：旧实现把这些节点整棵丢弃，本批按引擎节点树把它们表达出来。

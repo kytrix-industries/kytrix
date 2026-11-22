@@ -2,8 +2,8 @@
 //!
 //! # 与旧实现的关系
 //!
-//! 旧 `crate::assets::Assets` 是 `rust_embed` + GPUI 的 `AssetSource`：整个 `assets/` 目录被
-//! 嵌进二进制，GPUI 在渲染 `svg()` / `img()` 时按路径取字节。引擎没有 `AssetSource` 抽象
+//! 旧 `assets` 模块是 `rust_embed` + 旧 UI 层的 `AssetSource`：整个 `assets/` 目录被嵌进二进制，
+//! 渲染 `svg()` / `img()` 时按路径取字节。引擎没有 `AssetSource` 抽象
 //! （设计 §8.5：资源**文件**在应用层，引擎只提供 `ResourceCache`：字节 → 解码 → 图集 tile），
 //! 所以本模块做两件事：
 //!
@@ -44,7 +44,7 @@
 //! # 引用计数 / 生命周期
 //!
 //! - [`AssetImages`] 的异步插入**没有**窗口归属（引擎 `insert_async*` 不登记 owner）：条目活到
-//!   进程结束或应用显式 `App::resources_mut().unload(..)`。这与旧 GPUI 资产的生命周期一致
+//!   进程结束或应用显式 `App::resources_mut().unload(..)`。这与旧实现 资产的生命周期一致
 //!   （资源跟着进程走），也避免每帧重新解码。
 //! - [`crate::kit::icon::IconSpec::build`] 走的是**同步**插入 + 窗口归属：小图标（≤96 px）解码
 //!   成本可忽略，且图标数量随节点数增长，需要关窗回收。

@@ -5,7 +5,7 @@
 //! 同一个形状的两个实例：只在明度上不同，从不在语义上不同。
 //!
 //! 数据与旧 `style/palette.rs` **逐个数值一致**（OKLCH 分量），测试逐字段对照。颜色一律是引擎
-//! [`Color`]（`Oklch` 变体），不引入 gpui 类型。
+//! [`Color`]（`Oklch` 变体），不引入 UI 框架类型。
 
 use ui_core::paint::color::Color;
 
@@ -237,203 +237,152 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::{Appearance, Palette};
-    use crate::{
-        style::{color::Oklch as OldOklch, palette::Palette as OldPalette},
-        theme::color::oklch_components,
-    };
+    use crate::theme::color::oklch_components;
 
-    fn old_oklch(color: OldOklch) -> [f32; 4] {
+    /// 旧实现（`style/palette.rs`）的 Light 调色板 OKLCH 值（P5-2 在旧模块删除前逐位冻结）。
+    const LIGHT_LEGACY: [(&str, [f32; 4]); 35] = [
+        ("canvas", [0.978, 0.0, 0.0, 1.0]),
+        ("surface_raised", [1.0, 0.0, 0.0, 1.0]),
+        ("surface_sunken", [0.948, 0.0, 0.0, 1.0]),
+        ("overlay", [1.0, 0.0, 0.0, 1.0]),
+        ("control", [1.0, 0.0, 0.0, 1.0]),
+        ("text", [0.245, 0.028, 278.0, 1.0]),
+        ("brand", [0.526, 0.152, 249.5, 1.0]),
+        ("status.danger", [0.532, 0.19, 26.0, 1.0]),
+        ("status.warning", [0.545, 0.116, 76.0, 1.0]),
+        ("status.success", [0.52, 0.124, 154.0, 1.0]),
+        ("status.info", [0.53, 0.104, 232.0, 1.0]),
+        ("status.elevated", [0.545, 0.148, 45.0, 1.0]),
+        ("market.up", [0.514, 0.128, 152.0, 1.0]),
+        ("market.down", [0.542, 0.18, 22.0, 1.0]),
+        ("fear_greed.extreme_fear", [0.4958, 0.1905, 22.83, 1.0]),
+        ("fear_greed.fear", [0.6529, 0.211, 18.2, 1.0]),
+        ("fear_greed.neutral", [0.8724, 0.1636, 94.59, 1.0]),
+        ("fear_greed.greed", [0.8148, 0.1705, 161.41, 1.0]),
+        ("fear_greed.extreme_greed", [0.6306, 0.1263, 162.21, 1.0]),
+        ("series[0]", [0.62, 0.14, 62.0, 1.0]),
+        ("series[1]", [0.5, 0.15, 276.0, 1.0]),
+        ("series[2]", [0.56, 0.13, 194.0, 1.0]),
+        ("series[3]", [0.56, 0.17, 350.0, 1.0]),
+        ("series[4]", [0.54, 0.13, 120.0, 1.0]),
+        ("series[5]", [0.5, 0.01, 0.0, 1.0]),
+        ("map_ocean", [0.841, 0.046, 217.5, 1.0]),
+        ("map_land", [0.953, 0.009, 84.6, 1.0]),
+        ("map_border", [0.647, 0.133, 311.1, 1.0]),
+        ("map_road", [0.591, 0.213, 7.2, 1.0]),
+        ("map_road_minor", [0.57, 0.12, 74.9, 1.0]),
+        ("on_brand", [0.978, 0.0, 0.0, 1.0]),
+        ("on_inverse", [0.978, 0.0, 0.0, 1.0]),
+        ("scrim_alpha", [0.42, 0.0, 0.0, 0.0]),
+        ("veil_hover", [0.06, 0.0, 0.0, 0.0]),
+        ("veil_active", [0.1, 0.0, 0.0, 0.0]),
+    ];
+
+    /// 旧实现（`style/palette.rs`）的 Dark 调色板 OKLCH 值（P5-2 冻结）。
+    const DARK_LEGACY: [(&str, [f32; 4]); 35] = [
+        ("canvas", [0.215, 0.016, 252.4, 1.0]),
+        ("surface_raised", [0.262, 0.016, 252.4, 1.0]),
+        ("surface_sunken", [0.176, 0.016, 252.4, 1.0]),
+        ("overlay", [0.278, 0.016, 252.4, 1.0]),
+        ("control", [0.245, 0.016, 252.4, 1.0]),
+        ("text", [0.955, 0.012, 255.0, 1.0]),
+        ("brand", [0.722, 0.13, 242.0, 1.0]),
+        ("status.danger", [0.708, 0.17, 20.0, 1.0]),
+        ("status.warning", [0.822, 0.15, 84.0, 1.0]),
+        ("status.success", [0.762, 0.15, 160.0, 1.0]),
+        ("status.info", [0.752, 0.118, 226.0, 1.0]),
+        ("status.elevated", [0.76, 0.15, 52.0, 1.0]),
+        ("market.up", [0.782, 0.158, 150.0, 1.0]),
+        ("market.down", [0.702, 0.186, 20.0, 1.0]),
+        ("fear_greed.extreme_fear", [0.56, 0.19, 22.83, 1.0]),
+        ("fear_greed.fear", [0.7, 0.18, 18.2, 1.0]),
+        ("fear_greed.neutral", [0.8724, 0.1636, 94.59, 1.0]),
+        ("fear_greed.greed", [0.8148, 0.1705, 161.41, 1.0]),
+        ("fear_greed.extreme_greed", [0.68, 0.1263, 162.21, 1.0]),
+        ("series[0]", [0.8, 0.15, 78.0, 1.0]),
+        ("series[1]", [0.72, 0.13, 282.0, 1.0]),
+        ("series[2]", [0.78, 0.12, 196.0, 1.0]),
+        ("series[3]", [0.74, 0.17, 350.0, 1.0]),
+        ("series[4]", [0.7, 0.14, 120.0, 1.0]),
+        ("series[5]", [0.66, 0.01, 0.0, 1.0]),
+        ("map_ocean", [0.15, 0.0, 0.0, 1.0]),
+        ("map_land", [0.283, 0.0, 0.0, 1.0]),
+        ("map_border", [0.813, 0.09, 311.0, 1.0]),
+        ("map_road", [0.633, 0.0, 0.0, 1.0]),
+        ("map_road_minor", [0.53, 0.0, 0.0, 1.0]),
+        ("on_brand", [0.176, 0.02, 245.0, 1.0]),
+        ("on_inverse", [0.176, 0.016, 252.4, 1.0]),
+        ("scrim_alpha", [0.55, 0.0, 0.0, 0.0]),
+        ("veil_hover", [0.08, 0.0, 0.0, 0.0]),
+        ("veil_active", [0.14, 0.0, 0.0, 0.0]),
+    ];
+
+    /// 新调色板每个字段的 OKLCH 分量（顺序与 [`LIGHT_LEGACY`] / [`DARK_LEGACY`] 一致）。
+    fn components(palette: &Palette) -> [(&'static str, [f32; 4]); 35] {
         [
-            color.lightness(),
-            color.chroma(),
-            color.hue(),
-            color.alpha(),
+            ("canvas", oklch_components(palette.canvas)),
+            ("surface_raised", oklch_components(palette.surface_raised)),
+            ("surface_sunken", oklch_components(palette.surface_sunken)),
+            ("overlay", oklch_components(palette.overlay)),
+            ("control", oklch_components(palette.control)),
+            ("text", oklch_components(palette.text)),
+            ("brand", oklch_components(palette.brand)),
+            ("status.danger", oklch_components(palette.status.danger)),
+            ("status.warning", oklch_components(palette.status.warning)),
+            ("status.success", oklch_components(palette.status.success)),
+            ("status.info", oklch_components(palette.status.info)),
+            ("status.elevated", oklch_components(palette.status.elevated)),
+            ("market.up", oklch_components(palette.market.up)),
+            ("market.down", oklch_components(palette.market.down)),
+            (
+                "fear_greed.extreme_fear",
+                oklch_components(palette.fear_greed.extreme_fear),
+            ),
+            ("fear_greed.fear", oklch_components(palette.fear_greed.fear)),
+            (
+                "fear_greed.neutral",
+                oklch_components(palette.fear_greed.neutral),
+            ),
+            (
+                "fear_greed.greed",
+                oklch_components(palette.fear_greed.greed),
+            ),
+            (
+                "fear_greed.extreme_greed",
+                oklch_components(palette.fear_greed.extreme_greed),
+            ),
+            ("series[0]", oklch_components(palette.series[0])),
+            ("series[1]", oklch_components(palette.series[1])),
+            ("series[2]", oklch_components(palette.series[2])),
+            ("series[3]", oklch_components(palette.series[3])),
+            ("series[4]", oklch_components(palette.series[4])),
+            ("series[5]", oklch_components(palette.series[5])),
+            ("map_ocean", oklch_components(palette.map_ocean)),
+            ("map_land", oklch_components(palette.map_land)),
+            ("map_border", oklch_components(palette.map_border)),
+            ("map_road", oklch_components(palette.map_road)),
+            ("map_road_minor", oklch_components(palette.map_road_minor)),
+            ("on_brand", oklch_components(palette.on_brand)),
+            ("on_inverse", oklch_components(palette.on_inverse)),
+            ("scrim_alpha", [palette.scrim_alpha, 0.0, 0.0, 0.0]),
+            ("veil_hover", [palette.veil_hover, 0.0, 0.0, 0.0]),
+            ("veil_active", [palette.veil_active, 0.0, 0.0, 0.0]),
         ]
     }
 
-    /// 新调色板的每个字段都必须与旧 `style/palette.rs` 的 OKLCH 数值一致（数据移植的逐位证据）。
+    /// 新调色板的每个字段与旧实现的冻结 OKLCH 数值一致（数据移植的逐位证据）。
+    ///
+    /// 旧模块已在 P5-2 删除，期望值冻结在 [`LIGHT_LEGACY`] / [`DARK_LEGACY`]（见
+    /// `test-ledger/p5-2.md` §2）：任何调色板数值改动都会红。
     #[test]
-    fn every_palette_value_matches_the_old_style_palette() {
-        for (appearance, old) in [
-            (Appearance::Light, OldPalette::light()),
-            (Appearance::Dark, OldPalette::dark()),
+    fn every_palette_value_matches_the_frozen_legacy_table() {
+        for (appearance, legacy) in [
+            (Appearance::Light, LIGHT_LEGACY),
+            (Appearance::Dark, DARK_LEGACY),
         ] {
             let new = Palette::of(appearance);
-            let pairs: [(&str, [f32; 4], [f32; 4]); 35] = [
-                (
-                    "canvas",
-                    old_oklch(old.canvas),
-                    oklch_components(new.canvas),
-                ),
-                (
-                    "surface_raised",
-                    old_oklch(old.surface_raised),
-                    oklch_components(new.surface_raised),
-                ),
-                (
-                    "surface_sunken",
-                    old_oklch(old.surface_sunken),
-                    oklch_components(new.surface_sunken),
-                ),
-                (
-                    "overlay",
-                    old_oklch(old.overlay),
-                    oklch_components(new.overlay),
-                ),
-                (
-                    "control",
-                    old_oklch(old.control),
-                    oklch_components(new.control),
-                ),
-                ("text", old_oklch(old.text), oklch_components(new.text)),
-                ("brand", old_oklch(old.brand), oklch_components(new.brand)),
-                (
-                    "status.danger",
-                    old_oklch(old.status.danger),
-                    oklch_components(new.status.danger),
-                ),
-                (
-                    "status.warning",
-                    old_oklch(old.status.warning),
-                    oklch_components(new.status.warning),
-                ),
-                (
-                    "status.success",
-                    old_oklch(old.status.success),
-                    oklch_components(new.status.success),
-                ),
-                (
-                    "status.info",
-                    old_oklch(old.status.info),
-                    oklch_components(new.status.info),
-                ),
-                (
-                    "status.elevated",
-                    old_oklch(old.status.elevated),
-                    oklch_components(new.status.elevated),
-                ),
-                (
-                    "market.up",
-                    old_oklch(old.market.up),
-                    oklch_components(new.market.up),
-                ),
-                (
-                    "market.down",
-                    old_oklch(old.market.down),
-                    oklch_components(new.market.down),
-                ),
-                (
-                    "fear_greed.extreme_fear",
-                    old_oklch(old.fear_greed.extreme_fear),
-                    oklch_components(new.fear_greed.extreme_fear),
-                ),
-                (
-                    "fear_greed.fear",
-                    old_oklch(old.fear_greed.fear),
-                    oklch_components(new.fear_greed.fear),
-                ),
-                (
-                    "fear_greed.neutral",
-                    old_oklch(old.fear_greed.neutral),
-                    oklch_components(new.fear_greed.neutral),
-                ),
-                (
-                    "fear_greed.greed",
-                    old_oklch(old.fear_greed.greed),
-                    oklch_components(new.fear_greed.greed),
-                ),
-                (
-                    "fear_greed.extreme_greed",
-                    old_oklch(old.fear_greed.extreme_greed),
-                    oklch_components(new.fear_greed.extreme_greed),
-                ),
-                (
-                    "series[0]",
-                    old_oklch(old.series[0]),
-                    oklch_components(new.series[0]),
-                ),
-                (
-                    "series[1]",
-                    old_oklch(old.series[1]),
-                    oklch_components(new.series[1]),
-                ),
-                (
-                    "series[2]",
-                    old_oklch(old.series[2]),
-                    oklch_components(new.series[2]),
-                ),
-                (
-                    "series[3]",
-                    old_oklch(old.series[3]),
-                    oklch_components(new.series[3]),
-                ),
-                (
-                    "series[4]",
-                    old_oklch(old.series[4]),
-                    oklch_components(new.series[4]),
-                ),
-                (
-                    "series[5]",
-                    old_oklch(old.series[5]),
-                    oklch_components(new.series[5]),
-                ),
-                (
-                    "map_ocean",
-                    old_oklch(old.map_ocean),
-                    oklch_components(new.map_ocean),
-                ),
-                (
-                    "map_land",
-                    old_oklch(old.map_land),
-                    oklch_components(new.map_land),
-                ),
-                (
-                    "map_border",
-                    old_oklch(old.map_border),
-                    oklch_components(new.map_border),
-                ),
-                (
-                    "map_road",
-                    old_oklch(old.map_road),
-                    oklch_components(new.map_road),
-                ),
-                (
-                    "map_road_minor",
-                    old_oklch(old.map_road_minor),
-                    oklch_components(new.map_road_minor),
-                ),
-                (
-                    "on_brand",
-                    old_oklch(old.on_brand),
-                    oklch_components(new.on_brand),
-                ),
-                (
-                    "on_inverse",
-                    old_oklch(old.on_inverse),
-                    oklch_components(new.on_inverse),
-                ),
-                (
-                    "scrim_alpha",
-                    [old.scrim_alpha, 0.0, 0.0, 0.0],
-                    [new.scrim_alpha, 0.0, 0.0, 0.0],
-                ),
-                (
-                    "veil_hover",
-                    [old.veil_hover, 0.0, 0.0, 0.0],
-                    [new.veil_hover, 0.0, 0.0, 0.0],
-                ),
-                (
-                    "veil_active",
-                    [old.veil_active, 0.0, 0.0, 0.0],
-                    [new.veil_active, 0.0, 0.0, 0.0],
-                ),
-            ];
-
-            assert_eq!(
-                old.appearance == crate::style::palette::Appearance::Dark,
-                appearance == Appearance::Dark
-            );
-            for (name, old, new) in pairs {
+            for ((legacy_name, old), (name, new)) in legacy.into_iter().zip(components(&new)) {
+                assert_eq!(legacy_name, name, "{appearance:?} 的字段顺序漂移");
                 for index in 0..4 {
                     assert!(
                         (old[index] - new[index]).abs() < 1e-6,
