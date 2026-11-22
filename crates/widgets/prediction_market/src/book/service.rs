@@ -19,8 +19,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_connector::{
     error::MarketParticipantError,
     market::{
@@ -36,10 +35,11 @@ use market_participants_model::{
         PredictionOrderBookUpdate,
     },
 };
+use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     rpc::RpcCallError,
     runtime::{ServiceContext, WidgetService},
@@ -118,12 +118,12 @@ pub(crate) enum PredictionOrderBookError {
     Rpc(#[source] RpcCallError<PredictionOrderBookServiceError>),
 }
 
-impl LocalizedError for PredictionOrderBookError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for PredictionOrderBookError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Market(error) => error.localized_message(cx),
-            Self::Timeout(_) => t!(cx, "widget.prediction_market.book.timed_out"),
-            Self::Rpc(error) => error.localized_message(cx),
+            Self::Market(error) => error.translated_message(translate),
+            Self::Timeout(_) => t_smol!(translate, "widget.prediction_market.book.timed_out"),
+            Self::Rpc(error) => error.translated_message(translate),
         }
     }
 }
@@ -135,8 +135,8 @@ impl LocalizedError for PredictionOrderBookError {
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub(crate) enum PredictionOrderBookServiceError {}
 
-impl LocalizedError for PredictionOrderBookServiceError {
-    fn localized_message(&self, _cx: &App) -> SharedString {
+impl TranslatedError for PredictionOrderBookServiceError {
+    fn translated_message(&self, _translate: &Translate) -> SmolStr {
         match *self {}
     }
 }
