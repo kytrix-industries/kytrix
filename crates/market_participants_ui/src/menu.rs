@@ -4,86 +4,113 @@
 //! # What it owns
 //!
 //! The list of venues, and what each of them is doing. The list is the *venue list* — what
-//! `supported_venues()` answers — so it is the same whether or not anything is loaded, and
-//! whether a venue is loaded is read from the loaded venues (`LoadedVenues`) every time the rows
-//! are built rather than remembered. The activity is this menu's own memory: a load it started and
-//! has not heard the end of, or the failure the last one reported. Nothing is persisted:
-//! loading a venue is something this run did, not a setting.
+//! [`VenueDirectory::venues`] answers — so it is the same whether or not anything is loaded,
+//! and whether a venue is loaded is read from the directory every time the rows are built
+//! rather than remembered. The activity is this menu's own memory: a load it started and has
+//! not heard the end of, or the failure the last one reported. Nothing is persisted: loading a
+//! venue is something this run did, not a setting.
 //!
 //! # What it does not own
 //!
-//! The venues themselves. Committing a venue's scopes, catalogs and metadata is
-//! [`MarketParticipantsConnector::load_venue`], and this menu is its only caller: the user's press is
-//! the one event that makes the program talk to a market. The load runs on the
-//! application Tokio runtime and reports back through a GPUI task, because the executor a
-//! view runs on has no reactor to drive a request.
+//! The venues themselves. Committing a venue's scopes, catalogs and metadata is the
+//! directory's `load`, and this menu is its only caller outside the composition root: the
+//! user's press is the one event that makes the program talk to a market. The load runs on
+//! the engine's runtime and reports back through a channel, because the frame thread has no
+//! reactor to drive a request.
 //!
 //! A failure is reported twice and never hidden: the row keeps saying the venue failed to
 //! load, and the reason itself is opened once in an alert. A success says nothing — the row
-//! already reads "refresh" because the venue is in the loaded venues now.
+//! already reads "refresh" because the venue is in the directory's loaded venues now.
+//!
+//! # The picture, not the state machine
+//!
+//! The panel's rows are rebuilt only when what they are drawn from moved: the language, which
+//! venues are loaded, and what each venue is doing. A frame in which none of those moved
+//! builds nothing and writes nothing — the steady state is zero frames, as it is for a
+//! widget.
+//!
+//! # Release
+//!
+//! [`MarketParticipants::release`] cancels the loads still in flight, closes and releases the
+//! panel overlay and any alert, releases every kit component the rows and the trigger were
+//! built from, and gives the menu's signal scope back. The trigger node itself belongs to the
+//! caller's title bar: the caller removes it first, then releases the menu (the engine's
+//! teardown order is "remove the subtree, then release the scope", E16).
 
-use ahash::AHashMap;
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
+
+use ahash::{AHashMap, AHashSet};
 use base_ui::{
-    brand::Brand,
-    button::Button,
-    dropdown::Dropdown,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    layer::LayerExt as _,
-    menu::MenuItem,
-    size::{UnifiedSizable, UnifiedSize},
-    spinner::Spinner,
-    style::theme::ThemeExt,
-    tooltip::Tooltip,
+    kit::{
+        alert::AlertBuilder,
+        brand::{Brand, BrandKind},
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        icon::{IconKind, IconSpec},
+        interactive::Interactive,
+        layer::Band,
+        overlay::{
+            Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayOptions, OverlaySurface, Placement,
+        },
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+        tooltip::{Tooltip, TooltipContent, TooltipOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, ElementId, Entity, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Task,
-    WeakEntity, Window,
-    base::{Align, Disableable, Placement},
-    div, px,
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+use market_participants_connector::connector::VenueLoadError;
+use market_participants_model::identifier::VenueId;
+use smol_str::{SmolStr, format_smolstr};
+use taffy::style::Dimension;
+use tokio::sync::mpsc;
+use ui_core::{
+    a11y::{A11yOverride, A11yRole},
+    app::App,
+    error::EngineError,
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+    },
+    paint::style::StylePatch,
+    text::{TextOverflow, TextStyle},
+    window::WindowId,
 };
-use i18n::t;
-use market_participants_connector::{
-    connector::{MarketParticipantsConnector, VenueLoadError},
-    error::MarketParticipantError,
-    venue::loaded::VenuesUpdated,
+use widget::{error::TranslatedError, venue::VenueDisplay};
+
+use crate::{
+    error::{MenuError, VenueLoadFailure},
+    host::{MarketParticipantsHost, VenueDirectory},
 };
-use market_participants_model::{display::lexical::scope_display_code, identifier::VenueId};
-use smol_str::format_smolstr;
-use tokio::task::JoinError;
-use widget::{error::LocalizedError, venue::VenueDisplay};
-use widget_tokio_runtime::global;
 
-/// The element id of the title bar's entry: the trigger, its panel and the state behind them.
-const MENU_ID: &str = "market-participants-menu";
-
-/// The sibling scopes every row is built under: they are told apart by the index the venue has
-/// in the venue list, which is stable for as long as that list is.
-const ROW_ID: &str = "market-participants-row";
-const ACTION_ID: &str = "market-participants-action";
-/// The mark at the left of a row's action, whatever it holds.
-const MARK_ID: &str = "market-participants-mark";
-const SPINNER_ID: &str = "market-participants-spinner";
-
-/// How wide the panel is.
+/// The instance prefix of every kit key and node id this menu registers.
 ///
-/// A [`Dropdown`] sizes its panel from its trigger unless it is told otherwise, and this
-/// menu's trigger is a button narrower than a venue line, so the panel's width is stated by
-/// the menu. It is a fixed width because the panel is a column of venue lines with an action
-/// at the end of each of them: a panel that resized as a load reported itself would move the
-/// buttons under the pointer that opened it.
-const MENU_WIDTH: f32 = 280.0;
+/// One menu appends its own signal-scope index, so two title bars in one window own two
+/// identities. A constant key would make the later menu replace the earlier one's handlers:
+/// `App::on_action` replaces a handler of the same `Action`, and every kit component derives
+/// its actions from its key.
+const KEY_BASE: &str = "market-participants";
 
-/// The square the trigger takes: the title bar's control square, which the sidebar toggle
-/// drawn beside it takes as well.
+/// The panel's width, surface padding included.
 ///
-/// The menu is a title bar control, so it has to be the size of the bar's other controls:
-/// a square of its own would not line up with the toggle next to it.
-const TRIGGER_SIZE: Pixels = px(32.0);
+/// It is a fixed width because the panel is a column of venue lines with an action at the end
+/// of each of them: a panel that resized as a load reported itself would move the buttons
+/// under the pointer that opened it.
+const PANEL_WIDTH: f32 = 280.0;
 
-/// The mark inside the trigger, drawn at the size the sidebar toggle draws its own.
-const TRIGGER_ICON_SIZE: Pixels = px(16.0);
+/// The panel surface's own padding (`OverlaySurface::menu`), which the content width excludes.
+const SURFACE_PADDING: f32 = 4.0;
+
+/// The width the panel's own content column takes.
+const PANEL_CONTENT_WIDTH: f32 = PANEL_WIDTH - 2.0 * SURFACE_PADDING;
+
+/// The mark inside the trigger, drawn at the size the title bar's other marks take.
+const TRIGGER_ICON_SIZE: f32 = 16.0;
 
 /// The room the mark at the left of a row's action takes.
 ///
@@ -104,694 +131,996 @@ const ACTION_WIDTH: f32 = 64.0;
 ///
 /// There is no `Idle`: a venue nothing is happening to is not doing anything, which is what
 /// having no entry here says.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Activity {
     /// A load is in flight for this venue.
     Loading,
     /// The last load failed: the line the row keeps under the venue's name.
     ///
-    /// The state is the whole of what is remembered. The sentence the line reads is
-    /// read when the row is *drawn* rather than when the failure was reported,
-    /// because it names the venue: a sentence resolved at report time would keep the
-    /// language it was reported in, and the row it sits under would name the same
-    /// venue in the language the interface is showing now. What the failure actually
-    /// said is a fact about that moment and is stated in full by the alert that was
-    /// raised when it happened.
+    /// The state is the whole of what is remembered. The sentence the line reads is read
+    /// when the row is *drawn* rather than when the failure was reported, because it names
+    /// the venue: a sentence resolved at report time would keep the language it was reported
+    /// in, while the row it sits under would name the same venue in the language the
+    /// interface is showing now. What the failure actually said is a fact about that moment
+    /// and is stated in full by the alert that was raised when it happened.
     Failed,
 }
 
-/// One line of the panel: a venue this build speaks, and whether a load committed it.
+/// One line of the panel: a venue this build speaks, and whether the directory committed it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VenueRow {
     venue: VenueId,
-    /// Whether the venue is loaded, read from the loaded venues when the row was built.
     loaded: bool,
 }
 
-/// Why one row's action failed.
+/// What the panel's rows are currently drawn from.
 ///
-/// A load reports its own typed failure; a task that never reported at all is the other
-/// answer, and it is what is left to say when the load said nothing.
-#[derive(Debug, thiserror::Error)]
-enum LoadFailure {
-    #[error("{0}")]
-    Venue(#[from] VenueLoadError),
-    #[error("the task loading {venue} did not finish: {source}")]
-    Interrupted {
-        venue: VenueId,
-        #[source]
-        source: JoinError,
-    },
+/// The rows are rebuilt when this changes and only then: a language switch, a load that
+/// committed, a load that started or failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PanelSignature {
+    language: LanguageCode,
+    rows: Vec<(VenueId, bool, Option<Activity>)>,
 }
 
-impl LocalizedError for LoadFailure {
-    fn localized_message(&self, cx: &App) -> SharedString {
-        match self {
-            Self::Venue(error) => match error {
-                // Each variant of a load's failure is a sentence of its own: the stage that
-                // failed is what the row has to report, and a scope-carrying stage names the
-                // scope it failed on.
-                VenueLoadError::Discovery { venue, source } => t!(
-                    cx,
-                    "error.venue_load.discovery",
-                    market = venue.display_string(cx),
-                    cause = source.localized_message(cx)
-                ),
-                VenueLoadError::DiscoveryUnverifiable { venue, dex } => t!(
-                    cx,
-                    "error.venue_load.discovery_unverifiable",
-                    market = venue.display_string(cx),
-                    dex = dex.as_str()
-                ),
-                VenueLoadError::DiscoveryLimitExceeded {
-                    venue,
-                    named,
-                    limit,
-                } => t!(
-                    cx,
-                    "error.venue_load.discovery_limit_exceeded",
-                    market = venue.display_string(cx),
-                    named = *named,
-                    limit = *limit
-                ),
-                VenueLoadError::Registration { venue, .. } => t!(
-                    cx,
-                    "error.venue_load.registration",
-                    market = venue.display_string(cx)
-                ),
-                // The metadata stage is a venue-level sentence in the error type's own words —
-                // its `Display` names the venue and not the scope — so the row states the same
-                // thing the typed failure does. The scope the variant carries is a caller's
-                // answer to act on, not part of what the row says.
-                VenueLoadError::Metadata { venue, source, .. } => t!(
-                    cx,
-                    "error.venue_load.metadata",
-                    market = venue.display_string(cx),
-                    cause = source.localized_message(cx)
-                ),
-                VenueLoadError::Catalog {
-                    venue,
-                    scope,
-                    source,
-                } => match source.as_ref() {
-                    // A catalog that moved under its fetch is reported as the moved catalog it
-                    // is — the venue's own stage answer — rather than as a read that failed:
-                    // what the user has to do is load the market again.
-                    MarketParticipantError::Catalog(error)
-                        if matches!(
-                            error.as_ref(),
-                            market_participants_connector::catalog::error::CatalogError::RouteRevisionChanged { .. }
-                        ) =>
-                    {
-                        t!(
-                            cx,
-                            "error.venue_load.revision_changed",
-                            market = venue.display_string(cx),
-                            scope = scope_display_code(scope)
-                        )
-                    }
-                    cause => t!(
-                        cx,
-                        "error.venue_load.catalog",
-                        market = venue.display_string(cx),
-                        scope = scope_display_code(scope),
-                        cause = cause.localized_message(cx)
-                    ),
-                },
-                VenueLoadError::CatalogValidation {
-                    venue,
-                    scope,
-                    error,
-                } => t!(
-                    cx,
-                    "error.venue_load.catalog_validation",
-                    market = venue.display_string(cx),
-                    scope = scope_display_code(scope),
-                    cause = error.localized_message(cx)
-                ),
-                VenueLoadError::RevisionChanged { venue, scope } => t!(
-                    cx,
-                    "error.venue_load.revision_changed",
-                    market = venue.display_string(cx),
-                    scope = scope_display_code(scope)
-                ),
-                // A cancelled load is the user's own doing, and the row says so without
-                // dressing it up as a failure of the venue.
-                VenueLoadError::Interrupted { venue } => {
-                    t!(
-                        cx,
-                        "error.venue_load.interrupted",
-                        market = venue.display_string(cx)
-                    )
-                }
-                // A venue the definition table answers no definition for is one this build
-                // draws no row for, so this is a load started against a venue the menu was
-                // never able to offer: the sentence names the venue rather than reporting a
-                // stage that never ran.
-                VenueLoadError::UnsupportedVenue { venue } => t!(
-                    cx,
-                    "error.venue_load.unsupported_venue",
-                    market = venue.display_string(cx)
-                ),
-            },
-            // A load that did not finish has no venue-level reason to name: the line its row
-            // shows is all this program can say about it.
-            Self::Interrupted { venue, .. } => t!(
-                cx,
-                "window.market_participants.failed",
-                market = venue.display_string(cx)
-            ),
-        }
-    }
+/// What one load reported back to the frame thread.
+struct LoadOutcome {
+    venue: VenueId,
+    result: Result<(), VenueLoadError>,
+}
+
+/// The built pieces of one row, kept for `sync` and `release`.
+#[derive(Default)]
+struct RowComponents {
+    button: Option<Button>,
+    spinner: Option<Spinner>,
 }
 
 /// The market participants entry the title bar mounts.
+///
+/// The handle is a shallow `Rc`: the trigger's click callback upgrades the inner state to
+/// toggle the panel, so callbacks never keep the menu alive past [`Self::release`].
+#[derive(Clone)]
 pub struct MarketParticipants {
-    connector: MarketParticipantsConnector,
-    /// The rows the panel draws, rebuilt from the static venue list and the loaded venues.
-    rows: Vec<VenueRow>,
-    /// What each venue is doing, if anything.
-    activity: AHashMap<VenueId, Activity>,
-    /// The load in flight, one per venue.
-    ///
-    /// One entry per venue rather than one for the menu, because venues are independent:
-    /// a single slot would drop the load of the venue that was pressed first as soon
-    /// as a second row was pressed, leaving that venue to be reported by nobody.
-    tasks: AHashMap<VenueId, Task<()>>,
-    /// Whether the panel is open, which the overlay writes and the trigger reads.
-    open_state: Entity<bool>,
+    inner: Rc<RefCell<MenuInner>>,
 }
 
 impl MarketParticipants {
-    /// Builds the menu the application mounts, reading the market participants root from the globals
-    /// the composition root installed.
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let connector = cx.global::<MarketParticipantsConnector>().clone();
-        let open_state = cx.new(|_| false);
-
-        // Whether the panel is open lives in a state entity the overlay writes and the
-        // trigger reads, so this menu follows it: a press that opens the panel has to reach
-        // the frame that draws it, and an open panel has to show what the loaded venues hold
-        // *now* rather than what they held the last time it was opened.
-        let opened = open_state.clone();
-        cx.observe(&opened, |menu, state, cx| {
-            if *state.read(cx) {
-                menu.rebuild_rows();
-            }
-            cx.notify();
-        })
-        .detach();
-
-        // A commit changes what a row offers: the venue that just loaded offers a refresh where
-        // it offered a load, and a load that failed leaves the row as it was. The panel follows
-        // the commits rather than waiting for the next press of its trigger, so the row the user
-        // pressed reports what their own action did.
-        let events = connector.venues().events();
-        cx.subscribe(&events, |menu, _, _: &VenuesUpdated, cx| {
-            menu.rebuild_rows();
-            cx.notify();
-        })
-        .detach();
-
-        let mut menu = Self {
-            connector,
-            rows: Vec::new(),
-            activity: AHashMap::with_capacity(4),
-            tasks: AHashMap::with_capacity(4),
-            open_state,
-        };
-        menu.rebuild_rows();
+    /// Builds the menu the application mounts.
+    ///
+    /// Nothing is built, loaded or reported here: `build` mounts the trigger, and a load starts
+    /// when the user presses a row's action.
+    pub fn new(host: MarketParticipantsHost, app: &mut App) -> Self {
+        let scope = app.signal_scope();
+        let key = format_smolstr!("{KEY_BASE}@{}", scope.index());
+        let language = host.language(app);
+        let title = t_smol!(host.translate(), "window.market_participants.title");
+        let a11y_label = app.signal_scoped(scope, title);
+        let rows = read_rows(host.directory());
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let inner = Rc::new(RefCell::new(MenuInner {
+            host,
+            key,
+            scope,
+            a11y_label,
+            language,
+            rows,
+            activity: AHashMap::new(),
+            pending: AHashSet::new(),
+            outcome_tx,
+            outcome_rx,
+            window: None,
+            trigger: None,
+            trigger_node: None,
+            tooltip: None,
+            overlay: None,
+            rows_root: None,
+            buttons: Vec::new(),
+            spinners: Vec::new(),
+            panel_signature: None,
+            alert: None,
+            released: false,
+            self_weak: Weak::new(),
+        }));
+        let menu = Self { inner };
+        menu.inner.borrow_mut().self_weak = Rc::downgrade(&menu.inner);
         menu
     }
 
-    /// Re-reads the venue list and what is loaded.
+    /// The instance prefix every kit key and node id is derived from.
+    #[must_use]
+    pub fn key(&self) -> SmolStr {
+        self.inner.borrow().key.clone()
+    }
+
+    /// The trigger node, once [`Self::build`] ran.
+    #[must_use]
+    pub fn trigger_node(&self) -> Option<NodeId> {
+        self.inner.borrow().trigger_node
+    }
+
+    /// Whether the venue panel is open (the engine may have closed it; this follows the
+    /// handle's state, which [`Self::sync`] brings in step with the engine).
+    #[must_use]
+    pub fn is_open(&self, app: &App) -> bool {
+        self.inner
+            .borrow()
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.is_open(app))
+    }
+
+    /// Mounts the trigger under `parent`, and the panel and alert machinery that belongs to it.
     ///
-    /// The static venue list is what the panel lists — every venue this build can load,
-    /// whether or not it is loaded — and the loaded venues answer which of them are. It
-    /// is the only routing view: a venue is loaded exactly when its whole scope set,
-    /// catalog and metadata committed, so "in the list" and "fully usable" are the
-    /// same statement. Neither answer is cached across a look: a load changes the loaded
-    /// venues, and the row that offered the load reads the answer back rather than
-    /// assuming it.
-    fn rebuild_rows(&mut self) {
-        self.rows = self
-            .connector
-            .supported_venues()
-            .into_iter()
-            .map(|venue| {
-                let loaded = self.connector.venues().loaded(&venue).is_some();
-                VenueRow { venue, loaded }
-            })
-            .collect();
+    /// The trigger is the only node this menu builds in the caller's tree: the panel and the
+    /// alert are overlays the menu owns and releases itself.
+    ///
+    /// # Errors
+    /// [`MenuError`] when the trigger or its icon cannot be built (a closed window, a stale
+    /// parent node, a missing asset).
+    pub fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+    ) -> Result<(), MenuError> {
+        self.inner.borrow_mut().build(app, window, parent)
+    }
+
+    /// Runs one frame of the menu: drains what the loads reported, follows the language,
+    /// keeps the trigger, the panel and any alert in step with their state.
+    ///
+    /// The caller runs this from the application's frame hook, before the frame is drawn
+    /// (the same place a widget's `sync` runs). A steady frame does nothing.
+    ///
+    /// # Errors
+    /// [`MenuError`] when an overlay or a dialog cannot be synchronised (a closed window, a
+    /// stale node).
+    pub fn sync(&mut self, app: &mut App) -> Result<(), MenuError> {
+        self.inner.borrow_mut().sync(app)
+    }
+
+    /// Cancels what is in flight and releases every kit component, overlay and signal scope
+    /// the menu owns. Idempotent.
+    ///
+    /// The caller removes the trigger's node first: this only gives back what it holds.
+    pub fn release(&mut self, app: &mut App) {
+        self.inner.borrow_mut().release(app);
+    }
+
+    /// Cancels one load still in flight, settling its row back to the action it offered
+    /// (test read point for a load the directory itself stopped).
+    #[cfg(test)]
+    pub(crate) fn cancel_load(&mut self, venue: VenueId) {
+        self.inner.borrow().host.directory().cancel_load(&venue);
+    }
+
+    /// The venue rows the panel is currently drawn from (test read point).
+    #[cfg(test)]
+    fn rows(&self) -> Vec<VenueRow> {
+        self.inner.borrow().rows.clone()
+    }
+
+    /// How many loads this menu is driving (test read point, one per venue).
+    #[cfg(test)]
+    pub(crate) fn pending_loads(&self) -> usize {
+        self.inner.borrow().pending.len()
+    }
+
+    /// Runs one row's action, for a press a frame can deliver before the row it was drawn from
+    /// is replaced (test read point for the re-entrancy guard).
+    #[cfg(test)]
+    pub(crate) fn start_load(&mut self, app: &mut App, venue: VenueId) -> Result<(), MenuError> {
+        self.inner.borrow_mut().start_load(app, venue)
+    }
+}
+
+/// The state behind one menu.
+struct MenuInner {
+    host: MarketParticipantsHost,
+    /// The instance prefix of every kit key and node id.
+    key: SmolStr,
+    /// The menu's signal scope: the accessibility label signal lives here, and releasing it
+    /// is what tells the menu's signals from a rebuilt menu's.
+    scope: SignalScope,
+    /// The trigger's accessible name, rewritten when the language moves.
+    a11y_label: Signal<SmolStr>,
+    language: LanguageCode,
+    rows: Vec<VenueRow>,
+    activity: AHashMap<VenueId, Activity>,
+    pending: AHashSet<VenueId>,
+    outcome_tx: mpsc::UnboundedSender<LoadOutcome>,
+    outcome_rx: mpsc::UnboundedReceiver<LoadOutcome>,
+    window: Option<WindowId>,
+    trigger: Option<Interactive>,
+    trigger_node: Option<NodeId>,
+    tooltip: Option<Tooltip>,
+    overlay: Option<Overlay>,
+    /// The content column inside the panel's own surface.
+    rows_root: Option<NodeId>,
+    /// The row action buttons, kept so `release` / rebuild hands their handlers and scopes back.
+    buttons: Vec<Button>,
+    /// The progress marks of the rows in flight.
+    spinners: Vec<Spinner>,
+    /// What the panel's content was last built from; `None` = it must be built again.
+    panel_signature: Option<PanelSignature>,
+    /// The alert a failed load raised, while it is open.
+    alert: Option<Dialog>,
+    released: bool,
+    /// A weak handle to this menu, for the trigger and row callbacks.
+    self_weak: Weak<RefCell<MenuInner>>,
+}
+
+impl MenuInner {
+    fn build(&mut self, app: &mut App, window: WindowId, parent: NodeId) -> Result<(), MenuError> {
+        if self.released || self.trigger.is_some() {
+            return Ok(());
+        }
+        self.window = Some(window);
+
+        // The trigger is the title bar's icon-only control: the panel it opens names every
+        // venue, so the trigger itself has nothing to say but the mark, and the label is left
+        // to the tooltip and the accessible name.
+        let theme = self.host.theme().clone();
+        let trigger_key = format_smolstr!("{}:trigger", self.key);
+        let weak = self.self_weak.clone();
+        let trigger = Interactive::new(app, theme.clone(), trigger_key)
+            .variant(InteractiveVariant::Ghost)
+            .with_unified_size(UnifiedSize::Medium)
+            .a11y_role(A11yRole::Button)
+            .a11y_label_signal(self.a11y_label)
+            .on_click(move |ctx| {
+                let Some(shared) = weak.upgrade() else {
+                    return;
+                };
+                let window = ctx.window();
+                let app = ctx.app_mut();
+                if let Err(error) = shared.borrow_mut().toggle_panel(app, window) {
+                    log::warn!("toggling the market participants panel failed: {error}");
+                }
+            });
+        let trigger_node = trigger.build_bare(app, window, parent)?;
+        IconSpec::new(IconKind::Bank)
+            .with_size(TRIGGER_ICON_SIZE)
+            .build_themed(app, window, trigger_node, &theme, Role::FgDefault)?;
+        self.trigger = Some(trigger);
+        self.trigger_node = Some(trigger_node);
+
+        // The hint sits under the trigger, but only while the panel is down: the panel
+        // occupies that space, so a hint left over its first row would take the presses meant
+        // for that row.
+        let tooltip_key = format_smolstr!("{}:tooltip", self.key);
+        let tooltip = Tooltip::new(
+            app,
+            theme.clone(),
+            self.host.layer().clone(),
+            self.host.animation(),
+            tooltip_key,
+            TooltipOptions {
+                placement: Placement::BOTTOM,
+                ..TooltipOptions::default()
+            },
+        );
+        tooltip.attach(app, window, trigger_node);
+        tooltip.set_content(Some(TooltipContent::new(t_smol!(
+            self.host.translate(),
+            "window.market_participants.title"
+        ))));
+        self.tooltip = Some(tooltip);
+
+        // The panel hangs from the trigger's start edge: the trigger is the bar's leftmost
+        // control, and aligned to the other edge a panel wider than the trigger would be
+        // clamped back into the window and land under the sidebar.
+        let overlay_key = format_smolstr!("{}:panel", self.key);
+        let overlay = Overlay::new(
+            app,
+            theme,
+            self.host.layer().clone(),
+            self.host.animation(),
+            overlay_key,
+            OverlayOptions {
+                placement: Placement::BOTTOM_START,
+                gap: 4.0,
+                dismiss: DismissPolicy::OutsideClick,
+                modal: true,
+                // The panel sits in the dialog band, not the popup band: a failed load raises
+                // `base_ui::kit::dialog`'s alert, and the kit's layer order puts `Alert` above
+                // `Dialog` but *below* `Popup` — a menu in the popup band would cover the very
+                // alert its own rows raised, and would consume the press meant for it. A
+                // title-bar menu never overlaps a content popup, so the one band that lets the
+                // alert stand above its report is the right one (registered in
+                // `test-ledger/p4-1.md` §deviation).
+                band: Band::Dialog,
+                surface: OverlaySurface::menu(),
+                a11y: OverlayA11y::menu(t_smol!(
+                    self.host.translate(),
+                    "window.market_participants.title"
+                )),
+                scrim: None,
+                ..OverlayOptions::default()
+            },
+        );
+        self.overlay = Some(overlay);
+        Ok(())
+    }
+
+    /// Opens or closes the venue panel, from the trigger's press.
+    fn toggle_panel(&mut self, app: &mut App, window: WindowId) -> Result<(), MenuError> {
+        if self.released {
+            return Ok(());
+        }
+        let Some(overlay) = self.overlay.clone() else {
+            return Ok(());
+        };
+        if overlay.is_open(app) {
+            overlay.close(app);
+            return Ok(());
+        }
+        let Some(trigger) = self.trigger_node else {
+            return Ok(());
+        };
+        if self.window != Some(window) {
+            self.window = Some(window);
+        }
+        // The panel is rebuilt from a fresh reading of the directory: an open panel has to
+        // show what the loaded venues hold *now* rather than what they held when it was last
+        // built.
+        self.rows = read_rows(self.host.directory());
+        self.panel_signature = None;
+        overlay.open(app, window, Anchor::Node(trigger), |_, _| Ok(()))?;
+        Ok(())
+    }
+
+    fn sync(&mut self, app: &mut App) -> Result<(), MenuError> {
+        if self.released || self.window.is_none() {
+            return Ok(());
+        }
+
+        // ① Every load that reported since the last frame.
+        while let Ok(outcome) = self.outcome_rx.try_recv() {
+            self.finish_load(outcome, app)?;
+        }
+
+        // ② The language: the trigger's accessible name and the tooltip follow it, and the
+        // panel's static copy is rebuilt (a static block is rebuilt, not re-bound).
+        let language = self.host.language(app);
+        if language != self.language {
+            self.language = language;
+            let title = t_smol!(self.host.translate(), "window.market_participants.title");
+            let _ = app.write(&self.a11y_label, title);
+            self.panel_signature = None;
+        }
+
+        // ③ The trigger's own hover / focus / pressed state.
+        if let Some(trigger) = self.trigger.clone() {
+            trigger.sync(app)?;
+        }
+
+        // ④ The panel: close detection first (an outside click or `Esc` is the engine's
+        // close), then the hint, the alert, and the rows.
+        let Some(overlay) = self.overlay.clone() else {
+            return Ok(());
+        };
+        let was_open = overlay.is_open(app);
+        overlay.sync(app);
+        let open = overlay.is_open(app);
+        if was_open && !open {
+            self.clear_panel(app);
+        }
+        if let Some(trigger) = self.trigger.clone() {
+            trigger.set_selected(app, open);
+        }
+        self.sync_tooltip(app, open);
+        self.sync_alert(app)?;
+        if open {
+            let signature = self.current_signature();
+            if self.panel_signature.as_ref() != Some(&signature) {
+                self.rebuild_panel(app, signature)?;
+            }
+            for spinner in &self.spinners {
+                spinner.sync(app)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the hint's content and visibility in step: the title while the panel is down,
+    /// nothing while it is up.
+    fn sync_tooltip(&mut self, app: &mut App, panel_open: bool) {
+        let Some(tooltip) = self.tooltip.clone() else {
+            return;
+        };
+        let content = if panel_open {
+            None
+        } else {
+            Some(TooltipContent::new(t_smol!(
+                self.host.translate(),
+                "window.market_participants.title"
+            )))
+        };
+        tooltip.set_content(content);
+        let _ = tooltip.sync(app);
+    }
+
+    /// What the panel's rows are drawn from at this instant.
+    fn current_signature(&self) -> PanelSignature {
+        PanelSignature {
+            language: self.language,
+            rows: self
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.venue,
+                        row.loaded,
+                        self.activity.get(&row.venue).copied(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuilds the panel's content column from the current rows and activity.
+    fn rebuild_panel(&mut self, app: &mut App, signature: PanelSignature) -> Result<(), MenuError> {
+        let Some(window) = self.window else {
+            return Ok(());
+        };
+        let Some(overlay) = self.overlay.clone() else {
+            return Ok(());
+        };
+        let Some(panel) = overlay.panel_node() else {
+            return Ok(());
+        };
+
+        // The order is the engine's teardown order: the nodes that read these components'
+        // signals are removed first, then the components (and their scopes) are released.
+        if let Some(root) = self.rows_root.take() {
+            let _ = app.remove_node(window, root);
+        }
+        self.release_row_components(app);
+
+        let translate = self.host.translate().clone();
+        let theme = self.host.theme().clone();
+        let language = self.host.language_signal();
+        let key = self.key.clone();
+        let rows = self.rows.clone();
+        let weak = self.self_weak.clone();
+        let rows_root = {
+            let tree = app
+                .window_mut(window)
+                .ok_or(EngineError::UnknownWindow { window })?
+                .tree_mut();
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:rows"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_col()
+                        .width(PANEL_CONTENT_WIDTH)
+                        .min_width_0()
+                        .build(),
+                )
+                .build(tree, panel)?
+        };
+        for row in rows {
+            let activity = self.activity.get(&row.venue).copied();
+            let components = build_row(
+                app, window, rows_root, &key, &weak, row, activity, language, &translate, &theme,
+            )?;
+            if let Some(button) = components.button {
+                self.buttons.push(button);
+            }
+            if let Some(spinner) = components.spinner {
+                self.spinners.push(spinner);
+            }
+        }
+        self.rows_root = Some(rows_root);
+        self.panel_signature = Some(signature);
+        Ok(())
+    }
+
+    /// Releases the row components of the panel and forgets the content column's node.
+    ///
+    /// The nodes are gone already: the panel's overlay unmounted its subtree, or the rebuild
+    /// removed the content column before calling this.
+    fn clear_panel(&mut self, app: &mut App) {
+        self.rows_root = None;
+        self.panel_signature = None;
+        self.release_row_components(app);
+    }
+
+    fn release_row_components(&mut self, app: &mut App) {
+        for button in self.buttons.drain(..) {
+            button.release(app);
+        }
+        for spinner in self.spinners.drain(..) {
+            spinner.release(app);
+        }
     }
 
     /// Starts the load one row's action asks for.
-    ///
-    /// The request itself is what `load_venue` builds; this hands it to the application
-    /// runtime, because the executor a view runs on has no reactor and a network future
-    /// awaited there panics inside the market participant instead of being sent.
     ///
     /// A venue already loading is left alone. The row in flight attaches no action at all,
     /// and this is the same rule stated where the load is started: two presses delivered
     /// inside one frame both reach the handler the previous frame drew, and a second load
     /// would run beside the first one and report over it.
-    ///
-    /// A venue that would be unreadable without credentials is refused before the load is
-    /// built: the load itself would succeed — its directory is public — and every pane that
-    /// then read the market would fail on the credential, so what the user needs is to
-    /// configure the venue rather than to watch a load finish. The question is the market participant
-    /// root's, which is this menu's only source of configuration; a venue whose reads are
-    /// public answers no and is offered exactly as it was.
-    fn start_load(&mut self, venue: VenueId, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.activity.get(&venue), Some(Activity::Loading)) {
-            return;
+    fn start_load(&mut self, app: &mut App, venue: VenueId) -> Result<(), MenuError> {
+        if self.released || self.pending.contains(&venue) {
+            return Ok(());
         }
-        if self.connector.load_needs_credentials(venue) {
-            let market = venue.display_string(cx);
-            let title = t!(
-                cx,
+        let Some(window) = self.window else {
+            return Ok(());
+        };
+        if self.host.directory().needs_credentials(venue) {
+            let market = venue.display_string(self.host.translate());
+            let title = t_smol!(
+                self.host.translate(),
                 "window.market_participants.credentials_required_title",
                 market = market
             );
-            let message = t!(
-                cx,
+            let message = t_smol!(
+                self.host.translate(),
                 "window.market_participants.credentials_required_message",
                 market = market
             );
-            let confirm = t!(cx, "common.confirm");
-            window.alert(cx, move |alert, _, _| {
-                alert.ok(title, message).ok_text(confirm)
-            });
-            return;
+            self.raise_alert(app, title, message)?;
+            return Ok(());
         }
-        self.activity.insert(venue, Activity::Loading);
 
-        // The window the press came from is the window the report is made in: the alert
-        // belongs where the user is looking, and the task that has to raise it has no window
-        // of its own.
-        let window_handle = window.window_handle();
-        let load = global::handle(cx).run(self.connector.load_venue(venue));
-        let reported = venue;
-        let task = cx.spawn(async move |menu, cx| {
-            let outcome = load.await;
-            let _ = cx.update_window(window_handle, move |_, window, cx| {
-                let _ = menu.update(cx, |menu, cx| {
-                    menu.finish_load(&reported, outcome, window, cx)
+        self.activity.insert(venue, Activity::Loading);
+        self.pending.insert(venue);
+        self.panel_signature = None;
+
+        let directory = self.host.directory_arc();
+        let outcome_tx = self.outcome_tx.clone();
+        let executor = self.host.executor();
+        let wake = app.handle();
+        executor.spawn(Box::pin(async move {
+            let result = directory.load(venue).await;
+            if outcome_tx.send(LoadOutcome { venue, result }).is_ok() {
+                wake.send(move |app| {
+                    let _ = app.request_repaint(window);
                 });
-            });
-        });
-        self.tasks.insert(venue, task);
-        cx.notify();
+            }
+        }));
+        Ok(())
     }
 
     /// Accepts the outcome of one load.
     ///
     /// A success is silent: the row's label follows the loaded venues, which hold the venue
-    /// now, and the user is looking at the row. A failure is reported once — in the alert — and
-    /// stays on the row until the next load says otherwise. Whether the venue is loaded
-    /// is not this menu's answer to give: a first connection that failed is not registered
-    ///, so its row still offers to load, while a refresh that failed leaves
-    /// everything that was loaded exactly as it was, so its row still offers to refresh.
-    ///
-    /// A load whose task was cancelled reports nothing, and it is not left in flight either:
-    /// the row goes back to offering the action it was asked for rather than keeping a
-    /// progress mark nothing will ever finish.
-    fn finish_load(
-        &mut self,
-        venue: &VenueId,
-        outcome: Result<Result<(), VenueLoadError>, JoinError>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.tasks.remove(venue);
-
-        let failure = match outcome {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(LoadFailure::Venue(error)),
-            // The task the window was driving is gone: whatever happened is not this menu's
-            // to report any more. The row it was started from is still there, though, and it
-            // has to offer the venue's action again: `activity` is the only thing that says a
-            // venue is loading and a loading row attaches no action at all, so a venue left
-            // loading here is a venue no press can reach for the rest of the window's life.
-            Err(error) if error.is_cancelled() => {
-                self.activity.remove(venue);
-                self.rebuild_rows();
-                cx.notify();
-                return;
+    /// now. A failure is reported once — in the alert — and stays on the row until the next
+    /// load says otherwise. Whether the venue is loaded is not this menu's answer to give: a
+    /// first connection that failed is not registered, so its row still offers to load, while
+    /// a refresh that failed leaves everything that was loaded exactly as it was.
+    fn finish_load(&mut self, outcome: LoadOutcome, app: &mut App) -> Result<(), MenuError> {
+        let LoadOutcome { venue, result } = outcome;
+        if self.released {
+            return Ok(());
+        }
+        self.pending.remove(&venue);
+        match result {
+            Ok(()) => {
+                self.activity.remove(&venue);
             }
-            Err(source) => Some(LoadFailure::Interrupted {
-                venue: *venue,
-                source,
-            }),
-        };
-
-        match failure {
-            Some(failure) => {
-                log::warn!("loading {venue} failed: {failure}");
-                self.activity.insert(*venue, Activity::Failed);
-
-                let title = t!(
-                    cx,
+            Err(error) => {
+                log::warn!("loading {venue} failed: {error}");
+                self.activity.insert(venue, Activity::Failed);
+                let market = venue.display_string(self.host.translate());
+                let title = t_smol!(
+                    self.host.translate(),
                     "window.market_participants.failed",
-                    market = venue.display_string(cx)
+                    market = market
                 );
-                let message = failure.localized_message(cx);
-                let confirm = t!(cx, "common.confirm");
-                window.alert(cx, move |alert, _, _| {
-                    alert.ok(title, message).ok_text(confirm)
-                });
-            }
-            None => {
-                self.activity.remove(venue);
+                let message =
+                    VenueLoadFailure::new(error).translated_message(self.host.translate());
+                self.raise_alert(app, title, message)?;
             }
         }
-
-        self.rebuild_rows();
-        cx.notify();
+        self.rows = read_rows(self.host.directory());
+        self.panel_signature = None;
+        Ok(())
     }
 
-    /// One row of the panel: the venue, what it is doing, and the action it offers.
-    ///
-    /// The action is the only part of a row that takes input, and what it is comes from
-    /// `activity`: a venue whose load is in flight offers nothing to press. Greying the
-    /// button is not enough — a disabled control still takes the pointer — so the handler is
-    /// not attached while the load it would start is already running.
-    ///
-    /// The mark left of the action tells the two apart at a glance: a load in flight is shown
-    /// by the progress mark and nothing else, while a row that is not loading shows the
-    /// connection its action is about — a venue nothing has loaded offers to plug in, a loaded
-    /// one is plugged in already.
-    fn row(&self, menu: &WeakEntity<Self>, index: usize, row: &VenueRow, cx: &App) -> AnyElement {
-        let venue = row.venue;
-        let market = venue.display_string(cx);
-
-        // The logo is the venue's own, which is a fact about the identity and not about
-        // the name it is drawn under: matching the drawn name would blank the logo the
-        // moment the name changed language.
-        let brand_logo = match venue {
-            VenueId::Binance => Brand::binance(),
-            VenueId::Okx => Brand::okx(),
-            VenueId::Hyperliquid => Brand::hyperliquid(),
-            VenueId::Longbridge => Brand::longbridge(),
-            VenueId::Polymarket => Brand::polymarket(),
-        }
-        .size_4();
-
-        let loading = matches!(self.activity.get(&venue), Some(Activity::Loading));
-        let (label, state) = match row.loaded {
-            true => (t!(cx, "window.market_participants.refresh"), "REFRESH"),
-            false => (t!(cx, "window.market_participants.load"), "LOAD"),
+    /// Opens one alert, replacing whatever alert of this menu's was open.
+    fn raise_alert(
+        &mut self,
+        app: &mut App,
+        title: SmolStr,
+        message: SmolStr,
+    ) -> Result<(), MenuError> {
+        let Some(window) = self.window else {
+            return Ok(());
         };
-        let action_selector = format_smolstr!("TEST_MARKET_PARTICIPANTS_ACTION_{state}_{venue:?}");
-        let mut action = Button::new((ACTION_ID, index))
-            .filled()
-            .small()
-            .w(px(ACTION_WIDTH))
-            .flex_none()
-            .debug_selector(move || action_selector.to_string())
-            .child(div().flex_1().text_center().child(label));
-        if loading {
-            action = action.disabled(true);
-        } else {
-            let menu = menu.clone();
-            let pressed = venue;
-            action = action.on_click(move |_, window, cx| {
-                let _ = menu.update(cx, |menu, cx| menu.start_load(pressed, window, cx));
-            });
+        if let Some(previous) = self.alert.take() {
+            previous.release(app);
         }
+        let theme = self.host.theme().clone();
+        let layer = self.host.layer().clone();
+        let animation = self.host.animation();
+        let key = format_smolstr!("{}:alert", self.key);
+        let confirm = t_smol!(self.host.translate(), "common.confirm");
+        let dialog_title = title.clone();
+        let dialog = DialogBuilder::alert(dialog_title, move |dialog, _theme| {
+            let dialog = dialog.clone();
+            AlertBuilder::new()
+                .ok(title.clone(), message.clone())
+                .ok_text(confirm.clone())
+                .ok_action(move |_, app| {
+                    dialog.close(app);
+                })
+        })
+        .build(app, theme, layer, animation, key);
+        dialog.open(app, window)?;
+        self.alert = Some(dialog);
+        Ok(())
+    }
 
-        let mark = match (loading, row.loaded) {
-            (true, _) => {
-                let selector = format_smolstr!("TEST_MARKET_PARTICIPANTS_LOADING_{venue:?}");
-                div()
-                    .id((MARK_ID, index))
-                    .size(px(MARK_SIZE))
-                    .aria_label(t!(
-                        cx,
-                        "window.market_participants.loading",
-                        market = market
-                    ))
-                    .debug_selector(move || selector.to_string())
-                    .child(Spinner::new((SPINNER_ID, index)))
-                    .into_any_element()
-            }
-            (false, true) => {
-                let selector = format_smolstr!("TEST_MARKET_PARTICIPANTS_LOADED_{venue:?}");
-                div()
-                    .id((MARK_ID, index))
-                    .size(px(MARK_SIZE))
-                    .aria_label(t!(cx, "window.market_participants.loaded", market = market))
-                    .debug_selector(move || selector.to_string())
-                    .child(Icon::new(IconKind::PlugsConnected).size(px(MARK_SIZE)))
-                    .into_any_element()
-            }
-            (false, false) => {
-                let selector = format_smolstr!("TEST_MARKET_PARTICIPANTS_UNLOADED_{venue:?}");
-                div()
-                    .id((MARK_ID, index))
-                    .size(px(MARK_SIZE))
-                    .aria_label(t!(
-                        cx,
-                        "window.market_participants.unloaded",
-                        market = market
-                    ))
-                    .debug_selector(move || selector.to_string())
-                    .child(Icon::new(IconKind::Plugs).size(px(MARK_SIZE)))
-                    .into_any_element()
-            }
+    /// Syncs the alert open on a failed load, and releases it once it closed.
+    fn sync_alert(&mut self, app: &mut App) -> Result<(), MenuError> {
+        let Some(dialog) = self.alert.clone() else {
+            return Ok(());
         };
-
-        let mut line = div().flex_1().min_w_0().flex().flex_col().child(
-            div()
-                .truncate()
-                .text_size(UnifiedSize::Small.text_size())
-                .child(market.clone()),
-        );
-        if let Some(Activity::Failed) = self.activity.get(&venue) {
-            let failed_selector = format_smolstr!("TEST_MARKET_PARTICIPANTS_FAILED_{venue:?}");
-            line = line.child(
-                div()
-                    .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().roles.status.danger.base.hsla)
-                    .debug_selector(move || failed_selector.to_string())
-                    .child(t!(cx, "window.market_participants.failed", market = market)),
-            );
+        dialog.sync(app)?;
+        if !dialog.is_open(app) {
+            self.alert = None;
+            dialog.release(app);
         }
+        Ok(())
+    }
 
-        let row_selector = format_smolstr!("TEST_MARKET_PARTICIPANTS_ROW_{venue:?}");
-        div()
-            .id((ROW_ID, index))
-            .debug_selector(move || row_selector.to_string())
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(brand_logo)
-            .child(line)
-            .child(mark)
-            .child(action)
-            .into_any_element()
+    fn release(&mut self, app: &mut App) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+
+        // The loads still in flight ask the directory to stop before their futures are
+        // dropped: a load released without cancellation would keep a request alive for a menu
+        // nobody can see.
+        let pending: Vec<VenueId> = self.pending.drain().collect();
+        for venue in pending {
+            self.host.directory().cancel_load(&venue);
+        }
+        // The panel's overlay unmounts its own subtree, which the rows live in; the row
+        // components are released after their nodes are gone.
+        if let Some(overlay) = self.overlay.take() {
+            overlay.release(app);
+        }
+        self.release_row_components(app);
+        if let Some(alert) = self.alert.take() {
+            alert.release(app);
+        }
+        if let Some(tooltip) = self.tooltip.take() {
+            tooltip.release(app);
+        }
+        if let Some(trigger) = self.trigger.take() {
+            trigger.release(app);
+        }
+        self.trigger_node = None;
+        let _ = app.release_scope(self.scope);
     }
 }
 
-impl Render for MarketParticipants {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = t!(cx, "window.market_participants.title");
-        let menu = cx.entity().downgrade();
+/// Reads every venue this build speaks from `directory`, marking the loaded ones.
+fn read_rows(directory: &dyn VenueDirectory) -> Vec<VenueRow> {
+    directory
+        .venues()
+        .into_iter()
+        .map(|venue| VenueRow {
+            loaded: directory.is_loaded(&venue),
+            venue,
+        })
+        .collect()
+}
 
-        // The panel's rows are built here, once per frame the menu draws, and handed to the
-        // dropdown: the menu they are entries of is built with it, and a row is a picture of
-        // `rows` + `activity` as they are now rather than an element kept between frames.
-        //
-        // The trigger is the title bar's icon-only square, drawn as the sidebar toggle is:
-        // the panel it opens names every venue, so the trigger itself has nothing to say
-        // but the mark, and the label is left to the tooltip and the accessible name.
-        let mut dropdown = Dropdown::new(MENU_ID)
-            .ghost()
-            .h(TRIGGER_SIZE)
-            .w(TRIGGER_SIZE)
-            .justify_center()
-            .aria_label(label.clone())
-            .debug_selector(|| "TEST_MARKET_PARTICIPANTS_TRIGGER".into())
-            .open_state(&self.open_state)
-            // The panel hangs from the trigger's left edge: the trigger is the bar's
-            // leftmost control, and aligned to the other edge a panel wider than the trigger
-            // would be clamped back into the window and land under the sidebar.
-            .align(Align::Start)
-            .menu_width(px(MENU_WIDTH))
-            .child(
-                div()
-                    .debug_selector(|| "TEST_MARKET_PARTICIPANTS_ICON".into())
-                    .child(Icon::new(IconKind::Bank).size(TRIGGER_ICON_SIZE)),
-            );
-
-        for (index, row) in self.rows.iter().enumerate() {
-            dropdown = dropdown.menu_item(MenuItem::Custom(
-                div()
-                    .child(self.row(&menu, index, row, cx))
-                    .into_any_element(),
-            ));
-        }
-
-        // The hint sits under the square, as the sidebar toggle's does, but only while the
-        // panel is down. The panel occupies that space, so a hint left over its first row
-        // would take the presses meant for that row — and the hover that would have closed
-        // it is gone the moment the press moves the pointer.
-        let tooltip = Tooltip::new((ElementId::from(MENU_ID), "tooltip"), dropdown)
-            .placement(Placement::Bottom);
-        if *self.open_state.read(cx) {
-            tooltip
-        } else {
-            tooltip.content(label)
-        }
+/// The brand logo of a venue: a fact about the identity, not about the name it is drawn under.
+const fn brand_of(venue: VenueId) -> BrandKind {
+    match venue {
+        VenueId::Binance => BrandKind::Binance,
+        VenueId::Okx => BrandKind::Okx,
+        VenueId::Hyperliquid => BrandKind::Hyperliquid,
+        VenueId::Longbridge => BrandKind::Longbridge,
+        VenueId::Polymarket => BrandKind::Polymarket,
     }
+}
+
+/// One row of the panel: the venue, what it is doing, and the action it offers.
+///
+/// The action is the only part of a row that takes input, and what it is comes from
+/// `activity`: a venue whose load is in flight offers nothing to press. Greying the button is
+/// not enough — a disabled control still takes the pointer — so the handler is not attached
+/// while the load it would start is already running.
+///
+/// The mark left of the action tells the two apart at a glance: a load in flight is shown by
+/// the progress mark and nothing else, while a row that is not loading shows the connection
+/// its action is about — a venue nothing has loaded offers to plug in, a loaded one is plugged
+/// in already.
+fn build_row(
+    app: &mut App,
+    window: WindowId,
+    parent: NodeId,
+    key: &str,
+    weak: &Weak<RefCell<MenuInner>>,
+    row: VenueRow,
+    activity: Option<Activity>,
+    language: Signal<LanguageCode>,
+    translate: &Translate,
+    theme: &ThemeHandle,
+) -> Result<RowComponents, MenuError> {
+    let venue = row.venue;
+    let market = venue.display_string(translate);
+    let mut components = RowComponents::default();
+
+    let row_node = {
+        let tree = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree_mut();
+        NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_MARKET_PARTICIPANTS_ROW_{venue:?}"))
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .items_center()
+                    .gap(8.0)
+                    .width_full()
+                    .padding_y(2.0)
+                    .build(),
+            )
+            .build(tree, parent)?
+    };
+
+    Brand::new(brand_of(venue))
+        .with_size(16.0)
+        .with_alt(market.clone())
+        .build(app, window, row_node)?;
+
+    let line = {
+        let tree = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree_mut();
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .flex_1()
+                    .min_width_0()
+                    .build(),
+            )
+            .build(tree, row_node)?
+    };
+    let mut name_style = TextStyle::new(UnifiedSize::Small.text_size());
+    name_style.max_lines = 1;
+    name_style.overflow = TextOverflow::Ellipsis;
+    {
+        let tree = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree_mut();
+        NodeBuilder::text(market.clone(), name_style)
+            .style(StyleBuilder::new().min_width_0().build())
+            .build(tree, line)?;
+    }
+    if matches!(activity, Some(Activity::Failed)) {
+        let failed_theme = theme.clone();
+        let failed_translate = translate.clone();
+        let mut failed_style = TextStyle::new(UnifiedSize::Small.text_size());
+        failed_style.max_lines = 1;
+        failed_style.overflow = TextOverflow::Ellipsis;
+        let tree = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree_mut();
+        NodeBuilder::text(SmolStr::default(), failed_style)
+            .id(format_smolstr!("TEST_MARKET_PARTICIPANTS_FAILED_{venue:?}"))
+            .style(StyleBuilder::new().min_width_0().build())
+            .bind_text(move |cx| {
+                // The failing sentence names the venue, so it is resolved in the language the
+                // interface is showing rather than the one the failure was reported in.
+                let _language = cx.read(&language);
+                let market = venue.display_string(&failed_translate);
+                t_smol!(
+                    failed_translate,
+                    "window.market_participants.failed",
+                    market = market
+                )
+            })
+            .bind_style(move |cx| StylePatch {
+                foreground: Some(failed_theme.role(cx, Role::StatusDangerBase)),
+                ..StylePatch::default()
+            })
+            .build(tree, line)?;
+    }
+
+    let mark = {
+        let label = match (activity, row.loaded) {
+            (Some(Activity::Loading), _) => {
+                t_smol!(
+                    translate,
+                    "window.market_participants.loading",
+                    market = market
+                )
+            }
+            (_, true) => t_smol!(
+                translate,
+                "window.market_participants.loaded",
+                market = market
+            ),
+            (_, false) => {
+                t_smol!(
+                    translate,
+                    "window.market_participants.unloaded",
+                    market = market
+                )
+            }
+        };
+        let (selector, icon) = match (activity, row.loaded) {
+            (Some(Activity::Loading), _) => (
+                format_smolstr!("TEST_MARKET_PARTICIPANTS_LOADING_{venue:?}"),
+                None,
+            ),
+            (_, true) => (
+                format_smolstr!("TEST_MARKET_PARTICIPANTS_LOADED_{venue:?}"),
+                Some(IconKind::PlugsConnected),
+            ),
+            (_, false) => (
+                format_smolstr!("TEST_MARKET_PARTICIPANTS_UNLOADED_{venue:?}"),
+                Some(IconKind::Plugs),
+            ),
+        };
+        let tree = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree_mut();
+        let mark = NodeBuilder::boxed()
+            .id(selector)
+            .style(
+                StyleBuilder::new()
+                    .size(MARK_SIZE, MARK_SIZE)
+                    .flex_none()
+                    .build(),
+            )
+            .a11y(A11yOverride {
+                role: Some(A11yRole::GenericContainer),
+                label: Some(label),
+                ..A11yOverride::default()
+            })
+            .build(tree, row_node)?;
+        if let Some(icon) = icon {
+            IconSpec::new(icon).with_size(MARK_SIZE).build_themed(
+                app,
+                window,
+                mark,
+                theme,
+                Role::FgMuted,
+            )?;
+        }
+        mark
+    };
+    if matches!(activity, Some(Activity::Loading)) {
+        let spinner = Spinner::new(
+            app,
+            theme.clone(),
+            format_smolstr!("{key}:spinner:{venue:?}"),
+        )
+        .with_size(MARK_SIZE)
+        .with_label(t_smol!(
+            translate,
+            "window.market_participants.loading",
+            market = market
+        ));
+        spinner.build(app, window, mark)?;
+        components.spinner = Some(spinner);
+    }
+
+    let (label, state, loading) = match (row.loaded, activity) {
+        (true, _) => (
+            t_smol!(translate, "window.market_participants.refresh"),
+            "REFRESH",
+            matches!(activity, Some(Activity::Loading)),
+        ),
+        (false, _) => (
+            t_smol!(translate, "window.market_participants.load"),
+            "LOAD",
+            matches!(activity, Some(Activity::Loading)),
+        ),
+    };
+    // The action's own identity for tests and diagnostics is its cell: a kit button's node is
+    // named after its key, which carries the instance identity rather than the row's meaning.
+    let action_cell = {
+        let tree = app
+            .window_mut(window)
+            .ok_or(EngineError::UnknownWindow { window })?
+            .tree_mut();
+        NodeBuilder::boxed()
+            .id(format_smolstr!(
+                "TEST_MARKET_PARTICIPANTS_ACTION_{state}_{venue:?}"
+            ))
+            .style(StyleBuilder::new().flex_none().build())
+            .build(tree, row_node)?
+    };
+    let action_key = format_smolstr!("{key}:action:{venue:?}");
+    let mut button = Button::new(app, theme.clone(), action_key)
+        .primary()
+        .small()
+        .label(label.clone())
+        .a11y_label(label)
+        .disabled(loading);
+    if !loading {
+        let weak = weak.clone();
+        button = button.on_click(move |ctx| {
+            let Some(shared) = weak.upgrade() else {
+                return;
+            };
+            let app = ctx.app_mut();
+            if let Err(error) = shared.borrow_mut().start_load(app, venue) {
+                log::warn!("starting a load of {venue} failed: {error}");
+            }
+        });
+    }
+    let action_node = button.build(app, window, action_cell)?;
+    fix_width(app, window, action_node, ACTION_WIDTH)?;
+    components.button = Some(button);
+    Ok(components)
+}
+
+/// Runs one style tweak the kit components do not expose: the action button's fixed width.
+///
+/// The menu states it because the two labels it can carry ("load" / "refresh") must be drawn
+/// in the same box: a control that resized as a load reported itself would move the button
+/// under the pointer that pressed it.
+fn fix_width(app: &mut App, window: WindowId, node: NodeId, width: f32) -> Result<(), EngineError> {
+    let tree = app
+        .window_mut(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree_mut();
+    let mut style = tree.get(node)?.style().clone();
+    style.inner.size.width = Dimension::length(width);
+    style.inner.flex_grow = 0.0;
+    style.inner.flex_shrink = 0.0;
+    style.inner.justify_content = StyleBuilder::new()
+        .justify_center()
+        .build()
+        .inner
+        .justify_content;
+    tree.set_style(node, style)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::{Duration, Instant},
-    };
-
-    use app_config::{
-        market_participants::{
-            credentials::LongbridgeCredentials,
-            fixture::{self, FixtureAddress},
-            settings::VenueSettings,
-        },
-        network::ProxyRoute,
-        settings::Config,
-    };
-    use app_config_provider::notification::ConfigNotification;
-    use base_ui::{animation::ANIMATION_TICK, layer::Layer};
-    use gpui_kit::{
-        AppContext as _, Context, Entity, IntoElement, Modifiers, MouseButton, ParentElement as _,
-        Render, SharedString, Styled as _, TestAppContext, VisualTestContext, Window, div, px,
-        size,
-    };
-    use i18n::{language::codes::LanguageCode, t, translator::types::I18n};
+    use i18n::language::codes::LanguageCode;
     use market_participants_connector::{
-        catalog::{
-            batch::CatalogEntry,
-            error::{CatalogError, SourceError},
-            source::RouteInputRevision,
-            store::Catalog,
-        },
-        connector::{
-            MarketParticipantsConnector, MarketParticipantsConnectorInput, VenueLoadError,
-        },
+        catalog::{error::CatalogError, source::RouteInputRevision},
         error::MarketParticipantError,
         routing::{DescriptorError, RegistryError},
-        runtime::MarketParticipantNetworkSnapshot,
     };
     use market_participants_model::{
-        display::lexical::scope_display_code,
-        identifier::{VenueId, VenueScopeId},
-        listing::route::VenueRoute,
+        display::lexical::scope_display_code, identifier::VenueScopeId, listing::route::VenueRoute,
     };
-    use network::transport::hub::{TransportHub, TransportPolicy};
-    use smol_str::{SmolStr, format_smolstr};
-    use tokio::{
-        io::{AsyncReadExt as _, AsyncWriteExt as _},
-        net::{TcpListener, TcpStream},
-        sync::watch,
-        task::JoinHandle,
+    use smol_str::SmolStr;
+    use ui_core::{math::Point, node::builder::NodeBuilder};
+
+    use super::*;
+    use crate::{
+        host::{MarketParticipantsHost, VenueDirectory},
+        test_support::{Harness, supported_venues, translate, translate_in, venue},
     };
-    use widget::{error::LocalizedError, venue::VenueDisplay};
-    use widget_tokio_runtime::{global, runtime::Runtime};
 
-    use super::{Activity, LoadFailure, MarketParticipants};
-
-    const TRIGGER: &str = "TEST_MARKET_PARTICIPANTS_TRIGGER";
-    /// The box the panel is drawn in. The panel belongs to the dropdown this menu is, so the
-    /// box is named by the dropdown rather than by this menu.
-    const PANEL: &str = "TEST_DROPDOWN_PANEL";
-    const ALERT: &str = "BASE_UI_ALERT";
-    const ALERT_OK: &str = "BASE_UI_ALERT_OK";
-
-    const BINANCE_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Binance";
-    const OKX_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Okx";
-    const HYPERLIQUID_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Hyperliquid";
-    const LONGBRIDGE_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Longbridge";
-    const POLYMARKET_ROW: &str = "TEST_MARKET_PARTICIPANTS_ROW_Polymarket";
-
-    const OKX_LOAD: &str = "TEST_MARKET_PARTICIPANTS_ACTION_LOAD_Okx";
-    const OKX_REFRESH: &str = "TEST_MARKET_PARTICIPANTS_ACTION_REFRESH_Okx";
-    const OKX_FAILED: &str = "TEST_MARKET_PARTICIPANTS_FAILED_Okx";
-    const OKX_LOADING: &str = "TEST_MARKET_PARTICIPANTS_LOADING_Okx";
-
-    const BINANCE_LOAD: &str = "TEST_MARKET_PARTICIPANTS_ACTION_LOAD_Binance";
-    const BINANCE_FAILED: &str = "TEST_MARKET_PARTICIPANTS_FAILED_Binance";
-    const BINANCE_LOADING: &str = "TEST_MARKET_PARTICIPANTS_LOADING_Binance";
-
-    const LONGBRIDGE_LOAD: &str = "TEST_MARKET_PARTICIPANTS_ACTION_LOAD_Longbridge";
-    const LONGBRIDGE_LOADING: &str = "TEST_MARKET_PARTICIPANTS_LOADING_Longbridge";
-
-    const HYPERLIQUID_LOAD: &str = "TEST_MARKET_PARTICIPANTS_ACTION_LOAD_Hyperliquid";
-
-    /// The venues whose origins point at the loopback fixture.
-    ///
-    /// A harness configures every venue this build speaks — the ones a test drives with the
-    /// fixture's origin, and every other one with an origin nothing answers on — so a load a test
-    /// starts cannot leave the process.
-    const OKX_VENUES: &[VenueId] = &[VenueId::Okx];
-
-    /// The Binance venue, which the two-venue case drives.
-    const BINANCE_VENUES: &[VenueId] = &[VenueId::Binance];
-
-    /// The three venues whose reads are public, and so the three the panel offers without a
-    /// credentials gate.
-    const PUBLIC_VENUES: &[VenueId] = &[VenueId::Binance, VenueId::Okx, VenueId::Hyperliquid];
-
-    /// The origin every venue a test does not drive resolves to: a loopback port nothing listens
-    /// on, so a load through it fails in this process rather than reaching a real venue.
-    const UNREACHABLE: &str = "http://127.0.0.1:1/";
-
-    /// What the fixture answers a request none of its answers covers.
-    ///
-    /// A body no catalog protocol decodes, so the load fails on the venue's own answer: a
-    /// fixture that serves nothing stands for a venue that refuses the load, not for one that
-    /// published nothing.
-    const REFUSED: &str = r#""the fixture serves no answer for this request""#;
-
-    /// How long a test waits for a load it started to report before it fails.
-    const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// The catalog answers of the OKX routes, as the venue's own protocol spells them.
-    ///
-    /// The same wire shapes
-    /// `crates/market_participants_connector/tests/display_names.rs` serves to the same
-    /// adapter: the fixture is the wire, so a load that finishes against it finished
-    /// against the venue's protocol rather than against a stub of the adapter's functions.
-    const OKX_CATALOGS: &[FixtureAnswer] = &[
-        FixtureAnswer {
-            path: "/api/v5/public/instruments",
-            parameter: "instType=SPOT",
-            body: r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT","baseCcy":"BTC","quoteCcy":"USDT","tickSz":"0.1","lotSz":"0.000001","minSz":"0.00001","maxLmtSz":"1000","state":"live","listTime":"1500000000000"}]}"#,
-        },
-        FixtureAnswer {
-            path: "/api/v5/public/instruments",
-            parameter: "instType=SWAP",
-            body: r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","baseCcy":"","quoteCcy":"","settleCcy":"USDT","tickSz":"0.1","lotSz":"0.01","minSz":"0.01","maxLmtSz":"10000","ctVal":"0.01","ctType":"linear","uly":"BTC-USDT","instFamily":"BTC-USDT","state":"live"}]}"#,
-        },
-    ];
-
-    /// One built-in venue identity.
-    fn venue(name: &str) -> VenueId {
-        VenueId::from_name(name).expect("the built-in venue identity is canonical")
-    }
+    // ---------------------------------------------------------------- vocabulary
 
     fn okx() -> VenueId {
         venue("okx")
     }
 
-    /// The other venue the two-venue case drives.
     fn binance() -> VenueId {
         venue("binance")
     }
 
-    /// One built-in route of the venue the tests drive.
+    fn longbridge() -> VenueId {
+        venue("longbridge")
+    }
+
     fn okx_spot() -> VenueRoute {
         VenueRoute::new(
             okx(),
@@ -799,920 +1128,262 @@ mod tests {
         )
     }
 
-    /// The venue's other built-in route, which a load fetches after the first one.
-    fn okx_swap() -> VenueRoute {
-        VenueRoute::new(
-            okx(),
-            VenueScopeId::new("swap").expect("the built-in scope is canonical"),
-        )
-    }
+    // ---------------------------------------------------------------- harness actions
 
-    /// Where a harness's venue origins resolve.
-    ///
-    /// A venue is configured as a whole, so a harness points whole venues at its loopback
-    /// fixture: the venues it names resolve to the fixture's own origin, and every other venue
-    /// this build speaks resolves to a loopback port nothing answers on. No test in this module
-    /// may leave the process.
-    struct Origins {
-        /// The loopback sockets a driven venue answers on, when a test drives one.
-        fixture: Option<FixtureAddress>,
-        /// The venues that resolve to `fixture`.
-        loopback: Vec<VenueId>,
-    }
-
-    impl Origins {
-        /// No venue resolves to a fixture: every venue this build speaks is reached through
-        /// [`UNREACHABLE`], so a load fails in this process.
-        const OFFLINE: Self = Self {
-            fixture: None,
-            loopback: Vec::new(),
-        };
-
-        /// The venues named resolve to a loopback venue; every other venue resolves to
-        /// [`UNREACHABLE`].
-        fn at(fixture: &str, loopback: &[VenueId]) -> Self {
-            Self {
-                fixture: Some(FixtureAddress::at(
-                    &fixture.parse().expect("the fixture origin is a URL"),
-                )),
-                loopback: loopback.to_vec(),
-            }
-        }
-
-        /// The sockets every venue of this build resolves to here.
-        ///
-        /// The driven venues answer on the fixture's pair, and every other venue is reached on
-        /// [`UNREACHABLE`]. Both are loopback, which is what keeps a load in this process.
-        fn every_venue(&self) -> Vec<(VenueId, FixtureAddress)> {
-            market_participants_connector::venue::definition::supported_venues()
-                .into_iter()
-                .map(|venue| {
-                    let address = self.address_of(&venue);
-                    (venue, address)
-                })
-                .collect()
-        }
-
-        /// The sockets one venue resolves to here.
-        fn address_of(&self, venue: &VenueId) -> FixtureAddress {
-            match &self.fixture {
-                Some(fixture) if self.loopback.contains(venue) => fixture.clone(),
-                _ => FixtureAddress::at(&UNREACHABLE.parse().expect("the dead port is a URL")),
-            }
-        }
-    }
-
-    /// The market participants root a test drives, with every venue's origins resolving as `origins` says.
-    ///
-    /// The root's own work is handed to the process-wide test runtime rather than to the
-    /// runtime the harness installs for the window, so a test can pull the runtime a *load* is
-    /// driven on out from under the menu without taking the venue conversation with it.
-    ///
-    /// The configuration is what carries the fixture addresses, so the root dials them for as
-    /// long as it lives: there is nothing to hold beside it. It also carries `credentials`, when
-    /// a test supplies one, because that is the one thing the load gate answers from: a test
-    /// that says "this venue is configured" says it through the same field the settings page
-    /// writes, rather than through a seam beside the question.
-    ///
-    /// The credential values are placeholders. Nothing here asserts on them, and the venue they
-    /// belong to is reached at a loopback socket, so no request of a test carries them anywhere.
-    fn market_participants_root(
-        loaded_venues: &[VenueId],
-        origins: &Origins,
-        credentials: Option<(VenueId, LongbridgeCredentials)>,
-    ) -> MarketParticipantsConnector {
-        offline_symbol_directory();
-        let mut config = Config::default();
-        config.venues = fixture::venues(origins.every_venue()).into_venues();
-        for venue_config in config.venues.values_mut() {
-            venue_config.set_proxy(Some(ProxyRoute::System));
-        }
-        if let Some((venue, credentials)) = credentials {
-            let Some(VenueSettings::Longbridge(settings)) = config.venues.get_mut(&venue) else {
-                panic!("{venue} is the venue whose credentials the fixture fills in");
-            };
-            settings.credentials = Some(credentials);
-        }
-        let snapshot = Arc::new(MarketParticipantNetworkSnapshot::new(config.clone()));
-        let notification = ConfigNotification::new(snapshot);
-        // A fixture speaks plain HTTP on a loopback socket, which the transport has to be told
-        // is allowed; which origin a request addresses is the venue configuration's answer, and
-        // the fixture asserts that every venue this build speaks resolves to a loopback address.
-        let policy = TransportPolicy {
-            allow_plaintext: true,
-            extra_root_certificates: Vec::new(),
-        };
-        let connector = MarketParticipantsConnector::new_with_catalog(
-            MarketParticipantsConnectorInput::new(
-                Arc::new(TransportHub::new(policy)),
-                notification,
-            )
-            .with_runtime(Runtime::for_test()),
-            Arc::new(Catalog::new()),
-        )
-        .expect("the market participants root builds from typed runtime inputs");
-        connector
-            .load_fixture(
-                &market_participants_connector::test_support::definitions(loaded_venues),
-                &[],
-                &[],
-            )
-            .expect("the routes of the loaded venues load");
-        assert_every_venue_resolves_in_process(&config);
-        connector
-    }
-
-    /// Points every symbol-directory read of this module at the dead port, once.
-    ///
-    /// The venue whose directory the market participant publishes reads it from a host of its own rather
-    /// than from the venue's origin, so the fixture addresses cannot reach it: without this seam
-    /// a load of that venue would leave the process, which is the one thing no test in this
-    /// module may do. The install is process-wide and held for the life of the process because
-    /// the loads outlive the function that built their root.
-    fn offline_symbol_directory()
-    -> &'static market_participants_connector::test_support::SymbolDirectoryRootGuard {
-        static OFFLINE: std::sync::OnceLock<
-            market_participants_connector::test_support::SymbolDirectoryRootGuard,
-        > = std::sync::OnceLock::new();
-        OFFLINE.get_or_init(|| {
-            market_participants_connector::test_support::set_symbol_directory_root(
-                UNREACHABLE.parse().expect("the dead port is a URL"),
-            )
-        })
-    }
-
-    /// Asserts that every origin of every venue this build speaks is a loopback address.
-    ///
-    /// The build resolves a request through the venue configuration's own origins, so a venue
-    /// this fixture did not configure is a load that could reach a real venue: what is asserted
-    /// is the resolution rather than the ids of a list, so a venue added to the build later fails
-    /// a test here rather than quietly turning one into a request somewhere on the network.
-    fn assert_every_venue_resolves_in_process(config: &Config) {
-        let mut checked = 0;
-        for venue in market_participants_connector::venue::definition::supported_venues() {
-            let venue_config = config.venue(&venue).unwrap_or_else(|| {
-                panic!(
-                    "this build speaks {}, which this fixture does not configure: a load through \
-                     it would resolve to the build's built-in origin",
-                    venue.as_str()
-                )
-            });
-
-            for scope in venue_config.scope_ids() {
-                let Some(pair) = venue_config.origins(scope) else {
-                    continue;
-                };
-                for origin in [&pair.http, &pair.websocket] {
-                    assert!(
-                        is_loopback(origin),
-                        "{} resolves to {origin}, which is not a loopback origin: a load through \
-                         it would leave this process",
-                        venue.as_str()
-                    );
-                    checked += 1;
-                }
-            }
-        }
-
-        assert!(
-            checked > 0,
-            "this build's venue list addresses at least one origin"
-        );
-    }
-
-    /// Whether one origin addresses this machine.
-    fn is_loopback(origin: &url::Url) -> bool {
-        matches!(
-            origin.host_str(),
-            Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1")
-        )
-    }
-
-    /// One catalog answer the fixture serves: the request it belongs to, and the JSON the
-    /// venue's own protocol defines for that request.
-    struct FixtureAnswer {
-        /// The path the request addresses.
-        path: &'static str,
-        /// The query parameter that tells this answer's request from its siblings'.
-        parameter: &'static str,
-        /// The body the venue answers with.
-        body: &'static str,
-    }
-
-    impl FixtureAnswer {
-        /// Whether this answer is the one `request` asks for.
-        fn serves(&self, request: &FixtureRequest) -> bool {
-            request.asks(self.path, self.parameter)
-        }
-    }
-
-    /// One request the fixture was asked, read off the wire.
-    struct FixtureRequest {
-        /// The method the request was sent with.
-        method: SmolStr,
-        /// The path it addressed.
-        path: SmolStr,
-        /// The query it carried, without the `?`.
-        query: SmolStr,
-    }
-
-    impl FixtureRequest {
-        /// The request as it is recorded for an assertion.
-        fn line(&self) -> SmolStr {
-            format_smolstr!("{} {}?{}", self.method, self.path, self.query)
-        }
-
-        /// Whether the request addressed one path with one query parameter.
-        fn asks(&self, path: &str, parameter: &str) -> bool {
-            self.method == "GET"
-                && self.path == path
-                && self.query.split('&').any(|pair| pair == parameter)
-        }
-    }
-
-    /// The one loopback venue a test's loads can talk to.
-    ///
-    /// It is the wire, not a stub of the adapter: what it answers is the venue's own protocol,
-    /// and what it was asked is recorded, so a load that finished through it really finished
-    /// against the venue's format. Every request is held until the test opens the fixture, so
-    /// a load can be looked at while it is in flight instead of being stated.
-    struct VenueFixture {
-        /// The `http://` origin a harness points the venues it drives at.
-        origin: String,
-        /// What the fixture was asked, in the order the requests arrived.
-        asked: Arc<Mutex<Vec<SmolStr>>>,
-        /// Whether requests are answered or held.
-        open: watch::Sender<bool>,
-        server: JoinHandle<()>,
-    }
-
-    impl VenueFixture {
-        /// Answers every request the fixture is holding, and every one that arrives after.
-        fn release(&self) {
-            self.open
-                .send(true)
-                .expect("the fixture is still serving its requests");
-        }
-
-        /// What the fixture was asked, in the order the requests arrived.
-        fn asked(&self) -> Vec<SmolStr> {
-            self.asked
-                .lock()
-                .expect("the fixture's requests are readable")
-                .clone()
-        }
-
-        /// Stops serving: a fixture is a socket a load talks to, and a test that is finished
-        /// with it does not leave the listener behind for the next one.
-        fn shutdown(self) {
-            self.server.abort();
-        }
-    }
-
-    /// Serves the catalog protocols of the venues a test drives on a loopback port.
-    ///
-    /// A request no answer covers is answered with a body no catalog decodes, so a fixture
-    /// serving nothing makes the loads that reach it fail on the venue's answer — and a test
-    /// that meant to serve one finds out here rather than through an empty catalog.
-    fn venue_fixture(answers: &'static [FixtureAnswer]) -> VenueFixture {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("the fixture binds a loopback port");
-        listener
-            .set_nonblocking(true)
-            .expect("the fixture listener is non-blocking");
-        let address = listener
-            .local_addr()
-            .expect("the fixture listener has an address");
-        let asked: Arc<Mutex<Vec<SmolStr>>> = Arc::new(Mutex::new(Vec::new()));
-        let (open, held) = watch::channel(false);
-        let server = Runtime::for_test().run(serve(listener, answers, Arc::clone(&asked), held));
-        VenueFixture {
-            // The trailing slash is what a parsed origin states for a root path, and the
-            // origin the venue configuration holds is asserted against this string as it is.
-            origin: format!("http://{address}/"),
-            asked,
-            open,
-            server,
-        }
-    }
-
-    /// Accepts conversations and serves one held request at a time off each of them.
-    async fn serve(
-        listener: std::net::TcpListener,
-        answers: &'static [FixtureAnswer],
-        asked: Arc<Mutex<Vec<SmolStr>>>,
-        open: watch::Receiver<bool>,
-    ) {
-        let listener =
-            TcpListener::from_std(listener).expect("the fixture listener enters the runtime");
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let asked = Arc::clone(&asked);
-            let mut open = open.clone();
-            tokio::spawn(async move {
-                while let Some(request) = read_request(&mut socket).await {
-                    asked
-                        .lock()
-                        .expect("the fixture's requests are writable")
-                        .push(request.line());
-                    // Held until the test opens the fixture: a request the fixture is holding is
-                    // a load that is really in flight.
-                    if open.wait_for(|open| *open).await.is_err() {
-                        return;
-                    }
-                    let body = answers
-                        .iter()
-                        .find(|answer| answer.serves(&request))
-                        .map_or(REFUSED, |answer| answer.body);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    if socket.write_all(response.as_bytes()).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    }
-
-    /// Reads one request off a conversation.
-    ///
-    /// A catalog request is a `GET` whose answer never depends on a body, so what is read is
-    /// the request line and the headers that carry it.
-    async fn read_request(socket: &mut TcpStream) -> Option<FixtureRequest> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        let head = loop {
-            let read = socket.read(&mut chunk).await.ok()?;
-            if read == 0 {
-                return None;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                break position + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&buffer[..head]).into_owned();
-        let mut fields = head.lines().next().unwrap_or_default().split(' ');
-        let method = SmolStr::new(fields.next().unwrap_or_default());
-        let target = fields.next().unwrap_or_default();
-        let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        Some(FixtureRequest {
-            method,
-            path: SmolStr::new(path),
-            query: SmolStr::new(query),
-        })
-    }
-
-    /// The window a test drives: a row with the menu in it, over the layer every alert is
-    /// opened on.
-    struct Toolbar {
-        menu: Entity<MarketParticipants>,
-    }
-
-    impl Render for Toolbar {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            // The menu is mounted the way the title bar mounts it: a row that gives the
-            // trigger a place of its own.
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_end()
-                .child(self.menu.clone())
-        }
-    }
-
-    struct Harness<'a> {
-        menu: Entity<MarketParticipants>,
-        cx: &'a mut VisualTestContext,
-    }
-
-    fn harness<'a>(
-        cx: &'a mut TestAppContext,
-        loaded_venues: &[VenueId],
-        origins: &Origins,
-    ) -> Harness<'a> {
-        harness_over(cx, loaded_venues, origins, None)
-    }
-
-    /// [`harness`] over a configuration in which one venue holds credentials.
-    ///
-    /// The credentials are the settings page's own field, so a test that drives a configured
-    /// venue drives what a user who filled the page in would have.
-    fn harness_over<'a>(
-        cx: &'a mut TestAppContext,
-        loaded_venues: &[VenueId],
-        origins: &Origins,
-        credentials: Option<(VenueId, LongbridgeCredentials)>,
-    ) -> Harness<'a> {
-        // The loads the menu starts run on the application runtime, so the test's own
-        // executor has to be allowed to wait for them rather than only for its own queue.
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-            global::install(cx).expect("the test Tokio runtime should build");
-            let root = market_participants_root(loaded_venues, origins, credentials);
-            // A menu follows the venue commits the root announces, so the fixture attaches the
-            // boundary the application's install path attaches.
-            root.attach_events(cx);
-            cx.set_global(root);
-        });
-
-        let menu = cx.update(|cx| cx.new(MarketParticipants::new));
-        let rendered = menu.clone();
-        let (_, cx) =
-            cx.add_window_view(move |_, cx| Layer::new(cx.new(|_| Toolbar { menu: rendered })));
-        cx.simulate_resize(size(px(1280.0), px(960.0)));
-        cx.run_until_parked();
-
-        Harness { menu, cx }
-    }
-
-    /// Whether the thing `selector` names is drawn.
-    fn shows(harness: &mut Harness, selector: &'static str) -> bool {
-        harness.cx.debug_bounds(selector).is_some()
-    }
-
-    /// Lets a fade finish and paints what has settled: a popup in its first frames is painted
-    /// at zero opacity, so what is drawn has to be given the frames it is waiting for before
-    /// a test decides whether it is there.
-    fn settle(harness: &mut Harness) {
-        harness
-            .cx
-            .executor()
-            .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
-        harness.cx.update(|window, _| window.refresh());
-        harness.cx.run_until_parked();
-    }
-
-    /// Runs the window until what a load did shows up in it.
-    ///
-    /// A load runs on the application runtime and reports through a GPUI task, and the test
-    /// executor only runs what is already awake: waiting for a load means handing the thread
-    /// back until the answer that woke it arrives, which is what this does. It waits with a
-    /// deadline, so a load that never reports fails the test here instead of hanging it.
-    fn wait_for(harness: &mut Harness, what: &str, settled: impl Fn(&mut Harness) -> bool) {
-        let deadline = Instant::now() + LOAD_TIMEOUT;
-        while !settled(harness) {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            harness.cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// Presses what `selector` names and paints what has settled.
-    ///
-    /// The press is delivered the way a window delivers it — the button goes down, the
-    /// window draws the frame that follows, and only then does it come up — because a
-    /// control that closes on the way down and opens on the way up behaves differently when
-    /// the two are delivered without a frame between them. What a press *does* runs on the
-    /// way up, so the load a row starts begins after that frame rather than inside it.
-    fn press(harness: &mut Harness, selector: &'static str) {
-        let target = harness
-            .cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("the harness draws what it is asked to press: {selector}"))
-            .center();
-        harness
-            .cx
-            .simulate_mouse_down(target, MouseButton::Left, Modifiers::none());
-        harness.cx.run_until_parked();
-        harness
-            .cx
-            .simulate_mouse_up(target, MouseButton::Left, Modifiers::none());
-        harness.cx.run_until_parked();
-        settle(harness);
-    }
-
-    /// Opens the panel by pressing the trigger.
+    /// Opens the panel through the trigger, the way the title bar's press does.
     fn open_panel(harness: &mut Harness) {
-        press(harness, TRIGGER);
-        assert!(shows(harness, PANEL), "the trigger should open the panel");
-    }
-
-    /// Whether one venue is loaded, which is what a row's label is drawn from.
-    fn registered(harness: &mut Harness, venue: &VenueId) -> bool {
-        harness.cx.update(|_, cx| {
-            cx.global::<MarketParticipantsConnector>()
-                .venues()
-                .loaded(venue)
-                .is_some()
-        })
-    }
-
-    /// The listings one route has published, which is what "the venue's catalog loaded" means.
-    fn listings(harness: &mut Harness, route: &VenueRoute) -> Option<Arc<[CatalogEntry]>> {
-        harness.cx.update(|_, cx| {
-            cx.global::<MarketParticipantsConnector>()
-                .catalog()
-                .cached_listings(route)
-        })
-    }
-
-    /// How many loads this menu is driving, one per venue.
-    fn tasks_in_flight(harness: &mut Harness) -> usize {
-        harness.cx.update(|_, cx| harness.menu.read(cx).tasks.len())
-    }
-
-    /// What one venue's row is saying, when it is saying anything.
-    fn activity(harness: &mut Harness, venue: &VenueId) -> Option<Activity> {
-        harness
-            .cx
-            .update(|_, cx| harness.menu.read(cx).activity.get(venue).cloned())
-    }
-
-    /// What one venue's row reports about its own load, restated the way the row states it.
-    ///
-    /// It *restates* it rather than reading it: the stored state is now only "this row
-    /// failed", and the sentence is built at draw time from the row's own venue key. So
-    /// this pins that the row is in that state — a failure recorded against the wrong
-    /// venue, or one shared flag for the panel, still fails here — and it can show what
-    /// the row would say, but it is not evidence about what the row draws. Nothing in
-    /// this harness can read a drawn string.
-    fn failure_text(harness: &mut Harness, venue: &VenueId) -> SmolStr {
-        match activity(harness, venue) {
-            Some(Activity::Failed) => {}
-            other => panic!("{venue} should be reporting a failure, it is {other:?}"),
-        }
-
-        harness.cx.update(|_, cx| {
-            SmolStr::new(
-                t!(
-                    cx,
-                    "window.market_participants.failed",
-                    market = venue.display_string(cx)
-                )
-                .as_ref(),
-            )
-        })
-    }
-
-    /// The sentence a load refused for want of credentials states, in the language the window
-    /// shows, resolved the way the refusal resolves it.
-    ///
-    /// The alert a refusal opens is a private entity of the window layer, so this is the text it
-    /// is built from — the venue's own display name bound to `market` — rather than a second
-    /// spelling of it: what a test compares against it is comparing against what the alert says.
-    fn refusal_text(harness: &mut Harness, venue: &VenueId) -> SharedString {
-        harness.cx.update(|_, cx| {
-            t!(
-                cx,
-                "window.market_participants.credentials_required_message",
-                market = venue.display_string(cx)
-            )
-        })
-    }
-
-    /// Starts one venue's load where the row's action starts it, for the press a frame can
-    /// deliver before the row it was drawn from is replaced.
-    fn start_load(harness: &mut Harness, venue: &VenueId) {
-        harness.cx.update(|window, cx| {
-            harness
-                .menu
-                .update(cx, |menu, cx| menu.start_load(*venue, window, cx));
-        });
-        settle(harness);
-    }
-
-    /// Loads one venue the way the menu's action does — `MarketParticipantsConnector::load_venue` —
-    /// and answers what it reported.
-    fn load(harness: &mut Harness, venue: &VenueId) -> Result<(), VenueLoadError> {
-        let (connector, runtime) = harness.cx.update(|_, cx| {
-            (
-                cx.global::<MarketParticipantsConnector>().clone(),
-                global::handle(cx),
-            )
-        });
-        // The load is the market participants root's own work, and this thread is not inside a runtime:
-        // driving it here is what makes what it reported the test's to read.
-        runtime.handle().block_on(connector.load_venue(*venue))
-    }
-
-    /// Whether one load failed by refusing to resolve a request in this process.
-    ///
-    /// The build resolves a request through the venue configuration's own origins, and this
-    /// fixture points every one of them at a loopback address, so a failure that is *not* a
-    /// resolution refusal is one that reached the wire — a transport error, a decode error or a
-    /// venue's own answer. That is the typed answer to "did this load leave this process?".
-    fn refused_to_resolve(outcome: &Result<(), VenueLoadError>) -> bool {
-        match outcome {
-            Err(VenueLoadError::Discovery { source, .. }) => {
-                matches!(source.as_ref(), MarketParticipantError::Configuration(_))
-            }
-            Err(VenueLoadError::Catalog { source, .. }) => match source.as_ref() {
-                MarketParticipantError::Catalog(error) => matches!(
-                    error.as_ref(),
-                    CatalogError::SourceFailed { error, .. }
-                        if matches!(error.as_ref(), SourceError::Configuration { .. })
-                ),
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    /// A load of one venue cannot leave this process: every origin every venue this build speaks
-    /// is reached at is a loopback address, so what a load through one fails with is a failure of
-    /// getting there rather than a venue's own answer.
-    ///
-    /// The configuration is what a request resolves through, so the guarantee is asserted on it:
-    /// a venue this fixture did not configure is a load that could reach a real venue, wherever
-    /// the machine happens to be.
-    #[gpui_kit::test]
-    fn an_offline_load_should_fail_on_an_origin_nothing_answers_on(cx: &mut TestAppContext) {
-        let mut harness = harness(cx, &[], &Origins::OFFLINE);
-        let venues = harness.cx.update(|_, cx| {
-            cx.global::<MarketParticipantsConnector>()
-                .supported_venues()
-        });
-        assert_eq!(venues.len(), 5, "this build speaks five venues");
-
-        for venue in venues {
-            let outcome = load(&mut harness, &venue);
-            assert!(
-                !refused_to_resolve(&outcome),
-                "loading {venue} should have reached the origin it is configured with rather than \
-                 refusing to resolve one: {outcome:?}"
-            );
-            // Polymarket's scope set is static: its load answers without a venue
-            // conversation, so an unreachable origin is not a load failure there.
-            if venue == VenueId::Polymarket {
-                assert!(outcome.is_ok(), "the static scope set loads offline");
-                continue;
-            }
-            assert!(
-                format!("{outcome:?}").contains(UNREACHABLE),
-                "loading {venue} should have addressed the origin its own configuration names, so \
-                 what it failed with names that origin: {outcome:?}"
-            );
-        }
-    }
-
-    /// Every venue this build speaks is a row of the panel, and a venue it does not
-    /// speak is not: the list is `supported_venues()`, whether or not anything is loaded.
-    #[gpui_kit::test]
-    fn the_panel_should_list_every_venue_this_build_speaks(cx: &mut TestAppContext) {
-        let mut harness = harness(cx, &[], &Origins::OFFLINE);
-
+        let trigger = harness.menu().trigger_node().expect("the trigger is built");
+        harness.click(trigger);
+        harness.settle(2);
         assert!(
-            !shows(&mut harness, PANEL),
+            harness.menu().is_open(harness.app()),
+            "the trigger opens the panel"
+        );
+        assert!(harness.shows_panel(), "the open panel draws venue rows");
+    }
+
+    /// Presses one row's action.
+    fn click_action(harness: &mut Harness, venue: VenueId, loaded: bool) {
+        let node = harness
+            .action(venue, loaded)
+            .unwrap_or_else(|| panic!("the panel offers {venue}'s action"));
+        harness.click(node);
+        harness.settle(1);
+    }
+
+    fn alert_dialog(harness: &Harness) -> Option<Dialog> {
+        harness.menu().inner.borrow().alert.clone()
+    }
+
+    fn alert_open(harness: &Harness) -> bool {
+        alert_dialog(harness).is_some_and(|dialog| dialog.is_open(harness.app()))
+    }
+
+    fn alert_title(harness: &Harness) -> Option<SmolStr> {
+        alert_dialog(harness)
+            .and_then(|dialog| dialog.with_alert(|alert| SmolStr::new(alert.title())))
+    }
+
+    /// Reads the alert the way the user does: presses its one button and lets the fade finish.
+    fn click_alert_ok(harness: &mut Harness) {
+        let dialog = alert_dialog(harness).expect("an alert is open");
+        let button = dialog
+            .with_alert(|alert| alert.ok_button().clone())
+            .expect("the alert has its ok button");
+        harness.click_button(&button);
+        harness.settle_fade();
+        assert!(!alert_open(harness), "reading the alert closes it");
+    }
+
+    fn activity(harness: &Harness, venue: VenueId) -> Option<Activity> {
+        harness.menu().inner.borrow().activity.get(&venue).copied()
+    }
+
+    // ---------------------------------------------------------------- rows and state
+
+    /// The menu starts with every venue this build speaks, nothing loaded, no panel, no alert.
+    #[test]
+    fn the_menu_should_start_with_every_venue_and_no_activity() {
+        let harness = Harness::new();
+
+        assert_eq!(harness.menu().rows().len(), supported_venues().len());
+        assert!(harness.menu().rows().iter().all(|row| !row.loaded));
+        assert_eq!(harness.menu().pending_loads(), 0);
+        assert!(harness.menu().trigger_node().is_some());
+        assert!(!harness.menu().is_open(harness.app()));
+        assert!(alert_dialog(&harness).is_none());
+        assert_eq!(harness.overlay_count(), 0);
+    }
+
+    /// Every venue this build speaks is a row of the panel, and a venue it does not speak is
+    /// not: the list is the directory's venue list, whether or not anything is loaded.
+    #[test]
+    fn the_panel_should_list_every_venue_this_build_speaks() {
+        let mut harness = Harness::new();
+        assert!(
+            !harness.shows_panel(),
             "a panel nobody opened draws nothing"
         );
+
         open_panel(&mut harness);
 
-        let loaded = harness.cx.update(|_, cx| {
-            cx.global::<MarketParticipantsConnector>()
-                .supported_venues()
-        });
-        assert_eq!(loaded.len(), 5, "this build speaks five venues");
-        for row in [
-            BINANCE_ROW,
-            OKX_ROW,
-            HYPERLIQUID_ROW,
-            LONGBRIDGE_ROW,
-            POLYMARKET_ROW,
-        ] {
-            assert!(shows(&mut harness, row), "the panel draws {row}");
+        let translate = translate();
+        let venues = supported_venues();
+        assert_eq!(venues.len(), 5, "this build speaks five venues");
+        for venue in venues {
+            assert!(harness.shows_row(venue), "the panel draws {venue}");
+            assert!(
+                harness.shows_mark(venue, "UNLOADED"),
+                "a venue nothing loaded shows the unloaded mark"
+            );
+            assert!(
+                harness.action(venue, false).is_some(),
+                "a venue nothing loaded offers to load"
+            );
+            let name = venue.display_string(&translate);
+            assert!(
+                harness.has_text(harness.row(venue).expect("the row is drawn"), &name),
+                "the row names {venue}"
+            );
         }
     }
 
-    /// A market that cannot be read without credentials is refused before a load is started, and
-    /// the user is told to configure it instead.
-    ///
-    /// What this observes is that no load was requested at all: the menu drives one task per
-    /// venue, so a refusal that reached `load_venue` would have a task to show for itself and a
-    /// row in flight — and the alert would then be the *failure* alert, which reports a load that
-    /// ran. The row's own state is asserted beside it, because "nothing is loading" and "nothing
-    /// failed" are the two halves of "the load was never started".
-    #[gpui_kit::test]
-    fn a_load_without_credentials_should_be_refused_with_an_alert(cx: &mut TestAppContext) {
-        let mut harness = harness(cx, &[], &Origins::OFFLINE);
+    /// A market that cannot be read without credentials is refused before a load is started,
+    /// and the user is told to configure it instead.
+    #[test]
+    fn a_load_without_credentials_should_be_refused_with_an_alert() {
+        let gated = longbridge();
+        let mut harness = Harness::new();
+        harness.directory().require_credentials(gated);
         open_panel(&mut harness);
 
-        let longbridge = venue("longbridge");
-        assert!(
-            harness.cx.update(|_, cx| cx
-                .global::<MarketParticipantsConnector>()
-                .load_needs_credentials(longbridge)),
-            "a fresh installation holds no Longbridge credentials"
-        );
-
-        press(&mut harness, LONGBRIDGE_LOAD);
+        click_action(&mut harness, gated, false);
 
         assert!(
-            shows(&mut harness, ALERT),
-            "the refusal is stated where the user is looking"
+            harness.directory().loads().is_empty(),
+            "the refused load was never requested"
         );
-        assert_eq!(
-            tasks_in_flight(&mut harness),
-            0,
-            "the refused load was never requested, so no task of this menu is driving one"
-        );
+        assert_eq!(harness.menu().pending_loads(), 0);
+        assert!(activity(&harness, gated).is_none(), "nothing was started");
         assert!(
-            activity(&mut harness, &longbridge).is_none(),
-            "the venue is not loading and has not failed: nothing was started"
-        );
-        assert!(
-            shows(&mut harness, LONGBRIDGE_LOAD) && !shows(&mut harness, LONGBRIDGE_LOADING),
+            harness.action(gated, false).is_some(),
             "the row still offers the load it offered before the press"
         );
+        assert!(!harness.shows_mark(gated, "LOADING"));
         assert!(
-            !registered(&mut harness, &longbridge),
-            "a load that was never started registers nothing"
+            alert_open(&harness),
+            "the refusal is stated where the user is"
         );
 
-        // What the alert says is the credentials sentence rather than the load-failure one, which
-        // is what tells a user who has to configure a venue apart from one whose venue refused.
-        let (title, message) = harness.cx.update(|_, cx| {
-            (
-                t!(
-                    cx,
-                    "window.market_participants.credentials_required_title",
-                    market = longbridge.display_string(cx)
-                ),
-                t!(
-                    cx,
-                    "window.market_participants.credentials_required_message",
-                    market = longbridge.display_string(cx)
-                ),
-            )
-        });
-        assert!(!title.is_empty() && !message.is_empty());
-        assert!(
-            title.contains("Longbridge") && message.contains("Longbridge"),
-            "the refusal names the venue it is about: {title} / {message}"
+        let translate = translate();
+        let expected_title = t_smol!(
+            translate,
+            "window.market_participants.credentials_required_title",
+            market = gated.display_string(&translate)
         );
-    }
-
-    /// The credentials check is beside the re-entrancy guard rather than instead of it: a venue
-    /// that is configured loads exactly as it did, through the same path and with no alert.
-    #[gpui_kit::test]
-    fn a_configured_market_should_load_through_the_same_path(cx: &mut TestAppContext) {
-        let longbridge = venue("longbridge");
-        let mut harness = harness_over(
-            cx,
-            &[],
-            &Origins::OFFLINE,
-            Some((
-                longbridge,
-                LongbridgeCredentials {
-                    app_key: SmolStr::new_static("configured-app-key"),
-                    app_secret: SmolStr::new_static("configured-app-secret"),
-                    access_token: SmolStr::new_static("configured-access-token"),
-                },
-            )),
-        );
-        open_panel(&mut harness);
-
-        assert!(
-            !harness.cx.update(|_, cx| cx
-                .global::<MarketParticipantsConnector>()
-                .load_needs_credentials(longbridge)),
-            "a complete credential set is what the gate asks for"
-        );
-
-        press(&mut harness, LONGBRIDGE_LOAD);
-
-        assert!(
-            shows(&mut harness, LONGBRIDGE_LOADING),
-            "a configured venue starts the load its row offers"
+        let expected_message = t_smol!(
+            translate,
+            "window.market_participants.credentials_required_message",
+            market = gated.display_string(&translate)
         );
         assert_eq!(
-            tasks_in_flight(&mut harness),
-            1,
-            "the load really was requested and is this menu's task"
+            alert_title(&harness).as_deref(),
+            Some(expected_title.as_str())
         );
         assert!(
-            !shows(&mut harness, ALERT),
-            "a load that started is not the credentials refusal"
-        );
-
-        wait_for(&mut harness, "the load to report", |harness| {
-            tasks_in_flight(harness) == 0
-        });
-        settle(&mut harness);
-
-        assert!(
-            activity(&mut harness, &longbridge).is_some(),
-            "the load reported through the path a load of any other venue takes"
-        );
-        assert!(
-            !registered(&mut harness, &longbridge),
-            "the fixture holds its answer, so the venue did not commit"
+            harness.has_text_anywhere(&expected_message),
+            "the alert says which value to configure"
         );
     }
 
-    /// The three venues whose reads are public are offered exactly as they were: the credentials
-    /// gate is a question each venue's own definition answers, and none of them declares it.
-    ///
-    /// What the gate would have made of one of them is asserted first, so a venue that is *not*
-    /// refused here is refused nowhere: a press either starts a load — the fixture is asked for
-    /// the venue's own catalog — or the menu states the credentials refusal, and never both.
-    /// The fixture answers with a body no catalog decodes, so a load that ran fails on the venue's
-    /// own answer rather than committing.
-    #[gpui_kit::test]
-    fn venues_whose_reads_are_public_should_never_meet_the_credentials_gate(
-        cx: &mut TestAppContext,
-    ) {
-        let fixture = venue_fixture(&[]);
-        fixture.release();
-        let mut harness = harness(cx, &[], &Origins::at(&fixture.origin, PUBLIC_VENUES));
+    /// The credentials check is beside the re-entrancy guard rather than instead of it: a
+    /// venue that is configured loads exactly as it did, through the same path and with no
+    /// alert.
+    #[test]
+    fn a_configured_market_should_load_through_the_same_path() {
+        let gated = longbridge();
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
+        assert!(
+            !harness.directory().needs_credentials(gated),
+            "a fresh installation holds no Longbridge credentials, so the venue is configured"
+        );
+
+        click_action(&mut harness, gated, false);
+
+        assert_eq!(harness.directory().loads(), vec![gated]);
+        assert_eq!(harness.menu().pending_loads(), 1);
+        assert!(
+            harness.shows_mark(gated, "LOADING"),
+            "a configured venue starts the load its row offers"
+        );
+        assert!(
+            !alert_open(&harness),
+            "a load that started is not a refusal"
+        );
+
+        harness.directory().complete(
+            gated,
+            Err(VenueLoadError::Discovery {
+                venue: gated,
+                source: Box::new(MarketParticipantError::RuntimeUnavailable),
+            }),
+        );
+        harness.settle(2);
+
+        assert_eq!(harness.menu().pending_loads(), 0);
+        assert!(activity(&harness, gated).is_some(), "the load reported");
+        assert!(alert_open(&harness), "the failure reported itself");
+    }
+
+    /// The three venues whose reads are public are offered exactly as they were: the
+    /// credentials gate is a question each venue's own definition answers, and none of them
+    /// declares it.
+    #[test]
+    fn venues_whose_reads_are_public_should_never_meet_the_credentials_gate() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        for row in [BINANCE_ROW, OKX_ROW, HYPERLIQUID_ROW] {
-            assert!(shows(&mut harness, row), "the panel draws {row}");
+        for venue in [binance(), okx(), venue("hyperliquid")] {
+            assert!(!harness.directory().needs_credentials(venue));
+            let before = harness.directory().loads().len();
+
+            click_action(&mut harness, venue, false);
+
+            assert_eq!(
+                harness.directory().loads().len(),
+                before + 1,
+                "{venue} started the load its row offers"
+            );
+            assert!(harness.shows_mark(venue, "LOADING"));
+            assert!(!alert_open(&harness));
+
+            // The directory answers the way a cancelled connector load does, so the row goes
+            // back to the action it offered and the alert reports what happened.
+            harness.menu_mut().cancel_load(venue);
+            harness.settle(2);
+            assert!(alert_open(&harness), "{venue}'s reported load is reported");
+            click_alert_ok(&mut harness);
+            assert!(
+                harness.action(venue, false).is_some(),
+                "the row offers the load again once the alert is read"
+            );
         }
-
-        for (venue, load, catalog) in [
-            (binance(), BINANCE_LOAD, "/api/v3/exchangeInfo"),
-            (okx(), OKX_LOAD, "/api/v5/public/instruments"),
-            (venue("hyperliquid"), HYPERLIQUID_LOAD, "/info"),
-        ] {
-            assert!(
-                !harness.cx.update(|_, cx| cx
-                    .global::<MarketParticipantsConnector>()
-                    .load_needs_credentials(venue)),
-                "{venue} publishes its reads, so nothing about it has to be configured first"
-            );
-            let refused = refusal_text(&mut harness, &venue);
-            let asked_before = fixture.asked().len();
-
-            press(&mut harness, load);
-
-            wait_for(&mut harness, "the load to report", |harness| {
-                tasks_in_flight(harness) == 0 && shows(harness, ALERT)
-            });
-            settle(&mut harness);
-
-            let asked = fixture.asked();
-            assert!(
-                asked[asked_before..]
-                    .iter()
-                    .any(|target| target.contains(catalog)),
-                "{venue} started the load its row offers and asked for its own catalog: {:?}",
-                &asked[asked_before..]
-            );
-            assert!(
-                !refused.is_empty(),
-                "the refusal {venue} never met is still a sentence of its own"
-            );
-
-            press(&mut harness, ALERT_OK);
-            open_panel(&mut harness);
-        }
-
-        fixture.shutdown();
     }
 
     /// The alert a load refused for want of credentials raises is a sentence in every language
     /// the interface ships, and it says which market to configure and where.
-    ///
-    /// The keys are resolved here exactly as the refusal resolves them — the venue's own display
-    /// name bound to `market` — because the alert itself is a private entity of the window layer:
-    /// what this pins is the copy the refusal states, which is the same text the alert is built
-    /// from.
-    #[gpui_kit::test]
-    fn the_credentials_alert_should_read_in_every_language(cx: &mut TestAppContext) {
-        // The harness installs the catalogue the interface renders from, which is the one
-        // `install` may do once per process; the language is what this test moves.
-        let harness = harness(cx, &[], &Origins::OFFLINE);
-
-        let longbridge = venue("longbridge");
+    #[test]
+    fn the_credentials_alert_should_read_in_every_language() {
+        let gated = longbridge();
         let mut seen = Vec::new();
 
         for language in [LanguageCode::En, LanguageCode::ZhCn] {
-            harness.cx.update(|_, cx| cx.set_global(language));
-            let (market, title, message) = harness.cx.update(|_, cx| {
-                (
-                    longbridge.display_string(cx),
-                    t!(
-                        cx,
-                        "window.market_participants.credentials_required_title",
-                        market = longbridge.display_string(cx)
-                    ),
-                    t!(
-                        cx,
-                        "window.market_participants.credentials_required_message",
-                        market = longbridge.display_string(cx)
-                    ),
-                )
-            });
+            let translate = translate_in(language);
+            let market = gated.display_string(&translate);
+            let title = t_smol!(
+                translate,
+                "window.market_participants.credentials_required_title",
+                market = market
+            );
+            let message = t_smol!(
+                translate,
+                "window.market_participants.credentials_required_message",
+                market = market
+            );
 
             assert!(
-                !market.is_empty() && !title.is_empty() && !message.is_empty(),
-                "the refusal reads as a sentence in {language}: {title} / {message}"
+                !title.is_empty() && !message.is_empty(),
+                "the refusal reads as a sentence in {language}"
             );
             assert!(
-                title.contains(market.as_ref()) && message.contains(market.as_ref()),
-                "the refusal names the market in {language}: {title} / {message}"
+                title.contains(market.as_str()) && message.contains(market.as_str()),
+                "the refusal names the market in {language}"
             );
             assert!(
                 message.contains("API Key"),
                 "the refusal says which value to configure in {language}: {message}"
             );
-
             seen.push((title, message));
         }
 
@@ -1724,464 +1395,553 @@ mod tests {
 
     /// Pressing a row's action leaves the panel open: the row reports its progress and its
     /// failures in the panel, so a press that closed it would hide what it started.
-    #[gpui_kit::test]
-    fn pressing_a_row_action_should_leave_the_panel_open(cx: &mut TestAppContext) {
-        let mut harness = harness(cx, &[], &Origins::OFFLINE);
+    #[test]
+    fn pressing_a_row_action_should_leave_the_panel_open() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        press(&mut harness, OKX_LOAD);
-        // The press reached the row: the load it started failed and reported itself, so the
-        // panel being open is the panel surviving a press rather than a press that missed.
-        wait_for(&mut harness, "what the press started", |harness| {
-            shows(harness, ALERT)
-        });
+        click_action(&mut harness, okx(), false);
+        harness
+            .directory()
+            .complete(okx(), Err(VenueLoadError::Interrupted { venue: okx() }));
+        harness.settle(2);
 
         assert!(
-            shows(&mut harness, PANEL),
-            "the panel stays open while a row loads"
+            harness.menu().is_open(harness.app()),
+            "the panel stays open"
         );
         assert!(
-            shows(&mut harness, OKX_ROW),
+            harness.shows_row(okx()),
             "the row the press was made in is still drawn"
         );
         assert!(
-            shows(&mut harness, ALERT),
+            alert_open(&harness),
             "what the press started reported itself"
         );
     }
 
     /// A load that succeeded is silent and flips its row: the row's label follows the loaded
     /// venues, which hold the venue now, so the action it offers is a refresh.
-    ///
-    /// What the press starts is the real connection action against a venue that answers on a
-    /// loopback socket, and what the test reads is the state that load left: the row offers a
-    /// refresh because the venue really is in the loaded venues with its scopes and catalogs,
-    /// not because the test told the menu a load succeeded.
-    #[gpui_kit::test]
-    fn a_clicked_load_that_succeeds_should_offer_a_refresh(cx: &mut TestAppContext) {
-        let fixture = venue_fixture(OKX_CATALOGS);
-        let mut harness = harness(cx, &[], &Origins::at(&fixture.origin, OKX_VENUES));
+    #[test]
+    fn a_clicked_load_that_succeeds_should_offer_a_refresh() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
-        assert!(
-            shows(&mut harness, OKX_LOAD),
-            "a venue nothing has loaded offers to load"
-        );
-        assert!(
-            listings(&mut harness, &okx_spot()).is_none(),
-            "nothing has loaded the venue's catalog yet"
-        );
+        assert!(harness.action(okx(), false).is_some());
 
-        press(&mut harness, OKX_LOAD);
-        assert!(
-            shows(&mut harness, OKX_LOADING),
-            "the load the press started draws its progress"
-        );
+        click_action(&mut harness, okx(), false);
+        assert!(harness.shows_mark(okx(), "LOADING"));
 
-        // The load is really in flight and really waiting for the venue: the fixture is holding
-        // the catalog request, and nothing has been published while it waits. (A load commits
-        // nothing until it succeeds: the venue is in the loaded venues only once its scopes,
-        // catalogs and metadata have all landed, and a load that fails leaves nothing — V4.)
-        wait_for(&mut harness, "the venue's catalog request", |_| {
-            fixture.asked().len() == 1
-        });
-        assert!(!shows(&mut harness, ALERT));
-        assert!(
-            listings(&mut harness, &okx_spot()).is_none(),
-            "the catalog is not published before the venue answers"
-        );
-
-        fixture.release();
-        wait_for(&mut harness, "the venue to load", |harness| {
-            tasks_in_flight(harness) == 0
-        });
-        settle(&mut harness);
+        harness.directory().complete(okx(), Ok(()));
+        harness.settle(2);
 
         assert!(
-            registered(&mut harness, &okx()),
-            "the load really registered the venue"
-        );
-        let spot = listings(&mut harness, &okx_spot())
-            .expect("the load really published the venue's spot catalog");
-        assert!(
-            spot.iter().any(|entry| entry
-                .listing
-                .native_symbol
-                .as_ref()
-                .is_some_and(|symbol| symbol.as_str() == "BTC-USDT")),
-            "the catalog the venue answered with is what was published"
+            harness.directory().is_loaded(&okx()),
+            "the load registered the venue"
         );
         assert!(
-            listings(&mut harness, &okx_swap()).is_some(),
-            "the load fetched the venue's second catalog too"
-        );
-        assert!(
-            shows(&mut harness, OKX_REFRESH),
+            harness.action(okx(), true).is_some(),
             "a loaded venue offers to refresh"
         );
+        assert!(harness.action(okx(), false).is_none());
+        assert!(harness.shows_mark(okx(), "LOADED"));
         assert!(
-            !shows(&mut harness, OKX_LOAD),
-            "and no longer offers to load"
-        );
-        assert!(!shows(&mut harness, OKX_LOADING));
-        assert!(
-            !shows(&mut harness, ALERT),
+            !alert_open(&harness),
             "a load that succeeded reports nothing"
         );
-        assert!(
-            shows(&mut harness, PANEL),
-            "the panel the load was started from stays open"
-        );
-
-        let asked = fixture.asked();
-        assert_eq!(
-            asked.len(),
-            2,
-            "the fixture answered exactly the two catalog routes of the venue: {asked:?}"
-        );
-        assert!(
-            asked.iter().any(|target| target.contains("instType=SPOT")),
-            "the spot catalog was fetched: {asked:?}"
-        );
-        assert!(
-            asked.iter().any(|target| target.contains("instType=SWAP")),
-            "the swap catalog was fetched: {asked:?}"
-        );
-
-        fixture.shutdown();
+        assert!(harness.menu().is_open(harness.app()));
     }
 
     /// A first connection that fails is reported once, in the alert, and its row keeps
-    /// offering to load: nothing is loaded, so the row's own answer is still
-    /// "load", and pressing it again is the retry.
-    #[gpui_kit::test]
-    fn a_first_load_that_fails_should_be_reported_once(cx: &mut TestAppContext) {
-        let mut harness = harness(cx, &[], &Origins::OFFLINE);
+    /// offering to load: nothing is loaded, so pressing it again is the retry.
+    #[test]
+    fn a_first_load_that_fails_should_be_reported_once() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        press(&mut harness, OKX_LOAD);
-        wait_for(&mut harness, "the failed load", |harness| {
-            shows(harness, ALERT)
-        });
+        click_action(&mut harness, okx(), false);
+        harness
+            .directory()
+            .complete(okx(), Err(VenueLoadError::Interrupted { venue: okx() }));
+        harness.settle(2);
 
         assert!(
-            shows(&mut harness, ALERT),
+            alert_open(&harness),
             "the failure is reported where the user is"
         );
         assert!(
-            shows(&mut harness, OKX_FAILED),
+            harness
+                .find("TEST_MARKET_PARTICIPANTS_FAILED_Okx")
+                .is_some(),
             "the row keeps saying the venue failed to load"
         );
         assert!(
-            shows(&mut harness, OKX_LOAD),
-            "a venue that could not be loaded still offers to load"
+            harness.action(okx(), false).is_some(),
+            "the row still offers to load"
         );
-        assert!(
-            !registered(&mut harness, &okx()),
-            "a first connection that failed leaves nothing registered"
-        );
+        assert!(!harness.directory().is_loaded(&okx()));
 
-        // One alert per failed action: reading it does not bring it back, because it was
-        // opened once, when the load reported.
-        press(&mut harness, ALERT_OK);
+        click_alert_ok(&mut harness);
 
         assert!(
-            !shows(&mut harness, ALERT),
+            !alert_open(&harness),
             "the failure is reported once per action"
         );
+        assert!(
+            harness
+                .find("TEST_MARKET_PARTICIPANTS_FAILED_Okx")
+                .is_some(),
+            "reading the alert does not take the row's own report away"
+        );
+        assert!(harness.action(okx(), false).is_some());
     }
 
-    /// A refresh that fails changes nothing that was loaded — including the row's own
-    /// answer: the venue is still registered, so the row still offers to refresh.
-    #[gpui_kit::test]
-    fn a_refresh_that_fails_should_keep_offering_a_refresh(cx: &mut TestAppContext) {
-        let mut harness = harness(cx, &[okx()], &Origins::OFFLINE);
+    /// A refresh that fails changes nothing that was loaded — including the row's own answer:
+    /// the venue is still registered, so the row still offers to refresh.
+    #[test]
+    fn a_refresh_that_fails_should_keep_offering_a_refresh() {
+        let mut harness = Harness::new();
+        harness.directory().mark_loaded(okx());
         open_panel(&mut harness);
+        assert!(harness.action(okx(), true).is_some());
+
+        click_action(&mut harness, okx(), true);
+        harness
+            .directory()
+            .complete(okx(), Err(VenueLoadError::Interrupted { venue: okx() }));
+        harness.settle(2);
+
+        assert!(alert_open(&harness), "the failed refresh is reported");
         assert!(
-            shows(&mut harness, OKX_REFRESH),
-            "a loaded venue offers to refresh"
+            harness
+                .find("TEST_MARKET_PARTICIPANTS_FAILED_Okx")
+                .is_some()
         );
-
-        press(&mut harness, OKX_REFRESH);
-        wait_for(&mut harness, "the failed refresh", |harness| {
-            shows(harness, ALERT)
-        });
-
-        assert!(shows(&mut harness, ALERT), "the failed refresh is reported");
-        assert!(shows(&mut harness, OKX_FAILED), "the row reports it too");
         assert!(
-            shows(&mut harness, OKX_REFRESH),
+            harness.action(okx(), true).is_some(),
             "a refresh that failed leaves the venue loaded, so the row still offers one"
         );
-        assert!(!shows(&mut harness, OKX_LOAD));
-        assert!(
-            registered(&mut harness, &okx()),
-            "a refresh that failed changes nothing that was committed"
-        );
+        assert!(harness.action(okx(), false).is_none());
+        assert!(harness.directory().is_loaded(&okx()));
     }
 
-    /// A row whose load is in flight does not respond to a second press, while the same
-    /// press on the same row does start a load once the row is idle.
-    ///
-    /// The load the row is in flight for is a real one, held open by the fixture, so what the
-    /// second press meets is the state a press really leaves behind rather than one a test
-    /// stated.
-    #[gpui_kit::test]
-    fn a_row_that_is_loading_should_ignore_a_second_press(cx: &mut TestAppContext) {
-        let fixture = venue_fixture(&[]);
-        let mut harness = harness(cx, &[], &Origins::at(&fixture.origin, OKX_VENUES));
+    /// A row whose load is in flight does not respond to a second press, and the action itself
+    /// refuses a second start for the press a frame can deliver before the row is replaced.
+    #[test]
+    fn a_row_that_is_loading_should_ignore_a_second_press() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        press(&mut harness, OKX_LOAD);
-        assert!(
-            shows(&mut harness, OKX_LOADING),
-            "a row in flight draws its progress"
-        );
-        assert_eq!(tasks_in_flight(&mut harness), 1);
-
-        press(&mut harness, OKX_LOAD);
-
-        assert!(
-            !shows(&mut harness, ALERT),
-            "a row in flight starts nothing, so nothing failed"
-        );
-        assert!(
-            shows(&mut harness, OKX_LOADING) && !shows(&mut harness, OKX_FAILED),
-            "the row is still loading"
-        );
+        click_action(&mut harness, okx(), false);
+        assert!(harness.shows_mark(okx(), "LOADING"));
+        assert_eq!(harness.menu().pending_loads(), 1);
         assert_eq!(
-            tasks_in_flight(&mut harness),
+            harness.directory().pending(),
+            1,
+            "the load future is waiting for its answer"
+        );
+
+        let again = harness
+            .action(okx(), false)
+            .expect("the row keeps its action cell");
+        harness.click(again);
+        harness.settle(1);
+        assert_eq!(
+            harness.directory().loads().len(),
             1,
             "one load per venue: the press on a row in flight starts nothing"
         );
+        assert!(!alert_open(&harness));
 
-        // The action itself refuses a load for a venue that is already loading: that is the
-        // same rule stated where a load is started, for the second press one frame can
-        // deliver before the row it was drawn from is replaced.
-        start_load(&mut harness, &okx());
-
-        assert!(
-            !shows(&mut harness, ALERT),
-            "one load per venue: a second start is refused"
+        harness
+            .start_load(okx())
+            .expect("the re-entrancy guard is not an error");
+        // The load a start requests is registered when its future is first polled.
+        harness.drain();
+        assert_eq!(
+            harness.directory().loads().len(),
+            1,
+            "the second start is refused"
         );
-        assert!(shows(&mut harness, OKX_LOADING));
-        assert_eq!(tasks_in_flight(&mut harness), 1);
-
-        // The load the row is in flight for is the one that press started, and once it reports
-        // the row is idle again and offers the action it offered before — which is what the
-        // press it ignored would have started a second time.
-        fixture.release();
-        wait_for(&mut harness, "the load to report", |harness| {
-            tasks_in_flight(harness) == 0
-        });
-        assert!(
-            shows(&mut harness, ALERT),
-            "the load the press started reported"
-        );
-        assert!(shows(&mut harness, OKX_FAILED));
-        assert!(!shows(&mut harness, OKX_LOADING));
-        assert!(shows(&mut harness, OKX_LOAD));
-        fixture.shutdown();
+        assert_eq!(harness.menu().pending_loads(), 1);
     }
 
     /// Venues are independent: two loads run beside each other, and each failure is reported
     /// against the row that asked for it.
-    ///
-    /// Both loads are really in flight at the same time and both are held there by the
-    /// fixture, so what this pins is that the loads are held *per venue*: one slot for the
-    /// menu would have taken the first venue's load away from it the moment the second row was
-    /// pressed, and the row it was started from would have stayed loading for the rest of the
-    /// window's life.
-    #[gpui_kit::test]
-    fn loads_of_two_venues_should_run_beside_each_other(cx: &mut TestAppContext) {
-        let fixture = venue_fixture(&[]);
-        let both_venues: Vec<VenueId> = BINANCE_VENUES.iter().chain(OKX_VENUES).copied().collect();
-        let mut harness = harness(cx, &[], &Origins::at(&fixture.origin, &both_venues));
+    #[test]
+    fn loads_of_two_venues_should_run_beside_each_other() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
 
-        press(&mut harness, OKX_LOAD);
-        press(&mut harness, BINANCE_LOAD);
+        click_action(&mut harness, okx(), false);
+        click_action(&mut harness, binance(), false);
 
+        assert_eq!(harness.directory().loads(), vec![okx(), binance()]);
+        assert_eq!(harness.menu().pending_loads(), 2);
+        assert!(harness.shows_mark(okx(), "LOADING") && harness.shows_mark(binance(), "LOADING"));
+        assert!(!alert_open(&harness));
+
+        harness
+            .directory()
+            .complete(okx(), Err(VenueLoadError::Interrupted { venue: okx() }));
+        harness.directory().complete(
+            binance(),
+            Err(VenueLoadError::Interrupted { venue: binance() }),
+        );
+        harness.settle(2);
+
+        assert!(activity(&harness, okx()).is_some());
+        assert!(activity(&harness, binance()).is_some());
+        assert!(
+            harness
+                .find("TEST_MARKET_PARTICIPANTS_FAILED_Okx")
+                .is_some()
+        );
+        assert!(
+            harness
+                .find("TEST_MARKET_PARTICIPANTS_FAILED_Binance")
+                .is_some()
+        );
+        assert!(activity(&harness, venue("hyperliquid")).is_none());
         assert_eq!(
-            tasks_in_flight(&mut harness),
+            harness.overlay_count(),
             2,
-            "each venue's load is held by a task of its own"
+            "the panel and one alert: each failure is reported once"
         );
-        assert!(
-            shows(&mut harness, OKX_LOADING) && shows(&mut harness, BINANCE_LOADING),
-            "both rows are in flight"
-        );
-        assert!(
-            !shows(&mut harness, ALERT),
-            "nothing reported while the fixture holds both loads"
-        );
+    }
 
-        fixture.release();
-        wait_for(&mut harness, "both loads to report", |harness| {
-            tasks_in_flight(harness) == 0
-        });
-        settle(&mut harness);
+    /// A load cancelled at the directory is not left in flight: the row goes back to offering
+    /// the action it was asked for rather than keeping a progress mark nothing will finish.
+    #[test]
+    fn a_cancelled_load_should_not_wedge_its_row() {
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
 
-        assert!(
-            shows(&mut harness, OKX_FAILED) && shows(&mut harness, BINANCE_FAILED),
-            "each row reports the load it asked for"
-        );
-        assert!(
-            !shows(&mut harness, OKX_LOADING) && !shows(&mut harness, BINANCE_LOADING),
-            "both loads reached a terminal state"
-        );
-        assert!(
-            shows(&mut harness, OKX_LOAD) && shows(&mut harness, BINANCE_LOAD),
-            "a first connection that failed leaves nothing registered"
-        );
-        assert!(!registered(&mut harness, &okx()) && !registered(&mut harness, &binance()));
-        assert!(
-            shows(&mut harness, ALERT),
-            "the failure is reported where the user is"
-        );
+        click_action(&mut harness, okx(), false);
+        assert!(harness.shows_mark(okx(), "LOADING"));
 
-        // Each failure is the row's own. What a row *says* is no longer evidence of that:
-        // the line is drawn from the row's own venue key, so a row cannot name another
-        // venue's load however the failure was recorded. What is still evidence — and
-        // what one shared "something failed" flag, or a failure recorded against the
-        // wrong venue, would break — is that both rows carry a failure of their own and
-        // that a venue nobody loaded carries none.
-        let okx_said = failure_text(&mut harness, &okx());
-        let binance_said = failure_text(&mut harness, &binance());
+        harness.menu_mut().cancel_load(okx());
+        harness.settle(2);
+
+        assert_eq!(harness.menu().pending_loads(), 0);
+        assert!(!harness.shows_mark(okx(), "LOADING"));
         assert!(
-            activity(&mut harness, &venue("hyperliquid")).is_none(),
-            "a venue nobody loaded reports nothing"
+            harness.action(okx(), false).is_some(),
+            "the row offers the action again instead of staying in flight"
+        );
+        assert_eq!(harness.directory().cancelled(), vec![okx()]);
+        assert!(
+            alert_open(&harness),
+            "the directory's cancellation is reported"
+        );
+    }
+
+    // ---------------------------------------------------------------- language
+
+    /// Switching the language redraws the panel's static copy: names and action labels are
+    /// rebuilt in the language the interface shows.
+    #[test]
+    fn switching_the_language_should_redraw_the_panel() {
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
+        let row = harness.row(okx()).expect("the row is drawn");
+        let action = harness.action(okx(), false).expect("the action is drawn");
+        let english_name = harness.text_of(row);
+        let english_action = harness.text_of(action);
+        assert!(!english_name.is_empty() && !english_action.is_empty());
+
+        harness.switch_language(LanguageCode::ZhCn);
+        harness.settle(2);
+
+        let row = harness.row(okx()).expect("the row is still drawn");
+        let action = harness
+            .action(okx(), false)
+            .expect("the action is still drawn");
+        let chinese_name = harness.text_of(row);
+        let chinese_action = harness.text_of(action);
+        assert_ne!(
+            english_name, chinese_name,
+            "the row names the venue in the new language"
         );
         assert_ne!(
-            okx_said, binance_said,
-            "the two rows state their own venue rather than one shared sentence"
+            english_action, chinese_action,
+            "the action labels itself in the new language"
         );
-
-        // Both loads really went to the loopback venue, each of them for its own catalog.
-        let asked = fixture.asked();
-        assert!(
-            asked
-                .iter()
-                .any(|target| target.contains("/api/v3/exchangeInfo")),
-            "the Binance load asked the fixture for its catalog: {asked:?}"
-        );
-        assert!(
-            asked
-                .iter()
-                .any(|target| target.contains("/api/v5/public/instruments")),
-            "the OKX load asked the fixture for its catalog: {asked:?}"
-        );
-
-        fixture.shutdown();
+        assert!(!chinese_name.is_empty() && !chinese_action.is_empty());
     }
 
-    /// The control for the offline load above: a load that reaches an origin reports something
-    /// else, whatever that is.
-    ///
-    /// Without this, "the failure is a failure of getting there" could hold for every load —
-    /// including one that really reached a venue — and the assertion above would pin nothing: the
-    /// fixture here answers with a body no catalog protocol decodes, so a load that arrives fails
-    /// on the venue's own answer instead.
-    #[gpui_kit::test]
-    fn a_load_that_reaches_an_origin_should_not_fail_on_getting_there(cx: &mut TestAppContext) {
-        let fixture = venue_fixture(&[]);
-        fixture.release();
-        let mut harness = harness(cx, &[], &Origins::at(&fixture.origin, OKX_VENUES));
-
-        let outcome = load(&mut harness, &okx());
-
-        assert!(
-            matches!(outcome, Err(VenueLoadError::Catalog { .. })),
-            "the load reached the origin it resolved and failed on the venue's answer: \
-             {outcome:?}"
-        );
-        assert!(
-            !refused_to_resolve(&outcome),
-            "an origin that answers reports what the venue answered, not a refusal to resolve \
-             one: {outcome:?}"
-        );
-        assert_eq!(
-            fixture.asked().len(),
-            1,
-            "the request the load made is the one the fixture answered: {:?}",
-            fixture.asked()
-        );
-        fixture.shutdown();
-    }
-
-    /// A load that was cancelled does not wedge its row: the venue goes back to offering the
-    /// action it was asked for, and pressing it again starts a load.
-    ///
-    /// The task a load runs in can be gone without the load having reported anything — the
-    /// runtime the window drives it on was shut down under it — and the row it was started from
-    /// is the only thing that can put the venue back: `activity` is this menu's own memory, and
-    /// a loading row attaches no action at all, so a venue left loading is a venue no press can
-    /// ever reach again.
-    #[gpui_kit::test]
-    fn a_cancelled_load_should_not_wedge_its_row(cx: &mut TestAppContext) {
-        let fixture = venue_fixture(&[]);
-        let mut harness = harness(cx, &[okx()], &Origins::at(&fixture.origin, OKX_VENUES));
+    /// The panel is steady once drawn: a frame in which nothing moved requests no frame.
+    #[test]
+    fn an_open_panel_should_be_steady_when_nothing_moves() {
+        let mut harness = Harness::new();
         open_panel(&mut harness);
-        assert!(
-            shows(&mut harness, OKX_REFRESH),
-            "a loaded venue offers to refresh"
-        );
+        harness.settle(2);
+        let requests = harness.frame_requests();
 
-        press(&mut harness, OKX_REFRESH);
-        assert!(shows(&mut harness, OKX_LOADING));
-        assert_eq!(tasks_in_flight(&mut harness), 1);
-        wait_for(&mut harness, "the venue's catalog request", |_| {
-            fixture.asked().len() == 1
-        });
-
-        // Pull the runtime the window drives the load on out from under it: the task is
-        // cancelled, and what the menu is handed is the cancellation rather than a report.
-        harness
-            .cx
-            .update(|_, cx| global::install(cx).expect("a second runtime builds"));
-        wait_for(
-            &mut harness,
-            "the menu to hear the cancellation",
-            |harness| tasks_in_flight(harness) == 0,
-        );
-        settle(&mut harness);
-
-        assert!(
-            !shows(&mut harness, OKX_LOADING),
-            "a cancelled load does not keep its row loading"
-        );
-        assert!(
-            shows(&mut harness, OKX_REFRESH) && !shows(&mut harness, OKX_FAILED),
-            "a cancelled load is not a failure this menu reports"
-        );
-        assert!(!shows(&mut harness, ALERT), "and it opens no alert");
-        assert!(
-            activity(&mut harness, &okx()).is_none(),
-            "the venue is not doing anything any more"
-        );
-
-        // The control: the row is pressable again, which is what a cancelled load took away —
-        // a row the menu still believes is loading attaches no action at all.
-        press(&mut harness, OKX_REFRESH);
+        harness.settle(2);
 
         assert_eq!(
-            tasks_in_flight(&mut harness),
-            1,
-            "the press reaches the action the row offers again"
+            harness.frame_requests(),
+            requests,
+            "a steady panel requests no frame (I3)"
         );
-        assert!(shows(&mut harness, OKX_LOADING));
-        fixture.shutdown();
     }
+
+    // ---------------------------------------------------------------- hint and dismissal
+
+    /// The hint sits under the trigger, but not while the panel is down: the panel occupies
+    /// that space, and a hint over its first row would take the presses meant for it.
+    #[test]
+    fn an_open_panel_should_take_the_hint_away() {
+        let mut harness = Harness::new();
+        let translate = translate();
+        let title = t_smol!(translate, "window.market_participants.title");
+        let hint = |harness: &Harness| {
+            harness
+                .menu()
+                .inner
+                .borrow()
+                .tooltip
+                .as_ref()
+                .and_then(|tooltip| tooltip.content())
+                .map(|content| content.label())
+        };
+        assert_eq!(hint(&harness), Some(title));
+
+        open_panel(&mut harness);
+
+        assert_eq!(hint(&harness), None, "the open panel takes the hint away");
+    }
+
+    /// A press outside the panel closes it: the panel is one popup overlay, dismissed the way
+    /// every popup is.
+    #[test]
+    fn a_press_outside_the_panel_should_close_it() {
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
+
+        harness.click_point(Point {
+            x: 1200.0,
+            y: 850.0,
+        });
+        harness.settle_fade();
+
+        assert!(!harness.menu().is_open(harness.app()));
+        assert!(
+            !harness.shows_panel(),
+            "the closed panel leaves no rows behind"
+        );
+        assert_eq!(harness.overlay_count(), 0);
+    }
+
+    /// Two failures are two reports, and the alert states the failure that just happened: the
+    /// second alert replaces the first rather than stacking one over the other.
+    #[test]
+    fn a_second_failure_should_replace_the_alert() {
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
+
+        // Both loads start before either reports, so both failures land in one frame: the
+        // second report replaces the first alert rather than stacking one over the other.
+        click_action(&mut harness, okx(), false);
+        click_action(&mut harness, binance(), false);
+        harness
+            .directory()
+            .complete(okx(), Err(VenueLoadError::Interrupted { venue: okx() }));
+        harness.directory().complete(
+            binance(),
+            Err(VenueLoadError::Interrupted { venue: binance() }),
+        );
+        harness.settle(2);
+
+        let translate = translate();
+        let expected = t_smol!(
+            translate,
+            "window.market_participants.failed",
+            market = binance().display_string(&translate)
+        );
+        assert_eq!(alert_title(&harness).as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            harness.overlay_count(),
+            2,
+            "the panel and exactly one alert"
+        );
+    }
+
+    // ---------------------------------------------------------------- two panes
+
+    /// Two title bars in one window own two identities: their keys differ, their handlers do
+    /// not replace one another, and releasing one leaves the other working.
+    #[test]
+    fn two_menus_should_live_side_by_side() {
+        let mut harness = Harness::new();
+        let services = harness.services_rc();
+        let directory = harness.directory();
+        let executor = harness.executor();
+        let window = harness.window();
+        let toolbar = {
+            let tree = harness
+                .app_mut()
+                .window_mut(window)
+                .expect("the window exists")
+                .tree_mut();
+            let root = tree.root();
+            NodeBuilder::boxed()
+                .id("TEST_MARKET_PARTICIPANTS_TOOLBAR_2")
+                .build(tree, root)
+                .expect("the second toolbar builds")
+        };
+        let host = MarketParticipantsHost::new(services, directory).with_executor(executor);
+        let mut second = MarketParticipants::new(host, harness.app_mut());
+        second
+            .build(harness.app_mut(), window, toolbar)
+            .expect("the second trigger builds");
+
+        assert_ne!(
+            harness.menu().key(),
+            second.key(),
+            "two instances, two identities"
+        );
+        assert_ne!(
+            harness.menu().trigger_node(),
+            second.trigger_node(),
+            "each menu owns its own trigger"
+        );
+
+        // The second trigger is mounted but not laid out until a frame runs; the press is the
+        // first thing a title bar would deliver after the mount, so give it that frame.
+        harness.settle(1);
+        let trigger = second.trigger_node().expect("the second trigger is built");
+        harness.click(trigger);
+        second
+            .sync(harness.app_mut())
+            .expect("the second menu's frame");
+        harness.settle(1);
+        assert!(
+            second.is_open(harness.app()),
+            "the second menu opens its own panel"
+        );
+        assert!(
+            !harness.menu().is_open(harness.app()),
+            "the first menu is untouched"
+        );
+        assert_eq!(
+            harness.find_all("TEST_MARKET_PARTICIPANTS_ROW_").len(),
+            supported_venues().len(),
+            "the second menu draws every venue once"
+        );
+
+        // The first menu is released while the second one is open; the second one still works.
+        let first_trigger = harness.menu().trigger_node().expect("the first trigger");
+        harness.remove_node(first_trigger);
+        harness.release_menu();
+
+        let action = harness
+            .find_all(&format!("{}:action:Okx", second.key()))
+            .into_iter()
+            .next()
+            .expect("the second menu's action is drawn");
+        harness.click(action);
+        second
+            .sync(harness.app_mut())
+            .expect("the second menu's frame");
+        harness.settle(1);
+        assert_eq!(harness.directory().loads(), vec![okx()]);
+        assert_eq!(second.pending_loads(), 1);
+
+        second.release(harness.app_mut());
+        harness.app_mut().remove_node(window, toolbar).ok();
+    }
+
+    // ---------------------------------------------------------------- release
+
+    /// Releasing the menu cancels its loads, releases every kit component and gives the
+    /// window back to what it was before the menu was mounted.
+    #[test]
+    fn releasing_the_menu_should_cancel_its_loads_and_give_everything_back() {
+        let mut harness = Harness::new();
+        open_panel(&mut harness);
+        click_action(&mut harness, okx(), false);
+        assert_eq!(harness.menu().pending_loads(), 1);
+
+        let trigger = harness.menu().trigger_node().expect("the trigger is built");
+        harness.remove_node(trigger);
+        harness.release_menu();
+        harness.drain();
+
+        assert_eq!(
+            harness.directory().cancelled(),
+            vec![okx()],
+            "the load in flight was cancelled before it was dropped"
+        );
+        assert_eq!(harness.overlay_count(), 0, "the panel overlay is gone");
+        assert!(alert_dialog(&harness).is_none());
+        assert_eq!(
+            harness.menu().trigger_node(),
+            None,
+            "nothing of the menu's is left but the caller's node"
+        );
+
+        // Releasing twice is not an error: the second call has nothing left to give back.
+        harness.release_menu();
+    }
+
+    /// Building and releasing a menu repeatedly does not grow the window's tree: everything a
+    /// menu mounts, it unmounts (or hands back to the caller, who unmounts it).
+    #[test]
+    fn building_and_releasing_menus_should_not_grow_the_window() {
+        let mut harness = Harness::new();
+        let mut baseline = 0;
+
+        for index in 0..8 {
+            let window = harness.window();
+            let toolbar = {
+                let tree = harness
+                    .app_mut()
+                    .window_mut(window)
+                    .expect("the window exists")
+                    .tree_mut();
+                let root = tree.root();
+                NodeBuilder::boxed()
+                    .id(format!("TEST_MARKET_PARTICIPANTS_LOOP_{index}"))
+                    .build(tree, root)
+                    .expect("the loop toolbar builds")
+            };
+            let host = MarketParticipantsHost::new(harness.services_rc(), harness.directory())
+                .with_executor(harness.executor());
+            let mut menu = MarketParticipants::new(host, harness.app_mut());
+            menu.build(harness.app_mut(), window, toolbar)
+                .expect("the loop menu builds");
+            menu.sync(harness.app_mut()).expect("the loop menu's frame");
+            harness.drain();
+
+            let mounted = harness.tree_len();
+            menu.release(harness.app_mut());
+            harness
+                .app_mut()
+                .remove_node(window, toolbar)
+                .expect("the loop toolbar is removed");
+            harness.drain();
+            let after = harness.tree_len();
+
+            if index == 0 {
+                baseline = after;
+            }
+            assert_eq!(
+                after, baseline,
+                "a mounted and released menu leaves no node"
+            );
+            assert!(mounted > after);
+        }
+    }
+
+    // ---------------------------------------------------------------- i18n
 
     /// A missing key translates to an empty string, which is how this menu would fail
-    /// quietly: rows with no action, an alert that says nothing. Every key this crate reads
-    /// is listed here and resolved in every locale the binary embeds, so a rename or a
-    /// forgotten locale fails a test instead of blanking out the interface.
-    #[gpui_kit::test]
-    fn every_key_this_menu_reads_should_resolve_to_text(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-        });
-
+    /// quietly: rows with no action, an alert that says nothing. Every key this crate reads is
+    /// listed here and resolved in every locale the binary embeds, and every failure a load
+    /// can report is put through the same localization.
+    #[test]
+    fn every_key_this_menu_reads_should_resolve_to_text() {
         let keys = [
             "common.confirm",
             "error.venue_load.catalog",
@@ -2205,96 +1965,106 @@ mod tests {
             "window.market_participants.unloaded",
         ];
 
-        cx.update(|cx| {
-            let languages = cx.global::<I18n>().languages();
-            assert_eq!(
-                languages.len(),
-                2,
-                "this binary embeds the locales it renders in"
-            );
-
-            for language in languages {
-                cx.set_global(language);
-
-                for key in keys {
-                    assert!(
-                        !i18n::t!(cx, key).is_empty(),
-                        "{key} has no copy in {language}"
-                    );
-                }
-
-                // Every failure a load can report has to say something, and the one whose copy
-                // is a sentence of its own has to say *that*: a catalog that moved under its
-                // fetch is reported by asking the user to ask again, not by naming a route. Its
-                // two route input revisions are public, so the variant is built here and put
-                // through the same localization as the rest.
-                let stale_catalog = LoadFailure::Venue(VenueLoadError::Catalog {
-                    venue: okx(),
-                    scope: okx_spot().scope,
-                    source: Box::new(MarketParticipantError::Catalog(Box::new(
-                        CatalogError::RouteRevisionChanged {
-                            route: okx_spot(),
-                            staged: Box::new(
-                                RouteInputRevision::describe().catalog_descriptor(1).build(),
-                            ),
-                            current: Box::new(
-                                RouteInputRevision::describe().catalog_descriptor(2).build(),
-                            ),
-                        },
-                    ))),
-                });
-                let discovery = LoadFailure::Venue(VenueLoadError::Discovery {
-                    venue: okx(),
-                    source: Box::new(MarketParticipantError::RuntimeUnavailable),
-                });
-                let registration = LoadFailure::Venue(VenueLoadError::Registration {
-                    venue: okx(),
-                    source: Box::new(RegistryError::Descriptor(DescriptorError::DuplicateRoute {
-                        route: okx_spot(),
-                    })),
-                });
-                let route_catalog = LoadFailure::Venue(VenueLoadError::Catalog {
-                    venue: okx(),
-                    scope: okx_spot().scope,
-                    source: Box::new(MarketParticipantError::Catalog(Box::new(
-                        CatalogError::CatalogNotLoaded { route: okx_spot() },
-                    ))),
-                });
-                // The refusal of a venue the definition table answers no definition for: a row
-                // the menu never draws, but a failure its localization still has to state.
-                let unsupported = LoadFailure::Venue(VenueLoadError::UnsupportedVenue {
-                    venue: VenueId::Longbridge,
-                });
-
-                for failure in [&discovery, &registration, &route_catalog, &unsupported] {
-                    assert!(
-                        !failure.localized_message(cx).is_empty(),
-                        "{failure:?} has no copy in {language}"
-                    );
-                }
-
-                let stale = i18n::t!(
-                    cx,
-                    "error.venue_load.revision_changed",
-                    market = okx().display_string(cx),
-                    scope = scope_display_code(&okx_spot().scope)
-                );
+        for language in [LanguageCode::En, LanguageCode::ZhCn] {
+            let translate = translate_in(language);
+            for key in keys {
                 assert!(
-                    !stale.is_empty(),
-                    "the moved catalog sentence has no copy in {language}"
-                );
-                assert_eq!(
-                    stale_catalog.localized_message(cx),
-                    stale,
-                    "a catalog that moved under its fetch reads as its own sentence in {language}"
-                );
-                assert_ne!(
-                    route_catalog.localized_message(cx),
-                    stale,
-                    "a catalog failure that carries a route is not reported as a moved catalog in \
-                     {language}"
+                    !i18n::t_smol!(translate, key).is_empty(),
+                    "{key} has no copy in {language}"
                 );
             }
-        });
+
+            let discovery = VenueLoadFailure::new(VenueLoadError::Discovery {
+                venue: okx(),
+                source: Box::new(MarketParticipantError::RuntimeUnavailable),
+            });
+            let unverifiable = VenueLoadFailure::new(VenueLoadError::DiscoveryUnverifiable {
+                venue: okx(),
+                dex: SmolStr::new_static("dex-1"),
+            });
+            let limit = VenueLoadFailure::new(VenueLoadError::DiscoveryLimitExceeded {
+                venue: okx(),
+                named: 3,
+                limit: 2,
+            });
+            let registration = VenueLoadFailure::new(VenueLoadError::Registration {
+                venue: okx(),
+                source: Box::new(RegistryError::Descriptor(DescriptorError::DuplicateRoute {
+                    route: okx_spot(),
+                })),
+            });
+            let metadata = VenueLoadFailure::new(VenueLoadError::Metadata {
+                venue: okx(),
+                scope: None,
+                source: Box::new(MarketParticipantError::RuntimeUnavailable),
+            });
+            let route_catalog = VenueLoadFailure::new(VenueLoadError::Catalog {
+                venue: okx(),
+                scope: okx_spot().scope,
+                source: Box::new(MarketParticipantError::Catalog(Box::new(
+                    CatalogError::CatalogNotLoaded { route: okx_spot() },
+                ))),
+            });
+            let revision = VenueLoadFailure::new(VenueLoadError::RevisionChanged {
+                venue: okx(),
+                scope: okx_spot().scope,
+            });
+            let interrupted = VenueLoadFailure::new(VenueLoadError::Interrupted { venue: okx() });
+            let unsupported = VenueLoadFailure::new(VenueLoadError::UnsupportedVenue {
+                venue: VenueId::Longbridge,
+            });
+
+            for failure in [
+                &discovery,
+                &unverifiable,
+                &limit,
+                &registration,
+                &metadata,
+                &route_catalog,
+                &revision,
+                &interrupted,
+                &unsupported,
+            ] {
+                assert!(
+                    !failure.translated_message(&translate).is_empty(),
+                    "{failure:?} has no copy in {language}"
+                );
+            }
+
+            // A catalog that moved under its fetch is reported as its own sentence, and a
+            // catalog failure that carries a route is not reported as a moved catalog.
+            let stale = VenueLoadFailure::new(VenueLoadError::Catalog {
+                venue: okx(),
+                scope: okx_spot().scope,
+                source: Box::new(MarketParticipantError::Catalog(Box::new(
+                    CatalogError::RouteRevisionChanged {
+                        route: okx_spot(),
+                        staged: Box::new(
+                            RouteInputRevision::describe().catalog_descriptor(1).build(),
+                        ),
+                        current: Box::new(
+                            RouteInputRevision::describe().catalog_descriptor(2).build(),
+                        ),
+                    },
+                ))),
+            });
+            let expected = t_smol!(
+                translate,
+                "error.venue_load.revision_changed",
+                market = okx().display_string(&translate),
+                scope = scope_display_code(&okx_spot().scope)
+            );
+            assert_eq!(
+                stale.translated_message(&translate),
+                expected,
+                "a catalog that moved under its fetch reads as its own sentence in {language}"
+            );
+            assert_ne!(
+                route_catalog.translated_message(&translate),
+                expected,
+                "a catalog failure that carries a route is not reported as a moved catalog in \
+                 {language}"
+            );
+        }
     }
 }
