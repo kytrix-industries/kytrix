@@ -118,7 +118,7 @@ use ui_core::{
         signal::SignalScope,
         tree::{NodeKind, NodeTree},
     },
-    test_support::app::TestApp,
+    test_support::{app::TestApp, diagnostics::SignalSlotStats},
     window::{FrameIndex, WindowId},
 };
 
@@ -480,6 +480,21 @@ impl WidgetTestApp {
     #[must_use]
     pub fn frame_requests(&self) -> u64 {
         self.app.app().frame_requests()
+    }
+
+    /// The engine's value-slot table statistics (E21).
+    ///
+    /// A widget's signals and transient values live in its scope, and releasing the
+    /// scope returns them to the free stack for the next mount to reuse. That is what
+    /// makes a leak assertion expressible here: mount and release a widget (or open and
+    /// close a component) many times and neither `slots` nor `live` may grow — a
+    /// signal minted into the root scope instead is never reclaimed, and the `live`
+    /// count after a release is where it shows up.
+    ///
+    /// The read is an engine test probe: it draws nothing and asks for no frame.
+    #[must_use]
+    pub fn signal_slot_stats(&self) -> SignalSlotStats {
+        ui_core::test_support::diagnostics::signal_slot_stats(self.app.app())
     }
 
     /// Whether the last drained round committed pixels.
@@ -1065,6 +1080,41 @@ mod tests {
 
         assert!(harness.router().is_empty());
         harness.drain();
+    }
+
+    /// A mounted widget's values live in its own scope, and releasing it returns them:
+    /// the value-slot table is the leak assertion surface (E21 / W2c-R9). Repeating the
+    /// mount and release must leave neither the allocated slots nor the live count
+    /// growing — an unreclaimed signal shows up in `live`, and a slot table that only
+    /// ever appends shows up in `slots`.
+    #[test]
+    fn releasing_a_widget_reclaims_every_value_slot() {
+        let mut harness = WidgetTestApp::new();
+        let baseline = harness.signal_slot_stats();
+
+        let widget = harness.mount::<WaitingWidget>(());
+        let mounted = harness.signal_slot_stats();
+        assert!(
+            mounted.live > baseline.live,
+            "the mounted widget mints its own values: {mounted:?}"
+        );
+
+        widget.release(harness.app_mut());
+        let released = harness.signal_slot_stats();
+        assert_eq!(
+            released.live, baseline.live,
+            "release returns every value the mounted widget minted: {released:?}"
+        );
+
+        for _ in 0..8 {
+            let widget = harness.mount::<WaitingWidget>(());
+            widget.release(harness.app_mut());
+        }
+        assert_eq!(
+            harness.signal_slot_stats(),
+            released,
+            "eight more mount/release rounds reuse the slots instead of growing the table"
+        );
     }
 
     /// Two widget instances live in one application, each with its own signal scope and

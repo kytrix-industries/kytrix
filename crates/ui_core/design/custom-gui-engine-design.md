@@ -1,7 +1,19 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.11（2026-11-22）
+> **版本**：v2.12（2026-11-22）
+>
+> **v2.12 变更摘要（2026-11-22）**：**P3-1i（W2b/W2c 审查共同缺口：RPC 回复归因）完成**。§13 新增
+> **`WidgetBinding::call` 返回 `RequestId`**（`pub fn call(&mut self, cx, request) -> RequestId`，破坏性变更）与
+> **`Inbound::Rpc` 按精确 id 匹配**写法：`call` 返还的 id 是回复将携带的框架身份（`RpcClient` 新增
+> `reserve_request_id` / `call_with_id`，同一计数器、`call`/`call_with_timeout` 内部预留后提交），widget 用在飞命令表
+> `widget::binding::Pending<C>`（`ahash::HashMap<RequestId, C>`）登记「这条命令」，`sync` 里按 `take(request_id)` 归因；
+> **未知 id = 替换后迟到的答复，丢弃并计数**（`Pending::dropped`），不能落到当前在飞命令上。替换同帧的命令失败不再被吞，
+> 迟到回复不再改错状态。`WidgetTestApp` 新增 `signal_slot_stats() -> SignalSlotStats` 透传（E21 引擎读点），作为 scope
+> 泄漏断言面（W2c-R9）；`AnyWidget` recovery→load 端到端测试补一条（框架 F6）。`crates/widgets/AGENTS.md` §8.2 增
+> 单命令槽 widget 的 `RequestId` 义务（W1 F11 收口）与 §11 测试写法；W 批五处调用点（news / force_order / market_trade /
+> pentagon_pizza_index / financial_calendar）改为精确匹配。契约测试 170 → **177**（+7）。逐条登记
+> `.docs/gui-migration/design-changes.md` §20 与 `.docs/gui-migration/test-ledger/p3-1i.md`。
 >
 > **v2.11 变更摘要（2026-11-22）**：**P3-1h（W2a 审查 F1 High：多 pane 组件 key）完成**。§13 新增
 > **`WidgetCx::unique_key(&self, suffix: &str) -> SmolStr`**：kit 组件的 `key` 是**应用级** Action 身份
@@ -4034,9 +4046,23 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
     pub fn inbox(&self) -> &WidgetInbox<P>;
     pub fn take(&self) -> Vec<Inbound<P>>;
     pub fn client(&self) -> RpcClient<P>;
-    pub fn call(&mut self, cx: &mut WidgetCx<'_>, request: P::Request);  // 替换并 abort 上一次
+    /// 替换并 abort 上一次调用；返回**这条回复将携带的**框架身份（P3-1i）。
+    pub fn call(&mut self, cx: &mut WidgetCx<'_>, request: P::Request) -> RequestId;
     pub fn cancel(&mut self);
     pub async fn shutdown(self) -> RuntimeExit;
+}
+
+/// 一个 binding 的在飞命令表：`ahash::HashMap<RequestId, C>`（P3-1i）。
+pub struct Pending<C>;
+impl<C> Pending<C> {
+    pub fn new() -> Self;
+    /// 登记 `request_id` 是 `command` 的答复；binding abort 掉的上一条命令被遗忘。
+    pub fn track(&mut self, request_id: RequestId, command: C);
+    /// 取出这条答复对应的命令；未知 id（替换后迟到）⇒ `None` 并计数。
+    pub fn take(&mut self, request_id: RequestId) -> Option<C>;
+    pub fn dropped(&self) -> usize;          // 丢弃的迟到/未知答复数
+    pub fn is_empty(&self) -> bool;
+    pub fn clear(&mut self);                 // 主动放弃在飞命令（签出 / 失败）
 }
 
 // ── services.rs ────────────────────────────────────────────────────────────
@@ -4115,6 +4141,7 @@ impl WidgetTestApp {
     pub fn frame_index(&self) -> FrameIndex;                     // 提交游标（0 = 未提交；P3-1g）
     pub fn frame_requests(&self) -> u64;                         // I3 断言面（P3-1g）
     pub fn rendered(&self) -> bool;                              // 最近一轮是否提交像素（P3-1g）
+    pub fn signal_slot_stats(&self) -> SignalSlotStats;          // 值槽位表统计（E21 透传；P3-1i，泄漏断言面）
     pub fn drain_runtime(&mut self);   // services 的 current-thread runtime 推进一个 turn（不 sleep）
     pub fn run_until_idle(&mut self) -> usize;  // runtime turn 与 drain 交替，有界；返回 turn 数
     pub fn report(&mut self, state: WidgetState);
@@ -4261,7 +4288,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1h 实测 **170 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1i 实测 **177 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
     **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
@@ -4313,7 +4340,15 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
     **surface 失败释放 scope**（`a_refused_surface_construction_releases_the_scope_it_minted`；`WidgetTestApp::try_mount_in_scope`）；
     release 后 `header` 安全（`a_released_widget_answers_no_header_controls`）。
   - **binding**：收件箱与 RPC 回投；**替换 `call` 会 abort 旧调用且其回复无收件人**
-    （`replacing_a_call_cancels_the_previous_one` 断言旧请求 `respond` 失败、inbox 只收到新 `RequestId`）；cancel/shutdown。
+    （`replacing_a_call_cancels_the_previous_one` 断言旧请求 `respond` 失败、inbox 只收到新 `RequestId`）。
+  - **RPC 归因与泄漏面**（P3-1i）：`call` 返还的 id 就是回复携带的身份
+    （`binding::a_call_returns_the_identity_its_reply_carries`、`rpc::a_reserved_identity_is_the_one_the_service_and_the_reply_carry`、
+    `rpc::an_internally_numbered_call_continues_the_reserved_sequence`）；在飞命令表按精确 id 归因、未知 id 丢弃并计数、
+    替换后旧 id 变未知、主动 `clear` 不计数（`binding::a_pending_table_matches_identities_and_counts_late_answers` /
+    `tracking_a_replacement_makes_the_replaced_identity_unknown` / `clearing_abandons_the_command_without_counting_it`）；
+    `signal_slot_stats` 泄漏断言（`test_support::releasing_a_widget_reclaims_every_value_slot`：mount/release 8 轮后
+    `slots`/`live` 不增长）；recovery→load 端到端（`any::the_recovery_control_runs_the_widget_load_again`：真实
+    `click_recovery` 派发跑框架的 `ReloadHandle`，widget 第二次 `load` 的状态被画出）。
 
 ### 13.9 残余与需裁决
 
@@ -4332,6 +4367,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-11 | P3-1f 对 P3-1e 冻结面的增量 | `WidgetCx` 改为持有 `&Rc<WidgetServices>`、新增 `services_rc()`（`WidgetCx::new` 的 `services` 形参由 `&WidgetServices` 改为 `&Rc<WidgetServices>`；`AnyWidget` 与 `WidgetTestApp` 本来就持 `Rc`，mount / 测试调用点形状不变），`WidgetTestApp` 增 `services_rc()` 观测面——widget 在 `body` 里构造**拥有服务聚合的宿主**（`SelectorHost`）时取组合根那一个 `Rc`，不重建聚合；静态文案重建通法由 §13.10 冻结；事件过滤应用义务由 §13.11 冻结（引擎面 E21：`App::drain_events_where` + `test_support::diagnostics::signal_slot_stats`，P3-0b2 越界改 `ui_core` 已获 Lead 批准并登记 `ledger.md`）。测试 160 → 161。W 批未开工，不构成迁移负担，登记于 design-changes §17 |
 | R-12 | P3-1g 对 P3-1f 冻结面的增量（测试装置；无引擎面变更） | `WidgetTestApp` 增 `advance(Duration) -> bool`（推进**引擎时钟** + 一轮 `router.tick` + `TestApp::drain`，返回本轮是否提交像素）与观测面 `frame_index()` / `frame_requests()` / `rendered()`。E10 定时器 deadline 只在引擎钟推进后到期：**不读 wall clock、不真实 sleep**；到期回调在帧入口派发、写入参与同一帧；未到期轮是空闲轮（I3：不出帧、不增长帧请求）。`TestApp::advance` 已存在，本批**不改 `ui_core`**；`crates/widgets/**` 也未改——W2c 分支自建的 `ClockHost`（`TestApp` + `WidgetServices::builder` + 假墙钟）在合入后删除、改用本装置；W2b 的倒计时 timer 缺口（`test-ledger/w2-pizza.md` §8：到期 → 回调 → 再武装不可自动化）可据此补测（widget 自己的「现在」仍由测试写那个状态）。测试 161 → 164，登记于 design-changes §18 |
 | R-13 | P3-1h 对 P3-1g 冻结面的增量（纯增量；`WidgetCx::new` 形状不变） | §13.2 新增 `WidgetCx::unique_key(&self, suffix: &str) -> SmolStr`：格式 `"{suffix}@{scope}"`，scope 取上下文**已持有**的 `SignalScope` 下标——不新增 `instance_id` 形参（`WidgetCx::new` 仍 4 参数，W1/W2 已迁移 widget 的测试夹具零返工）；引擎 `new_scope` 只追加 scope 槽、从不回收下标，故同一 App 内实例前缀唯一、release 后也不复用。语义 / 生命周期 / 释放配对见 §13.3，静态块重建的 key 稳定性见 §13.10；硬规则见 `crates/widgets/AGENTS.md` §1-11 / §5 / §9 / §11 / §15.5。`WidgetTestApp` 本身已支持两个 `mount` 实例并存，本批只补契约测试。测试 164 → 170。**残余（不阻断）**：① 已迁移 W1/W2 代码里的常量 / 按 parent 手拼的 kit key 由各自 W 批改为 `unique_key`（登记 AGENTS §15.5，本批不改 `crates/widgets/**`）；② 前缀是 **App 内**实例身份，不得持久化 / 跨进程 / 跨 App 复用（instance id 与 scope 下标都不是稳定业务身份）；③ 同一实例内「同后缀 = 同 key」由调用方保证后缀按控件位置唯一，契约不检测重复后缀。不改 `ui_core`，登记于 design-changes §19 |
+| R-14 | P3-1i 对 P3-1h 冻结面的增量（破坏性：`WidgetBinding::call` 签名） | `WidgetBinding::call` 返回 `RequestId`（`RpcClient` 新增 `reserve_request_id` / `call_with_id`）；§13.2 新增 `widget::binding::Pending<C>` 在飞命令表（`ahash::HashMap<RequestId, C>`）；`WidgetTestApp` 新增 `signal_slot_stats()` 透传（E21 读点，scope 泄漏断言面，W2c-R9）；`AnyWidget` recovery→load 端到端测试（F6）。答复入口按精确 id 归因，未知 id 丢弃并计数（§13.12）。W 批五处调用点（news / force_order / market_trade / pentagon_pizza_index / financial_calendar）同步改为精确匹配；其余已迁移 crate 的 `call` 调用点是语句调用，签名变化零返工。不改 `ui_core` 生产代码。登记于 design-changes §20 |
 
 ### 13.10 静态文案重建通法（kit 未补绑定面之前的冻结写法）
 
@@ -4386,6 +4422,59 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 `the_filter_takes_its_own_text_and_leaves_every_other_event_queued`（文本进输入框、`Resized` 仍可被应用读到）与
 `opening_and_closing_the_dialog_a_hundred_times_reclaims_everything`（`signal_slot_stats`：100 轮开关后槽位 / 存活数 / 节点数
 不增长）。逐条规格见 `.docs/gui-migration/spec-deltas/E21.md`。
+
+### 13.12 RPC 回复归因：`call` 返回 `RequestId` 与在飞命令表（P3-1i）
+
+**问题（W2b/W2c 审查共同缺口）**：`WidgetBinding::call` 替换并 abort 上一次调用，但 id 在异步任务内分配，widget 事前
+看不见。两个命令共用一个 binding 的 pane（refresh / load）只能按「整体 pending 标志」猜答复归属：替换同帧到达的旧
+答复会被当成新命令的答复（旧 refresh 的失败清掉 load 的等待、或把已签出的 pane 报成失败），而 abort 只能挡住**尚未
+入箱**的答复。
+
+**框架面（冻结）**：
+
+- `WidgetBinding::call(cx, request) -> RequestId` 同步返回该请求的框架身份；实现 = `RpcClient::reserve_request_id()`
+  同步预留 + 任务内 `call_with_id(id, request)` 提交（**同一计数器**，`call`/`call_with_timeout` 也先预留再提交，id 不与
+  任何调用路径冲突）。答复（成功 `RpcResponse::request_id` / 失败 `RpcCallError::request_id`）恒等于返还的 id。
+- `Inbound::Rpc { request_id, result }` 原样携带该身份（P3-1 已冻结，不变）。
+- `widget::binding::Pending<C>` 是在飞命令表（`ahash::HashMap<RequestId, C>`，C = widget 自己的命令枚举）：
+  `track(id, cmd)` 登记；`take(id)` 归因，**未知 id ⇒ `None` 并计入 `dropped()`**；`clear()` 主动放弃（签出 / 失败 /
+  等待目录）。**一个 binding 一张表**：binding 的 abort 保证旧 id 永不再答复，`track` 因此遗忘旧条目。
+
+**应用义务（冻结写法）**：
+
+```rust
+// 1) 发令：call 返还的 id 与命令一起登记（替换掉的上一条自动遗忘）。
+let request_id = binding.call(cx, Request::Load(key));
+self.pending.track(request_id, PendingCommand::Load);
+
+// 2) 收令：sync 里 drain 收件箱，按精确 id 归因；没有条目 = 替换后迟到的答复。
+for inbound in binding.take() {
+    match inbound {
+        Inbound::Rpc { request_id, result } => match self.pending.take(request_id) {
+            Some(PendingCommand::Load) => self.apply_load_result(result, cx),
+            Some(PendingCommand::Refresh) => self.apply_refresh_result(result, cx),
+            None => { /* 丢弃（dropped 已 +1）；不得落到当前在飞命令上 */ }
+        },
+        .. => {}
+    }
+}
+```
+
+- **迟到 / 未知 id 一律丢弃并计数**，不得用「比上次大 / 小」或「当前 pending 标志」归因；只有一个命令槽的 widget 也
+  必须这么做（W1 F11：单命令槽不因 abort 而豁免，答复可能已入箱）。
+- 主动放弃命令（签出、失败、回到等待目录）时 `pending.clear()`：之后的答复按迟到计（`dropped` 增长），不判失败。
+- 答复入口仍要挡**终态**（`status.is_failed`）与本 scope 条件（§4.4/AGENTS §4.4）：id 归因与终态守卫是两道独立的门，
+  缺一不可。
+- 迟到答复不是错误，不重试、不重连（AGENTS §4.4/§10）；widget 可以 `log::debug!` 记录，但用户文案不变。
+
+**测试面**：`widget::binding::tests::{a_call_returns_the_identity_its_reply_carries,
+a_pending_table_matches_identities_and_counts_late_answers, tracking_a_replacement_makes_the_replaced_identity_unknown,
+clearing_abandons_the_command_without_counting_it}`；`widget::rpc::tests::{a_reserved_identity_is_the_one_the_service_and_the_reply_carry,
+an_internally_numbered_call_continues_the_reserved_sequence}`；五个 W 批 widget 各自的「答复归因」测试（替换后的答复被
+丢弃、终态不被迟到答复重绘）。**scope 泄漏断言面**：`WidgetTestApp::signal_slot_stats()`（E21 透传）——
+「mount/release 反复 N 轮后 `slots` / `live` 不增长」是组件 / widget 释放的泄漏断言（W2c-R9）；`widget::test_support::tests::
+releasing_a_widget_reclaims_every_value_slot` 是写法样例，`AnyWidget` recovery→load 的端到端测试见
+`widget::any::tests::the_recovery_control_runs_the_widget_load_again`（F6）。
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 
@@ -4582,4 +4671,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.11**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾 + P3-1d 上下文/宿主补缝 + P3-1e 组合根三单例 + P3-1f 服务句柄/静态文案通法 + P3-1g 测试时钟 + P3-1h 每实例组件 key）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.12**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾 + P3-1d 上下文/宿主补缝 + P3-1e 组合根三单例 + P3-1f 服务句柄/静态文案通法 + P3-1g 测试时钟 + P3-1h 每实例组件 key + P3-1i RPC 回复归因）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*

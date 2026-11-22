@@ -92,7 +92,7 @@ use ui_core::{
     window::WindowId,
 };
 use widget::{
-    binding::{Inbound, WidgetBinding},
+    binding::{Inbound, Pending, WidgetBinding},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
@@ -274,12 +274,32 @@ impl Countdown {
     }
 }
 
+/// One command this pane sent and has not seen the answer to.
+///
+/// The pane's two commands share one binding, and the binding replaces (and aborts) the
+/// call before it on every issue — but an answer can already be queued when that
+/// happens. The identity [`WidgetBinding::call`] returned is what says whose answer
+/// arrived: an answer this table does not know belongs to the command it replaced, and
+/// applying it to the command now in flight is exactly the mis-attribution this table
+/// exists to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// The read that starts or restarts the stream: `Load` or `Retry`.
+    Load,
+    /// The read the refresh control brought forward.
+    Refresh,
+    /// The stop of a stream nobody follows any more: its answer is nothing to report.
+    Unload,
+}
+
 /// One pane: the account it follows, the reading it holds, and the countdown to the
 /// next one.
 pub struct PentagonPizzaIndexWidget {
     /// The executor bridge. It is absent on a host that installed no Kytrix service
     /// connection, which is a business failure the pane reports rather than a wait.
     binding: Option<WidgetBinding<PizzaProtocol>>,
+    /// The command in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
     /// The reading the pane is showing, once a round has published one. It is the
@@ -303,18 +323,6 @@ pub struct PentagonPizzaIndexWidget {
     countdown: Rc<Countdown>,
     /// Whether a refresh command this pane sent has not yet been reported on.
     refresh_pending: bool,
-    /// Whether the load this pane sent has not been reported on.
-    ///
-    /// A load that answers after the reader behind it signed out is ignored: its
-    /// answer is about a stream the pane no longer follows, and reporting it would
-    /// turn the pane's waiting state into a failure.
-    load_pending: bool,
-    /// The framework request identity of the last reply this pane consumed.
-    ///
-    /// The engine numbers requests in order and only one command is in flight at a
-    /// time, so a reply that is not newer than this one is an answer the pane has
-    /// already applied: accepting it again would answer the command that replaced it.
-    last_request_id: Option<RequestId>,
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
     /// Click requests from the header control: a button handler owns no `&mut self`,
@@ -524,6 +532,7 @@ impl PentagonPizzaIndexWidget {
 
         Self {
             binding,
+            pending: Pending::new(),
             status,
             recovery,
             reading: None,
@@ -533,8 +542,6 @@ impl PentagonPizzaIndexWidget {
             next_refresh_at: None,
             countdown,
             refresh_pending: false,
-            load_pending: false,
-            last_request_id: None,
             account_id,
             refresh_requests,
             seen_refresh_requests: 0,
@@ -594,7 +601,7 @@ impl PentagonPizzaIndexWidget {
         // The command that was in flight belongs to the generation this call
         // replaces, so its answer is not something to wait for any more.
         self.refresh_pending = false;
-        self.load_pending = false;
+        self.pending.clear();
         let Some(key) = self.current_key() else {
             // There is nothing to read for a reader the service does not know, and
             // nothing has gone wrong, so the pane says what it is waiting for. The
@@ -608,7 +615,8 @@ impl PentagonPizzaIndexWidget {
             // The answer to a stop is nothing the pane reports: it is already
             // waiting for the account that would start the next read.
             if let Some(binding) = self.binding.as_mut() {
-                binding.call(cx, PizzaRequest::Unload);
+                let request_id = binding.call(cx, PizzaRequest::Unload);
+                self.pending.track(request_id, PendingCommand::Unload);
             }
             cx.request_frame()?;
             return Ok(());
@@ -623,8 +631,8 @@ impl PentagonPizzaIndexWidget {
             self.fail(PizzaFetchError::Service(KytrixServiceError::Closed), cx);
             return Ok(());
         };
-        self.load_pending = true;
-        binding.call(cx, PizzaRequest::Load(key));
+        let request_id = binding.call(cx, PizzaRequest::Load(key));
+        self.pending.track(request_id, PendingCommand::Load);
         cx.request_frame()?;
 
         Ok(())
@@ -667,33 +675,28 @@ impl PentagonPizzaIndexWidget {
         }
     }
 
-    /// Applies one RPC reply, once its request identity says it is a new answer.
+    /// Applies one RPC reply, attributed by the identity the binding returned.
     ///
-    /// Only one call is in flight at a time (the binding replaces and aborts the
-    /// previous one), so the pending flags say which command an answer belongs to.
-    /// The identity is the second half of that: a reply that is not newer than the
-    /// last one this pane consumed is an answer it has already applied, and applying
-    /// it again would clear the command that replaced the one it answered.
+    /// The binding replaces and aborts the command before it on every issue, but an
+    /// answer can already be queued when that happens. The table says which command the
+    /// answer belongs to: an identity it does not know answers a command this pane
+    /// replaced, and is dropped and counted instead of being applied to the command now
+    /// in flight (the mis-attribution that used to let a replaced refresh's failure clear
+    /// the load that replaced it).
     fn apply_rpc(
         &mut self,
         request_id: RequestId,
         result: Result<PizzaResponse, RpcCallError<PizzaServiceError>>,
         cx: &mut WidgetCx<'_>,
     ) {
-        if self
-            .last_request_id
-            .is_some_and(|answered| request_id <= answered)
-        {
-            log::debug!(
-                "the Pentagon Pizza Index pane ignored reply {request_id}: it is not newer than the last one it answered"
-            );
-            return;
-        }
-        self.last_request_id = Some(request_id);
-        if self.load_pending {
-            self.apply_load_result(result, cx);
-        } else if self.refresh_pending {
-            self.apply_refresh_result(result, cx);
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Load) => self.apply_load_result(result, cx),
+            Some(PendingCommand::Refresh) => self.apply_refresh_result(result, cx),
+            // The answer to the stop of a stream nobody follows: nothing to report.
+            Some(PendingCommand::Unload) => {}
+            None => log::debug!(
+                "the Pentagon Pizza Index pane ignored reply {request_id}: no command is waiting for it"
+            ),
         }
     }
 
@@ -702,10 +705,11 @@ impl PentagonPizzaIndexWidget {
         result: Result<PizzaResponse, RpcCallError<PizzaServiceError>>,
         cx: &mut WidgetCx<'_>,
     ) {
-        if !self.load_pending {
+        // A failure is terminal: the read's answer may not repaint the failure the user
+        // is reading (AGENTS §4.4).
+        if self.status.is_failed(cx.app()) {
             return;
         }
-        self.load_pending = false;
         if let Err(error) = result {
             let recovery = self.recovery.clone();
             self.status.report(
@@ -720,11 +724,12 @@ impl PentagonPizzaIndexWidget {
         result: Result<PizzaResponse, RpcCallError<PizzaServiceError>>,
         cx: &mut WidgetCx<'_>,
     ) {
-        if !self.refresh_pending {
+        // An accepted command stays pending until the round it started is reported: the
+        // acknowledgement and the round are two different messages. A round already
+        // reported (or a failed pane) leaves the acknowledgement nothing to say.
+        if !self.refresh_pending || self.status.is_failed(cx.app()) {
             return;
         }
-        // An accepted command stays pending until the round it started is reported:
-        // the acknowledgement and the round are two different messages.
         if let Err(error) = result {
             self.refresh_pending = false;
             let recovery = self.recovery.clone();
@@ -849,7 +854,8 @@ impl PentagonPizzaIndexWidget {
         }
         self.refresh_pending = true;
         if let Some(binding) = self.binding.as_mut() {
-            binding.call(cx, PizzaRequest::Refresh);
+            let request_id = binding.call(cx, PizzaRequest::Refresh);
+            self.pending.track(request_id, PendingCommand::Refresh);
         }
         cx.request_frame()?;
 
@@ -1784,7 +1790,8 @@ mod tests {
         sign_out(&mut harness);
         sync(&mut harness, &mut pane);
         harness.with_cx(|cx| {
-            pane.widget.apply_load_result(
+            pane.widget.apply_rpc(
+                RequestId::new(1),
                 Err(RpcCallError::ServiceClosed {
                     request_id: RequestId::new(1),
                 }),
@@ -1796,6 +1803,11 @@ mod tests {
             reported(&pane, &harness),
             WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
             "the load answered for the account that left"
+        );
+        assert_eq!(
+            pane.widget.pending.dropped(),
+            1,
+            "the answer to the replaced load is dropped and counted"
         );
     }
 
@@ -1819,9 +1831,10 @@ mod tests {
         sign_out(&mut harness);
         sync(&mut harness, &mut pane);
         harness.with_cx(|cx| {
-            pane.widget.apply_refresh_result(
+            pane.widget.apply_rpc(
+                RequestId::new(1),
                 Err(RpcCallError::ServiceClosed {
-                    request_id: RequestId::new(2),
+                    request_id: RequestId::new(1),
                 }),
                 cx,
             );
@@ -1831,6 +1844,11 @@ mod tests {
             reported(&pane, &harness),
             WidgetState::waiting(Notice::message("widget.pentagon_pizza_index.logged_out")),
             "the refresh answered for the account that left"
+        );
+        assert_eq!(
+            pane.widget.pending.dropped(),
+            1,
+            "the answer to the replaced refresh is dropped and counted"
         );
     }
 
@@ -2730,7 +2748,7 @@ mod tests {
         sync(&mut harness, &mut pane);
 
         assert!(
-            pane.widget.load_pending,
+            !pane.widget.pending.is_empty(),
             "the replacement's own answer is still waited for"
         );
         assert!(!pane.widget.refresh_pending);
@@ -2744,12 +2762,12 @@ mod tests {
         for _ in 0..64 {
             harness.drain_runtime();
             sync(&mut harness, &mut pane);
-            if !pane.widget.load_pending {
+            if pane.widget.pending.is_empty() {
                 break;
             }
         }
         assert!(
-            !pane.widget.load_pending,
+            pane.widget.pending.is_empty(),
             "the load's own acknowledgement was applied"
         );
     }
@@ -2763,18 +2781,25 @@ mod tests {
         let mut pane = pane(&mut harness);
         frame(&mut harness, &mut pane);
 
-        // The first reply the pane consumes is the acknowledgement of a load.
+        // The first command the pane sends is a load, whose acknowledgement it consumes.
+        harness
+            .with_cx(|cx| pane.widget.start(false, cx))
+            .expect("the load starts");
+        assert!(!pane.widget.pending.is_empty());
         harness.with_cx(|cx| {
             pane.widget
                 .apply_rpc(RequestId::new(1), Ok(PizzaResponse::StreamStarted), cx);
         });
-        assert_eq!(pane.widget.last_request_id, Some(RequestId::new(1)));
+        assert!(
+            pane.widget.pending.is_empty(),
+            "the load's acknowledgement was applied"
+        );
 
         // A command is in flight ...
         harness
             .with_cx(|cx| pane.widget.start(false, cx))
             .expect("the load starts");
-        assert!(pane.widget.load_pending);
+        assert!(!pane.widget.pending.is_empty());
 
         // ... and an answer the pane has already applied cannot be its answer.
         harness.with_cx(|cx| {
@@ -2788,9 +2813,10 @@ mod tests {
         });
 
         assert!(
-            pane.widget.load_pending,
+            !pane.widget.pending.is_empty(),
             "the stale reply did not answer the command in flight"
         );
+        assert_eq!(pane.widget.pending.dropped(), 1);
         assert_eq!(reported(&pane, &harness), WidgetState::Connecting);
     }
 

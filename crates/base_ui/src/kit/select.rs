@@ -24,9 +24,15 @@
 //!   显式 [`SelectOptions::width`] 时面板按该值**精确**宽（旧 `menu_width` 语义，不随内容增长）。
 //!
 //! 标签的视觉与 [`crate::kit::badge`] 的中性色块同源（`SurfaceControl` 底 / `LineBorder` 边 /
-//! `FgDefault` 字 / 4 px 圆角 / 尺寸档高度），但 `Badge` 的文本是**建树期固定**的，而标签文本随
-//! 选中集变化 —— 引擎的节点子树没有「重绑文本」入口，所以标签槽用 `bind_text` + `bind_style`
-//! 复刻同一份配色与几何（等价性由测试守护；建议后续给 `Badge` 加动态文本通道，见 spec-delta）。
+//! `FgDefault` 字 / 4 px 圆角 / 尺寸档高度）。P2-9 起 `Badge` 有 `bind_label` 绑定面，但标签槽
+//! 的选中项下标映射（`chosen[slot]` → `items`）不是单个信号，替换成 Badge 只会把同一段
+//! `bind_text` 挪进 kit（视觉等价已由测试守护）；本批保留现有实现，登记见 ledger。
+//!
+//! # tooltip（P2-9）
+//!
+//! [`Select::tooltip_text`] 保存 hover 说明的文案（W2c-R1 的 kit 能力缺口：旧 `Select` 有
+//! tooltip 参数，引擎化后没有入口）。选择器不自己画浮层 —— kit 的 [`crate::kit::tooltip`] 是
+//! 独立组件、按触发器节点挂载；调用方用 [`Select::tooltip`] 读出文案后自己建 Tooltip。
 //!
 //! # 键盘 / 关闭
 //!
@@ -288,6 +294,8 @@ struct SelectInner {
     chosen: Signal<Vec<usize>>,
     /// 触发器可访问名（显式 label / 选中项文本 / 多选摘要 / 占位文本）。
     a11y_label: Signal<SmolStr>,
+    /// tooltip 文本（P2-9：W2c-R1 的 kit 能力面；hover 浮层由调用方用 `kit::tooltip` 挂）。
+    tooltip: RefCell<Option<SmolStr>>,
     on_change: RefCell<Option<Rc<dyn Fn(&mut App, Vec<SmolStr>)>>>,
     actions: SelectActions,
     state: RefCell<SelectState>,
@@ -368,6 +376,7 @@ impl Select {
             revision: app.signal_scoped(scope, 0u64),
             chosen: app.signal_scoped(scope, Vec::new()),
             a11y_label,
+            tooltip: RefCell::new(None),
             on_change: RefCell::new(None),
             state: RefCell::new(SelectState::default()),
         });
@@ -494,6 +503,22 @@ impl Select {
     pub fn on_change(self, callback: impl Fn(&mut App, Vec<SmolStr>) + 'static) -> Self {
         *self.inner.on_change.borrow_mut() = Some(Rc::new(callback));
         self
+    }
+
+    /// tooltip 文本（hover 提示）。
+    ///
+    /// P2-9 补的 W2c-R1 缺口：旧 `Select` 有 tooltip 参数，引擎化后没有入口，筛选器的 hover
+    /// 说明只能删掉。选择器**不自己画浮层**（kit 的 tooltip 是独立组件、按触发器节点挂载），
+    /// 这里保存文案供调用方读取（[`Select::tooltip`]）；构建前后都可读、`mount` 不消费。
+    pub fn tooltip_text(self, text: impl Into<SmolStr>) -> Self {
+        *self.inner.tooltip.borrow_mut() = Some(text.into());
+        self
+    }
+
+    /// tooltip 文本读回（[`Select::tooltip_text`] 的原值；`None` = 未设置）。
+    #[must_use]
+    pub fn tooltip(&self) -> Option<SmolStr> {
+        self.inner.tooltip.borrow().clone()
     }
 
     /// 禁用 / 启用触发器。
@@ -2162,5 +2187,31 @@ mod tests {
             Some("Alpha +1"),
             "多选触发器给出选中摘要（旧实现完全不可读）"
         );
+    }
+
+    /// **P2-9 / W2c-R1**：`Select::tooltip_text` 保存 hover 说明，`tooltip()` 读回；构建 /
+    /// 挂载都不消费它（调用方据此自己挂 `kit::tooltip`）。
+    ///
+    /// 变异防线：把 `tooltip_text` 改成 no-op ⇒ 本用例红。
+    #[test]
+    fn a_select_keeps_the_tooltip_text_the_caller_supplied() {
+        let mut harness = Harness::new();
+        let select = harness
+            .select(SelectOptions::default())
+            .tooltip_text("Narrow the calendar by importance");
+        assert_eq!(
+            select.tooltip().as_deref(),
+            Some("Narrow the calendar by importance"),
+            "构建前后都可读"
+        );
+        harness.mount(&select, items());
+        assert_eq!(
+            select.tooltip().as_deref(),
+            Some("Narrow the calendar by importance"),
+            "mount 不消费 tooltip 文案"
+        );
+
+        let bare = harness.select(SelectOptions::default());
+        assert_eq!(bare.tooltip(), None, "没有设置时是 None");
     }
 }

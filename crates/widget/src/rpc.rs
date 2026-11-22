@@ -73,11 +73,21 @@ pub struct RpcClient<P: WidgetProtocol> {
 }
 
 impl<P: WidgetProtocol> RpcClient<P> {
+    /// Reserves the identity of the next call this client submits.
+    ///
+    /// A caller that has to attribute the reply before the request is sent reserves
+    /// the identity here and submits the same identity with [`RpcClient::call_with_id`].
+    /// [`RpcClient::call`] and [`RpcClient::call_with_timeout`] reserve internally, so
+    /// every identity on one client's channel comes from this one counter.
+    pub fn reserve_request_id(&self) -> RequestId {
+        RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed))
+    }
+
     pub async fn call(
         &self,
         request: P::Request,
     ) -> Result<RpcResponse<P::Response>, RpcCallError<P::Error>> {
-        self.call_with_timeout(request, self.default_timeout).await
+        self.call_with_id(self.reserve_request_id(), request).await
     }
 
     pub async fn call_with_timeout(
@@ -85,7 +95,31 @@ impl<P: WidgetProtocol> RpcClient<P> {
         request: P::Request,
         timeout: Duration,
     ) -> Result<RpcResponse<P::Response>, RpcCallError<P::Error>> {
-        let request_id = RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed));
+        self.call_with_id_and_timeout(self.reserve_request_id(), request, timeout)
+            .await
+    }
+
+    /// Submits `request` under an identity reserved with [`RpcClient::reserve_request_id`].
+    ///
+    /// The identity must come from this client's counter: it is the identity the
+    /// service sees ([`RpcRequest::request_id`]) and the reply carries
+    /// ([`RpcResponse::request_id`] / [`RpcCallError::request_id`]), which is what lets
+    /// a UI that has not seen the reply yet match it.
+    pub async fn call_with_id(
+        &self,
+        request_id: RequestId,
+        request: P::Request,
+    ) -> Result<RpcResponse<P::Response>, RpcCallError<P::Error>> {
+        self.call_with_id_and_timeout(request_id, request, self.default_timeout)
+            .await
+    }
+
+    async fn call_with_id_and_timeout(
+        &self,
+        request_id: RequestId,
+        request: P::Request,
+        timeout: Duration,
+    ) -> Result<RpcResponse<P::Response>, RpcCallError<P::Error>> {
         let deadline = Instant::now() + timeout;
         let state = Arc::new(CallState::new(request_id, deadline));
         let task = self.runtime.spawn(execute_call::<P>(
@@ -1125,5 +1159,69 @@ mod tests {
             state.take_outcome(),
             Some(CallOutcome::Failure(CallFailure::DeadlineExceeded))
         ));
+    }
+
+    /// The bridge's whole reason for reserving: the identity the caller knows before
+    /// the request is sent is the identity the service sees and the reply carries.
+    #[tokio::test(start_paused = true)]
+    async fn a_reserved_identity_is_the_one_the_service_and_the_reply_carry() {
+        let (client, mut requests) = channel::<TestProtocol>(
+            current_test_handle(),
+            NonZeroUsize::MIN,
+            Duration::from_secs(5),
+        );
+        let request_id = client.reserve_request_id();
+        assert_eq!(request_id, RequestId::new(1), "one counter, from the start");
+
+        let call = tokio::spawn(async move { client.call_with_id(request_id, 7).await });
+        let request = requests
+            .recv()
+            .await
+            .expect("the reserved call reaches the service");
+        assert_eq!(
+            request.request_id(),
+            request_id,
+            "the service answers under the identity the caller reserved"
+        );
+        let (reply, value) = request.into_parts();
+        reply
+            .respond(Ok(value))
+            .expect("the caller is still waiting");
+
+        let response = call
+            .await
+            .expect("the call task finishes")
+            .expect("the service answered");
+        assert_eq!(response.request_id(), request_id);
+        assert_eq!(response.into_value(), 7);
+    }
+
+    /// A call that reserves internally continues the same sequence, so a bridge that
+    /// reserved an identity cannot collide with one the client allocates itself.
+    #[tokio::test(start_paused = true)]
+    async fn an_internally_numbered_call_continues_the_reserved_sequence() {
+        let (client, mut requests) = channel::<TestProtocol>(
+            current_test_handle(),
+            NonZeroUsize::MIN,
+            Duration::from_secs(5),
+        );
+        assert_eq!(client.reserve_request_id(), RequestId::new(1));
+        let mut call = Box::pin(client.call(7));
+        assert!(
+            poll_once(call.as_mut()).is_pending(),
+            "the call submits its request on the first poll"
+        );
+        let request = requests.recv().await.expect("the call reaches the service");
+        assert_eq!(
+            request.request_id(),
+            RequestId::new(2),
+            "the call after a reservation takes the next identity"
+        );
+        let (reply, value) = request.into_parts();
+        reply
+            .respond(Ok(value))
+            .expect("the caller is still waiting");
+        let response = call.await.expect("the call succeeds");
+        assert_eq!(response.into_value(), 7);
     }
 }

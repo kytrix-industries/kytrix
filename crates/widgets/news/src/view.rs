@@ -84,12 +84,13 @@ use ui_core::{
     text::{TextOverflow, TextStyle},
 };
 use widget::{
-    binding::{Inbound, WidgetBinding},
+    binding::{Inbound, Pending, WidgetBinding},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
     error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
     services::WidgetServices,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
@@ -175,12 +176,29 @@ impl TranslatedError for NewsFailure {
     }
 }
 
+/// One command this pane sent and has not seen the answer to.
+///
+/// The binding replaces its one command slot on every call and aborts the call it
+/// replaced, but a reply can already be queued when that happens. The identity the
+/// binding returned is what says whose answer arrived: only a reply tracked here may
+/// steer the pane, and the two commands answer differently — a started read says
+/// whether the service took the account, a stop's answer is nothing the pane reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// A read: `Load` or `Retry`.
+    Start,
+    /// The stop that lets go of the stream an account left behind.
+    Stop,
+}
+
 /// One pane: the feed it holds, and the list that draws it.
 pub struct NewsWidget {
     /// The options the pane persists, which is whether it may be heard.
     config: NewsConfig,
     /// The executor bridge, absent on a host that installed no Kytrix service.
     binding: Option<WidgetBinding<NewsProtocol>>,
+    /// The commands in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
     config_change: WidgetConfigChange,
@@ -331,7 +349,9 @@ impl WidgetView for NewsWidget {
                 Inbound::Latest { key, message } => {
                     self.apply_latest(key, message, cx);
                 }
-                Inbound::Rpc { result, .. } => self.apply_load_result(result, cx),
+                Inbound::Rpc { request_id, result } => {
+                    self.apply_rpc(request_id, result, cx);
+                }
             }
         }
 
@@ -424,6 +444,7 @@ impl NewsWidget {
         Self {
             config,
             binding,
+            pending: Pending::new(),
             status,
             recovery,
             config_change,
@@ -486,7 +507,8 @@ impl NewsWidget {
             // Nothing is followed, so nothing should stay subscribed on this pane's
             // behalf: an account that signed out must not keep a stream it is not using.
             if let Some(binding) = self.binding.as_mut() {
-                binding.call(cx, NewsRequest::Stop);
+                let request_id = binding.call(cx, NewsRequest::Stop);
+                self.pending.track(request_id, PendingCommand::Stop);
             }
             cx.request_frame()?;
             return Ok(());
@@ -505,7 +527,7 @@ impl NewsWidget {
             );
             return Ok(());
         };
-        binding.call(
+        let request_id = binding.call(
             cx,
             if retry {
                 NewsRequest::Retry(scope)
@@ -513,6 +535,7 @@ impl NewsWidget {
                 NewsRequest::Load(scope)
             },
         );
+        self.pending.track(request_id, PendingCommand::Start);
         cx.request_frame()?;
 
         Ok(())
@@ -569,11 +592,42 @@ impl NewsWidget {
         let _ = cx.request_frame();
     }
 
+    /// Applies one RPC reply, once its identity says it answers the command in flight.
+    ///
+    /// The binding replaces its command slot on every call (an account change starts a
+    /// read and signs out with a stop), but a reply can already be queued when that
+    /// happens. Only the identity [`WidgetBinding::call`](widget::binding::WidgetBinding::call)
+    /// returned may steer the pane: a reply this table does not know is a late answer
+    /// to a replaced command, and it is dropped rather than applied to whatever command
+    /// replaced it.
+    fn apply_rpc(
+        &mut self,
+        request_id: RequestId,
+        result: widget::binding::WidgetRpcResult<NewsProtocol>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Start) => self.apply_load_result(result, cx),
+            // The stop lets go of a stream the pane already left; what the service says
+            // about it is nothing the pane reports.
+            Some(PendingCommand::Stop) => {}
+            None => log::debug!(
+                "the news pane ignored reply {request_id}: no command is waiting for it"
+            ),
+        }
+    }
+
     fn apply_load_result(
         &mut self,
         result: widget::binding::WidgetRpcResult<NewsProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        // A failure is terminal (AGENTS §4.4): the read's answer may not repaint the
+        // failure the user is reading, and it is not the reason the pane failed.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
+
         // The answer says the service took the account; what the subscription then
         // reports about itself arrives on the stream, which is where a failure to
         // subscribe is drawn from.
@@ -1740,6 +1794,104 @@ mod tests {
             "a recovery reads again without dropping what was read"
         );
         assert_eq!(snapshot_contents(&pane.widget), ["News 1"]);
+    }
+
+    /// The answer to the read the pane sent is reported: the binding returned the
+    /// identity before the request went out, and the reply carrying it is the one this
+    /// pane is waiting for.
+    #[test]
+    fn the_answer_to_the_read_it_sent_should_be_reported() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let mut pane = pane(&mut harness, FakeSource::default());
+        load(&mut harness, &mut pane);
+
+        harness.with_cx(|cx| {
+            pane.widget.apply_rpc(
+                RequestId::new(1),
+                Err(RpcCallError::ServiceClosed {
+                    request_id: RequestId::new(1),
+                }),
+                cx,
+            );
+        });
+
+        assert!(
+            pane.status.is_failed(harness.app()),
+            "the read's refusal is the pane's failure"
+        );
+        assert!(
+            failure_of(&harness, &pane).contains("service"),
+            "and it is the sentence the typed error states"
+        );
+    }
+
+    /// A read the pane replaced with the stop that signing out sends answers a command
+    /// that is no longer waiting: the reply is dropped and counted, and the waiting
+    /// state the sign-out reported is not repainted as a failure.
+    #[test]
+    fn the_answer_to_a_replaced_command_should_be_dropped() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let mut pane = pane(&mut harness, FakeSource::default());
+        load(&mut harness, &mut pane);
+        sign_out(&mut harness);
+        sync(&mut harness, &mut pane);
+        let waiting = WidgetState::waiting(Notice::message("widget.news.logged_out"));
+        assert_eq!(pane.status.state(harness.app()), waiting);
+
+        harness.with_cx(|cx| {
+            pane.widget.apply_rpc(
+                RequestId::new(1),
+                Err(RpcCallError::ServiceClosed {
+                    request_id: RequestId::new(1),
+                }),
+                cx,
+            );
+        });
+
+        assert_eq!(
+            pane.status.state(harness.app()),
+            waiting,
+            "the answer to the replaced read is not this pane's failure"
+        );
+        assert_eq!(
+            pane.widget.pending.dropped(),
+            1,
+            "the late answer is dropped and counted"
+        );
+    }
+
+    /// A failed pane is terminal: even the reply to the command it was still waiting
+    /// for does not reward a failure sentence with another one.
+    #[test]
+    fn a_failed_pane_should_not_repaint_its_failure_from_a_late_reply() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let mut pane = pane(&mut harness, FakeSource::default());
+        load(&mut harness, &mut pane);
+        report_status(
+            &mut harness,
+            &mut pane,
+            NewsStatus::Failed(NewsStreamError::Transport(TransportError::Closed)),
+        );
+        let failure = failure_of(&harness, &pane);
+
+        harness.with_cx(|cx| {
+            pane.widget.apply_rpc(
+                RequestId::new(1),
+                Err(RpcCallError::ServiceClosed {
+                    request_id: RequestId::new(1),
+                }),
+                cx,
+            );
+        });
+
+        assert_eq!(
+            failure_of(&harness, &pane),
+            failure,
+            "the sentence the user is reading is not rewritten"
+        );
     }
 
     /// The recovery an account without news access is offered is the subscription it is

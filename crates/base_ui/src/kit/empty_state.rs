@@ -13,15 +13,20 @@
 //!
 //! 旧 API 是 `EmptyState::new(ElementId, text)`；新 API 的 `key` 只用于调试 id，文本在
 //! [`EmptyState::text`]。
+//!
+//! 文案有两种形态（[`TextValue`]）：[`EmptyState::text`] 是构建期静态值（旧语义）；
+//! [`EmptyState::bind_text`] 绑定 `Signal<SmolStr>`，写信号即更新文本（语言切换不再需要
+//! 「先摘节点再重建」，P2-9）。
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
+    node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
 };
 
 use crate::{
+    kit::text_value::TextValue,
     style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
@@ -34,7 +39,7 @@ const TEXT_SIZE: f32 = 14.0;
 pub struct EmptyState {
     theme: ThemeHandle,
     key: SmolStr,
-    text: SmolStr,
+    text: TextValue,
 }
 
 impl EmptyState {
@@ -43,14 +48,21 @@ impl EmptyState {
         Self {
             theme,
             key: key.into(),
-            text: SmolStr::default(),
+            text: TextValue::default(),
         }
     }
 
-    /// 说明文字。
+    /// 静态说明文字（构建期固定；语言切换需要由调用方重建节点）。
     #[must_use]
     pub fn text(mut self, text: impl Into<SmolStr>) -> Self {
-        self.text = text.into();
+        self.text = TextValue::Static(text.into());
+        self
+    }
+
+    /// 绑定说明文字：写信号即更新文本，节点不重建（语言切换的绑定面）。
+    #[must_use]
+    pub fn bind_text(mut self, text: Signal<SmolStr>) -> Self {
+        self.text = TextValue::Bound(text);
         self
     }
 
@@ -74,12 +86,16 @@ impl EmptyState {
             .style(style)
             .build(tree, parent)?;
         let theme = self.theme.clone();
-        NodeBuilder::text(self.text.clone(), TextStyle::new(TEXT_SIZE))
-            .bind_style(move |cx: &mut ReadCtx<'_>| StylePatch {
-                foreground: Some(theme.role(cx, Role::FgMuted)),
-                ..StylePatch::default()
-            })
-            .build(tree, root)?;
+        let mut text = NodeBuilder::text(self.text.initial_text(), TextStyle::new(TEXT_SIZE));
+        if self.text.is_bound() {
+            let label = self.text.clone();
+            text = text.bind_text(move |cx| label.read(cx));
+        }
+        text.bind_style(move |cx: &mut ReadCtx<'_>| StylePatch {
+            foreground: Some(theme.role(cx, Role::FgMuted)),
+            ..StylePatch::default()
+        })
+        .build(tree, root)?;
         Ok(root)
     }
 }
@@ -189,5 +205,72 @@ mod tests {
         let record = snapshot.node_for(children[0]).expect("text node in a11y");
         assert_eq!(record.role, ui_core::a11y::A11yRole::Label);
         assert_eq!(record.label_text(), Some("No results"));
+    }
+
+    /// **P2-9 绑定面**：`bind_text(Signal<SmolStr>)` 在语言切换时更新文本，节点与文字叶子
+    /// id 都不变（不重建）。
+    ///
+    /// 变异防线：删掉 `bind_text`（只留初始空串）⇒ 本用例红。
+    #[test]
+    fn a_bound_text_switches_language_without_rebuilding_the_empty_state() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let language = app
+            .app_mut()
+            .signal(smol_str::SmolStr::new_static("暂无数据"));
+        let empty = EmptyState::new(theme, "empty").bind_text(language);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let node = empty
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                root,
+            )
+            .expect("build");
+        let _ = app.drain().expect("frame");
+        let text_node = {
+            let tree = app.app().window(window).expect("window").tree();
+            let children = tree.get(node).expect("node").children();
+            assert_eq!(children.len(), 1);
+            children[0]
+        };
+        assert_eq!(text_of(&app, text_node), "暂无数据");
+        assert_eq!(
+            app.a11y()
+                .expect("a11y")
+                .node_for(text_node)
+                .expect("text a11y")
+                .label_text(),
+            Some("暂无数据")
+        );
+
+        app.app_mut()
+            .write(&language, smol_str::SmolStr::new_static("No data yet"));
+        let _ = app.drain().expect("frame");
+        let tree = app.app().window(window).expect("window").tree();
+        assert_eq!(
+            tree.get(node).expect("node").children().to_vec(),
+            vec![text_node],
+            "语言切换不得重建空态节点或文字叶子"
+        );
+        assert_eq!(text_of(&app, text_node), "No data yet");
+        assert_eq!(
+            app.a11y()
+                .expect("a11y")
+                .node_for(text_node)
+                .expect("text a11y")
+                .label_text(),
+            Some("No data yet")
+        );
+    }
+
+    fn text_of(app: &TestApp, node: NodeId) -> smol_str::SmolStr {
+        let window = app.window_id();
+        let tree = app.app().window(window).expect("window").tree();
+        match tree.get(node).expect("node").kind() {
+            NodeKind::Text(content) => content.text.clone(),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 }
