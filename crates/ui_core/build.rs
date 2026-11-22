@@ -6,13 +6,8 @@
 //! - 只编译本平台：Windows → `dxc`（DXIL）、macOS → `xcrun metal`（metallib）、Linux → `glslangValidator`（SPIR-V）。
 //! - `ui_core_SKIP_SHADERS=1` 或 host ≠ target 时只写**占位产物**（P09 的 `include_bytes!` 仍可解析）。
 //! - Windows 目标额外把**本仓自带**的进程清单（`RT_MANIFEST`，DPI awareness = PerMonitorV2，
-//!   R07-1）编进 `.res` 并链接到每个链接本 crate 的可执行文件 —— 不再依赖 `gpui-pre` 之类
-//!   依赖的资源合并副作用；清单内容与 `1 RT_MANIFEST` 锚点在构建期静态校验。
-//! - **迁移过渡措施**（P5 删除 `gpui-kit` 后连同开关一起删除）：设置
-//!   `KYTRIX_UI_CORE_MANIFEST=0` 时跳过清单的 **rc 编译与链接**（清单存在性、XML/RC
-//!   锚点、MSVC 目标与 rerun 校验照旧），供仍依赖 `gpui-pre`（自带 manifest）的 crate
-//!   在 Windows 上链接测试二进制；见
-//!   `.docs/gui-migration/spec-deltas/build-transition.md`。
+//!   R07-1）编进 `.res` 并链接到每个链接本 crate 的可执行文件 —— 清单归本仓所有，不依赖任何
+//!   外部依赖的资源合并副作用；清单内容与 `1 RT_MANIFEST` 锚点在构建期静态校验。
 
 use std::{
     env, fs,
@@ -170,7 +165,7 @@ const METAL_LIBS: [(&str, &str); 2] = [
 ///
 /// 清单只声明「期望的 awareness」，实际值由 OS / 宿主决定，所以运行期还会再校验一次
 /// （`src/platform/windows/dpi_awareness.rs`）。这里要守的是：清单必须**本仓拥有** ——
-/// 依赖（`gpui-pre` 的默认特性 `windows-manifest`）带进来的清单只是副作用，依赖一换就没了。
+/// 依赖自带的清单只是副作用，依赖一换就没了。
 const MANIFEST_RC: &str = "src/platform/windows/ui_core_manifest.rc";
 const MANIFEST_XML: &str = "src/platform/windows/ui_core.manifest.xml";
 
@@ -181,17 +176,6 @@ const MANIFEST_XML_ANCHORS: [&str; 2] = [">true/pm</dpiAware>", ">PerMonitorV2</
 /// rc 侧锚点：清单必须是 `RT_MANIFEST` 的 **ID 1**（`CREATEPROCESS_MANIFEST_RESOURCE_ID`）。
 /// ID 不对时资源不会生效，但构建仍然成功 —— 所以必须静态校验。
 const MANIFEST_RC_ANCHOR: &str = "1 RT_MANIFEST";
-
-/// 迁移过渡开关：值为 `0` 时跳过清单的 **rc 编译与链接**（其它值/未设置 = 不启用）。
-///
-/// 迁移期 `base_ui` / `widgets/*_ui` 仍依赖 `gpui-pre`，而它的 `gpui.lib` 也带
-/// `RT_MANIFEST` ID 1；同一个 exe 拿到两份清单时 `link.exe` 报
-/// `CVT1100: duplicate resource. type:MANIFEST, name:1`。本开关只影响 `.res` 的
-/// 编译与 `rustc-link-*` 指令；rc/xml 存在性、锚点、MSVC 与 rerun 校验一律照旧。
-///
-/// **迁移过渡措施**：P5 删除 `gpui-kit` / `gpui-pre` 后，连同开关与
-/// `xtask` 的注入规则一起删除（`.docs/gui-migration/spec-deltas/build-transition.md`）。
-const TRANSITION_MANIFEST_ENV: &str = "KYTRIX_UI_CORE_MANIFEST";
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -242,17 +226,12 @@ fn emit_rerun(manifest: &Path, shader_dir: &Path) {
 /// 把本仓自带的进程清单编成 `.res` 并让**最终 exe** 链接它（R07-1）。
 ///
 /// 传播链：`cargo:rustc-link-search` + `cargo:rustc-link-lib` 写进 ui_core 的 rlib 元数据，
-/// 依赖本 crate 的每个可执行文件在链接时都会带上这条 `-l`（`gpui-pre` 的 `gpui.lib` 正是这样
-/// 把它的清单带进 exe 的 —— 本函数把同一机制变成**本仓声明**）。
-///
-/// **迁移过渡措施**：`KYTRIX_UI_CORE_MANIFEST=0` 时跳过清单的 rc 编译与链接（下游 exe 同时
-/// 链接 `gpui-pre` 的 manifest 会 `CVT1100`），但清单存在性 / 锚点校验与 rerun 触发照旧。
-/// P5 删除 `gpui-kit` 后删除该开关（`.docs/gui-migration/spec-deltas/build-transition.md`）。
+/// 依赖本 crate 的每个可执行文件在链接时都会带上这条 `-l` —— 清单因此由**本仓声明**，
+/// 而不是某个依赖的资源合并副作用。
 fn embed_manifest(project: &Path) {
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
     }
-    println!("cargo:rerun-if-env-changed={TRANSITION_MANIFEST_ENV}");
 
     let rc_file = project.join(MANIFEST_RC);
     let xml_file = project.join(MANIFEST_XML);
@@ -285,15 +264,7 @@ fn embed_manifest(project: &Path) {
         );
     }
 
-    // 迁移过渡期：清单本身仍然校验，只是不把它塞进下游 exe（`gpui-pre` 自带一份，
-    // 同时链接就是 CVT1100）。产物只服务于被跳过的链接，故连 rc 编译一起跳过。
-    if env::var(TRANSITION_MANIFEST_ENV).is_ok_and(|value| value == "0") {
-        println!(
-            "cargo:warning=ui_core: 过渡期跳过进程清单链接（KYTRIX_UI_CORE_MANIFEST=0；与 gpui-pre manifest 冲突，P5 后移除）"
-        );
-        return;
-    }
-
+    // 清单本身已通过锚点校验；下面把它编成资源并链进下游 exe。
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let artifact = out_dir.join("ui_core_manifest.lib");
     let rc_tool = find_rc().unwrap_or_else(|| {
@@ -326,8 +297,8 @@ fn embed_manifest(project: &Path) {
     }
 
     // 注意：同一条 `-l` 若被两个清单资源满足，`link.exe` 会以
-    // `CVT1100: duplicate resource. type:MANIFEST, name:1` 硬失败 —— 这正是「不要把清单
-    // 重复塞进同一个 exe」的机器证明（见 `.review` 报告里的 gpui-pre 冲突结论）。
+    // `CVT1100: duplicate resource. type:MANIFEST, name:1` 硬失败 —— 这正是「清单只能有
+    // 一份」的机器证明；本仓清单是唯一来源。
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=dylib=ui_core_manifest");
 }

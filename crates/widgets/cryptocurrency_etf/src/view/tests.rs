@@ -34,14 +34,6 @@ const ACCOUNT: &str = "test-account";
 /// The size the pane's body is laid out in, which is what the chart is measured from.
 const PAGE: (f32, f32) = (640.0, 360.0);
 
-/// The value slots the three header pickers keep after their components are released.
-///
-/// `kit::select` mints a signal scope of its own (`revision` / `chosen` / `a11y_label`)
-/// and its `release` does not hand that scope back yet: three values per picker, three
-/// pickers. It is registered with the kit batch (`test-ledger/w3-etf.md` §10-5), and the
-/// release test below pins the count so the widget's own release surface stays asserted.
-const PICKER_SCOPE_GAP: usize = 3 * 3;
-
 /// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -1182,12 +1174,9 @@ fn releasing_a_pane_should_hand_its_signals_and_components_back() {
         }
     }
 
-    // The header's four controls are kit components. They are released with the pane, and
-    // what stays behind is the kit's registered gap rather than this widget's: `Select`
-    // mints a signal scope its `release` does not hand back yet (three values per picker,
-    // three pickers — registered with the kit batch). Pinning the count is what makes a
-    // release that reclaimed less than this fail here, and it is also the assertion that
-    // goes red the day the kit closes the gap.
+    // The header's four controls are kit components. They are released with the pane,
+    // and their own scopes go with them: `Select::release` hands its signal scope back
+    // (P2-10), so nothing of the pane or of its controls may remain.
     let pane = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
     let group = page(&mut harness);
     pane.header(harness.app_mut(), HeaderGroup::Right, group)
@@ -1196,9 +1185,8 @@ fn releasing_a_pane_should_hand_its_signals_and_components_back() {
     pane.release(harness.app_mut());
     let released = harness.signal_slot_stats().live;
     assert_eq!(
-        released,
-        baseline.live + PICKER_SCOPE_GAP,
-        "the pane releases its components; what remains is the kit's picker scopes ({mounted} while mounted)"
+        released, baseline.live,
+        "the pane releases its components; every value slot it minted is handed back ({mounted} while mounted)"
     );
 }
 

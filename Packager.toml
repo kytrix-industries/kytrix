@@ -54,7 +54,7 @@ preinstallSection = "ManifestDPIAware true"
 # Linux: deb runtime dependencies. Must be a string array: a bare string parses as the
 # path variant of Dependencies, i.e. a dependency-list file.
 [deb]
-depends = ["libxkbcommon0", "libwayland-client0", "libxcb1", "libvulkan1"]
+depends = ["libxkbcommon0", "libwayland-client0", "libvulkan1"]
 section = "utils"
 priority = "optional"
 

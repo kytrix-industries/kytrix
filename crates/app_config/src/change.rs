@@ -12,8 +12,8 @@ use crate::{
 /// The configuration items one publish changed.
 ///
 /// The set is computed once per publish from the previous and next snapshots.
-/// It is deliberately a plain value: the GPUI events and the owner projections
-/// are both derived from it, and it has no dependency on GPUI.
+/// It is deliberately a plain value: the event channel and the owner projections
+/// are both derived from it, and it has no dependency on a UI toolkit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfigChangeSet {
     /// The new appearance, when it changed.

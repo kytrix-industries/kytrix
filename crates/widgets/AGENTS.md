@@ -726,8 +726,7 @@ impl WidgetView for ExampleWidget {
 ## 14. 验收
 
 ```powershell
-# 单个 widget crate（迁移期；链接前置见下）
-$env:KYTRIX_UI_CORE_MANIFEST='0'
+# 单个 widget crate
 cargo +nightly fmt -p <crate> -- --check
 cargo +nightly clippy -p <crate> --all-targets -- -D warnings
 cargo test -p <crate>
@@ -736,14 +735,12 @@ cargo check -p <crate> --all-targets
 # 框架契约层自身
 cargo +nightly fmt -p widget -- --check
 cargo +nightly clippy -p widget --all-targets -- -D warnings
-$env:KYTRIX_UI_CORE_MANIFEST='0'; cargo test -p widget
+cargo test -p widget
 cargo check -p widget --all-targets
-Select-String -Path crates\widget\src\*.rs -Pattern 'gpui'   # 必须 0
 ```
 
-**`KYTRIX_UI_CORE_MANIFEST=0` 是链接期开关**：`ui_core/build.rs` 的进程清单与 `gpui` 自带的 `RT_MANIFEST` 冲突，不带时
-Windows 上稳定 `CVT1100 duplicate resource` + `LNK1123`。P5 删除 gpui 依赖后移除该开关。它是**测试二进制的复跑前提**，
-不是测试失败，也不是可以长期保留的开关。
+测试二进制直接跑，**不需要任何环境变量**：链接期由 `ui_core/build.rs` 把本仓的 PerMonitorV2 进程清单
+（R07-1）编进每个链接 `ui_core` 的 exe；全仓只有这一份清单来源（P5-3 起迁移期的清单过渡开关已删除）。
 
 未执行的在线 RPC、真实窗口与 release profile 验证必须在交付说明里明确写「未执行」；静态检查通过不等于性能已测量。
 
