@@ -6,7 +6,9 @@
 //! - the **settings store** ([`ConfigStore`]) and its published snapshot
 //!   ([`Signal<Config>`]), whose writes go through one seam ([`ConfigHub::edit`]:
 //!   persist the candidate, publish it, then project what changed — the translator's
-//!   language, the engine language signal, the theme's appearance);
+//!   language, the engine language signal, the theme's appearance, and the network
+//!   projections the service connector, the download manager and the market-participants
+//!   connector route with);
 //! - the **translator** ([`Translate`]) and the language signal every drawn node registers
 //!   when its text must follow a language switch;
 //! - the **theme** ([`ThemeHandle`]), resolved at startup from the stored appearance and
@@ -16,32 +18,28 @@
 //!   [`Layer`], [`FrameRouter`] (the single `App::on_frame` owner) and [`AnimationRouter`]
 //!   (the single `App::on_animation_complete` owner);
 //! - the **services aggregate** ([`WidgetServices`]) every widget, page and title-bar
-//!   control is handed, with the two connector slots the frozen contract models as
-//!   `Option` (§13.9 R-1);
-//! - the **widget catalogue** ([`WidgetRegistry`]) a pane mounts a widget through, and the
-//!   **market participants connector** the title bar's venue menu loads through;
-//! - the **settings page seam** ([`SettingsStore`]) whose commit closure is
-//!   [`ConfigHub::edit`], and the **selector host**
-//!   ([`SelectorHost`]) with the translation engine and the catalogue injected.
+//!   control is handed, including the two connector slots (§13.9 R-1);
+//! - the **service connection** ([`KytrixServiceConnector`]) the account control and every
+//!   service-backed widget read, and the **download manager** ([`Downloads`]) the
+//!   translation page and the updater share;
+//! - the **widget catalogue** ([`WidgetRegistry`]) a pane mounts a widget through, the
+//!   **market participants connector** the title bar's venue menu loads through, and the
+//!   **settings page seam** ([`SettingsStore`]) whose commit closure is [`ConfigHub::edit`].
 //!
-//! # Connector gaps (P4-3)
+//! # Signals are one identity each
 //!
-//! Two collaborators the previous toolkit shell installed cannot be constructed without a
-//! toolkit `App` context, so the root leaves their contract slots empty and records the
-//! gap (§13.9 R-1 already models both as `Option`):
+//! The aggregate's `language`, `config` and `catalog_generation` signals are the ones this
+//! root writes and every consumer reads: the builder mints them, and [`ConfigHub`] holds
+//! clones of the same signals. A write through the hub is therefore a write every widget,
+//! page and title-bar control observes — a second signal carrying "the same" value would be
+//! a snapshot nothing follows.
 //!
-//! - [`WidgetServices::kytrix_service`] — `KytrixServiceConnector::install` needs a toolkit
-//!   `App` for its configuration-event bridge; a toolkit-free constructor (runtime +
-//!   [`ConfigNotification`](app_config_provider::notification::ConfigNotification) +
-//!   transport, with the root publishing network snapshots after each commit) is the
-//!   seam the next wiring batch adds;
-//! - the translation download service (`DownloadService`) — `download_provider` is a toolkit
-//!   entity (`Context`, `Task`, `EventEmitter`) and is deleted/replaced by P5-1; the
-//!   settings page therefore opens without a download table.
+//! # Network projections
 //!
-//! Everything else — settings persistence, translation, theme, catalogue, market
-//! participants, selector host, frame ownership — is wired here and is what the shell
-//! draws.
+//! The connector, the download manager and the market-participants connector each route
+//! with a network projection of the settings. Every commit republishes the projections when
+//! the network settings actually moved ([`ConfigNotification::publish`]), so a proxy change
+//! reaches the next session reconfigure / transfer start instead of the next launch.
 //!
 //! [`Signal<Config>`]: ui_core::node::signal::Signal
 
@@ -51,22 +49,40 @@ use std::{
     sync::Arc,
 };
 
-use app_config::settings::{Appearance as StoredAppearance, Config};
-use app_config_provider::store::{ConfigPersistenceError, ConfigRecovery, ConfigStore};
+use app_config::{
+    network::Config as NetworkConfig,
+    settings::{Appearance as StoredAppearance, Config},
+};
+use app_config_provider::{
+    notification::ConfigNotification,
+    store::{ConfigPersistenceError, ConfigRecovery, ConfigStore},
+};
 use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
     theme::{appearance::Appearance, handle::ThemeHandle},
 };
 use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
-use market_participants_connector::connector::{
-    MarketParticipantsConnector, MarketParticipantsConnectorInput,
+use kytrix_service_provider::service::connector::KytrixServiceConnector;
+use market_participants_connector::{
+    connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
+    runtime::MarketParticipantNetworkSnapshot,
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
+use profile_ui::host::ProfileHost;
+use settings_ui::{
+    session::{SettingsStore, SettingsWriteError},
+    translation_downloads::{TranslationDownloads, TranslationDownloadsDeps},
+};
 use ui_core::{app::App, node::signal::Signal};
+use updater_ui::updater::UpdaterDeps;
 use widget::{frame::FrameRouter, services::WidgetServices};
 use widget_registry::{catalogue, registry::WidgetRegistry};
 
-use crate::InitializationError;
+use crate::{
+    InitializationError,
+    account::StoredAccounts,
+    downloads::{Downloads, translation_unload},
+};
 
 /// The settings store, its published snapshot, and everything a commit projects from it.
 ///
@@ -86,6 +102,14 @@ pub(crate) struct ConfigHub {
     language: Signal<LanguageCode>,
     /// The theme service, whose appearance follows the stored one.
     theme: ThemeHandle,
+    /// The network projection the service connector and the download manager route with.
+    ///
+    /// One notification for both: the connector's forwarding task is its single waiter,
+    /// and the download manager only ever reads [`ConfigNotification::current`] when it
+    /// starts an attempt.
+    network: ConfigNotification<NetworkConfig>,
+    /// The market-participants projection the directory connector loads venues under.
+    market: ConfigNotification<MarketParticipantNetworkSnapshot>,
     /// How many writes the seam has committed, for tests and diagnostics.
     commits: Cell<u64>,
 }
@@ -94,6 +118,11 @@ impl ConfigHub {
     /// The translator.
     pub(crate) const fn translate(&self) -> &Translate {
         &self.translate
+    }
+
+    /// The settings snapshot every consumer reads.
+    pub(crate) const fn config_signal(&self) -> Signal<Config> {
+        self.config
     }
 
     /// The number of commits the seam has made.
@@ -161,6 +190,19 @@ impl ConfigHub {
             self.theme
                 .set_appearance(app, appearance_of(candidate.appearance));
         }
+        // The network projections are republished only when the network settings moved: a
+        // language or sidebar write must not reconfigure the service sessions or the
+        // directory connector.
+        let network = candidate.network_config();
+        if previous.network_config() != network {
+            self.network.publish(Arc::new(network));
+            let published = self.market.current();
+            let market = MarketParticipantNetworkSnapshot::from_previous(
+                candidate.clone(),
+                Some(&published),
+            );
+            self.market.publish(Arc::new(market));
+        }
 
         app.write(&self.config, candidate);
         Self::repaint_all(app);
@@ -185,6 +227,32 @@ impl ConfigHub {
         if self.theme.set_appearance(app, reported) {
             Self::repaint_all(app);
         }
+    }
+
+    /// A hub over `store` for a unit test that needs the commit seam without the shell.
+    #[cfg(test)]
+    pub(crate) fn for_test(app: &mut App, store: ConfigStore) -> Rc<Self> {
+        let initial = store.read();
+        let theme = ThemeHandle::new(app, appearance_of(initial.appearance));
+        let translate = crate::test_support::translate(LanguageCode::En);
+        let language = app.signal(LanguageCode::En);
+        let config = app.signal(initial.as_ref().clone());
+        let network: ConfigNotification<NetworkConfig> =
+            ConfigNotification::new(Arc::new(initial.as_ref().network_config()));
+        let market = ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::new(
+            initial.as_ref().clone(),
+        )));
+
+        Rc::new(Self {
+            store: RefCell::new(store),
+            config,
+            translate,
+            language,
+            theme,
+            network,
+            market,
+            commits: Cell::new(0),
+        })
     }
 }
 
@@ -215,6 +283,16 @@ pub(crate) const fn transport_policy() -> TransportPolicy {
     }
 }
 
+/// Which account session the root installs.
+#[derive(Clone, Copy)]
+enum Accounts {
+    /// The real OAuth session (the keyring credential store).
+    Production,
+    /// The signed-out in-memory session a headless host runs over.
+    #[cfg(test)]
+    SignedOut,
+}
+
 /// Everything the shell draws with, assembled once.
 pub(crate) struct Composition {
     /// The settings seam.
@@ -223,7 +301,7 @@ pub(crate) struct Composition {
     pub theme: ThemeHandle,
     /// The translator every page and component is handed.
     pub translate: Translate,
-    /// The engine language signal.
+    /// The engine language signal (the aggregate's own).
     pub language: Signal<LanguageCode>,
     /// The services aggregate every widget, page and title-bar control is handed.
     pub services: Rc<WidgetServices>,
@@ -235,10 +313,16 @@ pub(crate) struct Composition {
     pub catalogue: Rc<WidgetRegistry>,
     /// The market participants root the title bar loads venues through.
     pub market_participants: Option<MarketParticipantsConnector>,
+    /// The service connection every service-backed widget and the account control read.
+    accounts: Arc<KytrixServiceConnector>,
+    /// The process transport the connector, the downloads and the updater share.
+    transport: Arc<TransportHub>,
+    /// The process-wide download manager.
+    downloads: Rc<Downloads>,
+    /// The translation model downloads the settings page draws.
+    translation_downloads: Rc<TranslationDownloads>,
     /// The settings page seam (persist → publish → project).
-    pub settings_store: settings_ui::session::SettingsStore,
-    /// The directory generation the catalogue publishes (0 = nothing published yet).
-    pub catalog_generation: Signal<u64>,
+    pub settings_store: SettingsStore,
 
     /// Whether the settings file had to be replaced at startup.
     pub recovery: Option<ConfigRecovery>,
@@ -251,18 +335,30 @@ impl Composition {
         runtime: tokio::runtime::Handle,
     ) -> Result<Rc<Self>, InitializationError> {
         let (store, recovery) = crate::open_config_store();
-        Self::with_store(app, runtime, store, recovery)
+        Self::build(app, runtime, store, recovery, Accounts::Production)
     }
 
-    /// Builds the application's collaborators over the settings `store`.
+    /// Builds the application over the signed-out in-memory account session.
     ///
-    /// The store is an argument so a headless host can hand in an in-memory one; the
-    /// production entry point opens the on-disk store and hands that in.
-    pub(crate) fn with_store(
+    /// The headless host has no keyring and must not contact the account service; every
+    /// other collaborator is the production one, with an in-memory settings store.
+    #[cfg(test)]
+    pub(crate) fn with_store_for_test(
         app: &mut App,
         runtime: tokio::runtime::Handle,
         store: ConfigStore,
         recovery: Option<ConfigRecovery>,
+    ) -> Result<Rc<Self>, InitializationError> {
+        Self::build(app, runtime, store, recovery, Accounts::SignedOut)
+    }
+
+    /// Builds every collaborator, in dependency order.
+    fn build(
+        app: &mut App,
+        runtime: tokio::runtime::Handle,
+        store: ConfigStore,
+        recovery: Option<ConfigRecovery>,
+        accounts: Accounts,
     ) -> Result<Rc<Self>, InitializationError> {
         let initial = store.read();
         let theme = ThemeHandle::new(app, appearance_of(initial.appearance));
@@ -270,29 +366,37 @@ impl Composition {
             Rc::new(embedded::load()?),
             crate::language::code(initial.language),
         );
-        let language = app.signal(crate::language::code(initial.language));
-        let config = app.signal(initial.as_ref().clone());
-        let catalog_generation = app.signal(0_u64);
 
         let layer = Rc::new(Layer::new());
         let frame_router = Rc::new(FrameRouter::new(app)?);
         let animation_router = Rc::new(AnimationRouter::new());
 
-        let hub = Rc::new(ConfigHub {
-            store: RefCell::new(store),
-            config,
-            translate: translate.clone(),
-            language,
-            theme: theme.clone(),
-            commits: Cell::new(0),
-        });
+        // The process transport is one value: the service connection, the download manager
+        // and the updater all route through it, under the same lifecycle barrier.
+        let transport = Arc::new(TransportHub::new(transport_policy()));
+        let network: ConfigNotification<NetworkConfig> =
+            ConfigNotification::new(Arc::new(initial.as_ref().network_config()));
+        let market_notification = ConfigNotification::new(Arc::new(
+            MarketParticipantNetworkSnapshot::new(initial.as_ref().clone()),
+        ));
+        let service_runtime = widget_tokio_runtime::runtime::Runtime::from_handle(runtime.clone());
 
-        let market_participants = install_market_participants(&runtime, initial.as_ref());
+        let market_participants = install_market_participants(
+            &service_runtime,
+            Arc::clone(&transport),
+            market_notification.clone(),
+        );
+        let accounts = spawn_connector(
+            accounts,
+            &service_runtime,
+            network.clone(),
+            Arc::clone(&transport),
+        )?;
 
         let services = Rc::new(
             WidgetServices::builder(
                 app,
-                runtime,
+                runtime.clone(),
                 translate.clone(),
                 theme.clone(),
                 Rc::clone(&layer),
@@ -304,19 +408,49 @@ impl Composition {
             .catalog_generation(0)
             .reduce_motion(false)
             .market_participants(market_participants.clone())
-            .kytrix_service(None)
+            .kytrix_service(Some((*accounts).clone()))
             .open_url(open_url)
             .sound(no_audio)
             .build(),
         );
 
-        let settings_store = settings_ui::session::SettingsStore::new(app, config, {
+        // The hub publishes the aggregate's own signals: a widget, a page or the account
+        // control that reads one of them must observe this root's writes (see the module
+        // documentation, "Signals are one identity each").
+        let hub = Rc::new(ConfigHub {
+            store: RefCell::new(store),
+            config: services.config,
+            translate: translate.clone(),
+            language: services.language,
+            theme: theme.clone(),
+            network: network.clone(),
+            market: market_notification,
+            commits: Cell::new(0),
+        });
+
+        let settings_store = settings_ui::session::SettingsStore::new(app, services.config, {
             let hub = Rc::clone(&hub);
             move |app, candidate| {
                 hub.edit(app, |settings| *settings = candidate)
-                    .map_err(settings_ui::session::SettingsWriteError::new)
+                    .map_err(SettingsWriteError::new)
             }
         });
+
+        let downloads = Rc::new(Downloads::new(
+            app,
+            Arc::clone(&transport),
+            service_runtime,
+            network,
+        ));
+        let translation_downloads = TranslationDownloads::new(
+            app,
+            TranslationDownloadsDeps {
+                store: settings_store.clone(),
+                downloads: downloads.settings_service(),
+                runtime,
+                unload: translation_unload(),
+            },
+        );
 
         // The local translation engine is proved usable at startup (it is the only thing
         // that would load the model, and this call answers empty content without one). The
@@ -331,15 +465,18 @@ impl Composition {
             hub,
             theme,
             translate,
-            language,
+            language: services.language,
             services,
             layer,
             frame_router,
             animation_router,
             catalogue: Rc::new(catalogue::registry()?),
             market_participants,
+            accounts,
+            transport,
+            downloads,
+            translation_downloads,
             settings_store,
-            catalog_generation,
             recovery,
         }))
     }
@@ -347,6 +484,43 @@ impl Composition {
     /// The services aggregate.
     pub(crate) const fn services(&self) -> &Rc<WidgetServices> {
         &self.services
+    }
+
+    /// The process-wide download manager, for the shell's tests.
+    #[cfg(test)]
+    pub(crate) const fn downloads(&self) -> &Rc<Downloads> {
+        &self.downloads
+    }
+
+    /// The translation model downloads the settings page draws.
+    pub(crate) const fn translation_downloads(&self) -> &Rc<TranslationDownloads> {
+        &self.translation_downloads
+    }
+
+    /// What the updater needs from the root: the process transport and the download
+    /// manager it asks for its payload.
+    pub(crate) fn updater_deps(&self) -> UpdaterDeps {
+        UpdaterDeps::new(
+            Arc::clone(&self.transport),
+            self.downloads.updater_service(),
+        )
+    }
+
+    /// The account control's collaborators.
+    pub(crate) fn profile_host(&self) -> ProfileHost {
+        ProfileHost::new(
+            Rc::clone(&self.services),
+            self.accounts.clone(),
+            Rc::new(StoredAccounts::new(Rc::clone(&self.hub))),
+        )
+    }
+
+    /// Mirrors the download manager's snapshots onto the signal the settings page reads.
+    ///
+    /// Called once per frame by the shell's route: the settings page synchronizes itself
+    /// after this, so a transfer's progress reaches the row that draws it on that frame.
+    pub(crate) fn sync_downloads(&self, app: &mut App) {
+        self.downloads.sync(app);
     }
 
     /// Mirrors the market-participants catalogue generation into its engine signal.
@@ -360,8 +534,8 @@ impl Composition {
             return;
         };
         let published = connector.catalog().generation_id().get();
-        if app.read_with(&self.catalog_generation, |current| *current) != published {
-            app.write(&self.catalog_generation, published);
+        if app.read_with(&self.services.catalog_generation, |current| *current) != published {
+            app.write(&self.services.catalog_generation, published);
         }
     }
 
@@ -378,6 +552,24 @@ impl Composition {
     pub(crate) fn write_sidebar_mode(&self, app: &mut App, mode: app_config::ui::SidebarMode) {
         let _ = self.hub.edit(app, |config| config.ui.sidebar = mode);
     }
+}
+
+/// Connects the application to the account service over this build's session.
+fn spawn_connector(
+    accounts: Accounts,
+    runtime: &widget_tokio_runtime::runtime::Runtime,
+    network: ConfigNotification<NetworkConfig>,
+    transport: Arc<TransportHub>,
+) -> Result<Arc<KytrixServiceConnector>, InitializationError> {
+    let connector = match accounts {
+        Accounts::Production => KytrixServiceConnector::spawn(runtime.clone(), network, transport)?,
+        #[cfg(test)]
+        Accounts::SignedOut => {
+            KytrixServiceConnector::spawn_signed_out(runtime.clone(), network, transport)?
+        }
+    };
+
+    Ok(Arc::new(connector))
 }
 
 /// The prediction-event dialog's translation engine of this build.
@@ -408,23 +600,15 @@ fn prediction_translator(
 ///
 /// The connector is built over the process transport and the market-participants network
 /// projection of the settings, and it starts no work: no venue is loaded at startup, the
-/// user's own load is the only thing that fetches. The projection is a startup snapshot —
-/// the toolkit configuration-event bridge that would republish it on a network-settings write
-/// is the seam this batch is missing (see the module documentation); a proxy change
-/// therefore takes effect on the next start rather than on the next load.
+/// user's own load is the only thing that fetches. The projection is republished after every
+/// commit that changes the network or venue settings (see [`ConfigHub::publish`]).
 fn install_market_participants(
-    runtime: &tokio::runtime::Handle,
-    config: &Config,
+    runtime: &widget_tokio_runtime::runtime::Runtime,
+    transport: Arc<TransportHub>,
+    notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
 ) -> Option<MarketParticipantsConnector> {
-    let transport = Arc::new(TransportHub::new(transport_policy()));
-    let snapshot = Arc::new(
-        market_participants_connector::runtime::MarketParticipantNetworkSnapshot::new(
-            config.clone(),
-        ),
-    );
-    let notification = app_config_provider::notification::ConfigNotification::new(snapshot);
     let input = MarketParticipantsConnectorInput::new(transport, notification).with_runtime(
-        widget_tokio_runtime::runtime::Runtime::from_handle(runtime.clone()),
+        widget_tokio_runtime::runtime::Runtime::from_handle(runtime.handle().clone()),
     );
     match MarketParticipantsConnector::new(input) {
         Ok(connector) => Some(connector),
@@ -473,6 +657,11 @@ fn no_audio(_name: &'static str) -> Option<bytes::Bytes> {
 
 #[cfg(test)]
 mod tests {
+    use app_config::network::{ProxyAuthorizationConfig, ProxyConfig};
+    use app_config_provider::store::ConfigStore;
+    use smol_str::SmolStr;
+    use ui_core::test_support::app::TestApp;
+
     use super::*;
 
     /// The stored appearance preference resolves to a palette, and `System` starts in the
@@ -494,37 +683,62 @@ mod tests {
     /// leaves the published snapshot exactly as it was.
     #[test]
     fn a_refused_write_should_leave_the_snapshot_alone() {
-        let mut app = ui_core::test_support::app::TestApp::new();
-        let app = app.app_mut();
-        let (store, _) = (
-            ConfigStore::in_memory(Config::default()),
-            None::<ConfigRecovery>,
-        );
-        let snapshot = store.read();
-        let theme = ThemeHandle::new(app, Appearance::Dark);
-        let translate = Translate::new(
-            Rc::new(embedded::load().expect("embedded")),
-            LanguageCode::En,
-        );
-        let language = app.signal(LanguageCode::En);
-        let config = app.signal(snapshot.as_ref().clone());
-        let hub = ConfigHub {
-            store: RefCell::new(store),
-            config,
-            translate,
-            language,
-            theme,
-            commits: Cell::new(0),
-        };
+        let mut app = TestApp::new();
+        let hub = ConfigHub::for_test(app.app_mut(), ConfigStore::in_memory(Config::default()));
 
-        hub.edit(app, |config| config.appearance = StoredAppearance::Light)
-            .expect("an in-memory store stores every write");
+        hub.edit(app.app_mut(), |config| {
+            config.appearance = StoredAppearance::Light;
+        })
+        .expect("an in-memory store stores every write");
 
         assert_eq!(hub.commits(), 1);
         assert_eq!(
-            app.read_with(&config, |config| config.appearance),
+            app.app()
+                .read_with(&hub.config_signal(), |config| config.appearance),
             StoredAppearance::Light
         );
-        assert_eq!(hub.theme.current(app), Appearance::Light);
+        assert_eq!(hub.theme.current(app.app()), Appearance::Light);
+    }
+
+    /// A commit that moves the network settings republishes the projection the connector
+    /// and the download manager route with; a commit that moves nothing else does not.
+    #[test]
+    fn a_network_write_should_republish_the_routes() {
+        let mut app = TestApp::new();
+        let hub = ConfigHub::for_test(app.app_mut(), ConfigStore::in_memory(Config::default()));
+        let before = hub.network.current();
+
+        hub.edit(app.app_mut(), |config| {
+            config.language = app_config::settings::Language::En;
+        })
+        .expect("an in-memory store stores every write");
+        assert!(
+            Arc::ptr_eq(&before, &hub.network.current()),
+            "a language write says nothing about the network"
+        );
+
+        hub.edit(app.app_mut(), |config| {
+            config.proxies.insert(
+                SmolStr::new_static("p4-5"),
+                ProxyConfig {
+                    addr: SmolStr::new_static("127.0.0.1"),
+                    port: 9,
+                    authorization: ProxyAuthorizationConfig::None,
+                    resolve_dns_at_remote: false,
+                },
+            );
+        })
+        .expect("an in-memory store stores every write");
+        assert!(
+            !Arc::ptr_eq(&before, &hub.network.current()),
+            "a network write republishes the projection"
+        );
+        assert!(
+            hub.network
+                .current()
+                .proxies
+                .contains_key(&SmolStr::new_static("p4-5")),
+            "the published projection is the settings the store now holds"
+        );
     }
 }

@@ -1,45 +1,61 @@
-//! The download manager entity: the tasks it owns, the states they settle in,
-//! and the events that publish them.
+//! The download manager: the tasks it owns, the states they settle in, and the
+//! events that publish them.
 //!
-//! A task is one transfer, started on the application runtime and reported back
-//! to this entity by two interface tasks — one publishing the progress it writes
-//! once an interval, one for the outcome — which the entry holds for as long as
-//! the attempt lasts. Pausing cancels the attempt and settles at the partial file
-//! once it has stopped; deleting cancels it too, and only removes the files once
-//! both tasks have finished.
+//! A task is one transfer, started on the application runtime and reported back to
+//! this value from two runtime tasks — one publishing the progress it writes once an
+//! interval, one for the outcome. Pausing cancels the attempt and settles at the
+//! partial file once it has stopped; deleting cancels it too, and only removes the
+//! files once both tasks have finished.
+//!
+//! # Engine shape (P4-5)
+//!
+//! The manager is a plain value, not a toolkit entity: it holds its state behind a
+//! lock and hands every change to one injected sink ([`DownloadProvider::subscribe`]),
+//! because the engine has no entity system and the composition root is what knows how
+//! to wake the interface (the updater's inbox, the settings page's signal). The work
+//! itself runs on the application runtime the composition root passes in, and the
+//! only other collaborator is the transport the transfers route through.
 
 use std::{
     io,
     path::Path,
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    sync::{Arc, Mutex, PoisonError, Weak},
+    time::{Duration, Instant},
 };
 
 use ahash::AHashMap;
 use app_config::network::Config;
 use app_config_provider::notification::ConfigNotification;
-use gpui_kit::{BackgroundExecutor, Context, EventEmitter, Task};
 use network::transport::hub::TransportHub;
+use tokio::{
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use tokio_util::sync::CancellationToken;
 use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
     error::{DownloadError, DownloadFailure},
     fetch::{self, Validator},
-    global::DownloadProviderDeps,
     progress::{Progress, Snapshot},
     request::DownloadRequest,
     task::{DownloadEvent, DownloadId, DownloadStatus, DownloadTask},
 };
 
 /// How often a transfer's progress is published.
-const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
-/// How often a delete task checks whether the work it waits for has stopped.
-const DELETE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a delete waits for the cancelled attempt to settle.
 const ATTEMPT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a delete waits for its file removal to finish.
 const FILE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the download manager needs from the composition root.
+pub struct DownloadProviderDeps {
+    /// The application's transport: the routes, the clients and the operation barrier.
+    pub transport: Arc<TransportHub>,
+    /// The application runtime every transfer runs on.
+    pub runtime: Runtime,
+}
 
 /// One download as the manager holds it.
 struct Entry {
@@ -60,9 +76,9 @@ struct Entry {
     fresh: bool,
     /// The transfer in flight, or the last one when nothing is running.
     ///
-    /// The tasks are what keep the attempt running: a dropped interface task is
-    /// a cancelled one, so the entry owns them until the next attempt replaces
-    /// them or a delete moves them into its own task.
+    /// The tasks are what keep the attempt running: an aborted interface task is a
+    /// cancelled one, so the entry owns them until the next attempt replaces them
+    /// or a delete moves them into its own task.
     attempt: Option<Attempt>,
 }
 
@@ -71,105 +87,136 @@ struct Attempt {
     cancellation: CancellationToken,
     /// What this transfer has written, as the publishing task reads it.
     progress: Arc<Progress>,
-    tasks: Vec<Task<()>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+/// The state one manager serialises every operation against.
+struct State {
+    entries: AHashMap<DownloadId, Entry>,
+    /// The insertion order [`DownloadProvider::tasks`] answers in.
+    order: Vec<DownloadId>,
+    /// The one observer every task event is delivered to.
+    sink: Option<Arc<dyn Fn(DownloadEvent) + Send + Sync>>,
 }
 
 /// The download manager: every task in this process, and their states.
+///
+/// Cheap to clone by `Rc`/`Arc` as the composition root does: every method takes
+/// `&self` and the state is behind the manager's own lock.
 pub struct DownloadProvider {
+    inner: Arc<Inner>,
+}
+
+/// The shared body of one manager.
+struct Inner {
     transport: Arc<TransportHub>,
     runtime: Runtime,
     config: ConfigNotification<Config>,
-    entries: AHashMap<DownloadId, Entry>,
-    /// The insertion order `tasks` answers in.
-    order: Vec<DownloadId>,
+    state: Mutex<State>,
     /// The delete tasks that have not finished yet.
     ///
     /// A delete task belongs here rather than in the entry it deletes: the task
-    /// is what removes that entry, so holding it in the entry would drop it —
-    /// and cancel it — while it is doing the removing. A finished task is
-    /// dropped when the next delete starts, so a long session does not keep one
-    /// task per delete it ever ran.
-    delete_tasks: Vec<Task<()>>,
+    /// is what removes that entry, so holding it in the entry would drop it while
+    /// it is doing the removing. A finished task is dropped when the next delete
+    /// starts, so a long session does not keep one task per delete it ever ran.
+    delete_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-impl EventEmitter<DownloadEvent> for DownloadProvider {}
+/// Keeps a [`DownloadProvider::subscribe`] registration alive.
+///
+/// Dropping it unsubscribes: the updater releases its subscription when it is
+/// itself released, so a closed window stops receiving download events.
+pub struct DownloadSubscription {
+    inner: Weak<Inner>,
+    sink: Option<Arc<dyn Fn(DownloadEvent) + Send + Sync>>,
+}
+
+impl DownloadSubscription {
+    /// A handle for a manager that has no subscription to withdraw (tests, or a host
+    /// that only reads snapshots).
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            inner: Weak::new(),
+            sink: None,
+        }
+    }
+}
+
+impl Drop for DownloadSubscription {
+    fn drop(&mut self) {
+        let Some(sink) = self.sink.take() else {
+            return;
+        };
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state
+            .sink
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &sink))
+        {
+            state.sink = None;
+        }
+    }
+}
+
+impl std::fmt::Debug for DownloadProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DownloadProvider")
+            .field("tasks", &self.tasks().len())
+            .finish()
+    }
+}
 
 impl DownloadProvider {
     /// The manager over the composition root's dependencies.
-    pub(crate) fn new(deps: DownloadProviderDeps, config: ConfigNotification<Config>) -> Self {
+    ///
+    /// `config` is the network projection every transfer routes with; the composition
+    /// root publishes a new one after each settings commit
+    /// ([`ConfigNotification::publish`]), so a route change reaches the transfers
+    /// started after it.
+    #[must_use]
+    pub fn new(deps: DownloadProviderDeps, config: ConfigNotification<Config>) -> Self {
         Self {
-            transport: deps.transport,
-            runtime: deps.runtime,
-            config,
-            entries: AHashMap::with_capacity(4),
-            order: Vec::with_capacity(4),
-            delete_tasks: Vec::new(),
+            inner: Arc::new(Inner {
+                transport: deps.transport,
+                runtime: deps.runtime,
+                config,
+                state: Mutex::new(State {
+                    entries: AHashMap::with_capacity(4),
+                    order: Vec::with_capacity(4),
+                    sink: None,
+                }),
+                delete_tasks: Mutex::new(Vec::new()),
+            }),
         }
     }
 
-    /// Adds a download and starts it immediately.
+    /// Adds a download under `id` and starts it immediately.
     ///
-    /// A new task never continues a partial file: its first attempt starts from
-    /// zero and truncates any `.part` it finds, so bytes that no attempt of this
-    /// task wrote cannot be stitched onto the download. The partial file is the
-    /// resume point of this task's own pause and resume only.
-    ///
-    /// The same holds for a resume before the first attempt has opened the partial
-    /// file: the transfer announces that opening only once it has created or
-    /// truncated the file, so until then a resume starts from zero too, and
-    /// pausing before the file was ever opened cannot inherit bytes this task did
-    /// not write.
-    ///
-    /// The destination is not validated here: a destination with no file name
-    /// fails its first attempt with [`DownloadFailure::InvalidDestination`] rather
-    /// than panicking the caller.
-    pub fn add(&mut self, request: DownloadRequest, cx: &mut Context<Self>) -> DownloadId {
-        let id = DownloadId::new();
-        let status = DownloadStatus::Downloading {
-            downloaded: 0,
-            total: request.expected_size,
-            mb_per_second: 0.0,
-        };
-        self.entries.insert(
-            id,
-            Entry {
-                request,
-                status,
-                validator: Arc::new(Mutex::new(None)),
-                fresh: true,
-                attempt: None,
-            },
-        );
-        self.order.push(id);
-        self.start_attempt(id, true, cx);
-        self.publish(id, cx);
-
-        id
+    /// The identity is the caller's: the page that draws the row and the updater
+    /// that reads the payload both mint it before they add the task, so what they
+    /// hold and what the manager publishes cannot disagree.
+    pub fn add(&self, id: DownloadId, request: DownloadRequest) {
+        self.inner.add(id, request);
     }
 
     /// Every task, in the order the caller added them.
     ///
     /// A task stays here after it completes or fails; only [`Self::delete`]
     /// removes it.
+    #[must_use]
     pub fn tasks(&self) -> Vec<DownloadTask> {
-        let mut tasks = Vec::with_capacity(self.order.len());
-        for id in &self.order {
-            if let Some(task) = self.task(*id) {
-                tasks.push(task);
-            }
-        }
-
-        tasks
+        self.inner.tasks()
     }
 
     /// The task `id` names, when it is still held.
+    #[must_use]
     pub fn task(&self, id: DownloadId) -> Option<DownloadTask> {
-        self.entries.get(&id).map(|entry| DownloadTask {
-            id,
-            url: entry.request.url.clone(),
-            destination: entry.request.destination.clone(),
-            status: entry.status.clone(),
-        })
+        self.inner.task(id)
     }
 
     /// Stops a transfer that is in flight, keeping its partial file for a resume.
@@ -177,30 +224,11 @@ impl DownloadProvider {
     /// The task is `Pausing` until the transfer has stopped and settled as
     /// [`DownloadStatus::Paused`]. Any other state refuses the pause, because
     /// there is nothing running that could be stopped.
-    pub fn pause(&mut self, id: DownloadId, cx: &mut Context<Self>) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        let (downloaded, total) = match &entry.status {
-            DownloadStatus::Downloading {
-                downloaded, total, ..
-            } => (*downloaded, *total),
-            _ => return false,
-        };
-        if let Some(attempt) = &entry.attempt {
-            // The attempt stays owned: cancelling only asks it to stop, and its
-            // outcome task is what settles the state as `Paused`.
-            attempt.cancellation.cancel();
-            entry.status = DownloadStatus::Pausing { downloaded, total };
-        } else {
-            entry.status = DownloadStatus::Paused { downloaded, total };
-        }
-        self.publish(id, cx);
-
-        true
+    pub fn pause(&self, id: DownloadId) -> bool {
+        self.inner.pause(id)
     }
 
-    /// Starts a transfer again from its partial file.
+    /// Starts a transfer again from the partial file it left.
     ///
     /// Accepted from `Paused` and from `Failed`: a failed transfer is retried the
     /// same way a paused one is continued, from the bytes the partial file holds.
@@ -209,30 +237,8 @@ impl DownloadProvider {
     /// no attempt of it ever got as far as opening the partial file, so a resume
     /// keeps the fresh transfer's guarantee rather than continuing a file this
     /// task did not write.
-    pub fn resume(&mut self, id: DownloadId, cx: &mut Context<Self>) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        let total = match &entry.status {
-            DownloadStatus::Paused { total, .. } => *total,
-            DownloadStatus::Failed { .. } => entry.request.expected_size,
-            _ => return false,
-        };
-        let fresh = entry.fresh;
-        let downloaded = if fresh {
-            0
-        } else {
-            part_length(&entry.request.destination)
-        };
-        entry.status = DownloadStatus::Downloading {
-            downloaded,
-            total,
-            mb_per_second: 0.0,
-        };
-        self.start_attempt(id, fresh, cx);
-        self.publish(id, cx);
-
-        true
+    pub fn resume(&self, id: DownloadId) -> bool {
+        self.inner.resume(id)
     }
 
     /// Removes a task and the files it owns.
@@ -240,27 +246,178 @@ impl DownloadProvider {
     /// A running transfer is cancelled first, and its files are only removed once
     /// the attempt has stopped writing them. Deleting the same task twice is
     /// refused while the first delete is still in flight.
-    pub fn delete(&mut self, id: DownloadId, cx: &mut Context<Self>) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        if matches!(entry.status, DownloadStatus::Deleting) {
-            return false;
-        }
-        entry.status = DownloadStatus::Deleting;
-        let request = entry.request.clone();
-        let attempt = entry.attempt.take();
-        if let Some(attempt) = &attempt {
-            attempt.cancellation.cancel();
-        }
-        self.publish(id, cx);
+    pub fn delete(&self, id: DownloadId) -> bool {
+        self.inner.delete(id)
+    }
 
+    /// Registers the one sink every task event is delivered to.
+    ///
+    /// An implementation replaces the previous sink rather than adding a second one,
+    /// because the application has exactly one observer: the updater either owns the
+    /// event stream or does not exist. The settings page reads snapshots
+    /// ([`Self::tasks`]) instead.
+    pub fn subscribe(
+        &self,
+        sink: Arc<dyn Fn(DownloadEvent) + Send + Sync>,
+    ) -> DownloadSubscription {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.sink = Some(Arc::clone(&sink));
+        drop(state);
+
+        DownloadSubscription {
+            inner: Arc::downgrade(&self.inner),
+            sink: Some(sink),
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.sink = None;
+        for entry in state.entries.values() {
+            if let Some(attempt) = &entry.attempt {
+                attempt.cancellation.cancel();
+            }
+        }
+    }
+}
+
+impl Inner {
+    /// Adds one task and starts it; the caller's identity names it.
+    fn add(self: &Arc<Self>, id: DownloadId, request: DownloadRequest) {
+        let status = DownloadStatus::Downloading {
+            downloaded: 0,
+            total: request.expected_size,
+            mb_per_second: 0.0,
+        };
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.entries.insert(
+                id,
+                Entry {
+                    request,
+                    status,
+                    validator: Arc::new(Mutex::new(None)),
+                    fresh: true,
+                    attempt: None,
+                },
+            );
+            state.order.push(id);
+        }
+        self.start_attempt(id, true);
+        self.publish(id);
+    }
+
+    /// Every task snapshot, in the order the caller added them.
+    fn tasks(&self) -> Vec<DownloadTask> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tasks = Vec::with_capacity(state.order.len());
+        for id in &state.order {
+            if let Some(entry) = state.entries.get(id) {
+                tasks.push(task_snapshot(*id, entry));
+            }
+        }
+
+        tasks
+    }
+
+    /// The snapshot `id` names, when it is still held.
+    fn task(&self, id: DownloadId) -> Option<DownloadTask> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.entries.get(&id).map(|entry| task_snapshot(id, entry))
+    }
+
+    /// Stops a running transfer at its partial file.
+    fn pause(&self, id: DownloadId) -> bool {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return false;
+            };
+            let (downloaded, total) = match &entry.status {
+                DownloadStatus::Downloading {
+                    downloaded, total, ..
+                } => (*downloaded, *total),
+                _ => return false,
+            };
+            match &entry.attempt {
+                Some(attempt) => {
+                    // The attempt stays owned: cancelling only asks it to stop, and
+                    // its outcome task is what settles the state as `Paused`.
+                    attempt.cancellation.cancel();
+                    entry.status = DownloadStatus::Pausing { downloaded, total };
+                }
+                None => entry.status = DownloadStatus::Paused { downloaded, total },
+            }
+        }
+        self.publish(id);
+
+        true
+    }
+
+    /// Starts another attempt at a paused or failed task.
+    fn resume(self: &Arc<Self>, id: DownloadId) -> bool {
+        let fresh = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return false;
+            };
+            let total = match &entry.status {
+                DownloadStatus::Paused { total, .. } => *total,
+                DownloadStatus::Failed { .. } => entry.request.expected_size,
+                _ => return false,
+            };
+            let fresh = entry.fresh;
+            let downloaded = if fresh {
+                0
+            } else {
+                part_length(&entry.request.destination)
+            };
+            entry.status = DownloadStatus::Downloading {
+                downloaded,
+                total,
+                mb_per_second: 0.0,
+            };
+            fresh
+        };
+        self.start_attempt(id, fresh);
+        self.publish(id);
+
+        true
+    }
+
+    /// Cancels the task's attempt and removes it with its files.
+    fn delete(self: &Arc<Self>, id: DownloadId) -> bool {
+        let (request, pending) = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return false;
+            };
+            if matches!(entry.status, DownloadStatus::Deleting) {
+                return false;
+            }
+            entry.status = DownloadStatus::Deleting;
+            let attempt = entry.attempt.take();
+            if let Some(attempt) = &attempt {
+                attempt.cancellation.cancel();
+            }
+            (
+                entry.request.clone(),
+                attempt.map(|attempt| attempt.tasks).unwrap_or_default(),
+            )
+        };
+        self.publish(id);
+
+        let inner = Arc::downgrade(self);
         let runtime = self.runtime.clone();
-        let pending = attempt.map(|attempt| attempt.tasks).unwrap_or_default();
-        let delete = cx.spawn(async move |provider, cx| {
-            let clock = cx.background_executor().clone();
-            let outcome = if wait_for_attempts(pending, &clock).await {
-                remove_download_files(&runtime, &request.destination, &clock).await
+        let delete = self.runtime.run(async move {
+            let outcome = if wait_for_attempts(pending).await {
+                remove_download_files(&runtime, &request.destination).await
             } else {
                 log::warn!(
                     "the download to {:?} did not stop before its files were deleted",
@@ -276,11 +433,17 @@ impl DownloadProvider {
                     request.destination,
                 );
             }
-            let _ = provider.update(cx, |provider, cx| provider.finish_delete(id, outcome, cx));
+            if let Some(inner) = inner.upgrade() {
+                inner.finish_delete(id, outcome);
+            }
         });
+        let mut delete_tasks = self
+            .delete_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Only a delete that is still running needs its task held.
-        self.delete_tasks.retain(|task| !task.is_ready());
-        self.delete_tasks.push(delete);
+        delete_tasks.retain(|task| !task.is_finished());
+        delete_tasks.push(delete);
 
         true
     }
@@ -289,32 +452,50 @@ impl DownloadProvider {
     ///
     /// `fresh` is what the transfer does with an existing partial file: a new
     /// task's first attempt truncates it, while a resumed task continues it.
-    fn start_attempt(&mut self, id: DownloadId, fresh: bool, cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.get(&id) else {
-            return;
+    fn start_attempt(self: &Arc<Self>, id: DownloadId, fresh: bool) {
+        let attempt = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return;
+            };
+            let DownloadStatus::Downloading {
+                downloaded: starting_from,
+                ..
+            } = &entry.status
+            else {
+                return;
+            };
+            let starting_from = *starting_from;
+            // A replaced attempt must stop writing: its files belong to this new one.
+            if let Some(previous) = entry.attempt.take() {
+                previous.cancellation.cancel();
+                for task in &previous.tasks {
+                    task.abort();
+                }
+            }
+            let cancellation = self.transport.cancellation().child_token();
+            let progress = Arc::new(Progress::default());
+            entry.attempt = Some(Attempt {
+                cancellation: cancellation.clone(),
+                progress: Arc::clone(&progress),
+                tasks: Vec::with_capacity(2),
+            });
+            (
+                entry.request.clone(),
+                Arc::clone(&entry.validator),
+                starting_from,
+                cancellation,
+                progress,
+            )
         };
-        let DownloadStatus::Downloading {
-            downloaded: starting_from,
-            ..
-        } = &entry.status
-        else {
-            return;
-        };
-        let starting_from = *starting_from;
-        let request = entry.request.clone();
-        let validator = Arc::clone(&entry.validator);
+        let (request, validator, starting_from, cancellation, progress) = attempt;
+
         let transport = Arc::clone(&self.transport);
         let config = self.config.current();
-        let runtime = self.runtime.clone();
-        let resolving = runtime.clone();
-        let cancellation = self.transport.cancellation().child_token();
-        let download_cancellation = cancellation.clone();
-        let publishing_cancellation = cancellation.clone();
-        let progress = Arc::new(Progress::default());
+        let resolving = self.runtime.clone();
+        let transfer_cancellation = cancellation.clone();
         let transfer_progress = Arc::clone(&progress);
-        let publishing_progress = Arc::clone(&progress);
-
-        let downloading = runtime.run(async move {
+        let downloading = self.runtime.run(async move {
             fetch::download(
                 &transport,
                 &config,
@@ -322,175 +503,235 @@ impl DownloadProvider {
                 &request,
                 fresh,
                 validator,
-                &download_cancellation,
+                &transfer_cancellation,
                 &transfer_progress,
             )
             .await
         });
-        let publishing = cx.spawn(async move |provider, cx| {
-            let clock = cx.background_executor().clone();
-            let mut sampled_at = clock.now();
+
+        let publishing_inner = Arc::downgrade(self);
+        let publishing_cancellation = cancellation;
+        let publishing_progress = Arc::clone(&progress);
+        let publishing = self.runtime.run(async move {
+            let mut sampled_at = Instant::now();
             let mut sampled = starting_from;
             loop {
                 tokio::select! {
                     biased;
                     () = publishing_cancellation.cancelled() => return,
-                    () = clock.timer(PUBLISH_INTERVAL) => {}
+                    () = sleep(PUBLISH_INTERVAL) => {}
                 }
                 let snapshot = publishing_progress.snapshot();
-                let now = clock.now();
+                let now = Instant::now();
                 let interval = now.saturating_duration_since(sampled_at);
                 let rate = snapshot.megabytes_per_second_since(sampled, interval);
                 sampled_at = now;
                 sampled = snapshot.written();
-                let running = provider
-                    .update(cx, |provider, cx| {
-                        provider.publish_progress(id, snapshot, rate, cx)
-                    })
-                    .unwrap_or(false);
-                if !running {
+                let Some(inner) = publishing_inner.upgrade() else {
+                    return;
+                };
+                if !inner.publish_progress(id, snapshot, rate) {
                     return;
                 }
             }
         });
-        let outcome_task = cx.spawn(async move |provider, cx| {
+
+        let outcome_inner = Arc::downgrade(self);
+        let outcome = self.runtime.run(async move {
             let result = match downloading.await {
                 Ok(result) => result,
                 Err(error) => Err(DownloadError::Task(error)),
             };
-            let _ = provider.update(cx, |provider, cx| provider.finish_attempt(id, result, cx));
+            if let Some(inner) = outcome_inner.upgrade() {
+                inner.finish_attempt(id, result);
+            }
         });
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.attempt = Some(Attempt {
-                cancellation,
-                progress,
-                tasks: vec![publishing, outcome_task],
-            });
+
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(attempt) = state
+            .entries
+            .get_mut(&id)
+            .and_then(|entry| entry.attempt.as_mut())
+        {
+            attempt.tasks = vec![publishing, outcome];
         }
     }
 
     /// Publishes what a transfer has written since the last interval and the rate
     /// it wrote at; `false` once the task is no longer downloading, which is what
     /// ends the task that publishes.
-    fn publish_progress(
-        &mut self,
-        id: DownloadId,
-        snapshot: Snapshot,
-        rate: f32,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return false;
-        };
-        let DownloadStatus::Downloading {
-            downloaded,
-            total,
-            mb_per_second,
-        } = &mut entry.status
-        else {
-            return false;
-        };
-        // A number below the last one is a server that answered `200` after a
-        // range request, which restarts the file at zero; it is progress, not a
-        // stale report.
-        *downloaded = snapshot.written();
-        // The caller's expected size is not news a response can take back: only a
-        // size the transfer named replaces it.
-        if let Some(named) = snapshot.total() {
-            *total = Some(named);
+    fn publish_progress(&self, id: DownloadId, snapshot: Snapshot, rate: f32) -> bool {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return false;
+            };
+            let DownloadStatus::Downloading {
+                downloaded,
+                total,
+                mb_per_second,
+            } = &mut entry.status
+            else {
+                return false;
+            };
+            // A number below the last one is a server that answered `200` after a
+            // range request, which restarts the file at zero; it is progress, not a
+            // stale report.
+            *downloaded = snapshot.written();
+            // The caller's expected size is not news a response can take back: only a
+            // size the transfer named replaces it.
+            if let Some(named) = snapshot.total() {
+                *total = Some(named);
+            }
+            *mb_per_second = rate;
         }
-        *mb_per_second = rate;
-        self.publish(id, cx);
+        self.publish(id);
 
         true
     }
 
     /// Applies what an attempt produced: the final size, a cancellation that the
     /// pause asked for, or a failure.
-    fn finish_attempt(
-        &mut self,
-        id: DownloadId,
-        result: Result<u64, DownloadError>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(entry) = self.entries.get_mut(&id) else {
-            return;
-        };
-        // A delete cancelled this attempt; the delete task owns the files and the
-        // state from here on, so the outcome only has to stop being a download.
-        if matches!(entry.status, DownloadStatus::Deleting) {
-            return;
-        }
-        // The transfer opened the partial file, so from here on the bytes on disk
-        // are this task's own resume point, whichever outcome it stopped with.
-        if entry
-            .attempt
-            .as_ref()
-            .is_some_and(|attempt| attempt.progress.snapshot().opened())
+    fn finish_attempt(&self, id: DownloadId, result: Result<u64, DownloadError>) {
         {
-            entry.fresh = false;
-        }
-        entry.status = match result {
-            Ok(total) => DownloadStatus::Completed {
-                downloaded: total,
-                total,
-            },
-            Err(error) => match &entry.status {
-                DownloadStatus::Pausing { total, .. } => DownloadStatus::Paused {
-                    // A task that never opened its partial file has nothing to
-                    // resume; the next attempt truncates the file and starts from
-                    // zero, so the paused state announces that same starting point
-                    // instead of the length of a file this task never wrote.
-                    downloaded: if entry.fresh {
-                        0
-                    } else {
-                        part_length(&entry.request.destination)
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return;
+            };
+            // A delete cancelled this attempt; the delete task owns the files and the
+            // state from here on, so the outcome only has to stop being a download.
+            if matches!(entry.status, DownloadStatus::Deleting) {
+                return;
+            }
+            // The transfer opened the partial file, so from here on the bytes on disk
+            // are this task's own resume point, whichever outcome it stopped with.
+            if entry
+                .attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.progress.snapshot().opened())
+            {
+                entry.fresh = false;
+            }
+            entry.status = match result {
+                Ok(total) => DownloadStatus::Completed {
+                    downloaded: total,
+                    total,
+                },
+                Err(error) => match &entry.status {
+                    DownloadStatus::Pausing { total, .. } => DownloadStatus::Paused {
+                        // A task that never opened its partial file has nothing to
+                        // resume; the next attempt truncates the file and starts from
+                        // zero, so the paused state announces that same starting point
+                        // instead of the length of a file this task never wrote.
+                        downloaded: if entry.fresh {
+                            0
+                        } else {
+                            part_length(&entry.request.destination)
+                        },
+                        total: *total,
                     },
-                    total: *total,
+                    _ => DownloadStatus::Failed {
+                        failure: error.failure(),
+                    },
                 },
-                _ => DownloadStatus::Failed {
-                    failure: error.failure(),
-                },
-            },
-        };
-        self.publish(id, cx);
+            };
+        }
+        self.publish(id);
     }
 
     /// Applies what a delete produced: a removed task, or a failure the user can
     /// retry the delete from.
-    fn finish_delete(
-        &mut self,
-        id: DownloadId,
-        result: Result<(), DownloadFailure>,
-        cx: &mut Context<Self>,
-    ) {
+    fn finish_delete(&self, id: DownloadId, result: Result<(), DownloadFailure>) {
         if let Err(failure) = result {
-            if let Some(entry) = self.entries.get_mut(&id) {
-                entry.status = DownloadStatus::Failed { failure };
+            {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(entry) = state.entries.get_mut(&id) {
+                    entry.status = DownloadStatus::Failed { failure };
+                }
             }
-            self.publish(id, cx);
+            self.publish(id);
             return;
         }
-        self.entries.remove(&id);
-        self.order.retain(|other| *other != id);
-        cx.emit(DownloadEvent::TaskRemoved(id));
-        cx.notify();
+        let removed = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let removed = state.entries.remove(&id).is_some();
+            state.order.retain(|other| *other != id);
+            removed
+        };
+        if removed {
+            self.emit(DownloadEvent::TaskRemoved(id));
+        }
     }
 
     /// Publishes the snapshot observers react to.
-    fn publish(&mut self, id: DownloadId, cx: &mut Context<Self>) {
-        let Some(task) = self.task(id) else {
-            return;
-        };
-        cx.emit(DownloadEvent::TaskUpdated(task));
-        cx.notify();
+    fn publish(&self, id: DownloadId) {
+        if let Some(task) = self.task(id) {
+            self.emit(DownloadEvent::TaskUpdated(task));
+        }
     }
 
-    /// The network projection this manager routes with, for a test that installs
-    /// it without a composition root.
+    /// Delivers one event to the registered sink, if there is one.
+    fn emit(&self, event: DownloadEvent) {
+        let sink = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.sink.clone()
+        };
+        if let Some(sink) = sink {
+            sink(event);
+        }
+    }
+
+    /// Puts one entry in the manager without starting a transfer (the state-machine
+    /// tests drive [`Self::finish_attempt`] over one).
     #[cfg(test)]
-    pub(crate) fn config_for_test(&self) -> &ConfigNotification<Config> {
-        &self.config
+    fn insert_pausing_for_test(
+        &self,
+        id: DownloadId,
+        request: DownloadRequest,
+        fresh: bool,
+        opened: bool,
+    ) {
+        let progress = Progress::default();
+        if opened {
+            progress.opened_at(part_length(&request.destination), None);
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.entries.insert(
+            id,
+            Entry {
+                request,
+                status: DownloadStatus::Pausing {
+                    downloaded: 0,
+                    total: None,
+                },
+                validator: Arc::new(Mutex::new(None)),
+                fresh,
+                attempt: Some(Attempt {
+                    cancellation: CancellationToken::new(),
+                    progress: Arc::new(progress),
+                    tasks: Vec::new(),
+                }),
+            },
+        );
+        state.order.push(id);
+    }
+
+    /// Whether the entry still says its next attempt starts from zero (the
+    /// state-machine tests read the flag the outcome writes).
+    #[cfg(test)]
+    fn fresh_for_test(&self, id: DownloadId) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.entries.get(&id).is_some_and(|entry| entry.fresh)
+    }
+}
+
+/// The snapshot one entry is drawn from.
+fn task_snapshot(id: DownloadId, entry: &Entry) -> DownloadTask {
+    DownloadTask {
+        id,
+        url: entry.request.url.clone(),
+        destination: entry.request.destination.clone(),
+        status: entry.status.clone(),
     }
 }
 
@@ -503,18 +744,16 @@ fn part_length(destination: &Path) -> u64 {
 
 /// Waits for a cancelled attempt's tasks to finish.
 ///
-/// The interface clock is what this task may be woken by, and the deadline is
-/// what keeps an attempt that never stops from pinning the task in `Deleting`.
-async fn wait_for_attempts(pending: Vec<Task<()>>, clock: &BackgroundExecutor) -> bool {
-    let deadline = clock.now() + ATTEMPT_STOP_TIMEOUT;
-    while !pending.iter().all(Task::is_ready) {
-        if clock.now() >= deadline {
-            return false;
+/// The deadline is what keeps an attempt that never stops from pinning the task in
+/// `Deleting`.
+async fn wait_for_attempts(pending: Vec<JoinHandle<()>>) -> bool {
+    let joined = async move {
+        for task in pending {
+            let _ = task.await;
         }
-        clock.timer(DELETE_POLL_INTERVAL).await;
-    }
+    };
 
-    true
+    timeout(ATTEMPT_STOP_TIMEOUT, joined).await.is_ok()
 }
 
 /// Removes the partial file and the destination a task owns.
@@ -526,15 +765,12 @@ async fn wait_for_attempts(pending: Vec<Task<()>>, clock: &BackgroundExecutor) -
 async fn remove_download_files(
     runtime: &Runtime,
     destination: &Path,
-    clock: &BackgroundExecutor,
 ) -> Result<(), DownloadFailure> {
     let Some(part) = crate::partial::path(destination) else {
         return Ok(());
     };
     let files = vec![part, destination.to_path_buf()];
-    let completion: Arc<Mutex<Option<Option<io::ErrorKind>>>> = Arc::new(Mutex::new(None));
-    let worker_completion = Arc::clone(&completion);
-    drop(runtime.blocking(move || {
+    let removal = runtime.blocking(move || {
         let mut failure = None;
         for path in &files {
             if let Err(error) = std::fs::remove_file(path)
@@ -544,35 +780,23 @@ async fn remove_download_files(
                 failure = Some(error.kind());
             }
         }
-        *worker_completion
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(failure);
-    }));
+        failure
+    });
 
-    // Poll the completion rather than awaiting the blocking handle: the result is
-    // delivered from a worker thread, and the interface executor is what this
-    // task may be woken by.
-    let deadline = clock.now() + FILE_REMOVAL_TIMEOUT;
-    loop {
-        if let Some(failure) = completion
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            return match failure {
-                Some(kind) => Err(DownloadFailure::Io { kind }),
-                None => Ok(()),
-            };
+    match timeout(FILE_REMOVAL_TIMEOUT, removal).await {
+        Ok(Ok(Some(kind))) => Err(DownloadFailure::Io { kind }),
+        Ok(Ok(None)) => Ok(()),
+        Ok(Err(error)) => {
+            log::warn!("the download's files could not be removed: {error}");
+            Err(DownloadFailure::Io {
+                kind: io::ErrorKind::Other,
+            })
         }
-        if clock.now() >= deadline {
-            return Err(DownloadFailure::Io {
-                kind: io::ErrorKind::TimedOut,
-            });
-        }
-        clock.timer(DELETE_POLL_INTERVAL).await;
+        Err(_) => Err(DownloadFailure::Io {
+            kind: io::ErrorKind::TimedOut,
+        }),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -588,7 +812,6 @@ mod tests {
 
     use app_config::network::{Config, RouteTarget, ServiceTarget};
     use app_config_provider::notification::ConfigNotification;
-    use gpui_kit::{AppContext as _, Entity, TestAppContext};
     use hyper::{
         Request, Response, StatusCode,
         body::{Body, Bytes, Frame, Incoming, SizeHint},
@@ -603,16 +826,13 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::{net::TcpListener, time::Sleep};
-    use tokio_util::sync::CancellationToken;
     use url::Url;
     use uuid::Uuid;
     use widget_tokio_runtime::runtime::Runtime;
 
-    use super::{Attempt, DownloadProvider, Entry, PUBLISH_INTERVAL};
+    use super::{DownloadProvider, DownloadProviderDeps};
     use crate::{
-        error::{DownloadError, DownloadFailure},
-        global::DownloadProviderDeps,
-        progress::Progress,
+        error::DownloadFailure,
         request::DownloadRequest,
         task::{DownloadEvent, DownloadId, DownloadStatus},
     };
@@ -921,146 +1141,115 @@ mod tests {
     }
 
     /// The provider over a plaintext transport, without a composition root.
-    fn provider(cx: &mut TestAppContext) -> Entity<DownloadProvider> {
-        // The transfers report back from the runtime's threads, which the
-        // deterministic scheduler would otherwise refuse as non-determinism.
-        // This test drives real HTTP, so it parks like an integration harness.
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            cx.new(|_| {
-                DownloadProvider::new(
-                    DownloadProviderDeps {
-                        transport: Arc::new(TransportHub::new(TransportPolicy {
-                            allow_plaintext: true,
-                            extra_root_certificates: Vec::new(),
-                        })),
-                        runtime: Runtime::for_test(),
-                    },
-                    ConfigNotification::new(Arc::new(Config::default())),
-                )
-            })
-        })
+    fn provider() -> DownloadProvider {
+        DownloadProvider::new(
+            DownloadProviderDeps {
+                transport: Arc::new(TransportHub::new(TransportPolicy {
+                    allow_plaintext: true,
+                    extra_root_certificates: Vec::new(),
+                })),
+                runtime: Runtime::for_test(),
+            },
+            ConfigNotification::new(Arc::new(Config::default())),
+        )
     }
 
-    /// Subscribes `provider`'s events into a log the test asserts on.
-    fn events(
-        cx: &mut TestAppContext,
-        provider: &Entity<DownloadProvider>,
-    ) -> Arc<Mutex<Vec<DownloadEvent>>> {
-        let recorded: Arc<Mutex<Vec<DownloadEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&recorded);
-        cx.update(|cx| {
-            cx.subscribe(provider, move |_, event: &DownloadEvent, _| {
-                sink.lock()
-                    .expect("the event log is never poisoned")
-                    .push(event.clone());
-            })
-            .detach();
-        });
-
-        recorded
+    /// The event log one test subscribes the provider to.
+    struct EventLog {
+        recorded: Arc<Mutex<Vec<DownloadEvent>>>,
+        /// Kept alive for the test: dropping it unsubscribes.
+        _subscription: super::DownloadSubscription,
     }
 
-    fn recorded(events: &Arc<Mutex<Vec<DownloadEvent>>>) -> Vec<DownloadEvent> {
-        events
-            .lock()
-            .expect("the event log is never poisoned")
-            .clone()
-    }
+    impl EventLog {
+        fn recorded(&self) -> Vec<DownloadEvent> {
+            self.recorded
+                .lock()
+                .expect("the event log is never poisoned")
+                .clone()
+        }
 
-    /// The statuses the log holds for `id`, in the order they were published.
-    fn published(events: &Arc<Mutex<Vec<DownloadEvent>>>, id: DownloadId) -> Vec<DownloadStatus> {
-        recorded(events)
-            .into_iter()
-            .filter_map(|event| match event {
-                DownloadEvent::TaskUpdated(task) if task.id == id => Some(task.status),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// An attempt whose transfer had recorded `progress` when it stopped.
-    fn attempt(progress: Progress) -> Attempt {
-        Attempt {
-            cancellation: CancellationToken::new(),
-            progress: Arc::new(progress),
-            tasks: Vec::new(),
+        /// The statuses the log holds for `id`, in the order they were published.
+        fn published(&self, id: DownloadId) -> Vec<DownloadStatus> {
+            self.recorded()
+                .into_iter()
+                .filter_map(|event| match event {
+                    DownloadEvent::TaskUpdated(task) if task.id == id => Some(task.status),
+                    _ => None,
+                })
+                .collect()
         }
     }
 
-    fn status(
-        cx: &TestAppContext,
-        provider: &Entity<DownloadProvider>,
-        id: DownloadId,
-    ) -> Option<DownloadStatus> {
-        cx.update(|cx| provider.read(cx).task(id).map(|task| task.status))
+    /// Subscribes `provider`'s events into a log the test asserts on.
+    fn events(provider: &DownloadProvider) -> EventLog {
+        let recorded: Arc<Mutex<Vec<DownloadEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let subscription = provider.subscribe(Arc::new(move |event: DownloadEvent| {
+            sink.lock()
+                .expect("the event log is never poisoned")
+                .push(event);
+        }));
+
+        EventLog {
+            recorded,
+            _subscription: subscription,
+        }
     }
 
-    fn add(
-        cx: &mut TestAppContext,
-        provider: &Entity<DownloadProvider>,
-        request: DownloadRequest,
-    ) -> DownloadId {
-        cx.update(|cx| provider.update(cx, |provider, cx| provider.add(request, cx)))
+    fn status(provider: &DownloadProvider, id: DownloadId) -> Option<DownloadStatus> {
+        provider.task(id).map(|task| task.status)
     }
 
-    fn pause(cx: &mut TestAppContext, provider: &Entity<DownloadProvider>, id: DownloadId) -> bool {
-        cx.update(|cx| provider.update(cx, |provider, cx| provider.pause(id, cx)))
+    fn add(provider: &DownloadProvider, request: DownloadRequest) -> DownloadId {
+        let id = DownloadId::new();
+        provider.add(id, request);
+        id
     }
 
-    fn resume(
-        cx: &mut TestAppContext,
-        provider: &Entity<DownloadProvider>,
-        id: DownloadId,
-    ) -> bool {
-        cx.update(|cx| provider.update(cx, |provider, cx| provider.resume(id, cx)))
+    fn pause(provider: &DownloadProvider, id: DownloadId) -> bool {
+        provider.pause(id)
     }
 
-    fn delete(
-        cx: &mut TestAppContext,
-        provider: &Entity<DownloadProvider>,
-        id: DownloadId,
-    ) -> bool {
-        cx.update(|cx| provider.update(cx, |provider, cx| provider.delete(id, cx)))
+    fn resume(provider: &DownloadProvider, id: DownloadId) -> bool {
+        provider.resume(id)
     }
 
-    /// Polls `condition` on the interface executor until it holds, with real time
-    /// passing so the transfer it observes can make progress.
-    fn wait_until(
-        cx: &mut TestAppContext,
-        what: &str,
-        mut condition: impl FnMut(&mut TestAppContext) -> bool,
-    ) {
+    fn delete(provider: &DownloadProvider, id: DownloadId) -> bool {
+        provider.delete(id)
+    }
+
+    /// Polls `condition` until it holds, with real time passing so the transfer it
+    /// observes can make progress.
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + WAIT_LIMIT;
         loop {
-            if condition(cx) {
+            if condition() {
                 return;
             }
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            cx.executor().advance_clock(Duration::from_millis(20));
-            cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
-    #[gpui_kit::test]
-    fn adding_a_download_should_create_a_unique_task_and_publish_it(cx: &mut TestAppContext) {
+    /// The starting state is published under the caller's identity, and every added
+    /// task gets an identity of its own.
+    #[test]
+    fn adding_a_download_should_create_a_unique_task_and_publish_it() {
         let payload = payload(192 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
-        let provider = provider(cx);
-        let events = events(cx, &provider);
+        let provider = provider();
+        let events = events(&provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let first_destination = directory.path().join("first.bin");
         let second_destination = directory.path().join("second.bin");
         let expected = Some(payload.len() as u64);
 
         let first = add(
-            cx,
             &provider,
             request(address, "/payload", &first_destination, expected),
         );
         let second = add(
-            cx,
             &provider,
             request(address, "/payload", &second_destination, expected),
         );
@@ -1075,15 +1264,13 @@ mod tests {
             second.as_uuid(),
         );
 
-        let tasks = cx.update(|cx| provider.read(cx).tasks());
+        let tasks = provider.tasks();
         assert_eq!(
             tasks.iter().map(|task| task.id).collect::<Vec<_>>(),
             [first, second],
             "tasks answer in the order the caller added them",
         );
-        let task = cx
-            .update(|cx| provider.read(cx).task(first))
-            .expect("the added task is held");
+        let task = provider.task(first).expect("the added task is held");
         assert_eq!(task.id, first);
         assert_eq!(task.destination, first_destination);
         assert_eq!(task.url, url(address, "/payload"));
@@ -1096,7 +1283,7 @@ mod tests {
             },
         );
 
-        let published = recorded(&events);
+        let published = events.recorded();
         let added = published
             .iter()
             .find_map(|event| match event {
@@ -1115,51 +1302,49 @@ mod tests {
     }
 
     /// A destination that could not name a file is a failed task, never a panic.
-    #[gpui_kit::test]
-    fn a_destination_without_a_file_name_should_fail_instead_of_panicking(cx: &mut TestAppContext) {
-        let provider = provider(cx);
+    #[test]
+    fn a_destination_without_a_file_name_should_fail_instead_of_panicking() {
+        let provider = provider();
         let unreachable = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
         let id = add(
-            cx,
             &provider,
             request(unreachable, "/payload", Path::new(""), None),
         );
 
-        wait_until(cx, "the invalid destination to fail", |cx| {
+        wait_until("the invalid destination to fail", || {
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Failed {
                     failure: DownloadFailure::InvalidDestination,
                 })
             )
         });
         assert!(
-            delete(cx, &provider, id),
+            delete(&provider, id),
             "a task that never had a file can still be removed",
         );
-        wait_until(cx, "the invalid task to be removed", |cx| {
-            cx.update(|cx| provider.read(cx).tasks().is_empty())
+        wait_until("the invalid task to be removed", || {
+            provider.tasks().is_empty()
         });
     }
 
-    #[gpui_kit::test]
-    fn a_download_should_reach_its_destination_and_remove_the_part(cx: &mut TestAppContext) {
+    #[test]
+    fn a_download_should_reach_its_destination_and_remove_the_part() {
         let payload = payload(128 * 1024);
         let address = spawn_server(Arc::new(Server::whole(payload.clone())));
-        let provider = provider(cx);
-        let events = events(cx, &provider);
+        let provider = provider();
+        let events = events(&provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let part = directory.path().join("model.bin.part");
         let expected = payload.len() as u64;
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(expected)),
         );
-        wait_until(cx, "the download to complete", |cx| {
-            status(cx, &provider, id)
+        wait_until("the download to complete", || {
+            status(&provider, id)
                 == Some(DownloadStatus::Completed {
                     downloaded: expected,
                     total: expected,
@@ -1172,14 +1357,7 @@ mod tests {
         );
         assert!(!part.exists(), "the partial file is renamed into place");
 
-        let published = recorded(&events);
-        let statuses = published
-            .iter()
-            .filter_map(|event| match event {
-                DownloadEvent::TaskUpdated(task) if task.id == id => Some(task.status.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let statuses = events.published(id);
         assert!(
             matches!(statuses.first(), Some(DownloadStatus::Downloading { .. })),
             "the task is published as downloading when it is added: {statuses:?}",
@@ -1194,35 +1372,34 @@ mod tests {
         );
     }
 
-    #[gpui_kit::test]
-    fn pausing_a_download_should_keep_the_part_and_resuming_should_ask_for_it(
-        cx: &mut TestAppContext,
-    ) {
+    #[test]
+    fn pausing_a_download_should_keep_the_part_and_resuming_should_ask_for_it() {
         // Big enough that the transfer is still running when the first interval
         // publishes what it has written.
-        let payload = payload(512 * 1024);
+        // Long enough that the transfer is still running when the interval publishes
+        // the first progress the test waits for.
+        let payload = payload(2 * 1024 * 1024);
         let server = Arc::new(Server::paced(payload.clone()));
         let address = spawn_server(Arc::clone(&server));
-        let provider = provider(cx);
+        let provider = provider();
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let part = directory.path().join("model.bin.part");
         let expected = payload.len() as u64;
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(expected)),
         );
-        wait_until(cx, "some bytes to arrive before the pause", |cx| {
+        wait_until("some bytes to arrive before the pause", || {
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Downloading { downloaded, .. }) if downloaded > 0
             )
         });
 
-        assert!(pause(cx, &provider, id), "a running download can be paused");
-        let pausing = match status(cx, &provider, id) {
+        assert!(pause(&provider, id), "a running download can be paused");
+        let pausing = match status(&provider, id) {
             Some(DownloadStatus::Pausing { downloaded, total }) => {
                 assert_eq!(total, Some(expected));
                 downloaded
@@ -1233,13 +1410,10 @@ mod tests {
             pausing > 0,
             "the pause starts from the progress the task already had",
         );
-        wait_until(cx, "the download to settle as paused", |cx| {
-            matches!(
-                status(cx, &provider, id),
-                Some(DownloadStatus::Paused { .. })
-            )
+        wait_until("the download to settle as paused", || {
+            matches!(status(&provider, id), Some(DownloadStatus::Paused { .. }))
         });
-        let paused_at = match status(cx, &provider, id) {
+        let paused_at = match status(&provider, id) {
             Some(DownloadStatus::Paused { downloaded, total }) => {
                 assert_eq!(total, Some(expected));
                 downloaded
@@ -1262,12 +1436,9 @@ mod tests {
             "a paused download is not a destination file",
         );
 
-        assert!(
-            resume(cx, &provider, id),
-            "a paused download can be resumed"
-        );
-        wait_until(cx, "the resumed download to complete", |cx| {
-            status(cx, &provider, id)
+        assert!(resume(&provider, id), "a paused download can be resumed");
+        wait_until("the resumed download to complete", || {
+            status(&provider, id)
                 == Some(DownloadStatus::Completed {
                     downloaded: expected,
                     total: expected,
@@ -1299,48 +1470,45 @@ mod tests {
         );
     }
 
-    #[gpui_kit::test]
-    fn deleting_a_completed_download_should_remove_the_task_and_its_files(cx: &mut TestAppContext) {
+    #[test]
+    fn deleting_a_completed_download_should_remove_the_task_and_its_files() {
         let payload = payload(64 * 1024);
         let address = spawn_server(Arc::new(Server::whole(payload.clone())));
-        let provider = provider(cx);
-        let events = events(cx, &provider);
+        let provider = provider();
+        let events = events(&provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let part = directory.path().join("model.bin.part");
         let expected = payload.len() as u64;
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(expected)),
         );
-        wait_until(cx, "the download to complete", |cx| {
-            status(cx, &provider, id)
+        wait_until("the download to complete", || {
+            status(&provider, id)
                 == Some(DownloadStatus::Completed {
                     downloaded: expected,
                     total: expected,
                 })
         });
 
-        assert!(delete(cx, &provider, id), "a completed task can be deleted");
+        assert!(delete(&provider, id), "a completed task can be deleted");
         assert_eq!(
-            status(cx, &provider, id),
+            status(&provider, id),
             Some(DownloadStatus::Deleting),
             "the delete publishes its own state",
         );
         assert!(
-            !delete(cx, &provider, id),
+            !delete(&provider, id),
             "a task that is already being deleted is refused",
         );
 
-        wait_until(cx, "the task to be removed", |cx| {
-            cx.update(|cx| provider.read(cx).tasks().is_empty())
-        });
+        wait_until("the task to be removed", || provider.tasks().is_empty());
 
         assert!(!destination.exists(), "the destination is removed");
         assert!(!part.exists(), "the partial file is removed");
-        let published = recorded(&events);
+        let published = events.recorded();
         assert!(
             published.iter().any(
                 |event| matches!(event, DownloadEvent::TaskRemoved(removed) if *removed == id)
@@ -1349,39 +1517,35 @@ mod tests {
         );
     }
 
-    #[gpui_kit::test]
-    fn deleting_a_download_in_flight_should_cancel_it_and_remove_the_part(cx: &mut TestAppContext) {
+    #[test]
+    fn deleting_a_download_in_flight_should_cancel_it_and_remove_the_part() {
         // Big enough that the transfer is still running when the first interval
         // publishes what it has written.
-        let payload = payload(512 * 1024);
+        // Long enough that the transfer is still running when the interval publishes
+        // the first progress the test waits for.
+        let payload = payload(2 * 1024 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
-        let provider = provider(cx);
-        let events = events(cx, &provider);
+        let provider = provider();
+        let events = events(&provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let part = directory.path().join("model.bin.part");
         let expected = payload.len() as u64;
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(expected)),
         );
-        wait_until(cx, "some bytes to arrive before the delete", |cx| {
+        wait_until("some bytes to arrive before the delete", || {
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Downloading { downloaded, .. }) if downloaded > 0
             )
         });
         assert!(part.exists(), "the transfer has written a partial file");
 
-        assert!(
-            delete(cx, &provider, id),
-            "a download in flight can be deleted",
-        );
-        wait_until(cx, "the task to be removed", |cx| {
-            cx.update(|cx| provider.read(cx).tasks().is_empty())
-        });
+        assert!(delete(&provider, id), "a download in flight can be deleted",);
+        wait_until("the task to be removed", || provider.tasks().is_empty());
 
         assert!(
             !part.exists(),
@@ -1389,7 +1553,7 @@ mod tests {
         );
         assert!(!destination.exists(), "nothing was renamed into place");
 
-        let published = recorded(&events);
+        let published = events.recorded();
         assert!(
             published.iter().any(|event| matches!(
                 event,
@@ -1413,34 +1577,32 @@ mod tests {
         );
     }
 
-    #[gpui_kit::test]
-    fn two_downloads_should_publish_only_their_own_tasks(cx: &mut TestAppContext) {
+    #[test]
+    fn two_downloads_should_publish_only_their_own_tasks() {
         let payload = payload(160 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
-        let provider = provider(cx);
-        let events = events(cx, &provider);
+        let provider = provider();
+        let events = events(&provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let first_destination = directory.path().join("first.bin");
         let second_destination = directory.path().join("second.bin");
         let expected = payload.len() as u64;
 
         let first = add(
-            cx,
             &provider,
             request(address, "/payload", &first_destination, Some(expected)),
         );
         let second = add(
-            cx,
             &provider,
             request(address, "/payload", &second_destination, Some(expected)),
         );
-        wait_until(cx, "both downloads to complete", |cx| {
-            status(cx, &provider, first)
+        wait_until("both downloads to complete", || {
+            status(&provider, first)
                 == Some(DownloadStatus::Completed {
                     downloaded: expected,
                     total: expected,
                 })
-                && status(cx, &provider, second)
+                && status(&provider, second)
                     == Some(DownloadStatus::Completed {
                         downloaded: expected,
                         total: expected,
@@ -1456,7 +1618,7 @@ mod tests {
             payload.to_vec(),
         );
 
-        let published = recorded(&events);
+        let published = events.recorded();
         let mut first_updates = 0_usize;
         let mut second_updates = 0_usize;
         for event in &published {
@@ -1494,31 +1656,29 @@ mod tests {
     /// The progress of a task is published once an interval whether or not bytes
     /// arrive: a stalled transfer still reports its state, at zero rather than at
     /// the rate it last managed.
-    #[gpui_kit::test]
-    fn progress_should_be_published_once_an_interval_even_while_nothing_arrives(
-        cx: &mut TestAppContext,
-    ) {
+    #[test]
+    fn progress_should_be_published_once_an_interval_even_while_nothing_arrives() {
         let address = spawn_stalled_server();
-        let provider = provider(cx);
-        let events = events(cx, &provider);
+        let provider = provider();
+        let events = events(&provider);
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(4096)),
         );
         assert_eq!(
-            published(&events, id).len(),
+            events.published(id).len(),
             1,
             "adding publishes the starting state",
         );
 
         for interval in 1_usize..=3 {
-            cx.executor().advance_clock(PUBLISH_INTERVAL);
-            cx.run_until_parked();
-            let statuses = published(&events, id);
+            wait_until("the next interval publish", || {
+                events.published(id).len() > interval
+            });
+            let statuses = events.published(id);
             assert_eq!(
                 statuses.len(),
                 interval + 1,
@@ -1540,18 +1700,16 @@ mod tests {
 
     /// The rate is what the transfer wrote over the interval since it last
     /// published, in megabytes per second.
-    #[gpui_kit::test]
-    fn a_download_should_publish_the_rate_it_writes_at(cx: &mut TestAppContext) {
-        // Big enough that the transfer is still running when the first interval
-        // publishes what it has written.
-        let payload = payload(512 * 1024);
+    #[test]
+    fn a_download_should_publish_the_rate_it_writes_at() {
+        // Long enough to still be transferring one interval after it started.
+        let payload = payload(2 * 1024 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
-        let provider = provider(cx);
+        let provider = provider();
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
 
         let id = add(
-            cx,
             &provider,
             request(
                 address,
@@ -1560,9 +1718,9 @@ mod tests {
                 Some(payload.len() as u64),
             ),
         );
-        wait_until(cx, "a rate the transfer is writing at", |cx| {
+        wait_until("a rate the transfer is writing at", || {
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Downloading { mb_per_second, .. })
                     if mb_per_second > 0.0 && mb_per_second < 100.0
             )
@@ -1572,11 +1730,11 @@ mod tests {
     /// The bytes on disk are a task's resume point only once an attempt of it has
     /// opened the partial file: a pause before that settles at zero, and the next
     /// resume truncates whatever file it finds.
-    #[gpui_kit::test]
-    fn a_pause_should_settle_at_what_the_partial_file_holds_once_it_was_opened(
-        cx: &mut TestAppContext,
-    ) {
-        let provider = provider(cx);
+    #[test]
+    fn a_pause_should_settle_at_what_the_partial_file_holds_once_it_was_opened() {
+        use crate::error::DownloadError;
+
+        let provider = provider();
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let part = directory.path().join("model.bin.part");
@@ -1584,62 +1742,33 @@ mod tests {
         std::fs::write(&part, vec![0xEE_u8; partial as usize])
             .expect("the partial file is written");
 
-        let insert_pausing = |cx: &mut TestAppContext, fresh: bool, opened: bool| -> DownloadId {
-            let progress = Progress::default();
-            if opened {
-                progress.opened_at(partial, None);
-            }
+        let insert_pausing = |fresh: bool, opened: bool| -> DownloadId {
             let id = DownloadId::new();
-            cx.update(|cx| {
-                provider.update(cx, |provider, _| {
-                    provider.entries.insert(
-                        id,
-                        Entry {
-                            request: request(
-                                SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
-                                "/payload",
-                                &destination,
-                                None,
-                            ),
-                            status: DownloadStatus::Pausing {
-                                downloaded: 0,
-                                total: None,
-                            },
-                            validator: Arc::new(Mutex::new(None)),
-                            fresh,
-                            attempt: Some(attempt(progress)),
-                        },
-                    );
-                    provider.order.push(id);
-                });
-            });
-
+            provider.inner.insert_pausing_for_test(
+                id,
+                request(
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+                    "/payload",
+                    &destination,
+                    None,
+                ),
+                fresh,
+                opened,
+            );
             id
         };
-        let settle = |cx: &mut TestAppContext, id: DownloadId| {
-            cx.update(|cx| {
-                provider.update(cx, |provider, cx| {
-                    provider.finish_attempt(id, Err(DownloadError::Cancelled), cx)
-                });
-            });
-        };
-        let fresh = |cx: &TestAppContext, id: DownloadId| {
-            cx.update(|cx| {
-                provider
-                    .read(cx)
-                    .entries
-                    .get(&id)
-                    .expect("the entry is held")
-                    .fresh
-            })
+        let settle = |id: DownloadId| {
+            provider
+                .inner
+                .finish_attempt(id, Err(DownloadError::Cancelled));
         };
 
         // No attempt of this task ever opened the file, so there is nothing for a
         // resume to continue.
-        let unopened = insert_pausing(cx, true, false);
-        settle(cx, unopened);
+        let unopened = insert_pausing(true, false);
+        settle(unopened);
         assert_eq!(
-            status(cx, &provider, unopened),
+            status(&provider, unopened),
             Some(DownloadStatus::Paused {
                 downloaded: 0,
                 total: None,
@@ -1647,15 +1776,15 @@ mod tests {
             "a task whose transfer never opened the partial file resumes from zero",
         );
         assert!(
-            fresh(cx, unopened),
+            provider.inner.fresh_for_test(unopened),
             "the next attempt of that task still starts from zero",
         );
 
         // The attempt opened the file, so the bytes that arrived are its own.
-        let opened = insert_pausing(cx, true, true);
-        settle(cx, opened);
+        let opened = insert_pausing(true, true);
+        settle(opened);
         assert_eq!(
-            status(cx, &provider, opened),
+            status(&provider, opened),
             Some(DownloadStatus::Paused {
                 downloaded: partial,
                 total: None,
@@ -1663,105 +1792,96 @@ mod tests {
             "a task whose transfer opened the partial file resumes from the bytes it wrote",
         );
         assert!(
-            !fresh(cx, opened),
+            !provider.inner.fresh_for_test(opened),
             "the bytes on disk are the next attempt's resume point",
         );
 
         // An attempt that stopped before opening keeps the resume point an earlier
         // attempt of the same task made.
-        let resumed = insert_pausing(cx, false, false);
-        settle(cx, resumed);
+        let resumed = insert_pausing(false, false);
+        settle(resumed);
         assert_eq!(
-            status(cx, &provider, resumed),
+            status(&provider, resumed),
             Some(DownloadStatus::Paused {
                 downloaded: partial,
                 total: None,
             }),
             "a task that already opened the file keeps its resume point",
         );
-        assert!(!fresh(cx, resumed));
+        assert!(!provider.inner.fresh_for_test(resumed));
     }
 
-    #[gpui_kit::test]
-    fn a_pause_should_be_refused_unless_the_download_is_running(cx: &mut TestAppContext) {
+    #[test]
+    fn a_pause_should_be_refused_unless_the_download_is_running() {
         // Big enough that the transfer is still running when the first interval
         // publishes what it has written.
-        let payload = payload(512 * 1024);
+        // Long enough that the transfer is still running when the interval publishes
+        // the first progress the test waits for.
+        let payload = payload(2 * 1024 * 1024);
         let address = spawn_server(Arc::new(Server::paced(payload.clone())));
-        let provider = provider(cx);
+        let provider = provider();
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let expected = payload.len() as u64;
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(expected)),
         );
-        wait_until(cx, "the download to report progress", |cx| {
+        wait_until("the download to report progress", || {
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Downloading { downloaded, .. }) if downloaded > 0
             )
         });
 
-        assert!(pause(cx, &provider, id));
+        assert!(pause(&provider, id));
         assert!(
-            !pause(cx, &provider, id),
+            !pause(&provider, id),
             "a download that is already pausing has nothing to pause",
         );
         assert!(
-            !resume(cx, &provider, id),
+            !resume(&provider, id),
             "a download that is still pausing cannot be resumed",
         );
 
-        wait_until(cx, "the download to settle as paused", |cx| {
-            matches!(
-                status(cx, &provider, id),
-                Some(DownloadStatus::Paused { .. })
-            )
+        wait_until("the download to settle as paused", || {
+            matches!(status(&provider, id), Some(DownloadStatus::Paused { .. }))
         });
         assert!(
-            !pause(cx, &provider, id),
+            !pause(&provider, id),
             "a paused download has nothing to pause",
         );
-        assert!(
-            resume(cx, &provider, id),
-            "a paused download can be resumed"
-        );
+        assert!(resume(&provider, id), "a paused download can be resumed");
 
-        wait_until(cx, "the resumed download to complete", |cx| {
-            status(cx, &provider, id)
+        wait_until("the resumed download to complete", || {
+            status(&provider, id)
                 == Some(DownloadStatus::Completed {
                     downloaded: expected,
                     total: expected,
                 })
         });
         assert!(
-            !pause(cx, &provider, id),
+            !pause(&provider, id),
             "a completed download has nothing to pause",
         );
         assert!(
-            !resume(cx, &provider, id),
+            !resume(&provider, id),
             "a completed download has nothing to resume",
         );
     }
 
-    #[gpui_kit::test]
-    fn resuming_a_failed_download_should_start_another_attempt(cx: &mut TestAppContext) {
+    #[test]
+    fn resuming_a_failed_download_should_start_another_attempt() {
         let address = spawn_server(Arc::new(Server::whole(payload(1024))));
-        let provider = provider(cx);
+        let provider = provider();
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
 
-        let id = add(
-            cx,
-            &provider,
-            request(address, "/missing", &destination, None),
-        );
-        wait_until(cx, "the download to fail", |cx| {
+        let id = add(&provider, request(address, "/missing", &destination, None));
+        wait_until("the download to fail", || {
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Failed {
                     failure: DownloadFailure::Status { status: 404 },
                 })
@@ -1769,38 +1889,38 @@ mod tests {
         });
 
         assert!(
-            resume(cx, &provider, id),
+            resume(&provider, id),
             "a failed download is retried like a paused one",
         );
         assert!(
             matches!(
-                status(cx, &provider, id),
+                status(&provider, id),
                 Some(DownloadStatus::Downloading { .. })
             ),
             "the retry starts another attempt",
         );
     }
 
-    #[gpui_kit::test]
-    fn unknown_ids_should_be_refused(cx: &mut TestAppContext) {
-        let provider = provider(cx);
+    #[test]
+    fn unknown_ids_should_be_refused() {
+        let provider = provider();
         let unknown = DownloadId::new();
 
-        assert!(!pause(cx, &provider, unknown));
-        assert!(!resume(cx, &provider, unknown));
-        assert!(!delete(cx, &provider, unknown));
-        assert_eq!(cx.update(|cx| provider.read(cx).task(unknown)), None);
-        assert!(cx.update(|cx| provider.read(cx).tasks().is_empty()));
+        assert!(!pause(&provider, unknown));
+        assert!(!resume(&provider, unknown));
+        assert!(!delete(&provider, unknown));
+        assert_eq!(provider.task(unknown), None);
+        assert!(provider.tasks().is_empty());
     }
 
     /// A new task starts from zero, whatever partial file it finds at its
     /// destination: nothing else in this process wrote it, so it is not resumed.
-    #[gpui_kit::test]
-    fn adding_a_download_should_discard_a_partial_file_it_did_not_write(cx: &mut TestAppContext) {
+    #[test]
+    fn adding_a_download_should_discard_a_partial_file_it_did_not_write() {
         let payload = payload(96 * 1024);
         let server = Arc::new(Server::whole(payload.clone()));
         let address = spawn_server(Arc::clone(&server));
-        let provider = provider(cx);
+        let provider = provider();
         let directory = TempDir::new().expect("a temporary directory is available");
         let destination = directory.path().join("model.bin");
         let part = directory.path().join("model.bin.part");
@@ -1809,12 +1929,11 @@ mod tests {
         let expected = payload.len() as u64;
 
         let id = add(
-            cx,
             &provider,
             request(address, "/payload", &destination, Some(expected)),
         );
-        wait_until(cx, "the download to complete", |cx| {
-            status(cx, &provider, id)
+        wait_until("the download to complete", || {
+            status(&provider, id)
                 == Some(DownloadStatus::Completed {
                     downloaded: expected,
                     total: expected,
@@ -1831,6 +1950,42 @@ mod tests {
         assert_eq!(
             requests[0].range, None,
             "a new task never continues a partial file it did not write",
+        );
+    }
+
+    /// Dropping the subscription stops the delivery: the sink is the updater's, and
+    /// a closed window must not keep receiving events.
+    #[test]
+    fn a_dropped_subscription_should_stop_the_events() {
+        let provider = provider();
+        let recorded: Arc<Mutex<Vec<DownloadEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let subscription = provider.subscribe(Arc::new(move |event| {
+            sink.lock()
+                .expect("the event log is never poisoned")
+                .push(event);
+        }));
+        drop(subscription);
+
+        let directory = TempDir::new().expect("a temporary directory is available");
+        let id = add(
+            &provider,
+            request(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+                "/payload",
+                &directory.path().join("model.bin"),
+                None,
+            ),
+        );
+        wait_until("the unobserved download to fail", || {
+            matches!(status(&provider, id), Some(DownloadStatus::Failed { .. }))
+        });
+        assert!(
+            recorded
+                .lock()
+                .expect("the event log is never poisoned")
+                .is_empty(),
+            "a dropped subscription receives no events",
         );
     }
 }

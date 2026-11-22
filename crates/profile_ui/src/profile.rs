@@ -89,6 +89,7 @@ use tokio::sync::{
 use ui_core::{
     app::App,
     error::EngineError,
+    event::Event,
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -406,6 +407,24 @@ impl ProfileMenu {
         let result = self.sync_state(app, &mut state);
         self.state = Some(state);
         result
+    }
+
+    /// Forwards one platform event to the kit controls the control owns.
+    ///
+    /// The title bar dispatches pointer input to its own controls; the account control's
+    /// trigger and the menu entries are the same kind of kit control, so their pressed
+    /// state follows the same event stream. The overlay, the hints and the alert are
+    /// synchronized by their own frame routes and need no event forwarded.
+    pub fn dispatch(&mut self, app: &mut App, event: &Event) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let _ = state.trigger.button.dispatch(app, event);
+        if let Some(content) = &state.menu {
+            let _ = content.open_account.dispatch(app, event);
+            let _ = content.sign_out.dispatch(app, event);
+            let _ = content.copy.dispatch(app, event);
+        }
     }
 
     /// Releases every kit component this control built, its overlay, and its signal scope.

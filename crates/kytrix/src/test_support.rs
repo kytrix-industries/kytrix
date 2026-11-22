@@ -66,9 +66,13 @@ impl Harness {
         });
         let window = app.window_id();
         let runtime = app.app().runtime_handle().clone();
-        let composition =
-            Composition::with_store(app.app_mut(), runtime, ConfigStore::in_memory(config), None)
-                .expect("the composition root builds headlessly");
+        let composition = Composition::with_store_for_test(
+            app.app_mut(),
+            runtime,
+            ConfigStore::in_memory(config),
+            None,
+        )
+        .expect("the composition root builds headlessly");
         let shell = Shell::open_in(app.app_mut(), Rc::clone(&composition), window)
             .expect("the shell opens in the test window");
         let shell = Shell::install(app.app_mut(), shell).expect("the frame route installs");
@@ -240,10 +244,16 @@ impl Harness {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use app_config::{
+        network::{RouteTarget, ServiceTarget},
+        settings::{AccountConfig, AccountWalletKind},
         ui::SidebarMode,
         workspace::{WorkspaceConfig, WorkspaceLayout, WorkspacesConfig},
     };
+    use download_provider::{request::DownloadRequest, task::DownloadId};
+    use network::transport::http::HttpClientClass;
 
     use super::*;
     use crate::shell::metrics;
@@ -501,5 +511,135 @@ mod tests {
     fn the_harness_should_report_the_frame_cursor() {
         let harness = Harness::new();
         let _ = harness.frame_index();
+    }
+
+    /// The title bar carries the account control, and the aggregate carries the service
+    /// connection the control reads: the composition root wired both, not just one.
+    #[test]
+    fn the_title_bar_should_mount_the_account_control() {
+        let harness = Harness::new();
+        assert!(
+            harness.composition.services().kytrix_service().is_some(),
+            "the aggregate hands the service connection to widgets and the account control"
+        );
+        assert!(
+            harness.shell.borrow().title_bar().profile().is_some(),
+            "the title bar built the account control"
+        );
+        assert!(
+            harness.exists("TEST_PROFILE_TRIGGER_AVATAR"),
+            "the account trigger is drawn; ids: {:?}",
+            harness.debug_ids()
+        );
+    }
+
+    /// A settings write on the account record reaches the snapshot the account control
+    /// reads: the aggregate's config signal and the commit hub's are one signal, so a
+    /// sign-in redraws the trigger on the next frame instead of writing a snapshot nothing
+    /// follows.
+    #[test]
+    fn an_account_write_should_reach_the_account_control_snapshot() {
+        let mut harness = Harness::new();
+        let host = harness.composition.profile_host();
+        let account = account();
+        harness
+            .composition
+            .hub
+            .edit(harness.app.app_mut(), |config| {
+                config.account = Some(account.clone());
+            })
+            .expect("the in-memory store stores the account");
+
+        assert_eq!(
+            host.snapshot_signal(harness.app.app()).account,
+            Some(account),
+            "the account control reads the published snapshot"
+        );
+    }
+
+    /// The title bar installs the updater and mounts its indicator; closing the window
+    /// releases both (indicator first, because it reads the updater's signal).
+    #[test]
+    fn the_title_bar_should_install_and_release_the_updater() {
+        let mut harness = Harness::new();
+        let (indicator, updater) = {
+            let shell = harness.shell.borrow();
+            let title_bar = shell.title_bar();
+            assert!(title_bar.updater().is_some(), "the updater is installed");
+            assert!(title_bar.indicator().is_some(), "the indicator is mounted");
+            (
+                title_bar.indicator().expect("mounted").clone(),
+                title_bar.updater().expect("installed").clone(),
+            )
+        };
+        assert!(!indicator.is_released());
+        assert!(!updater.is_released());
+
+        harness.shutdown();
+
+        assert!(
+            indicator.is_released(),
+            "the indicator is released with the window"
+        );
+        assert!(
+            updater.is_released(),
+            "the updater is released with the window"
+        );
+        assert_eq!(
+            harness.composition.frame_router.len(),
+            0,
+            "both of their routes are gone"
+        );
+    }
+
+    /// The settings page and the updater download through one process manager: a task
+    /// added through either seam is the same task, and the settings page's signal follows
+    /// what the manager published on the next frame.
+    #[test]
+    fn the_downloads_seams_should_share_the_process_manager() {
+        let mut harness = Harness::new();
+        let request = || DownloadRequest {
+            url: "http://127.0.0.1:9/model.bin"
+                .parse()
+                .expect("the request URL is a URL"),
+            // No file name: the transfer would fail before it reaches the network, which
+            // keeps this test about the wiring rather than about a transfer.
+            destination: PathBuf::new(),
+            target: RouteTarget::Service(ServiceTarget::TranslationModelDownload),
+            class: HttpClientClass::ModelDownload,
+            expected_size: None,
+        };
+
+        let from_updater = harness.composition.updater_deps().downloads.add(request());
+        let from_settings = DownloadId::new();
+        let settings_downloads = harness.composition.downloads().settings_service();
+        (settings_downloads.add)(request(), from_settings);
+
+        let provider = Rc::clone(harness.composition.downloads().provider());
+        assert!(provider.task(from_updater).is_some());
+        assert!(
+            provider.task(from_settings).is_some(),
+            "the settings page's identity is the manager's identity"
+        );
+
+        harness.tick();
+        let tasks = harness.app.app().read_with(
+            &harness.composition.downloads().tasks_signal(),
+            Clone::clone,
+        );
+        assert!(
+            tasks.iter().any(|task| task.id == from_updater)
+                && tasks.iter().any(|task| task.id == from_settings),
+            "the frame route mirrors both seams' tasks onto the settings signal"
+        );
+    }
+
+    /// The account a test signs in as.
+    fn account() -> AccountConfig {
+        AccountConfig {
+            user_id: "user-1".to_owned(),
+            wallet_address: "0xabc".to_owned(),
+            wallet_kind: AccountWalletKind::Ethereum,
+        }
     }
 }

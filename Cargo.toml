@@ -94,6 +94,9 @@ dispatch2 = "0.3.1"
 ed25519-dalek = "3.0.0"
 either = "1.19.0"
 embed-resource = "3.0.12"
+# P4-5：应用日志 sink。gpui-kit 之前提供的初始化随外壳迁移消失，`log` 宏需要实现；
+# env_logger 由 `RUST_LOG` 配置，未设置时按 `info` 输出到 stderr。
+env_logger = "0.11.12"
 etagere = "0.3.0"
 flate2 = "1.1.11"
 fontique = "0.12.0"

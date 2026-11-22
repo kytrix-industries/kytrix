@@ -673,7 +673,7 @@ pub(super) struct KytrixServiceConnectorInner {
     /// The task that turns one publication of the network projection into a
     /// [`SupervisorCommand::Reconfigure`] for every live session.
     ///
-    /// [`KytrixServiceConnector::install`] is the production entry point for
+    /// [`KytrixServiceConnector::spawn`] is the production entry point for
     /// this task; every `KytrixServiceConnector` constructor starts it.
     pub config_task: Mutex<Option<JoinHandle<()>>>,
     pub next_subscriber_id: AtomicU64,

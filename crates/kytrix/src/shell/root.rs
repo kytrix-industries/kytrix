@@ -208,6 +208,7 @@ impl Shell {
         }
 
         self.composition.sync_catalog_generation(app);
+        self.composition.sync_downloads(app);
         self.title_bar.sync(app)?;
         self.sidebar.sync(app, &self.workspaces)?;
         self.pages.sync(app, &self.composition)?;

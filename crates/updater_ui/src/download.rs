@@ -20,9 +20,9 @@
 //! thread safe.
 //!
 //! A test supplies its own implementation ([`FakeDownloads`](crate::test_support));
-//! production supplies the adapter the composition root builds over the installed
-//! manager (wiring batch P4-3). The payload data types are the manager's own, so the
-//! two sides cannot drift.
+//! production supplies the adapter the composition root builds over the process
+//! manager ([`crate::Updater`] is installed with it, P4-5). The payload data types are
+//! the manager's own, so the two sides cannot drift.
 
 use std::{fmt, sync::Arc};
 
