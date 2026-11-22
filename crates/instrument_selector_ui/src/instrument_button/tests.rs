@@ -282,6 +282,7 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
         )
         .build(&host, app, window, root)
         .expect("the control builds")
+        .node()
     };
     live.drain();
     let bounds = live.bounds(node).expect("the control is laid out");
@@ -312,6 +313,7 @@ fn a_click_opens_the_selector_only_when_the_control_is_live() {
         )
         .build(&host, app, window, root)
         .expect("the control builds")
+        .node()
     };
     disabled.drain();
     let bounds = disabled.bounds(node).expect("the control is laid out");
@@ -337,6 +339,62 @@ fn the_placeholder_is_a_catalogue_key_that_resolves() {
         assert!(
             !i18n::t_smol!(translate, "instrument_selector.spot").is_empty(),
             "the placeholder key must resolve in {language}"
+        );
+    }
+}
+
+/// The handle hands the component back: releasing the control reclaims its signal scope and
+/// unregisters the click handler, so a caller that rebuilds its control does not grow the
+/// value store.
+///
+/// W2a review F2: `build` used to consume the button and answer with only its node, so a
+/// caller could not release the component at all and every rebuild leaked ten live slots
+/// (`live 18 → 28 → 38` over two language switches in the market-trade pane).
+#[test]
+fn releasing_the_control_should_reclaim_its_component() {
+    let mut harness = crate::test_support::Harness::new();
+    let action = ui_core::event::Action::Custom(SmolStr::new_static("instrument-button.click"));
+    let stats = |harness: &crate::test_support::Harness| {
+        ui_core::test_support::diagnostics::signal_slot_stats(harness.app())
+    };
+    let baseline = stats(&harness).live;
+
+    for cycle in 0..10 {
+        let handle = {
+            let host = harness.host().clone();
+            let window = harness.window();
+            let root = harness.root();
+            let app = harness.app_mut();
+            InstrumentButton::new(
+                "instrument-button",
+                None,
+                filters(one_scope()),
+                "instrument_selector.spot",
+                |_, _, _| {},
+            )
+            .build(&host, app, window, root)
+            .expect("the control builds")
+        };
+        assert!(
+            harness.app().has_action_handler(&action),
+            "cycle {cycle}: a live control registers the click it carries"
+        );
+
+        let window = harness.window();
+        harness
+            .app_mut()
+            .remove_node(window, handle.node())
+            .expect("the caller removes the control's node first");
+        handle.release(harness.app_mut());
+
+        assert!(
+            !harness.app().has_action_handler(&action),
+            "cycle {cycle}: release unregisters the click the control registered"
+        );
+        assert_eq!(
+            stats(&harness).live,
+            baseline,
+            "cycle {cycle}: the component's signal scope came back"
         );
     }
 }

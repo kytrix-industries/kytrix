@@ -6094,10 +6094,8 @@ name = "market_trade"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "app_config_provider",
  "base_ui",
  "futures",
- "gpui-kit",
  "i18n",
  "instrument_selector_ui",
  "log",
@@ -6108,8 +6106,8 @@ dependencies = [
  "smol_str",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
