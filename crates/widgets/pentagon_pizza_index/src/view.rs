@@ -15,8 +15,15 @@
 //!
 //! It reports the poll through the framework's status cell and nothing else: a failure
 //! is a failure, and the framework decides where that is shown and what the recovery
-//! looks like. The pane keeps no banner and no "unexpected response" state of its own;
-//! a response that does not match the request cannot happen, because both are typed.
+//! looks like. The pane keeps no banner and no "unexpected response" state of its own.
+//!
+//! # Why a reply is matched by request identity
+//!
+//! Two commands share one inbox. Draining it happens before anything in the frame can
+//! replace a command, so an answer that was delivered before the replacement is applied
+//! to the command it belongs to; on top of that a reply is only accepted when its
+//! framework `RequestId` is newer than the last one this pane consumed, which is what
+//! keeps a reply the pane has already answered from clearing the command now in flight.
 //!
 //! # Why the colour is a status role
 //!
@@ -40,10 +47,12 @@
 //! It is text beside the refresh button — when the next read is due, and the way to
 //! bring it forward, are one control's worth of information, so they sit together in the
 //! header. The index publishes one point an hour, so the countdown is the only thing on
-//! screen that moves on its own. It moves because a timer scoped to the body root writes
-//! the countdown signal (E10 `App::after_scoped`); the write only requests a frame when
-//! the label really changed, so a quiet pane does not repaint four times a second, and the
-//! timer stops being re-armed the moment there is nothing left to count down to.
+//! screen that moves on its own. It moves because an E10 one-shot timer writes the
+//! countdown signal and re-arms itself (see `Countdown`); the write only requests a frame
+//! when the label really changed, so a quiet pane does not repaint four times a second.
+//! The timer the pane holds is cancelled on every deadline change and on release, so a
+//! deadline that goes away cannot leave a chain running (I3) and a released pane cannot
+//! keep waking the engine.
 //!
 //! # What the old implementation drew
 //!
@@ -52,7 +61,12 @@
 //! test-ledger's §0 for the migration evidence). The bar therefore stays a node with a
 //! `bind_style` background; no engine `Canvas` is involved.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::{
@@ -70,7 +84,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 use ui_core::{
-    app::App,
+    app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::style::{PaintSpec, StylePatch},
@@ -84,6 +98,7 @@ use widget::{
     cx::WidgetCx,
     error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     time_zone::data_time_zone,
@@ -163,6 +178,102 @@ impl TranslatedError for PizzaFailure {
     }
 }
 
+/// The countdown the header draws, and the one-shot timer that keeps it moving.
+///
+/// It is shared with the timer callback (`Rc`), which has only `&mut App`: the deadline
+/// the label counts to lives in a `Cell`, the label itself is a signal, and the callback
+/// re-arms the timer. Every deadline change goes through `update`, which cancels the
+/// pending tick before it writes the label and arms the next chain — a deadline that
+/// flickers cannot leave two chains ticking (I3: the pane is woken once per tick, not
+/// twice), and `release` cancels through the same path.
+struct Countdown {
+    /// The window the timer belongs to.
+    window: WindowId,
+    /// The wall-clock millisecond the next read is due at, or nothing worth counting
+    /// to (a read in flight, a failure, a schedule that stopped).
+    deadline: Cell<Option<i64>>,
+    /// The time left, as the header's text node draws it.
+    label: Signal<Option<SmolStr>>,
+    /// The wall clock, which is what a deadline published in Unix milliseconds is
+    /// comparable against; a test hands in a clock it can move.
+    now: Rc<dyn Fn() -> i64>,
+    /// The tick this pane is waiting for, if any. Holding the id is what makes a
+    /// deadline change and `release` able to cancel it instead of leaving it to fire.
+    timer: RefCell<Option<TimerId>>,
+}
+
+impl Countdown {
+    fn new(cx: &mut WidgetCx<'_>, now: Rc<dyn Fn() -> i64>) -> Self {
+        Self {
+            window: cx.window(),
+            deadline: Cell::new(None),
+            label: cx.signal(None),
+            now,
+            timer: RefCell::new(None),
+        }
+    }
+
+    /// The deadline the label is counting to.
+    fn deadline(&self) -> Option<i64> {
+        self.deadline.get()
+    }
+
+    /// Moves the countdown to a new deadline (or stops it), and re-arms the timer.
+    ///
+    /// The label is written here rather than only on the next tick: a new answer
+    /// carries a new deadline, and the header has to state it on the frame that shows
+    /// the answer. The pending tick is cancelled first, so a deadline that comes back
+    /// before the old tick was due cannot leave a second chain running.
+    fn update(self: &Rc<Self>, app: &mut App, deadline: Option<i64>) {
+        self.deadline.set(deadline);
+        if let Some(id) = self.timer.borrow_mut().take() {
+            app.cancel_timer(&id);
+        }
+        self.write_label(app);
+        if deadline.is_some() {
+            self.arm(app);
+        }
+    }
+
+    /// Recomputes the label from the clock; returns whether it changed.
+    ///
+    /// The write only requests a frame when the label really moved (`App::write`
+    /// short-circuits equal values), which is what keeps a quiet 250 ms tick from
+    /// repainting the pane four times a second.
+    fn write_label(&self, app: &mut App) -> bool {
+        app.write(
+            &self.label,
+            countdown_label(self.deadline.get(), (self.now)()),
+        )
+    }
+
+    /// Arms the one-shot tick for the next interval, if there is anything to count to.
+    fn arm(self: &Rc<Self>, app: &mut App) {
+        if self.deadline.get().is_none() {
+            return;
+        }
+        let this = Rc::clone(self);
+        match app.after(self.window, COUNTDOWN_TICK, move |app| this.tick(app)) {
+            Ok(id) => *self.timer.borrow_mut() = Some(id),
+            Err(error) => {
+                log::error!(
+                    "the Pentagon Pizza Index countdown could not arm its next tick: {error}"
+                );
+            }
+        }
+    }
+
+    /// One tick: write the label and re-arm the next one.
+    ///
+    /// The timer it just served is already spent, so the field is cleared first; the
+    /// arm then owns the only pending tick this chain has.
+    fn tick(self: &Rc<Self>, app: &mut App) {
+        *self.timer.borrow_mut() = None;
+        self.write_label(app);
+        self.arm(app);
+    }
+}
+
 /// One pane: the account it follows, the reading it holds, and the countdown to the
 /// next one.
 pub struct PentagonPizzaIndexWidget {
@@ -187,15 +298,9 @@ pub struct PentagonPizzaIndexWidget {
     ready: Option<u64>,
     /// When the next automatic read is due, as the service's own deadline.
     next_refresh_at: Option<i64>,
-    /// The deadline the countdown timer reads. It is written by `sync` and read by the
-    /// timer's callback, which runs outside the widget (`&mut App` only).
-    deadline_signal: Signal<Option<i64>>,
-    /// The text beside the refresh button, as the header's text node reads it.
-    countdown_signal: Signal<Option<SmolStr>>,
-    /// Whether a countdown tick is currently armed. Only ever true while
-    /// `deadline_signal` is `Some`: the chain re-arms itself until the deadline is
-    /// cleared, and `sync` arms it again when a deadline comes back.
-    countdown_armed: bool,
+    /// The time left until that read, as the header draws it, and the tick that keeps
+    /// it moving.
+    countdown: Rc<Countdown>,
     /// Whether a refresh command this pane sent has not yet been reported on.
     refresh_pending: bool,
     /// Whether the load this pane sent has not been reported on.
@@ -204,6 +309,12 @@ pub struct PentagonPizzaIndexWidget {
     /// answer is about a stream the pane no longer follows, and reporting it would
     /// turn the pane's waiting state into a failure.
     load_pending: bool,
+    /// The framework request identity of the last reply this pane consumed.
+    ///
+    /// The engine numbers requests in order and only one command is in flight at a
+    /// time, so a reply that is not newer than this one is an answer the pane has
+    /// already applied: accepting it again would answer the command that replaced it.
+    last_request_id: Option<RequestId>,
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
     /// Click requests from the header control: a button handler owns no `&mut self`,
@@ -248,8 +359,9 @@ impl WidgetView for PentagonPizzaIndexWidget {
         // own. A host without the connector leaves the source absent; `load` reports
         // that as the pane's failure.
         let source = cx.services().kytrix_service().cloned();
+        let now: Rc<dyn Fn() -> i64> = Rc::new(unix_millis);
 
-        Ok(Self::assemble(source, status, recovery, cx))
+        Ok(Self::assemble(source, now, status, recovery, cx))
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
@@ -306,14 +418,17 @@ impl WidgetView for PentagonPizzaIndexWidget {
         self.build_level_bar(root, cx)?;
         self.build_observed_at(root, cx)?;
 
-        // The first content frame may already be counting down to a read; the timer is
-        // scoped to the body root, so it can only be armed once that root exists.
-        self.arm_countdown(cx)?;
-
         Ok(())
     }
 
     fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        // What the service delivered is drained before anything in this frame can
+        // replace a command: an answer that arrived before the frame belongs to the
+        // command that was in flight when it arrived (a sign-out or an account change
+        // later in this hook replaces that command, and would otherwise make the old
+        // answer look like the new command's).
+        self.drain_inbox(cx);
+
         // The settings are the pane's scope: signing in as someone else is another
         // read, and signing out is no read at all. A settings write reaches this hook on
         // the frame it schedules (the surface root reads the same signal), and the
@@ -323,8 +438,6 @@ impl WidgetView for PentagonPizzaIndexWidget {
             self.account_id = account;
             self.start(false, cx)?;
         }
-
-        self.drain_inbox(cx);
 
         // A header control owns no `&mut self`; it asks for the refresh it was clicked
         // for, and this is where the request becomes one.
@@ -341,7 +454,12 @@ impl WidgetView for PentagonPizzaIndexWidget {
             cx.request_frame()?;
         }
 
-        self.update_countdown(cx)?;
+        // The countdown follows the schedule the state now states. Comparing first is
+        // what keeps a steady frame from cancelling and re-arming the same tick.
+        let deadline = self.countdown_deadline(cx.app());
+        if deadline != self.countdown.deadline() {
+            Countdown::update(&self.countdown, cx.app_mut(), deadline);
+        }
         self.sync_refresh_control(cx)?;
 
         Ok(())
@@ -370,10 +488,10 @@ impl WidgetView for PentagonPizzaIndexWidget {
         // The header's nodes belong to the pane, which removes its row: only the
         // component's signal scope and action handler are this widget's to release.
         let _ = self.release_refresh_control(cx, false);
-        // The countdown timer is scoped to the body root, which the framework removes
-        // right after this hook; nothing it could write outlives the widget's scope.
+        // The countdown tick is this widget's: the framework's subtree teardown does
+        // not own it, so release is where it is cancelled.
+        Countdown::update(&self.countdown, cx.app_mut(), None);
         self.body_root = None;
-        self.countdown_armed = false;
         self.reading = None;
         self.ready = None;
         self.accepted = None;
@@ -386,17 +504,19 @@ impl PentagonPizzaIndexWidget {
     ///
     /// The pane has no opinion about where its index comes from, so the source is an
     /// argument: the production constructor answers it with the injected Kytrix service
-    /// connection, and a test with a fake one.
+    /// connection, and a test with a fake one. The clock is an argument for the same
+    /// reason: a countdown is measured against a wall clock, and a test that drives the
+    /// ticks has to own that clock.
     fn assemble<S: PizzaSource>(
         source: Option<S>,
+        now: Rc<dyn Fn() -> i64>,
         status: WidgetStatus,
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Self {
         let binding = source.map(|source| WidgetBinding::spawn(cx, PizzaService::new(source)));
         let reading_signal: Signal<Option<PizzaReading>> = cx.signal(None);
-        let deadline_signal: Signal<Option<i64>> = cx.signal(None);
-        let countdown_signal: Signal<Option<SmolStr>> = cx.signal(None);
+        let countdown = Rc::new(Countdown::new(cx, now));
         let refresh_requests = cx.signal(0_u64);
         // The pane records the account it was built for, but it does not start
         // anything: the framework calls `load` once construction is done.
@@ -411,11 +531,10 @@ impl PentagonPizzaIndexWidget {
             accepted: None,
             ready: None,
             next_refresh_at: None,
-            deadline_signal,
-            countdown_signal,
-            countdown_armed: false,
+            countdown,
             refresh_pending: false,
             load_pending: false,
+            last_request_id: None,
             account_id,
             refresh_requests,
             seen_refresh_requests: 0,
@@ -435,7 +554,20 @@ impl PentagonPizzaIndexWidget {
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Self {
-        Self::assemble(Some(source), status, recovery, cx)
+        let now: Rc<dyn Fn() -> i64> = Rc::new(unix_millis);
+        Self::assemble(Some(source), now, status, recovery, cx)
+    }
+
+    /// A pane whose countdown reads a clock the test moves.
+    #[cfg(test)]
+    fn new_with_source_at_clock<S: PizzaSource>(
+        source: S,
+        now: Rc<dyn Fn() -> i64>,
+        status: WidgetStatus,
+        recovery: WidgetAction,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
+        Self::assemble(Some(source), now, status, recovery, cx)
     }
 
     /// The account this pane would accept an answer from.
@@ -528,16 +660,40 @@ impl PentagonPizzaIndexWidget {
                 Inbound::Latest { key, message } => {
                     self.apply_latest(key, message, cx);
                 }
-                // One call is in flight at a time (the binding replaces the previous
-                // one), so the flags say which command this answer belongs to.
-                Inbound::Rpc { result, .. } => {
-                    if self.load_pending {
-                        self.apply_load_result(result, cx);
-                    } else if self.refresh_pending {
-                        self.apply_refresh_result(result, cx);
-                    }
+                Inbound::Rpc { request_id, result } => {
+                    self.apply_rpc(request_id, result, cx);
                 }
             }
+        }
+    }
+
+    /// Applies one RPC reply, once its request identity says it is a new answer.
+    ///
+    /// Only one call is in flight at a time (the binding replaces and aborts the
+    /// previous one), so the pending flags say which command an answer belongs to.
+    /// The identity is the second half of that: a reply that is not newer than the
+    /// last one this pane consumed is an answer it has already applied, and applying
+    /// it again would clear the command that replaced the one it answered.
+    fn apply_rpc(
+        &mut self,
+        request_id: RequestId,
+        result: Result<PizzaResponse, RpcCallError<PizzaServiceError>>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        if self
+            .last_request_id
+            .is_some_and(|answered| request_id <= answered)
+        {
+            log::debug!(
+                "the Pentagon Pizza Index pane ignored reply {request_id}: it is not newer than the last one it answered"
+            );
+            return;
+        }
+        self.last_request_id = Some(request_id);
+        if self.load_pending {
+            self.apply_load_result(result, cx);
+        } else if self.refresh_pending {
+            self.apply_refresh_result(result, cx);
         }
     }
 
@@ -700,51 +856,6 @@ impl PentagonPizzaIndexWidget {
         Ok(())
     }
 
-    /// Keeps the deadline and the label the header draws in step with the state.
-    fn update_countdown(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        let deadline = self.countdown_deadline(cx.app());
-        if *cx.read(&self.deadline_signal) != deadline {
-            cx.write(&self.deadline_signal, deadline);
-        }
-        if deadline.is_none() {
-            // Nothing is on the clock: the chain stops at its next tick, and this is
-            // what lets the next deadline arm it again.
-            self.countdown_armed = false;
-            if cx.read(&self.countdown_signal).is_some() {
-                cx.write(&self.countdown_signal, None);
-            }
-        } else {
-            let label = countdown_label(deadline, unix_millis());
-            if *cx.read(&self.countdown_signal) != label {
-                cx.write(&self.countdown_signal, label);
-            }
-            self.arm_countdown(cx)?;
-        }
-
-        Ok(())
-    }
-
-    /// Arms the countdown tick if a deadline exists and no chain is running.
-    fn arm_countdown(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        if self.countdown_armed {
-            return Ok(());
-        }
-        let Some(scope) = self.body_root else {
-            return Ok(());
-        };
-        let window = cx.window();
-        arm_countdown_timer(
-            cx.app_mut(),
-            window,
-            scope,
-            self.deadline_signal,
-            self.countdown_signal,
-        );
-        self.countdown_armed = true;
-
-        Ok(())
-    }
-
     /// Builds the rung's number, which the index itself publishes.
     fn build_level_number(&self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let reading = self.reading_signal;
@@ -889,8 +1000,12 @@ impl PentagonPizzaIndexWidget {
         let label = t_smol!(cx.translate(), "widget.pentagon_pizza_index.refresh_now");
         let theme = cx.theme().clone();
         let window = cx.window();
-        let countdown = self.countdown_signal;
+        let countdown = self.countdown.label;
         let countdown_theme = cx.theme().clone();
+        // The control is built in the state the pane is in now, not in the state the
+        // previous frame left it in: a pane that has nothing to refresh must not draw
+        // one frame of a live button (AGENTS §4.2).
+        let disabled = self.refresh_is_disabled(cx.app());
 
         let root = NodeBuilder::boxed()
             .id("TEST_PENTAGON_PIZZA_INDEX_REFRESH")
@@ -905,11 +1020,19 @@ impl PentagonPizzaIndexWidget {
             .build(cx.tree_mut(), parent)?;
 
         let requests = self.refresh_requests;
-        let key = format_smolstr!("pentagon_pizza_index.refresh.{}", parent.to_bits());
+        // The key is the control's application-level identity, and this pane is one of
+        // however many the layout holds: `unique_key` scopes it to this widget's own
+        // scope, so two panes never share one handler.
+        let key = cx.unique_key("pentagon_pizza_index.refresh");
         let button = Button::new(cx.app_mut(), theme, key)
             .ghost()
             .small()
+            // The kit's compact ladder draws the icon at 8 px where the old
+            // `size_3()` drew it at 12 px; that is the frozen kit's size rather than
+            // this pane's choice, registered as a visual difference (W2b test-ledger
+            // §6) instead of hand-building the icon here.
             .icon(IconKind::ArrowsClockwise)
+            .disabled(disabled)
             .a11y_label(label.clone())
             .tooltip_text(label)
             .on_click(move |ctx| {
@@ -1024,33 +1147,6 @@ fn countdown_label(deadline: Option<i64>, now: i64) -> Option<SmolStr> {
     deadline.map(|deadline| format_countdown(deadline.saturating_sub(now)))
 }
 
-/// Arms one countdown tick, and the chain of ticks after it.
-///
-/// The callback runs outside the widget (`&mut App` only), so everything it needs is a
-/// handle it captures: the window, the body root the timer is scoped to, the deadline
-/// signal it reads and the label signal it writes. The chain re-arms itself while a
-/// deadline exists; the moment there is none it stops, and `sync` arms it again when a
-/// deadline comes back. Scoping the timer to the body root is what cancels it when the
-/// pane goes away (E16).
-fn arm_countdown_timer(
-    app: &mut App,
-    window: WindowId,
-    scope: NodeId,
-    deadline: Signal<Option<i64>>,
-    countdown: Signal<Option<SmolStr>>,
-) {
-    let registered = app.after_scoped(window, scope, COUNTDOWN_TICK, move |app| {
-        let Some(due) = *app.read(&deadline) else {
-            return;
-        };
-        app.write(&countdown, countdown_label(Some(due), unix_millis()));
-        arm_countdown_timer(app, window, scope, deadline, countdown);
-    });
-    if let Err(error) = registered {
-        log::error!("the Pentagon Pizza Index countdown could not arm its next tick: {error}");
-    }
-}
-
 /// Removes a node this pane built, if it is still in the tree.
 ///
 /// A node that is already gone is not a failure: the pane rebuilds its header row, and
@@ -1092,7 +1188,7 @@ fn format_observed_at(observed_at: i64, zone: UtcOffset) -> SmolStr {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::{cell::Cell, rc::Rc};
 
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use base_ui::theme::{appearance::Appearance, resolved::Theme};
@@ -1107,7 +1203,9 @@ mod tests {
     use super::*;
     use crate::{
         model::PizzaDataError,
-        service::{PizzaServiceError, PizzaSnapshot, PizzaStatus, PizzaStreamMessage},
+        service::{
+            PizzaResponse, PizzaServiceError, PizzaSnapshot, PizzaStatus, PizzaStreamMessage,
+        },
         test_support::{ACCOUNT, FakeSource, FetchPlan, OBSERVED_AT, reading},
     };
 
@@ -1213,6 +1311,62 @@ mod tests {
         pane_with_source(harness, FakeSource::default())
     }
 
+    /// A wall clock the test owns, and how many times the pane read it.
+    ///
+    /// A countdown's label is formatted against the wall clock, which is not the
+    /// engine clock [`WidgetTestApp::advance`] moves; the read count is what tells one
+    /// timer chain from two (two chains tick twice per round).
+    struct TestClock {
+        now: Rc<Cell<i64>>,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl TestClock {
+        fn new(now: i64) -> Self {
+            Self {
+                now: Rc::new(Cell::new(now)),
+                reads: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn set(&self, now: i64) {
+            self.now.set(now);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.get()
+        }
+
+        fn now(&self) -> Rc<dyn Fn() -> i64> {
+            let now = Rc::clone(&self.now);
+            let reads = Rc::clone(&self.reads);
+            Rc::new(move || {
+                reads.set(reads.get() + 1);
+                now.get()
+            })
+        }
+    }
+
+    /// A pane over a source and a wall clock a test drives.
+    fn pane_with_source_at_clock(
+        harness: &mut WidgetTestApp,
+        source: FakeSource,
+        now: Rc<dyn Fn() -> i64>,
+    ) -> Pane {
+        let scope = harness.scope();
+        let status = WidgetStatus::new(harness.app_mut(), scope);
+        let parent = harness.placeholder_parent();
+        let widget = harness.with_cx(|cx| {
+            PentagonPizzaIndexWidget::new_with_source_at_clock(source, now, status, recovery(), cx)
+        });
+
+        Pane {
+            widget,
+            status,
+            audience_parent: parent,
+        }
+    }
+
     fn load(harness: &mut WidgetTestApp, pane: &mut Pane) {
         harness.with_cx(|cx| pane.widget.load(cx));
     }
@@ -1295,6 +1449,27 @@ mod tests {
     fn ready_pane(harness: &mut WidgetTestApp, level: u8, due: i64) -> Pane {
         sign_in(harness, ACCOUNT);
         let mut pane = pane(harness);
+        report_reading(harness, &mut pane, 1, reading(level));
+        report_status(
+            harness,
+            &mut pane,
+            PizzaStatus::Ready {
+                revision: 1,
+                next_refresh_at: due,
+            },
+        );
+        pane
+    }
+
+    /// A pane that is ready at `due`, counting down on a clock the test owns.
+    fn ready_pane_at_clock(
+        harness: &mut WidgetTestApp,
+        level: u8,
+        due: i64,
+        now: Rc<dyn Fn() -> i64>,
+    ) -> Pane {
+        sign_in(harness, ACCOUNT);
+        let mut pane = pane_with_source_at_clock(harness, FakeSource::default(), now);
         report_reading(harness, &mut pane, 1, reading(level));
         report_status(
             harness,
@@ -1736,7 +1911,7 @@ mod tests {
         frame(&mut harness, &mut pane);
 
         assert!(
-            read(&harness, &pane.widget.countdown_signal).is_some(),
+            read(&harness, &pane.widget.countdown.label).is_some(),
             "a ready pane counts down to its next read"
         );
         assert!(!pane.widget.refresh_is_disabled(harness.app()));
@@ -1749,7 +1924,7 @@ mod tests {
         );
         frame(&mut harness, &mut pane);
         assert!(
-            read(&harness, &pane.widget.countdown_signal).is_none(),
+            read(&harness, &pane.widget.countdown.label).is_none(),
             "a failed pane is not counting down to anything"
         );
         assert!(pane.widget.refresh_is_disabled(harness.app()));
@@ -1782,7 +1957,7 @@ mod tests {
         );
         assert!(pane.widget.current_key().is_none());
         assert!(
-            read(&harness, &pane.widget.countdown_signal).is_none(),
+            read(&harness, &pane.widget.countdown.label).is_none(),
             "a pane waiting for an account is not counting down to a read"
         );
     }
@@ -2059,11 +2234,13 @@ mod tests {
             .expect("the control is kept for release");
         assert_eq!(
             button.action_identity(),
-            Some(Action::Custom(format_smolstr!(
-                "pentagon_pizza_index.refresh.{}.click",
-                pane.audience_parent.to_bits()
-            ))),
-            "the control's click is an engine action"
+            Some(Action::Custom(format_smolstr!("{}.click", button.key()))),
+            "the control's click is an engine action named by the control's key"
+        );
+        assert!(
+            button.key().starts_with("pentagon_pizza_index.refresh@"),
+            "the key is this pane's own rather than a constant two panes would share: {}",
+            button.key()
         );
         assert!(
             !*harness.app().read(&button.interactive().disabled_signal()),
@@ -2080,8 +2257,17 @@ mod tests {
         let mut pane = pane(&mut harness);
         load(&mut harness, &mut pane);
         build_header(&mut harness, &mut pane);
-        frame(&mut harness, &mut pane);
 
+        // The state is the control's own from the first frame: a control built while
+        // the pane has nothing to refresh must not be drawn live for one frame
+        // (AGENTS §4.2).
+        let button = pane.widget.refresh_button.as_ref().expect("the control");
+        assert!(
+            read(&harness, &button.interactive().disabled_signal()),
+            "the control is born disabled when there is nothing to refresh"
+        );
+
+        frame(&mut harness, &mut pane);
         let button = pane.widget.refresh_button.as_ref().expect("the control");
         assert!(
             read(&harness, &button.interactive().disabled_signal()),
@@ -2196,6 +2382,416 @@ mod tests {
             Some(LanguageCode::ZhCn),
             "the pane recorded the language it rebuilt the control in"
         );
+    }
+
+    // ── countdown lifecycle ──────────────────────────────────────────────────
+
+    /// A tick recomputes the label from the wall clock against the deadline the pane
+    /// holds, and only the tick that moved the label asks for a frame (I3).
+    #[test]
+    fn a_countdown_tick_should_move_the_label_on_the_clock() {
+        let clock = TestClock::new(0);
+        let mut harness = harness();
+        let mut pane = ready_pane_at_clock(&mut harness, 2, 600_000, clock.now());
+        build_header(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        assert_eq!(countdown_text(&harness), "10:00");
+
+        let requests = harness.frame_requests();
+        assert!(
+            !harness.advance(Duration::from_millis(125)),
+            "half the interval is an idle round"
+        );
+        assert_eq!(countdown_text(&harness), "10:00");
+
+        clock.set(1_000);
+        assert!(
+            harness.advance(Duration::from_millis(125)),
+            "the tick that reached the deadline drew the label it moved"
+        );
+        assert_eq!(countdown_text(&harness), "09:59");
+        assert!(harness.frame_requests() > requests);
+    }
+
+    /// The timer re-arms itself for the next interval, so the label keeps moving
+    /// without any polling task.
+    #[test]
+    fn a_countdown_should_rearm_its_timer_for_each_tick() {
+        let clock = TestClock::new(0);
+        let mut harness = harness();
+        let mut pane = ready_pane_at_clock(&mut harness, 2, 600_000, clock.now());
+        build_header(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        assert!(pane.widget.countdown.timer.borrow().is_some());
+
+        for second in 1..=3 {
+            clock.set(second * 1_000);
+            assert!(
+                harness.advance(COUNTDOWN_TICK),
+                "tick {second} moved the label"
+            );
+            assert_eq!(countdown_text(&harness), format!("09:{:02}", 60 - second));
+            assert!(
+                pane.widget.countdown.timer.borrow().is_some(),
+                "the chain re-armed itself after tick {second}"
+            );
+        }
+    }
+
+    /// A failure and a sign-out both take the schedule away, and the pending tick is
+    /// cancelled with it rather than left to fire one last time.
+    #[test]
+    fn a_failed_or_signed_out_pane_should_stop_the_countdown() {
+        // A failure takes the schedule away, and the tick with it.
+        {
+            let clock = TestClock::new(0);
+            let mut harness = harness();
+            let mut pane = ready_pane_at_clock(&mut harness, 2, 600_000, clock.now());
+            build_header(&mut harness, &mut pane);
+            frame(&mut harness, &mut pane);
+            assert!(pane.widget.countdown.timer.borrow().is_some());
+
+            report_status(
+                &mut harness,
+                &mut pane,
+                PizzaStatus::Failed(PizzaFetchError::Service(KytrixServiceError::Timeout)),
+            );
+            frame(&mut harness, &mut pane);
+            assert!(
+                pane.widget.countdown.timer.borrow().is_none(),
+                "the failed pane's tick is cancelled"
+            );
+            assert!(
+                read(&harness, &pane.widget.countdown.label).is_none(),
+                "a failed pane is not counting down to anything"
+            );
+            harness.drain();
+            let requests = harness.frame_requests();
+            assert!(
+                !harness.advance(COUNTDOWN_TICK * 4),
+                "a pane that stopped has no timer left to fire"
+            );
+            assert_eq!(harness.frame_requests(), requests);
+            assert_eq!(countdown_text(&harness), "");
+        }
+
+        // ... and the same for the reader who signed out: the label does not come
+        // back a tick later.
+        let clock = TestClock::new(0);
+        let mut harness = harness();
+        let mut pane = ready_pane_at_clock(&mut harness, 2, 600_000, clock.now());
+        build_header(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        assert!(pane.widget.countdown.timer.borrow().is_some());
+
+        sign_out(&mut harness);
+        sync(&mut harness, &mut pane);
+        assert!(
+            pane.widget.countdown.timer.borrow().is_none(),
+            "the signed-out pane's tick is cancelled"
+        );
+        assert!(read(&harness, &pane.widget.countdown.label).is_none());
+        harness.drain();
+        let requests = harness.frame_requests();
+        assert!(!harness.advance(COUNTDOWN_TICK * 4));
+        assert_eq!(harness.frame_requests(), requests);
+        assert_eq!(
+            countdown_text(&harness),
+            "",
+            "the label does not come back after the account left"
+        );
+    }
+
+    /// Releasing the pane cancels the tick: nothing the pane registered may keep waking
+    /// the engine (or writing a signal whose scope is gone) after it is released.
+    #[test]
+    fn releasing_the_pane_should_cancel_the_countdown_timer() {
+        let clock = TestClock::new(0);
+        let mut harness = harness();
+        let mut pane = ready_pane_at_clock(&mut harness, 2, 600_000, clock.now());
+        build_header(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+
+        assert!(pane.widget.countdown.timer.borrow().is_some());
+
+        harness.with_cx(|cx| pane.widget.release(cx));
+
+        assert!(
+            pane.widget.countdown.timer.borrow().is_none(),
+            "release cancels the tick"
+        );
+        assert!(read(&harness, &pane.widget.countdown.label).is_none());
+        harness.drain();
+        let requests = harness.frame_requests();
+        assert!(
+            !harness.advance(COUNTDOWN_TICK * 4),
+            "a released pane's timer never fires"
+        );
+        assert_eq!(harness.frame_requests(), requests);
+    }
+
+    /// A deadline that goes away and comes back before the cancelled tick was due arms
+    /// exactly one chain: the pending tick is cancelled before the next one is armed.
+    #[test]
+    fn a_deadline_that_comes_back_should_not_arm_a_second_timer_chain() {
+        let clock = TestClock::new(0);
+        let mut harness = harness();
+        let mut pane = ready_pane_at_clock(&mut harness, 2, 600_000, clock.now());
+        build_header(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        assert!(pane.widget.countdown.timer.borrow().is_some());
+
+        // A read in flight takes the schedule away ...
+        report_status(
+            &mut harness,
+            &mut pane,
+            PizzaStatus::Refreshing {
+                next_refresh_at: 600_000,
+            },
+        );
+        sync(&mut harness, &mut pane);
+        assert!(
+            pane.widget.countdown.timer.borrow().is_none(),
+            "the read in flight cancelled the tick it replaced"
+        );
+        assert!(read(&harness, &pane.widget.countdown.label).is_none());
+
+        // ... and the answer puts the same deadline back before the cancelled tick would
+        // have been due.
+        report_status(
+            &mut harness,
+            &mut pane,
+            PizzaStatus::Ready {
+                revision: 1,
+                next_refresh_at: 600_000,
+            },
+        );
+        sync(&mut harness, &mut pane);
+
+        let reads = clock.reads();
+        let requests = harness.frame_requests();
+        harness.advance(COUNTDOWN_TICK);
+        assert_eq!(
+            clock.reads() - reads,
+            1,
+            "the deadline that came back arms one chain, not two"
+        );
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "the tick that changed nothing asks for no frame"
+        );
+
+        clock.set(1_000);
+        let reads = clock.reads();
+        harness.advance(COUNTDOWN_TICK);
+        assert_eq!(countdown_text(&harness), "09:59");
+        assert_eq!(
+            clock.reads() - reads,
+            1,
+            "and the surviving chain ticks once per round"
+        );
+    }
+
+    /// The countdown label the header draws.
+    fn countdown_text(harness: &WidgetTestApp) -> String {
+        text_node(harness, "TEST_PENTAGON_PIZZA_INDEX_COUNTDOWN")
+    }
+
+    // ── multi-pane keys ──────────────────────────────────────────────────────
+
+    /// The key of the refresh control a pane just built into `parent`.
+    ///
+    /// The control's key is its debug id prefix, so the test reads it back rather than
+    /// reconstructing the format: what it asserts is the pane's own identity, not how
+    /// `unique_key` spells it.
+    fn built_control_key(harness: &WidgetTestApp, parent: NodeId, before: &[NodeId]) -> SmolStr {
+        let wrapper = harness
+            .tree()
+            .get(parent)
+            .expect("the header row exists")
+            .children()
+            .iter()
+            .find(|child| !before.contains(child))
+            .copied()
+            .expect("the header built a control");
+        let debug = harness
+            .find_by_debug_prefix(wrapper, "pentagon_pizza_index.refresh")
+            .and_then(|node| harness.tree().debug_id(node))
+            .expect("the refresh control is built");
+        // The kit names the node its key identifies with an `:interactive` suffix; what
+        // is left is the key the action was derived from.
+        SmolStr::new(
+            debug
+                .strip_suffix(":interactive")
+                .expect("the kit names its interactive node after the key"),
+        )
+    }
+
+    fn children_of(harness: &WidgetTestApp, parent: NodeId) -> Vec<NodeId> {
+        harness
+            .tree()
+            .get(parent)
+            .expect("the header row exists")
+            .children()
+            .to_vec()
+    }
+
+    /// Two panes in one application build their own controls: the key is the pane's, so
+    /// building the second does not take the first's handler and releasing the first
+    /// does not take the second's (AGENTS §1.11 and §11's multi-pane rule).
+    #[test]
+    fn two_panes_should_keep_their_own_refresh_controls() {
+        let mut harness = harness();
+        let first = harness.mount::<PentagonPizzaIndexWidget>(PentagonPizzaIndexConfig);
+        let second = harness.mount::<PentagonPizzaIndexWidget>(PentagonPizzaIndexConfig);
+        harness.drain();
+        let parent = harness.placeholder_parent();
+
+        let before = children_of(&harness, parent);
+        first
+            .header(harness.app_mut(), HeaderGroup::Right, parent)
+            .expect("the first pane's header builds");
+        let first_key = built_control_key(&harness, parent, &before);
+        let before = children_of(&harness, parent);
+        second
+            .header(harness.app_mut(), HeaderGroup::Right, parent)
+            .expect("the second pane's header builds");
+        let second_key = built_control_key(&harness, parent, &before);
+
+        let first_action = Action::Custom(format_smolstr!("{first_key}.click"));
+        let second_action = Action::Custom(format_smolstr!("{second_key}.click"));
+        assert!(
+            harness.app().has_action_handler(&first_action),
+            "the first pane's control has a click handler"
+        );
+        assert!(
+            harness.app().has_action_handler(&second_action),
+            "building the second pane did not take the first pane's handler"
+        );
+
+        first.release(harness.app_mut());
+
+        assert!(
+            !harness.app().has_action_handler(&first_action),
+            "releasing the first pane took its own handler"
+        );
+        assert!(
+            harness.app().has_action_handler(&second_action),
+            "and left the second pane's handler alone"
+        );
+        assert_ne!(
+            first_key, second_key,
+            "two panes build their controls under different keys"
+        );
+        assert!(
+            harness.tree().get(parent).is_ok(),
+            "the header row both panes built into is not the released pane's to remove"
+        );
+    }
+
+    // ── RPC reply attribution ────────────────────────────────────────────────
+
+    /// An answer that was already in the inbox when the account changed is applied to
+    /// the command it answers, not to the load that replaced it: the replacement still
+    /// waits for its own answer, and the old command's failure is not reported as the
+    /// new account's.
+    #[test]
+    fn a_replaced_commands_answer_should_not_clear_the_command_that_replaced_it() {
+        let mut harness = harness();
+        let due = unix_millis().saturating_add(600_000);
+        let mut pane = ready_pane(&mut harness, 2, due);
+        frame(&mut harness, &mut pane);
+
+        // The click starts a refresh whose answer is already waiting when the frame
+        // that changes the account runs.
+        harness
+            .with_cx(|cx| pane.widget.refresh(cx))
+            .expect("the refresh starts");
+        assert!(pane.widget.refresh_pending);
+        let mut delivered = false;
+        for _ in 0..64 {
+            harness.drain_runtime();
+            if !pane
+                .widget
+                .binding
+                .as_ref()
+                .expect("the pane has a bridge")
+                .inbox()
+                .is_empty()
+            {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "the refresh was answered before the frame");
+
+        sign_in(&mut harness, "second-account");
+        sync(&mut harness, &mut pane);
+
+        assert!(
+            pane.widget.load_pending,
+            "the replacement's own answer is still waited for"
+        );
+        assert!(!pane.widget.refresh_pending);
+        assert_eq!(
+            reported(&pane, &harness),
+            WidgetState::Connecting,
+            "the old command's answer did not become the new account's failure"
+        );
+
+        // ... and the load's own acknowledgement reaches the pane when it arrives.
+        for _ in 0..64 {
+            harness.drain_runtime();
+            sync(&mut harness, &mut pane);
+            if !pane.widget.load_pending {
+                break;
+            }
+        }
+        assert!(
+            !pane.widget.load_pending,
+            "the load's own acknowledgement was applied"
+        );
+    }
+
+    /// A reply carrying a request identity the pane has already answered is not the
+    /// answer to the command now in flight.
+    #[test]
+    fn a_reply_the_pane_already_answered_should_not_clear_the_command_in_flight() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let mut pane = pane(&mut harness);
+        frame(&mut harness, &mut pane);
+
+        // The first reply the pane consumes is the acknowledgement of a load.
+        harness.with_cx(|cx| {
+            pane.widget
+                .apply_rpc(RequestId::new(1), Ok(PizzaResponse::StreamStarted), cx);
+        });
+        assert_eq!(pane.widget.last_request_id, Some(RequestId::new(1)));
+
+        // A command is in flight ...
+        harness
+            .with_cx(|cx| pane.widget.start(false, cx))
+            .expect("the load starts");
+        assert!(pane.widget.load_pending);
+
+        // ... and an answer the pane has already applied cannot be its answer.
+        harness.with_cx(|cx| {
+            pane.widget.apply_rpc(
+                RequestId::new(1),
+                Err(RpcCallError::ServiceClosed {
+                    request_id: RequestId::new(1),
+                }),
+                cx,
+            );
+        });
+
+        assert!(
+            pane.widget.load_pending,
+            "the stale reply did not answer the command in flight"
+        );
+        assert_eq!(reported(&pane, &harness), WidgetState::Connecting);
     }
 
     // ── service seam ────────────────────────────────────────────────────────
