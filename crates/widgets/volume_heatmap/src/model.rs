@@ -29,7 +29,7 @@
 //!
 //! Everything here is pure: it takes what one venue answered and produces the
 //! list of tiles, with the labels already formatted. Nothing in this module knows
-//! about GPUI or about the streams the answers arrive on.
+//! about the UI toolkit or about the streams the answers arrive on.
 
 use std::{cmp::Ordering, sync::Arc};
 
