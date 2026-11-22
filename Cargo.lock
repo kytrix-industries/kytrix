@@ -11380,9 +11380,8 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
+ "bytes",
  "i18n",
  "kytrix_service_provider",
  "log",

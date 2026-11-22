@@ -23,6 +23,7 @@ use std::sync::Arc;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
+    error::EngineError,
     math::{Point, Size},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
     paint::{color::Color, style::StylePatch},
@@ -369,17 +370,16 @@ pub struct MarkdownNode {
 impl MarkdownNode {
     /// 在 `parent` 下挂载（根节点 debug id = `MARKDOWN`），样式取 `theme` 的**当前外观**。
     ///
-    /// # Panics
-    /// 窗口已关闭 / `parent` 已卸载（与 [`MarkdownView::build`] 同一契约：根节点建树失败
-    /// 只可能是调用方给了陈旧句柄）。
-    #[must_use]
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]（`window` 已关闭）/ 根节点建树错误（`parent` 已卸载，
+    /// 只可能是调用方给了陈旧句柄）。失败时不留半建的子树：根节点就是建树的全部前置。
     pub fn mount(
         app: &mut App,
         window: WindowId,
         parent: NodeId,
         theme: ThemeHandle,
         document: Arc<MarkdownDocument>,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
         let appearance = theme.current(app);
         let view = MarkdownView::new(
             document.clone(),
@@ -402,28 +402,27 @@ impl MarkdownNode {
             })
             .build(
                 app.window_mut(window)
-                    .expect("markdown: window must be alive")
+                    .ok_or(EngineError::UnknownWindow { window })?
                     .tree_mut(),
                 parent,
-            )
-            .expect("markdown root needs a live parent");
+            )?;
         let mut images = super::inline_flow::PlaceholderImagePaint {
             color: view.style.image_placeholder,
         };
         let handles = view.build_into(
             app.window_mut(window)
-                .expect("markdown: window must be alive")
+                .ok_or(EngineError::UnknownWindow { window })?
                 .tree_mut(),
             root,
             &mut images,
         );
-        Self {
+        Ok(Self {
             root,
             document,
             theme,
             appearance,
             handles,
-        }
+        })
     }
 
     /// 外观变化时按新主题重建子树；返回是否重建（帧钩子里、样式 pass 之前调用）。
@@ -1415,7 +1414,8 @@ mod tests {
                 code: SmolStr::new_static("let x = 1;"),
             },
         ]);
-        let mut node = MarkdownNode::mount(app.app_mut(), window, root, theme.clone(), doc);
+        let mut node = MarkdownNode::mount(app.app_mut(), window, root, theme.clone(), doc)
+            .expect("the markdown mounts");
         let _ = app.drain().expect("首帧");
 
         assert_eq!(
@@ -1482,7 +1482,8 @@ mod tests {
             .map(|index| paragraph(vec![text(&format!("段落 {index}"))]))
             .collect::<Vec<_>>();
         let mut node =
-            MarkdownNode::mount(app.app_mut(), window, page, theme.clone(), document(blocks));
+            MarkdownNode::mount(app.app_mut(), window, page, theme.clone(), document(blocks))
+                .expect("the markdown mounts");
         let _ = app.drain().expect("首帧");
         app.app_mut()
             .scroll_to(&handle, Point::new(0.0, 240.0))
@@ -1553,7 +1554,8 @@ mod tests {
                     code: SmolStr::new_static("let x = 1;"),
                 },
             ]),
-        );
+        )
+        .expect("the markdown mounts");
         let _ = app
             .drain()
             .expect("首帧（样式 pass 求值根节点的 bind_style）");

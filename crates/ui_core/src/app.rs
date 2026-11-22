@@ -683,6 +683,16 @@ impl App {
         resources::on_frame(self, hook)
     }
 
+    /// 单槽是否已被 `App::on_frame` 占用。
+    ///
+    /// `on_frame` 是单槽（后注册覆盖先注册），静默替换会让先安装的帧钩子停摆；安装协议因此
+    /// 需要一个「槽是否空闲」的读点。消费者：`widget::frame::FrameRouter::new` / `install`，
+    /// 它们在槽被占用时返回 [`EngineError::FrameHookInstalled`]。
+    #[must_use]
+    pub fn frame_hook_installed(&self) -> bool {
+        self.frame_hook.is_some()
+    }
+
     /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
     ///
     /// D-6 起钩子之前先轮询一次异步解码结果（`App::poll_resources`）：平台泵每轮都会调用本函数，
