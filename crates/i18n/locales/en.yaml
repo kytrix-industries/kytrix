@@ -1163,6 +1163,11 @@ window:
     rename: Rename
     settings: Settings
     toggle: Toggle sidebar
+  system:
+    close: Close
+    maximize: Maximize
+    minimize: Minimize
+    restore: Restore
   updater:
     available: Update available
     download: Update
