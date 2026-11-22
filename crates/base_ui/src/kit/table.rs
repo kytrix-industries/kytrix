@@ -407,6 +407,7 @@ impl Table {
                 padding_y: 0.0,
                 row_stretch: fixed_rows,
                 scrollbar: options.scrollbar,
+                separator: false,
             },
             move |tree, parent, row| {
                 let count = count_for_rows.get();

@@ -22,6 +22,9 @@
 //! 3. 每轮调用一次 [`InputNode::sync`]（推荐放在外壳自己的 `on_frame` 钩子里，即帧之前）：
 //!    镜像引擎焦点、开关 IME、把 caret/选区画布交给引擎。
 //!
+//! 卸载输入框时调用一次 [`InputNode::release`]：摘除 `install` 注册的两个 Action handler
+//! （幂等；构建期 `disabled` 的输入框 `install` 是 no-op，release 返回 0）。
+//!
 //! 编辑产生的 `Change` / `Blur` 由外壳**读状态信号**观察（`InputState::text` / `is_focused` /
 //! `error`）；`PressEnter` 通过 [`InputSpec::submit`] 动作表达（单行输入在焦点节点上派发）。
 //! 图标 / 清空按钮 / 密码可见性切换都依赖「图标与资源」批次，本模块不引入。
@@ -1656,6 +1659,22 @@ impl InputNode {
         });
     }
 
+    /// 摘除 [`InputNode::install`] 注册的点击定位 / 拖选处理器（释放面；幂等）。
+    ///
+    /// 输入框**不持有**信号作用域：编辑状态与占位符信号由调用方创建、归调用方所有（见
+    /// [`build`] 的参数说明），因此释放面只摘本模块注册的两个 Action handler；节点卸载与
+    /// 作用域回收由调用方负责。**先卸载节点再 release**（handler 闭包捕获了状态信号，信号
+    /// 已释放后再求值会读死句柄）。
+    ///
+    /// 返回摘除的 handler 数：正常输入框首次 2、重复调用 0；构建期 `disabled` 的输入框
+    /// `install` 是 no-op，release 也返回 0。
+    pub fn release(&self, app: &mut App) -> usize {
+        [click_action(&self.spec), drag_action(&self.spec)]
+            .iter()
+            .filter(|action| app.off_action(action))
+            .count()
+    }
+
     /// 运行时写值（旧 `set_value` 的**程序化契约**；生产调用点在 P2-5 接线时直接换过来）。
     ///
     /// 与用户级 [`InputState::set_text`] 的差别（对照旧 gpui-base `input/base/state.rs`）：
@@ -2109,7 +2128,10 @@ mod tests {
 
     use smol_str::SmolStr;
     use ui_core::{
-        event::{Action, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, PointerButton},
+        event::{
+            Action, ActionSource, Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers,
+            PointerButton,
+        },
         interaction::ScrollHandle,
         math::{Point, Rect},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeKind},
@@ -2124,7 +2146,7 @@ mod tests {
 
     use super::{
         CaretMotion, InputError, InputNode, InputSpec, InputState, build, click_action,
-        utf8_from_utf16_offset, utf16_len,
+        drag_action, utf8_from_utf16_offset, utf16_len,
     };
     use crate::{
         style_builder::StyleBuilder,
@@ -2917,6 +2939,66 @@ mod tests {
             "主键点击必须把焦点交给输入框"
         );
         assert_eq!(harness.state().caret(), 0, "点在文本最左：caret 到 0");
+    }
+
+    /// **P2-9 释放面**：`release` 摘掉 `install` 注册的两个 handler，重复调用幂等；之后程序化
+    /// 派发点击动作不再被处理。
+    ///
+    /// 变异防线：release 只摘 click（漏 drag）/ 整体 no-op ⇒ 本用例红。
+    #[test]
+    fn release_detaches_the_click_and_drag_handlers_and_is_idempotent() {
+        let mut harness = harness(spec(), state("hello"));
+        let click = click_action(&harness.node.spec);
+        let drag = drag_action(&harness.node.spec);
+        assert!(
+            harness.app.app().has_action_handler(&click),
+            "install 注册点击定位"
+        );
+        assert!(
+            harness.app.app().has_action_handler(&drag),
+            "install 注册拖选"
+        );
+
+        assert_eq!(harness.node.release(harness.app.app_mut()), 2);
+        assert!(!harness.app.app().has_action_handler(&click));
+        assert!(!harness.app.app().has_action_handler(&drag));
+
+        let window = harness.window();
+        let root = harness.node.root;
+        assert!(
+            !harness.app.app_mut().dispatch_action(
+                window,
+                root,
+                click.clone(),
+                ActionSource::Programmatic
+            ),
+            "release 之后点击动作没有 handler（不再被处理）"
+        );
+
+        assert_eq!(
+            harness.node.release(harness.app.app_mut()),
+            0,
+            "重复 release 幂等"
+        );
+        assert!(!harness.app.app().has_action_handler(&click));
+        assert!(!harness.app.app().has_action_handler(&drag));
+    }
+
+    /// 构建期禁用的输入框 `install` 是 no-op：release 返回 0（没有可摘的 handler）。
+    #[test]
+    fn releasing_a_disabled_input_reports_nothing_to_release() {
+        let mut harness = harness(
+            InputSpec {
+                disabled: true,
+                ..spec()
+            },
+            state("hello"),
+        );
+        assert_eq!(
+            harness.node.release(harness.app.app_mut()),
+            0,
+            "禁用的输入框没有注册 handler"
+        );
     }
 
     #[test]

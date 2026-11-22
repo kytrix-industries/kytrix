@@ -78,6 +78,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::{App, AppHandle},
     error::EngineError,
+    event::Action,
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -117,11 +118,13 @@ const DIALOG_HEIGHT: f32 = 680.0;
 /// The deadline one translation gets after its model finished loading.
 const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(20);
 /// The kit key of the dialog itself.
-const DIALOG_KEY: &str = "prediction-selector";
-/// The node id of the selector's own content area, which tests look for.
+const KEY_BASE: &str = "prediction-selector";
+/// The node id of the selector's own content area (and of the nodes inside it), which tests
+/// look for.
+///
+/// Node ids are diagnostics rather than action identities, so they stay the same in every
+/// dialog instance.
 const PANEL_ID: &str = "PREDICTION_EVENT_SELECTOR";
-/// The kit key of the search input.
-const SEARCH_INPUT_ID: &str = "prediction-event-search";
 
 /// One chunk's translation as the blocking pool returns it.
 type TranslationOutcome = Result<Vec<TranslatedSegment>, TranslationFailure>;
@@ -220,6 +223,16 @@ struct SelectorState<S: PredictionEventSource> {
     weak: Weak<PredictionEventSelector<S>>,
     host: SelectorHost,
     window: WindowId,
+    /// The per-instance prefix of every kit key this dialog registers:
+    /// `"prediction-selector@{scope}"`.
+    ///
+    /// The selector is not a widget, so it has no
+    /// [`WidgetCx::unique_key`](widget::cx::WidgetCx::unique_key); it mints its own signal
+    /// scope instead (the engine appends one scope slot per dialog and never recycles an
+    /// index), and this prefix is derived from that scope. Every button, select, tabs bar,
+    /// tooltip, spinner and the card click actions are keyed by it, so a second pane's
+    /// prediction selector cannot overwrite the first one's handlers.
+    key: SmolStr,
     /// The dialog's own signal scope: every signal this dialog mints belongs to it, and
     /// [`Self::finish`] releases it after the kit components have unmounted their nodes
     /// (E16). A root-scope signal would never be reclaimed, so every open/close cycle
@@ -266,6 +279,11 @@ struct SelectorState<S: PredictionEventSource> {
     tabs_count: usize,
     body_node: Option<NodeId>,
     body_children: Vec<NodeId>,
+    /// The card click actions this dialog registered with [`App::on_action`], so
+    /// [`Self::finish`] can take them out again: the action identity is per-instance unique,
+    /// and a handler left behind would keep the dialog's callback closure alive for the rest
+    /// of the process.
+    card_actions: Vec<Action>,
     page_text: Signal<SmolStr>,
     /// Whether the translation control is drawn at all: the interface's own language needs
     /// no translation, and a disabled button on an English interface would be a control the
@@ -416,8 +434,11 @@ impl<S: PredictionEventSource> SelectorState<S> {
             .as_ref()
             .map(|event| event.route.venue)
             .unwrap_or(venues[0]);
-        // One scope per dialog: every signal below is reclaimed when `finish` releases it.
+        // One scope per dialog: every signal below is reclaimed when `finish` releases it, and
+        // the scope's index is what tells this dialog's kit keys from another pane's selector
+        // (see `SelectorState::key`).
         let scope = app.signal_scope();
+        let key = format_smolstr!("{KEY_BASE}@{}", scope.index());
         let search_input = app.signal_scoped(scope, InputState::new(""));
         let search_placeholder = app.signal_scoped(
             scope,
@@ -435,6 +456,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             weak,
             host: host.clone(),
             window,
+            key,
             scope,
             source,
             venues,
@@ -475,6 +497,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             tabs_count: 0,
             body_node: None,
             body_children: Vec::new(),
+            card_actions: Vec::new(),
             page_text,
             translate_visible,
             translate_button: None,
@@ -1030,7 +1053,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
     /* ── building ─────────────────────────────────────────────────────────── */
 
     fn build_dialog(selector: &Rc<PredictionEventSelector<S>>, app: &mut App) -> Dialog {
-        let (theme, translate, layer, animation, closed) = {
+        let (theme, translate, layer, animation, closed, key) = {
             let inner = selector.inner.borrow();
             (
                 inner.host.theme().clone(),
@@ -1038,6 +1061,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 inner.host.layer().clone(),
                 inner.host.animation(),
                 Rc::clone(&inner.closed),
+                inner.key.clone(),
             )
         };
         let weak = Rc::downgrade(selector);
@@ -1068,7 +1092,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 }
             })
             .on_close(move |_close, _app| closed.set(true))
-            .build(app, theme, layer, animation, DIALOG_KEY)
+            .build(app, theme, layer, animation, key)
     }
 
     fn register_route(selector: &Rc<PredictionEventSelector<S>>, host: &SelectorHost) -> RouteId {
@@ -1135,7 +1159,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             theme.clone(),
             layer.clone(),
             animation.clone(),
-            "prediction-venue",
+            format_smolstr!("{}:venue", self.key),
             SelectOptions::default(),
         )
         .on_change({
@@ -1165,7 +1189,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         self.select = Some(select);
 
         let spec = Arc::new(InputSpec {
-            name: SmolStr::new_static(SEARCH_INPUT_ID),
+            name: format_smolstr!("{}:search", self.key),
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
@@ -1230,26 +1254,30 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 })
                 .build(tree, parent)
         })?;
-        let translate_button = Button::new(app, theme.clone(), "prediction-translate")
-            .secondary()
-            .with_unified_size(UnifiedSize::Medium)
-            .icon(IconKind::Translate)
-            .a11y_label(t_smol!(translate, "prediction_selector.translate"))
-            .on_click({
-                let weak = Weak::clone(&self.weak);
-                move |ctx| {
-                    if let Some(selector) = weak.upgrade() {
-                        selector.inner.borrow_mut().start_translation(ctx.app_mut());
-                    }
+        let translate_button = Button::new(
+            app,
+            theme.clone(),
+            format_smolstr!("{}:translate", self.key),
+        )
+        .secondary()
+        .with_unified_size(UnifiedSize::Medium)
+        .icon(IconKind::Translate)
+        .a11y_label(t_smol!(translate, "prediction_selector.translate"))
+        .on_click({
+            let weak = Weak::clone(&self.weak);
+            move |ctx| {
+                if let Some(selector) = weak.upgrade() {
+                    selector.inner.borrow_mut().start_translation(ctx.app_mut());
                 }
-            });
+            }
+        });
         translate_button.build(app, window, translate_holder)?;
         let tooltip = Tooltip::new(
             app,
             theme.clone(),
             layer,
             animation,
-            "prediction-translate-tip",
+            format_smolstr!("{}:translate-tip", self.key),
             TooltipOptions::default(),
         );
         tooltip.set_content(Some(TooltipContent::new(t_smol!(
@@ -1303,7 +1331,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 )
                 .build(tree, root)
         })?;
-        let previous = Button::new(app, theme.clone(), "prediction-previous")
+        let previous = Button::new(app, theme.clone(), format_smolstr!("{}:previous", self.key))
             .ghost()
             .with_unified_size(UnifiedSize::Small)
             .label(t_smol!(translate, "prediction_selector.previous"))
@@ -1331,7 +1359,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
                 })
                 .build(tree, footer)
         })?;
-        let next = Button::new(app, theme, "prediction-next")
+        let next = Button::new(app, theme, format_smolstr!("{}:next", self.key))
             .ghost()
             .with_unified_size(UnifiedSize::Small)
             .label(t_smol!(translate, "prediction_selector.next"))
@@ -1373,7 +1401,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let tabs = TabBar::new(
             app,
             self.host.theme().clone(),
-            format_smolstr!("{PANEL_ID}:categories"),
+            format_smolstr!("{}:categories", self.key),
             items,
             TabBarOptions {
                 size: UnifiedSize::Small,
@@ -1646,7 +1674,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             match holder {
                 Ok(holder) => {
                     self.body_children.push(holder);
-                    let spinner = Spinner::new(app, theme, "prediction-spinner");
+                    let spinner = Spinner::new(app, theme, format_smolstr!("{}:spinner", self.key));
                     if let Err(error) = spinner.build(app, self.window, holder) {
                         log::warn!("building the prediction spinner failed: {error}");
                     }
@@ -1682,13 +1710,13 @@ impl<S: PredictionEventSource> SelectorState<S> {
             };
             self.body_children.push(holder);
             if let Err(error) = build_node(app, self.window, holder, |tree, holder| {
-                EmptyState::new(theme.clone(), "prediction-error")
+                EmptyState::new(theme.clone(), format_smolstr!("{}:error", self.key))
                     .text(message)
                     .build(tree, holder)
             }) {
                 log::warn!("building the prediction error message failed: {error}");
             }
-            let retry = Button::new(app, theme, "prediction-retry")
+            let retry = Button::new(app, theme, format_smolstr!("{}:retry", self.key))
                 .secondary()
                 .with_unified_size(UnifiedSize::Small)
                 .label(t_smol!(translate, "common.retry"))
@@ -1726,7 +1754,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             if let Ok(empty) = empty {
                 self.body_children.push(empty);
                 if let Err(error) = build_node(app, self.window, empty, |tree, empty| {
-                    EmptyState::new(theme, "prediction-empty")
+                    EmptyState::new(theme, format_smolstr!("{}:empty", self.key))
                         .text(t_smol!(translate, "prediction_selector.no_matching_events"))
                         .build(tree, empty)
                 }) {
@@ -1783,7 +1811,10 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let translate = self.host.translate().clone();
         let selected = self.selected.as_ref() == Some(&card.event);
         let reduce_motion = self.host.reduce_motion(app);
-        let action = ui_core::event::Action::Custom(format_smolstr!("{PANEL_ID}:select:{index}"));
+        let action = Action::Custom(format_smolstr!("{}:select:{index}", self.key));
+        if !self.card_actions.contains(&action) {
+            self.card_actions.push(action.clone());
+        }
         let event = card.event.clone();
         let title = card.title.clone();
         let weak = Weak::clone(&self.weak);
@@ -2073,7 +2104,14 @@ impl<S: PredictionEventSource> SelectorState<S> {
         if let Some(next) = self.next.take() {
             next.release(app);
         }
-        self.search_node = None;
+        if let Some(search) = self.search_node.take() {
+            // Kit's own release face (P2-9): detaches the click-to-place / drag-to-select
+            // handlers; the search input's signals live in this dialog's scope (released below).
+            search.release(app);
+        }
+        for action in self.card_actions.drain(..) {
+            app.off_action(&action);
+        }
         if let Some(id) = self.route_id.take() {
             self.router.unregister(id);
         }

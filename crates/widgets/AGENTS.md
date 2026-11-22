@@ -198,6 +198,7 @@ pub trait WidgetView: Sized + 'static {
 
 - `WidgetState::failed` 是**终态**：只有用户的恢复（重新 `load`）才离开。每个消息入口都要挡：`StreamKey` 是否仍属于当前
   scope、`status.is_failed(cx.app())`、等待目录时的 `awaiting_market` 等。
+- **RPC 答复先按精确 `RequestId` 归因**（§8.2 的在飞命令表）：未知 id = 替换后迟到的答复，丢弃并计数，不判失败、不重试。
 - 失败后不自动重连、不重试、不退避；错误由 widget 自己映射成强类型 `TranslatedError`。
 
 ---
@@ -349,10 +350,20 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 
 `WidgetBinding<P>` 把 tokio 侧结果投进 `WidgetInbox<P>` 并在交付时请求帧；widget 在 `sync` 里 `binding.take()` 消费：
 
-- `Inbound::{Reliable, Latest, Rpc}`；`Rpc` 带框架 `RequestId`，用于挡替换后的迟到响应。
-- `call` **替换并 abort** 上一次调用；`cancel` / `shutdown` 显式收尾；`Drop` 只 abort 转发任务。
-- 失败 / 取消后不再投递；widget 在 `sync` 里 drain 时先做 `is_failed` / `StreamKey` 守卫。
-- `Ready` 水位由**协议自己**定义：拿到完整快照不等于业务成功，widget 自己维护 `pending_snapshot` / `ready_received`。
+- `Inbound::{Reliable, Latest, Rpc}`。
+- **`call` 返回 `RequestId`（P3-1i）**：这是这条请求的框架身份，回复（`Inbound::Rpc { request_id, .. }`）携带同一个值。
+  `call` **替换并 abort** 上一次调用（abort 只挡尚未入箱的回复；已入箱的旧回复仍会到达）。
+- **在飞命令表（P3-1i，冻结写法）**：`widget::binding::Pending<C>`，`C` 是 widget 自己的命令枚举。发令时
+  `let id = binding.call(cx, request); self.pending.track(id, Command::X);`；收令时
+  `match self.pending.take(request_id) { Some(Command::X) => ..., None => { /* 丢弃 */ } }`。**未知 id = 替换后迟到的答复，
+  一律丢弃并计数（`pending.dropped()`），不得落到当前在飞命令上**——只有一个命令槽的 widget 也照此办理（W1 F11：
+  不要用「整体 pending 标志」或「id 单调比较」归因）。主动放弃命令（签出 / 失败 / 回到等待目录）时 `pending.clear()`
+  （不计数）；它之后的答复按迟到计。
+- 一个 binding 一张表；两个 binding 的 widget（如 `prediction_market` 的正文与盘口）各持一张。
+- 失败 / 取消后不再投递；widget 在 `sync` 里 drain 时先做 `is_failed` / `StreamKey` / `awaiting_market` 守卫——**id 归因与
+  终态守卫是两道独立的门**，缺一不可。
+- `Ready` 水位由**协议自己**定义：拿到完整快照不等于业务成功，widget 自己维护 `pending_snapshot` / `ready_received`
+  （「refresh 已请求、轮次还没上报」这类**轮次状态**不是命令槽：它随流消息清，不随答复清）。
 - 长任务由服务的流监督器持有；不 `detach` 无终点的任务，不写自动重连 / 退避。
 
 ### 8.3 目录：前置检查与世代变化
@@ -488,6 +499,8 @@ if generation != self.seen {
     测试自己写那个状态；
   - **观测面**（P3-1g）：`frame_index()`（提交游标，`0` = 未提交）、`frame_requests()`（I3 断言面）、`rendered()`
     （最近一轮是否提交像素；`advance` 的返回值就是本轮这个事实）。
+  - **值槽位统计**（P3-1i）：`signal_slot_stats() -> SignalSlotStats { slots, live, free }`（E21 透传）。释放断言的读点：
+    widget / 组件释放后 `live` 应回到 mount 前，反复开关不应让 `slots` 增长；根作用域铸造的信号永不回收，是它要抓的泄漏。
   - 断言面：`visible` / `text_of` / `has_text` / `has_canvas` / `has_inline_boxes` / `node_count` / `find_by_debug_prefix` /
     `click_recovery` / `enable_a11y_capture` + `a11y_hidden`。
 - **倒计时 / 定时器测试写法**（P3-1g；取代 W2c 自建的 `ClockHost`，补 W2b 的倒计时 timer 缺口）：
@@ -519,6 +532,56 @@ if generation != self.seen {
   `router.tick` → 帧（定时器在帧入口派发），生产是「定时器 → `FrameRouter::tick` → 帧」（`App::run_frame_hook`）。
   所以「`sync` 必须在本轮看到回调写入状态」的断言要多 `advance` 一次，或直接断言绘制结果——不要假设测试装置与
   生产泵逐拍同序。
+- **RPC 答复归因测试写法**（P3-1i；取代「整体 pending 标志 / id 单调比较」的旧断言）：
+
+  ```rust
+  #[test]
+  fn the_answer_to_a_replaced_command_should_be_dropped() {
+      let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+      let mut pane = pane(&mut harness);          // 测试自建 widget（bindings 的 id 从 1 起）
+      load(&mut harness, &mut pane);              // 第 1 条命令：Load（id 1）
+      replace_the_command(&mut harness, &mut pane); // 替换：第 2 条命令（id 2），旧 id 被遗忘
+
+      // 旧命令的答复（id 1）此刻才到：必须被丢弃，不能落到 id 2 的命令上。
+      harness.with_cx(|cx| {
+          pane.widget.apply_rpc(
+              RequestId::new(1),
+              Err(RpcCallError::ServiceClosed { request_id: RequestId::new(1) }),
+              cx,
+          );
+      });
+
+      assert!(!pane.status.is_failed(harness.app()), "旧命令的失败不是新命令的");
+      assert_eq!(pane.widget.pending.dropped(), 1, "迟到答复被丢弃并计数");
+  }
+  ```
+
+  断言三件：**匹配 id 的答复被应用**（成功 / 失败落到对应命令）、**未知 id 被丢弃且 `dropped()` 增长**、**终态不被迟到
+  答复重绘**。测试里手工构造 `Inbound::Rpc` 时，`request_id` 必须与 widget 实际发出的调用序列一致（每个 binding 的 id
+  从 1 开始，`call` 每次 +1，被替换也占号）；不确定时读 `pending` 或用注入通道。
+- **释放 / 泄漏断言写法**（P3-1i，W2c-R9）：
+
+  ```rust
+  #[test]
+  fn releasing_the_pane_should_reclaim_every_value_slot() {
+      let mut harness = WidgetTestApp::new();
+      let baseline = harness.signal_slot_stats();
+
+      let widget = harness.mount::<MyWidget>(MyConfig::default());
+      assert!(harness.signal_slot_stats().live > baseline.live, "widget 铸了自己的值");
+      widget.release(harness.app_mut());
+      assert_eq!(harness.signal_slot_stats().live, baseline.live, "释放归还全部值槽");
+
+      for _ in 0..8 {
+          let widget = harness.mount::<MyWidget>(MyConfig::default());
+          widget.release(harness.app_mut());
+      }
+      assert_eq!(harness.signal_slot_stats().slots, baseline.slots, "槽位复用，不增长");
+  }
+  ```
+
+  两个口径：`live`（当前存活，应回到基线）与 `slots`（分配过的总数，反复开关不应增长——增长说明释放没归还或每次都
+  新铸）。kit 组件的泄漏同样可测（`Button::release` 漏了组件作用域时 `live` 会涨），W2a 审查 F2 就是这么发现的。
 - 测试属性：纯逻辑 `#[test]`；涉及 tokio 服务 `#[tokio::test]`（dev-deps 开 `tokio` `test-util`）。界面测试一律经
   `WidgetTestApp`，不依赖任何窗口工具包。
 - 外部 crate 用测试装置：dev-dependencies 里 `widget = { workspace = true, features = ["test-support"] }`
@@ -548,7 +611,7 @@ if generation != self.seen {
 4. `model.rs` 纯逻辑 + 单测先行；`service.rs` 私有 Source trait + fake（正常 / 超时 / 失败 / 取消 / 替换）。
 5. `view.rs`：`new` 不干活、`load` 只做前置检查 + 启动、`has_content` 便宜、`body` 只建一次、状态只经 `report`。
 6. 每个改持久化字段的地方 `config_change.publish(cx.app_mut())`；规则 2 的校验在 `load` 里、订阅之前。
-7. 消息入口全部挡 `StreamKey` / `is_failed` / `awaiting_market`；失败即终态。
+7. 消息入口全部挡 `StreamKey` / `is_failed` / `awaiting_market`；RPC 答复按 `RequestId` 精确归因（§8.2）；失败即终态。
 8. 正文：`flex_1` + `min_*_0`，无自绘底色 / 圆角 / 裁剪；空快照画 `EmptyState` + `common.no_data`。
 9. 语言文本在 `bind_text` 里读语言；颜色在 `bind_style` 里读主题；不把颜色 / 句子烤进挂载期常量。
 10. `name-key` / 文案不自己拼；错误实现 `TranslatedError`。

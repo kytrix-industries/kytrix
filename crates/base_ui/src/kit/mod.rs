@@ -23,6 +23,7 @@
 //! | [`assets`] | 品牌图与 Widget 预览图的注册表、路径查找、引擎异步解码接线、E7 pending 节点来源 | `crate::assets` |
 //! | [`brand`] | 7 个品牌 logo（路径 / 字节 / 固有尺寸 / `Contain` 图片节点 / 可选 alt） | `crate::brand` |
 //! | [`size`] | 控件尺寸阶梯（读主题 `ComponentTokens`，不再重复维护数值） | `crate::size` |
+//! | [`text_value`] | 组件文案面：静态文本 / `Signal<SmolStr>` 绑定两态（badge / empty_state 复用） | 无（新基建） |
 //! | [`format`] | 数字分位格式化（纯文本） | `crate::format` |
 //! | [`motion`] | 深度条缓动的响应曲线（纯数学，不建帧循环） | `crate::motion` |
 //! | [`animation`] | 弹层淡出是否该出帧 + 动画 tick（消隐走引擎 `Transient`） | `crate::animation` |
@@ -30,11 +31,11 @@
 //! | [`interactive`] | 通用交互状态机（hover / pressed / focus / disabled / loading → `StylePatch`） | `crate::interactive` |
 //! | [`button`] | 按钮（变体 / 尺寸 / 图标 + 文字 / 加载 / 禁用 / on_click / a11y） | `crate::button` |
 //! | [`toggle`] | 开关 / 复选 / 单选（键盘 Space、状态动画、a11y checked） | `crate::toggle` |
-//! | [`badge`] | 状态标签（颜色 × 形状） | `crate::badge` |
+//! | [`badge`] | 状态标签（颜色 × 形状；文案静态 / 绑定两态） | `crate::badge` |
 //! | [`progress`] | 确定性进度条（轨道 + 指示器、a11y 数值通道） | `crate::progress` |
 //! | [`spinner`] | 旋转加载指示器（自绘画布 + 引擎动画） | `crate::spinner` |
 //! | [`separator`] | 分割线（横 / 纵） | `crate::separator` |
-//! | [`empty_state`] | 空态说明（弱化文字） | `crate::empty_state` |
+//! | [`empty_state`] | 空态说明（弱化文字；文案静态 / 绑定两态） | `crate::empty_state` |
 //! | [`alert`] | 对话框内容面板（4 类变体 / 输入校验 / 按钮行；内容根通用容器 + 关闭中双击守卫，按钮行实现与 dialog 共用） | `crate::alert` |
 //! | [`dialog`] | 模态对话框容器（遮罩 / 居中面板 / 焦点陷阱与恢复 / Esc 与点外部策略 / E13 组淡入淡出 + E10 完成回调 / a11y Dialog·AlertDialog；标题 / 关闭按钮 / 按钮行 / 确认取消回调；alert 内容协作） | `crate::dialog` + `crate::layer` 的 dialog·alert 槽 |
 //! | [`tab_bar`] | 标签栏（选中指示动画 / 方向键 / 关闭按钮 / a11y） | `crate::tab_bar` |
@@ -138,6 +139,7 @@ pub mod size;
 pub mod spinner;
 pub mod tab_bar;
 pub mod table;
+pub mod text_value;
 pub mod toggle;
 pub mod tooltip;
 pub mod tree;
