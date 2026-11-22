@@ -7898,10 +7898,8 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
  "futures",
- "gpui-kit",
  "i18n",
  "instrument_selector_ui",
  "log",
@@ -7910,11 +7908,12 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
+ "taffy",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

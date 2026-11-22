@@ -15,7 +15,7 @@
 //!   column of labels is stacked from the bottom up so the lowest one keeps its point,
 //!   and only a column too tall for the plot lets its upper boxes leave past 100%.
 
-use gpui_kit::{Bounds, Pixels, point, px};
+use ui_core::math::{Point, Rect, Size};
 
 use super::geometry::{Sample, ScreenPoint, ValueAxis, y_for_series};
 
@@ -66,7 +66,7 @@ pub(crate) fn nearest_timestamp(timestamps: &[i64], time: i64) -> Option<i64> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct HoveredSample {
     pub timestamp: i64,
-    pub x: Pixels,
+    pub x: f32,
 }
 
 /// The value a step line holds at `timestamp`.
@@ -86,7 +86,7 @@ pub(crate) fn value_at(samples: &[Sample], timestamp: i64) -> Option<f64> {
 pub(crate) fn hover_point(
     samples: &[Sample],
     axis: &ValueAxis,
-    plot: Bounds<Pixels>,
+    plot: Rect,
     hovered: HoveredSample,
 ) -> Option<ScreenPoint> {
     let percent = value_at(samples, hovered.timestamp)?;
@@ -101,12 +101,10 @@ pub(crate) fn hover_point(
 /// The right is preferred because it is what the reference chart does; the column
 /// flips only when its widest label would not fit there with the four-pixel strip the
 /// design keeps clear at the plot's right edge.
-pub(crate) fn label_side(
-    crosshair_x: Pixels,
-    widest_label: Pixels,
-    plot: Bounds<Pixels>,
-) -> LabelSide {
-    if crosshair_x + px(LABEL_GAP) + widest_label <= plot.right() - px(LABEL_RIGHT_MARGIN) {
+pub(crate) fn label_side(crosshair_x: f32, widest_label: f32, plot: Rect) -> LabelSide {
+    if crosshair_x + LABEL_GAP + widest_label
+        <= plot.origin.x + plot.size.width - LABEL_RIGHT_MARGIN
+    {
         LabelSide::Right
     } else {
         LabelSide::Left
@@ -119,17 +117,13 @@ pub(crate) fn label_side(
 /// `crosshair_x - 8` for every box, which is what keeps the column's edge straight
 /// even though the boxes differ in width. A box too wide for either side is clamped
 /// into the plot rather than drawn outside it.
-pub(crate) fn label_x(
-    crosshair_x: Pixels,
-    width: Pixels,
-    side: LabelSide,
-    plot: Bounds<Pixels>,
-) -> Pixels {
+pub(crate) fn label_x(crosshair_x: f32, width: f32, side: LabelSide, plot: Rect) -> f32 {
     let natural = match side {
-        LabelSide::Right => crosshair_x + px(LABEL_GAP),
-        LabelSide::Left => crosshair_x - px(LABEL_GAP) - width,
+        LabelSide::Right => crosshair_x + LABEL_GAP,
+        LabelSide::Left => crosshair_x - LABEL_GAP - width,
     };
-    natural.clamp(plot.origin.x, (plot.right() - width).max(plot.origin.x))
+    let right = plot.origin.x + plot.size.width;
+    natural.clamp(plot.origin.x, (right - width).max(plot.origin.x))
 }
 
 /// The top of every label box of a column, in the order the boxes were handed in.
@@ -142,19 +136,14 @@ pub(crate) fn label_x(
 /// that cannot fit even there is left above the plot. The whole column is never
 /// shifted because one box overflowed, which is what used to push a label at 0% out
 /// below the x axis.
-pub(crate) fn label_tops(
-    anchors: &[Pixels],
-    height: Pixels,
-    gap: Pixels,
-    plot: Bounds<Pixels>,
-) -> Vec<Pixels> {
+pub(crate) fn label_tops(anchors: &[f32], height: f32, gap: f32, plot: Rect) -> Vec<f32> {
     let mut tops = vec![plot.origin.y; anchors.len()];
     let mut order: Vec<usize> = (0..anchors.len()).collect();
     // Stable, so two labels drawn at the same point keep the series order.
-    order.sort_by(|left, right| f32::from(anchors[*right]).total_cmp(&f32::from(anchors[*left])));
-    let mut top_below: Option<Pixels> = None;
+    order.sort_by(|left, right| anchors[*right].total_cmp(&anchors[*left]));
+    let mut top_below: Option<f32> = None;
     for index in order {
-        let mut bottom = anchors[index].min(plot.bottom());
+        let mut bottom = anchors[index].min(plot.origin.y + plot.size.height);
         if let Some(top_below) = top_below {
             bottom = bottom.min(top_below - gap);
         }
@@ -176,10 +165,10 @@ pub(crate) fn label_tops(
 ///
 /// Both are drawn as rounded quads: a filled circle is a quad whose corner radii are
 /// half its side.
-pub(crate) fn dot_bounds(center: ScreenPoint, diameter: Pixels) -> Bounds<Pixels> {
+pub(crate) fn dot_bounds(center: ScreenPoint, diameter: f32) -> Rect {
     let radius = diameter / 2.0;
-    Bounds::new(
-        point(center.x - radius, center.y - radius),
-        gpui_kit::size(diameter, diameter),
+    Rect::from_origin_size(
+        Point::new(center.x - radius, center.y - radius),
+        Size::new(diameter, diameter),
     )
 }

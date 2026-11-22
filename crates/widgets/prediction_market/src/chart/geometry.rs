@@ -1,7 +1,7 @@
 //! Where a prediction chart's boxes, domains and ticks come from.
 //!
 //! Everything here is a function of the frame's inputs and nothing else: the box the
-//! element was given, the timestamps and probabilities of one snapshot, and the
+//! canvas node was laid out in, the timestamps and probabilities of one snapshot, and the
 //! display time zone. Nothing paints, nothing reads a window, and nothing here holds
 //! state — a resize is a new box, never a recomputation to remember.
 //!
@@ -17,9 +17,9 @@
 //! makes a step line enter the plot at its left edge and what lets the pointer read a
 //! value between two samples.
 
-use gpui_kit::{Bounds, Pixels, point, px, size};
 use market_participants_model::{decimal::Fraction, prediction::PredictionRange};
 use time::{Date, Month, OffsetDateTime, UtcOffset};
+use ui_core::math::{Point, Rect, Size};
 
 /// The room kept left of the plot.
 pub(crate) const LEFT_INSET: f32 = 8.0;
@@ -82,44 +82,64 @@ const PERCENT_SCALE: f64 = 1e16;
 /// antialiased edge, so both extremes stay visible at the axis.
 const SERIES_EDGE_INSET: f32 = 2.0;
 
+/// The far edges of a box.
+///
+/// Every box on this chart is placed from the box before it — the plot from the
+/// canvas, a label from its tick — and that arithmetic reads a far edge far more often
+/// than an origin. The engine's [`Rect`] stores the origin and the size, so the two
+/// derived readings live here rather than being written out in every placement.
+pub(crate) trait RectExt {
+    /// `origin.x + size.width`.
+    fn right(self) -> f32;
+    /// `origin.y + size.height`.
+    fn bottom(self) -> f32;
+}
+
+impl RectExt for Rect {
+    fn right(self) -> f32 {
+        self.origin.x + self.size.width
+    }
+
+    fn bottom(self) -> f32 {
+        self.origin.y + self.size.height
+    }
+}
+
 /// The box a chart is drawn in, and the plot inside it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ChartLayout {
-    /// The box the canvas was given, which is also the map's content mask.
-    pub bounds: Bounds<Pixels>,
+    /// The box the canvas node was given, which is also the map's content mask.
+    pub bounds: Rect,
     /// The only box data is drawn in.
-    pub plot: Bounds<Pixels>,
+    pub plot: Rect,
 }
 
 impl ChartLayout {
     /// Places the plot inside `bounds`, reserving the strips around it.
-    pub(crate) fn new(bounds: Bounds<Pixels>) -> Self {
-        let plot = Bounds::new(
-            point(
-                bounds.origin.x + px(LEFT_INSET),
-                bounds.origin.y + px(TOP_STRIP),
-            ),
-            size(
-                (bounds.size.width - px(LEFT_INSET + RIGHT_GUTTER)).max(Pixels::ZERO),
-                (bounds.size.height - px(TOP_STRIP + BOTTOM_BAND)).max(Pixels::ZERO),
+    pub(crate) fn new(bounds: Rect) -> Self {
+        let plot = Rect::from_origin_size(
+            Point::new(bounds.origin.x + LEFT_INSET, bounds.origin.y + TOP_STRIP),
+            Size::new(
+                (bounds.size.width - (LEFT_INSET + RIGHT_GUTTER)).max(0.0),
+                (bounds.size.height - (TOP_STRIP + BOTTOM_BAND)).max(0.0),
             ),
         );
         Self { bounds, plot }
     }
 
     /// The strip above the plot that holds the hovered time.
-    pub(crate) fn top_strip(self) -> Bounds<Pixels> {
-        Bounds::new(
+    pub(crate) fn top_strip(self) -> Rect {
+        Rect::from_origin_size(
             self.bounds.origin,
-            size(self.bounds.size.width, px(TOP_STRIP)),
+            Size::new(self.bounds.size.width, TOP_STRIP),
         )
     }
 
     /// The band under the plot that holds the x labels.
-    pub(crate) fn bottom_band(self) -> Bounds<Pixels> {
-        Bounds::new(
-            point(self.bounds.origin.x, self.plot.bottom()),
-            size(self.plot.size.width, px(BOTTOM_BAND)),
+    pub(crate) fn bottom_band(self) -> Rect {
+        Rect::from_origin_size(
+            Point::new(self.bounds.origin.x, self.plot.bottom()),
+            Size::new(self.plot.size.width, BOTTOM_BAND),
         )
     }
 }
@@ -175,7 +195,7 @@ pub(crate) fn time_domain(minimum: i64, maximum: i64, range: PredictionRange) ->
 }
 
 /// The x a timestamp is drawn at, clamped to the plot's edges.
-pub(crate) fn x_for_time(domain: TimeDomain, plot: Bounds<Pixels>, timestamp: i64) -> Pixels {
+pub(crate) fn x_for_time(domain: TimeDomain, plot: Rect, timestamp: i64) -> f32 {
     let span = domain.span();
     if span <= 0 {
         return plot.origin.x + plot.size.width / 2.0;
@@ -221,7 +241,7 @@ impl ValueAxis {
 }
 
 /// The y a percentage is drawn at, clamped to the axis.
-pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: Bounds<Pixels>) -> Pixels {
+pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: Rect) -> f32 {
     let ratio = if axis.maximum > 0.0 && percent.is_finite() {
         (percent / axis.maximum).clamp(0.0, 1.0)
     } else {
@@ -235,14 +255,13 @@ pub(crate) fn y_for_percent(percent: f64, axis: &ValueAxis, plot: Bounds<Pixels>
 /// The plot is the series' content mask, so a stroke centred on its top or
 /// bottom edge would lose half its width; the line and the hover dot both read
 /// this mapping, which keeps them on the same pixel at every value.
-pub(crate) fn y_for_series(percent: f64, axis: &ValueAxis, plot: Bounds<Pixels>) -> Pixels {
+pub(crate) fn y_for_series(percent: f64, axis: &ValueAxis, plot: Rect) -> f32 {
     let y = y_for_percent(percent, axis, plot);
-    let inset = px(SERIES_EDGE_INSET);
-    if plot.size.height <= inset * 2.0 {
+    if plot.size.height <= SERIES_EDGE_INSET * 2.0 {
         return y;
     }
-    let top = plot.origin.y + inset;
-    let bottom = plot.bottom() - inset;
+    let top = plot.origin.y + SERIES_EDGE_INSET;
+    let bottom = plot.bottom() - SERIES_EDGE_INSET;
     let fraction = (y - plot.origin.y) / plot.size.height;
     top + (bottom - top) * fraction
 }
@@ -257,8 +276,8 @@ pub(crate) struct Sample {
 /// One sample in screen space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScreenPoint {
-    pub x: Pixels,
-    pub y: Pixels,
+    pub x: f32,
+    pub y: f32,
 }
 
 /// A series folded onto the plot.
@@ -310,9 +329,9 @@ pub(crate) fn decimate(
     samples: &[Sample],
     domain: TimeDomain,
     axis: &ValueAxis,
-    plot: Bounds<Pixels>,
+    plot: Rect,
 ) -> Decimated {
-    if samples.is_empty() || plot.size.width <= Pixels::ZERO || plot.size.height <= Pixels::ZERO {
+    if samples.is_empty() || plot.size.width <= 0.0 || plot.size.height <= 0.0 {
         return Decimated::default();
     }
     let lead = lead_index(samples, domain.start);
@@ -328,7 +347,7 @@ pub(crate) fn decimate(
             continue;
         }
         let x = x_for_time(domain, plot, sample.timestamp);
-        let column = (f32::from(x - plot.origin.x)).floor() as i32;
+        let column = (x - plot.origin.x).floor() as i32;
         match columns.last_mut() {
             Some((last_column, last_index)) if *last_column == column => *last_index = index,
             _ => columns.push((column, index)),
@@ -353,12 +372,12 @@ pub(crate) fn decimate(
     // The comparison is against the last drawn y, so a run of subpixel moves still
     // accumulates into a full pixel rather than being flattened forever.
     let mut screen: Vec<ScreenPoint> = Vec::with_capacity(chosen.len());
-    let mut drawn_y: Option<Pixels> = None;
+    let mut drawn_y: Option<f32> = None;
     for index in chosen {
         let sample = samples[index];
         let y = y_for_series(sample.percent, axis, plot);
         let y = match drawn_y {
-            Some(previous) if (y - previous).abs() < px(1.0) => previous,
+            Some(previous) if (y - previous).abs() < 1.0 => previous,
             _ => y,
         };
         drawn_y = Some(y);
@@ -548,7 +567,7 @@ pub(crate) struct TimeTicks {
 /// full tick list is ever built. If the chosen step's aligned ticks still overflow,
 /// the axis steps up once. Only a year step, which has nothing above it, strides its
 /// ticks instead.
-pub(crate) fn time_ticks(domain: TimeDomain, plot_width: Pixels, zone: UtcOffset) -> TimeTicks {
+pub(crate) fn time_ticks(domain: TimeDomain, plot_width: f32, zone: UtcOffset) -> TimeTicks {
     let span = domain.span();
     if span <= 0 {
         return TimeTicks {
@@ -597,9 +616,8 @@ pub(crate) fn time_ticks(domain: TimeDomain, plot_width: Pixels, zone: UtcOffset
 /// `n` labels occupy `n - 1` gaps, so the count is one more than the whole gaps the
 /// plot fits. A clock axis longer than twelve hours is capped as well, so it steps up
 /// instead of running out of distinct times.
-fn maximum_tick_count(plot_width: Pixels, label: TimeLabelKind, span: i64) -> usize {
-    let count =
-        ((f32::from(plot_width) / label.spacing()).floor() as usize + 1).max(MINIMUM_TICK_COUNT);
+fn maximum_tick_count(plot_width: f32, label: TimeLabelKind, span: i64) -> usize {
+    let count = ((plot_width / label.spacing()).floor() as usize + 1).max(MINIMUM_TICK_COUNT);
     if label == TimeLabelKind::Clock && span > CLOCK_CAP_SPAN_MILLIS {
         count.min(CLOCK_LABEL_CAP)
     } else {
