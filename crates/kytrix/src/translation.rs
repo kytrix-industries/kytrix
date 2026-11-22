@@ -120,8 +120,9 @@ fn failure(error: TranslationError) -> TranslationFailure {
 ///
 /// Empty content is answered before the model is touched, so this keeps the whole
 /// translation path in the binary and fails only for a build that lost it. A failed probe
-/// aborts startup: a prediction-event dialog that cannot translate is a build defect, not a
-/// setting the user can fix.
+/// does not abort startup: the composition root logs it and opens the prediction-event
+/// dialogs without a translator, which is what a headless build without a model looks
+/// like (P4-3 ledger §4-③).
 pub(crate) fn probe(config: &Config) -> Result<(), TranslationError> {
     let directory = config.translation.model_directory.as_deref();
     let selected_model = config.translation.selected_model;

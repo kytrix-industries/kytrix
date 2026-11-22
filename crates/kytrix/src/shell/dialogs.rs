@@ -47,6 +47,14 @@ struct OpenDialog {
     scope: Option<SignalScope>,
 }
 
+/// What an alert that asks for a decision says.
+pub(crate) struct AlertCopy {
+    pub title: SmolStr,
+    pub message: SmolStr,
+    pub confirm: SmolStr,
+    pub cancel: SmolStr,
+}
+
 /// What a naming alert asks for.
 pub(crate) struct NameAlert {
     pub title: SmolStr,
@@ -106,19 +114,20 @@ impl Dialogs {
     }
 
     /// Opens an alert with one paragraph and a confirmation and a cancellation.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn alert_with_cancel(
         &mut self,
         app: &mut App,
         composition: &Composition,
-        title: impl Into<SmolStr>,
-        message: impl Into<SmolStr>,
-        confirm: impl Into<SmolStr>,
-        cancel: impl Into<SmolStr>,
+        alert: AlertCopy,
         on_confirm: impl Fn(&mut App) + 'static,
     ) {
+        let AlertCopy {
+            title,
+            message,
+            confirm,
+            cancel,
+        } = alert;
         let theme = composition.theme.clone();
-        let message: SmolStr = message.into();
         let confirmed: Rc<dyn Fn(&mut App)> = Rc::new(on_confirm);
         let builder = DialogBuilder::new(title).content(move |app, window, parent| {
             ui::label(
