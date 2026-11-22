@@ -37,7 +37,11 @@ use ui_core::{
     app::App,
     event::{InputEvent, Modifiers, PointerButton},
     math::{Point, Rect},
-    node::{id::NodeId, tree::NodeKind},
+    node::{
+        id::NodeId,
+        tree::{Node, NodeKind},
+    },
+    paint::style::StylePatch,
     test_support::app::TestApp,
     window::WindowId,
 };
@@ -117,7 +121,7 @@ pub(crate) fn catalog_with(route: &VenueRoute, entries: Vec<CatalogEntry>) -> Ar
 pub(crate) struct Harness {
     app: TestApp,
     services: Rc<WidgetServices>,
-    router: FrameRouter,
+    router: Rc<FrameRouter>,
     host: SelectorHost,
 }
 
@@ -134,29 +138,27 @@ impl Harness {
             size: ui_core::math::Size::new(1280.0, 900.0),
             ..ui_core::window::WindowOptions::default()
         });
+        // The same aggregate and the same three composition-root singletons the application
+        // root builds: the dialogs reach none of them through a global of their own.
         let runtime = app.app().runtime_handle().clone();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-        let config = app.app_mut().signal(Config::default());
-        let language = app.app_mut().signal(LanguageCode::En);
-        let catalog_generation = app.app_mut().signal(0_u64);
-        let reduce_motion = app.app_mut().signal(false);
-        let services = Rc::new(WidgetServices {
-            translate: translate(),
-            language,
-            config,
-            theme,
-            market_participants: None,
-            catalog_generation,
-            kytrix_service: None,
-            open_url: Rc::new(|_| {}),
-            sound: Rc::new(|_| None),
-            reduce_motion,
-            runtime,
-        });
-        let layer = Layer::new();
-        let router = FrameRouter::new(app.app_mut()).expect("the test host owns the frame hook");
-        let animation = AnimationRouter::new();
-        let host = SelectorHost::new(Rc::clone(&services), layer, router.clone(), animation);
+        let layer = Rc::new(Layer::new());
+        let router =
+            Rc::new(FrameRouter::new(app.app_mut()).expect("the test host owns the frame hook"));
+        let animation = Rc::new(AnimationRouter::new());
+        let services = Rc::new(
+            WidgetServices::builder(
+                app.app_mut(),
+                runtime,
+                translate(),
+                theme,
+                Rc::clone(&layer),
+                Rc::clone(&router),
+                Rc::clone(&animation),
+            )
+            .build(),
+        );
+        let host = SelectorHost::new(Rc::clone(&services));
         Self {
             app,
             services,
@@ -186,6 +188,16 @@ impl Harness {
     /// The injected services.
     pub(crate) fn services(&self) -> &WidgetServices {
         &self.services
+    }
+
+    /// The injected services, as the shared handle the host was built from.
+    pub(crate) fn services_rc(&self) -> Rc<WidgetServices> {
+        Rc::clone(&self.services)
+    }
+
+    /// The application's one layer stack (the composition-root singleton the services carry).
+    pub(crate) fn layer(&self) -> &Layer {
+        &self.services.layer
     }
 
     /// The frame router: its route count is what says a closed dialog released itself.
@@ -283,6 +295,55 @@ impl Harness {
         let _ = self.app.move_pointer(position);
     }
 
+    /// Delivers one platform event the way the platform pump does: the engine's interaction
+    /// dispatch runs, and the event is queued for the application to read.
+    pub(crate) fn pump(&mut self, event: ui_core::event::Event) {
+        self.app.dispatch_event(event);
+    }
+
+    /// The events the application can still read from the observation queue.
+    pub(crate) fn take_events(&mut self) -> Vec<(WindowId, ui_core::event::Event)> {
+        self.app.app_mut().drain_events()
+    }
+
+    /// The style patch the engine computed for `node` (what the node's `bind_style` wrote).
+    pub(crate) fn style_patch(&self, node: NodeId) -> Option<&StylePatch> {
+        let tree = self.app.app().window(self.app.window_id())?.tree();
+        tree.get(node).ok().map(Node::style_patch)
+    }
+
+    /// The first child of `node`.
+    pub(crate) fn first_child(&self, node: NodeId) -> Option<NodeId> {
+        let tree = self.app.app().window(self.app.window_id())?.tree();
+        tree.get(node)
+            .ok()
+            .and_then(|entry| entry.children().first().copied())
+    }
+
+    /// The number of nodes in the harness window's tree (a closed dialog leaves none behind).
+    pub(crate) fn tree_len(&self) -> usize {
+        self.app
+            .app()
+            .window(self.app.window_id())
+            .expect("the harness window exists")
+            .tree()
+            .len()
+    }
+
+    /// The text one text node draws.
+    pub(crate) fn node_text(&self, node: NodeId) -> SmolStr {
+        let tree = self
+            .app
+            .app()
+            .window(self.app.window_id())
+            .expect("the harness window exists")
+            .tree();
+        match tree.get(node).expect("the node exists").kind() {
+            NodeKind::Text(content) => content.text.clone(),
+            other => panic!("expected a text node, got {other:?}"),
+        }
+    }
+
     /// The nearest node under the window root whose debug id starts with `prefix`.
     pub(crate) fn find(&self, prefix: &str) -> Option<NodeId> {
         let tree = self.app.app().window(self.app.window_id())?.tree();
@@ -356,11 +417,6 @@ impl Harness {
         update(&mut config);
         let signal = self.services.config;
         let _ = self.app.app_mut().write(&signal, config);
-    }
-
-    /// The current settings snapshot.
-    pub(crate) fn config(&self) -> Config {
-        (*self.app.app().read(&self.services.config)).clone()
     }
 }
 

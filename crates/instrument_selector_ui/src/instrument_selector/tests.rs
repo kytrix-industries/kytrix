@@ -920,6 +920,51 @@ fn switching_language_rebuilds_the_venue_column() {
     );
 }
 
+/// The host is assembled from the services the composition root already owns: the dialog's
+/// overlay registers in the services' layer stack and its frame route in the services'
+/// router, so the application's z-order arbitration and its single frame hook see the
+/// dialog. A host that built its own layer stack / routers would open a dialog the
+/// application can neither order nor tick.
+#[test]
+fn the_dialog_builds_through_the_services_singletons() {
+    let mut harness = Harness::new();
+    assert!(Rc::ptr_eq(
+        &harness.host().services_rc(),
+        &harness.services_rc()
+    ));
+    assert!(std::ptr::eq(
+        harness.host().router(),
+        &*harness.services_rc().frame_router
+    ));
+    assert!(std::ptr::eq(
+        harness.host().layer(),
+        &*harness.services_rc().layer
+    ));
+
+    assert!(open(
+        &mut harness,
+        filters(InstrumentKindFilter::All, CapabilityId::Candlesticks)
+    ));
+    harness.settle(4);
+
+    assert_eq!(harness.overlay_count(), 1, "the dialog is open");
+    assert_eq!(
+        harness.layer().len(harness.window()),
+        1,
+        "the dialog's overlay is registered in the composition root's layer stack"
+    );
+    assert!(
+        !harness.router().is_empty(),
+        "the dialog's frame route lives in the composition root's router"
+    );
+    click_node(&mut harness, "instrument-selector:cancel");
+    assert!(settle_close(&mut harness));
+    assert!(
+        harness.layer().is_empty(harness.window()),
+        "closing removes the overlay from the same stack"
+    );
+}
+
 #[test]
 fn the_cancel_control_should_close_the_dialog() {
     let mut harness = Harness::new();
@@ -948,7 +993,9 @@ fn selecting_a_match_then_confirming_reports_the_key() {
     let entry = test_support::entry(&spot_route, spot("BTC", "USDT"), "BTCUSDT");
     let catalog = catalog_with(&spot_route, vec![entry]);
     let mut harness = Harness::with_catalog(catalog);
-    let confirmed: Rc<RefCell<Option<InstrumentSelection>>> = Rc::new(RefCell::new(None));
+    // Every confirmation is recorded, so a callback that runs twice is visible: the caller
+    // is a pane that opens something / follows the listing, and one click must report once.
+    let confirmed: Rc<RefCell<Vec<InstrumentSelection>>> = Rc::new(RefCell::new(Vec::new()));
     let callback = Rc::clone(&confirmed);
     let host = harness.host().clone();
     let window = harness.window();
@@ -969,7 +1016,7 @@ fn selecting_a_match_then_confirming_reports_the_key() {
         None,
         filters,
         Rc::new(move |selection, _, _| {
-            *callback.borrow_mut() = Some(selection);
+            callback.borrow_mut().push(selection);
         }),
         harness.app_mut(),
     );
@@ -1005,10 +1052,165 @@ fn selecting_a_match_then_confirming_reports_the_key() {
 
     state.confirm(harness.app_mut());
     assert_eq!(
-        confirmed.borrow().as_ref(),
-        Some(&InstrumentSelection {
+        confirmed.borrow().as_slice(),
+        [InstrumentSelection {
             listing: test_support::listing_key(&spot_route, "BTCUSDT"),
-        }),
-        "the confirmation hands the key to the caller"
+        }],
+        "one confirmation hands the key to the caller exactly once"
+    );
+    state.confirm(harness.app_mut());
+    assert_eq!(
+        confirmed.borrow().len(),
+        2,
+        "a second confirmation is a second report — the callback is not deduplicated, it \
+         simply never runs twice for one"
+    );
+}
+
+/// The dialog's signals live in a scope of its own: closing releases it (so a re-open starts
+/// from reclaimed slots), and releasing it again is a no-op.
+///
+/// The engine's `release_scope` answers how many value slots it reclaimed; a dialog that
+/// minted its signals at the root would leave four slots behind per open/close cycle and
+/// answer `> 0` here, because nothing else could have released them.
+#[test]
+fn the_dialog_releases_its_signal_scope_when_it_finishes() {
+    let mut harness = Harness::new();
+    let host = harness.host().clone();
+    let window = harness.window();
+    let mut state = SelectorState::new(
+        &host,
+        window,
+        route("binance", "spot"),
+        None,
+        filters(InstrumentKindFilter::All, CapabilityId::Candlesticks),
+        Rc::new(|_, _, _| {}),
+        harness.app_mut(),
+    );
+    let scope = state.scope;
+
+    state.finish(harness.app_mut());
+
+    assert_eq!(
+        harness.app_mut().release_scope(scope),
+        0,
+        "finish already released the dialog's scope, so a second release reclaims nothing"
+    );
+}
+
+/// A dialog's own signal scope means an open/close cycle allocates nothing for good: a
+/// hundred cycles leave the value store exactly where the first close left it, and no node,
+/// overlay or frame route behind.
+///
+/// The engine reports the slot table through `test_support::diagnostics::signal_slot_stats`;
+/// a dialog that minted its four signals at the root would add four live slots per cycle and
+/// nothing would ever reclaim them.
+#[test]
+fn opening_and_closing_the_dialog_a_hundred_times_reclaims_everything() {
+    let mut harness = Harness::new();
+    let filters = filters(InstrumentKindFilter::All, CapabilityId::Candlesticks);
+    let stats =
+        |harness: &Harness| ui_core::test_support::diagnostics::signal_slot_stats(harness.app());
+
+    assert!(open(&mut harness, filters.clone()));
+    harness.settle(4);
+    click_node(&mut harness, "instrument-selector:cancel");
+    assert!(settle_close(&mut harness), "the first close finishes");
+    let settled = stats(&harness);
+    let nodes = harness.tree_len();
+
+    for cycle in 0..100 {
+        assert!(open(&mut harness, filters.clone()), "cycle {cycle} opens");
+        harness.settle(2);
+        click_node(&mut harness, "instrument-selector:cancel");
+        assert!(settle_close(&mut harness), "cycle {cycle} closes");
+    }
+
+    assert_eq!(
+        stats(&harness),
+        settled,
+        "a hundred open/close cycles allocated no value slot for good"
+    );
+    assert_eq!(
+        harness.tree_len(),
+        nodes,
+        "a hundred open/close cycles left no node behind"
+    );
+    assert_eq!(harness.overlay_count(), 0, "the dialog is closed");
+    assert!(
+        harness.router().is_empty(),
+        "no frame route outlived the dialog"
+    );
+}
+
+/// The keyboard events a dialog owns are the typed text of its own window, and only while it
+/// is the window's modal scope: everything else stays in the application's observation queue.
+///
+/// A dialog that took the whole queue would swallow the pointer / resize / focus events the
+/// composition root reads (and, with two windows, another window's typing).
+#[test]
+fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
+    let mut harness = Harness::new();
+    assert!(open(
+        &mut harness,
+        filters(InstrumentKindFilter::All, CapabilityId::Candlesticks)
+    ));
+    harness.settle(4);
+    click_node(&mut harness, "instrument-selector-filter.root");
+    harness.settle(2);
+    assert_eq!(
+        harness.app().focused(harness.window()),
+        harness.find("instrument-selector-filter.root"),
+        "the click focuses the filter input"
+    );
+
+    harness.pump(ui_core::event::Event::Input(
+        ui_core::event::InputEvent::Text {
+            text: SmolStr::new_static("btc"),
+            timestamp: std::time::Instant::now(),
+        },
+    ));
+    harness.pump(ui_core::event::Event::Resized {
+        size: ui_core::math::Size::new(1280.0, 900.0),
+    });
+    harness.settle(2);
+
+    let text = harness
+        .find("instrument-selector-filter.text")
+        .expect("the input draws its text node");
+    assert_eq!(
+        harness.node_text(text),
+        "btc",
+        "the dialog took the text it owns and typed it into the filter"
+    );
+    let remaining = harness.take_events();
+    assert!(
+        !remaining
+            .iter()
+            .any(|(_, event)| matches!(event, ui_core::event::Event::Input(_))),
+        "the text event the dialog consumed is not left for the application: {remaining:?}"
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|(_, event)| matches!(event, ui_core::event::Event::Resized { .. })),
+        "an event the dialog does not own is still readable by the application: {remaining:?}"
+    );
+
+    click_node(&mut harness, "instrument-selector:cancel");
+    assert!(settle_close(&mut harness));
+    harness.pump(ui_core::event::Event::Input(
+        ui_core::event::InputEvent::Text {
+            text: SmolStr::new_static("late"),
+            timestamp: std::time::Instant::now(),
+        },
+    ));
+    harness.settle(1);
+    assert!(
+        harness.take_events().iter().any(|(_, event)| matches!(
+            event,
+            ui_core::event::Event::Input(ui_core::event::InputEvent::Text { .. })
+        )),
+        "a closed dialog takes nothing: the text stays with the application"
     );
 }

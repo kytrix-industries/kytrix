@@ -92,7 +92,12 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     error::EngineError,
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+        tree::NodeTree,
+    },
     paint::{primitive::Border, style::StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
@@ -427,6 +432,11 @@ pub struct InstrumentSelector {
 struct SelectorState {
     host: SelectorHost,
     window: WindowId,
+    /// The selector's own signal scope: every signal this dialog mints belongs to it, and
+    /// [`Self::finish`] releases it after the kit components have unmounted their nodes
+    /// (E16). A root-scope signal would never be reclaimed, so every open/close cycle
+    /// would leak its slots for the rest of the process.
+    scope: SignalScope,
     filters: InstrumentFilters,
     route: VenueRoute,
     selected_listing: Option<VenueListingKey>,
@@ -558,7 +568,9 @@ impl SelectorState {
             venue_rows(&filters, &translate),
             TreeOptions::default(),
         );
-        let selected = app.signal(None);
+        // One scope per dialog: every signal below is reclaimed when `finish` releases it.
+        let scope = app.signal_scope();
+        let selected = app.signal_scoped(scope, None);
         let rows: Rc<RefCell<Arc<[ListingRow]>>> = Rc::new(RefCell::new(Arc::default()));
         // The list owns the hovered-row signal, and the row closure is built before the
         // list exists; the cell is filled in right after construction, before any row
@@ -595,16 +607,17 @@ impl SelectorState {
             )
         };
         hovered.set(Some(list.hovered_signal()));
-        let input_state = app.signal(InputState::new(""));
-        let input_placeholder = app.signal(t_smol!(
-            host.translate(),
-            "instrument_selector.filter_placeholder"
-        ));
-        let message = app.signal(Some(ListMessage::NotLoaded));
+        let input_state = app.signal_scoped(scope, InputState::new(""));
+        let input_placeholder = app.signal_scoped(
+            scope,
+            t_smol!(host.translate(), "instrument_selector.filter_placeholder"),
+        );
+        let message = app.signal_scoped(scope, Some(ListMessage::NotLoaded));
 
         Self {
             host: host.clone(),
             window,
+            scope,
             filters,
             route,
             selected_listing,
@@ -931,21 +944,43 @@ impl SelectorState {
         }
     }
 
-    /// Feeds this dialog's text input the events the shell drained.
+    /// Feeds this dialog's text input the events the application drained.
     ///
-    /// The dialog is modal, so the events that reach it while it is open are the ones it
-    /// wants; pointer events are the engine's (hit testing / dispatch), and the input's
-    /// own `dispatch` ignores anything that is not text, key or IME input on its focused
-    /// node.
+    /// # Ownership
+    ///
+    /// A dialog owns **the typed text, key presses and IME input of its own window, and
+    /// only while it is that window's modal scope**. Nothing else: the engine's
+    /// interaction dispatch (hit testing, actions, scrolling) already ran when the platform
+    /// pushed the event, so what is left in the observation queue is what the application
+    /// is entitled to read. Taking another window's events — or the pointer / resize /
+    /// focus / close events of its own — would be the dialog swallowing the composition
+    /// root's events, which is why [`App::drain_events_where`] takes only this dialog's
+    /// share and leaves the rest queued. The top-most modal is the keyboard's only
+    /// consumer, so a second open dialog takes nothing.
     fn dispatch_events(&self, app: &mut App) {
         let Some(input) = self.input.as_ref() else {
             return;
         };
-        for (window, event) in app.drain_events() {
-            if window == self.window {
-                let _ = input.dispatch(app, &event);
-            }
+        if !self.owns_modal(app) {
+            return;
         }
+        let window = self.window;
+        for (_, event) in app
+            .drain_events_where(|target, event| target == window && crate::ui::is_text_input(event))
+        {
+            let _ = input.dispatch(app, &event);
+        }
+    }
+
+    /// Whether this dialog is the window's modal scope, and therefore the keyboard's owner.
+    fn owns_modal(&self, app: &App) -> bool {
+        let Some(dialog) = self.dialog.as_ref() else {
+            return false;
+        };
+        matches!(
+            (app.modal_scope(self.window), dialog.overlay_node()),
+            (Some(top), Some(own)) if top == own
+        )
     }
 
     /// Rebuilds the venue column when the language moved.
@@ -1297,6 +1332,12 @@ impl SelectorState {
     fn cancel(&self) {}
 
     /// Releases every kit component the dialog owns and stops the frame route.
+    ///
+    /// The order is the engine's release contract (E16): the nodes that read this
+    /// dialog's signals are unmounted first ([`Dialog::release`] unloads the overlay
+    /// subtree, and the list / tree / input own no node of their own any more), and only
+    /// then is the selector's signal scope released — a `bind_*` closure that read a
+    /// released handle would panic on its next evaluation.
     fn finish(&mut self, app: &mut App) {
         if let Some(dialog) = self.dialog.take() {
             dialog.release(app);
@@ -1307,6 +1348,7 @@ impl SelectorState {
         if let Some(id) = self.route_id.take() {
             self.router.unregister(id);
         }
+        let _ = app.release_scope(self.scope);
     }
 }
 

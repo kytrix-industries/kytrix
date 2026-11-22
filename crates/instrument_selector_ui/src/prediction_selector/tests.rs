@@ -184,6 +184,199 @@ fn an_english_interface_hides_the_translate_button() {
     );
 }
 
+/// An English interface does not draw the control at all: the old dialog returned an empty
+/// element instead of a button, and a disabled button would be a control that can never do
+/// anything. The container the button lives in is what is hidden, so it leaves the layout and
+/// the pointer never reaches it.
+#[test]
+fn an_english_interface_hides_the_control_not_only_the_affordance() {
+    let mut harness = configured(true); // Chinese: translation is offered
+    let mut state = loaded_state(&mut harness, translatable_page(), true);
+    let body = harness.root();
+    let window = harness.window();
+    state
+        .build_content(harness.app_mut(), window, body)
+        .expect("the dialog content builds");
+    state.update_controls(harness.app_mut());
+    harness.drain();
+    let holder = harness
+        .find(&format_smolstr!("{PANEL_ID}:translate"))
+        .expect("the translation control is built");
+    assert_eq!(
+        harness.style_patch(holder).and_then(|patch| patch.visible),
+        Some(true),
+        "a language that has something to translate draws the control"
+    );
+
+    harness.update_config(|config| config.language = Language::En);
+    state.update_controls(harness.app_mut());
+    harness.drain();
+
+    assert_eq!(
+        harness.style_patch(holder).and_then(|patch| patch.visible),
+        Some(false),
+        "an English interface hides the control instead of showing a button that never works"
+    );
+}
+
+/// Waiting text is dimmed while its translation is in flight; `reduce_motion` is what skips
+/// the dimming and lands on the final value, and a title whose translation arrived is drawn
+/// at full strength either way.
+///
+/// The assertion is on the opacity the text node's `bind_style` computed, so an
+/// implementation that ignores `reduce_motion` (dimming always) fails here.
+#[test]
+fn a_pending_title_is_dimmed_unless_the_application_reduces_motion() {
+    let mut harness = configured(true);
+    let mut state = loaded_state(&mut harness, translatable_page(), true);
+    state.translation = Some(run(1, &["Event 0"]));
+    state.translations.insert(
+        SmolStr::new_static("Event 1"),
+        SmolStr::new_static("事件 1"),
+    );
+    let text_size = harness.host().theme().tokens().small.font_size;
+    let root = harness.root();
+
+    state.build_card(
+        harness.app_mut(),
+        root,
+        0,
+        &translatable_page().events[0],
+        text_size,
+    );
+    state.build_card(
+        harness.app_mut(),
+        root,
+        1,
+        &translatable_page().events[1],
+        text_size,
+    );
+    harness.drain();
+
+    let pending = harness
+        .first_child(
+            harness
+                .find(&format_smolstr!("{PANEL_ID}:card:0"))
+                .expect("the first card is built"),
+        )
+        .expect("a card draws its title first");
+    assert_eq!(harness.node_text(pending), "Event 0");
+    assert_eq!(
+        harness.style_patch(pending).and_then(|patch| patch.opacity),
+        Some(0.55),
+        "text waiting for its translation is dimmed"
+    );
+    let arrived = harness
+        .first_child(
+            harness
+                .find(&format_smolstr!("{PANEL_ID}:card:1"))
+                .expect("the second card is built"),
+        )
+        .expect("a card draws its title first");
+    assert_eq!(harness.node_text(arrived), "事件 1");
+    assert_eq!(
+        harness.style_patch(arrived).and_then(|patch| patch.opacity),
+        None,
+        "a title whose translation arrived is drawn at full strength"
+    );
+
+    let reduce_motion = harness.services().reduce_motion;
+    let _ = harness.app_mut().write(&reduce_motion, true);
+    state.build_card(
+        harness.app_mut(),
+        root,
+        2,
+        &translatable_page().events[0],
+        text_size,
+    );
+    harness.drain();
+    let undimmed = harness
+        .first_child(
+            harness
+                .find(&format_smolstr!("{PANEL_ID}:card:2"))
+                .expect("the third card is built"),
+        )
+        .expect("a card draws its title first");
+    assert_eq!(harness.node_text(undimmed), "Event 0");
+    assert_eq!(
+        harness
+            .style_patch(undimmed)
+            .and_then(|patch| patch.opacity),
+        None,
+        "reduced motion draws waiting text at its final opacity"
+    );
+}
+
+/// A chunk's texts are matched back by the id the translator echoes, not by their position in
+/// the answer: a translator that returns its segments reordered must still land every text on
+/// the source it translates.
+#[test]
+fn a_chunk_is_matched_by_segment_id_not_by_position() {
+    let mut harness = configured(true);
+    let mut state = loaded_state(&mut harness, translatable_page(), true);
+    state.translation = Some(run(9, &["Event 0", "Yes"]));
+    let chunk = plan_translation(&[card(0, "Event 0", &["Yes"])], &AHashMap::new())
+        .into_iter()
+        .next()
+        .expect("the plan has one chunk");
+
+    state.apply_translation_event(
+        TranslationEvent::Chunk {
+            generation: 9,
+            chunk,
+            // The ids the request carried, answered in the opposite order.
+            outcome: Ok(vec![
+                TranslatedSegment {
+                    id: SmolStr::new_static("s01"),
+                    text: SmolStr::new_static("是"),
+                },
+                TranslatedSegment {
+                    id: SmolStr::new_static("s00"),
+                    text: SmolStr::new_static("事件 0"),
+                },
+            ]),
+        },
+        harness.app_mut(),
+    );
+
+    assert_eq!(
+        state.translations.get("Event 0").map(SmolStr::as_str),
+        Some("事件 0"),
+        "the title got the translation of the id it was requested under"
+    );
+    assert_eq!(
+        state.translations.get("Yes").map(SmolStr::as_str),
+        Some("是"),
+        "the label got its own translation, not the one at the same position"
+    );
+    assert!(
+        state
+            .translation
+            .as_ref()
+            .expect("the run continues")
+            .pending
+            .is_empty(),
+        "both requested texts were answered"
+    );
+}
+
+/// The dialog's signals live in a scope of its own: finishing releases it, and releasing it
+/// again reclaims nothing.
+#[test]
+fn the_dialog_releases_its_signal_scope_when_it_finishes() {
+    let mut harness = Harness::new();
+    let mut state = loaded_state(&mut harness, translatable_page(), false);
+    let scope = state.scope;
+
+    state.finish(harness.app_mut());
+
+    assert_eq!(
+        harness.app_mut().release_scope(scope),
+        0,
+        "finish already released the dialog's scope, so a second release reclaims nothing"
+    );
+}
+
 #[test]
 fn a_build_without_a_translator_disables_the_translation() {
     let mut harness = configured(false);
@@ -627,36 +820,6 @@ fn error_messages_resolve_in_the_language_the_host_renders() {
         !interrupted.contains("error."),
         "a failure is a sentence, not a key: {interrupted}"
     );
-}
-
-#[test]
-fn the_translation_pulse_respects_reduced_motion() {
-    let mut harness = configured(true);
-    let mut state = loaded_state(&mut harness, translatable_page(), true);
-    state.translation = Some(run(1, &["Event 0"]));
-
-    let (text, pending) = state.display_text(&SmolStr::new_static("Event 0"));
-    assert_eq!(text, "Event 0", "an untranslated text draws its source");
-    assert!(pending, "the text is still being translated");
-
-    let (translated, pending) = {
-        state.translations.insert(
-            SmolStr::new_static("Event 0"),
-            SmolStr::new_static("事件 0"),
-        );
-        state.translation = Some(run(2, &["Event 0"]));
-        state.display_text(&SmolStr::new_static("Event 0"))
-    };
-    assert_eq!(translated, "事件 0", "the arrived text replaces the source");
-    assert!(
-        !pending || pending,
-        "the pending state is a function of the run"
-    );
-
-    let reduce_motion = harness.services().reduce_motion;
-    let mut harness2 = configured(true);
-    let _ = harness2.app_mut().write(&reduce_motion, true);
-    assert!(harness2.config().language == Language::ZhCn);
 }
 
 /// A page's categories accumulate across pages, so a category label that a later

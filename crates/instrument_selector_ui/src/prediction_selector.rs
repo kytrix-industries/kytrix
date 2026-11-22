@@ -78,7 +78,11 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::{App, AppHandle},
     error::EngineError,
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+    },
     paint::{primitive::Border, style::StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
@@ -216,6 +220,11 @@ struct SelectorState<S: PredictionEventSource> {
     weak: Weak<PredictionEventSelector<S>>,
     host: SelectorHost,
     window: WindowId,
+    /// The dialog's own signal scope: every signal this dialog mints belongs to it, and
+    /// [`Self::finish`] releases it after the kit components have unmounted their nodes
+    /// (E16). A root-scope signal would never be reclaimed, so every open/close cycle
+    /// would leak its slots for the rest of the process.
+    scope: SignalScope,
     source: S,
     venues: Vec<VenueId>,
     venue: VenueId,
@@ -258,6 +267,12 @@ struct SelectorState<S: PredictionEventSource> {
     body_node: Option<NodeId>,
     body_children: Vec<NodeId>,
     page_text: Signal<SmolStr>,
+    /// Whether the translation control is drawn at all: the interface's own language needs
+    /// no translation, and a disabled button on an English interface would be a control the
+    /// user can never use (the old dialog did not build it). Bound to the control's
+    /// container, so the whole control — button, tooltip anchor and the gap it occupied —
+    /// is out of the layout and out of reach of the pointer.
+    translate_visible: Signal<bool>,
     translate_button: Option<Button>,
     spinner: Option<Spinner>,
     retry_button: Option<Button>,
@@ -401,16 +416,26 @@ impl<S: PredictionEventSource> SelectorState<S> {
             .as_ref()
             .map(|event| event.route.venue)
             .unwrap_or(venues[0]);
-        let search_input = app.signal(InputState::new(""));
-        let search_placeholder = app.signal(t_smol!(
-            host.translate(),
-            "prediction_selector.search_placeholder"
-        ));
-        let page_text = app.signal(SmolStr::default());
+        // One scope per dialog: every signal below is reclaimed when `finish` releases it.
+        let scope = app.signal_scope();
+        let search_input = app.signal_scoped(scope, InputState::new(""));
+        let search_placeholder = app.signal_scoped(
+            scope,
+            t_smol!(host.translate(), "prediction_selector.search_placeholder"),
+        );
+        let page_text = app.signal_scoped(scope, SmolStr::default());
+        // An English interface needs no translation, so the control starts out built for a
+        // language that has something to translate (the first `update_controls` of the open
+        // dialog writes the same value the settings state).
+        let translate_visible = app.signal_scoped(
+            scope,
+            host.config_ref(app, |config| config.language) != Language::En,
+        );
         Self {
             weak,
             host: host.clone(),
             window,
+            scope,
             source,
             venues,
             venue,
@@ -451,6 +476,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
             body_node: None,
             body_children: Vec::new(),
             page_text,
+            translate_visible,
             translate_button: None,
             spinner: None,
             retry_button: None,
@@ -1195,6 +1221,13 @@ impl<S: PredictionEventSource> SelectorState<S> {
             NodeBuilder::boxed()
                 .id(format_smolstr!("{PANEL_ID}:translate"))
                 .style(StyleBuilder::new().flex_none().build())
+                .bind_style({
+                    let visible = self.translate_visible;
+                    move |cx| StylePatch {
+                        visible: Some(*cx.read(&visible)),
+                        ..StylePatch::default()
+                    }
+                })
                 .build(tree, parent)
         })?;
         let translate_button = Button::new(app, theme.clone(), "prediction-translate")
@@ -1441,15 +1474,39 @@ impl<S: PredictionEventSource> SelectorState<S> {
         }
     }
 
+    /// Feeds the search box the events this dialog owns.
+    ///
+    /// # Ownership
+    ///
+    /// A dialog owns **the typed text, key presses and IME input of its own window, and
+    /// only while it is that window's modal scope**. Everything else stays in the
+    /// application's observation queue: the engine already dispatched the interaction when
+    /// the platform pushed the event, and the composition root still has to be able to read
+    /// what happened (see [`App::drain_events_where`]).
     fn dispatch_events(&mut self, app: &mut App) {
         let Some(search) = self.search_node.as_ref() else {
             return;
         };
-        for (window, event) in app.drain_events() {
-            if window == self.window {
-                let _ = search.dispatch(app, &event);
-            }
+        if !self.owns_modal(app) {
+            return;
         }
+        let window = self.window;
+        for (_, event) in app
+            .drain_events_where(|target, event| target == window && crate::ui::is_text_input(event))
+        {
+            let _ = search.dispatch(app, &event);
+        }
+    }
+
+    /// Whether this dialog is the window's modal scope, and therefore the keyboard's owner.
+    fn owns_modal(&self, app: &App) -> bool {
+        let Some(dialog) = self.dialog.as_ref() else {
+            return false;
+        };
+        matches!(
+            (app.modal_scope(self.window), dialog.overlay_node()),
+            (Some(top), Some(own)) if top == own
+        )
     }
 
     /// Cancels a running translation when the interface language moved.
@@ -1502,6 +1559,14 @@ impl<S: PredictionEventSource> SelectorState<S> {
     fn update_controls(&mut self, app: &mut App) {
         let affordance = self.translate_affordance(app);
         let translate = self.host.translate().clone();
+        // An English interface hides the control instead of leaving a button that can never
+        // do anything: the container the control is built in is what the user sees, and it
+        // is out of the layout while the interface needs no translation.
+        let visible = !matches!(affordance, TranslateAffordance::Hidden);
+        let visible_signal = self.translate_visible;
+        if *app.read(&visible_signal) != visible {
+            let _ = app.write(&visible_signal, visible);
+        }
         if let Some(button) = self.translate_button.as_ref() {
             let disabled = !matches!(affordance, TranslateAffordance::Ready);
             let _ = button.set_disabled(app, disabled);
@@ -1973,6 +2038,12 @@ impl<S: PredictionEventSource> SelectorState<S> {
         let _ = app.request_repaint(self.window);
     }
 
+    /// Releases every kit component the dialog owns and stops the frame route.
+    ///
+    /// The order is the engine's release contract (E16): the nodes that read this
+    /// dialog's signals are unmounted first (`Dialog::release` unloads the overlay
+    /// subtree; the buttons, tabs, spinner and tooltip own no node of their own any
+    /// more), and only then is the dialog's signal scope released.
     fn finish(&mut self, app: &mut App) {
         self.cancel_translation(app);
         if let Some(dialog) = self.dialog.take() {
@@ -2006,6 +2077,7 @@ impl<S: PredictionEventSource> SelectorState<S> {
         if let Some(id) = self.route_id.take() {
             self.router.unregister(id);
         }
+        let _ = app.release_scope(self.scope);
     }
 }
 

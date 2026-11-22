@@ -767,6 +767,22 @@ impl App {
         resources::drain_events(self)
     }
 
+    /// 只取走 `keep` 认可的平台事件，其余**留在队列里**（原顺序，丢弃计数不变）。
+    ///
+    /// 给「只拥有事件的一部分」的消费者：一个模态对话框把**自己窗口的文本 / 按键 / IME**交给
+    /// 自己的输入框（kit 的契约是「外壳 `drain_events` 之后逐条转发给 `InputNode::dispatch`」），
+    /// 而其它窗口、以及指针 / 尺寸 / 焦点 / 关闭这类**引擎自己已经分发过**的事件仍留在观测队列
+    /// 里，组合根照常读到它们 —— 对话框因此不会把应用的事件吞掉。
+    ///
+    /// 队列有界（同 [`App::drain_events`]）；被取走的事件不影响累计的丢弃计数。
+    #[must_use]
+    pub fn drain_events_where(
+        &mut self,
+        keep: impl FnMut(WindowId, &Event) -> bool,
+    ) -> Vec<(WindowId, Event)> {
+        resources::drain_events_where(self, keep)
+    }
+
     /// 累计被丢弃的事件条数（队列溢出诊断；单调递增）。
     #[must_use]
     pub fn events_dropped(&self) -> u64 {
@@ -960,6 +976,20 @@ impl App {
         indices: u32,
     ) -> Result<crate::paint::geometry::GeometryUpdate, EngineError> {
         geometry::truncate(self, geometry, vertices, indices)
+    }
+
+    /// 仅测试（`test-support`）：值槽位表的分配统计（分配过 / 存活 / 空闲）。
+    ///
+    /// 公开入口是 `test_support::diagnostics::signal_slot_stats`：作用域释放后槽位归还空闲栈，
+    /// 「反复开关一个面板后槽位总数 / 存活数不增长」因此可断言（R03-6 的泄漏面）。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn signal_slot_counts_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.store.slot_count_for_test(),
+            self.store.live_slot_count_for_test(),
+            self.store.free_slot_count_for_test(),
+        )
     }
 
     /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。

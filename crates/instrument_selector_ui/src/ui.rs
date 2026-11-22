@@ -9,6 +9,7 @@
 use ui_core::{
     app::App,
     error::EngineError,
+    event::{Event, InputEvent},
     node::{id::NodeId, tree::NodeTree},
     window::WindowId,
 };
@@ -42,4 +43,19 @@ pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) {
     if let Err(error) = app.remove_node(window, node) {
         log::warn!("removing a rebuilt dialog node failed: {error}");
     }
+}
+
+/// Whether `event` is one only a dialog's own text input can consume.
+///
+/// Typed text, a key press and IME input are what kit's
+/// [`InputNode::dispatch`](base_ui::kit::input::InputNode::dispatch) reads while the input
+/// has focus. Every other event is the engine's: the platform pushed it and the engine
+/// already ran the matching interaction dispatch (hit testing, actions, scrolling), so it
+/// is observation for the application rather than a command any dialog may take out of the
+/// queue.
+pub(crate) fn is_text_input(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
+    )
 }

@@ -1094,19 +1094,19 @@ impl StateStore {
     }
 
     /// 槽位表长度 = **槽位峰值**（数组只增不减：回收只把下标放进空闲栈）。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn slot_count_for_test(&self) -> usize {
         self.values.len()
     }
 
     /// 空闲栈长度（已回收、等待复用的槽位数）。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn free_slot_count_for_test(&self) -> usize {
         self.free_slots.len()
     }
 
     /// 存活（仍持有值）槽位数。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn live_slot_count_for_test(&self) -> usize {
         self.values
             .iter()
