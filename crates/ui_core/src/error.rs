@@ -160,6 +160,14 @@ pub enum EngineError {
     #[error("frame pipeline stopped: {detail}")]
     FramePipeline { detail: SmolStr },
 
+    /// `App::on_frame` 的单槽已被占用，第二个帧钩子安装者被拒绝。
+    ///
+    /// 单槽语义是「后注册覆盖先注册」：静默替换会让先安装的扇出（`widget::frame::FrameRouter`）
+    /// 悄无声息地停摆。因此安装协议把「槽已占用」表达为错误，唯一允许的重复安装是同一个
+    /// 路由器的幂等 `install`。消费者：`widget::frame::FrameRouter`。
+    #[error("the application frame hook is already installed")]
+    FrameHookInstalled,
+
     /// 平台报告的 DPI 缩放因子非法（非有限值或 `<= 0`）。唯一生产者是平台层 DPI 事件处理。
     #[error("invalid DPI scale factor {factor}: must be finite and greater than zero")]
     InvalidDpiScale { factor: f32 },
