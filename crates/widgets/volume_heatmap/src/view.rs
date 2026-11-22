@@ -25,68 +25,110 @@
 //! no "unexpected response" state of its own; a response that does not match the
 //! request cannot happen, because both are typed.
 //!
+//! # The body is one canvas and its empty state
+//!
+//! The pane's whole body is the map, and the engine's only self-drawing entry point is a
+//! `Canvas` node, so [`WidgetView::body`] builds one host node, the chart's canvas into it,
+//! and the stand-in that says a published map covering no instrument is still a map
+//! ([`VolumeHeatMapWidget::sync_empty_overlay`]). After that the chart owns its drawing:
+//! `sync` rebuilds the canvas when what it would draw moved
+//! ([`VolumeHeatMapChart`]), and nothing rebuilds the body.
+//!
 //! # Where the countdown lives
 //!
-//! The countdown is the refresh button's own label rather than a word beside it.
-//! The two are one control's worth of information — when the next read is due, and
-//! the way to bring it forward — so they are one control.
+//! The countdown is the refresh control's own label beside the button rather than a
+//! word elsewhere. The two are one control's worth of information — when the next read
+//! is due, and the way to bring it forward — so they are one group. (The old control
+//! drew the time left *inside* the button; a kit button's label is chosen when it is
+//! built and a countdown moves once a second, so the label is a `bind_text` node beside
+//! the button — registered as a W4a difference.)
 //!
-//! # The refresh control
+//! # The header controls
 //!
-//! It is disabled while the pane has nothing to bring forward: connecting, fetching,
-//! or waiting for the map its own refresh asked for. That is not decoration: the
-//! service refuses a second refresh while one is in flight, and a control that
-//! forwarded the click anyway would turn a fast double click into a failure the
-//! user has to dismiss. A *failed* pane is the exception, where the control is a
-//! way out and runs the same recovery the framework's banner offers.
+//! The picker is the pane's scope rather than a filter drawn over a finished
+//! map: what it states is the market participant the tiles below it are made of. Every
+//! control's key comes from [`WidgetCx::unique_key`], so two panes of this widget never
+//! share one handler (AGENTS §1 rule 11). A picker's and a button's copy is chosen when it
+//! is built, so a language switch rebuilds the button and re-states the picker's items;
+//! what the picker *offers* is its item list (`set_items`), which a commit moves without a
+//! rebuild. The choice a control reports is written into a request signal and applied by
+//! the next `sync`, because a control's handler owns no widget context (AGENTS §4.2).
 //!
-//! It reads the venue the pane is showing and nothing else: the command names that
-//! venue, so a click that arrives after the user moved to another market participant is
-//! refused rather than answered with a read of the one they left.
+//! # Why a reply is matched by request identity
+//!
+//! Two commands share one inbox, and a load or a venue switch replaces the command before
+//! it. Draining happens before anything in the frame can replace a command, so an answer
+//! that was delivered before the replacement is applied to the command it belongs to; on
+//! top of that every reply is attributed by the framework `RequestId` it answers
+//! ([`widget::binding::Pending`]), which is what keeps a replaced command's failure from
+//! being reported over the command that replaced it.
+//!
+//! # The directory
+//!
+//! The pane never loads the directory and never polls the catalogue: it re-reads the
+//! answers its [`MarketDirectory`] gives on every load, and re-runs that load when the
+//! injected [`catalog_generation`](widget::services::WidgetServices::catalog_generation)
+//! signal moves (AGENTS §8.3). A venue the directory stopped offering — the market was
+//! unloaded, or the venue no longer publishes a scope this map reads — is not a choice
+//! that holds: it goes back to "not chosen" and the pane reads the market that is there.
 
-use std::{sync::Arc, time::Duration};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::{
-    button::Button,
-    empty_state::EmptyState,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    menu::{MenuItem, MenuItemAction},
-    select::Select,
-    size::UnifiedSizable,
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::IconKind,
+        select::{Select, SelectItem, SelectOptions},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::role::Role,
 };
-use gpui_kit::{
-    AnyElement, App, AppContext, Context, ElementId, Entity, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Task, Window, base::Disableable, div,
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+use market_participants_connector::{
+    connector::MarketParticipantsConnector,
+    venue::definition::{ScopeEntry, venues_supporting},
 };
-use i18n::t;
-use market_participants_connector::venue::loaded::VenuesUpdated;
 use market_participants_model::{
     identifier::VenueId, listing::route::VenueRoute, routing::CapabilityId,
 };
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
+use ui_core::{
+    app::{App, TimerId},
+    error::EngineError,
+    event::{Event, InputEvent},
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::style::StylePatch,
+    text::TextStyle,
+    window::WindowId,
+};
 use widget::{
-    binding::{WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
-    error::{LocalizedError, market_is_catalog_not_loaded},
+    cx::WidgetCx,
+    error::{TranslatedError, market_is_catalog_not_loaded},
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
-    status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
+    status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     util::{format_countdown, unix_millis},
     venue::{VenueDisplay, route_display_string},
-    view::{WidgetHeader, WidgetView},
+    view::{HeaderGroup, ReloadHandle, WidgetView},
 };
-use widget_tokio_runtime::global;
 
+#[cfg(test)]
+use crate::service::VolumeHeatMapSource;
 use crate::{
     chart::VolumeHeatMapChart,
     model::HeatMapModelError,
     service::{
         VolumeHeatMapFetchError, VolumeHeatMapProtocol, VolumeHeatMapRequest, VolumeHeatMapService,
-        VolumeHeatMapServiceError, VolumeHeatMapSource, VolumeHeatMapStatus,
-        VolumeHeatMapStreamKey, VolumeHeatMapStreamMessage,
+        VolumeHeatMapServiceError, VolumeHeatMapStatus, VolumeHeatMapStreamKey,
+        VolumeHeatMapStreamMessage,
     },
 };
 
@@ -96,6 +138,15 @@ use crate::{
 /// quarter of a second is faster than the label's own resolution and cheaper than
 /// a frame.
 pub(crate) const COUNTDOWN_TICK: Duration = Duration::from_millis(250);
+
+/// The widget-local names of the header controls' kit keys.
+///
+/// A kit key is **application-level** — a button derives its click action from it and two
+/// panes that build the same constant key share one handler — so the pane never spells one
+/// out: [`WidgetCx::unique_key`] stamps each suffix with the pane's own instance scope
+/// (AGENTS §1 rule 11).
+const REFRESH_KEY_SUFFIX: &str = "volume_heatmap.header.refresh";
+const VENUE_KEY_SUFFIX: &str = "volume_heatmap.header.venue";
 
 /// The pane's configuration: the market participant whose map it shows.
 ///
@@ -128,95 +179,6 @@ struct Reading {
     routes: Arc<[VenueRoute]>,
 }
 
-/// Every loaded venue with a market this map may be drawn from, in the order the
-/// interface states venues.
-///
-/// A venue is a candidate exactly when one of its loaded scopes is one this map reads
-/// ([`reads_the_whole_market`]): a loaded market participant that answers tickers one
-/// listing at a time — Longbridge, today — publishes no route-level read this map is
-/// made of, so it is not offered even though its market is in memory. A venue no
-/// longer loaded is no longer offered either, and a map of it is replaced by the
-/// market that is there.
-fn available_venues(cx: &App) -> Vec<VenueId> {
-    let connector =
-        cx.global::<market_participants_connector::connector::MarketParticipantsConnector>();
-    let entries = connector.venues().entries();
-    connector
-        .supported_venues()
-        .into_iter()
-        .filter(|venue| {
-            entries
-                .iter()
-                .any(|(route, entry)| route.venue == *venue && reads_the_whole_market(entry))
-        })
-        .collect()
-}
-
-/// Whether one loaded scope is a market this map is drawn from.
-///
-/// The scope has to answer the route-level bulk ticker read: the map folds the
-/// tickers of a whole market, so a scope that answers one listing at a time cannot
-/// produce one, however many tickers it can serve one by one. It also has to publish
-/// a catalog, because a ticker carries a listing key and the catalog is the only
-/// thing that says which listing and instrument that key names.
-fn reads_the_whole_market(
-    entry: &market_participants_connector::venue::definition::ScopeEntry,
-) -> bool {
-    entry.catalog_source.is_some()
-        && entry
-            .capabilities
-            .iter()
-            .any(|support| support.capability == CapabilityId::AllTickers)
-}
-
-/// The scopes of one loaded venue that this map is drawn from.
-///
-/// One question is asked of the loaded venues — which scopes carry the whole-scope
-/// ticker read and publish a catalog — so a pane that reads one market participant never
-/// enumerates scopes of its own. The route and the entry it is judged by come from
-/// one reading of one commit:
-/// [`market_participants_connector::venue::loaded::LoadedVenues::entries`] takes the
-/// venue table's lock once, so a load landing while this runs cannot put one
-/// commit's route beside another's catalog source.
-fn venue_routes(
-    connector: &market_participants_connector::connector::MarketParticipantsConnector,
-    venue: VenueId,
-) -> Arc<[VenueRoute]> {
-    connector
-        .venues()
-        .entries()
-        .iter()
-        .filter(|(route, entry)| route.venue == venue && reads_the_whole_market(entry))
-        .map(|(route, _)| route.clone())
-        .collect()
-}
-
-/// Whether one route's market is in memory: the scope is loaded.
-///
-/// Reading a market is only possible once the user has loaded it, and "not
-/// loaded" is a wait rather than a failure.
-fn market_ready(cx: &App, route: &VenueRoute) -> bool {
-    cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
-        .venues()
-        .scope(route)
-        .is_some()
-}
-
-/// The markets a notice names while nothing is loaded: the venues whose loader can
-/// answer the route-level bulk ticker read, in the order supported_venues() answers.
-///
-/// This is the one static answer a pane may read: the capability's venue
-/// name set, never a scope, an origin or a credential. It is what says which
-/// markets can answer at all, which is the only honest answer while nothing is
-/// loaded.
-///
-/// What comes back is the venues themselves rather than their names: the notice is a
-/// reference into the catalogue, and the sentence that names them is resolved by the
-/// framework, in the language showing on the frame that draws it.
-fn market_venues() -> Vec<VenueId> {
-    market_participants_connector::venue::definition::venues_supporting(CapabilityId::AllTickers)
-}
-
 /// A failure a pane reports that is not already a stream error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VolumeHeatMapFailure {
@@ -224,11 +186,62 @@ pub(crate) enum VolumeHeatMapFailure {
     Rpc(RpcCallError<VolumeHeatMapServiceError>),
 }
 
-impl LocalizedError for VolumeHeatMapFailure {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for VolumeHeatMapFailure {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Fetch(error) => error.localized_message(cx),
-            Self::Rpc(error) => error.localized_message(cx),
+            Self::Fetch(error) => error.translated_message(translate),
+            Self::Rpc(error) => error.translated_message(translate),
+        }
+    }
+}
+
+impl TranslatedError for VolumeHeatMapFetchError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::MarketParticipant(error) => error.translated_message(translate),
+            Self::Model(error) => error.translated_message(translate),
+            Self::TooManyTickers {
+                route,
+                count,
+                limit,
+            } => t_smol!(
+                translate,
+                "error.volume_heatmap.too_many_tickers",
+                route = route_display_string(route, translate),
+                count = count,
+                limit = limit
+            ),
+            Self::Timeout(timeout) => t_smol!(
+                translate,
+                "error.volume_heatmap.timeout",
+                seconds = timeout.as_secs()
+            ),
+        }
+    }
+}
+
+impl TranslatedError for HeatMapModelError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            // Neither arm names the identity its own field carries: the message shows a
+            // reader a localized message, and a canonical `InstrumentId` or `AssetId`
+            // digest is an identity rather than a name, so it stays in the field.
+            Self::NotionalOverflow { .. } => {
+                t_smol!(translate, "error.volume_heatmap.notional_overflow")
+            }
+            Self::AssetNotNamed { .. } => {
+                t_smol!(translate, "error.volume_heatmap.asset_not_named")
+            }
+        }
+    }
+}
+
+impl TranslatedError for VolumeHeatMapServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::StreamClosed | Self::StreamBusy => {
+                t_smol!(translate, "error.volume_heatmap.stream_unavailable")
+            }
         }
     }
 }
@@ -249,64 +262,288 @@ fn is_waiting_for_a_catalog(failure: &VolumeHeatMapFailure) -> bool {
     )
 }
 
-impl LocalizedError for VolumeHeatMapFetchError {
-    fn localized_message(&self, cx: &App) -> SharedString {
-        match self {
-            Self::MarketParticipant(error) => error.localized_message(cx),
-            Self::Model(error) => error.localized_message(cx),
-            Self::TooManyTickers {
-                route,
-                count,
-                limit,
-            } => t!(
-                cx,
-                "error.volume_heatmap.too_many_tickers",
-                route = route_display_string(route, cx),
-                count = count,
-                limit = limit
-            ),
-            Self::Timeout(timeout) => t!(
-                cx,
-                "error.volume_heatmap.timeout",
-                seconds = timeout.as_secs()
-            ),
-        }
+/// Whether one loaded scope is a market this map is drawn from.
+///
+/// The scope has to answer the route-level bulk ticker read: the map folds the
+/// tickers of a whole market, so a scope that answers one listing at a time cannot
+/// produce one, however many tickers it can serve one by one. It also has to publish
+/// a catalog, because a ticker carries a listing key and the catalog is the only
+/// thing that says which listing and instrument that key names.
+fn reads_the_whole_market(entry: &ScopeEntry) -> bool {
+    entry.catalog_source.is_some()
+        && entry
+            .capabilities
+            .iter()
+            .any(|support| support.capability == CapabilityId::AllTickers)
+}
+
+/// Every loaded venue with a market this map may be drawn from, in the order the
+/// interface states venues.
+///
+/// A venue is a candidate exactly when one of its loaded scopes is one this map reads
+/// ([`reads_the_whole_market`]): a loaded market participant that answers tickers one
+/// listing at a time — Longbridge, today — publishes no route-level read this map is
+/// made of, so it is not offered even though its market is in memory. A venue no
+/// longer loaded is no longer offered either, and a map of it is replaced by the
+/// market that is there.
+///
+/// The two inputs are arguments rather than a connector so the rule is a pure function of
+/// the directory's own answer: one reading of one commit decides both, and a test can ask
+/// the question without a venue table.
+fn readable_venues(
+    supported: &[VenueId],
+    entries: &[(VenueRoute, Arc<ScopeEntry>)],
+) -> Vec<VenueId> {
+    supported
+        .iter()
+        .copied()
+        .filter(|venue| {
+            entries
+                .iter()
+                .any(|(route, entry)| route.venue == *venue && reads_the_whole_market(entry))
+        })
+        .collect()
+}
+
+/// The scopes of one loaded venue that this map is drawn from.
+///
+/// One question is asked of the loaded venues — which scopes carry the whole-scope
+/// ticker read and publish a catalog — so a pane that reads one market participant never
+/// enumerates scopes of its own. The route and the entry it is judged by come from
+/// one reading of one commit:
+/// [`market_participants_connector::venue::loaded::LoadedVenues::entries`] takes the
+/// venue table's lock once, so a load landing while this runs cannot put one
+/// commit's route beside another's catalog source.
+fn routes_of(entries: &[(VenueRoute, Arc<ScopeEntry>)], venue: VenueId) -> Vec<VenueRoute> {
+    entries
+        .iter()
+        .filter(|(route, entry)| route.venue == venue && reads_the_whole_market(entry))
+        .map(|(route, _)| route.clone())
+        .collect()
+}
+
+/// The markets a notice names while nothing is loaded: the venues whose loader can
+/// answer the route-level bulk ticker read, in the order supported_venues() answers.
+///
+/// This is the one static answer a pane may read: the capability's venue
+/// name set, never a scope, an origin or a credential. It is what says which
+/// markets can answer at all, which is the only honest answer while nothing is
+/// loaded.
+///
+/// What comes back is the venues themselves rather than their names: the notice is a
+/// reference into the catalogue, and the sentence that names them is resolved by the
+/// framework, in the language showing on the frame that draws it.
+fn market_venues() -> Vec<VenueId> {
+    venues_supporting(CapabilityId::AllTickers)
+}
+
+/// The loaded market directory one pane reads.
+///
+/// Production wraps the injected connector; a test drives a fixture, because the
+/// framework's headless host does not build a connector. The pane only asks the questions
+/// a load needs: which loaded venues publish a market this map can be drawn from, which
+/// scopes of one of them answer the whole-scope read, and whether a scope's catalog is in
+/// memory.
+trait MarketDirectory {
+    /// The loaded venues this map can be drawn from, in the directory's order.
+    fn readable_venues(&self) -> Vec<VenueId>;
+
+    /// The scopes of one venue this map reads, as the directory holds them now.
+    fn routes_of(&self, venue: VenueId) -> Vec<VenueRoute>;
+
+    /// Whether one route's market is loaded: its catalogue has been published.
+    fn is_loaded(&self, route: &VenueRoute) -> bool;
+}
+
+/// The application directory: the injected market-participants connector.
+struct ConnectorDirectory(MarketParticipantsConnector);
+
+impl MarketDirectory for ConnectorDirectory {
+    fn readable_venues(&self) -> Vec<VenueId> {
+        readable_venues(&self.0.supported_venues(), &self.0.venues().entries())
+    }
+
+    fn routes_of(&self, venue: VenueId) -> Vec<VenueRoute> {
+        routes_of(&self.0.venues().entries(), venue)
+    }
+
+    fn is_loaded(&self, route: &VenueRoute) -> bool {
+        self.0.venues().scope(route).is_some()
     }
 }
 
-impl LocalizedError for HeatMapModelError {
-    fn localized_message(&self, cx: &App) -> SharedString {
-        match self {
-            // Neither arm names the identity its own field carries: the message shows a
-            // reader a localized message, and a canonical `InstrumentId` or `AssetId`
-            // digest is an identity rather than a name, so it stays in the field.
-            Self::NotionalOverflow { .. } => t!(cx, "error.volume_heatmap.notional_overflow"),
-            Self::AssetNotNamed { .. } => t!(cx, "error.volume_heatmap.asset_not_named"),
-        }
-    }
+/// One command this pane sent and has not seen the answer to.
+///
+/// Two commands share the binding, so the tag names which one a reply answers: a reply
+/// whose identity is not tracked answers a call the pane already replaced (a venue switch,
+/// a reload, or a failure the user recovered from) and is dropped rather than applied to
+/// whichever command happens to be pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// The load that starts a map's stream.
+    Start,
+    /// A refresh of the map on screen.
+    Refresh,
 }
 
-impl LocalizedError for VolumeHeatMapServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
-        match self {
-            Self::StreamClosed | Self::StreamBusy => {
-                t!(cx, "error.volume_heatmap.stream_unavailable")
+/// What a header control asks the pane to do.
+///
+/// A control's handler runs with an application context and no widget context, so it
+/// cannot change the pane: it writes the request and asks for a frame, and the next
+/// `sync` applies it (AGENTS §4.2 — a control asks for the next `sync` instead of
+/// re-entering the widget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderRequest {
+    Refresh,
+    Venue(VenueId),
+}
+
+/// The countdown the header draws, and the one-shot timer that keeps it moving.
+///
+/// It is shared with the timer callback (`Rc`), which has only `&mut App`: the deadline
+/// the label counts to lives in a `Cell`, the label itself is a signal, and the callback
+/// re-arms the timer. Every deadline change goes through `update`, which cancels the
+/// pending tick before it writes the label and arms the next chain — a deadline that
+/// flickers cannot leave two chains ticking (I3: the pane is woken once per tick, not
+/// twice), and `release` cancels through the same path.
+struct Countdown {
+    /// The window the timer belongs to.
+    window: WindowId,
+    /// The wall-clock millisecond the next read is due at, or nothing worth counting
+    /// to (a read in flight, a failure, a schedule that stopped).
+    deadline: Cell<Option<i64>>,
+    /// The time left, as the header's text node draws it.
+    label: Signal<Option<SmolStr>>,
+    /// The wall clock, which is what a deadline published in Unix milliseconds is
+    /// comparable against; a test hands in a clock it can move.
+    now: Rc<dyn Fn() -> i64>,
+    /// The tick this pane is waiting for, if any. Holding the id is what makes a
+    /// deadline change and `release` able to cancel it instead of leaving it to fire.
+    timer: std::cell::RefCell<Option<TimerId>>,
+}
+
+impl Countdown {
+    fn new(cx: &mut WidgetCx<'_>, now: Rc<dyn Fn() -> i64>) -> Self {
+        Self {
+            window: cx.window(),
+            deadline: Cell::new(None),
+            label: cx.signal(None),
+            now,
+            timer: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The deadline the label is counting to.
+    fn deadline(&self) -> Option<i64> {
+        self.deadline.get()
+    }
+
+    /// Moves the countdown to a new deadline (or stops it), and re-arms the timer.
+    ///
+    /// The label is written here rather than only on the next tick: a new answer
+    /// carries a new deadline, and the header has to state it on the frame that shows
+    /// the answer. The pending tick is cancelled first, so a deadline that comes back
+    /// before the old tick was due cannot leave a second chain running.
+    fn update(self: &Rc<Self>, app: &mut App, deadline: Option<i64>) {
+        self.deadline.set(deadline);
+        if let Some(id) = self.timer.borrow_mut().take() {
+            app.cancel_timer(&id);
+        }
+        self.write_label(app);
+        if deadline.is_some() {
+            self.arm(app);
+        }
+    }
+
+    /// Recomputes the label from the clock; returns whether it changed.
+    ///
+    /// The write only requests a frame when the label really moved (`App::write`
+    /// short-circuits equal values), which is what keeps a quiet 250 ms tick from
+    /// repainting the pane four times a second.
+    fn write_label(&self, app: &mut App) -> bool {
+        app.write(
+            &self.label,
+            countdown_label(self.deadline.get(), (self.now)()),
+        )
+    }
+
+    /// Arms the one-shot tick for the next interval, if there is anything to count to.
+    fn arm(self: &Rc<Self>, app: &mut App) {
+        if self.deadline.get().is_none() {
+            return;
+        }
+        let this = Rc::clone(self);
+        match app.after(self.window, COUNTDOWN_TICK, move |app| this.tick(app)) {
+            Ok(id) => *self.timer.borrow_mut() = Some(id),
+            Err(error) => {
+                log::error!("the volume heat map countdown could not arm its next tick: {error}");
             }
         }
     }
+
+    /// One tick: write the label and re-arm the next one.
+    ///
+    /// The timer it just served is already spent, so the field is cleared first; the
+    /// arm then owns the only pending tick this chain has.
+    fn tick(self: &Rc<Self>, app: &mut App) {
+        *self.timer.borrow_mut() = None;
+        self.write_label(app);
+        self.arm(app);
+    }
+}
+
+/// The venue picker this pane built, and the copy it was built with.
+///
+/// A kit picker's item labels are chosen when the items are handed to it (a language
+/// switch re-states them, AGENTS §15.1); its *selection* is not — a picker's trigger text
+/// is a `bind_text` over the picker's own signals, so a commit that offers another venue
+/// is `set_items`.
+struct VenueControl {
+    /// The widget's own row inside the group the pane made, which the widget removes
+    /// itself.
+    root: NodeId,
+    select: Select,
+    /// The language the items were stated in.
+    language: LanguageCode,
+    /// The venues the items were built from, so a commit that changed them is compared
+    /// rather than re-stated every frame.
+    venues: Vec<VenueId>,
+}
+
+/// The refresh control this pane built: the button, the countdown beside it, and the
+/// language the button's copy was built in.
+struct RefreshControl {
+    root: NodeId,
+    /// The node the button lives in.
+    ///
+    /// A kit button's label is chosen when it is built, so a language switch replaces it;
+    /// the slot is what keeps the replaced button in the row's first position without the
+    /// widget having to move nodes.
+    slot: NodeId,
+    button: Button,
+    language: LanguageCode,
 }
 
 /// One pane: the market participant it draws, the countdown it counts, and its two controls.
 pub struct VolumeHeatMapWidget {
     pub config: VolumeHeatMapConfig,
     config_change: WidgetConfigChange,
-    binding: WidgetBinding<VolumeHeatMapProtocol>,
+    binding: Option<WidgetBinding<VolumeHeatMapProtocol>>,
+    /// The command in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     /// The pane's only channel for reporting state.
-    ///
-    /// Nothing outside this module reads the cell itself: the framework's surface
-    /// presents it, and the tests below read it through the extension trait.
-    status: Entity<WidgetStatus>,
+    status: WidgetStatus,
     pub recovery: WidgetAction,
+    /// The loaded market directory, when the host has one.
+    directory: Option<Rc<dyn MarketDirectory>>,
+    /// The canvas the body built, and the map it draws.
+    chart: VolumeHeatMapChart,
+    /// The body root, once the body exists.
+    body_root: Option<NodeId>,
+    /// The stand-in drawn over a published map that covers no instrument.
+    empty: Option<NodeId>,
+    /// The language the stand-in's copy was built in.
+    empty_language: Option<LanguageCode>,
     /// The venues with a loaded market this map can be drawn from, in the order the
     /// interface states them.
     ///
@@ -323,7 +560,6 @@ pub struct VolumeHeatMapWidget {
     /// that reloaded with a different scope set is a different stream rather than a
     /// repeat of the one being read.
     reading: Option<Reading>,
-    chart: VolumeHeatMapChart,
     /// The revision of the map the pane is showing, which is what makes it content
     /// and what readiness is measured against.
     accepted: Option<u64>,
@@ -332,7 +568,7 @@ pub struct VolumeHeatMapWidget {
     ready: Option<u64>,
     /// When the next automatic read is due, as the service's own deadline.
     next_refresh_at: Option<i64>,
-    pub countdown: Option<SharedString>,
+    countdown: Rc<Countdown>,
     /// Whether a refresh command this pane sent has been answered *and its round
     /// reported*.
     ///
@@ -350,7 +586,16 @@ pub struct VolumeHeatMapWidget {
     /// follows the readiness turns it into content. Every message entry refuses while
     /// this is set.
     awaiting_market: bool,
-    _countdown_task: Task<()>,
+    /// The generation this pane has already reacted to.
+    seen_generation: u64,
+    /// The directory generation the composition root publishes.
+    generation: Signal<u64>,
+    /// Where a header control hands over what the user did.
+    requests: Signal<Option<HeaderRequest>>,
+    /// The venue picker this pane built, if the pane has built its header row.
+    venue_control: Option<VenueControl>,
+    /// The refresh control this pane built, if the pane has built its header row.
+    refresh_control: Option<RefreshControl>,
 }
 
 impl WidgetView for VolumeHeatMapWidget {
@@ -365,26 +610,54 @@ impl WidgetView for VolumeHeatMapWidget {
     fn new(
         _instance_id: WidgetInstanceId,
         config: Self::Config,
-        status: Entity<WidgetStatus>,
-        _reload: impl Fn(&mut App) + 'static,
+        status: WidgetStatus,
+        _reload: ReloadHandle,
         config_change: WidgetConfigChange,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let source = cx
-            .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-            .market();
-        Self::new_with_source(config, source, status, config_change, recovery, cx)
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<Self, EngineError> {
+        let now: Rc<dyn Fn() -> i64> = Rc::new(unix_millis);
+        // A host without a directory has nothing to ask and nothing to start; the pane
+        // reports the neutral notice and waits. Every application supplies one.
+        let Some(connector) = cx.services().market_participants.clone() else {
+            return Ok(Self::assemble(
+                config,
+                None,
+                None,
+                status,
+                config_change,
+                recovery,
+                now,
+                cx,
+            ));
+        };
+        let service = VolumeHeatMapService::new(connector.market());
+        let binding = WidgetBinding::spawn(cx, service);
+        let directory: Rc<dyn MarketDirectory> = Rc::new(ConnectorDirectory(connector));
+        Ok(Self::assemble(
+            config,
+            Some(binding),
+            Some(directory),
+            status,
+            config_change,
+            recovery,
+            now,
+            cx,
+        ))
     }
 
-    fn load(&mut self, cx: &mut Context<Self>) {
+    fn load(&mut self, cx: &mut WidgetCx<'_>) {
         // The markets this map reads have to be loaded before it reads
         // anything: a venue the registry does not hold, or one whose catalog was
         // never published, is a market the user has not loaded, and the pane
         // waits for one instead of drawing a map of nothing. The notice names
         // every venue that could answer, which is the only honest thing to say
         // while none of them is in memory.
-        let venues = available_venues(cx);
+        let Some(directory) = self.directory.clone() else {
+            self.wait_for_market(cx);
+            return;
+        };
+        let venues = directory.readable_venues();
         if venues.is_empty() {
             self.venues = venues;
             self.wait_for_market(cx);
@@ -409,18 +682,18 @@ impl WidgetView for VolumeHeatMapWidget {
             log::warn!(
                 "the volume heat map's venue is not one this map can read; the pane picks a readable one"
             );
-            self.config_change.publish(cx);
+            self.config_change.publish(cx.app_mut());
         }
         let venue = match self.config.venue {
             Some(venue) => venue,
             None => {
                 let venue = self.venues[0];
                 self.config.venue = Some(venue);
-                self.config_change.publish(cx);
+                self.config_change.publish(cx.app_mut());
                 venue
             }
         };
-        let routes = self.routes_of(cx, venue);
+        let routes = directory.routes_of(venue);
         if routes.is_empty() {
             // The venue is loaded and publishes no scope this map can read. That is
             // the directory answering about a market the user has just loaded, so it
@@ -430,8 +703,11 @@ impl WidgetView for VolumeHeatMapWidget {
             return;
         }
 
-        let retry = self.status.is_failed(cx);
-        self.reading = Some(Reading { venue, routes });
+        let retry = self.status.is_failed(cx.app());
+        self.reading = Some(Reading {
+            venue,
+            routes: routes.into(),
+        });
         self.start(retry, cx);
     }
 
@@ -446,100 +722,247 @@ impl WidgetView for VolumeHeatMapWidget {
         self.reading.is_some() && self.accepted.is_some()
     }
 
-    /// The venue picker on the left, the refresh on the right.
-    ///
-    /// The picker is the pane's scope rather than a filter drawn over a finished
-    /// map: what it states is the market participant the tiles below it are made of. Neither
-    /// control is usable before the market participant's metadata is — both refuse input while the
-    /// pane waits for its market, and the picker has nothing to offer while no venue is
-    /// loaded.
-    fn header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> WidgetHeader {
-        WidgetHeader::empty()
-            .left(self.venue_select(cx))
-            .right(self.refresh_button(cx))
-    }
-
     fn config(&self) -> Option<&Self::Config> {
         Some(&self.config)
+    }
+
+    fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        if self.body_root.is_some() {
+            // The framework builds a body once; a second call is a caller that did not
+            // read the contract, and building the canvas node twice would double it.
+            return Ok(());
+        }
+        let root = NodeBuilder::boxed()
+            .id("TEST_VOLUME_HEATMAP_BODY")
+            .style(
+                StyleBuilder::new()
+                    .flex_1()
+                    .flex_col()
+                    .min_width_0()
+                    .min_height_0()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        self.chart.build(cx, root)?;
+        self.body_root = Some(root);
+        self.sync_empty_overlay(cx)?;
+        // The canvas node has no box until the frame that lays this body out, so the map
+        // cannot be painted on the frame that builds it: ask for the one that can.
+        cx.request_frame()?;
+        Ok(())
+    }
+
+    fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        // The directory generation is the one signal the framework's surface root also
+        // reads, so a write schedules the frame that runs this hook — including for a
+        // pane that is only waiting and has no body. Nothing else may poll the directory
+        // (AGENTS §8.3).
+        let generation = *cx.read(&self.generation);
+        if generation != self.seen_generation {
+            self.seen_generation = generation;
+            if !self.status.is_failed(cx.app()) {
+                self.reload_market(cx);
+            }
+        }
+
+        // The binding delivers messages instead of calling back into the widget; this is
+        // the one place they are applied, where the widget has a context again.
+        if let Some(binding) = self.binding.as_ref() {
+            for inbound in binding.take() {
+                self.apply(inbound, cx);
+            }
+        }
+
+        // A header control owns no `&mut self`; it asks for the transition it was used
+        // for, and this is where the request becomes one. The read is taken out of the
+        // signal before the write: an engine signal is not copied on read, so a write
+        // while a read guard is alive would alias the value it is reading.
+        let request = *cx.read(&self.requests);
+        if let Some(request) = request {
+            cx.write(&self.requests, None);
+            self.apply_header_request(request, cx);
+        }
+
+        // The body is built by the framework from the answer `has_content` gives, and it
+        // asks that question before this hook runs: content that first appeared here is
+        // one frame away, so ask for that frame.
+        if self.has_content() && self.body_root.is_none() {
+            cx.request_frame()?;
+        }
+
+        self.chart.sync(cx)?;
+        self.sync_empty_overlay(cx)?;
+
+        // The countdown follows the schedule the state now states. Comparing first is
+        // what keeps a steady frame from cancelling and re-arming the same tick.
+        let deadline = self.countdown_deadline(cx.app());
+        if deadline != self.countdown.deadline() {
+            Countdown::update(&self.countdown, cx.app_mut(), deadline);
+        }
+        self.sync_header(cx)?;
+
+        Ok(())
+    }
+
+    fn header(
+        &mut self,
+        group: HeaderGroup,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        match group {
+            HeaderGroup::Left => {
+                // The pane is building its row; the control this widget built into the
+                // previous one went with it. Only the components are the widget's to take
+                // down.
+                self.release_venue_control(cx, true);
+                let control = self.build_venue_control(cx, parent)?;
+                self.venue_control = Some(control);
+            }
+            HeaderGroup::Right => {
+                self.release_refresh_control(cx, true);
+                let control = self.build_refresh_control(cx, parent)?;
+                self.refresh_control = Some(control);
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, event: &Event, cx: &mut WidgetCx<'_>) -> bool {
+        let Event::Input(input) = event else {
+            return false;
+        };
+        // A pointer that is over the map follows the tile under it; one that left
+        // says so. Either way only a *tile* that moved is a change worth a frame: a
+        // pointer that moved a pixel inside one tile is the same drawing.
+        let moved = match input {
+            InputEvent::PointerMove { position, .. }
+            | InputEvent::PointerEnter { position, .. } => self.chart.point_at(*position),
+            InputEvent::PointerLeave { .. } => self.chart.clear_hover(),
+            _ => return false,
+        };
+        if moved {
+            let _ = cx.request_frame();
+        }
+        true
+    }
+
+    fn release(&mut self, cx: &mut WidgetCx<'_>) {
+        // Dropping the bridge aborts its forwarding tasks and cancels the service.
+        if let Some(mut binding) = self.binding.take() {
+            binding.cancel();
+        }
+        // The header's group nodes belong to the pane, which removes its row: only the
+        // components' signal scopes and action handlers are this widget's to release.
+        self.release_venue_control(cx, false);
+        self.release_refresh_control(cx, false);
+        // The chart's canvas node lives in the body, which the framework removes after
+        // this hook; the node and its cache are the chart's own, so they go here.
+        self.chart.release(cx);
+        // The countdown tick is this widget's: the framework's subtree teardown does not
+        // own it, so release is where it is cancelled.
+        Countdown::update(&self.countdown, cx.app_mut(), None);
+        self.empty = None;
+        self.empty_language = None;
+        self.body_root = None;
+        self.reading = None;
+        self.accepted = None;
+        self.ready = None;
+        self.next_refresh_at = None;
+        self.pending.clear();
     }
 }
 
 impl VolumeHeatMapWidget {
-    /// The seam a test can answer through: `new` only picks the production source.
-    pub fn new_with_source<S>(
+    /// Builds a widget over the collaborators a caller hands it.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
         config: VolumeHeatMapConfig,
-        source: S,
-        status: Entity<WidgetStatus>,
+        binding: Option<WidgetBinding<VolumeHeatMapProtocol>>,
+        directory: Option<Rc<dyn MarketDirectory>>,
+        status: WidgetStatus,
         config_change: WidgetConfigChange,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self
-    where
-        S: VolumeHeatMapSource,
-    {
-        let service = VolumeHeatMapService::new(source);
-        let binding = WidgetBinding::spawn_conditionally(
-            global::handle(cx).handle(),
-            service,
-            cx,
-            Self::apply_reliable,
-            Self::apply_latest,
-        );
-        let countdown_task = cx.spawn(async move |this, cx| {
-            loop {
-                if this
-                    .update(cx, |this, cx| {
-                        this.tick_countdown(cx);
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                cx.background_executor().timer(COUNTDOWN_TICK).await;
-            }
-        });
-        // The pane recovers from the markets it waits for without polling: a venue commit is
-        // the one event that can change what may be read, and a change that arrives while the
-        // pane has nothing to show is a reason to load again.
-        let events = cx
-            .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-            .venues()
-            .events();
-        cx.subscribe(&events, |this, _, event: &VenuesUpdated, cx| {
-            this.on_venues_updated(event, cx);
-        })
-        .detach();
+        now: Rc<dyn Fn() -> i64>,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
+        let generation = cx.services().catalog_generation;
+        let seen_generation = *cx.read(&generation);
+        let requests = cx.signal(None);
+        let countdown = Rc::new(Countdown::new(cx, Rc::clone(&now)));
 
         Self {
             config,
             config_change,
             binding,
+            pending: Pending::new(),
             status,
             recovery,
+            directory,
+            chart: VolumeHeatMapChart::new(),
+            body_root: None,
+            empty: None,
+            empty_language: None,
             venues: Vec::new(),
             reading: None,
-            chart: VolumeHeatMapChart::new(Arc::from([])),
             accepted: None,
             ready: None,
             next_refresh_at: None,
-            countdown: None,
+            countdown,
             refresh_pending: false,
             awaiting_market: false,
-            _countdown_task: countdown_task,
+            seen_generation,
+            generation,
+            requests,
+            venue_control: None,
+            refresh_control: None,
         }
     }
 
-    /// Runs the load a venue commit may have unblocked.
+    /// Builds a pane over a test's own source, directory and clock.
+    ///
+    /// The framework's headless host composes the services without a directory (the
+    /// connector still needs the application's own runtime to build), so an interface
+    /// test constructs the widget directly with the fixture it wants, and drives the
+    /// widget hooks itself.
+    #[cfg(test)]
+    fn with_source<S: VolumeHeatMapSource>(
+        config: VolumeHeatMapConfig,
+        source: S,
+        directory: Rc<dyn MarketDirectory>,
+        status: WidgetStatus,
+        config_change: WidgetConfigChange,
+        recovery: WidgetAction,
+        now: Rc<dyn Fn() -> i64>,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
+        let service = VolumeHeatMapService::new(source);
+        let binding = WidgetBinding::spawn(cx, service);
+        Self::assemble(
+            config,
+            Some(binding),
+            Some(directory),
+            status,
+            config_change,
+            recovery,
+            now,
+            cx,
+        )
+    }
+
+    /// Runs the load a new directory generation may have unblocked.
     ///
     /// The pane compares the market it is reading — the venue and the scopes of it
     /// that answer the route-level bulk ticker read — with the one that is loaded now: a
     /// commit that leaves both as they are is a publication behind a market the pane
     /// already has, so it only re-checks its precondition and never starts over what the
-    /// user is watching. That is this pane's answer even when the commit is a refresh of its own market,
-    /// which is the one place it differs from the panes whose streams resolve a listing when they
-    /// are opened: every fetch here reads the catalogue generation in memory at the moment it is
-    /// taken ([`crate::service::stream::VolumeHeatMapSource`]), so the map that follows such a
-    /// commit is already drawn from what that commit published and there is no stream to reopen.
+    /// user is watching. That is this pane's answer even when the commit is a refresh of
+    /// its own market, which is the one place it differs from the panes whose streams
+    /// resolve a listing when they are opened: every fetch here reads the catalogue
+    /// generation in memory at the moment it is taken
+    /// ([`crate::service::stream::VolumeHeatMapSource`]), so the map that follows such a
+    /// commit is already drawn from what that commit published and there is no stream to
+    /// reopen.
     ///
     /// A market that changed is a different map rather than a publication of the one
     /// being read: a venue loaded while this pane was open becomes a choice the
@@ -547,13 +970,14 @@ impl VolumeHeatMapWidget {
     /// that is gone sends the pane to the market that is there. That is what lets the
     /// map pick up a market loaded after it was opened — the protection is against
     /// restarting a stream that reads the same map, not against reading a market that
-    /// changed. A failure is terminal: the event does not revive a failed pane, only
+    /// changed. A failure is terminal: the generation does not revive a failed pane, only
     /// the user's own recovery does.
-    fn on_venues_updated(&mut self, _event: &VenuesUpdated, cx: &mut Context<Self>) {
-        if self.status.is_failed(cx) {
+    fn reload_market(&mut self, cx: &mut WidgetCx<'_>) {
+        let Some(directory) = self.directory.clone() else {
+            self.wait_for_market(cx);
             return;
-        }
-        let venues = available_venues(cx);
+        };
+        let venues = directory.readable_venues();
         if venues.is_empty() {
             // Nothing this pane reads is loaded any more, so nothing on screen is
             // backed by a market: the venue it was showing goes with it.
@@ -576,10 +1000,13 @@ impl VolumeHeatMapWidget {
             .venue
             .filter(|venue| self.venues.contains(venue))
             .unwrap_or(self.venues[0]);
-        let routes = self.routes_of(cx, venue);
-        let next = (!routes.is_empty()).then_some(Reading { venue, routes });
+        let routes = directory.routes_of(venue);
+        let next = (!routes.is_empty()).then(|| Reading {
+            venue,
+            routes: routes.into(),
+        });
         if next == self.reading {
-            if !self.market_ready(cx) {
+            if !self.market_ready(directory.as_ref()) {
                 self.wait_for_market(cx);
             }
             return;
@@ -589,19 +1016,14 @@ impl VolumeHeatMapWidget {
 
     /// Whether the market the pane reads is in memory: every scope of it is
     /// registered and its catalog has been published.
-    fn market_ready(&self, cx: &App) -> bool {
+    fn market_ready(&self, directory: &dyn MarketDirectory) -> bool {
         self.reading.as_ref().is_some_and(|reading| {
-            !reading.routes.is_empty() && reading.routes.iter().all(|route| market_ready(cx, route))
+            !reading.routes.is_empty()
+                && reading
+                    .routes
+                    .iter()
+                    .all(|route| directory.is_loaded(route))
         })
-    }
-
-    /// The scopes of one venue this map is drawn from, as the loaded venues answer
-    /// them now.
-    fn routes_of(&self, cx: &App, venue: VenueId) -> Arc<[VenueRoute]> {
-        venue_routes(
-            cx.global::<market_participants_connector::connector::MarketParticipantsConnector>(),
-            venue,
-        )
     }
 
     /// Reports the neutral notice for the markets this map reads, and drops what it
@@ -614,17 +1036,19 @@ impl VolumeHeatMapWidget {
     /// would otherwise write over the notice. The stream itself is left running:
     /// cancelling the binding would cancel the service behind it, and a service that
     /// is gone cannot read the market the user loads next.
-    fn wait_for_market(&mut self, cx: &mut Context<Self>) {
+    fn wait_for_market(&mut self, cx: &mut WidgetCx<'_>) {
         self.awaiting_market = true;
         self.reading = None;
         self.accepted = None;
         self.ready = None;
         self.next_refresh_at = None;
-        self.countdown = None;
         self.refresh_pending = false;
+        // The commands in flight name a market the pane is no longer reading; their
+        // answers are late, not this pane's (AGENTS §8.2).
+        self.pending.clear();
         self.chart.set_entries(Arc::from([]));
         self.report_markets_not_loaded(cx);
-        cx.notify();
+        let _ = cx.request_frame();
     }
 
     /// Reports the notice naming the markets this map reads.
@@ -636,28 +1060,15 @@ impl VolumeHeatMapWidget {
     /// The pane waits for every venue that answers the route-level bulk ticker read and
     /// lists every one of them: it reads the whole market, so the venues it can read at
     /// all and the venues it waits for are the same answer.
-    fn report_markets_not_loaded(&self, cx: &mut Context<Self>) {
+    fn report_markets_not_loaded(&self, cx: &mut WidgetCx<'_>) {
         let venues = market_venues();
         self.status.report(
+            cx.app_mut(),
             WidgetState::waiting(Notice::MarketNotLoaded {
                 supported: venues.clone(),
                 venues,
             }),
-            cx,
         );
-    }
-
-    /// Messages are reported through the binding, which a test drives by hand: it
-    /// is cancelled first so the service behind it cannot answer at the same time.
-    #[cfg(test)]
-    pub(crate) fn cancel_binding(&self) {
-        self.binding.cancel();
-    }
-
-    /// Whether the map on screen is showing `revision`.
-    #[cfg(test)]
-    pub(crate) const fn accepted_revision(&self) -> Option<u64> {
-        self.accepted
     }
 
     /// Starts reading, or restarts for a map the user is retrying.
@@ -665,92 +1076,118 @@ impl VolumeHeatMapWidget {
     /// A retry keeps the map the user is still reading — blanking it to reconnect
     /// would flash a screen of data away — while an explicit load starts over,
     /// because the pane cannot vouch for what it was showing.
-    fn start(&mut self, retry: bool, cx: &mut Context<Self>) {
+    fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
         self.ready = None;
         self.next_refresh_at = None;
-        self.countdown = None;
         // The command that was in flight belongs to the generation this call is
         // replacing, so its answer is not something to wait for any more.
         self.refresh_pending = false;
+        self.pending.clear();
         if !retry {
             self.accepted = None;
             self.chart.set_entries(Arc::from([]));
         }
-        self.status.report(WidgetState::Connecting, cx);
+        self.status.report(cx.app_mut(), WidgetState::Connecting);
         let Some(reading) = self.reading.clone() else {
             return;
         };
-        self.binding.call(
+        let Some(binding) = self.binding.as_mut() else {
+            return;
+        };
+        let request_id = binding.call(
+            cx,
             VolumeHeatMapRequest::Load {
                 venue: reading.venue,
                 routes: reading.routes,
             },
-            cx,
-            Self::apply_load_result,
         );
-        cx.notify();
+        self.pending.track(request_id, PendingCommand::Start);
+        let _ = cx.request_frame();
     }
 
-    fn apply_load_result(
-        &mut self,
-        result: WidgetRpcResult<VolumeHeatMapProtocol>,
-        cx: &mut Context<Self>,
-    ) {
-        self.refresh_pending = false;
-        if let Err(error) = result {
-            let recovery = self.recovery.clone();
-            self.status.report(
-                WidgetState::failed(Arc::new(VolumeHeatMapFailure::Rpc(error)), recovery),
-                cx,
-            );
+    /// Applies what the binding delivered, in arrival order.
+    fn apply(&mut self, inbound: Inbound<VolumeHeatMapProtocol>, cx: &mut WidgetCx<'_>) {
+        match inbound {
+            Inbound::Reliable { key, message } => self.apply_reliable(key, message, cx),
+            Inbound::Latest { key, message } => self.apply_latest(key, message, cx),
+            Inbound::Rpc { request_id, result } => self.apply_rpc(request_id, result, cx),
         }
     }
 
-    fn apply_refresh_result(
+    /// Applies one RPC reply, once its request identity says which command it answers.
+    ///
+    /// Only one call is in flight at a time (the binding replaces and aborts the previous
+    /// one), so the table says which command an answer belongs to. A reply whose identity
+    /// is not there answers a call the pane has already replaced, and applying it would
+    /// report the replaced command's failure over the one that replaced it.
+    fn apply_rpc(
+        &mut self,
+        request_id: RequestId,
+        result: WidgetRpcResult<VolumeHeatMapProtocol>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        // A failure is terminal, and every entry point has to say so: the reply to a
+        // command the recovery replaced would otherwise report the same failure again —
+        // under another error object, over the banner the user is reading.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Start) => self.apply_rpc_result(result, cx),
+            Some(PendingCommand::Refresh) => self.apply_rpc_result(result, cx),
+            None => {
+                log::debug!(
+                    "the volume heat map pane ignored reply {request_id}: it answers no command in flight"
+                );
+            }
+        }
+    }
+
+    /// Reported one way, whichever request it answers: the two differ in what they asked
+    /// for, not in what a failure means to the reader.
+    ///
+    /// An accepted refresh stays pending until the round it started is reported: the
+    /// acknowledgement and the round are two different messages, and the gate the service
+    /// holds spans both.
+    fn apply_rpc_result(
         &mut self,
         result: WidgetRpcResult<VolumeHeatMapProtocol>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        // An accepted command stays pending until the round it started is reported:
-        // the acknowledgement and the round are two different messages, and the
-        // gate the service holds spans both.
         if let Err(error) = result {
             self.refresh_pending = false;
             let recovery = self.recovery.clone();
             self.status.report(
+                cx.app_mut(),
                 WidgetState::failed(Arc::new(VolumeHeatMapFailure::Rpc(error)), recovery),
-                cx,
             );
         }
     }
 
     /// Applies a status the stream reported.
     ///
-    /// Returns whether anything a frame draws changed; a status is drawn by the
-    /// framework around the body, so publishing it is enough.
-    ///
     /// A status about another venue is not this pane's to apply: the pane shows one
     /// market participant, and the key is what says which one the message is about.
-    pub(crate) fn apply_reliable(
+    fn apply_reliable(
         &mut self,
         key: VolumeHeatMapStreamKey,
         message: Arc<VolumeHeatMapStreamMessage>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.is_about_the_map_on_screen(key, cx) {
-            return false;
+        cx: &mut WidgetCx<'_>,
+    ) {
+        if !self.is_about_the_map_on_screen(key, cx.app()) {
+            return;
         }
         let VolumeHeatMapStreamMessage::Status(status) = message.as_ref() else {
-            return false;
+            return;
         };
         self.next_refresh_at = status.next_refresh_at();
         match status {
             VolumeHeatMapStatus::Connecting { .. } => {
-                self.status.report(WidgetState::Connecting, cx);
+                self.status.report(cx.app_mut(), WidgetState::Connecting);
             }
             VolumeHeatMapStatus::Refreshing { .. } => {
                 self.refresh_pending = false;
-                self.status.report(WidgetState::Loading, cx);
+                self.status.report(cx.app_mut(), WidgetState::Loading);
             }
             VolumeHeatMapStatus::Ready { revision, .. } => {
                 self.refresh_pending = false;
@@ -759,9 +1196,9 @@ impl VolumeHeatMapWidget {
                 // them, so this can arrive before the map it describes: claiming
                 // readiness now would be claiming a map the pane does not have.
                 if self.accepted.is_some_and(|held| held >= *revision) {
-                    self.status.report(WidgetState::Ready, cx);
+                    self.status.report(cx.app_mut(), WidgetState::Ready);
                 } else {
-                    self.status.report(WidgetState::Loading, cx);
+                    self.status.report(cx.app_mut(), WidgetState::Loading);
                 }
             }
             VolumeHeatMapStatus::Failed { error, .. } => {
@@ -774,48 +1211,47 @@ impl VolumeHeatMapWidget {
                 if is_waiting_for_a_catalog(&failure) {
                     self.reading = None;
                     self.wait_for_market(cx);
-                    return false;
+                    return;
                 }
                 let recovery = self.recovery.clone();
-                self.status
-                    .report(WidgetState::failed(Arc::new(failure), recovery), cx);
+                self.status.report(
+                    cx.app_mut(),
+                    WidgetState::failed(Arc::new(failure), recovery),
+                );
             }
         }
-        false
     }
 
     /// Applies a map the stream published.
-    ///
-    /// Returns whether anything a frame draws changed, which is what the framework
-    /// turns into a repaint: the body is cached, and a map that folds into the same
-    /// pixels is not worth a frame.
-    pub(crate) fn apply_latest(
+    fn apply_latest(
         &mut self,
         key: VolumeHeatMapStreamKey,
         message: Arc<VolumeHeatMapStreamMessage>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.is_about_the_map_on_screen(key, cx) {
-            return false;
+        cx: &mut WidgetCx<'_>,
+    ) {
+        if !self.is_about_the_map_on_screen(key, cx.app()) {
+            return;
         }
         let VolumeHeatMapStreamMessage::Snapshot(snapshot) = message.as_ref() else {
-            return false;
+            return;
         };
         // A map the pane has already overtaken would only make the tiles jump
         // backwards: within one generation the service's revision only moves
         // forwards, so a smaller one can only be a map a status has replaced.
         if self.accepted.is_some_and(|held| snapshot.revision < held) {
-            return false;
+            return;
         }
-        let changed = self.chart.set_entries(snapshot.entries.clone());
+        let changed = self.chart.set_entries(Arc::clone(&snapshot.entries));
         self.accepted = Some(snapshot.revision);
         // Readiness is published at the protocol's own boundary: a complete map is
         // not the same thing as a map a status said was complete, and this is
         // where the two meet.
         if self.ready.is_some_and(|ready| snapshot.revision >= ready) {
-            self.status.report(WidgetState::Ready, cx);
+            self.status.report(cx.app_mut(), WidgetState::Ready);
         }
-        changed
+        if changed {
+            let _ = cx.request_frame();
+        }
     }
 
     /// Whether a message belongs to the map the pane is showing.
@@ -825,12 +1261,8 @@ impl VolumeHeatMapWidget {
     /// rather than waiting for a market, and the pane must not have failed — a
     /// failure is terminal until the user recovers, and a message that arrives after
     /// it is about a stream that no longer exists.
-    fn is_about_the_map_on_screen(
-        &self,
-        key: VolumeHeatMapStreamKey,
-        cx: &impl AppContext,
-    ) -> bool {
-        if self.status.is_failed(cx) || self.awaiting_market {
+    fn is_about_the_map_on_screen(&self, key: VolumeHeatMapStreamKey, app: &App) -> bool {
+        if self.status.is_failed(app) || self.awaiting_market {
             return false;
         }
         self.reading
@@ -845,8 +1277,8 @@ impl VolumeHeatMapWidget {
     /// flight there is nothing to count down to — the deadline the service announced
     /// belongs to the read after the one being waited for — so a number that started
     /// moving then would be counting down to a map the pane has not received.
-    fn countdown_deadline(&self, cx: &impl AppContext) -> Option<i64> {
-        let status = self.status.state(cx);
+    fn countdown_deadline(&self, app: &App) -> Option<i64> {
+        let status = self.status.state(app);
         if status.is_busy() || status.is_failed() {
             return None;
         }
@@ -860,58 +1292,155 @@ impl VolumeHeatMapWidget {
     /// data, and a failure is a state the framework offers its own recovery over,
     /// above the body — and so has one that is waiting for its market, which is not
     /// reading anything and says so with a placeholder of its own. So the control is an
-    /// icon alone and refuses input the rest of the time, and carries the countdown only
-    /// while there is one.
-    fn refresh_is_disabled(&self, cx: &impl AppContext) -> bool {
-        self.awaiting_market || self.refresh_pending || self.countdown_deadline(cx).is_none()
+    /// icon alone and refuses input the rest of the time.
+    fn refresh_is_disabled(&self, app: &App) -> bool {
+        self.awaiting_market || self.refresh_pending || self.countdown_deadline(app).is_none()
     }
 
-    /// The picker that decides which market participant the map is drawn from.
+    /// Shows another market participant's map.
     ///
-    /// It offers the loaded markets this map can read and nothing else, because a map
-    /// can only be drawn from a market that is in memory *and* answers the whole-scope
-    /// ticker read. The choice is identified by the venue's canonical identity and
-    /// *labelled* with its name in the language showing now, so the same choice survives
-    /// a language switch instead of being looked up by a translated string.
-    fn venue_select(&self, cx: &Context<Self>) -> AnyElement {
-        let selected = self.config.venue;
-        let label = selected.map_or_else(
-            || t!(cx, "widget.volume_heatmap.choose_venue"),
-            |venue| venue.display_string(cx),
-        );
-        let disabled = self.venue_picker_is_disabled();
-        let select = self.venues.iter().copied().fold(
-            Select::new(ElementId::Name(SharedString::new_static(
-                "VolumeHeatMapVenue",
-            )))
-            .placeholder(label)
-            .filled()
-            .small()
-            .disabled(disabled)
-            .selected_item(selected.map(|venue| SharedString::new(venue.as_str())))
-            .aria_label(t!(cx, "common.market_participants")),
-            |select, venue| {
-                select.menu_item(MenuItem::Action(MenuItemAction::new(
-                    SharedString::new(venue.as_str()),
-                    venue.display_string(cx),
-                )))
+    /// The map on screen belongs to the market participant being left, so it is dropped rather
+    /// than carried over: the pane cannot vouch for tiles the market it now reads did
+    /// not produce. Picking the venue that is already shown is not a change — the
+    /// picker refuses it, and this guard says the same thing one step later.
+    fn select_venue(&mut self, venue: VenueId, cx: &mut WidgetCx<'_>) {
+        if self.config.venue == Some(venue) {
+            return;
+        }
+        self.config.venue = Some(venue);
+        self.config_change.publish(cx.app_mut());
+        self.reading = None;
+        self.accepted = None;
+        self.chart.set_entries(Arc::from([]));
+        self.load(cx);
+    }
+
+    /// Reads the market again without waiting for the next interval.
+    ///
+    /// Only a ready pane gets here, so the command it sends is one the loop answers:
+    /// a failure is recovered through the framework's own control, above the body.
+    /// The command names the venue on screen, which is what makes it a read of the
+    /// map the user is looking at rather than of whichever market participant the loop happens
+    /// to be serving.
+    fn refresh(&mut self, cx: &mut WidgetCx<'_>) {
+        if self.refresh_is_disabled(cx.app()) {
+            return;
+        }
+        let Some(reading) = self.reading.as_ref() else {
+            return;
+        };
+        let venue = reading.venue;
+        let Some(binding) = self.binding.as_mut() else {
+            return;
+        };
+        self.refresh_pending = true;
+        let request_id = binding.call(cx, VolumeHeatMapRequest::Refresh { venue });
+        self.pending.track(request_id, PendingCommand::Refresh);
+        let _ = cx.request_frame();
+    }
+
+    /// Applies what a header control handed over.
+    fn apply_header_request(&mut self, request: HeaderRequest, cx: &mut WidgetCx<'_>) {
+        match request {
+            HeaderRequest::Refresh => self.refresh(cx),
+            HeaderRequest::Venue(venue) => self.select_venue(venue, cx),
+        }
+    }
+
+    /// Builds the venue picker into the pane's left header group.
+    fn build_venue_control(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<VenueControl, EngineError> {
+        let language = *cx.read(&cx.language());
+        let row = NodeBuilder::boxed()
+            .id("TEST_VOLUME_HEATMAP_VENUE")
+            .style(
+                StyleBuilder::new()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        let select = self.build_venue_select(cx, row)?;
+        Ok(VenueControl {
+            root: row,
+            select,
+            language,
+            venues: self.venues.clone(),
+        })
+    }
+
+    /// Builds the picker itself, with the venues the directory offers and the choice the
+    /// pane is showing.
+    fn build_venue_select(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<Select, EngineError> {
+        let requests = self.requests;
+        let translate = cx.translate().clone();
+        let label = t_smol!(translate, "common.market_participants");
+        let placeholder = if self.config.venue.is_some() {
+            SmolStr::default()
+        } else {
+            t_smol!(translate, "widget.volume_heatmap.choose_venue")
+        };
+        let options = SelectOptions::default()
+            .size(UnifiedSize::Small)
+            .label(label)
+            .placeholder(placeholder);
+        let window = cx.window();
+        let key = cx.unique_key(VENUE_KEY_SUFFIX);
+        let theme = cx.theme().clone();
+        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
+        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
+            move |app, chosen| {
+                let Some(id) = chosen.first() else {
+                    return;
+                };
+                let Ok(venue) = VenueId::from_name(id.as_str()) else {
+                    return;
+                };
+                app.write(&requests, Some(HeaderRequest::Venue(venue)));
+                let _ = app.request_repaint(window);
             },
         );
-
+        // The items are stated in the language showing now; a language switch re-states
+        // them (`sync_header`), which is the kit's static-copy rebuild rule (§15.1).
+        let items = self.venue_items(&translate);
         select
-            .on_change({
-                let widget = cx.entity();
-                move |venue, _, app| {
-                    let Some(venue) = venue
-                        .as_deref()
-                        .and_then(|value| VenueId::from_name(value).ok())
-                    else {
-                        return;
-                    };
-                    widget.update(app, |this, cx| this.select_venue(venue, cx));
-                }
+            .set_items(cx.app_mut(), items)
+            .unwrap_or_else(|error| {
+                log::warn!("the volume heat map picker could not state its venues: {error}");
+            });
+        if let Some(venue) = self.config.venue {
+            select.set_chosen(cx.app_mut(), [venue.as_str()], false);
+        }
+        let _ = select.set_disabled(cx.app_mut(), self.venue_picker_is_disabled());
+        select.build(cx.app_mut(), window, parent)?;
+        Ok(select)
+    }
+
+    /// The picker's items: the loaded venues this map can read, in the order the
+    /// interface states them.
+    ///
+    /// The choice is identified by the venue's canonical identity and *labelled* with its
+    /// name in the language showing now, so the same choice survives a language switch
+    /// instead of being looked up by a translated string.
+    fn venue_items(&self, translate: &Translate) -> Vec<SelectItem> {
+        self.venues
+            .iter()
+            .map(|venue| {
+                SelectItem::new(
+                    SmolStr::new(venue.as_str()),
+                    venue.display_string(translate),
+                )
             })
-            .into_any_element()
+            .collect()
     }
 
     /// Whether the venue picker has nothing to choose between.
@@ -925,1533 +1454,287 @@ impl VolumeHeatMapWidget {
         self.awaiting_market || self.venues.len() < 2
     }
 
-    /// Shows another market participant's map.
-    ///
-    /// The map on screen belongs to the market participant being left, so it is dropped rather
-    /// than carried over: the pane cannot vouch for tiles the market it now reads did
-    /// not produce. Picking the venue that is already shown is not a change — the
-    /// picker refuses it, and this guard says the same thing one step later.
-    fn select_venue(&mut self, venue: VenueId, cx: &mut Context<Self>) {
-        if self.config.venue == Some(venue) {
-            return;
-        }
-        self.config.venue = Some(venue);
-        self.config_change.publish(cx);
-        self.reading = None;
-        self.accepted = None;
-        self.chart.set_entries(Arc::from([]));
-        self.load(cx);
-    }
-
-    /// The control that reads the market again, and the time left until the next
-    /// automatic read.
-    fn refresh_button(&self, cx: &Context<Self>) -> AnyElement {
-        let disabled = self.refresh_is_disabled(cx);
-        Button::new(ElementId::Name(SharedString::new_static(
-            "VolumeHeatMapRefresh",
-        )))
-        .ghost()
-        .small()
-        .disabled(disabled)
-        .aria_label(t!(cx, "widget.volume_heatmap.refresh_now"))
-        .child(Icon::new(IconKind::ArrowsClockwise).size_3())
-        .children(self.countdown.clone())
-        .on_click({
-            let widget = cx.entity();
-            move |_, _, app| {
-                widget.update(app, |this, cx| this.refresh(cx));
-            }
+    /// Builds the refresh control into the pane's right header group.
+    fn build_refresh_control(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<RefreshControl, EngineError> {
+        let language = *cx.read(&cx.language());
+        let row = NodeBuilder::boxed()
+            .id("TEST_VOLUME_HEATMAP_REFRESH_ROW")
+            .style(
+                StyleBuilder::new()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .gap(4.0)
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        let slot = NodeBuilder::boxed()
+            .id("TEST_VOLUME_HEATMAP_REFRESH")
+            .style(
+                StyleBuilder::new()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .build(),
+            )
+            .build(cx.tree_mut(), row)?;
+        let button = self.build_refresh_button(cx, slot)?;
+        let countdown = self.countdown.label;
+        let theme = cx.theme().clone();
+        NodeBuilder::text(
+            SmolStr::default(),
+            TextStyle::new(UnifiedSize::Small.text_size()),
+        )
+        .id("TEST_VOLUME_HEATMAP_COUNTDOWN")
+        .bind_text(move |read| {
+            let label: Option<SmolStr> = read.read(&countdown).clone();
+            label.unwrap_or_default()
         })
-        .into_any_element()
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgDefault)),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), slot)?;
+        Ok(RefreshControl {
+            root: row,
+            slot,
+            button,
+            language,
+        })
     }
 
-    /// Reads the market again without waiting for the next interval.
+    /// Builds the refresh button, in the state the pane is in now.
+    fn build_refresh_button(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<Button, EngineError> {
+        let requests = self.requests;
+        let label = t_smol!(cx.translate(), "widget.volume_heatmap.refresh_now");
+        let disabled = self.refresh_is_disabled(cx.app());
+        let key = cx.unique_key(REFRESH_KEY_SUFFIX);
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let button = Button::new(cx.app_mut(), theme, key)
+            .ghost()
+            .small()
+            .icon(IconKind::ArrowsClockwise)
+            .disabled(disabled)
+            .a11y_label(label.clone())
+            .tooltip_text(label)
+            .on_click(move |ctx| {
+                // A button handler owns no widget: it asks the next sync for the refresh.
+                ctx.update(&requests, |request| *request = Some(HeaderRequest::Refresh));
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        button.build(cx.app_mut(), window, parent)?;
+        Ok(button)
+    }
+
+    /// Keeps the header controls in step with what they should state.
+    fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        self.sync_venue_control(cx)?;
+        self.sync_refresh_control(cx)?;
+        Ok(())
+    }
+
+    /// Keeps the picker's items, choice and availability current.
     ///
-    /// Only a ready pane gets here, so the command it sends is one the loop answers:
-    /// a failure is recovered through the framework's own control, above the body.
-    /// The command names the venue on screen, which is what makes it a read of the
-    /// map the user is looking at rather than of whichever market participant the loop happens
-    /// to be serving.
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.refresh_is_disabled(cx) {
-            return;
+    /// The picker's item labels are resolved text, so a language switch re-states them; a
+    /// commit that changed the readable venues does the same. What the picker *states* is
+    /// its `chosen` signal, which a venue switch moves without a rebuild.
+    fn sync_venue_control(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some((root, language, venues)) = self
+            .venue_control
+            .as_ref()
+            .map(|control| (control.root, control.language, control.venues.clone()))
+        else {
+            return Ok(());
+        };
+        // The pane rebuilds the row it calls `header` for, so the row this widget built
+        // into may already be gone — and it took the control with it. Touching a stale
+        // node would fail the whole synchronization, so a row that is missing is a
+        // release and nothing else.
+        if cx.tree().get(root).is_err() {
+            self.release_venue_control(cx, false);
+            return Ok(());
         }
-        let Some(reading) = self.reading.as_ref() else {
+        let language_now = *cx.read(&cx.language());
+        let items_moved = language != language_now || venues != self.venues;
+        if items_moved {
+            let translate = cx.translate().clone();
+            let items = self.venue_items(&translate);
+            if let Some(control) = self.venue_control.as_mut() {
+                control
+                    .select
+                    .set_items(cx.app_mut(), items)
+                    .unwrap_or_else(|error| {
+                        log::warn!(
+                            "the volume heat map picker could not replace its venues: {error}"
+                        );
+                    });
+                control.language = language_now;
+                control.venues = self.venues.clone();
+            }
+        }
+        let Some(control) = self.venue_control.as_ref() else {
+            return Ok(());
+        };
+        if let Some(venue) = self.config.venue {
+            let stated = control.select.chosen(cx.app());
+            if stated.len() != 1 || stated.first().map(SmolStr::as_str) != Some(venue.as_str()) {
+                control
+                    .select
+                    .set_chosen(cx.app_mut(), [venue.as_str()], false);
+            }
+        }
+        let _ = control
+            .select
+            .set_disabled(cx.app_mut(), self.venue_picker_is_disabled());
+        control.select.sync(cx.app_mut())?;
+        Ok(())
+    }
+
+    /// Keeps the refresh button's copy and availability current.
+    ///
+    /// A kit button's label and tooltip are chosen when it is built, so a language switch
+    /// rebuilds it — in the slot it already occupies, so nothing else in the row moves.
+    fn sync_refresh_control(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some((root, slot, language)) = self
+            .refresh_control
+            .as_ref()
+            .map(|control| (control.root, control.slot, control.language))
+        else {
+            return Ok(());
+        };
+        if cx.tree().get(root).is_err() {
+            self.release_refresh_control(cx, false);
+            return Ok(());
+        }
+        let language_now = *cx.read(&cx.language());
+        if language != language_now {
+            if let Some(control) = self.refresh_control.as_mut() {
+                if let Some(node) = control.button.node() {
+                    remove_own_node(cx, node);
+                }
+                let _ = control.button.release(cx.app_mut());
+            }
+            let button = self.build_refresh_button(cx, slot)?;
+            if let Some(control) = self.refresh_control.as_mut() {
+                control.button = button;
+                control.language = language_now;
+            }
+        }
+        let disabled = self.refresh_is_disabled(cx.app());
+        let Some(control) = self.refresh_control.as_ref() else {
+            return Ok(());
+        };
+        control.button.sync(cx.app_mut())?;
+        let _ = control.button.set_disabled(cx.app_mut(), disabled);
+        Ok(())
+    }
+
+    /// Shows `common.no_data` over a map that holds no tile.
+    ///
+    /// The stand-in is the widget's, not the framework's: a published map that covers no
+    /// instrument is *content*, so this is the body saying there is nothing in it rather
+    /// than a placeholder saying there is no body. Its copy is static, so it is built for
+    /// the language showing now and rebuilt when that moves (the same rule the surface
+    /// follows for its notices).
+    fn sync_empty_overlay(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let empty = self.has_content() && self.chart.is_empty();
+        if !empty {
+            if let Some(node) = self.empty.take() {
+                remove_own_node(cx, node);
+                self.empty_language = None;
+            }
+            return Ok(());
+        }
+        let language = *cx.read(&cx.language());
+        if self.empty.is_some() && self.empty_language == Some(language) {
+            return Ok(());
+        }
+        if let Some(node) = self.empty.take() {
+            remove_own_node(cx, node);
+        }
+        let Some(root) = self.body_root else {
+            return Ok(());
+        };
+        if cx.tree().get(root).is_err() {
+            self.body_root = None;
+            return Ok(());
+        }
+        let overlay = NodeBuilder::boxed()
+            .id("TEST_VOLUME_HEATMAP_EMPTY")
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .left(0.0)
+                    .items_center()
+                    .justify_center()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)?;
+        let text = t_smol!(cx.translate(), "common.no_data");
+        EmptyState::new(cx.theme().clone(), "volume_heatmap.empty")
+            .text(text)
+            .build(cx.tree_mut(), overlay)?;
+        self.empty = Some(overlay);
+        self.empty_language = Some(language);
+        Ok(())
+    }
+
+    /// Releases the picker's component, and the widget's own row when asked to.
+    fn release_venue_control(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
+        let Some(control) = self.venue_control.take() else {
             return;
         };
-        self.refresh_pending = true;
-        self.binding.call(
-            VolumeHeatMapRequest::Refresh {
-                venue: reading.venue,
-            },
-            cx,
-            Self::apply_refresh_result,
-        );
-        cx.notify();
+        if remove_node {
+            remove_own_node(cx, control.root);
+        }
+        let _ = control.select.release(cx.app_mut());
     }
 
-    /// Rebuilds the countdown, asking for the frame that draws it.
-    ///
-    /// The countdown is the only thing this pane draws that moves on its own, and
-    /// it moves once a second: the task wakes four times a second so a second is
-    /// never missed, and only the write that changed it asks for a frame. The
-    /// header is not cached, so nothing else here has to announce itself.
-    ///
-    /// The label is the deadline of a ready pane and nothing else, so leaving the
-    /// ready state — a read starting, a failure, a reload — takes the countdown off
-    /// the button in the same tick that it greys it.
-    fn tick_countdown(&mut self, cx: &mut Context<Self>) {
-        let label = self.countdown_deadline(cx).map(|due| {
-            SharedString::new(format_countdown(due.saturating_sub(unix_millis())).as_str())
-        });
-        if self.countdown == label {
+    /// Releases the refresh button, and the widget's own row when asked to.
+    fn release_refresh_control(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
+        let Some(control) = self.refresh_control.take() else {
             return;
+        };
+        if remove_node {
+            remove_own_node(cx, control.root);
         }
-        self.countdown = label;
-        cx.notify();
+        let _ = control.button.release(cx.app_mut());
     }
 }
 
-impl Render for VolumeHeatMapWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The body is only embedded while the pane has content, so this is the
-        // ready state and nothing else. Everything the pane is *doing* is drawn by
-        // the framework around this.
-        let canvas = self.chart.element(ElementId::Name(SharedString::new_static(
-            "VolumeHeatMapCanvas",
-        )));
-
-        // A map that covers no instrument draws no tile at all, which leaves the
-        // canvas and a failed load looking the same. The map is still the pane's
-        // content — the venue published it — so the pane says what it holds rather
-        // than letting the framework's placeholder speak for it. The canvas stays:
-        // the message stands over the map's own box rather than replacing it.
-        let empty = self.chart.is_empty().then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(EmptyState::new(
-                    "VolumeHeatMapEmpty",
-                    t!(cx, "common.no_data"),
-                ))
-                .into_any_element()
-        });
-
-        div()
-            .relative()
-            .size_full()
-            .min_h_0()
-            .child(canvas)
-            .children(empty)
-            .into_any_element()
+/// Removes a node this widget built, if it is still in the tree.
+///
+/// A node that is already gone is not a failure: the pane rebuilds its rows, and a node
+/// this widget built into the old one went with it.
+fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) {
+    if cx.tree().get(node).is_err() {
+        return;
     }
+    let window = cx.window();
+    let _ = cx.app_mut().remove_node(window, node);
+}
+
+/// The label beside the refresh button for `deadline` at `now`.
+///
+/// A deadline that has already passed counts as `00:00` rather than as a negative wait,
+/// which is the same rule [`format_countdown`] applies: the pane never shows a countdown
+/// that has run out as anything but zero.
+fn countdown_label(deadline: Option<i64>, now: i64) -> Option<SmolStr> {
+    deadline.map(|deadline| format_countdown(deadline.saturating_sub(now)))
 }
 
 #[cfg(test)]
-mod tests {
-    use gpui_kit::{App, Entity, TestAppContext};
-    use i18n::language::codes::LanguageCode;
-    use market_participants_connector::{catalog::test_support, market::error::MarketError};
-    use market_participants_model::decimal::Quantity;
-    use smol_str::SmolStr;
-    use widget::protocol::RequestId;
-    use widget_tokio_runtime::global;
-
-    use super::*;
-    use crate::{
-        model::{HeatMapEntry, PriceDirection},
-        service::{
-            VolumeHeatMapResponse,
-            test_support::{FakeSource, binance, okx},
-        },
-    };
-
-    /// A map of one tile is enough for every assertion here.
-    fn entries() -> Arc<[HeatMapEntry]> {
-        Arc::from([HeatMapEntry {
-            instrument: test_support::spot_token("fixture", "BTC", "USDT"),
-            base_asset_label: SmolStr::new_static("BTC"),
-            notional_asset: test_support::token("fixture", "USDT"),
-            notional: Quantity::from(120_u64),
-            notional_label: SmolStr::new_static("120"),
-            direction: PriceDirection::Up,
-        }])
-    }
-
-    fn ready(revision: u64) -> VolumeHeatMapStatus {
-        VolumeHeatMapStatus::Ready {
-            venue: binance(),
-            revision,
-            next_refresh_at: unix_millis() + COUNTDOWN,
-        }
-    }
-
-    fn refreshing() -> VolumeHeatMapStatus {
-        VolumeHeatMapStatus::Refreshing {
-            venue: binance(),
-            next_refresh_at: unix_millis() + COUNTDOWN,
-        }
-    }
-
-    /// A deadline far enough ahead that the label it produces is a real countdown
-    /// rather than one that has already run out.
-    const COUNTDOWN: i64 = 600_000;
-
-    fn failed() -> VolumeHeatMapStatus {
-        VolumeHeatMapStatus::Failed {
-            venue: binance(),
-            error: VolumeHeatMapFetchError::MarketParticipant(MarketError::ServiceClosed),
-        }
-    }
-
-    /// A status about the market participant the pane is *not* showing.
-    fn another_venues_status() -> VolumeHeatMapStatus {
-        VolumeHeatMapStatus::Ready {
-            venue: okx(),
-            revision: 9,
-            next_refresh_at: unix_millis() + COUNTDOWN,
-        }
-    }
-
-    /// Installs the market participants root and the directory a pane reads, with every venue
-    /// that answers the route-level bulk ticker read loaded or not.
-    ///
-    /// A loaded market is one commit of every one of its scopes, catalogs and metadata
-    /// routes, so the fixture publishes an (empty) catalog for every route the
-    /// registry holds: what a pane draws comes from the source a test hands it.
-    fn install(cx: &mut App, loaded: bool) {
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-        global::install(cx).expect("the test Tokio runtime should build");
-        let catalog = Arc::new(market_participants_connector::catalog::store::Catalog::new());
-        let connector =
-            market_participants_connector::test_support::install_root(cx, Arc::clone(&catalog));
-        if !loaded {
-            return;
-        }
-        let venues = connector.supported_venues();
-        connector
-            .load_fixture(
-                &market_participants_connector::test_support::definitions(&venues),
-                &[],
-                &[],
-            )
-            .expect("the venue's routes should load");
-        // Only catalog routes are registered in the fixture directory: a
-        // prediction scope publishes no catalog and has no route to bind here.
-        let routes: Vec<VenueRoute> = connector
-            .venues()
-            .scopes()
-            .iter()
-            .filter(|route| {
-                connector
-                    .venues()
-                    .scope(route)
-                    .is_some_and(|entry| entry.catalog_source.is_some())
-            })
-            .cloned()
-            .collect();
-        let sources = routes
-            .iter()
-            .map(|route| test_support::binding(&source_id(route), test_support::pending()))
-            .collect::<Vec<_>>();
-        let registrations = routes
-            .iter()
-            .map(|route| test_support::registration(route, &source_id(route)))
-            .collect::<Vec<_>>();
-        test_support::commit_fixture_routes(
-            &catalog,
-            market_participants_connector::catalog::source::CatalogRouteUpdate::new(
-                sources,
-                registrations,
-            ),
-            &test_support::requirements(&routes),
-        )
-        .expect("the fixture routes should register in the directory");
-        let published = routes
-            .iter()
-            .cloned()
-            .map(|route| (route, Vec::new()))
-            .collect::<Vec<_>>();
-        test_support::publish_fixture_catalogs(cx, &published);
-    }
-
-    /// The catalog source id of one fixture route.
-    fn source_id(route: &VenueRoute) -> String {
-        format!("fixture-{}-{}", route.venue, route.scope)
-    }
-
-    /// Loads the venues named with the scopes their own loaders publish.
-    fn load_venues(cx: &App, venues: &[market_participants_model::identifier::VenueId]) {
-        cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
-            .load_fixture(
-                &market_participants_connector::test_support::definitions(venues),
-                &[],
-                &[],
-            )
-            .expect("the venue's routes should load");
-    }
-
-    /// Loads one venue again with no scope at all, the way a shrinking commit takes
-    /// every scope away: a venue that publishes nothing is not a loaded venue.
-    fn unload_venue(cx: &App, venue: &market_participants_model::identifier::VenueId) {
-        cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
-            .load_fixture(&[], &[(*venue, Vec::new())], &[])
-            .expect("the shrinking commit lands");
-    }
-
-    /// The scopes of one venue that answer the route-level bulk ticker read, as the
-    /// pane reads them.
-    fn ticker_routes_of(
-        cx: &App,
-        venue: market_participants_model::identifier::VenueId,
-    ) -> Vec<VenueRoute> {
-        venue_routes(
-            cx.global::<market_participants_connector::connector::MarketParticipantsConnector>(),
-            venue,
-        )
-        .to_vec()
-    }
-
-    /// Creates a pane the way the framework does: status first, then one load.
-    ///
-    /// The fake never answers, so the load the pane starts stays in flight and the
-    /// tests below are the only thing that ever reports to it. A fake that answered
-    /// would race them: the service publishes on its own task, and a test that
-    /// reported a map at the same time would be asserting against whichever of the
-    /// two arrived last.
-    fn pane_with(cx: &mut TestAppContext) -> Entity<VolumeHeatMapWidget> {
-        pane_over(cx, true)
-    }
-
-    /// The same, over a fixture whose venues are loaded or not.
-    ///
-    /// Every fetch of the round stays in flight, so a pane a test leaves alone stays in the
-    /// middle of its first round rather than being answered by a fixture that ran out of plans.
-    fn pane_over(cx: &mut TestAppContext, loaded: bool) -> Entity<VolumeHeatMapWidget> {
-        pane_over_source(cx, FakeSource::pending(), loaded)
-    }
-
-    /// The same, over a source a test keeps so it can count what the pane asked for.
-    fn pane_over_source(
-        cx: &mut TestAppContext,
-        source: FakeSource,
-        loaded: bool,
-    ) -> Entity<VolumeHeatMapWidget> {
-        pane_over_config(cx, source, loaded, VolumeHeatMapConfig::default())
-    }
-
-    /// The same, over a stored configuration.
-    fn pane_over_config(
-        cx: &mut TestAppContext,
-        source: FakeSource,
-        loaded: bool,
-        config: VolumeHeatMapConfig,
-    ) -> Entity<VolumeHeatMapWidget> {
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            install(cx, loaded);
-            let pane = cx.new(|cx| {
-                let status = cx.new(|_| WidgetStatus::new());
-                let weak: gpui_kit::WeakEntity<VolumeHeatMapWidget> = cx.weak_entity();
-                let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
-                    let _ = weak.update(cx, |pane, cx| pane.load(cx));
-                });
-                VolumeHeatMapWidget::new_with_source(
-                    config,
-                    source,
-                    status,
-                    WidgetConfigChange::default(),
-                    recovery,
-                    cx,
-                )
-            });
-            pane.update(cx, |pane, cx| pane.load(cx));
-            pane
-        })
-    }
-
-    /// Counts the venue commits it is told about.
-    ///
-    /// A test that asserts a pane did *not* act on a commit still has to know the commit reached
-    /// it: this probe subscribes the same way and after the pane did, so the delivery it counts is
-    /// one the pane's own handler has already seen.
-    struct CommitProbe {
-        deliveries: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl CommitProbe {
-        fn new(
-            cx: &mut Context<Self>,
-            events: &Entity<market_participants_connector::venue::loaded::VenueEventSource>,
-            deliveries: Arc<std::sync::atomic::AtomicUsize>,
-        ) -> Self {
-            cx.subscribe(events, |probe, _, _: &VenuesUpdated, _| {
-                probe
-                    .deliveries
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            })
-            .detach();
-            Self { deliveries }
-        }
-    }
-
-    /// Gives the executor turns until the source has been asked for `expected` markets.
-    ///
-    /// A round runs on the application runtime rather than on the test's own queue, so waiting
-    /// for it means yielding to that runtime the way the load does.
-    fn settle_fetches(cx: &mut TestAppContext, source: &FakeSource, expected: usize) {
-        settle_until(cx, "the map to ask for its markets", || {
-            source.fetch_count() >= expected
-        });
-    }
-
-    /// Gives the executor turns until `expected` commits have reached their subscribers.
-    fn settle_deliveries(
-        cx: &mut TestAppContext,
-        deliveries: &Arc<std::sync::atomic::AtomicUsize>,
-        expected: usize,
-    ) {
-        settle_until(cx, "the commit to reach its subscribers", || {
-            deliveries.load(std::sync::atomic::Ordering::Acquire) >= expected
-        });
-    }
-
-    /// Polls a condition that becomes true on the application runtime.
-    fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !ready() {
-            assert!(std::time::Instant::now() < deadline, "{what} should happen");
-            cx.run_until_parked();
-            let handle = cx.update(|cx| global::handle(cx).handle().clone());
-            handle.block_on(async { tokio::task::yield_now().await });
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    /// Reports a status as the stream would.
-    ///
-    /// Cancelling the binding first is what makes the reported message the only
-    /// input the pane has: the load it was still holding is dropped with the
-    /// runtime, so nothing else can answer.
-    fn report_status(
-        pane: &Entity<VolumeHeatMapWidget>,
-        status: VolumeHeatMapStatus,
-        cx: &mut App,
-    ) -> bool {
-        pane.update(cx, |pane, context| {
-            pane.cancel_binding();
-            pane.apply_reliable(
-                VolumeHeatMapStreamKey::new(binance()),
-                Arc::new(VolumeHeatMapStreamMessage::Status(status)),
-                context,
-            )
-        })
-    }
-
-    /// Reports a map as the stream would.
-    fn report_map(pane: &Entity<VolumeHeatMapWidget>, revision: u64, cx: &mut App) -> bool {
-        pane.update(cx, |pane, context| {
-            pane.cancel_binding();
-            pane.apply_latest(
-                VolumeHeatMapStreamKey::new(binance()),
-                Arc::new(VolumeHeatMapStreamMessage::Snapshot(Arc::new(
-                    crate::service::VolumeHeatMapSnapshot {
-                        revision,
-                        entries: entries(),
-                    },
-                ))),
-                context,
-            )
-        })
-    }
-
-    #[gpui_kit::test]
-    fn a_pane_should_ask_for_nothing_until_a_map_arrives(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            assert!(!pane.read(cx).has_content());
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Connecting);
-            assert!(
-                pane.read(cx).status.state(cx).failure().is_none(),
-                "a pane that is still connecting has nothing to report"
-            );
-        });
-    }
-
-    /// A scope that answers the whole-scope ticker read but publishes no catalog is not a
-    /// scope this map can be drawn from: a ticker has no listing to be resolved against,
-    /// so it is not read — while a scope beside it that publishes one is.
-    #[gpui_kit::test]
-    fn a_route_that_publishes_no_catalog_should_not_be_read(cx: &mut TestAppContext) {
-        let pane = pane_over(cx, false);
-        let venue = market_participants_model::identifier::VenueId::Binance;
-
-        cx.update(|cx| {
-            cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .load_fixture(
-                    &[],
-                    &[(
-                        venue,
-                        vec![
-                            // The scope beside it: it publishes a catalog, so it is read.
-                            scope_entry("usd-m-perp", &[CapabilityId::AllTickers], true),
-                            scope_entry("spot", &[CapabilityId::AllTickers], false),
-                        ],
-                    )],
-                    &[],
-                )
-                .expect("the fixture scopes load");
-            let routes = pane.update(cx, |pane, cx| {
-                pane.venues = available_venues(cx);
-                pane.routes_of(cx, venue)
-            });
-
-            assert_eq!(
-                routes.as_ref(),
-                [test_support::route("binance", "usd-m-perp")],
-                "a scope that answers the whole-scope ticker read but publishes no catalog has \
-                 no listing to be resolved against"
-            );
-        });
-    }
-
-    /// A loaded scope that serves a ticker one listing at a time is not a scope this map
-    /// reads, however loaded and however catalogued it is: a heat map is folded from the
-    /// whole-scope read, and a scope that does not answer it is not a column of the map.
-    #[gpui_kit::test]
-    fn a_route_that_does_not_answer_the_whole_scope_ticker_read_should_not_be_read(
-        cx: &mut TestAppContext,
-    ) {
-        let pane = pane_over(cx, false);
-        let venue = market_participants_model::identifier::VenueId::Binance;
-
-        cx.update(|cx| {
-            cx.global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .load_fixture(
-                    &[],
-                    &[(
-                        venue,
-                        vec![
-                            // The scope beside it: it answers the whole-scope read, so it is read.
-                            scope_entry("usd-m-perp", &[CapabilityId::AllTickers], true),
-                            scope_entry("spot", &[CapabilityId::Tickers], true),
-                        ],
-                    )],
-                    &[],
-                )
-                .expect("the fixture scopes load");
-            let routes = pane.update(cx, |pane, cx| {
-                pane.venues = available_venues(cx);
-                pane.routes_of(cx, venue)
-            });
-
-            assert_eq!(
-                routes.as_ref(),
-                [test_support::route("binance", "usd-m-perp")],
-                "a loaded scope that serves only the listing-scoped ticker read is not a market \
-                 this map is drawn from"
-            );
-            assert!(
-                !routes.iter().any(|route| route.scope.as_str() == "spot"),
-                "the scope that does not answer the whole-scope read is excluded, not merely \
-                 outpaced: {routes:?}"
-            );
-        });
-    }
-
-    /// A market participant can be loaded and still not be a market this map reads: the
-    /// map is folded from the route-level read of every ticker of a scope, and a venue
-    /// that answers tickers one listing at a time publishes nothing of that shape.
-    /// Longbridge is that venue today, so the picker must not offer it however loaded it
-    /// is.
-    #[gpui_kit::test]
-    fn a_loaded_venue_without_the_whole_scope_ticker_read_should_not_be_offered(
-        cx: &mut TestAppContext,
-    ) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            let longbridge = VenueId::Longbridge;
-            assert!(
-                cx.global::<market_participants_connector::connector::MarketParticipantsConnector>(
-                )
-                .venues()
-                .loaded(&longbridge)
-                .is_some(),
-                "the fixture loaded Longbridge, so only the read it serves can exclude it"
-            );
-            assert!(
-                !pane.read(cx).venues.contains(&longbridge),
-                "a venue that answers tickers a listing at a time is not a market this map \
-                 reads: {:?}",
-                pane.read(cx).venues
-            );
-            assert!(
-                pane.read(cx).routes_of(cx, longbridge).is_empty(),
-                "and it contributes no scope to the map"
-            );
-            assert_eq!(
-                pane.read(cx).venues,
-                [binance(), okx(), VenueId::Hyperliquid],
-                "the picker offers the loaded venues that do answer the whole-scope read"
-            );
-        });
-    }
-
-    /// A stored choice of such a venue is a choice that no longer holds: it is reset and
-    /// the pane reads a market it can draw, so a user who had Longbridge selected before
-    /// the map stopped reading it is not left on a map that cannot be produced.
-    #[gpui_kit::test]
-    fn a_stored_venue_without_the_whole_scope_ticker_read_should_be_reset(cx: &mut TestAppContext) {
-        let pane = pane_over_config(
-            cx,
-            FakeSource::pending(),
-            true,
-            VolumeHeatMapConfig {
-                venue: Some(VenueId::Longbridge),
-            },
-        );
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).config.venue,
-                Some(binance()),
-                "the market that is readable is the one the pane falls back to"
-            );
-            assert_eq!(
-                pane.read(cx).reading.as_ref().map(|reading| reading.venue),
-                Some(binance())
-            );
-        });
-    }
-
-    /// One scope of a fixture load: it carries `capabilities`, and publishes a catalog when
-    /// `publishes` says so.
-    fn scope_entry(
-        scope: &str,
-        capabilities: &[CapabilityId],
-        publishes: bool,
-    ) -> market_participants_connector::venue::definition::ScopeEntry {
-        market_participants_connector::venue::definition::ScopeEntry {
-            scope: market_participants_model::identifier::VenueScopeId::new(scope)
-                .expect("the fixture scope is canonical"),
-            catalog_source: publishes.then(|| {
-                market_participants_connector::catalog::source::CatalogSourceId::new(format!(
-                    "fixture-{scope}"
-                ))
-                .expect("the fixture source id is canonical")
-            }),
-            normalization: Vec::new(),
-            capabilities: capabilities
-                .iter()
-                .map(|capability| {
-                    market_participants_connector::venue::definition::CapabilitySupport {
-                        capability: *capability,
-                        needs_auth: false,
-                    }
-                })
-                .collect(),
-        }
-    }
-
-    /// A market the user has not loaded is a wait rather than a failure (⑮): the
-    /// pane names what to load and has nothing to draw — not even for a map it
-    /// once accepted, because nothing on screen is backed by a market any more
-    /// (⑰). This is the pane's whole answer while nothing is loaded, and it is the
-    /// framework's own sentence that says where to load one.
-    #[gpui_kit::test]
-    fn an_unloaded_market_should_leave_the_pane_waiting(cx: &mut TestAppContext) {
-        let pane = pane_over(cx, false);
-
-        cx.update(|cx| {
-            let status = pane.read(cx).status.state(cx);
-            assert!(
-                status.failure().is_none(),
-                "an unloaded market is not a failure"
-            );
-            assert_eq!(
-                status,
-                WidgetState::waiting(Notice::MarketNotLoaded {
-                    venues: market_venues(),
-                    supported: market_venues(),
-                }),
-                "waiting is neither working nor ready"
-            );
-            let notice = status.notice().expect("the pane waits for its market");
-            let sentence = notice.resolve(cx);
-            assert!(
-                sentence.contains("Binance") && sentence.contains("OKX"),
-                "the notice names the markets that answer the whole-scope ticker read: {sentence}"
-            );
-            assert!(
-                !sentence.contains("Longbridge"),
-                "and not the one that answers a ticker only one listing at a time: {sentence}"
-            );
-            assert!(
-                sentence.contains("<kbd>![](file://icons/phosphoricons/bank.svg)</kbd>")
-                    && sentence.contains("top left corner"),
-                "and it points at the top left control that loads one, by its icon: {sentence}"
-            );
-            assert!(!pane.read(cx).has_content());
-
-            report_map(&pane, 1, cx);
-            assert!(
-                !pane.read(cx).has_content(),
-                "a venue the registry does not hold is no market to draw"
-            );
-        });
-    }
-
-    /// A pane that is waiting for its market has no header controls to offer either: the venue
-    /// picker chooses between markets that are in memory, and the refresh has no schedule to bring
-    /// forward. These are the two answers the controls in the header read.
-    #[gpui_kit::test]
-    fn waiting_for_the_market_should_disable_the_header_controls(cx: &mut TestAppContext) {
-        let pane = pane_over(cx, false);
-
-        cx.update(|cx| {
-            assert!(
-                pane.read(cx).awaiting_market,
-                "the fixture pane really is waiting for its market"
-            );
-            assert!(
-                pane.read(cx).venue_picker_is_disabled(),
-                "there is no market to switch the map to, so the picker refuses input"
-            );
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "and there is no schedule for the refresh to bring forward"
-            );
-        });
-    }
-
-    /// The words a waiting pane shows are the ones the window's language resolves them in: the
-    /// notice is a reference into the catalogue, resolved on the frame that draws it, so the
-    /// pane reports nothing again — nothing loads again, and nothing re-reports by hand.
-    #[gpui_kit::test]
-    fn a_pane_waiting_for_its_markets_should_follow_the_language(cx: &mut TestAppContext) {
-        let pane = pane_over(cx, false);
-
-        let (notice, english) = cx.update(|cx| {
-            let notice = pane
-                .read(cx)
-                .status
-                .state(cx)
-                .notice()
-                .cloned()
-                .expect("the pane waits for its markets");
-            let sentence = notice.resolve(cx);
-            assert!(
-                sentence.contains("Binance") && sentence.contains("OKX"),
-                "the notice names the markets that answer the whole-scope ticker read: {sentence}"
-            );
-            assert!(
-                !sentence.contains("Longbridge"),
-                "and not the one that answers a ticker only one listing at a time: {sentence}"
-            );
-
-            (notice, sentence.to_string())
-        });
-
-        cx.update(|cx| cx.set_global(LanguageCode::ZhCn));
-
-        cx.update(|cx| {
-            let sentence = notice.resolve(cx);
-            assert!(
-                sentence.contains("币安") && sentence.contains("欧易"),
-                "the same reference resolves in the language showing now: {sentence}"
-            );
-            assert_ne!(
-                sentence, english,
-                "the copy of the language the interface left is gone: {sentence}"
-            );
-        });
-    }
-
-    /// A stream that is still alive after its markets went away must not write a
-    /// status over the notice: the pane waits, and a status or a map already in flight
-    /// belongs to markets the pane no longer reports reading. Without the guard the
-    /// `Ready` turns the notice into the loading placeholder and the map that follows
-    /// the readiness turns it into content.
-    #[gpui_kit::test]
-    fn a_late_message_after_the_market_went_away_should_not_clear_the_notice(
-        cx: &mut TestAppContext,
-    ) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            // The pane is reading, which is the state a revocation interrupts.
-            report_map(&pane, 1, cx);
-            assert!(pane.read(cx).has_content(), "the map is what arrived");
-
-            // Every venue loaded again and published no scope at all: the pane's own
-            // gate is what notices, and it reports the neutral notice.
-            let venues = cx
-                .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .supported_venues();
-            for venue in &venues {
-                unload_venue(cx, venue);
-            }
-            pane.update(cx, |pane, cx| pane.load(cx));
-
-            let waiting = pane.read(cx).status.state(cx);
-            assert!(
-                waiting.notice().is_some(),
-                "the pane reports the neutral notice"
-            );
-            assert!(waiting.failure().is_none(), "waiting is not a failure");
-
-            report_status(&pane, ready(2), cx);
-            assert!(
-                pane.read(cx).status.state(cx).notice().is_some(),
-                "the notice is what the pane reports after a late status"
-            );
-
-            report_map(&pane, 2, cx);
-            assert!(
-                !pane.read(cx).has_content(),
-                "a map from the market that went away must not become content again"
-            );
-            assert!(
-                pane.read(cx).status.state(cx).notice().is_some(),
-                "the notice is what the pane reports after a late map"
-            );
-        });
-    }
-
-    /// The picker offers exactly the markets that are loaded, in the order the
-    /// interface states venues, and a venue loaded after the pane was opened joins
-    /// them.
-    #[gpui_kit::test]
-    fn the_venue_picker_should_offer_every_loaded_market(cx: &mut TestAppContext) {
-        let pane = pane_over(cx, false);
-
-        cx.update(|cx| {
-            assert!(
-                pane.read(cx).venues.is_empty(),
-                "nothing is loaded, so nothing can be chosen"
-            );
-        });
-
-        // The probe subscribes after the pane did, so a delivery it counts is one the
-        // pane's own handler has already seen: waiting on it is what makes the two
-        // commits below deterministic.
-        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let _probe = cx.update(|cx| {
-            let events = cx
-                .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .venues()
-                .events();
-            cx.new(|cx| CommitProbe::new(cx, &events, Arc::clone(&deliveries)))
-        });
-
-        cx.update(|cx| load_venues(cx, &[okx()]));
-        settle_deliveries(cx, &deliveries, 1);
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).venues,
-                [okx()],
-                "a loaded market is a choice the picker offers"
-            );
-            load_venues(cx, &[binance()]);
-        });
-        settle_deliveries(cx, &deliveries, 2);
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).venues,
-                [binance(), okx()],
-                "the venues are offered in the order the interface states them"
-            );
-        });
-    }
-
-    /// The choice is the venue's canonical identity rather than its name, which is
-    /// what keeps it a choice when the language changes: the picker's labels are
-    /// translated and the selection is not looked up by one.
-    #[gpui_kit::test]
-    fn the_venue_choice_should_survive_a_language_change(cx: &mut TestAppContext) {
-        let pane = pane_over_config(
-            cx,
-            FakeSource::pending(),
-            true,
-            VolumeHeatMapConfig { venue: Some(okx()) },
-        );
-
-        cx.update(|cx| {
-            assert_eq!(pane.read(cx).config.venue, Some(okx()));
-            assert_eq!(
-                pane.read(cx).reading.as_ref().map(|reading| reading.venue),
-                Some(okx()),
-                "the pane reads the venue its configuration names"
-            );
-            assert_eq!(
-                okx().display_string(cx).as_ref(),
-                "OKX",
-                "the picker states the venue in the language showing now"
-            );
-
-            cx.set_global(LanguageCode::ZhCn);
-
-            assert_eq!(
-                pane.read(cx).config.venue,
-                Some(okx()),
-                "a translated name cannot move the selection"
-            );
-            assert_eq!(okx().display_string(cx).as_ref(), "欧易");
-        });
-    }
-
-    /// A stored venue this build no longer reads, or one whose market is not loaded,
-    /// is a choice that does not hold: it goes back to "not chosen" and is reported,
-    /// and the pane reads a market that is there.
-    #[gpui_kit::test]
-    fn a_stored_venue_that_is_not_loaded_should_be_reset_and_reported(cx: &mut TestAppContext) {
-        let reported = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pane = cx.update(|cx| {
-            // Only Binance is loaded, so the stored OKX venue is not one the pane may
-            // read: it is the state a stored choice falls into when the market behind
-            // it is not there.
-            install(cx, false);
-            load_venues(cx, &[binance()]);
-            let pane = cx.new(|cx| {
-                let status = cx.new(|_| WidgetStatus::new());
-                let weak: gpui_kit::WeakEntity<VolumeHeatMapWidget> = cx.weak_entity();
-                let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
-                    let _ = weak.update(cx, |pane, cx| pane.load(cx));
-                });
-                let reported = Arc::clone(&reported);
-                VolumeHeatMapWidget::new_with_source(
-                    VolumeHeatMapConfig { venue: Some(okx()) },
-                    FakeSource::pending(),
-                    status,
-                    WidgetConfigChange::new(move |_| {
-                        reported.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    }),
-                    recovery,
-                    cx,
-                )
-            });
-            pane.update(cx, |pane, cx| pane.load(cx));
-            pane
-        });
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).config.venue,
-                Some(binance()),
-                "the market that is loaded is the one the pane falls back to"
-            );
-            assert!(
-                reported.load(std::sync::atomic::Ordering::Acquire) > 0,
-                "a reset that is not reported is a reset the user sees every start"
-            );
-        });
-    }
-
-    /// A commit that leaves the pane's market as it was — the venue it reads loading
-    /// again with the same scopes — is a publication behind a market the pane already
-    /// has: it re-checks its precondition and keeps the round it is running rather
-    /// than starting over on what the user is watching.
-    ///
-    /// What proves the pane did not start over is the source's own fetch count: a round asks
-    /// every scope the map reads once, so a second round is visible as more fetches.
-    #[gpui_kit::test]
-    fn a_commit_that_leaves_the_panes_market_alone_does_not_restart_its_round(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::pending();
-        let pane = pane_over_source(cx, source.clone(), true);
-        cx.update(|cx| {
-            load_venues(cx, &[binance()]);
-            pane.update(cx, |pane, cx| pane.load(cx));
-        });
-        let reading = cx.read(|cx| {
-            pane.read(cx)
-                .reading
-                .clone()
-                .expect("the pane reads a market")
-        });
-        assert!(
-            !reading.routes.is_empty(),
-            "the map reads the scopes of the venue whose market is loaded"
-        );
-        settle_fetches(cx, &source, reading.routes.len());
-        let fetches = source.fetch_count();
-        assert_eq!(
-            fetches,
-            reading.routes.len(),
-            "a round asks every scope the map reads exactly once"
-        );
-
-        // The venue loads again with the same scopes: a commit of a market the pane already has.
-        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let _probe = cx.update(|cx| {
-            let events = cx
-                .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .venues()
-                .events();
-            cx.new(|cx| CommitProbe::new(cx, &events, Arc::clone(&deliveries)))
-        });
-        cx.update(|cx| load_venues(cx, &[binance()]));
-        settle_deliveries(cx, &deliveries, 1);
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).reading.as_ref(),
-                Some(&reading),
-                "the market the map reads is the one it was already reading"
-            );
-            assert_eq!(
-                source.fetch_count(),
-                fetches,
-                "a commit that leaves the map's market as it was must not start its round over"
-            );
-        });
-    }
-
-    /// A venue loaded while the pane is already reading is a market the picker
-    /// offers from that moment on, without the map on screen being disturbed: the
-    /// commit is not a publication of the market being read.
-    #[gpui_kit::test]
-    fn a_venue_loaded_after_the_map_arrived_should_join_the_picker(cx: &mut TestAppContext) {
-        let pane = pane_over(cx, false);
-        cx.update(|cx| {
-            load_venues(cx, &[binance()]);
-        });
-        // A commit is announced on the market participants root's own task, so the pane starts
-        // reading the market on the executor.
-        cx.run_until_parked();
-        let before = cx.read(|cx| {
-            pane.read(cx)
-                .reading
-                .clone()
-                .expect("the pane reads the loaded venue")
-        });
-        assert_eq!(before.venue, binance());
-
-        cx.update(|cx| {
-            load_venues(cx, &[okx()]);
-        });
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).venues,
-                [binance(), okx()],
-                "the market loaded after the pane was opened is a choice it offers"
-            );
-            assert_eq!(
-                pane.read(cx).reading.as_ref(),
-                Some(&before),
-                "and it is not a reason to stop reading the market that is on screen"
-            );
-        });
-    }
-
-    /// The venue the pane is reading going away sends it to the market that is
-    /// there: nothing on screen is backed by a market any more, so the pane reads
-    /// another one rather than keeping tiles nothing published.
-    #[gpui_kit::test]
-    fn unloading_the_venue_on_screen_should_move_the_pane_to_the_loaded_one(
-        cx: &mut TestAppContext,
-    ) {
-        let pane = pane_over(cx, true);
-        cx.update(|cx| {
-            load_venues(cx, &[binance(), okx()]);
-            pane.update(cx, |pane, cx| pane.load(cx));
-        });
-        cx.run_until_parked();
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).config.venue,
-                Some(binance()),
-                "the first loaded venue is what a pane with no stored choice reads"
-            );
-
-            unload_venue(cx, &binance());
-            for route in ticker_routes_of(cx, okx()) {
-                test_support::publish_fixture_catalogs(cx, &[(route, Vec::new())]);
-            }
-        });
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).config.venue,
-                Some(okx()),
-                "the pane moves to the market that is loaded"
-            );
-            assert_eq!(
-                pane.read(cx).reading.as_ref().map(|reading| reading.venue),
-                Some(okx())
-            );
-        });
-    }
-
-    /// Loading the venues is what a waiting pane recovers from, by itself and
-    /// without a poll (⑯).
-    ///
-    /// What proves it recovered is that the service behind the binding actually ran a
-    /// round: a pane that had cancelled its binding while it waited would be told the
-    /// stream is closed, and no fetch would ever reach the source.
-    ///
-    /// What it reports then is one of the two working states and not either one by name:
-    /// `load` reports `Connecting` before the stream is asked for, and the round the
-    /// service starts publishes `Refreshing` the moment the first fetch is under way — a
-    /// status that arrives on the application runtime and reaches the pane on its own
-    /// task. Which of the two a test reads therefore depends on whether that round got
-    /// there first, and both mean the same thing: the pane left the notice and is
-    /// reading.
-    #[gpui_kit::test]
-    fn loading_the_venues_should_let_the_waiting_pane_start(cx: &mut TestAppContext) {
-        let source = FakeSource::pending();
-        let pane = pane_over_source(cx, source.clone(), false);
-        cx.update(|cx| {
-            assert!(
-                pane.read(cx).status.state(cx).notice().is_some(),
-                "the pane waits for a market nothing has published"
-            );
-
-            let venues = cx
-                .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .supported_venues();
-            load_venues(cx, &venues);
-            let routes = cx
-                .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                .venues()
-                .scopes();
-            // The catalogs a load publishes are what makes each scope a market the pane may
-            // read; the commit the load itself makes is what tells the pane to look again.
-            for route in routes.iter() {
-                let Some(entry) = cx
-                    .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-                    .venues()
-                    .scope(route)
-                else {
-                    continue;
-                };
-                if entry.catalog_source.is_some() {
-                    test_support::publish_fixture_catalogs(cx, &[(route.clone(), Vec::new())]);
-                }
-            }
-        });
-        // The commit is announced on the market participants root's own task, so the event that re-runs
-        // the load arrives on the executor, and the load it starts reaches the service the
-        // pane already had.
-        cx.run_until_parked();
-        settle_fetches(cx, &source, 1);
-
-        cx.update(|cx| {
-            let status = pane.read(cx).status.state(cx);
-            assert!(
-                status.notice().is_none(),
-                "the pane left the notice without being reopened"
-            );
-            assert!(
-                status.failure().is_none(),
-                "the pane started reading rather than failing: {:?}",
-                status.failure()
-            );
-            assert!(
-                status.is_busy(),
-                "the pane started reading rather than waiting: {status:?}"
-            );
-        });
-    }
-
-    /// Choosing another market participant drops the map the previous one published: the pane
-    /// cannot vouch for tiles the market it now reads did not produce.
-    #[gpui_kit::test]
-    fn choosing_another_venue_should_drop_the_map_of_the_previous_one(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-        cx.update(|cx| {
-            load_venues(cx, &[binance(), okx()]);
-            pane.update(cx, |pane, cx| pane.load(cx));
-            report_map(&pane, 1, cx);
-            assert!(pane.read(cx).has_content());
-            assert_eq!(pane.read(cx).accepted_revision(), Some(1));
-
-            pane.update(cx, |pane, cx| pane.select_venue(okx(), cx));
-
-            let pane = pane.read(cx);
-            assert!(
-                !pane.has_content(),
-                "the map of the market participant the user left is not content for the one they chose"
-            );
-            assert_eq!(pane.accepted_revision(), None);
-            assert_eq!(
-                pane.reading.as_ref().map(|reading| reading.venue),
-                Some(okx())
-            );
-        });
-    }
-
-    /// A status about another market participant is not this pane's to apply: what is on
-    /// screen is one market's map, and a message about another one would report a
-    /// state for tiles that are not there.
-    #[gpui_kit::test]
-    fn a_status_about_another_venue_should_be_ignored(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            report_status(&pane, ready(1), cx);
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
-
-            let applied = pane.update(cx, |pane, context| {
-                pane.apply_reliable(
-                    VolumeHeatMapStreamKey::new(okx()),
-                    Arc::new(VolumeHeatMapStreamMessage::Status(another_venues_status())),
-                    context,
-                )
-            });
-
-            assert!(!applied, "a message about another venue is not a change");
-            assert_eq!(
-                pane.read(cx).accepted_revision(),
-                Some(1),
-                "the map on screen is the one the pane is reading"
-            );
-        });
-    }
-
-    /// An empty map is content: it is what "this market participant is quoting nothing" looks
-    /// like, which is a fact about the market rather than a pane still waiting.
-    #[gpui_kit::test]
-    fn an_empty_map_should_still_be_content(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-        });
-
-        cx.update(|cx| {
-            assert!(pane.read(cx).has_content());
-            assert_eq!(pane.read(cx).accepted_revision(), Some(1));
-        });
-    }
-
-    /// Readiness and the map arrive on two channels with no order between them, so
-    /// the pane has to wait for the map a status describes rather than believe it.
-    #[gpui_kit::test]
-    fn readiness_before_the_map_it_describes_should_keep_the_pane_loading(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_status(&pane, ready(1), cx);
-            assert!(!pane.read(cx).has_content());
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Loading);
-        });
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_map_the_pane_has_overtaken_should_be_ignored(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 2, cx);
-            assert!(
-                !report_map(&pane, 1, cx),
-                "an older revision is not a change"
-            );
-            assert_eq!(pane.read(cx).accepted_revision(), Some(2));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_failed_map_should_offer_the_recovery_it_was_given(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            report_status(&pane, failed(), cx);
-
-            let status = pane.read(cx).status.state(cx);
-            let failure = status.failure().expect("a failed round is reported");
-            assert_eq!(
-                failure.action().label_key(),
-                "common.retry",
-                "every failure carries the framework's own way out"
-            );
-            assert!(!failure.text(cx).is_empty());
-        });
-    }
-
-    /// A failure is terminal for the pane: what arrives after it is a message about
-    /// a scope that no longer exists, and acting on it would show a map over the
-    /// recovery the user is looking at.
-    #[gpui_kit::test]
-    fn messages_after_a_failure_should_be_ignored(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            report_status(&pane, failed(), cx);
-
-            assert!(!report_map(&pane, 2, cx), "a late map is not a change");
-            assert!(!report_status(&pane, ready(2), cx));
-            assert!(pane.read(cx).status.is_failed(cx));
-            assert_eq!(pane.read(cx).accepted_revision(), Some(1));
-            assert!(pane.read(cx).countdown.is_none());
-        });
-    }
-
-    /// The countdown belongs to a ready pane, and only to a ready pane.
-    ///
-    /// A round in flight has a deadline too — the one it will arm when it lands — but
-    /// counting down to it before the map is on screen would be counting down to a map
-    /// the pane does not have yet. So the label appears with readiness and is taken
-    /// away by anything that is not it, and the control is greyed with a bare icon for
-    /// the same stretch.
-    #[gpui_kit::test]
-    fn the_countdown_should_only_run_while_the_pane_is_ready(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            report_status(&pane, ready(1), cx);
-            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
-
-            assert_eq!(
-                pane.read(cx).countdown.clone(),
-                Some(SharedString::new_static("10:00")),
-                "a ready pane counts down to the deadline the service published"
-            );
-            assert!(!pane.read(cx).refresh_is_disabled(cx));
-        });
-
-        cx.update(|cx| {
-            report_status(&pane, refreshing(), cx);
-            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
-
-            assert!(
-                pane.read(cx).countdown.is_none(),
-                "a round in flight has no countdown to show"
-            );
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "and nothing for the control to bring forward"
-            );
-        });
-
-        cx.update(|cx| {
-            report_status(
-                &pane,
-                VolumeHeatMapStatus::Ready {
-                    venue: binance(),
-                    revision: 2,
-                    next_refresh_at: unix_millis() + 60_000,
-                },
-                cx,
-            );
-            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
-
-            assert!(
-                pane.read(cx).countdown.is_none(),
-                "readiness without the map it describes is not something to count down from"
-            );
-            assert!(pane.read(cx).refresh_is_disabled(cx));
-
-            report_map(&pane, 2, cx);
-            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
-
-            assert_eq!(
-                pane.read(cx).countdown.clone(),
-                Some(SharedString::new_static("01:00")),
-                "and with the map in hand the countdown starts on the new deadline"
-            );
-            assert!(!pane.read(cx).refresh_is_disabled(cx));
-        });
-    }
-
-    /// A failure is the framework's to recover from, not the header's.
-    ///
-    /// A failed pane takes no more of its stream's messages, so a refresh command sent
-    /// from here would be accepted by the loop and its answer dropped by the pane. The
-    /// control is therefore greyed with the rest of the states that are not ready, and
-    /// the way out is the recovery the banner above the body offers.
-    #[gpui_kit::test]
-    fn a_failed_map_should_offer_its_recovery_rather_than_a_refresh(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            report_status(&pane, ready(1), cx);
-            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
-            assert!(pane.read(cx).countdown.is_some());
-
-            report_status(&pane, failed(), cx);
-            pane.update(cx, |pane, cx| pane.tick_countdown(cx));
-
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "the header has nothing to bring forward, so it offers nothing"
-            );
-            assert!(
-                pane.read(cx).countdown.is_none(),
-                "and a pane whose schedule stopped has nothing to count down to"
-            );
-            let failure = pane
-                .read(cx)
-                .status
-                .state(cx)
-                .failure()
-                .cloned()
-                .expect("a failure should be published");
-            assert_eq!(
-                failure.action().label_key(),
-                "common.retry",
-                "the framework's own recovery is the way out of it"
-            );
-        });
-
-        cx.update(|cx| {
-            pane.update(cx, |pane, cx| pane.refresh(cx));
-
-            assert!(
-                pane.read(cx).status.is_failed(cx),
-                "a disabled control changes nothing when it is pressed"
-            );
-        });
-    }
-
-    /// The double-click this control exists to absorb.
-    ///
-    /// A refresh is refused by the service while one is in flight, and the
-    /// framework shows a refusal as a failure — so a control that forwarded a
-    /// second click inside that window would answer a fast double click with a
-    /// banner. Each step below is one way the window is open, and the last is the
-    /// one an acknowledgement alone would leave open.
-    #[gpui_kit::test]
-    fn a_refresh_should_not_be_forwarded_while_a_map_is_being_fetched(cx: &mut TestAppContext) {
-        let pane = pane_with(cx);
-
-        cx.update(|cx| {
-            report_map(&pane, 1, cx);
-            report_status(&pane, ready(1), cx);
-            assert!(
-                !pane.read(cx).refresh_is_disabled(cx),
-                "an idle pane with a map can read again on demand"
-            );
-        });
-
-        cx.update(|cx| {
-            pane.update(cx, |pane, cx| {
-                pane.refresh(cx);
-                assert!(
-                    pane.refresh_is_disabled(cx),
-                    "the click closes the window itself, before anything has answered"
-                );
-                // The service acknowledges the command before it runs the round it
-                // started, so the acknowledgement is not the end of the window.
-                pane.apply_refresh_result(Ok(VolumeHeatMapResponse::RefreshQueued), cx);
-                assert!(
-                    pane.refresh_is_disabled(cx),
-                    "a queued refresh is still a refresh in flight"
-                );
-            });
-        });
-
-        cx.update(|cx| {
-            report_status(&pane, refreshing(), cx);
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "a fetch in flight has nothing to bring forward"
-            );
-        });
-
-        cx.update(|cx| {
-            report_status(&pane, ready(2), cx);
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "readiness without the map it describes is not a reason to read again"
-            );
-            report_map(&pane, 2, cx);
-            assert!(
-                !pane.read(cx).refresh_is_disabled(cx),
-                "and with the map in hand there is nothing left to wait for"
-            );
-        });
-    }
-
-    #[test]
-    fn the_widget_should_have_a_stable_identity() {
-        assert_eq!(VolumeHeatMapWidget::ID.as_str(), "kytrix.volume_heatmap");
-        assert_eq!(
-            VolumeHeatMapWidget::DISPLAY_NAME,
-            "widget.names.volume_heatmap"
-        );
-        assert_eq!(
-            VolumeHeatMapConfig::SCHEMA_VERSION,
-            WidgetConfigSchemaVersion::V1
-        );
-    }
-
-    /// Every message this pane can show, in one place.
-    ///
-    /// A key that is missing from a locale translates to an empty string rather
-    /// than to an error, so a gap in the interface is what a typo looks like: this
-    /// is the test that turns it into a failure.
-    #[gpui_kit::test]
-    fn every_message_this_pane_shows_should_resolve_to_text(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("the embedded locales should load");
-
-            for key in [
-                "widget.names.volume_heatmap",
-                "widget.volume_heatmap.refresh_now",
-                "widget.volume_heatmap.choose_venue",
-                "common.market_participants",
-                "error.volume_heatmap.notional_overflow",
-                "error.volume_heatmap.too_many_tickers",
-                "error.volume_heatmap.timeout",
-                "error.volume_heatmap.stream_unavailable",
-            ] {
-                assert!(!t!(cx, key).is_empty(), "{key} has no copy");
-            }
-
-            let failures = [
-                VolumeHeatMapFailure::Fetch(VolumeHeatMapFetchError::MarketParticipant(
-                    MarketError::ServiceClosed,
-                )),
-                VolumeHeatMapFailure::Fetch(VolumeHeatMapFetchError::Model(
-                    HeatMapModelError::NotionalOverflow {
-                        instrument: Box::new(test_support::spot_token("fixture", "BTC", "USDT")),
-                    },
-                )),
-                VolumeHeatMapFailure::Fetch(VolumeHeatMapFetchError::TooManyTickers {
-                    route: test_support::route("binance", "spot"),
-                    count: 10_001,
-                    limit: 10_000,
-                }),
-                VolumeHeatMapFailure::Fetch(VolumeHeatMapFetchError::Timeout(Duration::from_secs(
-                    5,
-                ))),
-                VolumeHeatMapFailure::Rpc(RpcCallError::Service {
-                    request_id: RequestId::new(1),
-                    source: VolumeHeatMapServiceError::StreamBusy,
-                }),
-                VolumeHeatMapFailure::Rpc(RpcCallError::Service {
-                    request_id: RequestId::new(2),
-                    source: VolumeHeatMapServiceError::StreamClosed,
-                }),
-            ];
-            for failure in failures {
-                assert!(
-                    !failure.localized_message(cx).is_empty(),
-                    "{failure:?} has no copy"
-                );
-            }
-        });
-    }
-}
+mod tests;
