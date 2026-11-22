@@ -5,40 +5,43 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
-gpui-kit = { workspace = true }
-i18n = { workspace = true }
+app_config = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
+ui_core = { workspace = true }
+widget = { workspace = true }
 
 # Workspace members
-app_config = { workspace = true }
 candlestick = { workspace = true }
 coin_market_cap_fear_and_greed_index = { workspace = true }
 cryptocurrency_etf = { workspace = true }
 empty = { workspace = true }
 ethereum_wallet = { workspace = true }
 financial_calendar = { workspace = true }
+financial_index = { workspace = true }
 force_order = { workspace = true }
 global_shipping_chokepoint = { workspace = true }
 hyperliquid_wallet = { workspace = true }
-financial_index = { workspace = true }
 market_trade = { workspace = true }
 news = { workspace = true }
 order_book = { workspace = true }
-perpetual_statistics = { workspace = true }
 pentagon_pizza_index = { workspace = true }
+perpetual_statistics = { workspace = true }
 prediction_market = { workspace = true }
 solana_wallet = { workspace = true }
-x = { workspace = true }
 volume_heatmap = { workspace = true }
 watch_list = { workspace = true }
-widget = { workspace = true }
+x = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
+# The product catalogue: the guard over every notice a registered widget hands over
+# asserts the copy the reader gets, not a fixture string.
+i18n = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true }
+# The framework's test host (`WidgetTestApp`): the registry is tested by mounting
+# through it, which is what a pane does.
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
-
