@@ -9638,19 +9638,18 @@ name = "solana_wallet"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
  "i18n",
  "kytrix_service_provider",
+ "log",
  "network",
  "serde",
  "smol_str",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
