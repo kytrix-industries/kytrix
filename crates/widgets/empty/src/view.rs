@@ -8,33 +8,57 @@
 //! but it is not offered for selection: the gallery lists the widgets a user may pick,
 //! and this is what a pane shows instead of one of them.
 //!
-//! # Why the hint is markdown
+//! # The smallest a widget can be
+//!
+//! This pane is the contract's minimal shape, and it is deliberately the one widget with
+//! no data source of its own: it reports the hint and draws nothing else.
+//!
+//! - [`WidgetView::new`] only keeps the state cell; it starts no work and reports
+//!   nothing.
+//! - [`WidgetView::load`] reports the hint as a [`Notice`] — a catalogue reference, not
+//!   a sentence. There is nothing to wait for, so the pane leaves `Connecting` on that
+//!   one report and never reports another state.
+//! - [`WidgetView::has_content`] is always `false`: the hint *is* the pane's content, and
+//!   a pane with nothing of its own to show is exactly what the framework's stand-in
+//!   draws.
+//! - [`WidgetView::body`] is therefore never reached; it is implemented empty because the
+//!   contract requires the method, not because the pane has a body.
+//! - there is no `sync`, `header` or `release` work: the pane owns no kit component, no
+//!   action key, no timer and no node of its own, so the trait's no-op defaults are the
+//!   whole of those phases.
+//!
+//! # Why the pane does not draw the hint itself
 //!
 //! The copy names the control the user has to reach for, at the top right of the pane's
-//! own header. A paragraph of text can only say it; the markdown component draws it: the
-//! button's name is bound by the same `<kbd>` the rest of the interface uses for keys,
-//! and the control's own puzzle icon precedes it, so the sentence points at the control
-//! the way the control is drawn. The document is the catalogue's, so it reads in
-//! whatever language the interface is showing — the text is re-read when the language
-//! moves, which is the one thing that can make a source read once go stale.
+//! own header. The catalogue authors it as rich text: the button's name is bound by the
+//! same `<kbd>` the rest of the interface uses for keys, and the control's own puzzle
+//! icon precedes it, so the sentence points at the control the way the control is drawn.
+//!
+//! A widget with nothing to show and a notice to say instead of it is the framework's
+//! `Waiting` placeholder, and that placeholder resolves the notice in the language
+//! showing on the frame that draws it, handing a rich one to the markdown component
+//! (`crates/widget/src/ui/placeholder.rs`, decided by [`Notice::is_markdown`]). So the
+//! pane holds no copy and parses no markdown: a language switch invalidates the surface,
+//! which rebuilds the stand-in in the language now showing. What is left of the widget is
+//! the contract itself, which is what makes this crate the skeleton the content widgets
+//! grow from.
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::markdown::view::{Markdown, MarkdownState};
-use gpui_kit::{
-    App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    Styled, Window, div,
-};
-use i18n::{language::codes::LanguageCode, t};
 use serde::{Deserialize, Serialize};
+use ui_core::{error::EngineError, node::id::NodeId};
 use widget::{
     category::WidgetCategory,
     config::WidgetConfigChange,
+    cx::WidgetCx,
     identity::{WidgetId, WidgetInstanceId},
-    status::{WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
-    view::WidgetView,
+    status::{Notice, WidgetAction, WidgetState, WidgetStatus},
+    view::{ReloadHandle, WidgetView},
 };
 
 /// The message the hint is read from.
+///
+/// It is a catalogue key, not copy: the surface resolves it on the frame that draws it,
+/// in the language showing then.
 const HINT: &str = "widget.empty.hint";
 
 /// The pane persists nothing about this widget; the type exists because every widget
@@ -47,16 +71,11 @@ impl WidgetConfig for EmptyConfig {
 }
 
 /// The pane nothing has been chosen for.
+///
+/// There is nothing to keep but the state cell: the pane owns no data, no component and
+/// no node.
 pub struct EmptyWidget {
-    markdown: Entity<MarkdownState>,
-    status: Entity<WidgetStatus>,
-    /// The language the markdown source was read in.
-    ///
-    /// Parsing is the markdown component's expensive step, so the source is read when
-    /// the widget is built rather than on every frame; a language the interface moved
-    /// to since is the one thing that makes it stale, and this is how the frame that
-    /// notices compares.
-    language: LanguageCode,
+    status: WidgetStatus,
 }
 
 impl WidgetView for EmptyWidget {
@@ -72,144 +91,77 @@ impl WidgetView for EmptyWidget {
     fn new(
         _instance_id: WidgetInstanceId,
         _config: Self::Config,
-        status: Entity<WidgetStatus>,
-        _reload: impl Fn(&mut App) + 'static,
+        status: WidgetStatus,
+        _reload: ReloadHandle,
         _config_change: WidgetConfigChange,
         _recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        // The hint is read where it is built rather than when it is asked for: the
-        // widget has nothing to wait for, so its state is complete the moment it
-        // exists.
-        let language = *cx.global::<LanguageCode>();
-        let hint = t!(cx, HINT);
-        let markdown = cx.new(|cx| MarkdownState::new(hint, cx));
-
-        Self {
-            markdown,
-            status,
-            language,
-        }
+        _cx: &mut WidgetCx<'_>,
+    ) -> Result<Self, EngineError> {
+        // The pane has nothing to wait for and nothing to fail at, so the state cell is
+        // the whole of its construction; the framework calls `load` once this returns.
+        Ok(Self { status })
     }
 
     /// A pane with nothing to read has nothing to wait for: it is ready the moment it
-    /// exists.
-    fn load(&mut self, cx: &mut Context<Self>) {
-        self.status.report(WidgetState::Ready, cx);
+    /// exists, and the one thing it has to say is the hint.
+    ///
+    /// The notice is a catalogue reference, so this report does not have to be repeated
+    /// when the language moves: the surface resolves the key in the language showing on
+    /// the frame that draws it.
+    fn load(&mut self, cx: &mut WidgetCx<'_>) {
+        self.status
+            .report(cx.app_mut(), WidgetState::waiting(Notice::message(HINT)));
     }
 
-    /// The hint is the pane's whole content, so a pane showing this widget has content
-    /// from its first frame.
+    /// The hint is the pane's whole content, and the framework draws it: this widget
+    /// never has a body of its own.
     fn has_content(&self) -> bool {
-        true
+        false
     }
-}
 
-impl Render for EmptyWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let language = *cx.global::<LanguageCode>();
-        if language != self.language {
-            self.language = language;
-            let hint = t!(cx, HINT);
-            self.markdown
-                .update(cx, |markdown, cx| markdown.set_source(hint, cx));
-        }
-
-        // The body draws what the pane has to say and nothing around it: the surface
-        // owns the box, its colour and its corners, so this is only the hint's own
-        // shape — centred in the pane, at the size the framework's stand-in text uses.
-        div()
-            .debug_selector(|| "TEST_EMPTY_WIDGET".into())
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_sm()
-            .child(Markdown::new(&self.markdown).min_w_0())
+    /// Never called: [`has_content`](WidgetView::has_content) is `false`, so the framework
+    /// always presents the hint instead of building a body. The contract requires the
+    /// method, and a widget with content of its own builds that subtree here.
+    fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use app_config::widget::{
         VersionedWidgetConfig, WidgetConfig, WidgetConfigSchemaVersion, decode_or_default,
     };
-    use gpui_kit::{
-        App, AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, Styled,
-        TestAppContext, VisualTestContext, Window, div, px, size,
-    };
-    use i18n::{language::codes::LanguageCode, t};
+    use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
     use widget::{
         category::WidgetCategory,
-        config::WidgetConfigChange,
-        identity::WidgetInstanceId,
-        status::{WidgetAction, WidgetStatus, WidgetStatusExt},
+        status::{Notice, WidgetState},
+        test_support::WidgetTestApp,
         view::WidgetView,
     };
 
     use super::{EmptyConfig, EmptyWidget, HINT};
 
-    /// The hint the catalogue spells in `language`.
-    fn hint_in(cx: &mut TestAppContext, language: LanguageCode) -> String {
-        cx.update(|cx| {
-            cx.set_global(language);
-            t!(cx, HINT).to_string()
-        })
+    /// The translator the product ships: the hint is catalogue copy, so these tests
+    /// assert what the reader actually gets.
+    fn product_translate(language: LanguageCode) -> Translate {
+        Translate::new(
+            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            language,
+        )
     }
 
-    /// A widget built the way the framework builds one: state, then one load.
-    fn widget(cx: &mut TestAppContext) -> Entity<EmptyWidget> {
-        cx.update(|cx| {
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("the embedded locales should load");
-
-            let status = cx.new(|_| WidgetStatus::new());
-            let widget = cx.new(move |cx| {
-                let weak: gpui_kit::WeakEntity<EmptyWidget> = cx.weak_entity();
-                let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
-                    let _ = weak.update(cx, |widget, cx| widget.load(cx));
-                });
-
-                EmptyWidget::new(
-                    WidgetInstanceId::new(),
-                    EmptyConfig,
-                    status,
-                    |_| {},
-                    WidgetConfigChange::default(),
-                    recovery,
-                    cx,
-                )
-            });
-            widget.update(cx, |widget, cx| widget.load(cx));
-
-            widget
-        })
+    /// The framework's headless host, over the product catalogue.
+    fn harness() -> WidgetTestApp {
+        WidgetTestApp::with_translate(product_translate(LanguageCode::En))
     }
 
-    /// A window holding nothing but the widget's body, at a size a hint sits in.
-    struct BodyHarness {
-        widget: Entity<EmptyWidget>,
-    }
-
-    impl Render for BodyHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.widget.clone())
-        }
-    }
-
-    fn draw(cx: &mut TestAppContext, widget: Entity<EmptyWidget>) -> &mut VisualTestContext {
-        let (_, cx) = cx.add_window_view(move |_, _| BodyHarness { widget });
-        cx.simulate_resize(size(px(640.0), px(360.0)));
-        cx.run_until_parked();
-
-        cx
-    }
-
-    /// The source the widget's markdown state currently holds.
-    fn source(widget: &Entity<EmptyWidget>, cx: &mut VisualTestContext) -> String {
-        cx.read(|cx| widget.read(cx).markdown.read(cx).source().to_string())
+    /// The hint's sentence in `language`.
+    fn hint_in(language: LanguageCode) -> String {
+        let translate = product_translate(language);
+        t_smol!(&translate, HINT).to_string()
     }
 
     #[test]
@@ -220,6 +172,8 @@ mod tests {
             EmptyWidget::DISPLAY_NAME,
             EmptyWidget::CATEGORY,
             EmptyWidget::SELECTABLE,
+            EmptyWidget::DESCRIPTION,
+            EmptyWidget::ICON,
             EmptyConfig::SCHEMA_VERSION,
         );
 
@@ -230,6 +184,8 @@ mod tests {
                 "widget.names.empty",
                 WidgetCategory::Market,
                 false,
+                None,
+                None,
                 WidgetConfigSchemaVersion::V1,
             ),
             "a pane stores this widget by ID, and the gallery must keep it out of the \
@@ -249,128 +205,278 @@ mod tests {
 
     /// A missing key is an empty string on screen rather than an error, so a gap in the
     /// catalogue is what a typo looks like: this is the test that turns it into a failure.
-    #[gpui_kit::test]
-    fn every_message_this_widget_shows_should_resolve_to_text(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("the embedded locales should load");
+    #[test]
+    fn every_message_this_widget_shows_should_resolve_to_text() {
+        for language in [LanguageCode::En, LanguageCode::ZhCn] {
+            let translate = product_translate(language);
 
-            for language in [LanguageCode::En, LanguageCode::ZhCn] {
-                cx.set_global(language);
-
-                for key in [HINT, EmptyWidget::DISPLAY_NAME] {
-                    assert!(!t!(cx, key).is_empty(), "{key} has no copy in {language}");
-                }
+            for key in [HINT, EmptyWidget::DISPLAY_NAME] {
+                assert!(
+                    !t_smol!(&translate, key).is_empty(),
+                    "{key} has no copy in {language}"
+                );
             }
-        });
+        }
     }
 
-    /// A pane showing this widget has content from its first frame and nothing wrong
-    /// with it, so the framework draws the hint rather than a stand-in or a spinner.
-    #[gpui_kit::test]
-    fn the_widget_should_be_ready_and_have_content_the_moment_it_is_built(cx: &mut TestAppContext) {
-        let widget = widget(cx);
+    #[test]
+    fn a_mounted_pane_should_report_the_hint_and_show_it() {
+        let mut harness = harness();
+        let widget = harness.mount::<EmptyWidget>(EmptyConfig);
 
-        cx.read(|cx| {
-            let widget = widget.read(cx);
-
-            assert!(widget.has_content());
-            assert!(
-                !widget.status.is_busy(cx),
-                "the pane is not waiting for anything"
-            );
-            assert!(!widget.status.is_failed(cx));
-        });
-    }
-
-    /// The hint is what the body draws, and the pane reads its language from the
-    /// catalogue: the source the markdown state holds is the message itself.
-    #[gpui_kit::test]
-    fn the_body_should_draw_the_hint(cx: &mut TestAppContext) {
-        let widget = widget(cx);
-        let expected = hint_in(cx, LanguageCode::En);
-        let cx = draw(cx, widget.clone());
-
-        assert_eq!(source(&widget, cx), expected);
-        assert!(
-            cx.debug_bounds("TEST_EMPTY_WIDGET").is_some(),
-            "the body should render"
-        );
-        assert!(
-            cx.debug_bounds("BASE_UI_MARKDOWN").is_some(),
-            "the body is the markdown component"
-        );
-    }
-
-    /// The hint is centred in the pane, so a pane too wide for one line of text still
-    /// reads as one sentence rather than as a line against its left edge.
-    #[gpui_kit::test]
-    fn the_hint_should_be_centred_in_the_body(cx: &mut TestAppContext) {
-        let widget = widget(cx);
-        let cx = draw(cx, widget);
-
-        let body = cx
-            .debug_bounds("TEST_EMPTY_WIDGET")
-            .expect("the body should render");
-        let hint = cx
-            .debug_bounds("BASE_UI_MARKDOWN_BLOCK_0")
-            .expect("the hint should draw its paragraph");
-
-        let body_centre = body.center().x;
-        let hint_centre = hint.center().x;
-        assert!(
-            (body_centre - hint_centre).abs() < px(1.0),
-            "the hint should sit at the centre of the body: {hint:?} against {body:?}"
-        );
-    }
-
-    /// The hint follows a language chosen after the widget was built: the source is
-    /// re-read when the frame notices the interface moved, so a pane waiting for a
-    /// widget reads in the language everything else is read in.
-    #[gpui_kit::test]
-    fn the_hint_should_follow_a_language_chosen_after_the_widget_was_built(
-        cx: &mut TestAppContext,
-    ) {
-        let widget = widget(cx);
-        let english = hint_in(cx, LanguageCode::En);
-        let cx = draw(cx, widget.clone());
-        assert_eq!(source(&widget, cx), english);
-
-        cx.update(|_, cx| cx.set_global(LanguageCode::ZhCn));
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let chinese = hint_in(cx, LanguageCode::ZhCn);
-        assert_ne!(chinese, english, "the fixture languages have to differ");
+        // Registration: the framework built the surface and ran the first load. There is
+        // nothing to wait for, so the pane goes straight from `Connecting` to the hint.
         assert_eq!(
-            source(&widget, cx),
-            chinese,
-            "the same widget should read the copy the interface now shows"
+            harness.tree().debug_id(widget.surface()),
+            Some("WIDGET_SURFACE")
+        );
+        assert_eq!(
+            widget.status().state(harness.app()),
+            WidgetState::waiting(Notice::message(HINT))
+        );
+        assert!(!widget.status().is_busy(harness.app()));
+        assert!(!widget.status().is_failed(harness.app()));
+        assert!(
+            widget.config().is_none(),
+            "the pane persists nothing, so the layout stores no config for it"
+        );
+
+        harness.drain();
+
+        let surface = widget.surface();
+        let placeholder = harness
+            .find_by_debug_prefix(surface, "WIDGET_PLACEHOLDER")
+            .expect("the framework stands the hint in for the content");
+        assert!(harness.visible(placeholder));
+        assert!(
+            harness
+                .find_by_debug_prefix(placeholder, "MARKDOWN")
+                .is_some(),
+            "the catalogue authors the hint as rich text, so it is drawn by the markdown \
+             component: {:?}",
+            harness.text_of(placeholder)
+        );
+        let text = harness.text_of(placeholder);
+        assert!(
+            text.contains("upper-right corner") && text.contains("select a widget"),
+            "the hint is the catalogue's sentence: {text:?}"
+        );
+        assert!(
+            !text.contains("<kbd>") && !text.contains("![](") && !text.contains("<p "),
+            "the notice's source markup never reaches the reader: {text:?}"
+        );
+        assert!(
+            harness.has_inline_boxes(placeholder),
+            "the kbd icon is an inline box, not source text"
+        );
+        assert!(harness.rendered(), "the hint is what the frame painted");
+
+        // The widget has no body of its own, so the content slot the framework offers it
+        // is hidden and stays empty.
+        let content = harness
+            .find_by_debug_prefix(surface, "WIDGET_CONTENT")
+            .expect("the surface's content slot exists");
+        assert!(
+            !harness.visible(content),
+            "nothing is drawn in the content slot"
+        );
+        assert_eq!(
+            harness
+                .tree()
+                .get(content)
+                .expect("the content slot exists")
+                .children()
+                .len(),
+            0,
+            "the pane never builds a body"
         );
     }
 
-    /// Not every line fits the box it is given, and the hint has to be readable when one
-    /// does not: the text is measured against the body rather than drawn past its edge.
-    #[gpui_kit::test]
-    fn a_hint_narrower_than_its_text_should_stay_inside_the_body(cx: &mut TestAppContext) {
-        let widget = widget(cx);
-        let (_, cx) = cx.add_window_view(move |_, _| BodyHarness { widget });
-        cx.simulate_resize(size(px(160.0), px(360.0)));
-        cx.run_until_parked();
+    /// The pane has nothing that changes on its own: once the hint is up, a frame paints
+    /// nothing, asks for nothing and rebuilds nothing (I3).
+    #[test]
+    fn the_pane_should_ask_for_no_frames_once_the_hint_is_up() {
+        let mut harness = harness();
+        let widget = harness.mount::<EmptyWidget>(EmptyConfig);
+        harness.drain();
 
-        let body = cx
-            .debug_bounds("TEST_EMPTY_WIDGET")
-            .expect("the body should render");
-        let hint = cx
-            .debug_bounds("BASE_UI_MARKDOWN_BLOCK_0")
-            .expect("the hint should draw its paragraph");
+        let placeholder = harness
+            .find_by_debug_prefix(widget.surface(), "WIDGET_PLACEHOLDER")
+            .expect("the framework stands the hint in for the content");
+        let text = harness.text_of(placeholder);
+        let nodes = harness.node_count();
+        let requests = harness.frame_requests();
 
+        harness.drain();
+
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "a steady pane asks for no frame"
+        );
+        assert!(!harness.rendered(), "and the round paints nothing");
+        assert_eq!(
+            harness.node_count(),
+            nodes,
+            "the stand-in is not rebuilt when nothing moved"
+        );
+        assert_eq!(harness.text_of(placeholder), text);
+    }
+
+    /// The hint follows a language chosen after the pane was mounted: the widget reports a
+    /// catalogue reference, and the surface redraws it in the language showing now.
+    #[test]
+    fn the_hint_should_follow_a_language_chosen_after_the_pane_was_mounted() {
+        let mut harness = harness();
+        let widget = harness.mount::<EmptyWidget>(EmptyConfig);
+        harness.drain();
+
+        let placeholder = harness
+            .find_by_debug_prefix(widget.surface(), "WIDGET_PLACEHOLDER")
+            .expect("the framework stands the hint in for the content");
+        let english = harness.text_of(placeholder);
+        assert!(english.contains("select a widget"), "{english:?}");
+        assert_ne!(
+            hint_in(LanguageCode::En),
+            hint_in(LanguageCode::ZhCn),
+            "the catalogue's two languages have to differ"
+        );
+
+        let requests = harness.frame_requests();
+        harness.switch_language(LanguageCode::ZhCn);
         assert!(
-            hint.left() >= body.left() - px(1.0) && hint.right() <= body.right() + px(1.0),
-            "the hint should be measured against the body it is drawn in: {hint:?} against {body:?}"
+            harness.frame_requests() > requests,
+            "the surface root read the language signal while rendering, so the switch \
+             schedules the frame that redraws the hint"
+        );
+        harness.drain();
+
+        let chinese = harness.text_of(placeholder);
+        assert_ne!(chinese, english);
+        assert!(
+            chinese.contains("选择一个部件"),
+            "the hint reads in the language showing now: {chinese:?}"
         );
         assert!(
-            hint.size.height > Pixels::ZERO,
-            "the text should still be drawn, wrapped"
+            !chinese.contains("<kbd>") && !chinese.contains("![]("),
+            "the Chinese copy is rich text too, never its source: {chinese:?}"
         );
+        assert!(
+            harness.has_inline_boxes(placeholder),
+            "the kbd icon is an inline box in the new language as well"
+        );
+        assert_eq!(
+            widget.status().state(harness.app()),
+            WidgetState::waiting(Notice::message(HINT)),
+            "the hint is a catalogue reference, so the language move needed no re-report"
+        );
+    }
+
+    /// Two panes on one application: each has its own surface, both show the hint, and
+    /// one pane's release leaves the other's surface and state alone (the pane owns no
+    /// kit key, so there is no action identity to collide over either).
+    #[test]
+    fn two_panes_should_show_the_hint_side_by_side() {
+        let mut harness = harness();
+        let first = harness.mount::<EmptyWidget>(EmptyConfig);
+        let second = harness.mount::<EmptyWidget>(EmptyConfig);
+        harness.drain();
+
+        assert_ne!(first.surface(), second.surface());
+        assert_eq!(harness.router().len(), 2, "both panes route their frames");
+
+        let first_placeholder = harness
+            .find_by_debug_prefix(first.surface(), "WIDGET_PLACEHOLDER")
+            .expect("the first pane's hint is up");
+        let second_placeholder = harness
+            .find_by_debug_prefix(second.surface(), "WIDGET_PLACEHOLDER")
+            .expect("the second pane's hint is up");
+        assert!(harness.visible(first_placeholder));
+        assert!(harness.visible(second_placeholder));
+
+        // One language write reaches both panes on the frame it schedules.
+        harness.switch_language(LanguageCode::ZhCn);
+        harness.drain();
+        for placeholder in [first_placeholder, second_placeholder] {
+            assert!(
+                harness.text_of(placeholder).contains("选择一个部件"),
+                "each pane's hint follows the language: {:?}",
+                harness.text_of(placeholder)
+            );
+        }
+
+        assert!(first.release(harness.app_mut()) > 0);
+        assert_eq!(
+            harness.router().len(),
+            1,
+            "only the released pane's route is gone"
+        );
+        assert!(harness.tree().get(first.surface()).is_err());
+        assert!(harness.tree().get(second.surface()).is_ok());
+        assert!(harness.visible(second_placeholder));
+        assert_eq!(
+            second.status().state(harness.app()),
+            WidgetState::waiting(Notice::message(HINT))
+        );
+        harness.drain();
+        assert!(
+            harness.text_of(second_placeholder).contains("选择一个部件"),
+            "the pane still on screen keeps its hint"
+        );
+    }
+
+    /// Releasing a pane gives back everything the mount took: its nodes, its frame route
+    /// and its value slots. Release is idempotent, and mounting again reuses the slots
+    /// instead of growing the table (a leaked pane shows up in `live`, a table that only
+    /// ever appends in `slots`).
+    #[test]
+    fn releasing_the_pane_should_leave_nothing_behind() {
+        let mut harness = harness();
+        let baseline_nodes = harness.node_count();
+        let baseline = harness.signal_slot_stats();
+
+        let widget = harness.mount::<EmptyWidget>(EmptyConfig);
+        harness.drain();
+        assert_eq!(harness.router().len(), 1);
+        assert!(
+            harness.signal_slot_stats().live > baseline.live,
+            "the mounted pane minted its own values"
+        );
+
+        assert!(
+            widget.release(harness.app_mut()) > 0,
+            "the scope owned the pane's signals"
+        );
+        assert!(widget.is_released());
+        assert_eq!(harness.router().len(), 0, "the frame route is unregistered");
+        assert!(
+            harness.tree().get(widget.surface()).is_err(),
+            "the surface's nodes are gone"
+        );
+        assert_eq!(harness.node_count(), baseline_nodes);
+        assert_eq!(
+            harness.signal_slot_stats().live,
+            baseline.live,
+            "release hands every value slot back"
+        );
+        assert_eq!(
+            widget.release(harness.app_mut()),
+            0,
+            "a second release is a no-op"
+        );
+
+        // The first mount grew the table to the pane's peak; every later round has to
+        // reuse those slots instead of growing it further.
+        let released = harness.signal_slot_stats();
+        for _ in 0..8 {
+            let widget = harness.mount::<EmptyWidget>(EmptyConfig);
+            widget.release(harness.app_mut());
+        }
+        assert_eq!(
+            harness.signal_slot_stats(),
+            released,
+            "eight more mount/release rounds reuse the slots instead of growing the table"
+        );
+        assert_eq!(harness.node_count(), baseline_nodes);
     }
 }
