@@ -131,7 +131,7 @@ use ui_core::{
     a11y::A11yPatch,
     app::App,
     error::EngineError,
-    event::{Action, ActionSource},
+    event::{Action, ActionSource, Event},
     math::Rect,
     node::{
         builder::NodeBuilder,
@@ -388,6 +388,17 @@ impl WidgetTestApp {
     #[must_use]
     pub fn services(&self) -> &WidgetServices {
         &self.services
+    }
+
+    /// Delivers one platform event the way the pump does.
+    ///
+    /// Input goes through the engine's interaction dispatch, and every event lands in the
+    /// observation queue [`App::drain_events_where`] reads — which is what a widget that
+    /// owns the text input of its own window consumes (`WidgetView::sync` drains it, the
+    /// way a dialog's fields do). A widget that only builds kit controls never needs this:
+    /// the engine dispatches their actions without the observation queue.
+    pub fn dispatch_event(&mut self, event: Event) {
+        self.app.dispatch_event(event);
     }
 
     /// The services aggregate as the shared handle this host owns, like the

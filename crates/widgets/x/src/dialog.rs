@@ -3517,13 +3517,13 @@ fn build_node(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use i18n::language::codes::LanguageCode;
     use kytrix_service_provider::service::x::{
         XApiError, XProfile, XSelection, XSelectionStatus, XSelectionsResponse,
     };
-    use ui_core::event::ActionSource;
+    use ui_core::event::{ActionSource, ImeEvent};
     use widget::test_support::WidgetTestApp;
 
     use super::*;
@@ -4036,5 +4036,372 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The dialog's node with the given debug suffix (the page containers, the message
+    /// blocks and the fields are addressed by the dialog's own key).
+    fn node(dialog: &TweetDialog, harness: &WidgetTestApp, suffix: &str) -> NodeId {
+        let key = dialog.inner.borrow().keys.dialog.clone();
+        let prefix = format_smolstr!("{key}:{suffix}");
+        harness
+            .find_by_debug_prefix(harness.root(), &prefix)
+            .unwrap_or_else(|| panic!("the dialog draws {suffix}"))
+    }
+
+    /// The text one of the two fields holds.
+    fn typed(harness: &WidgetTestApp, dialog: &TweetDialog, query: bool) -> SmolStr {
+        let state = {
+            let state = dialog.inner.borrow();
+            if query {
+                state.query_state
+            } else {
+                state.filter_state
+            }
+        };
+        SmolStr::new(harness.app().read(&state).text())
+    }
+
+    /// The pages are one under the other with only the one being worked on drawn: the
+    /// control on the managed page pushes the search page, and the way back pops it.
+    #[test]
+    fn the_dialog_should_show_one_page_at_a_time() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        settle_frames(&mut harness, &mut dialog, &view);
+        let managed = node(&dialog, &harness, "monitored");
+        let search = node(&dialog, &harness, "add");
+        assert!(harness.visible(managed), "the dialog opens on its accounts");
+        assert!(!harness.visible(search));
+
+        let add = dialog
+            .inner
+            .borrow()
+            .add_account
+            .clone()
+            .expect("the managed page draws the control that opens the search page");
+        click(&mut harness, &add);
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(
+            !harness.visible(managed),
+            "the accounts page is not drawn under the search page"
+        );
+        assert!(harness.visible(search), "the search page is showing");
+
+        let back = dialog
+            .inner
+            .borrow()
+            .back
+            .clone()
+            .expect("the search page draws the way back");
+        click(&mut harness, &back);
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(
+            harness.visible(managed),
+            "the way back pops the search page"
+        );
+        assert!(!harness.visible(search));
+    }
+
+    /// A search that is out is drawn as a spinner, and the spinner exists only while the
+    /// search is: a hidden spinner is released rather than spinning off screen (I3).
+    #[test]
+    fn a_search_that_is_out_should_be_drawn_as_a_spinner() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let mut pane_view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        settle_frames(&mut harness, &mut dialog, &pane_view);
+        let searching = node(&dialog, &harness, "add:searching");
+        assert!(!harness.visible(searching));
+        assert!(
+            dialog.inner.borrow().spinner.is_none(),
+            "nothing is being waited for yet"
+        );
+
+        pane_view.searching = Some(SmolStr::new_static("kytrix"));
+        settle_frames(&mut harness, &mut dialog, &pane_view);
+        assert!(
+            dialog.inner.borrow().spinner.is_some(),
+            "the searching window draws a spinner"
+        );
+        assert!(
+            harness.visible(searching),
+            "the searching window is showing"
+        );
+        assert!(
+            harness.has_canvas(searching),
+            "the spinner is what the searching window draws"
+        );
+
+        pane_view.searching = None;
+        settle_frames(&mut harness, &mut dialog, &pane_view);
+        assert!(
+            dialog.inner.borrow().spinner.is_none(),
+            "the spinner is released when the search answers"
+        );
+        assert!(!harness.visible(searching));
+    }
+
+    /// The copy chosen when a control is built follows the language: the controls are
+    /// rebuilt, and the fields' placeholders and accessible names with them.
+    #[test]
+    fn the_dialog_s_static_copy_should_follow_the_language() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        settle_frames(&mut harness, &mut dialog, &view);
+        let english = translate(LanguageCode::En);
+        let add = dialog
+            .inner
+            .borrow()
+            .add_account
+            .clone()
+            .expect("the managed page draws the control that opens the search page");
+        assert_eq!(
+            add.a11y_label_text(),
+            Some(t_smol!(english, "widget.x.add_account").as_str()),
+            "the control is named in the language it was built in"
+        );
+        let filter = dialog
+            .inner
+            .borrow()
+            .filter
+            .as_ref()
+            .map(|input| input.root)
+            .expect("the managed page draws its filter");
+        assert!(
+            harness
+                .text_of(filter)
+                .contains(t_smol!(english, "widget.x.filter_placeholder").as_str()),
+            "the field is placeheld in the language it was built in: {}",
+            harness.text_of(filter)
+        );
+
+        harness.switch_language(LanguageCode::ZhCn);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let chinese = translate(LanguageCode::ZhCn);
+        let rebuilt = dialog
+            .inner
+            .borrow()
+            .add_account
+            .clone()
+            .expect("the control is rebuilt for the language");
+        assert_eq!(
+            rebuilt.a11y_label_text(),
+            Some(t_smol!(chinese, "widget.x.add_account").as_str()),
+            "the control's copy follows the language"
+        );
+        assert!(
+            harness
+                .text_of(filter)
+                .contains(t_smol!(chinese, "widget.x.filter_placeholder").as_str()),
+            "the field's placeholder follows the language: {}",
+            harness.text_of(filter)
+        );
+    }
+
+    /// The typed text and an IME commit reach the dialog's own fields, and only while the
+    /// dialog is the window's modal scope: the fields are fed from the observation queue
+    /// the engine leaves to a modal dialog's owner.
+    #[test]
+    fn typing_and_ime_should_reach_the_dialog_s_fields() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        settle_frames(&mut harness, &mut dialog, &view);
+        let filter = dialog
+            .inner
+            .borrow()
+            .filter
+            .as_ref()
+            .map(|input| input.root)
+            .expect("the managed page draws its filter");
+        let window = harness.window();
+        assert!(
+            harness.app_mut().set_focus(window, Some(filter)),
+            "the field takes the focus"
+        );
+
+        harness.dispatch_event(Event::Input(InputEvent::Text {
+            text: SmolStr::new_static("ky"),
+            timestamp: Instant::now(),
+        }));
+        sync(&mut harness, &mut dialog, &view);
+        assert_eq!(
+            typed(&harness, &dialog, false).as_str(),
+            "ky",
+            "the focused field takes the typed text"
+        );
+
+        harness.dispatch_event(Event::Ime(ImeEvent::Commit {
+            text: SmolStr::new_static("中"),
+            replace: None,
+        }));
+        sync(&mut harness, &mut dialog, &view);
+        assert_eq!(
+            typed(&harness, &dialog, false).as_str(),
+            "ky中",
+            "an IME commit reaches the field the keyboard is on"
+        );
+
+        // The other field is the search page's, and it is not the focused one.
+        assert_eq!(
+            typed(&harness, &dialog, true).as_str(),
+            "",
+            "text goes to the field the reader is in, not to both"
+        );
+    }
+
+    /// An answer to a question the reader no longer has is not drawn: editing the query
+    /// takes the answer away, and the answer to the query showing now is drawn.
+    #[test]
+    fn a_search_answer_should_belong_to_the_query_that_asked_for_it() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        set_query(&mut harness, &dialog, "kytrix");
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(!harness.visible(node(&dialog, &harness, "add:list")));
+
+        let found = SearchAnswer::Found(Arc::from(vec![profile("99", "someone")]));
+        harness.with_cx(|cx| {
+            dialog.answered_search(cx, &SmolStr::new_static("kytrix"), found);
+        });
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(harness.visible(node(&dialog, &harness, "add:list")));
+
+        // The reader edits the query while an answer for the old one is what is drawn.
+        set_query(&mut harness, &dialog, "someone-else");
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(
+            !harness.visible(node(&dialog, &harness, "add:list")),
+            "an answer does not stand under a query it was not asked with"
+        );
+
+        // The answer to the old query, arriving late, is not drawn either.
+        harness.with_cx(|cx| {
+            dialog.answered_search(
+                cx,
+                &SmolStr::new_static("kytrix"),
+                SearchAnswer::Found(Arc::from(vec![profile("99", "someone")])),
+            );
+        });
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(!harness.visible(node(&dialog, &harness, "add:list")));
+
+        // The answer to the query showing now is.
+        harness.with_cx(|cx| {
+            dialog.answered_search(
+                cx,
+                &SmolStr::new_static("someone-else"),
+                SearchAnswer::Found(Arc::from(vec![profile("99", "someone")])),
+            );
+        });
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(harness.visible(node(&dialog, &harness, "add:list")));
+    }
+
+    /// A search that was answered and found nothing says so on the page that asked, rather
+    /// than leaving the page blank or opening an alert.
+    #[test]
+    fn an_empty_search_answer_should_say_so_on_the_page_that_asked() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        set_query(&mut harness, &dialog, "nobody");
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        harness.with_cx(|cx| {
+            dialog.answered_search(
+                cx,
+                &SmolStr::new_static("nobody"),
+                SearchAnswer::Found(Arc::from(Vec::new())),
+            );
+        });
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let message = node(&dialog, &harness, "add:empty");
+        assert!(
+            harness.visible(message),
+            "the answer is drawn where it was asked"
+        );
+        let translate = harness.services().translate.clone();
+        assert!(
+            harness
+                .text_of(message)
+                .contains(t_smol!(translate, "widget.x.no_search_results").as_str()),
+            "an answer that found nothing says so"
+        );
+        assert!(dialog.inner.borrow().alert.is_none(), "it is not a failure");
+    }
+
+    /// A search that could not be answered is drawn in the words the failure itself gives,
+    /// on the page that asked — not as an alert over the dialog.
+    #[test]
+    fn a_search_that_could_not_be_answered_should_be_drawn_where_it_was_asked() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![monitored("42", Some("kytrix"))], 4)),
+        );
+        set_query(&mut harness, &dialog, "kytrix");
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let error = RpcCallError::DeadlineExceeded {
+            request_id: widget::protocol::RequestId::new(4),
+        };
+        let expected = error
+            .translated_message(&translate(LanguageCode::En))
+            .to_string();
+        harness.with_cx(|cx| {
+            dialog.answered_search(
+                cx,
+                &SmolStr::new_static("kytrix"),
+                SearchAnswer::Failed(error),
+            );
+        });
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let message = node(&dialog, &harness, "add:failed");
+        assert!(
+            harness.visible(message),
+            "the failure is drawn where it was asked"
+        );
+        assert!(
+            harness.text_of(message).contains(expected.as_str()),
+            "the words are the failure's own: {}",
+            harness.text_of(message)
+        );
+        assert!(
+            dialog.inner.borrow().alert.is_none(),
+            "a search that failed is not a change to the accounts, so there is nothing to alert"
+        );
     }
 }

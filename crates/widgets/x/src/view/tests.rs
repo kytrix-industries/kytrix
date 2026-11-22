@@ -591,30 +591,79 @@ fn a_pane_should_persist_no_config() {
     );
 }
 
+/// The i18n keys one source file names, as the catalogue literals it reads.
+///
+/// Scanning the sources rather than keeping a hand-written list is what keeps the guard
+/// from going stale: the dialog's keys fell out of the list once already, and a missing
+/// key is an empty string on screen rather than an error.
+fn keys_in(source: &'static str) -> Vec<&'static str> {
+    let bytes = source.as_bytes();
+    let mut keys = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let Some(length) = bytes[start..].iter().position(|byte| *byte == b'"') else {
+            break;
+        };
+        let end = start + length;
+        let literal = &source[start..end];
+        let is_key = (literal.starts_with("widget.") || literal.starts_with("common."))
+            && literal
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_');
+        if is_key && !keys.contains(&literal) {
+            keys.push(literal);
+        }
+        index = end + 1;
+    }
+    keys
+}
+
 /// A missing key is an empty string on screen rather than an error, so a gap in the
 /// interface is what a typo looks like: this is the test that turns it into a failure.
+///
+/// Every key the crate's sources name must resolve to non-empty copy in **both** locales
+/// the pane ships, so a key added to one catalogue and not the other (or renamed in the
+/// source and not in the catalogues) fails here rather than showing a blank.
 #[test]
 fn every_message_this_pane_shows_should_resolve_to_text() {
-    let translate = translate(LanguageCode::En);
-
-    for key in [
-        "widget.names.x",
-        "widget.descriptions.x",
-        "widget.x.age_date",
-        "widget.x.age_full_date",
-        "widget.x.age_hours",
-        "widget.x.age_minutes",
-        "widget.x.age_seconds",
-        "widget.x.logged_out",
-        "widget.x.manage",
-        "widget.x.tweet",
-        "widget.x.waiting",
-        "common.no_data",
-        "common.retry",
+    let mut keys: Vec<&'static str> = Vec::new();
+    for source in [
+        include_str!("../view.rs"),
+        include_str!("../dialog.rs"),
+        include_str!("../model.rs"),
+        include_str!("../service.rs"),
+        include_str!("../media.rs"),
     ] {
-        assert!(!t_smol!(translate, key).is_empty(), "{key} has no copy");
+        for key in keys_in(source) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.sort_unstable();
+
+    // The floor is the scan's own failure mode: a parser that stops finding keys would
+    // otherwise make this test pass without checking anything.
+    assert!(
+        keys.len() >= 40,
+        "the guard must cover the pane's whole vocabulary: {keys:?}"
+    );
+    for language in [LanguageCode::En, LanguageCode::ZhCn] {
+        let translate = translate(language);
+        for key in &keys {
+            assert!(
+                !t_smol!(translate, key).is_empty(),
+                "{key} has no copy in {language:?}"
+            );
+        }
     }
 
+    let translate = translate(LanguageCode::En);
     for status in [
         XSelectionStatus::Active,
         XSelectionStatus::Paused,
@@ -1145,10 +1194,15 @@ fn a_repost_row_should_say_who_reposted_it() {
         Some("kytrix display"),
         "the plan says who reposted the timeline entry"
     );
+    let line = t_smol!(
+        harness.services().translate,
+        "widget.x.reposted",
+        name = reposted_by.clone().unwrap_or_default()
+    );
     let body = body_root(&pane);
     assert!(
-        harness.has_text(body, "kytrix display"),
-        "the repost line names the account that reposted: {}",
+        harness.has_text(body, line.as_str()),
+        "the repost line is the localized sentence: {}",
         harness.text_of(body)
     );
     let text = body_text(&harness, &pane);
@@ -1156,6 +1210,20 @@ fn a_repost_row_should_say_who_reposted_it() {
     assert!(
         text.contains("seven display"),
         "the reposted author is drawn"
+    );
+
+    harness.switch_language(LanguageCode::ZhCn);
+    frame(&mut harness, &mut pane);
+    let localized = t_smol!(
+        harness.services().translate,
+        "widget.x.reposted",
+        name = reposted_by.unwrap_or_default()
+    );
+    assert_ne!(localized, line, "the two locales differ");
+    assert!(
+        harness.has_text(body_root(&pane), localized.as_str()),
+        "the repost line follows the language without rebuilding the row: {}",
+        body_text(&harness, &pane)
     );
 }
 
@@ -1598,10 +1666,93 @@ fn a_frame_should_offer_a_failed_picture_again() {
     let handled = click_at(&mut harness, &mut pane, point);
 
     assert!(handled, "the failed picture's tile is a target");
+    assert_eq!(
+        *harness.app().read(&pane.widget.media_retry),
+        Some(SmolStr::new(url.as_str())),
+        "the click asks for that picture again, and the next frame sends it"
+    );
+    frame(&mut harness, &mut pane);
     assert!(
         !pane.widget.pending.is_empty(),
         "asking for the picture again is a call the pane tracks"
     );
+    assert_eq!(
+        *harness.app().read(&pane.widget.media_retry),
+        None,
+        "the request is taken once"
+    );
+}
+
+/// The failed picture's tile is reachable without a pointer: it is in the a11y tree
+/// (not hidden) and it is focusable, and activating it asks for the picture again.
+#[test]
+fn a_failed_picture_should_be_offered_again_from_the_keyboard() {
+    let mut harness = harness();
+    harness.enable_a11y_capture();
+    let mut pane = quiet_pane(&mut harness, FakeSource::default());
+    report_status(&mut harness, &mut pane, TweetStatus::Ready);
+    let url = picture_url("keyboard-retry");
+    let mut feed = Feed::new();
+    feed.profile(profile_event("42", "kytrix"));
+    let snapshot = feed.push(media_tweet("1", 1_700_000_000_000, &url));
+    report_update(
+        &mut harness,
+        &mut pane,
+        1,
+        snapshot,
+        media_states(&[(&url, MediaState::Failed)]),
+    );
+    build_body(&mut harness, &mut pane);
+    sync(&mut harness, &mut pane);
+    // The a11y snapshot is delivered by the frame that draws the rows: the frame after it
+    // is idle and carries none, so the read is of the drawing frame.
+    harness.drain();
+
+    let tile = harness
+        .find_by_debug_prefix(body_root(&pane), "TEST_TWEET_MEDIA:1:0")
+        .expect("the failed picture's tile is drawn");
+    let action = pane
+        .widget
+        .media_retry_action
+        .clone()
+        .expect("the pane registered the retry action");
+    assert!(
+        !harness.a11y_hidden(tile),
+        "a failed picture is a way to ask for it again, not decoration"
+    );
+    let window = harness.window();
+    assert!(
+        harness.app_mut().set_focus(window, Some(tile)),
+        "the tile a keyboard reader can reach is what makes the retry possible"
+    );
+    assert!(
+        harness
+            .app_mut()
+            .dispatch_action_focused(window, action, ActionSource::Key),
+        "the focused tile's activation is the retry"
+    );
+    frame(&mut harness, &mut pane);
+
+    assert_eq!(
+        *harness.app().read(&pane.widget.media_retry),
+        None,
+        "the activation asked for the picture through the same request a click does"
+    );
+    assert!(
+        !pane.widget.pending.is_empty(),
+        "the picture is being fetched again"
+    );
+}
+
+/// One tweet whose whole body is one link, so a pointer anywhere over the text is over
+/// the link.
+fn linked_tweet(tweet_id: &str, timestamp: i64, text: &str, url: &str) -> XTweetEvent {
+    let mut event = tweet_event(tweet_id, timestamp, "42", text);
+    event.text_segments = vec![XTweetTextSegment {
+        text: text.into(),
+        url: Some(url.into()),
+    }];
+    event
 }
 
 /// A click on a row opens the tweet it draws.
@@ -1636,6 +1787,114 @@ fn a_click_on_a_row_should_open_its_tweet() {
     );
 
     assert_eq!(opened.borrow().as_slice(), [tweet_url("kytrix", "1")]);
+}
+
+/// A link inside a tweet is drawn in the theme's link colour, and the colour follows the
+/// appearance: a run's colour is a static load, so the rows are built for an appearance
+/// and rebuilt when it moves (AGENTS §7).
+#[test]
+fn a_link_should_be_drawn_in_the_brand_colour() {
+    let mut harness = harness();
+    let mut pane = quiet_pane(&mut harness, FakeSource::default());
+    report_status(&mut harness, &mut pane, TweetStatus::Ready);
+    let mut feed = Feed::new();
+    feed.profile(profile_event("42", "kytrix"));
+    let target = "https://example.com/article";
+    report_feed(
+        &mut harness,
+        &mut pane,
+        1,
+        feed.push(linked_tweet("1", 1_700_000_000_000, target, target)),
+    );
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let text = harness
+        .find_by_debug_prefix(body_root(&pane), "TEST_TWEET_TEXT:1")
+        .expect("the tweet's text node is drawn");
+    let theme = harness.services().theme.clone();
+    let light_link = theme.theme_for(Appearance::Light).role(Role::BrandBase);
+    let dark_link = theme.theme_for(Appearance::Dark).role(Role::BrandBase);
+    assert_eq!(
+        run_colours(&harness, text),
+        vec![light_link],
+        "the link's run is drawn in the theme's link colour"
+    );
+
+    assert!(theme.set_appearance(harness.app_mut(), Appearance::Dark));
+    frame(&mut harness, &mut pane);
+
+    assert_ne!(
+        light_link, dark_link,
+        "the two appearances have different link colours"
+    );
+    let text = harness
+        .find_by_debug_prefix(body_root(&pane), "TEST_TWEET_TEXT:1")
+        .expect("the rebuilt row draws the tweet's text");
+    assert_eq!(
+        run_colours(&harness, text),
+        vec![dark_link],
+        "the link follows the appearance it is drawn in"
+    );
+}
+
+/// The runs a text node draws, which is where a link's colour lives.
+fn run_colours(harness: &WidgetTestApp, node: NodeId) -> Vec<ui_core::paint::color::Color> {
+    match harness.tree().get(node).expect("the text node").kind() {
+        NodeKind::Text(content) => content.runs().iter().map(|run| run.style.color).collect(),
+        other => panic!("expected a text node, found {other:?}"),
+    }
+}
+
+/// A click over a link opens the link, not the tweet the link is in: the byte the pointer
+/// is over names which link was clicked, which is the same range the run is coloured for.
+#[test]
+fn a_click_on_a_link_should_open_the_link_not_the_tweet() {
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let mut harness = {
+        let opened = Rc::clone(&opened);
+        WidgetTestApp::with_translate(translate(LanguageCode::En))
+            .with_open_url(move |url| opened.borrow_mut().push(url.to_owned()))
+    };
+    let mut pane = quiet_pane(&mut harness, FakeSource::default());
+    report_status(&mut harness, &mut pane, TweetStatus::Ready);
+    let mut feed = Feed::new();
+    feed.profile(profile_event("42", "kytrix"));
+    let target = "https://example.com/article";
+    report_feed(
+        &mut harness,
+        &mut pane,
+        1,
+        feed.push(linked_tweet("1", 1_700_000_000_000, target, target)),
+    );
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let text = harness
+        .find_by_debug_prefix(body_root(&pane), "TEST_TWEET_TEXT:1")
+        .expect("the tweet's text node is drawn");
+    // The text node fills the column, so its centre is past the glyphs: a click over the
+    // link has to land on the glyphs the link is drawn as, near the start of the line.
+    let bounds = harness
+        .tree()
+        .get(text)
+        .expect("the text node is alive")
+        .layout()
+        .bounds;
+    let point = Point::new(
+        bounds.origin.x + 8.0,
+        bounds.origin.y + bounds.size.height / 2.0,
+    );
+    assert!(
+        click_at(&mut harness, &mut pane, point),
+        "the text is a target"
+    );
+
+    assert_eq!(
+        opened.borrow().as_slice(),
+        [target],
+        "the link opens rather than the tweet it is in"
+    );
 }
 
 #[test]
@@ -2044,6 +2303,48 @@ fn the_answer_to_a_replaced_command_should_be_dropped() {
     assert!(
         pane.widget.pending.is_empty(),
         "the answer is taken off the table"
+    );
+}
+
+/// A failure is terminal: a reply that was already out when the pane gave up does not
+/// steer it, and it is not even taken off the table as if it answered something
+/// (AGENTS §4.4 — the identity attribution and the failure gate are two doors, and every
+/// entry checks both).
+#[test]
+fn a_reply_after_a_failure_should_not_be_applied() {
+    let mut harness = harness();
+    let mut pane = quiet_pane(&mut harness, FakeSource::default());
+    load(&mut harness, &mut pane);
+    report_status(
+        &mut harness,
+        &mut pane,
+        TweetStatus::Failed(TweetStreamError::Service(KytrixServiceError::Closed)),
+    );
+    assert!(state_of(&harness, &pane).is_failed());
+
+    // A read of the monitored accounts was in flight when the stream failed; its answer
+    // arrives after the pane gave up.
+    pane.widget
+        .pending
+        .track(RequestId::new(2), PendingCommand::FetchSelections);
+    let answer = selection_data(vec![selection("7", "seven")], 4);
+    with_cx_of(&mut harness, pane.scope, |cx| {
+        pane.widget
+            .apply_rpc(RequestId::new(2), Ok(TweetResponse::Selections(answer)), cx);
+    });
+
+    assert!(
+        pane.widget.selections.is_none(),
+        "a failed pane does not take the answer it was waiting for before it failed"
+    );
+    assert_eq!(
+        pane.widget.pending.take(RequestId::new(2)),
+        Some(PendingCommand::FetchSelections),
+        "the answer is not attributed either: the gate is before the identity"
+    );
+    assert!(
+        state_of(&harness, &pane).is_failed(),
+        "the failure is still the pane's state"
     );
 }
 
@@ -2565,7 +2866,8 @@ fn a_steady_pane_should_not_ask_for_a_frame() {
 }
 
 /// A picture state arriving is a change the rows are built against, so the visible
-/// window is rebuilt for it; a report that changes nothing does not rebuild anything.
+/// window is rebuilt for it; a report whose picture states are equal does not rebuild
+/// anything — even though the service hands every event its own map.
 #[test]
 fn a_media_only_update_should_rebuild_the_visible_window() {
     let mut harness = harness();
@@ -2588,7 +2890,7 @@ fn a_media_only_update_should_rebuild_the_visible_window() {
     assert_eq!(loading_rows.len(), 1);
 
     let failed = media_states(&[(&url, MediaState::Failed)]);
-    report_update(&mut harness, &mut pane, 2, snapshot.clone(), failed.clone());
+    report_update(&mut harness, &mut pane, 2, snapshot.clone(), failed);
     frame(&mut harness, &mut pane);
     let failed_rows = mounted_rows(&harness, &pane);
     assert_eq!(failed_rows.len(), 1);
@@ -2598,11 +2900,20 @@ fn a_media_only_update_should_rebuild_the_visible_window() {
     );
     assert_eq!(row_count(&harness, &pane), 1);
 
-    report_update(&mut harness, &mut pane, 3, snapshot, failed);
+    // The service publishes a fresh map with every event (a new `Arc` even when nothing
+    // about the pictures changed): the rebuild is decided by what the states are, not by
+    // which allocation they came in.
+    report_update(
+        &mut harness,
+        &mut pane,
+        3,
+        snapshot,
+        media_states(&[(&url, MediaState::Failed)]),
+    );
     frame(&mut harness, &mut pane);
     assert_eq!(
         mounted_rows(&harness, &pane),
         failed_rows,
-        "a report that changes nothing rebuilds nothing"
+        "a report that changes no picture state rebuilds nothing"
     );
 }
