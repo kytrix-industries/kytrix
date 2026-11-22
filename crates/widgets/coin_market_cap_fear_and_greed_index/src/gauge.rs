@@ -32,6 +32,16 @@
 //!   radial cuts themselves are not covered by that distance field; the caps below
 //!   paint over them, which is why the cut is not visible (a **known difference**
 //!   from the reference, whose path fill rounded every edge).
+//!   The strip meets the first of the `Ui` pipeline's three coverage-mesh conditions —
+//!   the distance is linear along the normal — and **not** the other two
+//!   ([`GeometryPipeline::Ui`](ui_core::paint::geometry::GeometryPipeline::Ui) states
+//!   them): neighbouring quads share a radial edge, so the AA band of two triangles
+//!   writes the same pixels from both sides, and the four square corners of each band
+//!   are not extruded into triangles of their own. The engine does not check these
+//!   conditions; not meeting them shows only as aliasing, and here that aliasing lands
+//!   on the radial cuts and shared edges the same-coloured caps paint over (the same
+//!   reason the cut is invisible). A later caller reusing this mesh where those edges
+//!   are not covered would see it.
 //! - **the caps and the indicator** are quads with corner radii of their own radius,
 //!   which is what makes them circles. A quad's own corners reach `r·√2` from its
 //!   centre — past the band's outer edge — and only rounding every corner by `r`
@@ -557,18 +567,25 @@ impl Gauge {
 
         let geometry = GaugeGeometry::compute(bounds);
         let mut canvas = Canvas::new(bounds);
-        let mut bands = Vec::new();
-        if let Some(geometry) = geometry {
-            // The masked drawing the reference did: the arc is clipped to the box
-            // the node ended up with, so a rounding error cannot paint over a
-            // sibling.
-            let _ = canvas.push_clip(ClipRect {
-                rect: bounds,
-                corner_radius: [0.0; 4],
-            });
+        // The masked drawing the reference did: the frame is clipped to the box the
+        // node ended up with, so a rounding error cannot paint over a sibling. The
+        // words are inside that mask too — the reference masked the whole frame, not
+        // just the arc — so it is pushed before the frame's two branches split.
+        let _ = canvas.push_clip(ClipRect {
+            rect: bounds,
+            corner_radius: [0.0; 4],
+        });
+        let mut bands = Vec::with_capacity(SEGMENT_COUNT);
+        if let Some(geometry) = &geometry {
             for index in 0..SEGMENT_COUNT {
                 let mesh = geometry.band_mesh(index);
-                let id = register_band(cx.app_mut(), &mesh)?;
+                let id = match register_band(cx.app_mut(), &mesh) {
+                    Ok(id) => id,
+                    // The frame is abandoned whole, so the meshes registered so far
+                    // are given back here: `self.prepared` still holds the frame this
+                    // one was replacing, and nothing else would return them.
+                    Err(error) => return Err(abandon_frame(cx.app_mut(), bands, error)),
+                };
                 canvas.push_path(Path {
                     bounds: mesh.bounds,
                     geometry: id,
@@ -593,25 +610,31 @@ impl Gauge {
             score_size * LINE_HEIGHT_RATIO,
             level_size * LINE_HEIGHT_RATIO,
         );
-        let score_line = cx.app_mut().shape_text(
+        let score_line = match cx.app_mut().shape_text(
             format_smolstr!("{score}").as_str(),
             &text_style(score_size, colors.text),
             None,
             &[],
-        )?;
-        let level_line = cx.app_mut().shape_text(
+        ) {
+            Ok(line) => line,
+            Err(error) => return Err(abandon_frame(cx.app_mut(), bands, error)),
+        };
+        let level_line = match cx.app_mut().shape_text(
             level.as_str(),
             &text_style(level_size, colors.text),
             None,
             &[],
-        )?;
+        ) {
+            Ok(line) => line,
+            Err(error) => return Err(abandon_frame(cx.app_mut(), bands, error)),
+        };
         let _ = canvas.push_shaped_text(&score_line, text_origin(score_box, score_line.size()));
         let _ = canvas.push_shaped_text(&level_line, text_origin(level_box, level_line.size()));
-        if geometry.is_some() {
-            let _ = canvas.pop_clip();
-        }
+        let _ = canvas.pop_clip();
 
-        cx.set_canvas(node, canvas)?;
+        if let Err(error) = cx.set_canvas(node, canvas) {
+            return Err(abandon_frame(cx.app_mut(), bands, error));
+        }
         self.release_bands(cx.app_mut());
         self.prepared = Some(PreparedGauge {
             key: GaugeKey {
@@ -663,6 +686,20 @@ impl Gauge {
             }
         }
     }
+}
+
+/// Gives back the band meshes a frame registered before it failed.
+///
+/// A frame registers its meshes in the process-wide store as it builds, so one that
+/// cannot be finished would leave them there for the life of the process: the widget
+/// only ever releases the frame it kept (`Gauge::release_bands`), and this one is never
+/// kept. The error comes back unchanged — it is the caller's to report, not this
+/// cleanup's.
+fn abandon_frame(app: &mut App, bands: Vec<GeometryId>, error: EngineError) -> EngineError {
+    for id in bands {
+        let _ = app.geometry_mut().release(id);
+    }
+    error
 }
 
 /// Registers one band's mesh in the process-wide geometry store.

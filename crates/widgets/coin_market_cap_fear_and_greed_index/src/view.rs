@@ -19,6 +19,19 @@
 //! starts it again — a service that is briefly unreachable does not turn into a
 //! request every minute until someone notices.
 //!
+//! # Why a reply is matched by request identity
+//!
+//! One binding carries one command at a time: a second `call` replaces and aborts the
+//! first. Abort only stops an answer that has not been handed to the widget yet, so an
+//! answer can already be queued when the replacement happens — and the one place they
+//! are delivered, `sync`, replaces a command before it drains exactly when the account
+//! changes. The pane therefore records the framework `RequestId` every command was
+//! issued under ([`Pending`]) and applies an answer only to the identity it belongs
+//! to. An identity the table does not know answers a command this pane replaced or
+//! gave up on, and is dropped and counted instead of being applied to the command now
+//! waiting: the mis-attribution that would let the failure of a signed-out account's
+//! `Load` fail the pane the next account is reading (AGENTS §4.4, §8.2).
+//!
 //! # Who may see it
 //!
 //! The service serves this snapshot over an authenticated connection, so a pane
@@ -106,12 +119,13 @@ use ui_core::{
     text::{TextAlign, TextStyle},
 };
 use widget::{
-    binding::{Inbound, WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
     error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     view::{HeaderGroup, ReloadHandle, WidgetView},
@@ -125,10 +139,9 @@ use crate::{
     },
     service::{
         CoinMarketCapFearAndGreedIndexFetchError, CoinMarketCapFearAndGreedIndexProtocol,
-        CoinMarketCapFearAndGreedIndexRequest, CoinMarketCapFearAndGreedIndexResponse,
-        CoinMarketCapFearAndGreedIndexService, CoinMarketCapFearAndGreedIndexServiceError,
-        CoinMarketCapFearAndGreedIndexSource, CoinMarketCapFearAndGreedIndexStreamKey,
-        CoinMarketCapFearAndGreedIndexStreamMessage,
+        CoinMarketCapFearAndGreedIndexRequest, CoinMarketCapFearAndGreedIndexService,
+        CoinMarketCapFearAndGreedIndexServiceError, CoinMarketCapFearAndGreedIndexSource,
+        CoinMarketCapFearAndGreedIndexStreamKey, CoinMarketCapFearAndGreedIndexStreamMessage,
     },
 };
 
@@ -165,6 +178,15 @@ const ROW_TEXT_SIZE: UnifiedSize = UnifiedSize::Medium;
 ///
 /// The reference drew both at `text_xs` (12 px), which is the ladder's compact size.
 const SMALL_TEXT_SIZE: UnifiedSize = UnifiedSize::Small;
+
+/// The size step of the pane's two decorative icons: the section headings' info icon
+/// and the header's refresh icon.
+///
+/// The reference drew both with `Icon::size_3()` (12 px), which is *not* the icon step
+/// of the control they sit in: a `Small` heading or button draws its icon at 8 px. The
+/// 12 px icon is the ladder's medium step, and giving it explicitly is what keeps the
+/// two icons the size the reference drew them (kit P2-9 `Button::icon_size`).
+const ICON_SIZE: UnifiedSize = UnifiedSize::Medium;
 
 /// How many rows the pane draws.
 const ROW_COUNT: usize = 6;
@@ -415,11 +437,27 @@ struct Card {
     extreme_rows: NodeId,
 }
 
+/// The commands one pane can have in flight on its one binding.
+///
+/// The identity [`WidgetBinding::call`] returned is what says whose answer arrived: an
+/// answer this table does not know belongs to a command the pane replaced or gave up
+/// on (see the module documentation). The kind recorded is what tells the pane whether
+/// the answer ends the window a click opened — only a refresh does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// The read that starts or restarts the stream: `Load` or `Retry`.
+    Load,
+    /// The read the refresh control brought forward.
+    Refresh,
+}
+
 /// One fear and greed pane: the account it follows, the reading it draws, and its
 /// refresh control.
 pub struct CoinMarketCapFearAndGreedIndexWidget {
     /// The executor bridge, absent on a host that installed no Kytrix service.
     binding: Option<WidgetBinding<CoinMarketCapFearAndGreedIndexProtocol>>,
+    /// The command in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
     gauge: Gauge,
@@ -544,7 +582,7 @@ impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
                 Inbound::Latest { key, message } => {
                     self.apply_latest(key, message, cx);
                 }
-                Inbound::Rpc { result, .. } => self.apply_rpc(result, cx),
+                Inbound::Rpc { request_id, result } => self.apply_rpc(request_id, result, cx),
             }
         }
 
@@ -635,6 +673,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
 
         Self {
             binding,
+            pending: Pending::new(),
             status,
             recovery,
             gauge: Gauge::new(),
@@ -689,8 +728,12 @@ impl CoinMarketCapFearAndGreedIndexWidget {
     /// Starts reading, or restarts for an account the user is retrying.
     fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         // The command that was in flight belongs to the stream this call is
-        // replacing, so its answer is not something to wait for any more.
+        // replacing, so its answer is not something to wait for any more. Forgetting
+        // it here is what keeps that answer from being applied to the command about
+        // to be issued: a `Load` for the account that just signed out fails while the
+        // pane is reading for the one that replaced it.
         self.refresh_pending = false;
+        self.pending.clear();
         let Some(key) = self.current_key() else {
             // There is nothing to read for a reader the service does not know, and
             // nothing has gone wrong, so the pane says what it is waiting for.
@@ -720,7 +763,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             cx.request_frame()?;
             return Ok(());
         };
-        binding.call(
+        let request_id = binding.call(
             cx,
             if retry {
                 CoinMarketCapFearAndGreedIndexRequest::Retry(key)
@@ -728,6 +771,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                 CoinMarketCapFearAndGreedIndexRequest::Load(key)
             },
         );
+        self.pending.track(request_id, PendingCommand::Load);
         cx.request_frame()?;
 
         Ok(())
@@ -755,7 +799,8 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             return Ok(());
         };
         self.refresh_pending = true;
-        binding.call(cx, CoinMarketCapFearAndGreedIndexRequest::Refresh);
+        let request_id = binding.call(cx, CoinMarketCapFearAndGreedIndexRequest::Refresh);
+        self.pending.track(request_id, PendingCommand::Refresh);
         cx.request_frame()?;
 
         Ok(())
@@ -776,29 +821,41 @@ impl CoinMarketCapFearAndGreedIndexWidget {
 
     /// Applies the answer to a load, a retry or a refresh.
     ///
+    /// The answer is matched to the command it answers by the framework identity the
+    /// binding returned when that command was issued. An identity the table does not
+    /// know answers a command this pane replaced or gave up on — the account changed,
+    /// the pane signed out — so it is dropped and counted rather than applied to the
+    /// command now waiting (see the module documentation).
+    ///
     /// A failure is terminal, so an answer that arrives after one is dropped: the
     /// recovery reports `Connecting` before it asks for anything, which is what
     /// makes the next answer one this pane still wants.
     fn apply_rpc(
         &mut self,
+        request_id: RequestId,
         result: WidgetRpcResult<CoinMarketCapFearAndGreedIndexProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        let Some(command) = self.pending.take(request_id) else {
+            log::debug!(
+                "the fear and greed pane ignored reply {request_id}: no command is waiting for it"
+            );
+            return;
+        };
         if self.status.is_failed(cx.app()) {
             return;
         }
-        match result {
-            Ok(
-                CoinMarketCapFearAndGreedIndexResponse::StreamStarted
-                | CoinMarketCapFearAndGreedIndexResponse::RefreshQueued,
-            ) => {}
-            Err(error) => {
-                // A refused command is not one to keep waiting for, whichever command
-                // it was: the pane reports the failure and the wait ends with it.
-                self.refresh_pending = false;
-                self.report_failure(CoinMarketCapFearAndGreedIndexFailure::Rpc(error), cx);
-            }
+        let Err(error) = result else {
+            // An accepted command. The reading it asked for arrives on the stream, and
+            // that is what ends the wait — a refresh's wait included.
+            return;
+        };
+        if command == PendingCommand::Refresh {
+            // A refused refresh is not one to keep waiting for: the window the click
+            // opened ends with the answer to the command that opened it.
+            self.refresh_pending = false;
         }
+        self.report_failure(CoinMarketCapFearAndGreedIndexFailure::Rpc(error), cx);
     }
 
     /// Applies the failure the stream reported.
@@ -974,7 +1031,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
         let theme = self.theme.clone();
         let window = cx.window();
         let icon = IconSpec::new(IconKind::WarningCircle)
-            .with_size(SMALL_TEXT_SIZE.icon_size())
+            .with_size(ICON_SIZE.icon_size())
             .build_themed(cx.app_mut(), window, row, &theme, Role::FgSubtle)
             .map_err(|error| icon_error(error, row))?;
         let key = cx.unique_key(descriptor.key);
@@ -1379,6 +1436,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .ghost()
             .small()
             .icon(IconKind::ArrowsClockwise)
+            .icon_size(ICON_SIZE.icon_size())
             .a11y_label(label)
             .disabled(disabled)
             // A disabled button is only *drawn* disabled, so the handler stays

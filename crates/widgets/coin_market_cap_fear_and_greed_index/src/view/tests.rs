@@ -302,6 +302,30 @@ fn path_count(canvas: &Canvas) -> usize {
         .count()
 }
 
+/// The fill of each band, in draw order.
+fn band_fills(canvas: &Canvas) -> Vec<ui_core::paint::color::Color> {
+    primitives(canvas)
+        .into_iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::Path(path) => Some(path.fill),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the scale's five roles resolve to in `theme`.
+fn band_colours(theme: &base_ui::theme::resolved::Theme) -> Vec<ui_core::paint::color::Color> {
+    [
+        Role::FearGreedExtremeFear,
+        Role::FearGreedFear,
+        Role::FearGreedNeutral,
+        Role::FearGreedGreed,
+        Role::FearGreedExtremeGreed,
+    ]
+    .map(|role| theme.role(role))
+    .to_vec()
+}
+
 fn quads(canvas: &Canvas) -> Vec<&ui_core::paint::primitive::Quad> {
     primitives(canvas)
         .into_iter()
@@ -862,6 +886,59 @@ fn an_account_change_should_read_the_new_account() {
     );
 }
 
+/// The answer to a command this pane replaced is not the answer to the command now in
+/// flight. Changing the account replaces the `Load` (and `sync` drains after that), so
+/// the replaced command's failure arrives when the new account's read is waiting: it
+/// has to be dropped — counted as late — rather than reported as the new pane's
+/// failure, which would leave the pane terminal until the user recovered it.
+#[test]
+fn an_answer_to_a_replaced_load_should_not_fail_the_pane() {
+    let mut harness = harness();
+    let mut pane = pane_for(
+        &mut harness,
+        Some(ACCOUNT),
+        FakeSource::new([FetchPlan::Pending, FetchPlan::Pending]),
+    );
+    load(&mut harness, &mut pane);
+    sign_in(&mut harness, "someone-else");
+    sync(&mut harness, &mut pane);
+    assert_eq!(
+        pane.status.state(harness.app()),
+        WidgetState::Connecting,
+        "the replacement read is waiting for its own answer"
+    );
+
+    harness.with_cx(|cx| {
+        pane.widget.apply_rpc(
+            RequestId::new(1),
+            Err(RpcCallError::Service {
+                request_id: RequestId::new(1),
+                source: CoinMarketCapFearAndGreedIndexServiceError::StreamBusy,
+            }),
+            cx,
+        );
+    });
+
+    assert!(
+        !pane.status.is_failed(harness.app()),
+        "the replaced load's failure is not the failure of the command now waiting"
+    );
+    assert_eq!(
+        pane.widget.pending.dropped(),
+        1,
+        "the late answer is dropped and counted"
+    );
+    assert!(
+        !pane.widget.pending.is_empty(),
+        "the replacement's own answer is still waited for"
+    );
+    assert_eq!(
+        pane.status.state(harness.app()),
+        WidgetState::Connecting,
+        "the pane is still waiting rather than failed"
+    );
+}
+
 /// A refresh is one command and one answer, and the control is closed between them:
 /// the service refuses a second command while one is in flight.
 #[test]
@@ -942,9 +1019,12 @@ fn a_refused_refresh_should_be_reported_as_a_failure() {
     harness.with_cx(|cx| {
         pane.widget.refresh(cx).expect("the refresh is sent");
         assert!(pane.widget.refresh_is_disabled(cx.app()));
+        // The pane issued a `Load` (identity 1) and then this refresh (identity 2);
+        // the service refuses the refresh it was given.
         pane.widget.apply_rpc(
+            RequestId::new(2),
             Err(RpcCallError::Service {
-                request_id: RequestId::new(1),
+                request_id: RequestId::new(2),
                 source: CoinMarketCapFearAndGreedIndexServiceError::StreamBusy,
             }),
             cx,
@@ -952,6 +1032,15 @@ fn a_refused_refresh_should_be_reported_as_a_failure() {
     });
 
     assert!(pane.status.is_failed(harness.app()));
+    assert_eq!(
+        pane.widget.pending.dropped(),
+        0,
+        "the answer named the command that was waiting for it"
+    );
+    assert!(
+        pane.widget.pending.is_empty(),
+        "the answered command is no longer in flight"
+    );
     assert!(
         !pane.widget.refresh_pending,
         "a refused command is not one to keep waiting for"
@@ -1185,6 +1274,61 @@ fn a_collected_reading_should_draw_the_gauge_frame() {
     }
 }
 
+/// The two decorative icons are drawn at the 12 px the reference drew them
+/// (`Icon::size_3()`): the section headings' info icon and the header's refresh icon.
+/// Both sit in a `Small` control, whose icon step is 8 px, so the size has to be asked
+/// for explicitly — the reference decoupled the icon from the control's size step.
+#[test]
+fn the_two_decorative_icons_should_keep_the_reference_size() {
+    let mut harness = harness();
+    let mut pane = pane_for(
+        &mut harness,
+        Some(ACCOUNT),
+        FakeSource::new([FetchPlan::Pending]),
+    );
+    load(&mut harness, &mut pane);
+    report_snapshot(&mut harness, &mut pane, snapshot(46));
+    build_body(&mut harness, &mut pane);
+    harness
+        .with_cx(|cx| pane.widget.header(HeaderGroup::Right, pane.parent, cx))
+        .expect("the header builds");
+    frame(&mut harness, &mut pane);
+
+    // The card's children are the gauge, the first heading, its rows, the second
+    // heading and its rows; a heading's children are its label and its info icon.
+    let body = found(&harness, &pane, BODY_SELECTOR).expect("the body is built");
+    let card = harness.tree().get(body).expect("the body node").children()[0];
+    let heading = harness.tree().get(card).expect("the card node").children()[1];
+    let info_icon = harness
+        .tree()
+        .get(heading)
+        .expect("the heading row")
+        .children()[1];
+    assert_eq!(
+        node_bounds(&harness, info_icon).size.width,
+        12.0,
+        "the heading's info icon is drawn at the reference's 12 px"
+    );
+
+    // The control's node wraps the kit button, whose first child is its icon.
+    let control = found(&harness, &pane, REFRESH_SELECTOR).expect("the refresh control");
+    let button = harness
+        .tree()
+        .get(control)
+        .expect("the control node")
+        .children()[0];
+    let refresh_icon = harness
+        .tree()
+        .get(button)
+        .expect("the button node")
+        .children()[0];
+    assert_eq!(
+        node_bounds(&harness, refresh_icon).size.width,
+        12.0,
+        "the header's refresh icon is drawn at the reference's 12 px"
+    );
+}
+
 /// The reading walks across the half circle: a higher score puts the dot further
 /// right, which is the one thing a test can read out of a painted frame.
 #[test]
@@ -1236,22 +1380,9 @@ fn the_gauge_should_read_its_colours_from_the_theme() {
 
     let canvas = gauge_canvas(&harness, &pane);
     let theme = base_ui::theme::resolved::Theme::of(Appearance::Light);
-    let bands: Vec<ui_core::paint::color::Color> = primitives(&canvas)
-        .into_iter()
-        .filter_map(|primitive| match primitive {
-            Primitive::Path(path) => Some(path.fill),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        bands,
-        vec![
-            theme.role(Role::FearGreedExtremeFear),
-            theme.role(Role::FearGreedFear),
-            theme.role(Role::FearGreedNeutral),
-            theme.role(Role::FearGreedGreed),
-            theme.role(Role::FearGreedExtremeGreed),
-        ],
+        band_fills(&canvas),
+        band_colours(&theme),
         "the bands are the scale's own roles"
     );
     let circles = quads(&canvas);
@@ -1260,6 +1391,48 @@ fn the_gauge_should_read_its_colours_from_the_theme() {
         panic!("the dot is a solid quad");
     };
     assert_eq!(*fill, theme.role(Role::FgDefault));
+}
+
+/// The colours a frame is drawn in are part of what the prepared frame was made from,
+/// so switching to the dark appearance has to prepare it again — a canvas that kept
+/// the light roles would be a pane drawn in the theme the user just left.
+#[test]
+fn a_dark_appearance_should_repaint_the_gauge() {
+    let mut harness = harness();
+    let mut pane = pane_for(
+        &mut harness,
+        Some(ACCOUNT),
+        FakeSource::new([FetchPlan::Pending]),
+    );
+    load(&mut harness, &mut pane);
+    report_snapshot(&mut harness, &mut pane, snapshot(46));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let light_canvas = gauge_canvas(&harness, &pane);
+    assert_eq!(
+        band_fills(&light_canvas),
+        band_colours(&base_ui::theme::resolved::Theme::of(Appearance::Light)),
+        "the frame a light pane prepared is drawn in the light roles"
+    );
+
+    let theme = pane.widget.theme.clone();
+    assert!(
+        theme.set_appearance(harness.app_mut(), Appearance::Dark),
+        "another appearance is a change the pane has to draw"
+    );
+    frame(&mut harness, &mut pane);
+
+    let dark_canvas = gauge_canvas(&harness, &pane);
+    assert_eq!(
+        band_fills(&dark_canvas),
+        band_colours(&base_ui::theme::resolved::Theme::of(Appearance::Dark)),
+        "the dark appearance repaints the bands in the dark roles"
+    );
+    assert!(
+        !Arc::ptr_eq(&light_canvas, &dark_canvas),
+        "the redraw prepared a canvas of its own"
+    );
 }
 
 /// A new reading redraws the values, not the tree: the body is built once and every
@@ -1357,6 +1530,39 @@ fn a_steady_frame_should_do_no_work() {
         harness.frame_requests(),
         requests,
         "a steady pane asks for no frame"
+    );
+}
+
+/// A steady frame keeps the canvas it is drawn from rather than preparing it again.
+///
+/// The request count above cannot see this: `Window::set_canvas` writes a node's canvas
+/// without asking for a frame, so a pane that rebuilt its canvas every frame would look
+/// quiet. The canvas' own identity is what says whether it was replaced.
+#[test]
+fn a_steady_canvas_should_be_kept() {
+    let mut harness = harness();
+    let mut pane = pane_for(
+        &mut harness,
+        Some(ACCOUNT),
+        FakeSource::new([FetchPlan::Pending]),
+    );
+    load(&mut harness, &mut pane);
+    report_snapshot(&mut harness, &mut pane, snapshot(46));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let drawn = gauge_canvas(&harness, &pane);
+    sync(&mut harness, &mut pane);
+    sync(&mut harness, &mut pane);
+
+    assert!(
+        Arc::ptr_eq(&drawn, &gauge_canvas(&harness, &pane)),
+        "a steady frame keeps the canvas it is drawn from"
+    );
+    assert_eq!(
+        harness.app().geometry().len(),
+        5,
+        "a steady frame registers no mesh of its own either"
     );
 }
 
@@ -1762,6 +1968,44 @@ fn a_card_that_goes_away_should_release_its_geometries() {
         harness.app().geometry().len(),
         0,
         "the empty state replaced the card, and the card's meshes went with it"
+    );
+}
+
+/// A redraw registers the five meshes of the frame it prepared and gives the five of
+/// the frame it replaced back. The store is process-wide rather than scoped to a
+/// window, so a redraw that did not return them would grow it by five per reading —
+/// and nothing would ever give them back, because the widget only holds the newest
+/// frame.
+#[test]
+fn changing_the_reading_should_keep_five_meshes_alive() {
+    let mut harness = harness();
+    let mut pane = pane_for(
+        &mut harness,
+        Some(ACCOUNT),
+        FakeSource::new([FetchPlan::Pending]),
+    );
+    load(&mut harness, &mut pane);
+    report_snapshot(&mut harness, &mut pane, snapshot(46));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+    assert_eq!(harness.app().geometry().len(), 5);
+
+    for score in [10, 20, 30, 40, 50, 60, 70, 80] {
+        report_snapshot(&mut harness, &mut pane, snapshot(score));
+        frame(&mut harness, &mut pane);
+        assert_eq!(
+            harness.app().geometry().len(),
+            5,
+            "a redraw keeps exactly the five meshes it draws with (reading {score})"
+        );
+    }
+
+    report_snapshot(&mut harness, &mut pane, empty_snapshot());
+    frame(&mut harness, &mut pane);
+    assert_eq!(
+        harness.app().geometry().len(),
+        0,
+        "the card's meshes go when the card does"
     );
 }
 
