@@ -21,9 +21,8 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use gpui_kit::SharedString;
 use kytrix_service_provider::service::engine::{NewsEvent, NewsKind};
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
 /// How many items one subscription retains.
@@ -54,8 +53,8 @@ impl From<NewsKind> for NewsCategory {
 #[derive(Debug)]
 pub(super) struct NewsItem {
     timestamp: i64,
-    title: Option<SharedString>,
-    content: SharedString,
+    title: Option<SmolStr>,
+    content: SmolStr,
     category: NewsCategory,
     display: Mutex<Option<(UtcOffset, Arc<NewsItemDisplay>)>>,
 }
@@ -64,18 +63,18 @@ impl NewsItem {
     fn new(event: NewsEvent) -> Self {
         Self {
             timestamp: event.timestamp,
-            title: event.title.map(|title| SharedString::new(title.as_str())),
-            content: SharedString::new(event.content.as_str()),
+            title: event.title,
+            content: event.content,
             category: NewsCategory::from(event.category),
             display: Mutex::new(None),
         }
     }
 
-    pub(super) fn title(&self) -> Option<&SharedString> {
+    pub(super) fn title(&self) -> Option<&SmolStr> {
         self.title.as_ref()
     }
 
-    pub(super) const fn content(&self) -> &SharedString {
+    pub(super) const fn content(&self) -> &SmolStr {
         &self.content
     }
 
@@ -107,7 +106,7 @@ impl NewsItem {
 /// The part of an item's row that is built rather than borrowed.
 #[derive(Debug)]
 pub(super) struct NewsItemDisplay {
-    pub time: SharedString,
+    pub time: SmolStr,
 }
 
 impl NewsItemDisplay {
@@ -122,6 +121,19 @@ impl NewsItemDisplay {
 #[derive(Clone, Debug, Default)]
 pub(super) struct NewsSnapshot {
     items: Arc<[Arc<NewsItem>]>,
+}
+
+/// Two snapshots are one feed only when they share the allocation holding it.
+///
+/// A snapshot is handed to an engine signal, whose writes are short-circuited when the
+/// value is equal. The retained items are shared between the snapshots a feed grows
+/// through, and a rebuilt feed is a new allocation, so comparing the allocation is the
+/// same distinction the widget itself draws: the same reports in new allocations are a
+/// new feed (see [`has_new_news`] and [`unshown`]).
+impl PartialEq for NewsSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.items, &other.items)
+    }
 }
 
 impl NewsSnapshot {
@@ -259,7 +271,7 @@ pub(super) fn unshown(held: &[Arc<NewsItem>], next: &[Arc<NewsItem>]) -> Option<
 ///
 /// The service stamps news in UTC, so what a reader sees is that instant converted
 /// by the offset the caller read from the settings.
-fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+fn format_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
     // The offset can move an instant past the last date the calendar holds — a
     // timestamp at the far end of the range is one the service cannot publish, and
     // it is written as a placeholder rather than taken to a date that is not one.
@@ -267,19 +279,16 @@ fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--"),
+            || SmolStr::new_static("--"),
             |time| {
-                SharedString::new(
-                    format_smolstr!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        time.year(),
-                        u8::from(time.month()),
-                        time.day(),
-                        time.hour(),
-                        time.minute(),
-                        time.second()
-                    )
-                    .as_str(),
+                format_smolstr!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    time.year(),
+                    u8::from(time.month()),
+                    time.day(),
+                    time.hour(),
+                    time.minute(),
+                    time.second()
                 )
             },
         )
@@ -317,7 +326,7 @@ mod tests {
         // 2023-11-14T22:13:20Z, so a formatter that reads seconds as milliseconds, or
         // that drops the date, does not pass.
         assert_eq!(
-            format_time(1_700_000_000_000, UtcOffset::UTC).as_ref(),
+            format_time(1_700_000_000_000, UtcOffset::UTC).as_str(),
             "2023-11-14 22:13:20"
         );
         assert_eq!(
@@ -325,7 +334,7 @@ mod tests {
                 1_700_000_000_000,
                 UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "2023-11-15 06:13:20",
             "the instant is read in the zone the settings display"
         );
@@ -333,7 +342,7 @@ mod tests {
 
     #[test]
     fn time_should_read_as_a_placeholder_when_it_is_not_an_instant() {
-        assert_eq!(format_time(i64::MAX, UtcOffset::UTC).as_ref(), "--");
+        assert_eq!(format_time(i64::MAX, UtcOffset::UTC).as_str(), "--");
     }
 
     /// The display offset can move an instant past the last day the calendar holds.
@@ -352,7 +361,7 @@ mod tests {
                 timestamp,
                 UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "--"
         );
 
@@ -368,7 +377,7 @@ mod tests {
                 timestamp,
                 UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "--",
             "a western offset can run off the other end of the calendar"
         );
@@ -420,7 +429,7 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.items().len(), 2);
         assert_eq!(
-            snapshot.items()[0].content().as_ref(),
+            snapshot.items()[0].content().as_str(),
             "Content updated",
             "the newest arrival of one instant is read first"
         );
