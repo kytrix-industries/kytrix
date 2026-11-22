@@ -12,18 +12,25 @@
 //!   就是一段文字），图标 / 复合内容用 [`crate::kit::interactive::Interactive`] 自己搭；
 //! - 静态绘制改成 `bind_style`（主题切换要跟着换色）；布局占位边框仍用 `StyleBuilder::border`，
 //!   与绘制边框成对写；
-//! - a11y：根声明 `Label` + 文本，文字叶子显式 `hidden`（避免同一句话被播报两遍）。
+//! - 文案有两种形态（[`TextValue`]）：[`Badge::text`] 是构建期静态值（旧语义）；
+//!   [`Badge::bind_label`] 绑定 `Signal<SmolStr>`，写信号即更新文本与可访问名、**不重建节点**
+//!   （语言切换不再需要「先摘节点再重建」，P2-9）；
+//! - a11y：根声明 `Label` + 文本（绑定形态在同一个 `bind_a11y` pass 里补 label），文字叶子显式
+//!   `hidden`（避免同一句话被播报两遍）。
 
 use smol_str::SmolStr;
 use ui_core::{
-    a11y::{A11yOverride, A11yRole},
-    node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
+    a11y::{A11yOverride, A11yPatch, A11yRole},
+    node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{color::Color, primitive::Border, style::StylePatch},
     text::TextStyle,
 };
 
 use crate::{
-    kit::size::{UnifiedSizable, UnifiedSize},
+    kit::{
+        size::{UnifiedSizable, UnifiedSize},
+        text_value::TextValue,
+    },
     style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
@@ -64,7 +71,7 @@ pub struct Badge {
     color: BadgeColor,
     shape: Option<BadgeShape>,
     size: UnifiedSize,
-    text: SmolStr,
+    label: TextValue,
 }
 
 impl Badge {
@@ -75,14 +82,21 @@ impl Badge {
             color: BadgeColor::default(),
             shape: None,
             size: UnifiedSize::Medium,
-            text: SmolStr::default(),
+            label: TextValue::default(),
         }
     }
 
-    /// 文本。
+    /// 静态文本（构建期固定；语言切换需要由调用方重建节点）。
     #[must_use]
     pub fn text(mut self, text: impl Into<SmolStr>) -> Self {
-        self.text = text.into();
+        self.label = TextValue::Static(text.into());
+        self
+    }
+
+    /// 绑定文本：写信号即更新标签文本与可访问名，节点不重建（语言切换的绑定面）。
+    #[must_use]
+    pub fn bind_label(mut self, label: Signal<SmolStr>) -> Self {
+        self.label = TextValue::Bound(label);
         self
     }
 
@@ -175,8 +189,9 @@ impl Badge {
         let color = self.color;
         let shape = self.shape();
         let size = self.size;
-        let text = self.text.clone();
-        let root = NodeBuilder::boxed()
+        let label = self.label.clone();
+        let initial = label.initial_text();
+        let mut root = NodeBuilder::boxed()
             .style(
                 StyleBuilder::new()
                     .flex_row()
@@ -203,24 +218,35 @@ impl Badge {
             })
             .a11y(A11yOverride {
                 role: Some(A11yRole::Label),
-                label: Some(text.clone()),
+                // 静态文案仍是构建期声明；绑定文案的初始值为空串，由同一个动态 pass 写入。
+                label: (!label.is_bound()).then(|| initial.clone()),
                 ..A11yOverride::default()
-            })
-            .build(tree, parent)?;
+            });
+        if label.is_bound() {
+            let bound = label.clone();
+            root = root.bind_a11y(move |cx| A11yPatch {
+                label: Some(bound.read(cx)),
+                ..A11yPatch::default()
+            });
+        }
+        let root = root.build(tree, parent)?;
         let theme_text = self.theme.clone();
-        NodeBuilder::text(text, TextStyle::new(size.text_size()))
-            .bind_style(move |cx| {
-                let (_, foreground, _) = badge_colors(cx, &theme_text, color, shape);
-                StylePatch {
-                    foreground: Some(foreground),
-                    ..StylePatch::default()
-                }
-            })
-            .a11y(A11yOverride {
-                hidden: true,
-                ..A11yOverride::default()
-            })
-            .build(tree, root)?;
+        let mut text = NodeBuilder::text(initial, TextStyle::new(size.text_size()));
+        if label.is_bound() {
+            text = text.bind_text(move |cx| label.read(cx));
+        }
+        text.bind_style(move |cx| {
+            let (_, foreground, _) = badge_colors(cx, &theme_text, color, shape);
+            StylePatch {
+                foreground: Some(foreground),
+                ..StylePatch::default()
+            }
+        })
+        .a11y(A11yOverride {
+            hidden: true,
+            ..A11yOverride::default()
+        })
+        .build(tree, root)?;
         Ok(root)
     }
 }
@@ -473,5 +499,81 @@ mod tests {
             "宽度至少是内边距之和（实际 {}）",
             bounds.size.width
         );
+    }
+
+    /// **P2-9 绑定面**：`bind_label(Signal<SmolStr>)` 在语言切换时更新文本与可访问名，
+    /// 节点与文字叶子 id 都不变（不重建）。
+    ///
+    /// 变异防线：把 `bind_text` / `bind_a11y` 删掉（只留初始空串）⇒ 本用例红。
+    #[test]
+    fn a_bound_label_switches_language_without_rebuilding_the_badge() {
+        let mut app = TestApp::new();
+        app.enable_a11y_capture();
+        let handle = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let language = app.app_mut().signal(smol_str::SmolStr::new_static("综合"));
+        let badge = Badge::new(handle).neutral().bind_label(language);
+        assert!(badge.label.is_bound(), "bind_label 走绑定形态");
+        assert!(
+            !Badge::new(ThemeHandle::new(app.app_mut(), Appearance::Light))
+                .text("Static")
+                .label
+                .is_bound(),
+            "text() 保持静态形态"
+        );
+        let window = app.window_id();
+        let root = app.app().window(window).expect("window").tree().root();
+        let node = badge
+            .build(
+                app.app_mut().window_mut(window).expect("window").tree_mut(),
+                root,
+            )
+            .expect("build");
+        let _ = app.drain().expect("frame");
+
+        let text_node = {
+            let tree = app.app().window(window).expect("window").tree();
+            let children = tree.get(node).expect("node").children();
+            assert_eq!(children.len(), 1, "标签只有一段文字");
+            children[0]
+        };
+        assert_eq!(text_of(&app, text_node), "综合", "首帧就是信号真值");
+        assert_eq!(
+            app.a11y()
+                .expect("a11y")
+                .node_for(node)
+                .expect("a11y node")
+                .label_text(),
+            Some("综合"),
+            "可访问名同样来自信号"
+        );
+
+        app.app_mut()
+            .write(&language, smol_str::SmolStr::new_static("General"));
+        let _ = app.drain().expect("frame");
+        let tree = app.app().window(window).expect("window").tree();
+        assert_eq!(
+            tree.get(node).expect("node").children().to_vec(),
+            vec![text_node],
+            "语言切换不得重建标签节点或文字叶子"
+        );
+        assert_eq!(text_of(&app, text_node), "General");
+        assert_eq!(
+            app.a11y()
+                .expect("a11y")
+                .node_for(node)
+                .expect("a11y node")
+                .label_text(),
+            Some("General"),
+            "可访问名随信号更新"
+        );
+    }
+
+    fn text_of(app: &TestApp, node: NodeId) -> smol_str::SmolStr {
+        let window = app.window_id();
+        let tree = app.app().window(window).expect("window").tree();
+        match tree.get(node).expect("node").kind() {
+            NodeKind::Text(content) => content.text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 }

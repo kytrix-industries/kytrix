@@ -44,6 +44,17 @@
 //! 应用层的 `RowHeights` 只服务双端列表锚点换算与测量回写，滚动帧不重建它（前缀和只在行高
 //! 变更时重建）。
 //!
+//! # 行间分隔线（P2-9）
+//!
+//! [`ListOptions::separator`] 在行容器里挂一条绝对定位的 1 px `LineDivider`（每行顶部、首行
+//! 不画）。它是行容器的**第二个**子节点（内容容器仍是首子，`row_content_node` / 变高实测按首
+//! 子读的契约不变），因此不挤占行内容布局、也不改变行高与 `set_virtual_extents` 的实测值。
+//! 引擎的虚拟行本身就是绝对定位（[`ui_core::interaction::virtual_list`] 的契约），行容器因此
+//! 天然是分隔线的包含块，不需要额外的 `position` 声明。
+//! overscan 仍按**行数**（[`ListOptions::overscan`]）：像素级 overscan 估计（旧 news 的
+//! 150 px vs 变高估计 76 px）没有等价入口，登记见 ledger —— 需要时用「估计行高 × 行数」自行
+//! 折算，内核不做像素预算。
+//!
 //! # a11y（E9 集合语义下的纯列表）
 //!
 //! 纯列表**不声明**表格 / 树角色：虚拟列表容器由引擎按种类推导成 `List`（`size_of_set` 由
@@ -74,7 +85,7 @@ use std::{
 
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    a11y::A11yPatch,
+    a11y::{A11yOverride, A11yPatch},
     app::App,
     error::EngineError,
     event::{Action, Modifiers},
@@ -161,6 +172,8 @@ pub struct ListOptions {
     pub row_stretch: bool,
     /// 是否画自绘滚动条。
     pub scrollbar: bool,
+    /// 行间是否画内置分隔线（行顶部 1 px，首行不画；不参与行高 / 变高实测）。
+    pub separator: bool,
 }
 
 impl ListOptions {
@@ -178,6 +191,7 @@ impl ListOptions {
             padding_y: 2.0,
             row_stretch: false,
             scrollbar: true,
+            separator: false,
         }
     }
 
@@ -222,6 +236,18 @@ impl ListOptions {
     #[must_use]
     pub fn row_stretch(mut self) -> Self {
         self.row_stretch = true;
+        self
+    }
+
+    /// 行间内置分隔线（1 px `LineDivider`，画在每行顶部、首行不画；绝对定位，不参与行高与
+    /// 变高实测）。
+    ///
+    /// P2-9 能力面：旧 news 的 `DequeUnsizedList::separator` 只能在行内容里自建
+    /// `kit::separator`（行内元素会挤占内容行的布局）；内置分隔线把这条线放在行容器里、脱离
+    /// 内容布局。
+    #[must_use]
+    pub fn separator(mut self) -> Self {
+        self.separator = true;
         self
     }
 }
@@ -1178,6 +1204,35 @@ impl List {
                 .style(content_style)
                 .build(tree, row)?;
             content(tree, parent, index)?;
+            // 内置分隔线：行顶部 1 px（首行不画）。绝对定位 ⇒ 不参与行内容布局与变高实测；
+            // 内容容器保持行容器的**第一个**子节点（`row_content_node` / 变高实测按首子读）。
+            if self.inner.options.separator && index > 0 {
+                let theme = self.inner.theme.clone();
+                NodeBuilder::boxed()
+                    .id(format_smolstr!(
+                        "{}:row:{}:separator",
+                        self.inner.key,
+                        index
+                    ))
+                    .style(
+                        StyleBuilder::new()
+                            .absolute()
+                            .top(0.0)
+                            .left(0.0)
+                            .right(0.0)
+                            .height(1.0)
+                            .build(),
+                    )
+                    .bind_style(move |cx| StylePatch {
+                        background: Some(theme.role(cx, Role::LineDivider)),
+                        ..StylePatch::default()
+                    })
+                    .a11y(A11yOverride {
+                        hidden: true,
+                        ..A11yOverride::default()
+                    })
+                    .build(tree, row)?;
+            }
             populated.push(index);
         }
         // P3-11：只标本次真的补了内容的行（旧实现把整个可见窗口都标脏）。
@@ -2997,5 +3052,120 @@ mod deque_tests {
             "变高双端列表按测量前缀和保持锚点（原第 2 条移到下标 1 并贴顶）"
         );
         assert!(offset > 0.0);
+    }
+
+    /// 纯文本行列表（内置分隔线用例的装置：不依赖 `ui_tests` 的私有 helper）。
+    fn separator_list(options: ListOptions, rows: usize) -> (TestApp, List) {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let list = List::new(
+            app.app_mut(),
+            theme,
+            "list",
+            options,
+            |tree: &mut NodeTree, parent: ui_core::node::id::NodeId, index: usize| {
+                NodeBuilder::text(format_smolstr!("row{index}"), TextStyle::new(12.0))
+                    .build(tree, parent)?;
+                Ok::<(), EngineError>(())
+            },
+        );
+        let window = app.window_id();
+        mount_list(&mut app, &list, rows, window);
+        (app, list)
+    }
+
+    /// **P2-9 内置分隔线**：首行不画、其后每行顶部一条 1 px `LineDivider`；分隔线是行容器的
+    /// 第二个子节点（内容容器仍是首子），绝对定位、不改变行高。
+    ///
+    /// 变异防线：`if index > 0` 写成无条件（首行也画）/ 删掉分隔线构建 ⇒ 本用例红。
+    #[test]
+    fn the_builtin_separator_draws_one_divider_per_row_except_the_first() {
+        let (app, list) = separator_list(ListOptions::fixed(ROW_EXTENT).separator(), 4);
+        let theme = crate::theme::resolved::Theme::of(Appearance::Light);
+        let window = app.window_id();
+        let mounted = list.mounted_rows(app.app());
+        assert!(mounted.len() >= 2, "至少挂两行才能看到分隔线");
+        for (index, row) in mounted {
+            let tree = app.app().window(window).expect("window").tree();
+            let children = tree.get(row).expect("row").children().to_vec();
+            if index == 0 {
+                assert_eq!(children.len(), 1, "首行不画分隔线");
+                continue;
+            }
+            assert_eq!(
+                children.len(),
+                2,
+                "第 {index} 行 = 内容容器 + 分隔线（内容容器仍是首子）"
+            );
+            assert!(
+                tree.get(children[0])
+                    .expect("content")
+                    .children()
+                    .iter()
+                    .any(|child| matches!(
+                        tree.get(*child).expect("row text").kind(),
+                        ui_core::node::tree::NodeKind::Text(_)
+                    )),
+                "首子仍是行内容"
+            );
+            let separator = children[1];
+            let expected_id = format_smolstr!("list:row:{index}:separator");
+            assert_eq!(tree.debug_id(separator), Some(expected_id.as_str()));
+            let style = tree.get(separator).expect("separator").style();
+            assert_eq!(
+                style.inner.size.height.into_option(),
+                Some(1.0),
+                "分隔线 1 px 高"
+            );
+            assert_eq!(
+                style.inner.position,
+                taffy::style::Position::Absolute,
+                "分隔线绝对定位（不参与行内容布局）"
+            );
+            assert_eq!(
+                style.inner.inset.top,
+                taffy::style::LengthPercentageAuto::length(0.0),
+                "分隔线贴行顶部"
+            );
+            // 引擎的虚拟行是绝对定位（`interaction::virtual_list` 契约）：行容器就是包含块。
+            assert_eq!(
+                tree.get(row).expect("row").style().inner.position,
+                taffy::style::Position::Absolute,
+                "虚拟行绝对定位 ⇒ 行容器是分隔线的包含块"
+            );
+            let row_bounds = app.probe().bounds(row).expect("row bounds");
+            let separator_bounds = app.probe().bounds(separator).expect("separator bounds");
+            assert_eq!(separator_bounds.size.height, 1.0, "分隔线几何高 1 px");
+            assert!(
+                (separator_bounds.size.width - row_bounds.size.width).abs() < 0.5,
+                "分隔线横跨整行（行宽 {}，线宽 {}）",
+                row_bounds.size.width,
+                separator_bounds.size.width
+            );
+            assert!(
+                (separator_bounds.origin.y - row_bounds.origin.y).abs() < 0.5,
+                "分隔线落在行顶边（行 y {}，线 y {}）",
+                row_bounds.origin.y,
+                separator_bounds.origin.y
+            );
+            let patch = tree.get(separator).expect("separator").style_patch();
+            assert_eq!(
+                patch.background,
+                Some(theme.role(crate::theme::role::Role::LineDivider)),
+                "分隔线颜色 = LineDivider"
+            );
+        }
+
+        // 未开选项：行里没有分隔线（现有布局不变）。
+        let (plain, plain_list) = separator_list(ListOptions::fixed(ROW_EXTENT), 4);
+        let window = plain.window_id();
+        for (_, row) in plain_list.mounted_rows(plain.app()) {
+            let tree = plain.app().window(window).expect("window").tree();
+            assert_eq!(
+                tree.get(row).expect("row").children().len(),
+                1,
+                "未开 separator 时行里只有内容容器"
+            );
+        }
     }
 }

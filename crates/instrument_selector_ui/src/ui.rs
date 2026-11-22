@@ -6,11 +6,10 @@
 //! [`build_node`] is the one statement that takes the tree borrow, runs the builder, and
 //! gives it back before the next kit call.
 
-use smol_str::format_smolstr;
 use ui_core::{
     app::App,
     error::EngineError,
-    event::{Action, Event, InputEvent},
+    event::{Event, InputEvent},
     node::{id::NodeId, tree::NodeTree},
     window::WindowId,
 };
@@ -43,22 +42,6 @@ pub(crate) fn build_node(
 pub(crate) fn remove_node(app: &mut App, window: WindowId, node: NodeId) {
     if let Err(error) = app.remove_node(window, node) {
         log::warn!("removing a rebuilt dialog node failed: {error}");
-    }
-}
-
-/// Removes the two `Action` handlers an installed input registered.
-///
-/// `base_ui::kit::input::InputNode::install` registers the click-to-place and drag-to-select
-/// handlers under keys derived from the spec name (`"base_ui.input.{name}.click"` /
-/// `".drag"`, the kit's documented action convention), and the kit input has no `release`.
-/// A dialog that unmounts its input has to take those handlers out itself: each dialog's
-/// input name is per-instance unique, so leaving them behind would grow the action table by
-/// two entries (and keep the input's state signals alive) for every open/close cycle.
-pub(crate) fn release_input_actions(app: &mut App, name: &str) {
-    for suffix in [".click", ".drag"] {
-        app.off_action(&Action::Custom(format_smolstr!(
-            "base_ui.input.{name}{suffix}"
-        )));
     }
 }
 

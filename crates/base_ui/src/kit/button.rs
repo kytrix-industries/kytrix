@@ -23,6 +23,14 @@
 //!   注册 handler；
 //! - 拼接（旧 `Join::button`）只做到**外角圆角**（`joined_edges` 的角半径写进 `PaintSpec`）；
 //!   引擎的绘制边框只有统一宽度，共享边无法只画一条线（登记见 spec-delta §3）。
+//!
+//! # P2-9 追加能力（W2b2/W2c 缺口的 kit 侧收口）
+//!
+//! - [`Button::icon_size`]：图标边长与控件档位解耦（pizza F4 的旧 `size_3()` = 12 px 可用；
+//!   默认仍跟随 `UnifiedSize::icon_size()` 的 8 / 12 / 16 阶梯）；
+//! - [`Button::label_text`] / [`Button::a11y_label_text`] / [`Button::tooltip`]：构建期文案的
+//!   读回面（语言重建测试不必再按节点替换断言；**没有**动态文案通道，语言切换仍由调用方重建
+//!   按钮）。
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -75,6 +83,8 @@ pub struct Button {
     variant: ButtonVariant,
     size: UnifiedSize,
     icon: Option<IconKind>,
+    /// 图标逻辑边长覆盖（`None` = 跟随尺寸档的 `icon_size` token）。
+    icon_size: Option<f32>,
     label: Option<SmolStr>,
     a11y_label: Option<SmolStr>,
     disabled: bool,
@@ -100,6 +110,7 @@ impl Button {
             variant: ButtonVariant::Primary,
             size: UnifiedSize::Medium,
             icon: None,
+            icon_size: None,
             label: None,
             a11y_label: None,
             disabled: false,
@@ -159,6 +170,17 @@ impl Button {
     #[must_use]
     pub fn icon(mut self, icon: IconKind) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    /// 图标逻辑边长覆盖（`None` = 跟随尺寸档的 `icon_size` token：Small 8 / Medium 12 / Large 16）。
+    ///
+    /// P2-9 补的缺口（W2b2 F4）：旧按钮的图标尺寸常与控件档位**解耦**（pizza 的刷新按钮是
+    /// `Button::small()` + `Icon::size_3()` = 12 px），kit 默认按尺寸档给 8 px，视觉缩小 33%。
+    /// 需要旧口径的调用方在这里显式给 12.0；尺寸档 token 仍是默认值（不是新的阶梯）。
+    #[must_use]
+    pub fn icon_size(mut self, size: f32) -> Self {
+        self.icon_size = Some(size);
         self
     }
 
@@ -234,6 +256,31 @@ impl Button {
         *self.geometry.borrow()
     }
 
+    /// 可见文字读回（`None` = 没有可见文字）。
+    ///
+    /// P2-9 补的读回面（W2b2/W2c 登记）：静态文案只能在构建期选，语言重建测试此前无法从按钮
+    /// 读回「这次切换后的文案」，只能按节点替换断言。返回值是**配置值**（`build` 不消费它），
+    /// `build` 之后照常可读。
+    ///
+    /// 名字带 `_text`：构建期 setter [`Button::label`] 已占用 `label`（Rust 不支持同名不同
+    /// arity 的重载），读回面用另一个名字（任务里的「或等价」）。
+    #[must_use]
+    pub fn label_text(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// 生效的可访问名读回：显式 [`Button::a11y_label`] 优先，否则可见文字。
+    #[must_use]
+    pub fn a11y_label_text(&self) -> Option<&str> {
+        self.a11y_label.as_deref().or(self.label.as_deref())
+    }
+
+    /// tooltip 文本读回（P2-4b 挂点；`None` = 未设置）。
+    #[must_use]
+    pub fn tooltip(&self) -> Option<&str> {
+        self.tooltip.as_deref()
+    }
+
     /// 内部状态机（组合控件 / 测试用）。
     #[must_use]
     pub fn interactive(&self) -> &Interactive {
@@ -298,13 +345,14 @@ impl Button {
         let label = self.label.clone();
         let icon = self.icon;
         let size = self.size;
+        let icon_size = self.icon_size.unwrap_or_else(|| size.icon_size());
         let for_icon = interactive.clone();
         let for_text = interactive.clone();
         let watcher = interactive.clone();
         let node = interactive.build(app, window, parent, move |app, window, parent| {
             if let Some(kind) = icon {
                 let icon_node =
-                    mount_dynamic_icon(app, window, parent, kind, size.icon_size(), move |cx| {
+                    mount_dynamic_icon(app, window, parent, kind, icon_size, move |cx| {
                         StylePatch {
                             foreground: Some(for_icon.foreground_color(cx)),
                             ..StylePatch::default()
@@ -565,6 +613,75 @@ mod tests {
             label_style.inner.size.height,
             taffy::style::Dimension::auto(),
             "文字节点高度由行高决定"
+        );
+    }
+
+    /// **P2-9 / W2b2 F4**：`icon_size` 覆盖把图标边长与控件档位解耦 —— small 档默认 8 px
+    /// （尺寸档 token），显式 12.0 恢复旧 `Icon::size_3()` 的视觉。
+    ///
+    /// 变异防线：`build` 忽略 `icon_size`（继续用 `size.icon_size()`）⇒ 本用例红。
+    #[test]
+    fn an_icon_size_override_restores_the_legacy_12px_icon() {
+        fn icon_width(configure: impl FnOnce(Button) -> Button) -> f32 {
+            let harness = harness(configure);
+            let window = harness.app.window_id();
+            let tree = harness.app.app().window(window).expect("window").tree();
+            let children = tree.get(harness.node).expect("node").children();
+            tree.get(children[0])
+                .expect("icon")
+                .style()
+                .inner
+                .size
+                .width
+                .into_option()
+                .expect("图标有显式尺寸")
+        }
+
+        assert_eq!(
+            icon_width(|button| button.icon(IconKind::ArrowsClockwise).small()),
+            8.0,
+            "small 档的图标 token 是 8 px（旧 size_2）"
+        );
+        assert_eq!(
+            icon_width(|button| button
+                .icon(IconKind::ArrowsClockwise)
+                .small()
+                .icon_size(12.0)),
+            12.0,
+            "显式覆盖恢复旧 size_3 的 12 px"
+        );
+    }
+
+    /// **P2-9 读回面**：构建期文案可读回（可见文字 / 生效可访问名 / tooltip），`build` 之后仍在。
+    ///
+    /// 变异防线：把 `label_text()` 改成恒 `None`（或返回 `a11y_label`）⇒ 本用例红。
+    #[test]
+    fn a_button_reads_its_configured_labels_back() {
+        let harness = harness(|button| button.a11y_label("Close").tooltip_text("Close dialog"));
+        assert_eq!(harness.button.label_text(), Some("Save"), "可见文字读回");
+        assert_eq!(
+            harness.button.a11y_label_text(),
+            Some("Close"),
+            "显式可访问名优先于可见文字"
+        );
+        assert_eq!(harness.button.tooltip(), Some("Close dialog"));
+        assert_eq!(
+            harness.button.label_text(),
+            Some("Save"),
+            "build 之后仍可读回（配置值不被 build 消费）"
+        );
+
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let bare = Button::new(app.app_mut(), theme.clone(), "bare");
+        assert_eq!(bare.label_text(), None);
+        assert_eq!(bare.a11y_label_text(), None);
+        assert_eq!(bare.tooltip(), None);
+        let labeled = Button::new(app.app_mut(), theme, "labeled").label("OK");
+        assert_eq!(
+            labeled.a11y_label_text(),
+            Some("OK"),
+            "没有显式 a11y 名时回落到可见文字"
         );
     }
 

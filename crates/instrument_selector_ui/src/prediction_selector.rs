@@ -101,7 +101,7 @@ use crate::{
         LocalTranslator, TranslatedSegment, TranslationCancel, TranslationChunk,
         TranslationFailure, TranslationSetup, page_has_translatable_text, plan_translation,
     },
-    ui::{build_node, release_input_actions, remove_node},
+    ui::{build_node, remove_node},
 };
 
 /// The number of cards one page draws.
@@ -2105,7 +2105,9 @@ impl<S: PredictionEventSource> SelectorState<S> {
             next.release(app);
         }
         if let Some(search) = self.search_node.take() {
-            release_input_actions(app, &search.spec.name);
+            // Kit's own release face (P2-9): detaches the click-to-place / drag-to-select
+            // handlers; the search input's signals live in this dialog's scope (released below).
+            search.release(app);
         }
         for action in self.card_actions.drain(..) {
             app.off_action(&action);
