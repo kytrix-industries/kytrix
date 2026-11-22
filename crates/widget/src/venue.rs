@@ -359,11 +359,12 @@ mod tests {
                 venues: vec![VenueId::Binance],
                 supported: vec![VenueId::Binance, VenueId::Okx],
             };
+            let translate = translate(language);
             assert!(
-                notice.is_markdown(),
+                notice.is_markdown(&translate),
                 "the placeholder must draw this notice through the markdown component"
             );
-            let notice = notice.resolve(&translate(language));
+            let notice = notice.resolve(&translate);
 
             assert!(
                 notice.contains(&format!(

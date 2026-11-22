@@ -1,8 +1,16 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.6（2026-11-22）
+> **版本**：v2.7（2026-11-22）
 >
+> **v2.7 变更摘要（2026-11-22）**：**P3-1d（W1 迁移暴露的契约补缝批）完成**。§13 补齐六处 W1 实测缺口：①
+> `Notice::is_markdown` 改为**按解析后的目录值判定**（`fn is_markdown(&self, translate: &Translate) -> bool`）——任意文案来源
+> （`Message` 也可以是 `<p align="center">` 段落）含 HTML/markdown 标记即走 `kit::markdown`，纯文本仍 `empty_state`
+> （§13.2/§13.6）；② `WidgetTestApp` 新增注入构造器 `with_market_participants` / `with_kytrix_service` / `with_open_url` /
+> `with_sound`（W1 的私有源缝可删）；③ `WidgetTestApp` 新增 `drain_runtime` / `run_until_idle`（services 的 current-thread
+> runtime 由宿主拥有，有界 turn、不 sleep）；④ `WidgetSurface` 根新增 `services.config` 依赖锚点——设置写入即使 widget
+> 无正文也出帧（§13.5）；⑤ AGENTS §15 登记 kit 静态文案绑定面与 `kit::list` separator/像素 overscan（kit 后续批）；⑥
+> 测试 146 → **156**。逐条登记 `.docs/gui-migration/design-changes.md` §15。
 > **v2.6 变更摘要（2026-11-22）**：**P3-1c（P3-1b 复核收尾批）完成**。§13 契约补齐两处 W1 前置：① `WidgetServices`
 > 新增 `catalog_generation: Signal<u64>`（目录已发布世代；组合根写、框架 surface 根读），widget 在 `sync` 比较世代并重跑
 > `load`——「目录变更 → 重跑 `load`」由此只有一条通法，且等待目录、没有正文的 widget 也会被唤醒（§13.5/§13.9 R-8）；
@@ -3846,8 +3854,9 @@ pub enum Notice {
 }
 impl Notice {
     pub const fn message(key: &'static str) -> Self;
-    /// 富文本口径：`MarketNotLoaded` 交给 `kit::markdown` 画，`Message` 是纯文本。
-    pub const fn is_markdown(&self) -> bool;
+    /// 富文本口径：解析后的目录值含 HTML 标签 / markdown 链接、图片 / `**强调**` / 行内代码即富文本（任意来源，
+    /// `Message` 也可以是 `<p align="center">` 段落），交给 `kit::markdown` 画；否则是一句话。
+    pub fn is_markdown(&self, translate: &Translate) -> bool;
     pub fn resolve(&self, translate: &Translate) -> SmolStr;
 }
 
@@ -4000,6 +4009,10 @@ pub struct WidgetTestApp;
 impl WidgetTestApp {
     pub fn new() -> Self;
     pub fn with_translate(translate: Translate) -> Self;   // 产品目录（catalogue 文案）断言
+    pub fn with_market_participants(self, Option<MarketParticipantsConnector>) -> Self;  // 注入目录槽（W1 私有源缝可删）
+    pub fn with_kytrix_service(self, Option<KytrixServiceConnector>) -> Self;            // 注入服务槽（headless 只能 None）
+    pub fn with_open_url(self, impl Fn(&str) + 'static) -> Self;                         // 注入开链命令
+    pub fn with_sound(self, impl Fn(&'static str) -> Option<Bytes> + 'static) -> Self;   // 注入音频字节源
     pub fn app(&self) -> &App;  pub fn app_mut(&mut self) -> &mut App;
     pub fn services(&self) -> &WidgetServices;
     pub fn router(&self) -> &FrameRouter;
@@ -4008,6 +4021,8 @@ impl WidgetTestApp {
     pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R;
     pub fn tick(&mut self);            // router.tick
     pub fn drain(&mut self);           // tick + TestApp::drain（生产泵序）
+    pub fn drain_runtime(&mut self);   // services 的 current-thread runtime 推进一个 turn（不 sleep）
+    pub fn run_until_idle(&mut self) -> usize;  // runtime turn 与 drain 交替，有界；返回 turn 数
     pub fn report(&mut self, state: WidgetState);
     pub fn switch_language(&mut self, language: LanguageCode);
     pub fn build_surface(&mut self) -> WidgetSurface;
@@ -4084,7 +4099,9 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **语言**：`Translate` 是纯 `i18n` 状态（`Cell`，不引 `ui_core`）；`Signal<LanguageCode>` 是引擎依赖。组合根切换时
   **先 `Translate::set_language`、后写信号**。widget 在 `bind_text`/`bind_style` 内 `rcx.read(&language)` 登记依赖。
 - **主题**：`ThemeHandle` 的 `role(cx, Role)` 只在 `bind_style` 里读（G3：挂载期常量颜色不会跟外观切换）。
-- **设置**：`WidgetServices::config` 是设置快照信号；时区经 `data_time_zone(&Config)`（`time_zone.rs`）。
+- **设置**：`WidgetServices::config` 是设置快照信号；时区经 `data_time_zone(&Config)`（`time_zone.rs`）。**框架 `WidgetSurface`
+  根在渲染时读该信号（P3-1d）**：一次设置写入请求恰好一帧并跑每个已挂载 widget 的 `sync`，包括还没有正文、自己树里没有
+  `bind_*` 可登记依赖的 widget（signed-out 面板 → 设置变化）；widget 自己不再为设置变化 `request_frame`。
 - **目录世代**：`WidgetServices::catalog_generation: Signal<u64>` 是目录已发布世代（组合根写、`WidgetSurface` 根读，`0` =
   尚未发布）；写入即请求恰好一帧，并让每个已挂载 widget 的 `sync` 比较世代、变了就重跑 `load`——包括等待目录、还没有正文的
   widget。这是「目录变更 → 重跑 `load`」的唯一通法；widget 不轮询 `catalog().generation_id()`，也不自建观察节点（§13.9 R-8）。
@@ -4102,9 +4119,11 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 
 实现约束：正文/占位用 `StylePatch.visible` + `A11yPatch.hidden` 切换（**不用** `display:none`，R-28）；banner 在
 不需要时**不建节点**（不占行）；占位子树在切到有内容时**释放**（spinner 动画不空转，I3）。占位里**富文本 notice**
-（`Notice::is_markdown()`：`common.market_not_loaded` 的 `<p align>` / `<kbd>` / 行内 logo）经 `kit::markdown` 的
-`MarkdownNode` 画成节点树，不得把 markdown/HTML 源码当纯文本画；普通 `Message` 仍由 `kit::empty_state` 画一句。行内图片
-（市场 logo / `bank` 图标）在资产批接入前由 `PlaceholderImagePaint` 画成**占位色块**（R-4，不影响文字 / `<kbd>` / 粗体）。
+（`Notice::is_markdown(&Translate)` 对解析后的目录值判定：HTML 标签 / markdown 链接、图片 / `**强调**` / 行内代码——
+`common.market_not_loaded` 的 `<p align>` / `<kbd>` / 行内 logo，以及 `widget.news.logged_out` 这类 widget 自己的
+`<p align="center">` 文案都算）经 `kit::markdown` 的 `MarkdownNode` 画成节点树，不得把 markdown/HTML 源码当纯文本画；
+纯文本 notice 仍由 `kit::empty_state` 画一句。行内图片（市场 logo / `bank` 图标）在资产批接入前由
+`PlaceholderImagePaint` 画成**占位色块**（R-4，不影响文字 / `<kbd>` / 粗体）。
 
 ### 13.7 FrameRouter 与 I3
 
@@ -4127,17 +4146,27 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1c 实测 **146 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1d 实测 **156 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
-    （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）。
+    （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
+    **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
   - **surface**：占位切换 / banner / 禁用恢复 / 点击恢复；语言重建（`a_waiting_placeholder_should_come_back_in_the_language_showing_now`、
     `a_failure_banner_should_read_in_the_language_showing_now`）；**语言信号依赖登记 → 写信号出帧**
     （`writing_the_language_signal_requests_the_redrawing_frame`）；a11y `hidden`（`the_swapped_out_subtree_is_hidden_from_assistive_technology`）；
-    富文本 notice 画成节点树（`a_rich_notice_is_drawn_as_rich_text`）。
+    富文本 notice 画成节点树（`a_rich_notice_is_drawn_as_rich_text`）；**`Message` 的富文本目录值同样走 markdown**
+    （P3-1d：`a_rich_message_notice_is_drawn_as_rich_text`）；**设置信号依赖登记 → 写信号出帧**
+    （P3-1d：`writing_the_settings_signal_requests_the_redrawing_frame`）。
+  - **占位**：`ui::placeholder::a_rich_message_notice_goes_through_the_markdown_component`（P3-1d：`<p>`/`<kbd>`/`![](` 不露原文、
+    inline box 存在；纯文本 notice 仍由 empty state 画）。
   - **目录世代**（P3-1c）：surface 根登记依赖 → 写信号出帧（`writing_the_directory_generation_requests_the_redrawing_frame`）；
     等待目录的消费方在世代变化后 `sync` 重跑 `load` 并长出正文、无变化不出帧
     （`services::a_directory_generation_change_reaches_a_widget_waiting_for_it` /
     `an_unchanged_directory_generation_schedules_no_frame`）。
+  - **测试宿主注入与 runtime 驱动**（P3-1d）：默认宿主的 headless 缺席（`the_default_host_has_no_directory_service_or_audio`）；
+    注入开链命令 / 音频源（`a_test_injects_the_application_collaborators_it_exercises`）；headless 自建目录连接器后注入
+    （`a_headless_market_participants_directory_can_be_injected`）；`drain_runtime` 推进 services runtime
+    （`drain_runtime_advances_the_services_runtime`）；`run_until_idle` 驱动服务链并呈现服务请求的帧
+    （`run_until_idle_drives_a_chain_of_service_work` / `run_until_idle_presents_the_frame_a_service_asked_for`）。
   - **路由**：扇出 / 注销 / 弱句柄自注销 / 空路由不出帧；**单槽占用报错**
     （`a_second_router_cannot_install_itself`、`a_second_router_constructor_reports_the_occupied_slot`）。
   - **擦除与生命周期**：`a_minimal_widget_runs_the_whole_lifecycle`（mount → waiting → loading → ready → waiting(zh) →
@@ -4155,11 +4184,12 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-1 | `WidgetServices::{market_participants, kytrix_service}` 为 `Option` | 两者都是 application-shell 对象：`MarketParticipantsConnector` 的构造需 `widget_tokio_runtime::Runtime`，`KytrixServiceConnector::install` 需工具包 `App` + `ConfigNotification`，两个 crate 都仍依赖 `gpui-kit`，契约层测试无法在零工具包上下文构造。组合根永远给 `Some`；读市场的 widget 在 `None` 时映射为业务 notice/failure，读服务的 widget 映射为业务 failure。**需裁决**：P4 给两个 connector 增 gpui-free fixture 缝后改回必填 |
 | R-2 | `WidgetServices` 形状相对 P3-0 变更 | `config: ConfigManager` → `Signal<Config>`（P3-0 R4 已预告）；新增 `theme`（P3-1）、`kytrix_service`/`open_url`/`sound`/`reduce_motion`（P3-1b）与 `catalog_generation`（P3-1c）；见 design-changes。P3-0 的 5 字段不复存在 |
 | R-3 | 正文一次建树 | 引擎无 `.cached()`；widget 若按帧重建 body 会破坏节点身份/依赖边。20 crate 迁移时以此为准。`WidgetView::sync` 里才「有内容」的 body 晚一帧出现（framework 在 sync 前采样 `has_content`），widget 自行 `request_frame` |
-| R-4 | notice 的 markdown 文案 | **P3-1b 已收口**：`Notice::is_markdown()`（`MarketNotLoaded`）由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），普通 `Message` 由 `kit::empty_state` 画一句。**残余（P3-1c 裁决：登记为资产批次事项，不阻塞 W1）**：行内图片的绘制是占位色块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路属资产批次（P4/P5），不影响文字与 kbd 的正确呈现；**W1 真窗口验收不据此判缺陷** |
+| R-4 | notice 的 markdown 文案 | **P3-1b/P3-1d 已收口**：`Notice::is_markdown(&Translate)` 对**解析后的目录值**判定（HTML 标签 / markdown 链接、图片 / 强调 / 行内代码），任意文案来源（`MarketNotLoaded` 与 `Message` 皆可）命中即由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），纯文本 notice 仍由 `kit::empty_state` 画一句。**残余（P3-1c 裁决：登记为资产批次事项，不阻塞 W1）**：行内图片的绘制是占位色块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路属资产批次（P4/P5），不影响文字与 kbd 的正确呈现；**W1 真窗口验收不据此判缺陷** |
 | R-5 | `AnyWidget` 内部唯一 downcast | 类型擦除在 vtable 单态化函数内部完成，公开面无 downcast/trait object；安全由 mount 时同一 `W` 填充保证 |
 | R-6 | a11y 角色 | 引擎 `A11yRole` 无 `Alert`；banner 用 `GenericContainer` + `A11yLive::Assertive` 表达告警语义 |
 | R-7 | P3-1b 对 P3-1 冻结面的增量 | 相对 `2e4d3d6` 的必须变更（W1 开工前收口）：`WidgetCx::config` → `config_ref`（不克隆；`Arc<Config>` 出口删除）、新增 `account`/`window_mut`/`set_canvas`；`WidgetServices` 6 → 10 字段；`Notice::is_markdown`；`FrameRouter::new/install` → `Result`；引擎新增 `App::frame_hook_installed` 与 `EngineError::FrameHookInstalled`；`WidgetTestApp` 新增 `with_translate`/`try_mount`/`tree`/`a11y_hidden` 等并删除假 `recovery_action`。P3-1b 之前没有下游代码（W 批未开工），故不构成迁移负担，登记于 design-changes §13 |
 | R-8 | P3-1c 对 P3-1b 冻结面的增量 | `WidgetServices` 新增 `catalog_generation: Signal<u64>`（目录已发布世代：组合根写、`WidgetSurface` 根读；widget 在 `sync` 比较后重跑 `load`，等待目录、无正文的 widget 也会被唤醒——「目录变更 → 重跑 `load`」的唯一通法）；`MarkdownNode::mount` → `Result<Self, EngineError>`（N5：富文本占位的失败面统一）；mount 的 surface 失败释放 scope（N4）；`WidgetTestApp::try_mount_in_scope`（失败路径观测缝）。W 批仍未开工，故不构成迁移负担，登记于 design-changes §14 |
+| R-9 | P3-1d 对 P3-1c 冻结面的增量 | `Notice::is_markdown` 由 `const fn(&self)` 改为 `fn(&self, &Translate)`（判定基于解析后的目录值；契约只增语义、不删变体）；`WidgetTestApp` 新增注入构造器 `with_market_participants`/`with_kytrix_service`/`with_open_url`/`with_sound` 与 `drain_runtime`/`run_until_idle`，宿主改为拥有 `WidgetServices.runtime` 的 current-thread runtime（App 引擎 runtime 不变）；`WidgetSurface` 根新增 `services.config` 依赖锚点；`crates/widget` 增两个 test-only dev-dependency（`app_config_provider`/`widget_tokio_runtime`，供 headless 目录连接器注入测试）。W 批未开工，不构成迁移负担，登记于 design-changes §15 |
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 

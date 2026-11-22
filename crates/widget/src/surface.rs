@@ -52,10 +52,11 @@
 //! catalogue reference and a failure is a typed error, and both are turned into
 //! sentences here, through the translation context the frame was handed. A notice is
 //! rebuilt when the language moves; a failure's text is a `bind_text` closure that
-//! reads the language signal, so it follows a switch without a rebuild. A notice the
-//! catalogue authors as markdown/HTML (`common.market_not_loaded`) is drawn by the
-//! engine's markdown component, not as its source text — see
-//! [`ui::placeholder`](crate::ui::placeholder).
+//! reads the language signal, so it follows a switch without a rebuild. A notice
+//! whose catalogue value is authored as markdown/HTML — `common.market_not_loaded`
+//! is, and so are several widgets' own messages such as `widget.news.logged_out` —
+//! is drawn by the engine's markdown component, not as its source text; see
+//! [`ui::placeholder`](crate::ui::placeholder) and [`Notice::is_markdown`].
 //!
 //! # The body is the widget's; the box around it is the framework's
 //!
@@ -153,6 +154,7 @@ impl WidgetSurface {
         let root_deps = status.signal();
         let root_language = language;
         let root_generation = cx.services().catalog_generation;
+        let root_config = cx.services().config;
         let root = NodeBuilder::boxed()
             .id("WIDGET_SURFACE")
             .style(
@@ -165,18 +167,26 @@ impl WidgetSurface {
                     .build(),
             )
             // The root is the surface's dependency anchor: a state report, a language
-            // switch or a new catalogue generation invalidates it, which is what
-            // requests the frame that runs `sync`. It draws nothing itself.
+            // switch, a new catalogue generation or a new settings snapshot invalidates
+            // it, which is what requests the frame that runs `sync`. It draws nothing
+            // itself.
             //
             // The directory dependency belongs here rather than in the widget's body:
             // a widget waiting for the market has no body, yet it is exactly the one
             // that must re-check the gate when the directory publishes. The widget
             // compares the value in `sync` and reloads; it never schedules the frame
             // itself.
+            //
+            // The settings dependency belongs here for the same reason: a widget that
+            // follows a setting (the account a pane is scoped to, the display time
+            // zone) compares it in `sync`, and while it has no body there is no
+            // `bind_*` in its own tree to carry the edge — a signed-out pane that has
+            // no content yet must still wake when the settings move.
             .bind_style(move |read| {
                 let _state = read.read(&root_deps);
                 let _language = read.read(&root_language);
                 let _generation = read.read(&root_generation);
+                let _config = read.read(&root_config);
                 StylePatch::default()
             })
             .build(cx.tree_mut(), parent)?;
@@ -870,6 +880,32 @@ mod tests {
         );
     }
 
+    /// The surface root is also the **settings** dependency anchor. A widget that
+    /// follows a setting (the account its pane is scoped to, the display time zone)
+    /// compares it in `sync`, and while it has no content it has no `bind_*` of its
+    /// own to carry the edge — a signed-out pane that has nothing to show must still
+    /// wake when the settings move.
+    #[test]
+    fn writing_the_settings_signal_requests_the_redrawing_frame() {
+        let mut harness = WidgetTestApp::new();
+        let mut surface = harness.build_surface();
+        harness.report(WidgetState::waiting(Notice::message("test.waiting")));
+        harness.sync_surface(&mut surface, false);
+        let requests = harness.app().frame_requests();
+        let config = harness.services().config;
+        let mut moved = (*harness.app().read(&config)).clone();
+        moved.data_time_zone =
+            app_config::time_zone::DataTimeZone::from_hours(8).expect("UTC+8 is offered");
+
+        assert!(harness.app_mut().write(&config, moved));
+
+        assert!(
+            harness.app().frame_requests() > requests,
+            "the surface root read the settings signal while rendering, so the write \
+             requests a frame (no widget body involved)"
+        );
+    }
+
     /// R-28: the slot that is not drawn is hidden in the a11y tree, not merely
     /// invisible in the style pass. Assistive technology receives the same switch the
     /// user sees, and the hidden subtree is not announced.
@@ -935,5 +971,43 @@ mod tests {
             harness.has_inline_boxes(surface.placeholder),
             "the kbd icon and the venue logos are inline boxes, not source text"
         );
+    }
+
+    /// The catalogue also authors widgets' **own** messages as rich text
+    /// (`widget.news.logged_out` is a `<p align="center">` paragraph, and W1's news
+    /// pane reported it as a plain `Notice::message`), so the markdown decision is
+    /// made from the resolved value rather than from the notice variant. A rich
+    /// message goes through the markdown component exactly like
+    /// `common.market_not_loaded`, and its source markup never reaches the reader.
+    #[test]
+    fn a_rich_message_notice_is_drawn_as_rich_text() {
+        for (key, has_inline_box) in [
+            ("widget.news.logged_out", false),
+            ("widget.empty.hint", true),
+        ] {
+            let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+            let mut surface = harness.build_surface();
+            harness.report(WidgetState::waiting(Notice::message(key)));
+
+            harness.sync_surface(&mut surface, false);
+
+            let text = harness.text_of(surface.placeholder);
+            assert!(
+                harness
+                    .find_by_debug_prefix(surface.placeholder, "MARKDOWN")
+                    .is_some(),
+                "{key} is authored as rich text and goes through the markdown component"
+            );
+            assert!(
+                !text.contains("<p ") && !text.contains("<kbd>") && !text.contains("![]("),
+                "{key}'s source markup is not drawn as text: {text:?}"
+            );
+            if has_inline_box {
+                assert!(
+                    harness.has_inline_boxes(surface.placeholder),
+                    "{key}'s kbd icon is an inline box, not source text"
+                );
+            }
+        }
     }
 }

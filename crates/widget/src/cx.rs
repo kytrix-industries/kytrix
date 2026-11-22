@@ -166,9 +166,11 @@ impl<'a> WidgetCx<'a> {
     /// A read here does not create a dependency — it is for decisions taken in
     /// `sync`/`load`. A widget that must redraw when a setting moves reads
     /// [`WidgetServices::config`](crate::services::WidgetServices::config) inside
-    /// the closure that draws. The snapshot is not cloned: a per-frame or per-row
-    /// read (the display time zone, the account) borrows it for the duration of the
-    /// call.
+    /// the closure that draws. The framework's surface root also reads that signal,
+    /// so a settings write schedules a frame even while the widget has no body — its
+    /// `sync` then sees the new snapshot. The snapshot is not cloned: a per-frame or
+    /// per-row read (the display time zone, the account) borrows it for the duration
+    /// of the call.
     pub fn config_ref<R>(&self, read: impl FnOnce(&Config) -> R) -> R {
         self.app.read_with(&self.services.config, read)
     }
