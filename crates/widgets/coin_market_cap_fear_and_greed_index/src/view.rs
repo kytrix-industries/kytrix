@@ -24,8 +24,13 @@
 //! The service serves this snapshot over an authenticated connection, so a pane
 //! with no account behind it fetches nothing and says so. That is a *waiting* state
 //! rather than a failure: nothing has gone wrong, the pane is just not for an
-//! anonymous reader. Nothing is retried on a timer either — the account event
-//! subscription re-scopes the pane the moment the user signs in.
+//! anonymous reader.
+//!
+//! The account is read from the injected settings snapshot on every frame rather
+//! than followed through an event subscription (AGENTS §8.1): signing in or out is a
+//! settings write, and the framework's surface root reads the same snapshot, so the
+//! frame that presents the new account is the frame this pane's `sync` sees it in.
+//! Nothing is retried on a timer either.
 //!
 //! # An empty snapshot is not an error
 //!
@@ -34,41 +39,83 @@
 //! service, so the pane draws 「暂无数据」 in the body and reports readiness: a
 //! spinner over a healthy empty answer would say the pane is still working, and a
 //! failure would ask the user to recover from something that has not failed.
+//!
+//! # The body is built once and kept up to date
+//!
+//! [`WidgetView::body`] builds the tree once: the gauge's canvas, two section
+//! headings with their info notes, and two groups of rows. Everything dynamic is a
+//! `bind_text` / `bind_style` closure over the pane's own signals (the snapshot, the
+//! language, the theme), so a new reading redraws the rows without rebuilding them.
+//! Two things are structural and are therefore replaced rather than re-bound:
+//!
+//! - **the empty stand-in** (`common.no_data`) is built and taken down as the
+//!   snapshot moves between collected and uncollected, and rebuilt when the language
+//!   moves (its copy is a build-time `SmolStr`, AGENTS §15.1);
+//! - **the rows** change shape when a reading disappears or appears — a missing row
+//!   has no level dot and no level name — so the row nodes are rebuilt when the set
+//!   of present readings moves. A changed score or a language switch is not a
+//!   rebuild: those are bindings.
+//!
+//! # The header control is a signal, not a re-entry
+//!
+//! The refresh button's handler runs with an application context and no widget
+//! context, so it cannot call into the pane: it writes the pane's request signal and
+//! asks for a frame, and the next `sync` performs the refresh (AGENTS §4.2). The
+//! button is drawn disabled for the states that cannot refresh, and the action entry
+//! guards itself as well — a disabled kit control only draws that state, it does not
+//! stop an event.
+//!
+//! # The canvas is drawn by the gauge module
+//!
+//! The reading is self-drawn ([`crate::gauge`]): a canvas node whose frame is
+//! prepared from the node's measured box and rebuilt only when the box, the reading,
+//! the language or the theme colours move. The canvas content does not follow the
+//! engine's group opacity (spec-delta E13 R1); this pane has no group fade.
+//!
+//! # Time zones
+//!
+//! A row's date stays the UTC calendar day the service generated rather than becoming
+//! a calendar value, so the display time zone does not move it: reading it in another
+//! zone would name a day the service did not. The pane therefore reads no time zone
+//! at all, and the test `the_display_time_zone_should_not_move_a_service_date` pins
+//! that (there is nothing here for `cx.data_time_zone()` to format).
 
 use std::sync::Arc;
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use app_config_provider::{events::AccountChanged, manager::ConfigManager};
 use base_ui::{
-    button::Button,
-    empty_state::EmptyState,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    size::UnifiedSizable,
-    style::theme::{Theme, ThemeExt},
-    tooltip::Tooltip,
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::{IconError, IconKind, IconSpec},
+        size::{UnifiedSizable, UnifiedSize},
+        tooltip::{Tooltip, TooltipContent, TooltipOptions},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, base::Disableable, div, prelude::FluentBuilder, px,
-};
-use i18n::t;
-use kytrix_service_provider::service::connector::KytrixServiceConnector;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+use kytrix_service_provider::service::engine::KytrixServiceError;
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::style::StylePatch,
+    text::{TextAlign, TextStyle},
+};
 use widget::{
-    account::account_of,
-    binding::{WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
-    error::LocalizedError,
+    cx::WidgetCx,
+    error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
     rpc::RpcCallError,
-    status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
-    view::{WidgetHeader, WidgetView},
+    status::{Notice, WidgetAction, WidgetState, WidgetStatus},
+    view::{HeaderGroup, ReloadHandle, WidgetView},
 };
-use widget_tokio_runtime::global;
 
 use crate::{
     gauge::{Gauge, level_color},
@@ -105,6 +152,54 @@ const LEVEL_MARKER_SIZE: f32 = 8.0;
 /// name, which is what makes the level names read as one column down the card.
 const VALUE_COLUMN_WIDTH: f32 = 28.0;
 
+/// The weight a value and a section heading are drawn at.
+const SEMIBOLD: u16 = 600;
+
+/// The text size of a row's label and value.
+///
+/// The theme has no body/typography token yet (AGENTS §15.4), so the pane takes the
+/// kit size ladder: the reference's `text_sm` (14 px) is the ladder's regular size.
+const ROW_TEXT_SIZE: UnifiedSize = UnifiedSize::Medium;
+
+/// The text size of a level's name and of a section heading.
+///
+/// The reference drew both at `text_xs` (12 px), which is the ladder's compact size.
+const SMALL_TEXT_SIZE: UnifiedSize = UnifiedSize::Small;
+
+/// How many rows the pane draws.
+const ROW_COUNT: usize = 6;
+
+/// How many of those rows are the history rows (the rest are the yearly extremes).
+const HISTORY_ROWS: usize = 4;
+
+/// How many section headings the card draws.
+const SECTION_COUNT: usize = 2;
+
+/// The debug id of the pane's body root.
+const BODY_SELECTOR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_BODY";
+
+/// The debug id of the stand-in an uncollected answer draws.
+const EMPTY_SELECTOR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_EMPTY";
+
+/// The debug id of the header's refresh control.
+const REFRESH_SELECTOR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH";
+
+/// The widget-local name of the header control's kit key.
+///
+/// A kit key is **application-level** — the button derives its click action from it
+/// (`"<key>.click"`) — so the pane does not spell it out: [`WidgetCx::unique_key`]
+/// stamps this suffix with the pane's instance scope, and two panes cannot share a
+/// handler (AGENTS §9, hard constraint 11).
+const HEADER_KEY_SUFFIX: &str = "coin_market_cap_fear_and_greed_index.header.refresh";
+
+/// The debug selectors of the six rows.
+const ROW_YESTERDAY: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YESTERDAY";
+const ROW_LAST_WEEK: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_WEEK";
+const ROW_LAST_MONTH: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_MONTH";
+const ROW_LAST_YEAR: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_YEAR";
+const ROW_YEARLY_HIGH: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_HIGH";
+const ROW_YEARLY_LOW: &str = "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_LOW";
+
 /// The debug selectors of the dash each row draws when it has no reading.
 ///
 /// A painted frame's text is not readable from a test, so the selector a value
@@ -135,6 +230,92 @@ const LEVEL_MARKER_YEARLY_HIGH: &str =
 const LEVEL_MARKER_YEARLY_LOW: &str =
     "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_LEVEL_MARKER_YEARLY_LOW";
 
+/// One row of the card, and the catalogue copy that names it.
+#[derive(Clone, Copy, Debug)]
+struct RowDescriptor {
+    /// The row's debug id.
+    row: &'static str,
+    /// The debug id of the dot-and-name group, drawn only when the row has a reading.
+    marker: &'static str,
+    /// The debug id of the value node when the row has no reading.
+    missing: &'static str,
+    /// The catalogue key the row's label is read from.
+    label: &'static str,
+    /// Whether the label names the day the reading happened on (the yearly rows do).
+    dated: bool,
+}
+
+/// The six rows, in the order the card draws them.
+const ROWS: [RowDescriptor; ROW_COUNT] = [
+    RowDescriptor {
+        row: ROW_YESTERDAY,
+        marker: LEVEL_MARKER_YESTERDAY,
+        missing: MISSING_YESTERDAY,
+        label: "widget.coin_market_cap_fear_and_greed_index.yesterday",
+        dated: false,
+    },
+    RowDescriptor {
+        row: ROW_LAST_WEEK,
+        marker: LEVEL_MARKER_LAST_WEEK,
+        missing: MISSING_LAST_WEEK,
+        label: "widget.coin_market_cap_fear_and_greed_index.last_week",
+        dated: false,
+    },
+    RowDescriptor {
+        row: ROW_LAST_MONTH,
+        marker: LEVEL_MARKER_LAST_MONTH,
+        missing: MISSING_LAST_MONTH,
+        label: "widget.coin_market_cap_fear_and_greed_index.last_month",
+        dated: false,
+    },
+    RowDescriptor {
+        row: ROW_LAST_YEAR,
+        marker: LEVEL_MARKER_LAST_YEAR,
+        missing: MISSING_LAST_YEAR,
+        label: "widget.coin_market_cap_fear_and_greed_index.last_year",
+        dated: false,
+    },
+    RowDescriptor {
+        row: ROW_YEARLY_HIGH,
+        marker: LEVEL_MARKER_YEARLY_HIGH,
+        missing: MISSING_YEARLY_HIGH,
+        label: "widget.coin_market_cap_fear_and_greed_index.yearly_high",
+        dated: true,
+    },
+    RowDescriptor {
+        row: ROW_YEARLY_LOW,
+        marker: LEVEL_MARKER_YEARLY_LOW,
+        missing: MISSING_YEARLY_LOW,
+        label: "widget.coin_market_cap_fear_and_greed_index.yearly_low",
+        dated: true,
+    },
+];
+
+/// One section heading, and the note its info icon explains.
+#[derive(Clone, Copy, Debug)]
+struct SectionDescriptor {
+    /// The catalogue key of the heading.
+    title: &'static str,
+    /// The catalogue key of the note the info icon shows.
+    info: &'static str,
+    /// The widget-local name of the tooltip's kit key.
+    key: &'static str,
+}
+
+/// The card's two section headings.
+const SECTIONS: [SectionDescriptor; SECTION_COUNT] = [
+    SectionDescriptor {
+        title: "widget.coin_market_cap_fear_and_greed_index.title",
+        info: "widget.coin_market_cap_fear_and_greed_index.info_history",
+        key: "coin_market_cap_fear_and_greed_index.info.history",
+    },
+    SectionDescriptor {
+        title: "widget.coin_market_cap_fear_and_greed_index.yearly_extremes",
+        info: "widget.coin_market_cap_fear_and_greed_index.info_yearly",
+        key: "coin_market_cap_fear_and_greed_index.info.yearly",
+    },
+];
+
 /// The pane has nothing to persist, so its config carries the schema version alone.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CoinMarketCapFearAndGreedIndexConfig;
@@ -150,68 +331,131 @@ enum CoinMarketCapFearAndGreedIndexFailure {
     Rpc(RpcCallError<CoinMarketCapFearAndGreedIndexServiceError>),
 }
 
-impl LocalizedError for CoinMarketCapFearAndGreedIndexFailure {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for CoinMarketCapFearAndGreedIndexFailure {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Fetch(error) => error.localized_message(cx),
-            Self::Rpc(error) => error.localized_message(cx),
+            Self::Fetch(error) => error.translated_message(translate),
+            Self::Rpc(error) => error.translated_message(translate),
         }
     }
 }
 
-impl LocalizedError for CoinMarketCapFearAndGreedIndexFetchError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for CoinMarketCapFearAndGreedIndexFetchError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::Parse(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Parse(error) => error.translated_message(translate),
         }
     }
 }
 
-impl LocalizedError for CoinMarketCapFearAndGreedIndexParseError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for CoinMarketCapFearAndGreedIndexParseError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::ScoreOutOfRange { value } => {
-                t!(
-                    cx,
-                    "error.coin_market_cap_fear_and_greed_index.score_out_of_range",
-                    value = value
-                )
-            }
+            Self::ScoreOutOfRange { value } => t_smol!(
+                translate,
+                "error.coin_market_cap_fear_and_greed_index.score_out_of_range",
+                value = value
+            ),
         }
     }
 }
 
-impl LocalizedError for CoinMarketCapFearAndGreedIndexServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for CoinMarketCapFearAndGreedIndexServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::StreamClosed | Self::StreamBusy => {
-                t!(
-                    cx,
-                    "error.coin_market_cap_fear_and_greed_index.stream_unavailable"
-                )
-            }
+            Self::StreamClosed | Self::StreamBusy => t_smol!(
+                translate,
+                "error.coin_market_cap_fear_and_greed_index.stream_unavailable"
+            ),
         }
     }
+}
+
+/// Which of the six rows currently carry a reading.
+///
+/// The row *nodes* differ by it — a row without a reading has no level dot and no
+/// level name — so a change is what rebuilds them. A changed score is not: that is a
+/// binding on nodes that stay where they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowsKey([bool; ROW_COUNT]);
+
+impl RowsKey {
+    fn of(snapshot: &CoinMarketCapFearAndGreedIndexSnapshot) -> Self {
+        Self(std::array::from_fn(|index| {
+            row_at(snapshot, index).is_some()
+        }))
+    }
+}
+
+/// The header's refresh control, kept so its state can be synchronized and it can be
+/// released.
+struct HeaderControl {
+    button: Button,
+    /// The wrapper node the pane's header group holds.
+    node: NodeId,
+    /// The action identity the button registered (`"<key>.click"`), so a test can
+    /// dispatch the click the engine would.
+    #[cfg(test)]
+    action: ui_core::event::Action,
+    /// The language the control's accessible name was built in.
+    language: LanguageCode,
+    /// Whether the control is currently drawn disabled.
+    disabled: bool,
+}
+
+/// The card the body draws for a collected answer.
+struct Card {
+    /// The card container.
+    root: NodeId,
+    /// The container the four history rows live in. It outlives a row rebuild, so
+    /// the card's child order (and therefore the layout order) is fixed.
+    history_rows: NodeId,
+    /// The container the two yearly rows live in.
+    extreme_rows: NodeId,
 }
 
 /// One fear and greed pane: the account it follows, the reading it draws, and its
 /// refresh control.
 pub struct CoinMarketCapFearAndGreedIndexWidget {
-    binding: WidgetBinding<CoinMarketCapFearAndGreedIndexProtocol>,
-    status: Entity<WidgetStatus>,
+    /// The executor bridge, absent on a host that installed no Kytrix service.
+    binding: Option<WidgetBinding<CoinMarketCapFearAndGreedIndexProtocol>>,
+    status: WidgetStatus,
     recovery: WidgetAction,
     gauge: Gauge,
     /// The answer the body is drawn from, or nothing before the first one arrives.
     snapshot: Option<Arc<CoinMarketCapFearAndGreedIndexSnapshot>>,
+    /// The reading the row bindings read. A row closure has no application context,
+    /// so the snapshot is a signal the nodes watch rather than a field they borrow.
+    items: Signal<Option<Arc<CoinMarketCapFearAndGreedIndexSnapshot>>>,
+    /// The selected language, read where text and static copy are built.
+    language: Signal<LanguageCode>,
     /// Whether a refresh this pane sent is still waiting for the reading it asked
     /// for. It closes the window between the click and the answer, during which the
     /// service would refuse a second command.
     refresh_pending: bool,
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
-    /// Keeps the pane following the account the settings hold.
-    _account: Subscription,
+    /// Click requests from the header control: a button handler owns no widget
+    /// context, so it asks the next `sync` for the refresh instead.
+    refresh_requests: Signal<u64>,
+    seen_refresh_requests: u64,
+    /// The header control, once the pane has built its header row.
+    header: Option<HeaderControl>,
+    /// The root of the body this pane built.
+    body_root: Option<NodeId>,
+    /// The card, once the body has built one.
+    card: Option<Card>,
+    /// Which rows the card currently draws (see [`RowsKey`]).
+    rows_built: Option<RowsKey>,
+    /// The stand-in an uncollected answer draws, with the language it was built in.
+    empty: Option<NodeId>,
+    empty_language: Option<LanguageCode>,
+    /// The info notes beside the two section headings.
+    tooltips: [Option<Tooltip>; SECTION_COUNT],
+    tooltips_language: Option<LanguageCode>,
+    translate: Translate,
+    theme: ThemeHandle,
 }
 
 impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
@@ -228,23 +472,26 @@ impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
     fn new(
         _instance_id: WidgetInstanceId,
         _config: Self::Config,
-        status: Entity<WidgetStatus>,
-        _reload: impl Fn(&mut App) + 'static,
+        status: WidgetStatus,
+        _reload: ReloadHandle,
         _config_change: WidgetConfigChange,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let source = cx.global::<KytrixServiceConnector>().clone();
-        Self::new_with_source(source, status, recovery, cx)
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<Self, EngineError> {
+        let source = cx.services().kytrix_service().cloned();
+
+        Ok(Self::assemble(source, status, recovery, cx))
     }
 
-    fn load(&mut self, cx: &mut Context<Self>) {
+    fn load(&mut self, cx: &mut WidgetCx<'_>) {
         // A retry keeps the reading the user is still looking at — blanking it to
         // reconnect would flash a screen of data away — while an explicit load
         // starts over, because the pane cannot vouch for what it was showing.
-        let retry = self.status.is_failed(cx);
-        self.account_id = account_of(&cx.global::<ConfigManager>().read());
-        self.start(retry, cx);
+        let retry = self.status.is_failed(cx.app());
+        self.account_id = cx.account();
+        if let Err(error) = self.start(retry, cx) {
+            log::error!("the fear and greed pane could not start: {error}");
+        }
     }
 
     /// A pane is content once an answer has arrived for the account it follows.
@@ -255,37 +502,136 @@ impl WidgetView for CoinMarketCapFearAndGreedIndexWidget {
         self.snapshot.is_some()
     }
 
-    fn header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> WidgetHeader {
-        WidgetHeader::empty().right(self.refresh_control(cx))
+    fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let root = NodeBuilder::boxed()
+            .id(BODY_SELECTOR)
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .size_full()
+                    .min_width_0()
+                    .min_height_0()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        self.body_root = Some(root);
+        self.sync_body_content(cx)?;
+
+        Ok(())
+    }
+
+    fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        // The settings are the pane's scope: signing in or out is another read, and
+        // a settings write reaches this hook on the frame it schedules.
+        let account = cx.account();
+        if account != self.account_id {
+            self.account_id = account;
+            self.start(false, cx)?;
+        }
+
+        // The binding delivers messages instead of calling back into the widget; this
+        // is the one place they are applied, where the widget has a context again.
+        let messages = self
+            .binding
+            .as_ref()
+            .map(WidgetBinding::take)
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                Inbound::Reliable { key, message } => {
+                    self.apply_reliable(key, message, cx);
+                }
+                Inbound::Latest { key, message } => {
+                    self.apply_latest(key, message, cx);
+                }
+                Inbound::Rpc { result, .. } => self.apply_rpc(result, cx),
+            }
+        }
+
+        // A click on the header control is applied here rather than in its handler,
+        // which owns no widget context (see the module documentation).
+        let requests = *cx.read(&self.refresh_requests);
+        if requests != self.seen_refresh_requests {
+            self.seen_refresh_requests = requests;
+            self.refresh(cx)?;
+        }
+
+        self.sync_body_content(cx)?;
+        self.sync_gauge(cx)?;
+        self.sync_tooltips(cx)?;
+        self.sync_header(cx)?;
+
+        // The body is built by the framework from the answer `has_content` gives, and
+        // it asks that question before this hook runs: content that first appeared
+        // here is one frame away, so ask for that frame.
+        if self.snapshot.is_some() && self.body_root.is_none() {
+            cx.request_frame()?;
+        }
+
+        Ok(())
+    }
+
+    fn header(
+        &mut self,
+        group: HeaderGroup,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        if group != HeaderGroup::Right {
+            return Ok(());
+        }
+        // The pane is building its row; the control this widget built into the
+        // previous one went with it. Only the component is the widget's to take down.
+        self.release_header(cx, true);
+        self.build_header(parent, cx)
+    }
+
+    fn release(&mut self, cx: &mut WidgetCx<'_>) {
+        // Dropping the bridge aborts its forwarding tasks and cancels the service.
+        self.binding = None;
+        // The header's nodes belong to the pane, which removes its row: only the
+        // component's signal scope and action handler are this widget's to release.
+        self.release_header(cx, false);
+        self.release_tooltips(cx);
+        // The meshes live in the process-wide geometry store, so nothing else would
+        // give them back.
+        self.gauge.release(cx.app_mut());
+        if let Some(card) = self.card.take() {
+            let _ = remove_own_node(cx, card.root);
+        }
+        self.rows_built = None;
+        self.empty = None;
+        self.empty_language = None;
+        if let Some(root) = self.body_root.take() {
+            let _ = remove_own_node(cx, root);
+        }
+        self.snapshot = None;
     }
 }
 
 impl CoinMarketCapFearAndGreedIndexWidget {
-    /// The seam a test can answer through: `new` only picks the production source.
-    fn new_with_source<S>(
-        source: S,
-        status: Entity<WidgetStatus>,
+    /// The seam the framework and the tests build a pane through.
+    ///
+    /// The pane has no opinion about where its readings come from, so the source is
+    /// an argument: the production constructor answers it with the injected Kytrix
+    /// service connection, and a test with a fake source.
+    fn assemble<S: CoinMarketCapFearAndGreedIndexSource>(
+        source: Option<S>,
+        status: WidgetStatus,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self
-    where
-        S: CoinMarketCapFearAndGreedIndexSource,
-    {
-        let binding = WidgetBinding::spawn_conditionally(
-            global::handle(cx).handle(),
-            CoinMarketCapFearAndGreedIndexService::new(source),
-            cx,
-            Self::apply_reliable,
-            Self::apply_latest,
-        );
-        // The account is the pane's scope, and the user can change it while the
-        // pane is open: signing out has to take the reading with it, and signing in
-        // has to fetch. Following the account event is what makes that happen
-        // without the pane having to be reopened.
-        let events = cx.global::<ConfigManager>().events().clone();
-        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
-            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
+        let binding = source.map(|source| {
+            WidgetBinding::spawn(cx, CoinMarketCapFearAndGreedIndexService::new(source))
         });
+        let items = cx.signal(None::<Arc<CoinMarketCapFearAndGreedIndexSnapshot>>);
+        let refresh_requests = cx.signal(0_u64);
+        let language = cx.services().language;
+        let translate = cx.translate().clone();
+        let theme = cx.theme().clone();
+        // The pane records the account it was built for, but it starts nothing: the
+        // framework calls `load` once construction is done.
+        let account_id = cx.account();
 
         Self {
             binding,
@@ -293,12 +639,34 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             recovery,
             gauge: Gauge::new(),
             snapshot: None,
+            items,
+            language,
             refresh_pending: false,
-            // The pane records the account it was built for, but it does not start
-            // anything: the framework calls `load` once construction is done.
-            account_id: account_of(&cx.global::<ConfigManager>().read()),
-            _account: account,
+            account_id,
+            refresh_requests,
+            seen_refresh_requests: 0,
+            header: None,
+            body_root: None,
+            card: None,
+            rows_built: None,
+            empty: None,
+            empty_language: None,
+            tooltips: [None, None],
+            tooltips_language: None,
+            translate,
+            theme,
         }
+    }
+
+    /// A pane over a source the caller answers, for the crate's own tests.
+    #[cfg(test)]
+    fn new_with_source<S: CoinMarketCapFearAndGreedIndexSource>(
+        source: S,
+        status: WidgetStatus,
+        recovery: WidgetAction,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
+        Self::assemble(Some(source), status, recovery, cx)
     }
 
     /// The account this pane would accept an answer from.
@@ -314,91 +682,109 @@ impl CoinMarketCapFearAndGreedIndexWidget {
     /// waiting: a pane that is connecting has nothing to bring forward, a failed one
     /// is recovered through the framework's own control above the reading, and a
     /// pending refresh would be refused by the service as busy.
-    fn refresh_is_disabled(&self, cx: &impl AppContext) -> bool {
-        self.refresh_pending || self.status.state(cx) != WidgetState::Ready
-    }
-
-    /// Follows the account the settings now hold.
-    ///
-    /// Another account is another scope: the answer the pane is showing was served
-    /// to the previous one, so it is dropped rather than kept under a new name.
-    fn reconcile_account(&mut self, account: Option<SmolStr>, cx: &mut Context<Self>) {
-        if self.account_id == account {
-            return;
-        }
-        self.account_id = account;
-        self.start(false, cx);
+    fn refresh_is_disabled(&self, app: &App) -> bool {
+        self.refresh_pending || self.status.state(app) != WidgetState::Ready
     }
 
     /// Starts reading, or restarts for an account the user is retrying.
-    fn start(&mut self, retry: bool, cx: &mut Context<Self>) {
+    fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         // The command that was in flight belongs to the stream this call is
         // replacing, so its answer is not something to wait for any more.
         self.refresh_pending = false;
         let Some(key) = self.current_key() else {
             // There is nothing to read for a reader the service does not know, and
             // nothing has gone wrong, so the pane says what it is waiting for.
-            self.clear_snapshot(cx);
+            self.clear_snapshot(cx)?;
             self.status.report(
+                cx.app_mut(),
                 WidgetState::waiting(Notice::message(
                     "widget.coin_market_cap_fear_and_greed_index.logged_out",
                 )),
-                cx,
             );
-            cx.notify();
-            return;
+            cx.request_frame()?;
+            return Ok(());
         };
         if !retry {
-            self.clear_snapshot(cx);
+            self.clear_snapshot(cx)?;
         }
-        self.status.report(WidgetState::Connecting, cx);
-        self.binding.call(
+        self.status.report(cx.app_mut(), WidgetState::Connecting);
+        let Some(binding) = self.binding.as_mut() else {
+            // A host without the service connection can answer nothing: the pane is
+            // for a reader whose connection is missing, and that is a failure.
+            self.report_failure(
+                CoinMarketCapFearAndGreedIndexFailure::Fetch(
+                    CoinMarketCapFearAndGreedIndexFetchError::Service(KytrixServiceError::Closed),
+                ),
+                cx,
+            );
+            cx.request_frame()?;
+            return Ok(());
+        };
+        binding.call(
+            cx,
             if retry {
                 CoinMarketCapFearAndGreedIndexRequest::Retry(key)
             } else {
                 CoinMarketCapFearAndGreedIndexRequest::Load(key)
             },
-            cx,
-            Self::apply_rpc_result,
         );
-        cx.notify();
+        cx.request_frame()?;
+
+        Ok(())
     }
 
     /// Drops the reading the pane can no longer vouch for.
-    fn clear_snapshot(&mut self, cx: &mut Context<Self>) {
+    fn clear_snapshot(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         self.snapshot = None;
-        cx.notify();
+        cx.write(&self.items, None);
+        cx.request_frame()?;
+
+        Ok(())
     }
 
     /// Reads the account's answer again without waiting for the next interval.
     ///
-    /// Only a ready pane gets here, and the control that calls it does not even
-    /// carry a click handler when it is disabled — this guard is the second one, at
-    /// the action's entry.
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.refresh_is_disabled(cx) {
-            return;
+    /// Only a ready pane gets here, and the control that calls it is drawn disabled
+    /// for the other states — the handler still fires (a kit control's `disabled`
+    /// only draws the state), so this guard is the one that stops it.
+    fn refresh(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        if self.refresh_is_disabled(cx.app()) {
+            return Ok(());
         }
+        let Some(binding) = self.binding.as_mut() else {
+            return Ok(());
+        };
         self.refresh_pending = true;
-        cx.notify();
-        self.binding.call(
-            CoinMarketCapFearAndGreedIndexRequest::Refresh,
-            cx,
-            Self::apply_refresh_result,
+        binding.call(cx, CoinMarketCapFearAndGreedIndexRequest::Refresh);
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
+    /// Reports one failure, with the recovery the framework offered this widget.
+    fn report_failure(
+        &self,
+        failure: CoinMarketCapFearAndGreedIndexFailure,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        let recovery = self.recovery.clone();
+        self.status.report(
+            cx.app_mut(),
+            WidgetState::failed(Arc::new(failure), recovery),
         );
     }
 
-    /// Applies the answer to a load or a retry.
+    /// Applies the answer to a load, a retry or a refresh.
     ///
     /// A failure is terminal, so an answer that arrives after one is dropped: the
     /// recovery reports `Connecting` before it asks for anything, which is what
     /// makes the next answer one this pane still wants.
-    fn apply_rpc_result(
+    fn apply_rpc(
         &mut self,
         result: WidgetRpcResult<CoinMarketCapFearAndGreedIndexProtocol>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        if self.status.is_failed(cx) {
+        if self.status.is_failed(cx.app()) {
             return;
         }
         match result {
@@ -407,32 +793,12 @@ impl CoinMarketCapFearAndGreedIndexWidget {
                 | CoinMarketCapFearAndGreedIndexResponse::RefreshQueued,
             ) => {}
             Err(error) => {
-                let recovery = self.recovery.clone();
-                self.status.report(
-                    WidgetState::failed(
-                        Arc::new(CoinMarketCapFearAndGreedIndexFailure::Rpc(error)),
-                        recovery,
-                    ),
-                    cx,
-                );
+                // A refused command is not one to keep waiting for, whichever command
+                // it was: the pane reports the failure and the wait ends with it.
+                self.refresh_pending = false;
+                self.report_failure(CoinMarketCapFearAndGreedIndexFailure::Rpc(error), cx);
             }
         }
-    }
-
-    /// Applies the answer to a refresh command.
-    ///
-    /// An accepted command stays pending until the reading it asked for is reported:
-    /// the acknowledgement and the reading are two different messages, and the
-    /// service refuses a second command in between.
-    fn apply_refresh_result(
-        &mut self,
-        result: WidgetRpcResult<CoinMarketCapFearAndGreedIndexProtocol>,
-        cx: &mut Context<Self>,
-    ) {
-        if result.is_err() {
-            self.refresh_pending = false;
-        }
-        self.apply_rpc_result(result, cx);
     }
 
     /// Applies the failure the stream reported.
@@ -443,33 +809,29 @@ impl CoinMarketCapFearAndGreedIndexWidget {
         &mut self,
         key: CoinMarketCapFearAndGreedIndexStreamKey,
         message: Arc<CoinMarketCapFearAndGreedIndexStreamMessage>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) -> bool {
-        if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
+        if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx.app()) {
             return false;
         }
         let CoinMarketCapFearAndGreedIndexStreamMessage::Failed { error } = message.as_ref() else {
             return false;
         };
         self.refresh_pending = false;
-        let recovery = self.recovery.clone();
-        self.status.report(
-            WidgetState::failed(
-                Arc::new(CoinMarketCapFearAndGreedIndexFailure::Fetch(error.clone())),
-                recovery,
-            ),
+        self.report_failure(
+            CoinMarketCapFearAndGreedIndexFailure::Fetch(error.clone()),
             cx,
         );
+
         false
     }
 
     /// Applies the snapshot the stream published.
     ///
-    /// Returns whether anything a frame draws changed, which is what the framework
-    /// turns into a repaint: the body is cached, and an answer that folds into the
-    /// same pixels is not worth a frame. The comparison is the snapshot's
-    /// [`same_display`](CoinMarketCapFearAndGreedIndexSnapshot::same_display) rather than the whole answer,
-    /// because the collection time is never drawn.
+    /// Returns whether anything a frame draws changed: the body is kept, and an
+    /// answer that folds into the same pixels is not worth a frame. The comparison is
+    /// the snapshot's [`same_display`](CoinMarketCapFearAndGreedIndexSnapshot::same_display)
+    /// rather than the whole answer, because the collection time is never drawn.
     ///
     /// Two things still count as a change even when a frame would draw the same: an
     /// answer ends a refresh the header is waiting for (the control re-enables), and
@@ -481,9 +843,9 @@ impl CoinMarketCapFearAndGreedIndexWidget {
         &mut self,
         key: CoinMarketCapFearAndGreedIndexStreamKey,
         message: Arc<CoinMarketCapFearAndGreedIndexStreamMessage>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) -> bool {
-        if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx) {
+        if self.current_key().as_ref() != Some(&key) || self.status.is_failed(cx.app()) {
             return false;
         }
         let CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(snapshot) = message.as_ref()
@@ -495,7 +857,7 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             .as_ref()
             .is_some_and(|held| held.same_display(snapshot))
             && !self.refresh_pending
-            && self.status.state(cx) == WidgetState::Ready;
+            && self.status.state(cx.app()) == WidgetState::Ready;
         if no_op {
             // The answer neither moves the drawing nor ends anything the pane is
             // waiting for, so the allocation it already holds is the one the body
@@ -503,1504 +865,698 @@ impl CoinMarketCapFearAndGreedIndexWidget {
             return false;
         }
         self.snapshot = Some(snapshot.clone());
+        cx.write(&self.items, self.snapshot.clone());
         self.refresh_pending = false;
-        self.status.report(WidgetState::Ready, cx);
+        self.status.report(cx.app_mut(), WidgetState::Ready);
 
         true
     }
 
-    /// The header's right group: the control that reads the answer again.
+    /// Keeps the body in step with the reading: the card for a collected answer, the
+    /// `common.no_data` stand-in for an uncollected one.
+    fn sync_body_content(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(root) = self.body_root else {
+            return Ok(());
+        };
+        let Some(snapshot) = self.snapshot.clone() else {
+            // The framework draws a placeholder over the body while there is no
+            // content; the nodes stay as they are for the answer that replaces it.
+            return Ok(());
+        };
+        self.sync_empty_state(cx)?;
+        if snapshot.is_empty() {
+            self.remove_card(cx)?;
+            return Ok(());
+        }
+        if self.card.is_none() {
+            self.build_card(cx, root, &snapshot)?;
+        }
+        self.sync_rows(cx, &snapshot)?;
+
+        Ok(())
+    }
+
+    /// Builds the card: the gauge, the two section headings with their notes, and the
+    /// two row groups.
+    fn build_card(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
+    ) -> Result<(), EngineError> {
+        let card = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .size_full()
+                    .min_width_0()
+                    .min_height_0()
+                    .gap(8.0)
+                    .padding(12.0)
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        self.gauge.build(cx, card)?;
+        let history_rows = self.build_section(cx, card, 0)?;
+        let extreme_rows = self.build_section(cx, card, 1)?;
+        self.card = Some(Card {
+            root: card,
+            history_rows,
+            extreme_rows,
+        });
+        self.build_rows(cx, history_rows, 0..HISTORY_ROWS)?;
+        self.build_rows(cx, extreme_rows, HISTORY_ROWS..ROW_COUNT)?;
+        self.rows_built = Some(RowsKey::of(snapshot));
+
+        Ok(())
+    }
+
+    /// Builds one section heading over the container its rows will live in.
     ///
-    /// The button is disabled rather than absent for the states that cannot refresh,
-    /// so the header does not reflow when the reading arrives.
-    fn refresh_control(&self, cx: &Context<Self>) -> AnyElement {
-        let disabled = self.refresh_is_disabled(cx);
-        let widget = cx.entity();
-
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .debug_selector(|| "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH".into())
-                    .child(
-                        Button::new(ElementId::Name(SharedString::new_static(
-                            "CoinMarketCapFearAndGreedIndexRefresh",
-                        )))
-                        .ghost()
-                        .small()
-                        .disabled(disabled)
-                        .aria_label(t!(
-                            cx,
-                            "widget.coin_market_cap_fear_and_greed_index.refresh"
-                        ))
-                        .child(Icon::new(IconKind::ArrowsClockwise).size_3())
-                        // A disabled button is only drawn as disabled, so the click
-                        // handler is not attached at all — and the action guards
-                        // itself as well.
-                        .when(!disabled, |button| {
-                            button.on_click(move |_, _, app| {
-                                widget.update(app, |this, cx| this.refresh(cx));
-                            })
-                        }),
-                    ),
+    /// The container is the card's fixed child: a row rebuild replaces the nodes
+    /// inside it, never the container, so the card's order — gauge, heading, history,
+    /// heading, yearly — cannot depend on a rebuild.
+    fn build_section(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        index: usize,
+    ) -> Result<NodeId, EngineError> {
+        let descriptor = SECTIONS[index];
+        let row = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .items_center()
+                    .gap(4.0)
+                    .build(),
             )
-            .into_any_element()
+            .build(cx.tree_mut(), parent)?;
+        let language = self.language;
+        let translate = self.translate.clone();
+        let theme = self.theme.clone();
+        NodeBuilder::text(
+            SmolStr::default(),
+            text_style(SMALL_TEXT_SIZE.text_size(), SEMIBOLD, None),
+        )
+        .bind_text(move |read| {
+            let _language = read.read(&language);
+            t_smol!(translate, descriptor.title)
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgMuted)),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), row)?;
+
+        // The note is a kit tooltip on a decorative icon, exactly as the reference
+        // drew it: the icon is the trigger, so the heading itself stays a label.
+        let theme = self.theme.clone();
+        let window = cx.window();
+        let icon = IconSpec::new(IconKind::WarningCircle)
+            .with_size(SMALL_TEXT_SIZE.icon_size())
+            .build_themed(cx.app_mut(), window, row, &theme, Role::FgSubtle)
+            .map_err(|error| icon_error(error, row))?;
+        let key = cx.unique_key(descriptor.key);
+        let layer = cx.layer().clone();
+        let animation = cx.animation().clone();
+        let content = t_smol!(self.translate, descriptor.info);
+        let tooltip = Tooltip::new(
+            cx.app_mut(),
+            self.theme.clone(),
+            layer,
+            animation,
+            key,
+            TooltipOptions::default(),
+        );
+        tooltip.set_content(Some(TooltipContent::new(content)));
+        tooltip.attach(cx.app_mut(), window, icon);
+        self.tooltips[index] = Some(tooltip);
+
+        let rows = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .gap(4.0)
+                    .width_full()
+                    .min_width_0()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+
+        Ok(rows)
     }
 
-    /// The reading's card: the gauge, the four history rows and the two yearly
-    /// extremes.
-    fn card(
+    /// Builds every row of one group into its container.
+    fn build_rows(
         &self,
+        cx: &mut WidgetCx<'_>,
+        container: NodeId,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), EngineError> {
+        for index in range {
+            self.build_row(cx, container, index)?;
+        }
+
+        Ok(())
+    }
+
+    /// Builds one row of the card: its label, the level it sat in, and its value.
+    fn build_row(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        let descriptor = ROWS[index];
+        let present = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| row_at(snapshot, index).is_some());
+        let row = NodeBuilder::boxed()
+            .id(descriptor.row)
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(8.0)
+                    .width_full()
+                    .min_width_0()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+
+        // What the row is. A yearly row names the day its reading happened on, which
+        // is part of the sentence rather than a second line: the binding resolves the
+        // whole label, so a missing day is a dash inside one catalogue message.
+        let language = self.language;
+        let items = self.items;
+        let translate = self.translate.clone();
+        let theme = self.theme.clone();
+        NodeBuilder::text(
+            SmolStr::default(),
+            text_style(ROW_TEXT_SIZE.text_size(), 400, None),
+        )
+        .style(StyleBuilder::new().flex_1().min_width_0().build())
+        .bind_text(move |read| {
+            let _language = read.read(&language);
+            let snapshot = read.read(&items);
+            row_label(descriptor, snapshot.as_deref(), index, &translate)
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgMuted)),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), row)?;
+
+        let right = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .items_center()
+                    .gap(8.0)
+                    .flex_none()
+                    .build(),
+            )
+            .build(cx.tree_mut(), row)?;
+
+        if present {
+            self.build_level_marker(cx, right, index)?;
+        }
+
+        let items = self.items;
+        let language = self.language;
+        let theme = self.theme.clone();
+        let mut value = NodeBuilder::text(
+            SmolStr::default(),
+            text_style(ROW_TEXT_SIZE.text_size(), SEMIBOLD, Some(TextAlign::End)),
+        )
+        .style(
+            StyleBuilder::new()
+                .width(VALUE_COLUMN_WIDTH)
+                .flex_none()
+                .build(),
+        )
+        .bind_text(move |read| {
+            let _language = read.read(&language);
+            let snapshot = read.read(&items);
+            value_text(
+                snapshot
+                    .as_deref()
+                    .and_then(|snapshot| row_at(snapshot, index)),
+            )
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgDefault)),
+            ..StylePatch::default()
+        });
+        if !present {
+            // The dash is the whole value of a row without a reading: the selector is
+            // what tells a test (and a debugging session) which row drew it.
+            value = value.id(descriptor.missing);
+        }
+        value.build(cx.tree_mut(), right)?;
+
+        Ok(())
+    }
+
+    /// Builds the dot and the level's name a row with a reading carries.
+    fn build_level_marker(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        index: usize,
+    ) -> Result<(), EngineError> {
+        let descriptor = ROWS[index];
+        let marker = NodeBuilder::boxed()
+            .id(descriptor.marker)
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .items_center()
+                    .gap(4.0)
+                    .flex_none()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+
+        // The dot's colour is a binding over the reading and the theme; the static
+        // paint only has to give the first style pass something valid to draw.
+        let appearance = self.theme.current(cx.app());
+        let initial = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| row_at(snapshot, index))
+            .map_or_else(
+                || self.theme.theme_for(appearance).role(Role::FgDefault),
+                |row| level_color(self.theme.theme_for(appearance), Level::of(row.score)),
+            );
+        let items = self.items;
+        let theme = self.theme.clone();
+        NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .size(LEVEL_MARKER_SIZE, LEVEL_MARKER_SIZE)
+                    .flex_none()
+                    .build(),
+            )
+            .paint(
+                PaintBuilder::new()
+                    .background(initial)
+                    .rounded(LEVEL_MARKER_SIZE / 2.0)
+                    .build(),
+            )
+            .bind_style(move |read| {
+                let snapshot = read.read(&items);
+                let level = snapshot
+                    .as_deref()
+                    .and_then(|snapshot| row_at(snapshot, index))
+                    .map(|row| Level::of(row.score));
+                match level {
+                    Some(level) => StylePatch {
+                        background: Some(level_color(theme.theme(read), level)),
+                        ..StylePatch::default()
+                    },
+                    None => StylePatch::default(),
+                }
+            })
+            .build(cx.tree_mut(), marker)?;
+
+        let language = self.language;
+        let translate = self.translate.clone();
+        let items = self.items;
+        let theme = self.theme.clone();
+        NodeBuilder::text(
+            SmolStr::default(),
+            text_style(SMALL_TEXT_SIZE.text_size(), 400, None),
+        )
+        .bind_text(move |read| {
+            let _language = read.read(&language);
+            let snapshot = read.read(&items);
+            level_name(
+                snapshot
+                    .as_deref()
+                    .and_then(|snapshot| row_at(snapshot, index)),
+                &translate,
+            )
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgDefault)),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), marker)?;
+
+        Ok(())
+    }
+
+    /// Rebuilds the row nodes when the set of present readings changed.
+    ///
+    /// The row containers are the card's fixed children and stay: the nodes inside
+    /// them are replaced, so the card's order — gauge, heading, history, heading,
+    /// yearly — never depends on a rebuild.
+    fn sync_rows(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
         snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
-        cx: &Context<Self>,
-    ) -> AnyElement {
+    ) -> Result<(), EngineError> {
+        let Some(card) = self.card.as_ref() else {
+            return Ok(());
+        };
+        let key = RowsKey::of(snapshot);
+        if self.rows_built == Some(key) {
+            return Ok(());
+        }
+        let (history_rows, extreme_rows) = (card.history_rows, card.extreme_rows);
+        replace_children(cx, history_rows)?;
+        replace_children(cx, extreme_rows)?;
+        self.build_rows(cx, history_rows, 0..HISTORY_ROWS)?;
+        self.build_rows(cx, extreme_rows, HISTORY_ROWS..ROW_COUNT)?;
+        self.rows_built = Some(key);
+        // The nodes that were on screen are gone and the ones built in their place
+        // have not been drawn yet; nothing else asks for that frame.
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
+    /// Takes the card down, releasing the components it owns first.
+    fn remove_card(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(card) = self.card.take() else {
+            return Ok(());
+        };
+        self.rows_built = None;
+        self.release_tooltips(cx);
+        self.gauge.release(cx.app_mut());
+        remove_own_node(cx, card.root)
+    }
+
+    /// Shows `common.no_data` over an uncollected answer.
+    ///
+    /// The stand-in is the widget's, not the framework's: an uncollected answer is
+    /// *content*, so this is the body saying there is nothing in it rather than a
+    /// placeholder saying there is no body. Its copy is static, so it is built for the
+    /// language showing now and rebuilt when that moves (AGENTS §15.1).
+    fn sync_empty_state(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let empty = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.is_empty());
+        if !empty {
+            if let Some(node) = self.empty.take() {
+                remove_own_node(cx, node)?;
+                self.empty_language = None;
+            }
+            return Ok(());
+        }
+
+        let language = *cx.read(&self.language);
+        let stale = self
+            .empty
+            .is_none_or(|_| self.empty_language != Some(language));
+        if !stale {
+            return Ok(());
+        }
+        if let Some(node) = self.empty.take() {
+            remove_own_node(cx, node)?;
+        }
+        let Some(root) = self.body_root else {
+            return Ok(());
+        };
+
+        let overlay = NodeBuilder::boxed()
+            .id(EMPTY_SELECTOR)
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .left(0.0)
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)?;
+        let text = t_smol!(self.translate, "common.no_data");
+        EmptyState::new(self.theme.clone(), EMPTY_SELECTOR)
+            .text(text)
+            .build(cx.tree_mut(), overlay)?;
+        self.empty = Some(overlay);
+        self.empty_language = Some(language);
+
+        Ok(())
+    }
+
+    /// Draws the reading the pane now holds.
+    fn sync_gauge(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return Ok(());
+        };
+        if snapshot.is_empty() || self.card.is_none() {
+            return Ok(());
+        }
         let level = Level::of(snapshot.current);
-
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .child(
-                div()
-                    .debug_selector(|| "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE".into())
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        self.gauge
-                            .element(snapshot.current, t!(cx, level.key()), cx),
-                    ),
-            )
-            .child(self.section(
-                t!(cx, "widget.coin_market_cap_fear_and_greed_index.title"),
-                "widget.coin_market_cap_fear_and_greed_index.info_history",
-                "CoinMarketCapFearAndGreedIndexHistoryInfo",
-                cx,
-            ))
-            .child(self.history_rows(snapshot, cx))
-            .child(self.section(
-                t!(
-                    cx,
-                    "widget.coin_market_cap_fear_and_greed_index.yearly_extremes"
-                ),
-                "widget.coin_market_cap_fear_and_greed_index.info_yearly",
-                "CoinMarketCapFearAndGreedIndexYearlyInfo",
-                cx,
-            ))
-            .child(self.extreme_rows(snapshot, cx))
-            .into_any_element()
+        let value = snapshot.current;
+        let level_name = t_smol!(self.translate, level.key());
+        self.gauge.sync(cx, value, &level_name)
     }
 
-    /// One section heading with the note that explains it.
-    fn section(
-        &self,
-        title: SharedString,
-        info_key: &'static str,
-        info_id: &'static str,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
+    /// Keeps the two info notes in the language showing now, and ticks them.
+    ///
+    /// A tooltip's content is a resolved sentence, so a language switch replaces it
+    /// (the component closes the old panel and opens the new one). Its `sync` drives
+    /// the hover / delay state machine and the overlay's own frame work.
+    fn sync_tooltips(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let language = *cx.read(&self.language);
+        if self.tooltips_language != Some(language) {
+            let translate = self.translate.clone();
+            for (index, tooltip) in self.tooltips.iter().enumerate() {
+                if let Some(tooltip) = tooltip {
+                    tooltip.set_content(Some(TooltipContent::new(t_smol!(
+                        translate,
+                        SECTIONS[index].info
+                    ))));
+                }
+            }
+            self.tooltips_language = Some(language);
+        }
+        for tooltip in self.tooltips.iter().flatten() {
+            let _ = tooltip.sync(cx.app_mut());
+        }
 
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.roles.fg.muted.hsla)
-                    .child(title),
-            )
-            .child(
-                // The trigger itself must not occlude: an occluding trigger never
-                // hears the hover that opens the note.
-                Tooltip::new(
-                    ElementId::Name(SharedString::new_static(info_id)),
-                    Icon::new(IconKind::WarningCircle)
-                        .size_3()
-                        .text_color(theme.roles.fg.subtle.hsla),
-                )
-                .content(div().max_w(px(320.0)).text_xs().child(t!(cx, info_key))),
-            )
-            .into_any_element()
+        Ok(())
     }
 
-    /// Yesterday, last week, last month and last year, each with the level it sat in.
-    fn history_rows(
-        &self,
-        snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let rows = [
-            (
-                "widget.coin_market_cap_fear_and_greed_index.yesterday",
-                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YESTERDAY",
-                LEVEL_MARKER_YESTERDAY,
-                MISSING_YESTERDAY,
-                snapshot.yesterday.as_ref(),
-            ),
-            (
-                "widget.coin_market_cap_fear_and_greed_index.last_week",
-                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_WEEK",
-                LEVEL_MARKER_LAST_WEEK,
-                MISSING_LAST_WEEK,
-                snapshot.last_week.as_ref(),
-            ),
-            (
-                "widget.coin_market_cap_fear_and_greed_index.last_month",
-                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_MONTH",
-                LEVEL_MARKER_LAST_MONTH,
-                MISSING_LAST_MONTH,
-                snapshot.last_month.as_ref(),
-            ),
-            (
-                "widget.coin_market_cap_fear_and_greed_index.last_year",
-                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_YEAR",
-                LEVEL_MARKER_LAST_YEAR,
-                MISSING_LAST_YEAR,
-                snapshot.last_year.as_ref(),
-            ),
-        ];
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(rows.map(|(key, selector, marker_selector, missing, row)| {
-                value_row(
-                    selector,
-                    marker_selector,
-                    missing,
-                    t!(cx, key),
-                    row,
-                    theme,
-                    cx,
-                )
-            }))
-            .into_any_element()
+    /// Releases the two tooltips (their overlays and their signal scopes).
+    fn release_tooltips(&mut self, cx: &mut WidgetCx<'_>) {
+        for tooltip in self.tooltips.iter_mut() {
+            if let Some(tooltip) = tooltip.take() {
+                tooltip.release(cx.app_mut());
+            }
+        }
+        self.tooltips_language = None;
     }
 
-    /// The highest and the lowest reading of the past year, each with the day it
-    /// happened, the level it sat in and the dot that carries the level's colour.
-    fn extreme_rows(
-        &self,
-        snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let rows = [
-            (
-                "widget.coin_market_cap_fear_and_greed_index.yearly_high",
-                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_HIGH",
-                LEVEL_MARKER_YEARLY_HIGH,
-                MISSING_YEARLY_HIGH,
-                snapshot.yearly_high.as_ref(),
-            ),
-            (
-                "widget.coin_market_cap_fear_and_greed_index.yearly_low",
-                "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_LOW",
-                LEVEL_MARKER_YEARLY_LOW,
-                MISSING_YEARLY_LOW,
-                snapshot.yearly_low.as_ref(),
-            ),
-        ];
+    /// Builds the pane's refresh control into the header group's container.
+    fn build_header(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let language = *cx.read(&self.language);
+        let label = t_smol!(
+            self.translate,
+            "widget.coin_market_cap_fear_and_greed_index.refresh"
+        );
+        let key = cx.unique_key(HEADER_KEY_SUFFIX);
+        let theme = self.theme.clone();
+        let requests = self.refresh_requests;
+        let disabled = self.refresh_is_disabled(cx.app());
+        let window = cx.window();
+        let node = NodeBuilder::boxed()
+            .id(REFRESH_SELECTOR)
+            .style(StyleBuilder::new().flex_none().build())
+            .build(cx.tree_mut(), parent)?;
+        let button = Button::new(cx.app_mut(), theme, key)
+            .ghost()
+            .small()
+            .icon(IconKind::ArrowsClockwise)
+            .a11y_label(label)
+            .disabled(disabled)
+            // A disabled button is only *drawn* disabled, so the handler stays
+            // attached and the guard that matters is the one in `refresh`, at the
+            // action's entry.
+            .on_click(move |ctx| {
+                ctx.update(&requests, |count| *count += 1);
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        button.build(cx.app_mut(), window, node)?;
+        self.header = Some(HeaderControl {
+            #[cfg(test)]
+            action: button
+                .action_identity()
+                .expect("a click callback registered the control's action"),
+            button,
+            node,
+            language,
+            disabled,
+        });
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(rows.map(|(key, selector, marker_selector, missing, row)| {
-                value_row(
-                    selector,
-                    marker_selector,
-                    missing,
-                    yearly_label(key, row, cx),
-                    row,
-                    theme,
-                    cx,
-                )
-            }))
-            .into_any_element()
+        Ok(())
     }
-}
 
-impl Render for CoinMarketCapFearAndGreedIndexWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The body is only embedded while the pane has content, so this is the ready
-        // state and nothing else. Everything the pane is *doing* is drawn by the
-        // framework around this.
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return div().size_full().min_h_0().into_any_element();
+    /// Keeps the header control in step with the state it is drawn for.
+    ///
+    /// The button's accessible name is a resolved sentence, so a language switch
+    /// rebuilds the control; a state change only toggles the disabled drawing.
+    fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let disabled = self.refresh_is_disabled(cx.app());
+        let Some(header) = self.header.as_mut() else {
+            return Ok(());
         };
-        let body = if snapshot.is_empty() {
-            // An uncollected snapshot is empty rather than broken, and a blank body
-            // would read as a pane that is still loading.
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(EmptyState::new(
-                    ElementId::Name(SharedString::new_static(
-                        "CoinMarketCapFearAndGreedIndexEmpty",
-                    )),
-                    t!(cx, "common.no_data"),
-                ))
-                .into_any_element()
-        } else {
-            self.card(snapshot, cx)
+        header.button.sync(cx.app_mut())?;
+        if disabled != header.disabled {
+            let _ = header.button.set_disabled(cx.app_mut(), disabled);
+            header.disabled = disabled;
+        }
+        let language = *cx.read(&self.language);
+        if header.language == language {
+            return Ok(());
+        }
+        let node = header.node;
+        // The pane may have rebuilt its header row since: the group is not this
+        // widget's node, so a stale control already went with the row.
+        let parent = cx
+            .tree()
+            .get(node)
+            .ok()
+            .and_then(ui_core::node::tree::Node::parent);
+        self.release_header(cx, true);
+        match parent {
+            Some(parent) if cx.tree().get(parent).is_ok() => self.build_header(parent, cx),
+            _ => Ok(()),
+        }
+    }
+
+    /// Removes the control's wrapper (when the widget owns the teardown) and releases
+    /// the component's scope and action handler.
+    fn release_header(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
+        let Some(header) = self.header.take() else {
+            return;
         };
-
-        div()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(body)
-            .into_any_element()
+        if remove_node && cx.tree().get(header.node).is_ok() {
+            let window = cx.window();
+            let _ = cx.app_mut().remove_node(window, header.node);
+        }
+        let _ = header.button.release(cx.app_mut());
     }
 }
 
-/// One row of the history or of the yearly extremes: what it is, the level it sat
-/// in, and the number or a dash.
-///
-/// The level is carried by an 8px dot and a default-coloured name; the dot is what
-/// makes five levels tellable apart without using the scale's yellow as text. A row
-/// without a reading has no level and marks its value with `missing`, so a test can
-/// assert from the painted frame that the dash was drawn and which row drew it.
-fn value_row(
-    selector: &'static str,
-    marker_selector: &'static str,
-    missing: &'static str,
-    label: SharedString,
-    row: Option<&CoinMarketCapFearAndGreedIndexRow>,
-    theme: &Theme,
-    cx: &App,
-) -> AnyElement {
-    let level = row.map(|row| Level::of(row.score));
-    let mut value = div()
-        .w(px(VALUE_COLUMN_WIDTH))
-        .flex_none()
-        .text_right()
-        .text_sm()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.roles.fg.default.hsla)
-        .child(value_text(row));
-
-    if row.is_none() {
-        value = value.debug_selector(move || missing.into());
+/// The text style one line of this pane's text is drawn with.
+fn text_style(size: f32, weight: u16, alignment: Option<TextAlign>) -> TextStyle {
+    let mut style = TextStyle::new(size);
+    style.weight = weight;
+    if let Some(alignment) = alignment {
+        style.alignment = alignment;
     }
 
-    div()
-        .debug_selector(move || selector.into())
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.roles.fg.muted.hsla)
-                .child(label),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .children(level.map(|level| {
-                    div()
-                        .debug_selector(move || marker_selector.into())
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .size(px(LEVEL_MARKER_SIZE))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(level_color(theme, level)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.roles.fg.default.hsla)
-                                .child(t!(cx, level.key())),
-                        )
-                }))
-                .child(value),
-        )
-        .into_any_element()
+    style
 }
 
-/// The label of a yearly row, naming the day the reading happened on.
-///
-/// A row without a reading names the dash as its day rather than dropping the
-/// parenthesis: `Yearly High (—)` says the row exists and has no value, while a
-/// second label without a date would be a second message to translate.
-fn yearly_label(
-    key: &'static str,
-    row: Option<&CoinMarketCapFearAndGreedIndexRow>,
-    cx: &App,
-) -> SharedString {
-    t!(cx, key, date = date_text(row))
+/// The row whose reading `index` names, if the answer carries it.
+fn row_at(
+    snapshot: &CoinMarketCapFearAndGreedIndexSnapshot,
+    index: usize,
+) -> Option<&CoinMarketCapFearAndGreedIndexRow> {
+    match index {
+        0 => snapshot.yesterday.as_ref(),
+        1 => snapshot.last_week.as_ref(),
+        2 => snapshot.last_month.as_ref(),
+        3 => snapshot.last_year.as_ref(),
+        4 => snapshot.yearly_high.as_ref(),
+        5 => snapshot.yearly_low.as_ref(),
+        _ => None,
+    }
+}
+
+/// The label of one row, in the language showing on the frame that draws it.
+fn row_label(
+    descriptor: RowDescriptor,
+    snapshot: Option<&CoinMarketCapFearAndGreedIndexSnapshot>,
+    index: usize,
+    translate: &Translate,
+) -> SmolStr {
+    let row = snapshot.and_then(|snapshot| row_at(snapshot, index));
+    if descriptor.dated {
+        t_smol!(translate, descriptor.label, date = date_text(row))
+    } else {
+        t_smol!(translate, descriptor.label)
+    }
+}
+
+/// The level's name beside a row's dot, or nothing for a row without a reading.
+fn level_name(row: Option<&CoinMarketCapFearAndGreedIndexRow>, translate: &Translate) -> SmolStr {
+    row.map_or_else(SmolStr::default, |row| {
+        t_smol!(translate, Level::of(row.score).key())
+    })
 }
 
 /// The value of a row, or the dash that says there is none.
-fn value_text(row: Option<&CoinMarketCapFearAndGreedIndexRow>) -> SharedString {
+fn value_text(row: Option<&CoinMarketCapFearAndGreedIndexRow>) -> SmolStr {
     row.map_or_else(
-        || SharedString::new_static(MISSING),
-        |row| SharedString::new(format_smolstr!("{}", row.score).as_str()),
+        || SmolStr::new_static(MISSING),
+        |row| format_smolstr!("{}", row.score),
     )
 }
 
 /// The day a row happened on, or the dash that says there is no reading.
-fn date_text(row: Option<&CoinMarketCapFearAndGreedIndexRow>) -> SharedString {
-    row.map_or_else(
-        || SharedString::new_static(MISSING),
-        |row| SharedString::new(row.date.as_str()),
-    )
+fn date_text(row: Option<&CoinMarketCapFearAndGreedIndexRow>) -> SmolStr {
+    row.map_or_else(|| SmolStr::new_static(MISSING), |row| row.date.clone())
+}
+
+/// Removes every child of `parent`, keeping `parent` itself in place.
+fn replace_children(cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<(), EngineError> {
+    let children = cx
+        .tree()
+        .get(parent)
+        .map(|target| target.children().to_vec())
+        .unwrap_or_default();
+    for child in children {
+        remove_own_node(cx, child)?;
+    }
+
+    Ok(())
+}
+
+/// Removes a node this pane built, if it is still in the tree.
+///
+/// Every block this pane replaces goes through this step: the nodes first, then the
+/// components that own scopes on them. A node that is already gone is not a failure —
+/// the framework removes the surface's subtree after `release`, and a header row the
+/// pane rebuilt took the control with it — so asking the engine to remove it again
+/// would fail the rebuild (`StaleNode`) and leave the pane without the replacement.
+fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineError> {
+    if cx.tree().get(node).is_err() {
+        return Ok(());
+    }
+    let window = cx.window();
+    cx.app_mut().remove_node(window, node).map(|_| ())
+}
+
+/// The engine error an icon mount reports.
+///
+/// `IconSpec::build_themed` reports a refused size, an unknown kind and a wrong node
+/// kind beside the two engine errors; this pane passes a size from the theme's ladder
+/// and a constant kind, so those cannot happen, and an impossible one is reported as
+/// a stale node of the row the icon was being mounted in rather than panicking.
+fn icon_error(error: IconError, parent: NodeId) -> EngineError {
+    match error {
+        IconError::Decode(error) | IconError::Node(error) => error,
+        IconError::UnknownWindow { window } => EngineError::UnknownWindow { window },
+        IconError::InvalidSize { .. }
+        | IconError::UnknownKind { .. }
+        | IconError::NotImageNode { .. } => EngineError::StaleNode { node: parent },
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{cell::Cell, rc::Rc, time::Duration};
-
-    use app_config::settings::{AccountConfig, AccountWalletKind, Config};
-    use gpui_kit::{
-        AppContext, BorrowAppContext, Entity, IntoElement, Modifiers, Render, TestAppContext,
-        VisualTestContext, Window, div,
-    };
-    use i18n::language::codes::LanguageCode;
-    use kytrix_service_provider::service::engine::KytrixServiceError;
-    use widget::{protocol::RequestId, rpc::RpcCallError, status::Failure};
-
-    use super::*;
-    use crate::test_support::{
-        ACCOUNT, COLLECTED_AT, FakeSource, FetchPlan, empty_snapshot, row, snapshot,
-    };
-
-    /// Settings holding `account`, or holding nothing when it is `None`.
-    fn settings(account: Option<&str>) -> Config {
-        let mut config = Config::default();
-        config.account = account.map(|user_id| AccountConfig {
-            user_id: user_id.to_owned(),
-            wallet_address: "0x0000000000000000000000000000000000000001".to_owned(),
-            wallet_kind: AccountWalletKind::Ethereum,
-        });
-        config
-    }
-
-    /// Installs the application state a pane is built on: the theme, the translator
-    /// and the runtime.
-    ///
-    /// Each is an application-wide global an application installs exactly once, so a
-    /// test that needs a second pane in one application installs them once and scopes
-    /// the panes with [`sign_in`] rather than installing them again.
-    fn install(cx: &mut App) {
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-        global::install(cx).expect("the test Tokio runtime should build");
-    }
-
-    /// Scopes the panes built from here on to `account`, or to nobody.
-    fn sign_in(cx: &mut App, account: Option<&str>) {
-        let manager = ConfigManager::in_memory(settings(account), cx);
-        cx.set_global(manager);
-    }
-
-    /// Lets the pane and its service run until what the test is waiting for happens.
-    ///
-    /// Two executors are involved: the pane sends its commands from GPUI's own, and
-    /// the service answers on the application runtime. So both are given a turn —
-    /// the pane first, because a command that has not been sent is a service with
-    /// nothing to answer.
-    fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&App) -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            cx.run_until_parked();
-            let handle = cx.update(|cx| global::handle(cx).handle().clone());
-            handle.block_on(async { tokio::task::yield_now().await });
-            if cx.update(|cx| ready(cx)) {
-                return;
-            }
-            assert!(std::time::Instant::now() < deadline, "{what} should happen");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// A pane the framework would have built, driven by the source a test answers
-    /// through.
-    fn pane_with_source<S>(
-        source: S,
-        cx: &mut Context<CoinMarketCapFearAndGreedIndexWidget>,
-    ) -> CoinMarketCapFearAndGreedIndexWidget
-    where
-        S: CoinMarketCapFearAndGreedIndexSource,
-    {
-        let status = cx.new(|_| WidgetStatus::new());
-        let weak = cx.weak_entity();
-        let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
-            let _ = weak.update(cx, |pane, cx| pane.load(cx));
-        });
-        CoinMarketCapFearAndGreedIndexWidget::new_with_source(source, status, recovery, cx)
-    }
-
-    fn pane_with(
-        cx: &mut TestAppContext,
-        account: Option<&str>,
-        source: FakeSource,
-    ) -> Entity<CoinMarketCapFearAndGreedIndexWidget> {
-        cx.update(install);
-        pane_over(cx, account, source)
-    }
-
-    /// The same pane over the state [`install`] already put in place.
-    fn pane_over(
-        cx: &mut TestAppContext,
-        account: Option<&str>,
-        source: FakeSource,
-    ) -> Entity<CoinMarketCapFearAndGreedIndexWidget> {
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            sign_in(cx, account);
-            cx.new(|cx| {
-                let mut pane = pane_with_source(source, cx);
-                pane.load(cx);
-                pane
-            })
-        })
-    }
-
-    fn key() -> CoinMarketCapFearAndGreedIndexStreamKey {
-        CoinMarketCapFearAndGreedIndexStreamKey {
-            account_id: SmolStr::new_static(ACCOUNT),
-        }
-    }
-
-    /// The reading of `snapshot(current)` as a later poll collected it.
-    ///
-    /// The collector publishes again every minute, so an index that has not moved
-    /// arrives as a new answer carrying the same drawing and a new collection time.
-    fn recollected(current: u8, collected_at: i64) -> Arc<CoinMarketCapFearAndGreedIndexSnapshot> {
-        Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
-            collected_at,
-            ..(*snapshot(current)).clone()
-        })
-    }
-
-    /// Reports a snapshot as the stream would.
-    ///
-    /// The framework's conditional stream handler asks the pane for a frame exactly
-    /// when the handler reports that one changed — it calls `notify` only for a
-    /// `true` answer. Mirroring that one line is what lets a test count the frames
-    /// the pane asks for, rather than only the answer its handler returns.
-    fn report_snapshot(
-        pane: &Entity<CoinMarketCapFearAndGreedIndexWidget>,
-        snapshot: Arc<CoinMarketCapFearAndGreedIndexSnapshot>,
-        cx: &mut App,
-    ) -> bool {
-        pane.update(cx, |pane, context| {
-            let changed = pane.apply_latest(
-                key(),
-                Arc::new(CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(
-                    snapshot,
-                )),
-                context,
-            );
-            if changed {
-                context.notify();
-            }
-            changed
-        })
-    }
-
-    /// Reports the failure the stream would.
-    ///
-    /// A failure is drawn by the framework around the body, so the handler answers
-    /// that nothing a frame draws changed and the pane is not notified; the state
-    /// cell it writes is what the surface redraws from.
-    fn report_failure(pane: &Entity<CoinMarketCapFearAndGreedIndexWidget>, cx: &mut App) -> bool {
-        pane.update(cx, |pane, context| {
-            pane.apply_reliable(
-                key(),
-                Arc::new(CoinMarketCapFearAndGreedIndexStreamMessage::Failed {
-                    error: CoinMarketCapFearAndGreedIndexFetchError::Service(
-                        KytrixServiceError::Disconnected,
-                    ),
-                }),
-                context,
-            )
-        })
-    }
-
-    /// The failure the pane published.
-    fn published_failure(pane: &Entity<CoinMarketCapFearAndGreedIndexWidget>, cx: &App) -> Failure {
-        pane.read(cx)
-            .status
-            .state(cx)
-            .failure()
-            .cloned()
-            .expect("a failure should be published")
-    }
-
-    #[gpui_kit::test]
-    fn a_pane_without_an_account_should_ask_for_one(cx: &mut TestAppContext) {
-        let source = FakeSource::new([FetchPlan::Pending]);
-        let pane = pane_with(cx, None, source.clone());
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message(
-                    "widget.coin_market_cap_fear_and_greed_index.logged_out"
-                )),
-                "a pane nobody is signed in for says what it is waiting for"
-            );
-            assert!(!pane.read(cx).has_content());
-            assert!(
-                pane.read(cx).current_key().is_none(),
-                "there is nothing to read without an account"
-            );
-            assert_eq!(
-                source.fetch_count(),
-                0,
-                "a pane nobody is signed in for fetches nothing"
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn an_account_should_start_the_stream_with_its_first_fetch(cx: &mut TestAppContext) {
-        let source = FakeSource::new([FetchPlan::Pending]);
-        let pane = pane_with(cx, Some(ACCOUNT), source.clone());
-        settle_until(cx, "the first fetch", |_| source.fetch_count() == 1);
-
-        cx.update(|cx| {
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Connecting);
-            assert!(!pane.read(cx).has_content());
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "a pane waiting for its first answer offers no refresh"
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_snapshot_should_be_drawn_as_content(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            let changed = report_snapshot(&pane, snapshot(46), cx);
-
-            assert!(changed, "accepting an answer is a change worth a frame");
-            assert!(pane.read(cx).has_content());
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
-            assert!(
-                !pane.read(cx).refresh_is_disabled(cx),
-                "an idle pane with an answer can read again on demand"
-            );
-        });
-    }
-
-    /// The reading the pane draws is what it compares: a later poll of an index
-    /// that has not moved carries a new collection time but the same pixels, so it
-    /// is not a frame and the allocation it replaced is kept.
-    ///
-    /// The frames are counted on the entity rather than inferred from the handler's
-    /// answer: the identical answer is applied in an update of its own, and the pane
-    /// has to stay silent — no notification, so no frame.
-    #[gpui_kit::test]
-    fn a_snapshot_that_changed_nothing_should_not_ask_for_a_frame(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-        let held = snapshot(46);
-        let polled_again = recollected(46, COLLECTED_AT + 60_000);
-        assert_ne!(
-            held.as_ref(),
-            polled_again.as_ref(),
-            "the second answer differs: only its collection time moved"
-        );
-        let notifications = Rc::new(Cell::new(0));
-        let counted = notifications.clone();
-        let _observed = cx.update(|cx| {
-            cx.observe(&pane, move |_, _| {
-                counted.set(counted.get() + 1);
-            })
-        });
-
-        cx.update(|cx| {
-            assert!(
-                report_snapshot(&pane, held.clone(), cx),
-                "the first answer is a change worth a frame"
-            );
-        });
-        assert_eq!(notifications.get(), 1, "the first answer asks for a frame");
-
-        cx.update(|cx| {
-            let changed = report_snapshot(&pane, polled_again, cx);
-
-            assert!(
-                !changed,
-                "an answer that folds into the same pixels is not worth a frame"
-            );
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
-            assert!(
-                Arc::ptr_eq(
-                    &held,
-                    pane.read(cx).snapshot.as_ref().expect("the answer is kept")
-                ),
-                "the allocation of an unchanged answer is the one that is kept"
-            );
-        });
-        assert_eq!(
-            notifications.get(),
-            1,
-            "the same reading polled again notifies nobody"
-        );
-    }
-
-    /// An uncollected answer draws 「暂无数据」, so the first collected answer is a
-    /// change even when its rows are still the empty defaults: the empty state goes
-    /// away, and the pane has to keep the collected answer rather than the old one.
-    #[gpui_kit::test]
-    fn a_collected_answer_should_replace_an_empty_one_with_the_same_rows(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            let uncollected = empty_snapshot();
-            assert!(
-                report_snapshot(&pane, uncollected.clone(), cx),
-                "the first answer is a change worth a frame"
-            );
-            assert!(
-                pane.read(cx)
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.is_empty()),
-                "the pane holds the uncollected answer"
-            );
-
-            let collected = Arc::new(CoinMarketCapFearAndGreedIndexSnapshot {
-                collected_at: COLLECTED_AT,
-                ..(*uncollected).clone()
-            });
-            assert!(
-                report_snapshot(&pane, collected.clone(), cx),
-                "the empty state disappearing is a change worth a frame"
-            );
-            assert!(
-                Arc::ptr_eq(
-                    &collected,
-                    pane.read(cx).snapshot.as_ref().expect("the answer is kept")
-                ),
-                "the collected answer is the one the body draws from"
-            );
-        });
-    }
-
-    /// A refresh is one command and one answer: even when the answer draws exactly
-    /// what is already on screen, it still ends the wait and notifies, because that
-    /// is what re-enables the header's control.
-    #[gpui_kit::test]
-    fn an_unchanged_answer_should_end_a_pending_refresh(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-        cx.update(|cx| {
-            assert!(report_snapshot(&pane, snapshot(46), cx));
-            pane.update(cx, |pane, cx| pane.refresh(cx));
-            assert!(
-                pane.read(cx).refresh_pending,
-                "the click leaves a refresh waiting for its answer"
-            );
-        });
-
-        let notifications = Rc::new(Cell::new(0));
-        let counted = notifications.clone();
-        let _observed = cx.update(|cx| {
-            cx.observe(&pane, move |_, _| {
-                counted.set(counted.get() + 1);
-            })
-        });
-
-        cx.update(|cx| {
-            assert!(
-                report_snapshot(&pane, snapshot(46), cx),
-                "the answer a refresh waited for is a change even when it draws the same"
-            );
-            assert!(
-                !pane.read(cx).refresh_pending,
-                "the answer ends the wait the click started"
-            );
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
-            assert!(
-                !pane.read(cx).refresh_is_disabled(cx),
-                "the header's control becomes live again"
-            );
-        });
-        assert_eq!(
-            notifications.get(),
-            1,
-            "the answer notifies even though nothing drawn changed"
-        );
-    }
-
-    /// A retry keeps the reading and reports `Connecting`, so the answer that draws
-    /// the same is still the answer that finishes it: the pane reports `Ready` and
-    /// asks for a frame rather than staying in a state nothing else would end.
-    #[gpui_kit::test]
-    fn an_unchanged_answer_should_still_finish_a_retry(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            assert!(report_snapshot(&pane, snapshot(46), cx));
-            report_failure(&pane, cx);
-            pane.update(cx, |pane, cx| pane.load(cx));
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::Connecting,
-                "a recovery reports Connecting over the reading it kept"
-            );
-            assert!(
-                pane.read(cx).has_content(),
-                "the reading stays on screen through the retry"
-            );
-
-            assert!(
-                report_snapshot(&pane, snapshot(46), cx),
-                "the retry's answer is a change even though it draws the same"
-            );
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::Ready,
-                "the answer ends the Connecting the retry reported"
-            );
-        });
-    }
-
-    /// A missing row is drawn as a dash rather than as a missing snapshot: the pane
-    /// is content, the gauge is drawn, and the six rows are in the painted frame with
-    /// a dash where a reading is absent.
-    ///
-    /// The rows are asserted through the debug selectors of a real frame: a row that
-    /// stopped being drawn, or a dash that stopped being painted, fails here even
-    /// though the text helpers below still answer correctly.
-    #[gpui_kit::test]
-    fn a_snapshot_with_missing_rows_should_draw_six_rows_and_dashes(cx: &mut TestAppContext) {
-        cx.update(install);
-        let pane = pane_over(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-        let (harness, cx): (Entity<BodyHarness>, &mut VisualTestContext) =
-            cx.add_window_view(|_, _| BodyHarness::new(pane.clone()));
-        let mut partial = (*snapshot(46)).clone();
-        partial.yesterday = None;
-        partial.yearly_high = None;
-
-        cx.update(|_, cx| {
-            assert!(
-                report_snapshot(&pane, Arc::new(partial), cx),
-                "a partly empty answer is still content"
-            );
-            assert!(pane.read(cx).has_content());
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::Ready,
-                "a missing row is not a missing snapshot"
-            );
-        });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert!(
-            cx.update(|_, cx| harness.read(cx).frames.get()) > 0,
-            "the pane has to be drawn before its rows can be read"
-        );
-
-        for selector in [
-            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YESTERDAY",
-            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_WEEK",
-            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_MONTH",
-            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_LAST_YEAR",
-            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_HIGH",
-            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_ROW_YEARLY_LOW",
-        ] {
-            assert!(
-                cx.debug_bounds(selector).is_some(),
-                "{selector} is one of the six rows the pane draws"
-            );
-        }
-        for selector in [MISSING_YESTERDAY, MISSING_YEARLY_HIGH] {
-            assert!(
-                cx.debug_bounds(selector).is_some(),
-                "{selector}: a row without a reading paints its dash"
-            );
-        }
-        for selector in [
-            MISSING_LAST_WEEK,
-            MISSING_LAST_MONTH,
-            MISSING_LAST_YEAR,
-            MISSING_YEARLY_LOW,
-        ] {
-            assert!(
-                cx.debug_bounds(selector).is_none(),
-                "{selector}: a row with a reading paints no dash"
-            );
-        }
-        assert!(
-            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
-                .is_some(),
-            "the gauge is drawn beside the rows"
-        );
-        for selector in [LEVEL_MARKER_YESTERDAY, LEVEL_MARKER_YEARLY_HIGH] {
-            assert!(
-                cx.debug_bounds(selector).is_none(),
-                "{selector}: a row without a reading draws no level dot"
-            );
-        }
-        for selector in [
-            LEVEL_MARKER_LAST_WEEK,
-            LEVEL_MARKER_LAST_MONTH,
-            LEVEL_MARKER_LAST_YEAR,
-            LEVEL_MARKER_YEARLY_LOW,
-        ] {
-            assert!(
-                cx.debug_bounds(selector).is_some(),
-                "{selector}: a row with a reading draws its level dot"
-            );
-        }
-
-        cx.update(|_, cx| {
-            assert_eq!(value_text(None).as_ref(), "—");
-            assert_eq!(date_text(None).as_ref(), "—");
-            assert_eq!(value_text(Some(&row("2026-10-23", 45))).as_ref(), "45");
-            assert_eq!(
-                date_text(Some(&row("2026-10-23", 45))).as_ref(),
-                "2026-10-23"
-            );
-            assert_eq!(
-                yearly_label(
-                    "widget.coin_market_cap_fear_and_greed_index.yearly_high",
-                    None,
-                    cx
-                )
-                .as_ref(),
-                "Yearly High (—)",
-                "a missing day is named by the same dash as a missing value"
-            );
-            assert_eq!(
-                yearly_label(
-                    "widget.coin_market_cap_fear_and_greed_index.yearly_high",
-                    Some(&row("2025-11-20", 88)),
-                    cx
-                )
-                .as_ref(),
-                "Yearly High (2025-11-20)"
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_failure_should_keep_the_reading_and_offer_the_framework_recovery(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            report_snapshot(&pane, snapshot(46), cx);
-            pane.update(cx, |pane, cx| pane.refresh(cx));
-            assert!(
-                pane.read(cx).refresh_pending,
-                "a click leaves a refresh waiting for its reading"
-            );
-            report_failure(&pane, cx);
-
-            assert!(pane.read(cx).status.is_failed(cx));
-            assert!(
-                !pane.read(cx).refresh_pending,
-                "the failure the refresh was waiting for ends the wait"
-            );
-            let failure = published_failure(&pane, cx);
-            assert!(
-                !failure.text(cx).is_empty(),
-                "a failure has to say what went wrong"
-            );
-            assert_eq!(
-                failure.action().label_key(),
-                "common.retry",
-                "a failure always offers the framework's way out"
-            );
-            assert!(pane.read(cx).has_content(), "the reading stays on screen");
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "a failed pane offers no refresh of its own"
-            );
-        });
-
-        cx.update(|cx| {
-            pane.update(cx, |pane, cx| pane.load(cx));
-
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Connecting);
-            assert!(
-                pane.read(cx).has_content(),
-                "a retry keeps the reading the user was looking at"
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_failure_should_be_terminal_for_late_messages(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            report_snapshot(&pane, snapshot(46), cx);
-            report_failure(&pane, cx);
-
-            let changed = report_snapshot(&pane, snapshot(40), cx);
-
-            assert!(!changed, "a failed pane takes no more snapshots");
-            assert!(pane.read(cx).status.is_failed(cx));
-            assert_eq!(
-                pane.read(cx)
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.current),
-                Some(46),
-                "the reading the user was looking at is what stays"
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_snapshot_from_another_account_should_be_ignored(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            let changed = pane.update(cx, |pane, context| {
-                pane.apply_latest(
-                    CoinMarketCapFearAndGreedIndexStreamKey {
-                        account_id: SmolStr::new_static("another-account"),
-                    },
-                    Arc::new(CoinMarketCapFearAndGreedIndexStreamMessage::Snapshot(
-                        snapshot(46),
-                    )),
-                    context,
-                )
-            });
-
-            assert!(!changed, "another account's answer is not this pane's");
-            assert!(!pane.read(cx).has_content());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn another_account_should_take_the_reading_with_it(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            report_snapshot(&pane, snapshot(46), cx);
-            pane.update(cx, |pane, cx| {
-                pane.reconcile_account(Some(SmolStr::new_static("second-account")), cx);
-            });
-
-            assert!(
-                !pane.read(cx).has_content(),
-                "the answer was served to the account that just left"
-            );
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::Connecting,
-                "another account is another read"
-            );
-
-            pane.update(cx, |pane, cx| pane.reconcile_account(None, cx));
-
-            assert!(!pane.read(cx).has_content());
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message(
-                    "widget.coin_market_cap_fear_and_greed_index.logged_out"
-                )),
-                "signing out asks for an account rather than reporting a failure"
-            );
-            assert!(pane.read(cx).current_key().is_none());
-        });
-    }
-
-    /// Another account is another read, and the pane hears about it from the
-    /// settings rather than from a reload: what the new account is owed is fetched
-    /// for it, and signing out takes the reading away.
-    #[gpui_kit::test]
-    fn an_account_change_should_read_the_new_account(cx: &mut TestAppContext) {
-        let source = FakeSource::new([FetchPlan::Snapshot(46), FetchPlan::Snapshot(40)]);
-        let pane = pane_with(cx, Some(ACCOUNT), source.clone());
-        settle_until(cx, "the pane to read", |cx| pane.read(cx).has_content());
-        assert_eq!(source.fetch_count(), 1);
-
-        cx.update(|cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(
-                    |config| {
-                        config.account = Some(AccountConfig {
-                            user_id: "someone-else".to_owned(),
-                            wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                            wallet_kind: AccountWalletKind::Ethereum,
-                        });
-                    },
-                    cx,
-                );
-            });
-        });
-        cx.run_until_parked();
-
-        settle_until(cx, "the replacement read", |cx| {
-            pane.read(cx).account_id.as_deref() == Some("someone-else")
-                && pane.read(cx).has_content()
-        });
-        assert_eq!(source.fetch_count(), 2);
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx)
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.current),
-                Some(40),
-                "the new account is read for itself"
-            );
-        });
-
-        cx.update(|cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(|config| config.account = None, cx);
-            });
-        });
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::waiting(Notice::message(
-                    "widget.coin_market_cap_fear_and_greed_index.logged_out"
-                ))
-            );
-            assert!(
-                !pane.read(cx).has_content(),
-                "signing out takes the reading with it"
-            );
-        });
-    }
-
-    /// A refresh is one command and one answer, and the control is closed between
-    /// them: the service refuses a second command while one is in flight, so a
-    /// control that forwarded a fast double click would answer it with a banner.
-    #[gpui_kit::test]
-    fn a_refresh_should_close_the_control_until_the_answer_arrives(cx: &mut TestAppContext) {
-        let source = FakeSource::new([FetchPlan::Snapshot(46), FetchPlan::Snapshot(40)]);
-        let pane = pane_with(cx, Some(ACCOUNT), source);
-        settle_until(cx, "the first answer", |cx| {
-            pane.read(cx).status.state(cx) == WidgetState::Ready
-        });
-
-        cx.update(|cx| {
-            assert!(!pane.read(cx).refresh_is_disabled(cx));
-            pane.update(cx, |pane, cx| pane.refresh(cx));
-
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "the click closes the window itself, before anything has answered"
-            );
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::Ready,
-                "a refresh is not a state of its own: the reading on screen is still ready"
-            );
-        });
-
-        settle_until(cx, "the refreshed answer", |cx| {
-            pane.read(cx)
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.current == 40)
-        });
-        cx.update(|cx| {
-            assert_eq!(pane.read(cx).status.state(cx), WidgetState::Ready);
-            assert!(
-                !pane.read(cx).refresh_is_disabled(cx),
-                "the answer reopens the control"
-            );
-        });
-
-        cx.update(|cx| {
-            pane.update(cx, |pane, cx| {
-                pane.refresh(cx);
-                assert!(pane.refresh_pending, "the click puts a refresh in flight");
-                pane.reconcile_account(Some(SmolStr::new_static("someone-else")), cx);
-                assert!(
-                    !pane.refresh_pending,
-                    "the command belonged to the stream the account change replaced"
-                );
-            });
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_refused_refresh_should_be_reported_as_a_failure(cx: &mut TestAppContext) {
-        let pane = pane_with(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-
-        cx.update(|cx| {
-            report_snapshot(&pane, snapshot(46), cx);
-            pane.update(cx, |pane, cx| {
-                pane.refresh(cx);
-                assert!(pane.refresh_is_disabled(cx));
-                pane.apply_refresh_result(
-                    Err(RpcCallError::Service {
-                        request_id: RequestId::new(1),
-                        source: CoinMarketCapFearAndGreedIndexServiceError::StreamBusy,
-                    }),
-                    cx,
-                );
-            });
-
-            assert!(pane.read(cx).status.is_failed(cx));
-            assert!(
-                !pane.read(cx).refresh_pending,
-                "a refused command is not one to keep waiting for"
-            );
-            assert!(
-                pane.read(cx).refresh_is_disabled(cx),
-                "a failed pane offers no refresh of its own"
-            );
-            let failure = published_failure(&pane, cx);
-            assert!(!failure.text(cx).is_empty());
-            assert_eq!(failure.action().label_key(), "common.retry");
-        });
-    }
-
-    /// A level's name and the notes beside the headings are catalogue references
-    /// resolved on the frame that draws them, and the gauge keeps its prepared text
-    /// until that text, the reading or the canvas changes — so a language change has
-    /// to redraw the pane and rebuild that prepared frame.
-    ///
-    /// The gauge's prepared level is read back because a painted frame's text is not
-    /// otherwise readable: it is the exact string the last frame drew. Reading `t!`
-    /// alone would prove nothing about the render.
-    #[gpui_kit::test]
-    fn a_language_change_should_redraw_the_level_name_in_the_new_language(cx: &mut TestAppContext) {
-        cx.update(install);
-        let pane = pane_over(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-        let (harness, cx): (Entity<BodyHarness>, &mut VisualTestContext) =
-            cx.add_window_view(|_, _| BodyHarness::new(pane.clone()));
-
-        cx.update(|_, cx| {
-            assert!(report_snapshot(&pane, snapshot(66), cx));
-        });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let (english_level, english_note, frames_before) = cx.update(|_, cx| {
-            (
-                t!(cx, Level::Greed.key()),
-                t!(
-                    cx,
-                    "widget.coin_market_cap_fear_and_greed_index.info_history"
-                ),
-                harness.read(cx).frames.get(),
-            )
-        });
-        assert_eq!(english_level.as_ref(), "Greed");
-        assert!(!english_note.is_empty());
-        cx.update(|_, cx| {
-            assert_eq!(
-                pane.read(cx)
-                    .gauge
-                    .prepared_level()
-                    .expect("a drawn gauge prepares its text")
-                    .as_ref(),
-                english_level.as_ref(),
-                "the gauge draws the level in the language of the frame that built it"
-            );
-        });
-
-        cx.update(|_, cx| {
-            cx.set_global(LanguageCode::ZhCn);
-            cx.refresh_windows();
-        });
-        cx.run_until_parked();
-
-        assert!(
-            cx.update(|_, cx| harness.read(cx).frames.get()) > frames_before,
-            "a language change asks the window for a new frame"
-        );
-        cx.update(|_, cx| {
-            assert_eq!(
-                pane.read(cx)
-                    .gauge
-                    .prepared_level()
-                    .expect("the redrawn pane prepares its text again")
-                    .as_ref(),
-                "贪婪",
-                "the gauge of the redrawn frame names the level in the new language"
-            );
-            assert_eq!(t!(cx, Level::Greed.key()).as_ref(), "贪婪");
-            assert_ne!(
-                t!(
-                    cx,
-                    "widget.coin_market_cap_fear_and_greed_index.info_history"
-                ),
-                english_note,
-                "the note beside the heading is resolved in the language showing now"
-            );
-            assert_eq!(
-                yearly_label(
-                    "widget.coin_market_cap_fear_and_greed_index.yearly_high",
-                    None,
-                    cx
-                )
-                .as_ref(),
-                "年度最高值（—）"
-            );
-        });
-    }
-
-    /// One pane mounted in a window of its own, which is what paints its body.
-    struct BodyHarness {
-        pane: Entity<CoinMarketCapFearAndGreedIndexWidget>,
-        /// How many frames the window has drawn the pane in.
-        frames: Rc<Cell<usize>>,
-    }
-
-    impl BodyHarness {
-        fn new(pane: Entity<CoinMarketCapFearAndGreedIndexWidget>) -> Self {
-            Self {
-                pane,
-                frames: Rc::new(Cell::new(0)),
-            }
-        }
-    }
-
-    impl Render for BodyHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            self.frames.set(self.frames.get() + 1);
-            div().size_full().child(self.pane.clone())
-        }
-    }
-
-    /// Nothing collected yet is a healthy empty answer: the body says so, and no
-    /// gauge is drawn from a reading that does not exist.
-    #[gpui_kit::test]
-    fn an_empty_snapshot_should_say_there_is_no_data_instead_of_drawing_a_gauge(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(install);
-        let pane = pane_over(cx, Some(ACCOUNT), FakeSource::new([FetchPlan::Pending]));
-        let (_, cx): (Entity<BodyHarness>, &mut VisualTestContext) =
-            cx.add_window_view(|_, _| BodyHarness::new(pane.clone()));
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("EMPTY_STATE").is_none(),
-            "a pane with no answer yet has nothing to say about data"
-        );
-
-        cx.update(|_, cx| {
-            report_snapshot(&pane, snapshot(46), cx);
-        });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
-                .is_some(),
-            "a collected reading is drawn as a gauge"
-        );
-        assert!(cx.debug_bounds("EMPTY_STATE").is_none());
-
-        cx.update(|_, cx| {
-            report_snapshot(&pane, snapshot(0), cx);
-        });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
-                .is_some(),
-            "a collected zero is a reading at the bottom of the scale, not an empty snapshot"
-        );
-        assert!(cx.debug_bounds("EMPTY_STATE").is_none());
-
-        cx.update(|_, cx| {
-            assert!(
-                report_snapshot(&pane, empty_snapshot(), cx),
-                "an uncollected snapshot is content of its own"
-            );
-            assert!(
-                pane.read(cx).has_content(),
-                "an empty snapshot must not turn the body into a placeholder"
-            );
-            assert_eq!(
-                pane.read(cx).status.state(cx),
-                WidgetState::Ready,
-                "an uncollected snapshot is a healthy answer, not a failure or a wait"
-            );
-        });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("EMPTY_STATE").is_some(),
-            "an uncollected snapshot says there is no data"
-        );
-        assert!(
-            cx.debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_GAUGE")
-                .is_none(),
-            "nothing is drawn from a reading nobody collected"
-        );
-    }
-
-    /// One pane's header row, mounted in a window of its own.
-    ///
-    /// The pane chrome is what lays a header out in the application, and it is not
-    /// part of this crate; the harness stands in for it, so the control is built and
-    /// painted exactly the way a frame builds it.
-    struct HeaderHarness {
-        pane: Entity<CoinMarketCapFearAndGreedIndexWidget>,
-    }
-
-    impl Render for HeaderHarness {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let header = self.pane.update(cx, |pane, cx| pane.header(window, cx));
-            div()
-                .size_full()
-                .flex()
-                .child(
-                    div()
-                        .debug_selector(|| {
-                            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_HEADER_LEFT".into()
-                        })
-                        .children(header.left),
-                )
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .debug_selector(|| {
-                            "TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_HEADER_RIGHT".into()
-                        })
-                        .children(header.right),
-                )
-        }
-    }
-
-    /// Mounts one pane's header row in a window of its own, over `source`.
-    fn header_window(
-        cx: &mut TestAppContext,
-        source: FakeSource,
-    ) -> (Entity<HeaderHarness>, &mut VisualTestContext) {
-        cx.update(install);
-        cx.executor().allow_parking();
-        cx.update(|cx| sign_in(cx, Some(ACCOUNT)));
-        cx.add_window_view(|_, cx| {
-            let pane = cx.new(|cx| {
-                let mut pane = pane_with_source(source, cx);
-                pane.load(cx);
-                pane
-            });
-            HeaderHarness { pane }
-        })
-    }
-
-    /// The click sends a refresh command, not a reload: the pane stays `Ready`,
-    /// keeps the reading on screen and waits for the answer it asked for.
-    ///
-    /// A header that called `load` would show `Connecting` and drop the reading, so
-    /// the assertions are made while the fetch is still in flight.
-    #[gpui_kit::test]
-    fn the_header_should_refresh_without_starting_over(cx: &mut TestAppContext) {
-        let source = FakeSource::new([FetchPlan::Snapshot(46), FetchPlan::Held(52)]);
-        let (harness, cx) = header_window(cx, source.clone());
-        settle_until(cx, "the first answer", |cx| {
-            harness.read(cx).pane.read(cx).status.state(cx) == WidgetState::Ready
-        });
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let button = cx
-            .debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH")
-            .expect("the header should draw its refresh control");
-        cx.simulate_click(button.center(), Modifiers::none());
-        settle_until(cx, "the refresh to fetch", |_| source.fetch_count() == 2);
-
-        cx.update(|_, cx| {
-            let pane = harness.read(cx).pane.read(cx);
-
-            assert_eq!(
-                pane.status.state(cx),
-                WidgetState::Ready,
-                "a refresh is not a state of its own: the reading on screen is still ready"
-            );
-            assert!(
-                pane.refresh_pending,
-                "the click leaves a refresh waiting for its reading"
-            );
-            assert!(
-                pane.has_content(),
-                "a refresh does not clear the reading on screen"
-            );
-            assert_eq!(
-                pane.snapshot.as_ref().map(|snapshot| snapshot.current),
-                Some(46),
-                "the reading the user is looking at stays while its replacement is read"
-            );
-        });
-
-        source.release();
-        settle_until(cx, "the refreshed answer", |cx| {
-            harness
-                .read(cx)
-                .pane
-                .read(cx)
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.current == 52)
-        });
-        cx.update(|_, cx| {
-            let pane = harness.read(cx).pane.read(cx);
-
-            assert!(
-                !pane.refresh_pending,
-                "the answer the refresh waited for ends the wait"
-            );
-            assert_eq!(pane.status.state(cx), WidgetState::Ready);
-        });
-        assert_eq!(
-            source.fetch_count(),
-            2,
-            "a refresh fetches once; it does not restart the stream"
-        );
-    }
-
-    /// The control is disabled while the first answer is still outstanding, and a
-    /// disabled control carries no click handler at all.
-    #[gpui_kit::test]
-    fn a_disabled_refresh_should_not_forward_a_click(cx: &mut TestAppContext) {
-        let source = FakeSource::new([FetchPlan::Pending]);
-        let (harness, cx) = header_window(cx, source.clone());
-        settle_until(cx, "the first fetch", |_| source.fetch_count() == 1);
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-
-        let button = cx
-            .debug_bounds("TEST_COIN_MARKET_CAP_FEAR_AND_GREED_INDEX_REFRESH")
-            .expect("the header draws its refresh control even while it is disabled");
-        cx.simulate_click(button.center(), Modifiers::none());
-        cx.run_until_parked();
-
-        cx.update(|_, cx| {
-            assert_eq!(
-                source.fetch_count(),
-                1,
-                "a disabled control sends nothing to the service"
-            );
-            assert_eq!(
-                harness.read(cx).pane.read(cx).status.state(cx),
-                WidgetState::Connecting
-            );
-        });
-    }
-}
+mod tests;

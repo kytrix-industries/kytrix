@@ -6,22 +6,24 @@ edition.workspace = true
 
 [dependencies]
 app_config = { workspace = true }
-app_config_provider = { workspace = true }
 base_ui = { workspace = true }
-gpui-kit = { workspace = true }
+bytes = { workspace = true }
 i18n = { workspace = true }
 kytrix_proto = { workspace = true }
 kytrix_service_provider = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+ui_core = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+# The framework's headless host (`WidgetTestApp`), which every interface test of this
+# crate drives the widget through; the feature is what turns on the engine's test support.
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
