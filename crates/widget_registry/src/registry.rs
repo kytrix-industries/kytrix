@@ -1,39 +1,86 @@
-//! The widget registry: descriptors, factories, and lookup by persisted ID.
+//! The widget registry: descriptors, mount factories, and lookup by persisted ID.
+//!
+//! Every widget is compiled into the application, so the complete catalogue is known at
+//! build time and nothing registers widgets at runtime. This crate owns the one list of
+//! them: the descriptor a selection surface lists and the erased mount a pane calls.
+//!
+//! # What a registration is, and what it is not
+//!
+//! A registration is *identity plus a monomorphized mount*. It is not a widget
+//! instance: [`WidgetView`] is not object safe (its `Config` is an associated type and
+//! its state belongs to its own type), so the registry keeps a function pointer built
+//! once per registered type rather than a trait object.
+//!
+//! The registry no longer builds the state cell, the presentation shell, the recovery
+//! control, or the header. Those are the framework's and they belong to one mount, in
+//! `AnyWidget::mount`'s documented order: scope → `WidgetStatus` (an engine `Signal`,
+//! not a toolkit entity) → surface shell → body cell and `ReloadHandle` → `W::new` →
+//! `load` → frame route. The pane supplies what only it knows — the window, the parent
+//! node, and the composition root's `Rc<WidgetServices>` — and [`WidgetRegistration`]
+//! supplies the part that is the same for all 24 entries: decoding a stored config
+//! into the widget's own type and erasing the result.
+//!
+//! # No process global
+//!
+//! The catalogue used to be installed as a toolkit global that panes looked up by
+//! type. The engine has no global registry and no global lookup: the composition root
+//! (the widget gallery, the application shell) builds [`crate::catalogue::registry`]
+//! once and passes the `WidgetRegistry` to whatever mounts a pane, exactly as it passes
+//! `Rc<WidgetServices>` — see `crates/widgets/AGENTS.md` §8.1.
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
-    error::Error as StdError,
-    fmt::{self, Display},
+    fmt,
+    rc::Rc,
 };
 
 use app_config::widget::{VersionedWidgetConfig, WidgetConfig, decode_or_default};
-use gpui_kit::{AnyView, App, AppContext, Entity, Global};
 use smol_str::SmolStr;
 use thiserror::Error;
+use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
 use widget::{
-    any::{AnyWidget, has_content_of, persisted_config_of},
+    any::AnyWidget,
     config::WidgetConfigChange,
     descriptor::WidgetDescriptor,
     identity::{WidgetId, WidgetInstanceId},
-    status::{WidgetAction, WidgetStatus},
-    surface::WidgetSurface,
+    services::WidgetServices,
     view::WidgetView,
 };
 
-/// A descriptor paired with its statically linked view factory.
+/// The erased mount one registration performs.
+///
+/// [`WidgetView`] is not object safe, so the registry keeps a function pointer
+/// monomorphized for the registered type instead of a trait object: the stored config
+/// is decoded into that type inside the function, and what comes back is the erased
+/// [`AnyWidget`] the pane hosts.
+type MountFn = fn(
+    &mut App,
+    WindowId,
+    NodeId,
+    &Rc<WidgetServices>,
+    WidgetInstanceId,
+    Option<VersionedWidgetConfig>,
+    WidgetConfigChange,
+) -> Result<AnyWidget, EngineError>;
+
+/// A descriptor paired with its statically linked mount.
 #[derive(Clone)]
 pub struct WidgetRegistration {
     descriptor: WidgetDescriptor,
-    factory: fn(Option<VersionedWidgetConfig>, WidgetConfigChange, &mut App) -> AnyWidget,
+    mount: MountFn,
 }
 
 impl WidgetRegistration {
-    /// Builds a registration whose config loading and type erasure are handled by
-    /// the framework.
+    /// Registers one statically linked view type.
+    ///
+    /// The descriptor and the mounted widget's own descriptor come from the same
+    /// declarations (`ID`, `DISPLAY_NAME`, `CATEGORY`, `DESCRIPTION`, `ICON`,
+    /// `SELECTABLE`, `Config::SCHEMA_VERSION`), so a pane's widget and the registry's
+    /// entry for it cannot disagree about any of them.
     pub fn for_view<W: WidgetView>() -> Self {
         Self {
             descriptor: descriptor_of::<W>(),
-            factory: create_widget_view::<W>,
+            mount: mount_of::<W>,
         }
     }
 
@@ -42,28 +89,76 @@ impl WidgetRegistration {
         &self.descriptor
     }
 
-    /// Instantiates the concrete view and erases it into an [`AnyWidget`].
+    /// Mounts one instance of this widget under `parent`.
     ///
-    /// `config_change` is the pane's own report, so a widget created here writes
-    /// its config back to the pane hosting it.
-    pub fn create(
+    /// `config` is the envelope the pane stored for this instance, or `None` when the
+    /// pane has none; `config_change` is the pane's own report, so a widget mounted
+    /// here writes its config back to the pane hosting it.
+    ///
+    /// Nothing here can fail on the config: a stored envelope this build cannot read —
+    /// another schema version, a payload that no longer decodes — becomes the config
+    /// type's default rather than an error, because a pane the application cannot
+    /// rebuild is worse than a pane that lost its settings. The mount itself can fail
+    /// on the engine (`EngineError`): the window or the parent node it names is gone.
+    pub fn mount(
         &self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        services: &Rc<WidgetServices>,
         config: Option<VersionedWidgetConfig>,
         config_change: WidgetConfigChange,
-        cx: &mut App,
-    ) -> Entity<AnyWidget> {
-        let widget = (self.factory)(config, config_change, cx);
-
-        cx.new(|_| widget)
+    ) -> Result<AnyWidget, EngineError> {
+        (self.mount)(
+            app,
+            window,
+            parent,
+            services,
+            WidgetInstanceId::new(),
+            config,
+            config_change,
+        )
     }
 }
 
-/// The immutable metadata of one widget type, as every registration and every
-/// created instance reports it.
+impl fmt::Debug for WidgetRegistration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WidgetRegistration")
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Decodes one stored config into the widget's own type and mounts it.
 ///
-/// One construction serves both, so a pane's widget and the registry's entry for
-/// it can never disagree about the identity, the description, the icon, or
-/// whether the widget may be offered by a selection surface.
+/// The registry's whole share of a mount: the widget is constructed from the config its
+/// type declares and the framework does the rest (see the module documentation).
+fn mount_of<W: WidgetView>(
+    app: &mut App,
+    window: WindowId,
+    parent: NodeId,
+    services: &Rc<WidgetServices>,
+    instance_id: WidgetInstanceId,
+    config: Option<VersionedWidgetConfig>,
+    config_change: WidgetConfigChange,
+) -> Result<AnyWidget, EngineError> {
+    AnyWidget::mount::<W>(
+        app,
+        window,
+        parent,
+        services,
+        instance_id,
+        decode_or_default::<W::Config>(config),
+        config_change,
+    )
+}
+
+/// The descriptor one registered type declares.
+///
+/// One construction serves both the registry's entry and the mounted widget, so the two
+/// can never disagree about the identity, the description, the icon, or whether the
+/// widget may be offered by a selection surface.
 fn descriptor_of<W: WidgetView>() -> WidgetDescriptor {
     let mut descriptor = WidgetDescriptor::new(
         W::ID,
@@ -82,82 +177,6 @@ fn descriptor_of<W: WidgetView>() -> WidgetDescriptor {
     descriptor
 }
 
-/// Creates one widget instance: config, state, recovery, then the first load.
-///
-/// The order matters. The state cell the widget reports into exists before the
-/// widget does, and the weak handle the recovery runs through with it, so every
-/// failure the widget is able to report already offers the user a way out. The
-/// surface is built around the erased body before the first load, so a widget that
-/// reports while loading is presented by the frame that follows. The first load runs
-/// last, after construction, so a widget never has to report a failure from inside
-/// its own constructor.
-///
-/// Nothing here can fail. A stored config that this build cannot read — another
-/// schema version, a payload that no longer decodes — becomes the config type's
-/// default rather than an error, because a pane the application cannot rebuild is
-/// worse than a pane that lost its settings.
-fn create_widget_view<W: WidgetView>(
-    config: Option<VersionedWidgetConfig>,
-    config_change: WidgetConfigChange,
-    cx: &mut App,
-) -> AnyWidget {
-    let instance_id = WidgetInstanceId::new();
-    let config = decode_or_default::<W::Config>(config);
-    let status: Entity<WidgetStatus> = cx.new(|_| WidgetStatus::new());
-    let view = cx.new({
-        let status = status.clone();
-        move |cx| {
-            let weak: gpui_kit::WeakEntity<W> = cx.weak_entity();
-            let reload = reload_action(weak.clone());
-            // The framework's recovery is the same capability, labelled for the
-            // user, so a failure the widget reports always offers a way out.
-            let recovery = WidgetAction::new("common.retry", reload_action(weak));
-
-            W::new(
-                instance_id,
-                config,
-                status,
-                reload,
-                config_change,
-                recovery,
-                cx,
-            )
-        }
-    });
-    let instrument_link = view.read(cx).instrument_link();
-    let body: AnyView = view.clone().into();
-    let surface = cx.new(|cx| WidgetSurface::new(status, body, has_content_of::<W>(), cx));
-    view.update(cx, |view, cx| view.load(cx));
-
-    AnyWidget::new(
-        descriptor_of::<W>(),
-        instance_id,
-        surface,
-        widget::any::build_header_of(view.downgrade()),
-        persisted_config_of::<W>(),
-        instrument_link,
-    )
-}
-
-/// The one thing every recovery this framework offers does: run `load` again.
-///
-/// It goes through a weak handle, so a widget that is gone is simply not
-/// reloaded, and a widget never keeps itself alive through its own recovery.
-fn reload_action<W: WidgetView>(view: gpui_kit::WeakEntity<W>) -> impl Fn(&mut App) + 'static {
-    move |cx: &mut App| {
-        let _ = view.update(cx, |widget, cx| widget.load(cx));
-    }
-}
-
-impl fmt::Debug for WidgetRegistration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("WidgetRegistration")
-            .field("descriptor", &self.descriptor)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Registry for statically linked widget factories.
 ///
 /// A `BTreeMap` gives deterministic ID ordering and logarithmic lookup without
@@ -166,8 +185,6 @@ impl fmt::Debug for WidgetRegistration {
 pub struct WidgetRegistry {
     registrations: BTreeMap<WidgetId, WidgetRegistration>,
 }
-
-impl Global for WidgetRegistry {}
 
 impl WidgetRegistry {
     /// Registers a statically linked widget and rejects duplicate stable IDs.
@@ -190,56 +207,41 @@ impl WidgetRegistry {
         self.registrations.get(id)
     }
 
-    /// Instantiates a widget by ID.
-    pub fn create(
-        &self,
-        id: &str,
-        config: Option<VersionedWidgetConfig>,
-        config_change: WidgetConfigChange,
-        cx: &mut App,
-    ) -> Result<Entity<AnyWidget>, WidgetCreateError> {
-        Ok(self
-            .get(id)
-            .ok_or_else(|| WidgetCreateError::NotRegistered(SmolStr::new(id)))?
-            .create(config, config_change, cx))
-    }
-
-    /// Instantiates a widget using its config type's default value.
-    pub fn create_default(
-        &self,
-        id: &str,
-        config_change: WidgetConfigChange,
-        cx: &mut App,
-    ) -> Result<Entity<AnyWidget>, WidgetCreateError> {
-        self.create(id, None, config_change, cx)
-    }
-
-    /// Instantiates a widget from the registry stored in GPUI global state.
+    /// Mounts a widget by ID under `parent`, with the config its pane stored.
     ///
-    /// The registration is cloned before invoking the factory so the immutable
-    /// global borrow does not overlap the factory's mutable `App` borrow.
-    pub fn create_global(
+    /// This is what a pane does to fill itself: the ID it restored from the layout is
+    /// looked up, and the registration mounts one instance with the pane's own config
+    /// report. A pane whose stored ID this build does not know gets
+    /// [`WidgetMountError::NotRegistered`] and shows the catalogue's fallback widget
+    /// instead (`crates/widgets/AGENTS.md` §1, `app_config::workspace::DEFAULT_WIDGET_ID`).
+    pub fn mount(
+        &self,
         id: &str,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        services: &Rc<WidgetServices>,
         config: Option<VersionedWidgetConfig>,
         config_change: WidgetConfigChange,
-        cx: &mut App,
-    ) -> Result<Entity<AnyWidget>, WidgetCreateError> {
-        let registration = cx
-            .global::<Self>()
+    ) -> Result<AnyWidget, WidgetMountError> {
+        let registration = self
             .get(id)
-            .cloned()
-            .ok_or_else(|| WidgetCreateError::NotRegistered(SmolStr::new(id)))?;
+            .ok_or_else(|| WidgetMountError::NotRegistered(SmolStr::new(id)))?;
 
-        Ok(registration.create(config, config_change, cx))
+        Ok(registration.mount(app, window, parent, services, config, config_change)?)
     }
 
-    /// Instantiates a default-config widget from GPUI global state.
-    pub fn create_default_global(
+    /// Mounts a widget by ID with its config type's default value.
+    pub fn mount_default(
+        &self,
         id: &str,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        services: &Rc<WidgetServices>,
         config_change: WidgetConfigChange,
-        cx: &mut App,
-    ) -> Result<Entity<AnyWidget>, WidgetCreateError> {
-        Self::create_global(id, None, config_change, cx)
+    ) -> Result<AnyWidget, WidgetMountError> {
+        self.mount(id, app, window, parent, services, None, config_change)
     }
 
     /// Iterates registrations in stable widget ID order.
@@ -248,77 +250,68 @@ impl WidgetRegistry {
     }
 }
 
-/// A widget registration or lookup failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A widget registration failure.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum WidgetRegistryError {
     /// A second registration attempted to claim an existing stable ID.
+    #[error("widget id `{0}` is already registered")]
     DuplicateId(WidgetId),
 }
 
-impl Display for WidgetRegistryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DuplicateId(id) => write!(formatter, "widget id `{id}` is already registered"),
-        }
-    }
-}
-
-impl StdError for WidgetRegistryError {}
-
+/// A widget lookup or mount failure.
 #[derive(Debug, Error)]
-pub enum WidgetCreateError {
+pub enum WidgetMountError {
+    /// No registration exists for the ID a pane or a selection surface asked for.
     #[error("widget id `{0}` is not registered")]
     NotRegistered(SmolStr),
+    /// The engine refused the mount: the window or the parent node it names is gone.
+    #[error(transparent)]
+    Mount(#[from] EngineError),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
     use app_config::widget::{VersionedWidgetConfig, WidgetConfig, WidgetConfigSchemaVersion};
-    use gpui_kit::{App, Context, Empty, IntoElement, Render, TestAppContext, Window};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
+    use smol_str::SmolStr;
+    use ui_core::{error::EngineError, node::builder::NodeBuilder, text::TextStyle};
     use widget::{
         category::WidgetCategory,
         config::WidgetConfigChange,
+        cx::WidgetCx,
         identity::{WidgetId, WidgetInstanceId},
         instrument_link::InstrumentLink,
-        status::{WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
-        view::WidgetView,
+        status::{Notice, WidgetAction, WidgetState, WidgetStatus},
+        test_support::{FixtureFailure, WidgetTestApp},
+        view::{HeaderGroup, ReloadHandle, WidgetView},
     };
 
     use super::*;
 
     const ALPHA_ID: WidgetId = WidgetId::new_static("kytrix.test.alpha");
     const BETA_ID: WidgetId = WidgetId::new_static("kytrix.test.beta");
-    const SCHEMA_V1: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 
-    const MESSAGES: &str = r#"
-common:
-  retry: Retry
-"#;
+    /// The notice the fixture widgets report while they have nothing to show.
+    ///
+    /// It is a key of the test host's fixture catalogue (`test.waiting`), which is the
+    /// one `WidgetTestApp::new` renders.
+    const TEST_WAITING: &str = "test.waiting";
 
-    /// Installs the translator and language the framework localizes a recovery
-    /// label with.
-    fn install(cx: &mut App) {
-        let i18n = i18n::translator::types::I18n::builder()
-            .locale_yaml(i18n::language::codes::LanguageCode::En, MESSAGES)
-            .expect("test locale should parse")
-            .fallback(i18n::language::codes::LanguageCode::En)
-            .build()
-            .expect("test translator should build");
-
-        cx.set_global(i18n);
-        cx.set_global(i18n::language::codes::LanguageCode::En);
+    thread_local! {
+        /// How many times the fixture's `load` ran on this test's thread.
+        ///
+        /// The framework calls `load` with no handle the registry could keep, so the
+        /// fixture counts its own calls. Each test runs on its own thread, so the count
+        /// does not leak from one test to the next.
+        static LOADS: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// A test app with the translator every creation path needs.
-    fn app() -> TestAppContext {
-        let cx = TestAppContext::single();
-        cx.update(install);
-
-        cx
+    /// How many times a fixture widget was loaded on this test's thread.
+    fn loads() -> usize {
+        LOADS.with(Cell::get)
     }
 
     #[derive(Clone, Default, Serialize, Deserialize)]
@@ -329,28 +322,14 @@ common:
     impl WidgetConfig for TestConfig {
         const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
     }
-
-    /// Counts how many times the framework asks a widget to load.
-    #[derive(Clone, Default)]
-    struct Loads(Rc<Cell<usize>>);
-
-    impl Loads {
-        fn count(&self) -> usize {
-            self.0.get()
-        }
-    }
-
+    /// A widget that persists one option and reports a waiting notice while it loads.
+    ///
+    /// Its own state cell is the one the framework minted; a widget keeps the handle it
+    /// was given rather than a copy of the state, which is how what it is doing reaches
+    /// the pane showing it.
     struct TestView {
-        loads: Loads,
+        status: WidgetStatus,
         config: TestConfig,
-        recovery: WidgetAction,
-        reload: Rc<dyn Fn(&mut App)>,
-        config_change: WidgetConfigChange,
-        /// The state this widget reports into.
-        ///
-        /// A widget keeps the cell it was handed rather than a copy of it: it is how
-        /// what the widget is doing reaches the pane showing it.
-        status: Entity<WidgetStatus>,
     }
 
     impl WidgetView for TestView {
@@ -363,25 +342,21 @@ common:
         fn new(
             _instance_id: WidgetInstanceId,
             config: Self::Config,
-            status: Entity<WidgetStatus>,
-            reload: impl Fn(&mut App) + 'static,
-            config_change: WidgetConfigChange,
-            recovery: WidgetAction,
-            _cx: &mut Context<Self>,
-        ) -> Self {
-            let loads = Loads::default();
-            Self {
-                loads,
-                config,
-                recovery,
-                reload: Rc::new(reload),
-                config_change,
-                status,
-            }
+            status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            _recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self { status, config })
         }
 
-        fn load(&mut self, _cx: &mut Context<Self>) {
-            self.loads.0.set(self.loads.0.get() + 1);
+        fn load(&mut self, cx: &mut WidgetCx<'_>) {
+            LOADS.with(|loads| loads.set(loads.get() + 1));
+            self.status.report(
+                cx.app_mut(),
+                WidgetState::waiting(Notice::message(TEST_WAITING)),
+            );
         }
 
         fn has_content(&self) -> bool {
@@ -391,15 +366,62 @@ common:
         fn config(&self) -> Option<&Self::Config> {
             Some(&self.config)
         }
-    }
 
-    impl Render for TestView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            Empty
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
         }
     }
 
-    /// A view that persists nothing, so the framework stores no config for it.
+    /// A widget that changes its persisted option while it loads and reports the change.
+    ///
+    /// The envelope a pane stores is built from the config the widget holds **now**, and
+    /// the report is what gets that change written out.
+    struct MutatingView {
+        config: TestConfig,
+        config_change: WidgetConfigChange,
+    }
+
+    impl WidgetView for MutatingView {
+        type Config = TestConfig;
+
+        const ID: WidgetId = WidgetId::new_static("kytrix.test.mutating");
+        const DISPLAY_NAME: &'static str = "widget.names.news";
+        const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            config: Self::Config,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
+            config_change: WidgetConfigChange,
+            _recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self {
+                config,
+                config_change,
+            })
+        }
+
+        fn load(&mut self, cx: &mut WidgetCx<'_>) {
+            self.config.seed = 9;
+            self.config_change.publish(cx.app_mut());
+        }
+
+        fn has_content(&self) -> bool {
+            false
+        }
+
+        fn config(&self) -> Option<&Self::Config> {
+            Some(&self.config)
+        }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    /// A view that persists nothing, so the registry stores no config for it.
     struct StatelessView;
 
     impl WidgetView for StatelessView {
@@ -412,25 +434,23 @@ common:
         fn new(
             _instance_id: WidgetInstanceId,
             _config: Self::Config,
-            _status: Entity<WidgetStatus>,
-            _reload: impl Fn(&mut App) + 'static,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
             _config_change: WidgetConfigChange,
             _recovery: WidgetAction,
-            _cx: &mut Context<Self>,
-        ) -> Self {
-            Self
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self)
         }
 
-        fn load(&mut self, _cx: &mut Context<Self>) {}
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
 
         fn has_content(&self) -> bool {
             false
         }
-    }
 
-    impl Render for StatelessView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            Empty
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
         }
     }
 
@@ -447,25 +467,23 @@ common:
         fn new(
             _instance_id: WidgetInstanceId,
             _config: Self::Config,
-            _status: Entity<WidgetStatus>,
-            _reload: impl Fn(&mut App) + 'static,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
             _config_change: WidgetConfigChange,
             _recovery: WidgetAction,
-            _cx: &mut Context<Self>,
-        ) -> Self {
-            Self
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self)
         }
 
-        fn load(&mut self, _cx: &mut Context<Self>) {}
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
 
         fn has_content(&self) -> bool {
             false
         }
-    }
 
-    impl Render for AlphaView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            Empty
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
         }
     }
 
@@ -482,37 +500,33 @@ common:
         fn new(
             _instance_id: WidgetInstanceId,
             _config: Self::Config,
-            _status: Entity<WidgetStatus>,
-            _reload: impl Fn(&mut App) + 'static,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
             _config_change: WidgetConfigChange,
             _recovery: WidgetAction,
-            _cx: &mut Context<Self>,
-        ) -> Self {
-            Self
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self)
         }
 
-        fn load(&mut self, _cx: &mut Context<Self>) {}
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
 
         fn has_content(&self) -> bool {
             false
         }
-    }
 
-    impl Render for BetaView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            Empty
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
         }
     }
-
     /// The selection the linked fixture propagates, written as the payload a pane
     /// stores rather than built from the model types.
     ///
-    /// The registry is the framework crate: what it has to carry through
-    /// registration without translating is the link a view offers, and the widget
-    /// API is the only listing shape it depends on. The payload is therefore
-    /// decoded into whatever selection [`InstrumentLink::new`] takes — its field
-    /// names are the ones the link's own wire shape declares — and every
-    /// assertion below compares against the payload itself.
+    /// The registry is the framework crate: what it has to carry through a mount without
+    /// translating is the link a view offers, and the widget API is the only listing
+    /// shape it depends on. The payload is therefore decoded into whatever selection
+    /// [`InstrumentLink::new`] takes — its field names are the ones the link's own wire
+    /// shape declares — and every assertion below compares against the payload itself.
     const LINKED_SELECTION: &str = r#"{"listing":{"route":{"venue":"binance","scope":"spot"},"listing_id":"listing-id/v1/9999999999999999999999999999999999999999999999999999999999999999"}}"#;
 
     /// The payload above, as the JSON both the fixture and its assertions read.
@@ -533,19 +547,23 @@ common:
         fn new(
             _instance_id: WidgetInstanceId,
             _config: Self::Config,
-            _status: Entity<WidgetStatus>,
-            _reload: impl Fn(&mut App) + 'static,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
             _config_change: WidgetConfigChange,
             _recovery: WidgetAction,
-            _cx: &mut Context<Self>,
-        ) -> Self {
-            Self
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self)
         }
 
-        fn load(&mut self, _cx: &mut Context<Self>) {}
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
 
         fn has_content(&self) -> bool {
             false
+        }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
         }
 
         fn instrument_link(&self) -> Option<InstrumentLink> {
@@ -557,15 +575,9 @@ common:
         }
     }
 
-    impl Render for LinkedView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            Empty
-        }
-    }
-
-    /// A view the framework builds for itself rather than offering to the user:
-    /// it carries a picture and a description like any other widget, and the only
-    /// thing that keeps it out of a selection surface is its own answer.
+    /// A view the framework builds for itself rather than offering to the user: it
+    /// carries a picture and a description like any other widget, and the only thing that
+    /// keeps it out of a selection surface is its own answer.
     struct InternalView;
 
     impl WidgetView for InternalView {
@@ -581,26 +593,174 @@ common:
         fn new(
             _instance_id: WidgetInstanceId,
             _config: Self::Config,
-            _status: Entity<WidgetStatus>,
-            _reload: impl Fn(&mut App) + 'static,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
             _config_change: WidgetConfigChange,
             _recovery: WidgetAction,
-            _cx: &mut Context<Self>,
-        ) -> Self {
-            Self
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self)
         }
 
-        fn load(&mut self, _cx: &mut Context<Self>) {}
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
 
         fn has_content(&self) -> bool {
             false
         }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
+        }
     }
 
-    impl Render for InternalView {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            Empty
+    /// A view that builds one control into the header group it is asked for.
+    ///
+    /// The pane owns the header row's layout and hands the widget the container of one
+    /// group, which is the whole of the old `WidgetHeader { left, right }` shape.
+    struct HeaderedView;
+
+    impl WidgetView for HeaderedView {
+        type Config = TestConfig;
+
+        const ID: WidgetId = WidgetId::new_static("kytrix.test.headered");
+        const DISPLAY_NAME: &'static str = "widget.names.candlestick";
+        const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            _config: Self::Config,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            _recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self)
         }
+
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
+
+        fn has_content(&self) -> bool {
+            false
+        }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn header(
+            &mut self,
+            group: HeaderGroup,
+            parent: NodeId,
+            cx: &mut WidgetCx<'_>,
+        ) -> Result<(), EngineError> {
+            if group == HeaderGroup::Right {
+                return Ok(());
+            }
+            NodeBuilder::text(SmolStr::new_static("sound"), TextStyle::new(13.0))
+                .id("TEST_HEADER_CONTROL")
+                .build(cx.tree_mut(), parent)?;
+            Ok(())
+        }
+    }
+
+    /// A view whose first load fails and whose recovery's load settles: the state it
+    /// reports is how a test sees which path ran.
+    struct RecoveringView {
+        status: WidgetStatus,
+        recovery: WidgetAction,
+        failed: bool,
+    }
+
+    impl WidgetView for RecoveringView {
+        type Config = TestConfig;
+
+        const ID: WidgetId = WidgetId::new_static("kytrix.test.recovering");
+        const DISPLAY_NAME: &'static str = "widget.names.candlestick";
+        const CATEGORY: WidgetCategory = WidgetCategory::Market;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            _config: Self::Config,
+            status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self {
+                status,
+                recovery,
+                failed: false,
+            })
+        }
+
+        fn load(&mut self, cx: &mut WidgetCx<'_>) {
+            if self.failed {
+                self.status.report(
+                    cx.app_mut(),
+                    WidgetState::waiting(Notice::message(TEST_WAITING)),
+                );
+                return;
+            }
+            self.failed = true;
+            self.status.report(
+                cx.app_mut(),
+                WidgetState::failed(Arc::new(FixtureFailure), self.recovery.clone()),
+            );
+        }
+
+        fn has_content(&self) -> bool {
+            false
+        }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+    /// A registry holding one fixture registration, which is what a test mounts by ID.
+    fn fixture_registry<W: WidgetView>() -> WidgetRegistry {
+        let mut registry = WidgetRegistry::default();
+        registry
+            .register(WidgetRegistration::for_view::<W>())
+            .expect("one registration per fixture");
+
+        registry
+    }
+
+    /// Mounts one widget by ID the way a pane does: through the registry, with the
+    /// composition root's services and the pane's own config report.
+    fn mount_by_id(
+        registry: &WidgetRegistry,
+        harness: &mut WidgetTestApp,
+        id: &str,
+        config: Option<VersionedWidgetConfig>,
+    ) -> AnyWidget {
+        mount_with_change(registry, harness, id, config, WidgetConfigChange::default())
+    }
+
+    /// The same, over an explicit config report.
+    fn mount_with_change(
+        registry: &WidgetRegistry,
+        harness: &mut WidgetTestApp,
+        id: &str,
+        config: Option<VersionedWidgetConfig>,
+        config_change: WidgetConfigChange,
+    ) -> AnyWidget {
+        let services = Rc::clone(harness.services_rc());
+        let window = harness.window();
+        let parent = harness.root();
+        registry
+            .mount(
+                id,
+                harness.app_mut(),
+                window,
+                parent,
+                &services,
+                config,
+                config_change,
+            )
+            .unwrap_or_else(|error| panic!("{id} should mount: {error}"))
     }
 
     #[test]
@@ -625,7 +785,10 @@ common:
         assert_eq!(descriptor.id(), &TestView::ID);
         assert_eq!(descriptor.display_name(), TestView::DISPLAY_NAME);
         assert_eq!(descriptor.category(), TestView::CATEGORY);
-        assert_eq!(descriptor.config_schema_version(), SCHEMA_V1);
+        assert_eq!(
+            descriptor.config_schema_version(),
+            WidgetConfigSchemaVersion::V1
+        );
         assert_eq!(descriptor.description(), None);
         assert_eq!(descriptor.icon(), None);
         assert!(
@@ -643,22 +806,29 @@ common:
         assert_eq!(descriptor.icon(), InternalView::ICON);
     }
 
-    /// The metadata a created widget reports is the metadata it was registered
-    /// with — identity, description, icon and selectability alike. One
-    /// construction serves both, so a pane's widget and the registry's entry for
-    /// it cannot disagree about any of them.
+    /// The metadata a mounted widget reports is the metadata it was registered with —
+    /// identity, description, icon and selectability alike. One construction serves both,
+    /// so a pane's widget and the registry's entry for it cannot disagree about any of
+    /// them.
     #[test]
-    fn a_created_widget_should_report_the_descriptor_it_was_registered_with() {
-        let registration = WidgetRegistration::for_view::<InternalView>();
-        let cx = app();
+    fn a_mounted_widget_should_report_the_descriptor_it_was_registered_with() {
+        let registry = fixture_registry::<InternalView>();
+        let mut harness = WidgetTestApp::new();
+        let widget = mount_by_id(&registry, &mut harness, InternalView::ID.as_str(), None);
 
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let descriptor = widget.read(cx).descriptor();
-
-            assert_eq!(descriptor, registration.descriptor());
-            assert!(!descriptor.selectable());
-        });
+        let descriptor = widget.descriptor();
+        assert_eq!(
+            &descriptor,
+            registry
+                .get(InternalView::ID.as_str())
+                .expect("the fixture is registered")
+                .descriptor()
+        );
+        assert_eq!(descriptor.description(), InternalView::DESCRIPTION);
+        assert!(
+            !descriptor.selectable(),
+            "the widget keeps itself out of a selection surface"
+        );
     }
 
     #[test]
@@ -680,435 +850,405 @@ common:
     }
 
     #[test]
-    fn create_should_assign_unique_instance_ids() {
-        let mut registry = WidgetRegistry::default();
-        registry
-            .register(WidgetRegistration::for_view::<TestView>())
-            .expect("registration should succeed");
-        let cx = app();
+    fn mount_should_assign_unique_instance_ids() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
 
-        cx.update(|cx| {
-            let first = registry
-                .create_default("kytrix.test.typed", WidgetConfigChange::default(), cx)
-                .expect("registered widget should be created");
-            let second = registry
-                .create_default("kytrix.test.typed", WidgetConfigChange::default(), cx)
-                .expect("registered widget should be created again");
+        let first = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
+        let second = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
 
-            assert_ne!(first.read(cx).instance_id(), second.read(cx).instance_id());
-        });
+        assert_ne!(first.instance_id(), second.instance_id());
+        assert_eq!(first.widget_id(), TestView::ID);
     }
 
     #[test]
-    fn create_should_report_unknown_widget_id() {
-        let registry = WidgetRegistry::default();
-        let cx = app();
+    fn mount_should_report_unknown_widget_id() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
+        let services = Rc::clone(harness.services_rc());
+        let window = harness.window();
+        let parent = harness.root();
 
-        cx.update(|cx| {
-            let error = registry
-                .create_default("kytrix.test.missing", WidgetConfigChange::default(), cx)
-                .expect_err("unknown widget should fail");
+        let error = registry
+            .mount_default(
+                "kytrix.test.missing",
+                harness.app_mut(),
+                window,
+                parent,
+                &services,
+                WidgetConfigChange::default(),
+            )
+            .expect_err("unknown widget should fail");
 
-            assert!(matches!(
-                error,
-                WidgetCreateError::NotRegistered(id) if id == "kytrix.test.missing"
-            ));
-        });
+        assert!(matches!(
+            error,
+            WidgetMountError::NotRegistered(id) if id == "kytrix.test.missing"
+        ));
     }
 
     #[test]
-    fn create_should_start_the_widget_once() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
+    fn mount_should_start_the_widget_once() {
+        LOADS.with(|loads| loads.set(0));
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
 
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget.read(cx).surface().read(cx).body().clone();
-            let loads = body
-                .downcast::<TestView>()
-                .expect("the body should be the widget view")
-                .read(cx)
-                .loads
-                .count();
+        let widget = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
 
-            assert_eq!(loads, 1, "the framework starts the widget's work");
-        });
+        assert_eq!(loads(), 1, "the framework starts the widget's work");
+        assert_eq!(
+            widget.status().state(harness.app()),
+            WidgetState::waiting(Notice::message(TEST_WAITING)),
+            "what the first load reported is the state the pane reads"
+        );
+        assert_eq!(harness.router().len(), 1, "the mount routes one frame");
     }
 
     #[test]
-    fn a_created_widget_should_keep_the_config_it_was_created_with() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
+    fn a_mounted_widget_should_keep_the_config_it_was_mounted_with() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
+        let config =
+            VersionedWidgetConfig::encode(&TestConfig { seed: 7 }).expect("config should encode");
+        let widget = mount_by_id(
+            &registry,
+            &mut harness,
+            TestView::ID.as_str(),
+            Some(config.clone()),
+        );
+
+        assert_eq!(
+            widget.config(),
+            Some(config),
+            "the widget reports the config it holds, so the pane stores what it is showing"
+        );
+    }
+
+    #[test]
+    fn a_widget_should_report_the_config_it_holds_after_it_changes_it() {
+        let registry = fixture_registry::<MutatingView>();
+        let mut harness = WidgetTestApp::new();
+        let reports = Rc::new(Cell::new(0));
+        let change = WidgetConfigChange::new({
+            let reports = reports.clone();
+            move |_| reports.set(reports.get() + 1)
+        });
         let config =
             VersionedWidgetConfig::encode(&TestConfig { seed: 7 }).expect("config should encode");
 
-        cx.update(|cx| {
-            let widget =
-                registration.create(Some(config.clone()), WidgetConfigChange::default(), cx);
+        let widget = mount_with_change(
+            &registry,
+            &mut harness,
+            MutatingView::ID.as_str(),
+            Some(config),
+            change,
+        );
 
-            assert_eq!(
-                widget.read(cx).config(cx),
-                Some(config),
-                "the widget reports the config it holds, so the pane stores what it is showing"
-            );
-        });
-    }
-
-    #[test]
-    fn a_widget_should_report_its_config_after_it_changes_it() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
-
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-
-            body.update(cx, |body, _| body.config.seed = 9);
-
-            assert_eq!(
-                widget.read(cx).config(cx),
-                VersionedWidgetConfig::encode(&TestConfig { seed: 9 }).ok(),
-                "the envelope is built from the config the widget holds now, not \
-                 from the one it was created with"
-            );
-        });
+        assert_eq!(
+            widget
+                .config()
+                .expect("the fixture persists its config")
+                .decode::<TestConfig>()
+                .seed,
+            9,
+            "the envelope is built from the config the widget holds now, not from the one it \
+             was mounted with"
+        );
+        assert_eq!(
+            reports.get(),
+            1,
+            "the report the pane handed the widget is the one that reaches the pane"
+        );
     }
 
     #[test]
     fn a_widget_that_persists_nothing_should_report_no_config() {
-        let registration = WidgetRegistration::for_view::<StatelessView>();
-        let cx = app();
+        let registry = fixture_registry::<StatelessView>();
+        let mut harness = WidgetTestApp::new();
         let stored =
             VersionedWidgetConfig::encode(&TestConfig { seed: 7 }).expect("config should encode");
+        let widget = mount_by_id(
+            &registry,
+            &mut harness,
+            StatelessView::ID.as_str(),
+            Some(stored),
+        );
 
-        cx.update(|cx| {
-            let widget = registration.create(Some(stored), WidgetConfigChange::default(), cx);
-
-            assert_eq!(
-                widget.read(cx).config(cx),
-                None,
-                "a widget that persists no options stores no config, whatever its \
-                 pane was restored from"
-            );
-        });
+        assert_eq!(
+            widget.config(),
+            None,
+            "a widget that persists no options stores no config, whatever its pane was \
+             restored from"
+        );
     }
 
     #[test]
-    fn a_widget_created_without_config_should_get_the_defaults() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
+    fn a_widget_mounted_without_config_should_get_the_defaults() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
+        let widget = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
 
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-
-            assert_eq!(body.read(cx).config.seed, 0);
-        });
+        assert_eq!(
+            widget
+                .config()
+                .expect("the fixture persists its config")
+                .decode::<TestConfig>()
+                .seed,
+            0
+        );
     }
 
     /// A stored config a build cannot read is a pane that comes back with default
     /// settings, not one the application refuses to rebuild.
     #[test]
     fn an_unreadable_config_should_become_the_defaults() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
         let unreadable: VersionedWidgetConfig = serde_json::from_value(json!({
-            "schema_version": SCHEMA_V1.get(),
+            "schema_version": WidgetConfigSchemaVersion::V1.get(),
             "payload": "{\"seed\":",
         }))
         .expect("the envelope itself is well formed");
+        let widget = mount_by_id(
+            &registry,
+            &mut harness,
+            TestView::ID.as_str(),
+            Some(unreadable.clone()),
+        );
 
-        cx.update(|cx| {
-            let widget =
-                registration.create(Some(unreadable.clone()), WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-
-            assert_eq!(
-                body.read(cx).config.seed,
-                0,
-                "a payload that does not decode is the default config"
-            );
-            assert_ne!(
-                widget.read(cx).config(cx),
-                Some(unreadable),
-                "the pane then writes the rebuilt config back"
-            );
-        });
+        assert_eq!(
+            widget
+                .config()
+                .expect("the fixture persists its config")
+                .decode::<TestConfig>()
+                .seed,
+            0,
+            "a payload that does not decode is the default config"
+        );
+        assert_ne!(
+            widget.config(),
+            Some(unreadable),
+            "the pane then writes the rebuilt config back"
+        );
     }
-
-    /// The status a created widget is given is the state its surface presents, and
-    /// it starts out connecting: someone asked for this widget, so its first piece
-    /// of work is the connection its data depends on.
+    /// The recovery control a mounted widget offers is the framework's: the registry
+    /// hands the mount to `AnyWidget::mount`, a failure the widget reports carries that
+    /// action, a click goes through the engine's real action dispatch, and the action
+    /// runs the widget's `load` again.
     #[test]
-    fn create_should_give_the_widget_a_status_that_starts_connecting() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
+    fn a_failed_first_load_should_offer_the_frameworks_recovery() {
+        let registry = fixture_registry::<RecoveringView>();
+        let mut harness = WidgetTestApp::new();
+        let widget = mount_by_id(&registry, &mut harness, RecoveringView::ID.as_str(), None);
+        assert!(widget.status().is_failed(harness.app()));
+        harness.drain();
 
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let status = widget.read(cx).surface().read(cx).status().clone();
+        let placeholder = harness
+            .find_by_debug_prefix(widget.surface(), "WIDGET_PLACEHOLDER")
+            .expect("the failure stands in for the missing content");
+        harness.click_recovery(placeholder);
 
-            assert_eq!(status.state(cx), WidgetState::Connecting);
-        });
+        assert_eq!(
+            widget.status().state(harness.app()),
+            WidgetState::waiting(Notice::message(TEST_WAITING)),
+            "the recovery ran the widget's load again"
+        );
     }
 
-    /// What the widget reports and what the pane presents are one state: the cell
-    /// the widget was given is the one the surface the pane embeds reads.
-    #[test]
-    fn the_status_the_widget_was_given_should_be_the_one_the_pane_reads() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
-
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-            let status = widget.read(cx).surface().read(cx).status().clone();
-            let reported = body.read(cx).status.clone();
-
-            reported.report(WidgetState::Loading, cx);
-
-            assert_eq!(
-                status.state(cx),
-                WidgetState::Loading,
-                "the widget must publish into the state the pane reads"
-            );
-        });
-    }
-
-    #[test]
-    fn the_default_recovery_should_reload_the_widget() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
-
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-
-            let recovery = body.read(cx).recovery.clone();
-            assert_eq!(recovery.label(cx).as_ref(), "Retry");
-            assert!(recovery.is_enabled());
-            recovery.run(cx);
-
-            assert_eq!(body.read(cx).loads.count(), 2);
-        });
-    }
-
-    #[test]
-    fn the_reload_the_widget_was_given_should_also_restart_it() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
-
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-
-            let reload = body.read(cx).reload.clone();
-            reload(cx);
-
-            assert_eq!(body.read(cx).loads.count(), 2);
-        });
-    }
-
-    #[test]
-    fn the_config_report_the_widget_was_given_should_reach_the_pane() {
-        let registration = WidgetRegistration::for_view::<TestView>();
-        let cx = app();
-        let reports = Rc::new(Cell::new(0));
-        let change = WidgetConfigChange::new({
-            let reports = reports.clone();
-            move |_| reports.set(reports.get() + 1)
-        });
-
-        cx.update(|cx| {
-            let widget = registration.create(None, change, cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<TestView>()
-                .expect("the body should be the widget view");
-
-            let change = body.read(cx).config_change.clone();
-            change.publish(cx);
-        });
-
-        assert_eq!(reports.get(), 1);
-    }
-
-    #[test]
-    fn create_global_should_release_registry_borrow_before_the_factory_runs() {
-        let mut registry = WidgetRegistry::default();
-        registry
-            .register(WidgetRegistration::for_view::<TestView>())
-            .expect("registration should succeed");
-        let cx = app();
-
-        cx.update(|cx| {
-            cx.set_global(registry);
-            let widget = WidgetRegistry::create_default_global(
-                "kytrix.test.typed",
-                WidgetConfigChange::default(),
-                cx,
-            )
-            .expect("global registration should create a widget");
-
-            assert_eq!(widget.read(cx).widget_id().as_str(), "kytrix.test.typed");
-        });
-    }
-
-    #[test]
-    fn a_widget_should_be_able_to_override_its_header() {
-        struct HeaderedView;
-
-        impl WidgetView for HeaderedView {
-            type Config = TestConfig;
-
-            const ID: WidgetId = WidgetId::new_static("kytrix.test.headered");
-            const DISPLAY_NAME: &'static str = "widget.names.candlestick";
-            const CATEGORY: WidgetCategory = WidgetCategory::Monitoring;
-
-            fn new(
-                _instance_id: WidgetInstanceId,
-                _config: Self::Config,
-                _status: Entity<WidgetStatus>,
-                _reload: impl Fn(&mut App) + 'static,
-                _config_change: WidgetConfigChange,
-                _recovery: WidgetAction,
-                _cx: &mut Context<Self>,
-            ) -> Self {
-                Self
-            }
-
-            fn load(&mut self, _cx: &mut Context<Self>) {}
-
-            fn has_content(&self) -> bool {
-                true
-            }
-        }
-
-        impl Render for HeaderedView {
-            fn render(
-                &mut self,
-                _window: &mut Window,
-                _cx: &mut Context<Self>,
-            ) -> impl IntoElement {
-                Empty
-            }
-        }
-
-        let registration = WidgetRegistration::for_view::<HeaderedView>();
-        let cx = app();
-
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let body = widget
-                .read(cx)
-                .surface()
-                .read(cx)
-                .body()
-                .clone()
-                .downcast::<HeaderedView>()
-                .expect("the body should be the widget view");
-
-            assert!(body.read(cx).has_content());
-            assert_eq!(
-                registration.descriptor().id().as_str(),
-                "kytrix.test.headered"
-            );
-        });
-    }
-
-    /// The link a pane receives is the exact one the view offered, listing key
-    /// included: registration reads it once, at build time, and nothing on the way
-    /// to the pane is allowed to translate it into another venue or another
-    /// listing of the same canonical instrument.
+    /// The link a pane receives is the exact one the view offered, listing key included:
+    /// the mount reads it once and nothing on the way to the pane is allowed to translate
+    /// it into another venue or another listing of the same canonical instrument.
     #[test]
     fn a_widget_should_hand_its_instrument_link_to_the_pane_unchanged() {
-        let registration = WidgetRegistration::for_view::<LinkedView>();
-        let cx = app();
+        let registry = fixture_registry::<LinkedView>();
+        let mut harness = WidgetTestApp::new();
+        let widget = mount_by_id(&registry, &mut harness, LinkedView::ID.as_str(), None);
+        let link = widget
+            .instrument_link()
+            .expect("the view offers a link, so the pane receives one");
+        let offered = linked_selection();
 
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
-            let link = widget
-                .read(cx)
-                .instrument_link()
-                .expect("the view offers a link, so the pane receives one")
-                .clone();
-            let offered = linked_selection();
-
-            assert_eq!(
-                serde_json::to_value(link.selection()).expect("a selection serializes"),
-                offered,
-                "the pane receives the selection the view offered, unchanged"
-            );
-            assert_eq!(
-                serde_json::to_value(link.listing()).expect("a listing key serializes"),
-                offered["listing"],
-                "the listing key is carried through as it was offered"
-            );
-            assert_eq!(
-                serde_json::to_value(link.selection().listing.route).expect("a route serializes"),
-                offered["listing"]["route"],
-                "the route is carried through rather than translated to another venue"
-            );
-        });
+        assert_eq!(
+            serde_json::to_value(link.selection()).expect("a selection serializes"),
+            offered,
+            "the pane receives the selection the view offered, unchanged"
+        );
+        assert_eq!(
+            serde_json::to_value(link.listing()).expect("a listing key serializes"),
+            offered["listing"],
+            "the listing key is carried through as it was offered"
+        );
+        assert_eq!(
+            serde_json::to_value(link.selection().listing.route).expect("a route serializes"),
+            offered["listing"]["route"],
+            "the route is carried through rather than translated to another venue"
+        );
     }
 
-    /// A view that offers no link gives the pane nothing to coordinate with, which
-    /// is how a widget declares that it has no instrument of its own.
+    /// A view that offers no link gives the pane nothing to coordinate with, which is how
+    /// a widget declares that it has no instrument of its own.
     #[test]
     fn a_widget_without_an_instrument_link_should_leave_the_pane_without_one() {
-        let registration = WidgetRegistration::for_view::<StatelessView>();
-        let cx = app();
+        let registry = fixture_registry::<StatelessView>();
+        let mut harness = WidgetTestApp::new();
+        let widget = mount_by_id(&registry, &mut harness, StatelessView::ID.as_str(), None);
 
-        cx.update(|cx| {
-            let widget = registration.create(None, WidgetConfigChange::default(), cx);
+        assert!(widget.instrument_link().is_none());
+    }
 
-            assert!(widget.read(cx).instrument_link().is_none());
-        });
+    /// The pane builds a header row and hands the widget the container of one group; the
+    /// widget builds into that container and an empty group occupies nothing.
+    #[test]
+    fn a_widget_should_build_its_header_into_the_group_it_is_asked_for() {
+        let registry = fixture_registry::<HeaderedView>();
+        let mut harness = WidgetTestApp::new();
+        let widget = mount_by_id(&registry, &mut harness, HeaderedView::ID.as_str(), None);
+        let parent = harness.root();
+        let nodes = harness.node_count();
+
+        widget
+            .header(harness.app_mut(), HeaderGroup::Right, parent)
+            .expect("the group the fixture leaves empty builds nothing");
+        assert_eq!(harness.node_count(), nodes);
+
+        widget
+            .header(harness.app_mut(), HeaderGroup::Left, parent)
+            .expect("the widget builds its control into the group container");
+        let control = harness
+            .find_by_debug_prefix(parent, "TEST_HEADER_CONTROL")
+            .expect("the widget's header control exists");
+        assert_eq!(
+            harness.tree().debug_id(control),
+            Some("TEST_HEADER_CONTROL")
+        );
+    }
+
+    /// A parent node the pane removed is the engine's refusal, not the registry's: the
+    /// mount reports it as its own error and rolls the shell back, so a pane is handed no
+    /// half-built widget.
+    #[test]
+    fn mounting_into_a_stale_parent_should_report_the_engine_error() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+        let window = harness.window();
+        harness
+            .app_mut()
+            .remove_node(window, parent)
+            .expect("the placeholder host is removable");
+        let services = Rc::clone(harness.services_rc());
+        let nodes = harness.node_count();
+
+        let error = registry
+            .mount_default(
+                TestView::ID.as_str(),
+                harness.app_mut(),
+                window,
+                parent,
+                &services,
+                WidgetConfigChange::default(),
+            )
+            .expect_err("a stale parent refuses the surface");
+
+        assert!(
+            matches!(
+                error,
+                WidgetMountError::Mount(EngineError::StaleNode { .. })
+            ),
+            "the engine's refusal is carried out as its own error: {error:?}"
+        );
+        assert_eq!(
+            harness.node_count(),
+            nodes,
+            "the refused mount removes the shell it built"
+        );
+        assert!(
+            harness.router().is_empty(),
+            "no frame route is registered for a widget that does not exist"
+        );
+    }
+
+    /// Two panes on one application: each mounts the same registration, so each has its
+    /// own surface, instance identity, state and frame route, and releasing one leaves the
+    /// other alone.
+    #[test]
+    fn two_panes_should_mount_the_same_registration_side_by_side() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
+        let first = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
+        let second = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
+
+        assert_ne!(first.surface(), second.surface());
+        assert_ne!(first.instance_id(), second.instance_id());
+        assert_eq!(first.widget_id(), second.widget_id());
+        assert_eq!(harness.router().len(), 2, "both panes route their frames");
+
+        assert!(first.release(harness.app_mut()) > 0);
+        assert_eq!(
+            harness.router().len(),
+            1,
+            "only the released pane's route is gone"
+        );
+        assert!(harness.tree().get(first.surface()).is_err());
+        assert!(harness.tree().get(second.surface()).is_ok());
+        assert_eq!(
+            second.status().state(harness.app()),
+            WidgetState::waiting(Notice::message(TEST_WAITING))
+        );
+    }
+
+    /// Releasing a pane gives back everything the mount took: its nodes, its frame route
+    /// and its value slots. Release is idempotent, and mounting again reuses the slots
+    /// instead of growing the table (a leaked pane shows up in `live`, a table that only
+    /// ever appends in `slots`).
+    #[test]
+    fn releasing_a_mounted_widget_should_leave_nothing_behind() {
+        let registry = fixture_registry::<TestView>();
+        let mut harness = WidgetTestApp::new();
+        let baseline_nodes = harness.node_count();
+        let baseline = harness.signal_slot_stats();
+
+        let widget = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
+        harness.drain();
+        assert_eq!(harness.router().len(), 1);
+        assert!(
+            harness.signal_slot_stats().live > baseline.live,
+            "the mounted pane minted its own values"
+        );
+
+        assert!(
+            widget.release(harness.app_mut()) > 0,
+            "the scope owned the pane's signals"
+        );
+        assert!(widget.is_released());
+        assert_eq!(harness.router().len(), 0, "the frame route is unregistered");
+        assert!(
+            harness.tree().get(widget.surface()).is_err(),
+            "the surface's nodes are gone"
+        );
+        assert_eq!(harness.node_count(), baseline_nodes);
+        assert_eq!(
+            harness.signal_slot_stats().live,
+            baseline.live,
+            "release hands every value slot back"
+        );
+        assert_eq!(
+            widget.release(harness.app_mut()),
+            0,
+            "a second release is a no-op"
+        );
+
+        // The first mount grew the table to the pane's peak; every later round has to
+        // reuse those slots instead of growing it further.
+        let released = harness.signal_slot_stats();
+        for _ in 0..8 {
+            let widget = mount_by_id(&registry, &mut harness, TestView::ID.as_str(), None);
+            widget.release(harness.app_mut());
+        }
+        assert_eq!(
+            harness.signal_slot_stats(),
+            released,
+            "eight more mount/release rounds reuse the slots instead of growing the table"
+        );
+        assert_eq!(harness.node_count(), baseline_nodes);
     }
 }
