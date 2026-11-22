@@ -6,7 +6,6 @@ edition.workspace = true
 
 [dependencies]
 futures = { workspace = true }
-gpui-kit = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -15,6 +14,7 @@ smol_str = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+ui_core = { workspace = true }
 
 # Workspace members
 app_config = { workspace = true }
@@ -23,13 +23,16 @@ instrument_selector_ui = { workspace = true }
 market_participants_connector = { workspace = true }
 market_participants_model = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
 # The connection seam a widget test connects a venue through: the crate's own
 # `test-support` feature, which is never enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
+# The engine's node/canvas inspection the chart tests read, and the framework's
+# headless host (`WidgetTestApp`), which is what every interface test drives the
+# widget through. Only the test build opens either feature.
+ui_core = { workspace = true, features = ["test-support"] }
+widget = { workspace = true, features = ["test-support"] }
 # The market participants root the header's instrument control reads the routing of is built
 # from typed runtime inputs, so a view test needs the transport hub those inputs
 # name.

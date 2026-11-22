@@ -1,563 +1,912 @@
-//! The rows the panel renders: one per configured indicator and one per parameter.
+//! The rows the panel shows: one card per configured indicator and one row per parameter.
 //!
-//! Everything here is a free function over the values a row is drawn from: the
-//! panel owns the state and the configuration, and a row only needs to know what
-//! it shows and which panel method an interaction calls. Every colour is a
-//! `ColorPicker`, never a swatch: a line list draws one per line on that line's
-//! row, and a switch row draws its own for the line colour it controls. The
-//! dimensions the design fixes live here too, beside the rows that use them.
+//! Everything here is a builder over the values a row is drawn from: the panel owns the state and
+//! the configuration, and a row only needs to know what it shows and which [`PanelEdit`] an
+//! interaction writes. The controls are
+//! [`kit`](base_ui::kit) components — a [`Button`] for the caret, the add-line row and the delete
+//! buttons, a [`Toggle`] for the checkbox that enables an indicator and for its switches, a
+//! [`FieldInput`] for every period field and a [`FieldPicker`] for every configurable colour — so
+//! their keys, action handlers and signal scopes are the components' own and the panel only keeps
+//! the handles to release.
 //!
-//! A row is not drawn on the panel: it is drawn inside the card of the indicator
-//! it belongs to (see `view::card`). The card's padding is the inset a row starts
-//! from — the node row's left edge sits one card border plus that padding inside
-//! the card — and a settings row indents its first control so that what is *drawn*
-//! lands on the vertical line the square inside the indicator's checkbox is on.
+//! The built rows are **rebuilt as a block**, never patched in place: the tree of cards is a
+//! function of `(configuration, language)` — which indicators exist, how many lines a list has,
+//! which labels a control carries — and comparing those two values is cheaper and harder to get
+//! wrong than keeping every control's copy and count in step. A field that is being typed into is
+//! not rebuilt: typing does not change the configuration, and the rebuild only runs when the
+//! widget's configuration or the language actually moved.
 //!
-//! That line is why the inset is not one number: a label or an `Input` paints from
-//! its own left edge and takes [`SETTING_INSET`], while a checkbox paints a square
-//! one padding inside its box and takes [`CHECKBOX_INSET`] so that its square lands
-//! on the same line. The rows line up by what the eye sees, not by the boxes the
-//! drawing is laid out in.
+//! The dimensions the panel fixes live here too, beside the rows that use them: the node row's
+//! height, a settings row's height, the width of a period field and the insets the rows line their
+//! controls up by. The insets are computed from the kit size steps rather than stated twice: the
+//! caret is a small button whose width is its icon plus its own paddings and border, and a settings
+//! row insets its first control so that what is *drawn* lands on the vertical line the checkbox's
+//! square is on.
 
 use base_ui::{
-    button::Button,
-    icon::{Icon, IconKind},
-    input::Input,
-    interactive::InteractiveVariantExt,
-    size::UnifiedSizable,
-    style::theme::ThemeExt,
-    toggle::Toggle,
-    tooltip::{Tooltip, TooltipExt},
+    kit::{
+        button::Button,
+        icon::IconKind,
+        size::{UnifiedSizable, UnifiedSize},
+        toggle::Toggle,
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, Role,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, base::Placement, div,
-    prelude::FluentBuilder, px,
+use i18n::t_smol;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    a11y::{A11yOverride, A11yPatch, A11yRole},
+    error::EngineError,
+    event::Action,
+    node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal},
+    paint::{color::Color, primitive::Border, style::StylePatch},
+    text::TextStyle,
 };
-use i18n::t;
+use widget::cx::WidgetCx;
 
 use super::{
-    colors::{ColorKey, LinePicker},
-    inputs::{InputKey, LineInput},
-    view::IndicatorPanel,
+    colors::{self, ColorField, ColorKey, FieldPicker, color_labels},
+    inputs::{self, FieldInput, InputField, InputKey},
+    view::{Control, PanelEdit},
 };
 use crate::indicator::{
-    IndicatorDefinition, IndicatorId, IndicatorPane, LineListConfig, SettingControl, SettingKey,
-    SettingRow,
+    CandlestickIndicatorConfig, INDICATOR_CATALOG, IndicatorDefinition, IndicatorEntry,
+    IndicatorId, IndicatorPane, LineListConfig, SettingControl, SettingKey, SettingRow,
+    definition_of,
 };
 
 /// The height of an indicator's node row.
 const NODE_ROW_HEIGHT: f32 = 28.0;
 /// The height of one settings row.
 const SETTING_ROW_HEIGHT: f32 = 32.0;
-/// The height of the hint under a field that does not hold a period.
-const HINT_ROW_HEIGHT: f32 = 18.0;
-/// How far the hint is inset past the control it explains.
-const HINT_INSET: f32 = 4.0;
 /// The gap between the caret and the checkbox that enables an indicator.
 const NODE_GAP: f32 = 4.0;
-/// The size of the caret that opens and folds an indicator's settings.
-const CARET_SIZE: f32 = 16.0;
-/// The padding an indicator's checkbox draws inside its own box, before its square.
-///
-/// `UnifiedSize::Small`'s `px()`, written as a number because a `const` cannot call
-/// it. `rows_tests` holds the two together: the square this padding leads to is the
-/// line every settings row aligns on, so the number and the control's own size must
-/// not drift apart.
-pub(super) const CHECKBOX_PADDING: f32 = 4.0;
-/// How far a settings row insets a control whose visible edge is its own box.
-///
-/// The node row puts the checkbox that enables the indicator one caret slot and one
-/// [`NODE_GAP`] in, and the square inside that checkbox a further
-/// [`CHECKBOX_PADDING`]. A label or an `Input` has no such padding of its own — its
-/// box is what is seen — so it has to start at the square's line to read as the same
-/// column: a caret slot, the gap, and the checkbox's padding.
-///
-/// `pub(super)` rather than private, which makes it visible to the whole `panel`
-/// module: the panel's tests read it as the offset a settings row's first control
-/// starts at, and that is what makes "the control is on the left, and on the
-/// checkbox's line" a measurement rather than a description. A literal 24.0 in the
-/// test would pin the number instead of the row that places its children by it.
-pub(super) const SETTING_INSET: f32 = CARET_SIZE + NODE_GAP + CHECKBOX_PADDING;
-/// How far a settings row insets a checkbox, whose visible edge is its square.
-///
-/// A checkbox draws [`CHECKBOX_PADDING`] of its own before the square, so putting
-/// its *box* on [`SETTING_INSET`] would push its square [`CHECKBOX_PADDING`] past
-/// every label and field above it. It takes one padding less and its square lands on
-/// the same line as the rest: the rows line up by what is drawn, not by the boxes
-/// the drawing is laid out in.
-const CHECKBOX_INSET: f32 = SETTING_INSET - CHECKBOX_PADDING;
+/// The gap between two controls of a settings row.
+const ROW_GAP_X: f32 = 8.0;
+/// The gap between two lines of a line list.
+const LINE_GAP: f32 = 4.0;
 /// The width of one period field.
 ///
-/// `pub(super)` for the same reason [`SETTING_INSET`] is: a test measures the field
-/// against the width the row gives it, so the number is stated once, beside the
-/// row that applies it.
+/// `pub(super)` so the panel's tests measure the field against the width the row gives it rather
+/// than pinning a second copy of the number.
 pub(super) const PERIOD_FIELD_WIDTH: f32 = 60.0;
+/// The edge of the caret glyph and of a delete button's glyph.
+const ROW_ICON_SIZE: f32 = 12.0;
+/// The padding inside one indicator's card, on all four sides.
+const CARD_PADDING: f32 = 8.0;
+/// The corner radius of one indicator's card.
+const CARD_RADIUS: f32 = 4.0;
+/// How far the invalid-period hint is inset past the control it explains.
+const HINT_INSET: f32 = 4.0;
 
-/// A section heading: "Main chart" or "Sub chart".
+/// The panel signals the rows' handlers write into.
 ///
-/// The caption is its own element so that the box the selector names is the box
-/// the text is laid out in: the row around it is a fixed height, which would say
-/// nothing about the size of the text inside it.
-///
-/// The selector names the pane the heading introduces, because the panel draws
-/// two of them and a test that measured "the section heading" would otherwise
-/// answer about whichever one the frame painted last.
-pub(super) fn section_title(pane: IndicatorPane, label: SharedString, cx: &App) -> AnyElement {
-    div()
-        .h(px(NODE_ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(cx.theme().roles.fg.muted.hsla)
-        .child(
-            div()
-                .debug_selector(move || section_title_selector(pane))
-                .child(label),
-        )
-        .into_any_element()
+/// A control's callback runs with an application context and no panel, so it cannot change the
+/// configuration: it writes what the user did, and the panel's `sync` applies it to the
+/// configuration the widget published.
+#[derive(Clone, Copy)]
+pub(super) struct Wiring {
+    /// Committed edits and panel-local actions, drained by the panel's sync.
+    pub edits: Signal<Option<PanelEdit>>,
+    /// The field currently in error, read by every row's hint and error frame.
+    pub invalid: Signal<Option<InputKey>>,
 }
 
-/// One indicator's node row: the caret, the checkbox that enables it and the
-/// indicator's name.
+/// The controls, action handlers and card nodes one rebuild produced.
 ///
-/// The row exists for every indicator, and it is always the first child of that
-/// indicator's card: an indicator with no settings is a card holding this row and
-/// nothing else. The caret exists only for one that has settings to show, and it
-/// is not a control of its own: the whole row is what opens and folds them, so it
-/// is the row that states whether they are open.
-pub(super) fn node_row(
-    index: usize,
-    definition: &'static IndicatorDefinition,
-    enabled: bool,
-    expanded: bool,
-    panel: &WeakEntity<IndicatorPanel>,
-    cx: &App,
-) -> AnyElement {
-    let caption = t!(cx, definition.name_key);
-    let expandable = !definition.rows.is_empty();
-    let id = definition.id;
-    let row_id = node_id(index);
-    let caret = if expandable {
-        let icon = caret_icon(expanded);
-        div()
-            .debug_selector(move || caret_selector(id, icon))
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(CARET_SIZE))
-            .child(
-                div()
-                    .debug_selector(move || caret_glyph_selector(id, icon))
-                    .flex_none()
-                    .child(Icon::new(icon).size_3()),
-            )
-            .into_any_element()
-    } else {
-        // The title of an indicator without a caret keeps the caret's space, so
-        // that every title in the panel starts at the same x.
-        div().size(px(CARET_SIZE)).into_any_element()
+/// The panel keeps them for as long as the rows are built: the controls have to be synced and
+/// eventually released, the handlers unregistered, and the cards are what a pointer is mirrored
+/// against.
+pub(super) struct BuiltRows {
+    pub controls: Vec<Control>,
+    pub actions: Vec<Action>,
+    pub cards: Vec<(IndicatorId, NodeId)>,
+}
+
+/// Builds the whole row tree from `config` and the current language.
+///
+/// `content` is the panel's column; every card and section heading is built under it. `hover` is
+/// one mirror per catalogue indicator, and `expanded` the panel's own open state — both are the
+/// panel's fields, handed over so a card's style closure and its settings know what they draw.
+pub(super) fn build_rows(
+    cx: &mut WidgetCx<'_>,
+    config: &CandlestickIndicatorConfig,
+    theme: &ThemeHandle,
+    wiring: Wiring,
+    hover: Vec<(IndicatorId, Signal<bool>)>,
+    expanded: Vec<(IndicatorId, bool)>,
+    content: NodeId,
+) -> Result<BuiltRows, EngineError> {
+    let mut rows = Rows {
+        cx,
+        theme: theme.clone(),
+        wiring,
+        hover,
+        expanded,
+        controls: Vec::with_capacity(32),
+        actions: Vec::with_capacity(INDICATOR_CATALOG.len() * 2),
+        cards: Vec::with_capacity(INDICATOR_CATALOG.len()),
     };
-    let toggle_panel = panel.clone();
-    let expand_panel = panel.clone();
-
-    div()
-        .id(row_id.clone())
-        // The row is an expandable node, and accesskit only reports `aria_*`
-        // for an element that declares a role. A tree item is the role that
-        // carries both the expanded and the selected state.
-        .role(Role::TreeItem)
-        .h(px(NODE_ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .gap_1()
-        .aria_label(caption.clone())
-        // The checkbox's state is the indicator's "selected" state: the node
-        // is what a reader lands on, and the toggle inside it is its control.
-        .aria_selected(enabled)
-        .when(expandable, |row| {
-            row.cursor_pointer()
-                .aria_expanded(expanded)
-                .on_click(move |_, _, cx| {
-                    let _ = expand_panel.update(cx, |panel, cx| panel.toggle_expanded(id, cx));
-                })
-        })
-        .child(caret)
-        .child(
-            Toggle::new((row_id, "enabled"))
-                .debug_selector(move || node_toggle_selector(id))
-                .checkbox()
-                .small()
-                .checked(enabled)
-                // The title is the checkbox's own label rather than a text element
-                // beside it: the toggle already lays its label out one `gap` after
-                // the square, and a second element after it would be separated by the
-                // node row's own gap as well — two spaces between two things that are
-                // one control. It also makes the title part of what the checkbox
-                // answers: pressing the name ticks the box, which is what a labelled
-                // checkbox is.
-                .label(caption.clone())
-                .aria_label(caption)
-                .on_change(move |checked, _, cx| {
-                    // Clicking the checkbox is not a second way to open the
-                    // settings under it.
-                    cx.stop_propagation();
-                    let _ = toggle_panel.update(cx, |panel, cx| panel.set_enabled(id, checked, cx));
-                }),
-        )
-        .into_any_element()
+    rows.build_all(config, content)?;
+    Ok(BuiltRows {
+        controls: rows.controls,
+        actions: rows.actions,
+        cards: rows.cards,
+    })
 }
 
-/// One `Period` row: its label on the left, its field on the right, and the hint
-/// under it while the field does not hold a period.
-///
-/// The error frame is drawn over the row rather than declared as its border. A border
-/// is part of the box the row lays its children out in, so a row that carried one
-/// would hold its controls a pixel further in than a row without one — and its last
-/// control would stop a pixel short of the card's padding however the padding was
-/// stated. An absolutely positioned overlay takes no space in the layout, so a row's
-/// controls sit at the same inset whether or not the field is in error.
-pub(super) fn period_row(
-    row_index: usize,
-    row: &SettingRow,
-    input: &LineInput,
-    invalid: bool,
-    cx: &App,
-) -> AnyElement {
-    let caption = t!(cx, row.label_key);
-    let label_selector = period_label_selector(input.id, row_index);
-
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .relative()
-                .h(px(SETTING_ROW_HEIGHT))
-                .flex()
-                .items_center()
-                .gap_2()
-                .pl(px(SETTING_INSET))
-                .when(invalid, |row| row.child(error_frame(cx)))
-                .child(
-                    div()
-                        .debug_selector(move || label_selector)
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .child(caption.clone()),
-                )
-                .child(
-                    div()
-                        .id(ElementId::NamedInteger(
-                            SharedString::new_static("CandlestickIndicatorPeriodField"),
-                            input.slot,
-                        ))
-                        .w(px(PERIOD_FIELD_WIDTH))
-                        .aria_label(caption)
-                        .child(Input::new(&input.entity).small()),
-                ),
-        )
-        .when(invalid, |row| row.child(invalid_hint(cx)))
-        .into_any_element()
+/// The builder one rebuild runs through.
+struct Rows<'a, 'b> {
+    cx: &'a mut WidgetCx<'b>,
+    theme: ThemeHandle,
+    wiring: Wiring,
+    hover: Vec<(IndicatorId, Signal<bool>)>,
+    expanded: Vec<(IndicatorId, bool)>,
+    controls: Vec<Control>,
+    actions: Vec<Action>,
+    cards: Vec<(IndicatorId, NodeId)>,
 }
 
-/// One `Switch` row: the checkbox and the name of what it switches on the left,
-/// the picker for that line's colour on the right.
-///
-/// The toggle takes the free width and the picker keeps its own, so the picker
-/// sits at the row's right edge rather than beside the label. MACD's histogram is
-/// not configurable, which is why only the rows the catalogue gives a colour have
-/// a picker.
-pub(super) fn switch_row(
-    index: usize,
-    id: IndicatorId,
-    row: &SettingRow,
-    on: bool,
-    picker: &LinePicker,
-    panel: &WeakEntity<IndicatorPanel>,
-    cx: &App,
-) -> AnyElement {
-    let caption = t!(cx, row.label_key);
-    let color = t!(cx, "widget.candlestick.indicator.line_color");
-    let key = row.key;
-    let row_selector = switch_row_selector(picker.key());
-    let toggle_selector = switch_toggle_selector(picker.key());
-    let panel = panel.clone();
-
-    div()
-        .debug_selector(move || row_selector)
-        .h(px(SETTING_ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .gap_2()
-        // The checkbox's own box takes one padding less than a label does, so that
-        // the square it draws lands on the same line as every label and field.
-        .pl(px(CHECKBOX_INSET))
-        .child(
-            div().flex_1().min_w_0().child(
-                Toggle::new((node_id(index), row.label_key))
-                    .debug_selector(move || toggle_selector)
-                    .checkbox()
-                    .small()
-                    .checked(on)
-                    .label(caption.clone())
-                    .aria_label(caption)
-                    .on_change(move |checked, _, cx| {
-                        let _ =
-                            panel.update(cx, |panel, cx| panel.set_switch(id, key, checked, cx));
-                    }),
-            ),
-        )
-        .child(color_control(picker, color_selector(picker.key()), color))
-        .into_any_element()
-}
-
-/// One line list: a row per line, and the button that adds another.
-///
-/// The whole list is one element so that the "+" button is a row of the same column
-/// as the lines it grows: the column's `gap` is what separates two lines, and a button
-/// outside the column would be separated by whatever the card put between its children
-/// — nothing, which reads as the button belonging to the last line. Only an expanded
-/// indicator draws a line list at all, so the button needs no visibility of its own.
-pub(super) fn line_list(
-    index: usize,
-    id: IndicatorId,
-    row: &SettingRow,
-    lines: &LineListConfig,
-    inputs: &[LineInput],
-    pickers: &[LinePicker],
-    invalid: Option<InputKey>,
-    panel: &WeakEntity<IndicatorPanel>,
-    cx: &App,
-) -> Option<AnyElement> {
-    let SettingControl::LineList { min_rows } = row.control else {
-        return None;
-    };
-    let can_remove = can_remove_line(min_rows, lines.rows.len());
-    let mut column = div()
-        .debug_selector(|| "TEST_PANEL_LINE_LIST".into())
-        .id((node_id(index), row.label_key))
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .aria_label(t!(cx, row.label_key));
-    for line_index in 0..lines.rows.len() {
-        let key = row.key;
-        let color_key = ColorKey {
-            id,
-            row: Some(line_index),
-            key,
-        };
-        let Some(input) = inputs
-            .iter()
-            .find(|input| input.id == id && input.row == Some(line_index) && input.key == key)
-        else {
-            continue;
-        };
-        let Some(picker) = pickers.iter().find(|picker| picker.key() == color_key) else {
-            continue;
-        };
-        let line_invalid = invalid
-            == Some(InputKey {
-                id,
-                row: Some(line_index),
-                key,
-            });
-        column = column.child(line_row(
-            line_index,
-            id,
-            input,
-            picker,
-            can_remove,
-            line_invalid,
-            panel,
-            cx,
-        ));
+impl Rows<'_, '_> {
+    /// Builds the two sections and every card they hold, in catalogue order.
+    fn build_all(
+        &mut self,
+        config: &CandlestickIndicatorConfig,
+        content: NodeId,
+    ) -> Result<(), EngineError> {
+        for pane in [IndicatorPane::Main, IndicatorPane::Sub] {
+            self.section_title(pane, content)?;
+            for entry in &config.entries {
+                let definition = definition_of(entry.id);
+                if definition.pane != pane {
+                    continue;
+                }
+                self.card(config, entry, definition, content)?;
+            }
+        }
+        Ok(())
     }
 
-    // The "+" row is the column's last child rather than a sibling of it: the gap it
-    // is separated from the last line by must be the gap between two lines, and only
-    // a child of this container is placed by its `gap`.
-    Some(
-        column
-            .child(add_line_row(index, id, panel, cx))
-            .into_any_element(),
-    )
-}
-
-/// One line of a line list: its period field, the picker that sets its colour,
-/// and the button that deletes it.
-///
-/// The field sits at the row's left, under the list's indent, and the controls
-/// sit at its right: a spacer takes the width between them, so the picker and the
-/// delete button stay at the edge whether or not the delete button is drawn. A
-/// spacer rather than `justify_between` because the number of controls varies —
-/// the last line of a list has no delete button — and `justify_between` would
-/// move the picker to the middle of the row exactly when the button is missing.
-///
-/// The picker is the control, not a swatch beside one. A line list draws exactly
-/// one picker per line, on that line's row; MACD's and KDJ's switch rows draw
-/// their own pickers for the colours those rows control. The two never share an
-/// entity, so no colour has two editors.
-fn line_row(
-    line_index: usize,
-    id: IndicatorId,
-    input: &LineInput,
-    picker: &LinePicker,
-    can_remove: bool,
-    invalid: bool,
-    panel: &WeakEntity<IndicatorPanel>,
-    cx: &App,
-) -> AnyElement {
-    let period = t!(cx, "widget.candlestick.indicator.period");
-    let remove = t!(cx, "widget.candlestick.indicator.remove_line");
-    let color = t!(cx, "widget.candlestick.indicator.line_color");
-    let delete_panel = panel.clone();
-    let row_selector = line_row_selector(id, line_index);
-    let field_selector = period_field_selector(id, line_index);
-    let delete_selector = delete_button_selector(id, line_index);
-
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .debug_selector(move || row_selector)
-                .relative()
-                .h(px(SETTING_ROW_HEIGHT))
-                .flex()
-                .items_center()
-                .gap_2()
-                .pl(px(SETTING_INSET))
-                .when(invalid, |row| row.child(error_frame(cx)))
-                .child(
-                    div()
-                        .debug_selector(move || field_selector)
-                        .id(ElementId::NamedInteger(
-                            SharedString::new_static("CandlestickIndicatorLineField"),
-                            input.slot,
-                        ))
-                        .flex_none()
-                        .w(px(PERIOD_FIELD_WIDTH))
-                        .aria_label(period)
-                        .child(Input::new(&input.entity).small()),
-                )
-                .child(div().flex_1())
-                .child(color_control(picker, color_selector(picker.key()), color))
-                // The last line of a list has no delete button at all: a drawn
-                // but disabled one would offer a control that can never act.
-                .when(can_remove, |row| {
-                    row.child(
-                        Button::new(ElementId::NamedInteger(
-                            SharedString::new_static("CandlestickIndicatorDeleteLine"),
-                            input.slot,
-                        ))
-                        .debug_selector(move || delete_selector)
-                        // An outlined control rather than a bare glyph: this is the
-                        // one row control that destroys something, and a ghost
-                        // button drew nothing until the pointer found it. The edge
-                        // says where the target is, so the trash icon reads as a
-                        // button on every line rather than as decoration.
-                        .outline()
-                        .small()
-                        .aria_label(remove.clone())
-                        .with_tooltip(remove)
-                        .on_click(move |_, _, cx| {
-                            let _ = delete_panel.update(cx, |panel, cx| {
-                                panel.remove_line(id, line_index, cx);
-                            });
-                        })
-                        // No stated width, and no centring: the button is exactly as
-                        // wide as the glyph it draws, so its two paddings are its whole
-                        // frame and the icon has nowhere to sit but the middle. An
-                        // earlier `.w(24px)` made the box 2px wider than the icon and
-                        // the extra pixel landed on one side, which read as the glyph
-                        // being nudged left. That width is gone rather than compensated
-                        // for; a centring call here would only be needed again if
-                        // something made the box wider than its content.
-                        .child(
-                            div()
-                                .debug_selector(move || delete_icon_selector(id, line_index))
-                                .flex_none()
-                                .child(Icon::new(IconKind::Trash).size_3()),
-                        ),
-                    )
-                }),
-        )
-        .when(invalid, |row| row.child(invalid_hint(cx)))
-        .into_any_element()
-}
-
-/// The "+" row: one button across the list's width, with no disabled state to
-/// reach — a list has no maximum length.
-///
-/// The caption is centred rather than left at the button's 4px padding: the
-/// button spans the whole row, so a caption at its left edge reads like a field
-/// label instead of the action that adds a line.
-///
-/// The row takes its height from the button rather than stating one: the inset the
-/// card holds its last row by is the button's own bottom edge, so a row taller than
-/// the button would leave that edge higher than every other control's, and the
-/// padding under the list would read as larger than the padding beside it.
-fn add_line_row(
-    index: usize,
-    id: IndicatorId,
-    panel: &WeakEntity<IndicatorPanel>,
-    cx: &App,
-) -> AnyElement {
-    let label = t!(cx, "widget.candlestick.indicator.add_line");
-    let panel = panel.clone();
-
-    div()
-        .debug_selector(|| "TEST_PANEL_ADD_LINE".into())
-        .w_full()
-        // The button draws its own outline from its outer edge, so the row's inset is
-        // the whole of it: the button's frame lands on the line the labels and the
-        // checkbox's square are on, and the list it grows is read as one column.
-        .pl(px(SETTING_INSET))
-        .child(
-            Button::new(ElementId::NamedInteger(
-                SharedString::new_static("CandlestickIndicatorAddLine"),
-                index as u64,
+    /// A section heading: "Main chart" or "Sub chart".
+    fn section_title(&mut self, pane: IndicatorPane, parent: NodeId) -> Result<(), EngineError> {
+        let translate = self.cx.translate().clone();
+        let language = self.cx.language();
+        let theme = self.theme.clone();
+        let holder = NodeBuilder::boxed()
+            .id(format_smolstr!(
+                "TEST_PANEL_SECTION_TITLE_{}",
+                pane_name(pane)
             ))
-            .debug_selector(|| "TEST_PANEL_ADD_LINE_BUTTON".into())
+            .style(
+                StyleBuilder::new()
+                    .height(NODE_ROW_HEIGHT)
+                    .flex_row()
+                    .items_center()
+                    .build(),
+            )
+            .build(self.cx.tree_mut(), parent)?;
+        NodeBuilder::text(
+            SmolStr::default(),
+            TextStyle::new(UnifiedSize::Medium.text_size()).with_weight(500),
+        )
+        .bind_text(move |read| {
+            let _language = *read.read(&language);
+            t_smol!(translate, section_key(pane))
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgMuted)),
+            ..StylePatch::default()
+        })
+        .build(self.cx.tree_mut(), holder)?;
+        Ok(())
+    }
+
+    /// One indicator's card: its node row, and its settings while it is open.
+    ///
+    /// The card is the box that says "these rows belong to this indicator"; a card that is folded
+    /// (or an indicator with nothing to configure) answers the pointer with a lighter surface,
+    /// while an open card draws no hover at all — its children are controls of their own.
+    fn card(
+        &mut self,
+        config: &CandlestickIndicatorConfig,
+        entry: &IndicatorEntry,
+        definition: &'static IndicatorDefinition,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let id = definition.id;
+        let name = indicator_name(id);
+        let border = self.theme.tokens().border_width;
+        let open = self.is_expanded(id) && !definition.rows.is_empty();
+        let folded = !open;
+        let hover = self.hover_signal(id);
+        let theme = self.theme.clone();
+        let card = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_CARD_{name}"))
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .flex_col()
+                    .padding(CARD_PADDING)
+                    .border(border)
+                    .build(),
+            )
+            .paint(
+                PaintBuilder::new()
+                    .rounded(CARD_RADIUS)
+                    .border(border, Color::TRANSPARENT)
+                    .build(),
+            )
+            .bind_style(move |read| {
+                let (background, border_color) =
+                    card_colors(theme.theme(read), folded, folded && *read.read(&hover));
+                StylePatch {
+                    background: Some(background),
+                    border: Some(Border {
+                        width: border,
+                        color: border_color,
+                    }),
+                    ..StylePatch::default()
+                }
+            })
+            .build(self.cx.tree_mut(), parent)?;
+        self.node_row(definition, entry.enabled, open, card)?;
+        if open {
+            for (row_index, row) in definition.rows.iter().enumerate() {
+                match row.control {
+                    SettingControl::LineList { .. } => {
+                        let Some(lines) = entry.settings.lines() else {
+                            continue;
+                        };
+                        self.line_list(config, id, row, lines, card)?;
+                    }
+                    SettingControl::Period { .. } => {
+                        let key = InputKey {
+                            id,
+                            row: None,
+                            key: row.key,
+                        };
+                        let Some(field) = inputs::field_of(config, key) else {
+                            continue;
+                        };
+                        self.period_row(id, row, row_index, field, card)?;
+                    }
+                    SettingControl::Switch => {
+                        self.switch_row(config, id, row, entry, card)?;
+                    }
+                }
+            }
+        }
+        self.cards.push((id, card));
+        Ok(())
+    }
+
+    /// One indicator's node row: the caret that opens its settings, the checkbox that enables it
+    /// and the indicator's name.
+    ///
+    /// The row itself is what opens and folds the settings, as it was in the old panel: the caret
+    /// is a copy of the same action for a reader who looks for a control, and a click anywhere on
+    /// the row that the checkbox did not take toggles the card. An indicator with no settings gets
+    /// no caret, so its card is a title that still answers the pointer.
+    fn node_row(
+        &mut self,
+        definition: &'static IndicatorDefinition,
+        enabled: bool,
+        expanded: bool,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let id = definition.id;
+        let name = indicator_name(id);
+        let caption = t_smol!(self.cx.translate(), definition.name_key);
+        let expandable = !definition.rows.is_empty();
+        let mut row = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_NODE_{name}"))
+            .style(
+                StyleBuilder::new()
+                    .height(NODE_ROW_HEIGHT)
+                    .flex_row()
+                    .items_center()
+                    .gap(NODE_GAP)
+                    .build(),
+            )
+            .a11y(A11yOverride {
+                role: Some(A11yRole::TreeItem),
+                label: Some(caption.clone()),
+                ..A11yOverride::default()
+            })
+            .bind_a11y(move |_read| A11yPatch {
+                expanded: expandable.then_some(expanded),
+                selected: Some(enabled),
+                ..A11yPatch::default()
+            });
+        if expandable {
+            let action = self.register_expand(id, &format_smolstr!("panel.node.{name}.row"));
+            row = row.on_click(action);
+        }
+        let row = row.build(self.cx.tree_mut(), parent)?;
+        if expandable {
+            let key = self
+                .cx
+                .unique_key(&format_smolstr!("panel.node.{name}.caret"));
+            let edits = self.wiring.edits;
+            let window = self.cx.window();
+            let caret = Button::new(self.cx.app_mut(), self.theme.clone(), key)
+                .ghost()
+                .small()
+                .icon(caret_icon(expanded))
+                .icon_size(ROW_ICON_SIZE)
+                .a11y_label(caption.clone())
+                .on_click(move |ctx| {
+                    ctx.write(&edits, Some(PanelEdit::ToggleExpanded(id)));
+                    let _ = ctx.app_mut().request_repaint(window);
+                });
+            caret.build(self.cx.app_mut(), window, row)?;
+            self.controls.push(Control::Button(caret));
+        } else {
+            // The title of an indicator without a caret keeps the caret's space, so that every
+            // title in the panel starts at the same x.
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .width(caret_width(&self.theme))
+                        .height(NODE_ROW_HEIGHT)
+                        .flex_none()
+                        .build(),
+                )
+                .build(self.cx.tree_mut(), row)?;
+        }
+        let key = self
+            .cx
+            .unique_key(&format_smolstr!("panel.node.{name}.enabled"));
+        let edits = self.wiring.edits;
+        let window = self.cx.window();
+        let toggle = Toggle::new(self.cx.app_mut(), self.theme.clone(), key)
+            .checkbox()
+            .small()
+            .checked(enabled)
+            .label(caption)
+            .on_change(move |checked, app| {
+                app.write(
+                    &edits,
+                    Some(PanelEdit::SetEnabled {
+                        id,
+                        enabled: checked,
+                    }),
+                );
+                let _ = app.request_repaint(window);
+            });
+        toggle.build(self.cx.app_mut(), window, row)?;
+        self.controls.push(Control::Toggle(toggle));
+        Ok(())
+    }
+
+    /// One named period row: its label on the left, its field on the right, and the hint under it
+    /// while the field does not hold a period it may take.
+    fn period_row(
+        &mut self,
+        id: IndicatorId,
+        row: &SettingRow,
+        row_index: usize,
+        field: InputField,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let name = indicator_name(id);
+        let key = InputKey {
+            id,
+            row: None,
+            key: row.key,
+        };
+        let caption = t_smol!(self.cx.translate(), row.label_key);
+        let border = self.theme.tokens().border_width;
+        let holder = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_PERIOD_ROW_{name}_{row_index}"))
+            .style(StyleBuilder::new().width_full().flex_col().build())
+            .build(self.cx.tree_mut(), parent)?;
+        let line = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .height(SETTING_ROW_HEIGHT)
+                    .flex_row()
+                    .items_center()
+                    .gap(ROW_GAP_X)
+                    .padding_sides(0.0, 0.0, 0.0, setting_inset(&self.theme))
+                    .relative()
+                    .build(),
+            )
+            .paint(
+                PaintBuilder::new()
+                    .border(border, Color::TRANSPARENT)
+                    .build(),
+            )
+            .bind_style(invalid_border(&self.theme, self.wiring.invalid, key))
+            .build(self.cx.tree_mut(), holder)?;
+        self.label_text(
+            row.label_key,
+            format_smolstr!("TEST_PANEL_PERIOD_LABEL_{name}_{row_index}"),
+            line,
+        )?;
+        let field_node = NodeBuilder::boxed()
+            .id(format_smolstr!(
+                "TEST_PANEL_PERIOD_FIELD_{name}_{row_index}"
+            ))
+            .style(
+                StyleBuilder::new()
+                    .width(PERIOD_FIELD_WIDTH)
+                    .flex_none()
+                    .build(),
+            )
+            // The kit input's own accessible name is its action key; the labelled group around
+            // it is what tells a reader which setting the field edits.
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Group),
+                label: Some(caption),
+                ..A11yOverride::default()
+            })
+            .build(self.cx.tree_mut(), line)?;
+        let suffix = format_smolstr!("panel.period.{name}.{}", setting_name(row.key));
+        let input = FieldInput::build(&mut *self.cx, field_node, &field, suffix.as_str());
+        self.controls.push(Control::Input(input));
+        self.invalid_hint(
+            key,
+            format_smolstr!("TEST_PANEL_INVALID_{name}_{row_index}"),
+            holder,
+        )?;
+        Ok(())
+    }
+
+    /// One switch row: the checkbox and the name of what it switches on the left, the picker for
+    /// that line's colour on the right.
+    fn switch_row(
+        &mut self,
+        config: &CandlestickIndicatorConfig,
+        id: IndicatorId,
+        row: &SettingRow,
+        entry: &IndicatorEntry,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let Some(color_key) = row.color_key else {
+            return Ok(());
+        };
+        let color_key = ColorKey {
+            id,
+            row: None,
+            key: color_key,
+        };
+        let Some(field) = colors::field_of(config, color_key) else {
+            return Ok(());
+        };
+        let caption = t_smol!(self.cx.translate(), row.label_key);
+        let on = entry.settings.switch(row.key).unwrap_or(false);
+        let name = indicator_name(id);
+        let setting = row.key;
+        let holder = NodeBuilder::boxed()
+            .id(format_smolstr!(
+                "TEST_PANEL_SWITCH_ROW_{name}_{}",
+                setting_name(setting)
+            ))
+            .style(
+                StyleBuilder::new()
+                    .height(SETTING_ROW_HEIGHT)
+                    .flex_row()
+                    .items_center()
+                    .gap(ROW_GAP_X)
+                    .padding_sides(0.0, 0.0, 0.0, checkbox_inset(&self.theme))
+                    .build(),
+            )
+            .build(self.cx.tree_mut(), parent)?;
+        self.toggle_row(
+            id,
+            setting,
+            caption,
+            on,
+            &format_smolstr!("panel.switch.{name}.{}", setting_name(setting)),
+            holder,
+        )?;
+        let labels = color_labels(self.cx.translate());
+        let color_holder = NodeBuilder::boxed()
+            .id(format_smolstr!(
+                "TEST_PANEL_COLOR_{name}_{}",
+                setting_name(color_key.key)
+            ))
+            .style(StyleBuilder::new().flex_none().build())
+            .build(self.cx.tree_mut(), holder)?;
+        let suffix = format_smolstr!("panel.color.{name}.{}", setting_name(color_key.key));
+        let picker = FieldPicker::build(
+            &mut *self.cx,
+            color_holder,
+            &field,
+            &labels,
+            self.wiring.edits,
+            suffix.as_str(),
+        )?;
+        self.controls.push(Control::Picker(picker));
+        Ok(())
+    }
+
+    /// Builds a checkbox toggle into `parent` and connects it to one named switch.
+    fn toggle_row(
+        &mut self,
+        id: IndicatorId,
+        setting: SettingKey,
+        caption: SmolStr,
+        on: bool,
+        suffix: &str,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let holder = NodeBuilder::boxed()
+            .style(StyleBuilder::new().flex_1().min_width_0().build())
+            .build(self.cx.tree_mut(), parent)?;
+        let key = self.cx.unique_key(suffix);
+        let edits = self.wiring.edits;
+        let window = self.cx.window();
+        let toggle = Toggle::new(self.cx.app_mut(), self.theme.clone(), key)
+            .checkbox()
+            .small()
+            .checked(on)
+            .label(caption)
+            .on_change(move |checked, app| {
+                app.write(
+                    &edits,
+                    Some(PanelEdit::SetSwitch {
+                        id,
+                        key: setting,
+                        on: checked,
+                    }),
+                );
+                let _ = app.request_repaint(window);
+            });
+        toggle.build(self.cx.app_mut(), window, holder)?;
+        self.controls.push(Control::Toggle(toggle));
+        Ok(())
+    }
+
+    /// One line list: a row per line, and the button that adds another.
+    fn line_list(
+        &mut self,
+        config: &CandlestickIndicatorConfig,
+        id: IndicatorId,
+        row: &SettingRow,
+        lines: &LineListConfig,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let SettingControl::LineList { min_rows } = row.control else {
+            return Ok(());
+        };
+        let name = indicator_name(id);
+        let list = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_LINE_LIST_{name}"))
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .flex_col()
+                    .gap(LINE_GAP)
+                    .build(),
+            )
+            .build(self.cx.tree_mut(), parent)?;
+        let can_remove = can_remove_line(min_rows, lines.rows.len());
+        for index in 0..lines.rows.len() {
+            let input_key = InputKey {
+                id,
+                row: Some(index),
+                key: row.key,
+            };
+            let color_key = ColorKey {
+                id,
+                row: Some(index),
+                key: row.key,
+            };
+            let (Some(field), Some(color)) = (
+                inputs::field_of(config, input_key),
+                colors::field_of(config, color_key),
+            ) else {
+                continue;
+            };
+            self.line_row(id, index, field, color, can_remove, list)?;
+        }
+        self.add_line_row(id, list)?;
+        Ok(())
+    }
+
+    /// One line of a line list: its period field, the picker that sets its colour, and the button
+    /// that deletes it.
+    fn line_row(
+        &mut self,
+        id: IndicatorId,
+        index: usize,
+        field: InputField,
+        color: ColorField,
+        can_remove: bool,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let name = indicator_name(id);
+        let input_key = InputKey {
+            id: field.id,
+            row: field.row,
+            key: field.key,
+        };
+        let border = self.theme.tokens().border_width;
+        let holder = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_LINE_ROW_{name}_{index}"))
+            .style(StyleBuilder::new().width_full().flex_col().build())
+            .build(self.cx.tree_mut(), parent)?;
+        let line_node = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .height(SETTING_ROW_HEIGHT)
+                    .flex_row()
+                    .items_center()
+                    .gap(ROW_GAP_X)
+                    .padding_sides(0.0, 0.0, 0.0, setting_inset(&self.theme))
+                    .relative()
+                    .build(),
+            )
+            .paint(
+                PaintBuilder::new()
+                    .border(border, Color::TRANSPARENT)
+                    .build(),
+            )
+            .bind_style(invalid_border(&self.theme, self.wiring.invalid, input_key))
+            .build(self.cx.tree_mut(), holder)?;
+        let field_node = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_LINE_FIELD_{name}_{index}"))
+            .style(
+                StyleBuilder::new()
+                    .width(PERIOD_FIELD_WIDTH)
+                    .flex_none()
+                    .build(),
+            )
+            // A line has no visible label of its own; the group's name is the setting it edits,
+            // which is what a reader needs to hear before the field's value.
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Group),
+                label: Some(t_smol!(
+                    self.cx.translate(),
+                    "widget.candlestick.indicator.period"
+                )),
+                ..A11yOverride::default()
+            })
+            .build(self.cx.tree_mut(), line_node)?;
+        let suffix = format_smolstr!("panel.line.{name}.{index}.period");
+        let input = FieldInput::build(&mut *self.cx, field_node, &field, suffix.as_str());
+        self.controls.push(Control::Input(input));
+        NodeBuilder::boxed()
+            .style(StyleBuilder::new().flex_1().build())
+            .build(self.cx.tree_mut(), line_node)?;
+        let labels = color_labels(self.cx.translate());
+        let color_holder = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_COLOR_{name}_{index}"))
+            .style(StyleBuilder::new().flex_none().build())
+            .build(self.cx.tree_mut(), line_node)?;
+        let suffix = format_smolstr!("panel.color.{name}.{index}");
+        let picker = FieldPicker::build(
+            &mut *self.cx,
+            color_holder,
+            &color,
+            &labels,
+            self.wiring.edits,
+            suffix.as_str(),
+        )?;
+        self.controls.push(Control::Picker(picker));
+        if can_remove {
+            self.delete_line(id, index, line_node)?;
+        }
+        self.invalid_hint(
+            input_key,
+            format_smolstr!("TEST_PANEL_INVALID_{name}_{index}"),
+            holder,
+        )?;
+        Ok(())
+    }
+
+    /// The button that deletes one line.
+    ///
+    /// The last line of a list has no delete button at all: a drawn but disabled one would offer a
+    /// control that can never act, and the configuration refuses the removal anyway.
+    fn delete_line(
+        &mut self,
+        id: IndicatorId,
+        index: usize,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let name = indicator_name(id);
+        let label = t_smol!(
+            self.cx.translate(),
+            "widget.candlestick.indicator.remove_line"
+        );
+        let holder = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_DELETE_LINE_{name}_{index}"))
+            .style(StyleBuilder::new().flex_none().build())
+            .build(self.cx.tree_mut(), parent)?;
+        let key = self
+            .cx
+            .unique_key(&format_smolstr!("panel.line.{name}.{index}.delete"));
+        let edits = self.wiring.edits;
+        let window = self.cx.window();
+        let button = Button::new(self.cx.app_mut(), self.theme.clone(), key)
             .outline()
             .small()
-            .w_full()
-            .justify_center()
-            .aria_label(label.clone())
-            .with_tooltip(label.clone())
-            .on_click(move |_, _, cx| {
-                let _ = panel.update(cx, |panel, cx| panel.add_line(id, cx));
-            })
-            .child(
-                div()
-                    .debug_selector(|| "TEST_PANEL_ADD_LINE_LABEL".into())
-                    .flex_none()
-                    .child(label),
-            ),
+            .icon(IconKind::Trash)
+            .icon_size(ROW_ICON_SIZE)
+            .a11y_label(label)
+            .on_click(move |ctx| {
+                ctx.write(&edits, Some(PanelEdit::RemoveLine { id, index }));
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        button.build(self.cx.app_mut(), window, holder)?;
+        self.controls.push(Control::Button(button));
+        Ok(())
+    }
+
+    /// The "+" row: one button under the last line of a list.
+    fn add_line_row(&mut self, id: IndicatorId, parent: NodeId) -> Result<(), EngineError> {
+        let name = indicator_name(id);
+        let label = t_smol!(self.cx.translate(), "widget.candlestick.indicator.add_line");
+        let holder = NodeBuilder::boxed()
+            .id(format_smolstr!("TEST_PANEL_ADD_LINE_{name}"))
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .flex_row()
+                    .padding_sides(0.0, 0.0, 0.0, setting_inset(&self.theme))
+                    .build(),
+            )
+            .build(self.cx.tree_mut(), parent)?;
+        let key = self
+            .cx
+            .unique_key(&format_smolstr!("panel.add_line.{name}"));
+        let edits = self.wiring.edits;
+        let window = self.cx.window();
+        let button = Button::new(self.cx.app_mut(), self.theme.clone(), key)
+            .outline()
+            .small()
+            .label(label.clone())
+            .a11y_label(label)
+            .on_click(move |ctx| {
+                ctx.write(&edits, Some(PanelEdit::AddLine(id)));
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        button.build(self.cx.app_mut(), window, holder)?;
+        self.controls.push(Control::Button(button));
+        Ok(())
+    }
+
+    /// A row label: a text node whose sentence is resolved on the frame that draws it.
+    fn label_text(
+        &mut self,
+        key: &'static str,
+        id: SmolStr,
+        parent: NodeId,
+    ) -> Result<NodeId, EngineError> {
+        let translate = self.cx.translate().clone();
+        let language = self.cx.language();
+        let theme = self.theme.clone();
+        NodeBuilder::text(
+            SmolStr::default(),
+            TextStyle::new(UnifiedSize::Small.text_size()),
         )
-        .into_any_element()
+        .id(id)
+        .style(StyleBuilder::new().flex_1().min_width_0().build())
+        .bind_text(move |read| {
+            let _language = *read.read(&language);
+            t_smol!(translate, key)
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::FgDefault)),
+            ..StylePatch::default()
+        })
+        .build(self.cx.tree_mut(), parent)
+    }
+
+    /// The hint under a field whose text is not a period it may take.
+    ///
+    /// The node is always built and carries no text while the field is valid: an empty text
+    /// measures nothing, so the row is as tall as its controls, and the sentence grows it only
+    /// while the user is looking at it.
+    fn invalid_hint(
+        &mut self,
+        key: InputKey,
+        id: SmolStr,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let translate = self.cx.translate().clone();
+        let language = self.cx.language();
+        let theme = self.theme.clone();
+        let invalid = self.wiring.invalid;
+        let inset = setting_inset(&self.theme) + HINT_INSET;
+        NodeBuilder::text(
+            SmolStr::default(),
+            TextStyle::new(UnifiedSize::Small.text_size()),
+        )
+        .id(id)
+        .style(
+            StyleBuilder::new()
+                .padding_sides(0.0, 0.0, 0.0, inset)
+                .build(),
+        )
+        .bind_text(move |read| {
+            let _language = *read.read(&language);
+            if *read.read(&invalid) == Some(key) {
+                t_smol!(translate, "widget.candlestick.indicator.period_invalid")
+            } else {
+                SmolStr::default()
+            }
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::StatusDangerBase)),
+            ..StylePatch::default()
+        })
+        .build(self.cx.tree_mut(), parent)?;
+        Ok(())
+    }
+
+    /// Registers the action that opens or folds one indicator's settings, and returns it.
+    ///
+    /// The action identity is minted from the pane's own scope, so two panes never share one, and
+    /// a row rebuilt on a later frame reclaims the action it registered before.
+    fn register_expand(&mut self, id: IndicatorId, suffix: &str) -> Action {
+        let action = Action::Custom(format_smolstr!("{}.click", self.cx.unique_key(suffix)));
+        let edits = self.wiring.edits;
+        let window = self.cx.window();
+        self.cx.app_mut().on_action(action.clone(), move |ctx| {
+            ctx.write(&edits, Some(PanelEdit::ToggleExpanded(id)));
+            let _ = ctx.app_mut().request_repaint(window);
+        });
+        self.actions.push(action.clone());
+        action
+    }
+
+    /// The hover mirror of one card.
+    fn hover_signal(&self, id: IndicatorId) -> Signal<bool> {
+        self.hover
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, signal)| *signal)
+            .expect("every catalogue indicator has a hover mirror")
+    }
+
+    /// Whether `id`'s settings are open.
+    ///
+    /// An indicator the list does not name is open: that is the same answer the constructor
+    /// gives, so a catalogue entry the panel has not seen starts open rather than folded and
+    /// unreachable.
+    fn is_expanded(&self, id: IndicatorId) -> bool {
+        self.expanded
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .is_none_or(|(_, open)| *open)
+    }
+}
+
+/// The colours one card is painted in, given what it is and whether the pointer is on it.
+///
+/// A pure function so the three states the design asks for are one piece of logic a test can call:
+/// a folded card under the pointer, a folded card at rest, and an open card (which draws no hover
+/// at all). The hover lifts the surface to the control colour and strengthens the edge rather than
+/// compositing a veil; the engine's paint has no blend step for the panel to ask for, and the
+/// difference is recorded in the migration report.
+pub(super) fn card_colors(theme: &Theme, folded: bool, hovered: bool) -> (Color, Color) {
+    let background = theme.role(Role::SurfaceSunken);
+    if !folded || !hovered {
+        return (background, theme.role(Role::LineDivider));
+    }
+    (
+        theme.role(Role::SurfaceControl),
+        theme.role(Role::LineStrong),
+    )
 }
 
 /// Whether a line list with `rows` lines may lose one of them.
 ///
-/// A line list never goes below the minimum its catalogue row declares, and at
-/// that minimum the row's delete button is not drawn at all: nothing in the row
-/// can be pressed to empty the list, and the configuration refuses the removal
-/// as well.
+/// A line list never goes below the minimum its catalogue row declares, and at that minimum the
+/// row's delete button is not drawn at all.
 pub(super) fn can_remove_line(min_rows: usize, rows: usize) -> bool {
     rows > min_rows
 }
 
 /// The icon that states whether an indicator's settings are open.
 ///
-/// This is the one place the direction is decided: the caret points down while
-/// the settings are drawn and right while they are folded, so the same control
-/// says both "this is open" and "this opens".
+/// The one place the direction is decided: the caret points down while the settings are drawn and
+/// right while they are folded, so the same control says both "this is open" and "this opens".
 pub(super) fn caret_icon(expanded: bool) -> IconKind {
     if expanded {
         IconKind::CaretDown
@@ -566,248 +915,65 @@ pub(super) fn caret_icon(expanded: bool) -> IconKind {
     }
 }
 
-/// The picker of one colour setting, wrapped in its tooltip and its test selector.
+/// The border of a row that holds a field in error, transparent while the field is valid.
 ///
-/// The tooltip is placed below its trigger, which is the direction the panel asks
-/// for. The picker's own panel opens downwards from the same control and covers the
-/// tooltip when it does; that is intended — the panel is what the user is working in,
-/// and the caption has already done its job by the time it is open. Opening the panel
-/// also takes the pointer off the trigger, so in practice the tooltip is gone before
-/// the panel has finished appearing.
-fn color_control(picker: &LinePicker, selector: String, label: SharedString) -> AnyElement {
-    div()
-        .debug_selector(move || selector)
-        .flex_none()
-        .child(
-            Tooltip::new(
-                ElementId::NamedInteger(
-                    SharedString::new_static("CandlestickIndicatorColorTooltip"),
-                    picker.slot(),
-                ),
-                picker.entity().clone(),
-            )
-            .placement(Placement::Bottom)
-            .content(label),
-        )
-        .into_any_element()
-}
-
-/// The hint under a field whose text is not a period it may take.
-///
-/// It starts [`HINT_INSET`] past the label it explains, which is the row's first
-/// control and therefore begins at [`SETTING_INSET`] from the row's edge.
-fn invalid_hint(cx: &App) -> AnyElement {
-    div()
-        .debug_selector(|| "TEST_PANEL_INVALID_PERIOD".into())
-        .h(px(HINT_ROW_HEIGHT))
-        .pl(px(SETTING_INSET + HINT_INSET))
-        .text_xs()
-        .text_color(cx.theme().roles.status.danger.base.hsla)
-        .child(t!(cx, "widget.candlestick.indicator.period_invalid"))
-        .into_any_element()
-}
-
-/// The frame marking a field in error, drawn over the row it belongs to.
-///
-/// An overlay rather than the row's own border: a border is laid out, so a row
-/// carrying one would hold its controls a pixel further in than a row without one.
-/// `inset_0` pins it to the row's edges, and being absolutely positioned it takes no
-/// space in the row's layout — which is what keeps the last control's right edge on
-/// the card's padding whether or not this frame is drawn.
-fn error_frame(cx: &App) -> AnyElement {
-    div()
-        .absolute()
-        .inset_0()
-        .border_1()
-        .border_color(cx.theme().roles.status.danger.base.hsla)
-        .into_any_element()
-}
-
-/// The element id of one indicator's card.
-///
-/// A card needs an id of its own because it carries state — the pointer's hover,
-/// and the two transitions that follow it — and because that state must survive the
-/// panel being redrawn: an id that moved with the frame would reset the transition
-/// on every keystroke in a field under it.
-pub(super) fn card_id(index: usize) -> ElementId {
-    ElementId::NamedInteger(
-        SharedString::new_static("CandlestickIndicatorCard"),
-        index as u64,
-    )
-}
-
-/// The element id of one indicator's node row, and of everything named after it.
-fn node_id(index: usize) -> ElementId {
-    ElementId::NamedInteger(
-        SharedString::new_static("CandlestickIndicator"),
-        index as u64,
-    )
-}
-
-/// The debug selector of one indicator's caret.
-///
-/// An indicator with no settings rows is drawn without a caret, which is what a
-/// test asks this selector for. The direction is part of the name, and it is read
-/// from the icon the row is about to draw rather than from the flag it was given:
-/// a selector that said "right" because the row was folded would still say it
-/// after the row started drawing a left caret, which is the bug the selector is
-/// there to catch.
-///
-/// The names are written out rather than derived from the id's `Debug` spelling:
-/// a selector a test reads should not depend on how a derive happens to print.
-fn caret_selector(id: IndicatorId, icon: IconKind) -> String {
-    let direction = match icon {
-        IconKind::CaretDown => "DOWN",
-        IconKind::CaretRight => "RIGHT",
-        IconKind::CaretLeft => "LEFT",
-        _ => panic!("only a caret names a caret selector"),
-    };
-    format!("TEST_PANEL_CARET_{}_{direction}", indicator_name(id))
-}
-
-/// The debug selector of one indicator's card.
-///
-/// The box a test measures the node row and the settings against: everything the
-/// indicator draws is inside this card, which is what lets a test say "these rows
-/// belong to this indicator" rather than "these rows are somewhere in the panel".
-pub(super) fn card_selector(id: IndicatorId) -> String {
-    format!("TEST_PANEL_CARD_{}", indicator_name(id))
-}
-
-/// The debug selector of the arrow glyph itself, inside the slot that holds it.
-///
-/// The slot is a fixed 16px and the arrow inside it is 12, so the slot's own box
-/// says nothing about where the arrow is: a caret inset within its slot moves the
-/// glyph and leaves the slot exactly where it was. What the alignment is about is
-/// the glyph, so the glyph is what gets the selector.
-fn caret_glyph_selector(id: IndicatorId, icon: IconKind) -> String {
-    let direction = match icon {
-        IconKind::CaretDown => "DOWN",
-        IconKind::CaretRight => "RIGHT",
-        IconKind::CaretLeft => "LEFT",
-        _ => panic!("only a caret names a caret glyph selector"),
-    };
-    format!("TEST_PANEL_CARET_GLYPH_{}_{direction}", indicator_name(id))
-}
-
-/// The debug selector of the checkbox that enables one indicator.
-///
-/// A settings row aligns its first control with this box's left edge, so a test
-/// that says "the parameter starts under the checkbox" has to be able to ask where
-/// the checkbox is.
-fn node_toggle_selector(id: IndicatorId) -> String {
-    format!("TEST_PANEL_NODE_TOGGLE_{}", indicator_name(id))
-}
-
-/// The debug selector of one `Period` row's label.
-///
-/// Named after the indicator and the row's place in its catalogue entry: a
-/// period row has no line index, and two of an indicator's rows can both be
-/// periods (MACD has three), so the position is what tells them apart.
-fn period_label_selector(id: IndicatorId, row_index: usize) -> String {
-    let name = indicator_name(id);
-    format!("TEST_PANEL_PERIOD_LABEL_{name}_{row_index}")
-}
-
-/// The debug selector of the heading that introduces one region of the chart.
-fn section_title_selector(pane: IndicatorPane) -> String {
-    let pane = match pane {
-        IndicatorPane::Main => "MAIN",
-        IndicatorPane::Sub => "SUB",
-    };
-    format!("TEST_PANEL_SECTION_TITLE_{pane}")
-}
-
-/// The debug selector of one colour picker.
-///
-/// A line's picker is named after its indicator and its line, and a switch row's
-/// after its indicator and the line key it controls. The indicator name keeps the
-/// selectors apart even though two indicators' line lists both start at row 0.
-fn color_selector(key: ColorKey) -> String {
-    let name = indicator_name(key.id);
-    match key.row {
-        Some(row) => format!("TEST_PANEL_COLOR_{name}_{row}"),
-        None => format!("TEST_PANEL_COLOR_{name}_{}", color_key_name(key.key)),
+/// The frame is painted over the row rather than declared as a layout border, so a row holds its
+/// controls at the same inset whether or not the field is in error.
+fn invalid_border(
+    theme: &ThemeHandle,
+    invalid: Signal<Option<InputKey>>,
+    key: InputKey,
+) -> impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static {
+    let theme = theme.clone();
+    let width = theme.tokens().border_width;
+    move |read| {
+        let color = if *read.read(&invalid) == Some(key) {
+            theme.role(read, Role::StatusDangerBorder)
+        } else {
+            Color::TRANSPARENT
+        };
+        StylePatch {
+            border: Some(Border { width, color }),
+            ..StylePatch::default()
+        }
     }
 }
 
-/// The debug selector of one `Switch` row.
+/// The width of the caret button, from the kit's small size step.
 ///
-/// The row is named after the same key its picker is, so a test can ask whether
-/// the picker is drawn inside the row and where it sits on it.
-fn switch_row_selector(key: ColorKey) -> String {
-    let name = indicator_name(key.id);
-    format!("TEST_PANEL_SWITCH_ROW_{name}_{}", color_key_name(key.key))
+/// A small button is its icon plus its own horizontal paddings and its layout border; the caret
+/// overrides the icon edge to 12 so the glyph keeps the size the old panel gave it.
+fn caret_width(theme: &ThemeHandle) -> f32 {
+    ROW_ICON_SIZE + 2.0 * UnifiedSize::Small.px() + 2.0 * theme.tokens().border_width
 }
 
-/// The debug selector of the checkbox inside one `Switch` row.
+/// How far a settings row insets a control whose visible edge is its own box.
 ///
-/// The row and its checkbox are two boxes: the row is what the inset places and the
-/// toggle is what the first-control alignment is about, so a test that asked only
-/// for the row would answer about the wrong box.
-fn switch_toggle_selector(key: ColorKey) -> String {
-    let name = indicator_name(key.id);
-    format!(
-        "TEST_PANEL_SWITCH_TOGGLE_{name}_{}",
-        color_key_name(key.key)
-    )
+/// The node row puts the checkbox one caret and one gap in, and the square inside that checkbox a
+/// further small-control padding. A label or a field has no such padding of its own, so it starts
+/// at that many pixels to read as the same column.
+fn setting_inset(theme: &ThemeHandle) -> f32 {
+    caret_width(theme) + NODE_GAP + UnifiedSize::Small.px()
 }
 
-/// The debug selector of one line of a line list.
+/// How far a settings row insets a checkbox, whose visible edge is its square.
 ///
-/// The row is what a test measures the controls inside it against: the field's
-/// left edge and the controls' right edge are stated relative to it. The line
-/// index is part of the name because a list draws as many rows as it has lines.
-fn line_row_selector(id: IndicatorId, line_index: usize) -> String {
-    let name = indicator_name(id);
-    format!("TEST_PANEL_LINE_ROW_{name}_{line_index}")
+/// A checkbox draws one small-control padding of its own before the square, so putting its box on
+/// [`setting_inset`] would push its square past every label above it. It takes one padding less,
+/// and the rows line up by what is drawn.
+fn checkbox_inset(theme: &ThemeHandle) -> f32 {
+    setting_inset(theme) - UnifiedSize::Small.px()
 }
 
-/// The debug selector of the wrapper around one line's period field.
-///
-/// The wrapper, not the field itself: the field is a `base_ui` input whose box a
-/// test already finds under its own selector, and what this row decides is where
-/// the wrapper it was given is placed.
-fn period_field_selector(id: IndicatorId, line_index: usize) -> String {
-    let name = indicator_name(id);
-    format!("TEST_PANEL_PERIOD_FIELD_{name}_{line_index}")
-}
-
-/// The debug selector of one line's delete button.
-///
-/// Named after its line like the row it sits on: a list draws one delete button
-/// per line, so a selector every one of them shares would answer about whichever
-/// of them the frame happened to paint last.
-fn delete_button_selector(id: IndicatorId, line_index: usize) -> String {
-    let name = indicator_name(id);
-    format!("TEST_PANEL_DELETE_LINE_{name}_{line_index}")
-}
-
-/// The debug selector of the glyph inside one line's delete button.
-///
-/// The wrapper, not the icon: `Icon` is a `RenderOnce` over an `svg()`, which has no
-/// selector of its own, and what a centring test has to measure is the glyph's box
-/// against the button's. A wrapper with no styling of its own is that box: it takes
-/// the icon's size and is placed by the button exactly where the icon is drawn, so the
-/// two agree to the pixel while the wrapper is the thing that can be asked for.
-fn delete_icon_selector(id: IndicatorId, line_index: usize) -> String {
-    let name = indicator_name(id);
-    format!("TEST_PANEL_DELETE_ICON_{name}_{line_index}")
-}
-
-/// The name a colour key is written under in a test selector.
-fn color_key_name(key: SettingKey) -> &'static str {
-    match key {
-        SettingKey::DifColor => "DIF",
-        SettingKey::DeaColor => "DEA",
-        SettingKey::KColor => "K",
-        SettingKey::DColor => "D",
-        SettingKey::JColor => "J",
-        _ => panic!("only a colour setting names a colour selector"),
+/// The heading key of one region of the chart.
+fn section_key(pane: IndicatorPane) -> &'static str {
+    match pane {
+        IndicatorPane::Main => "widget.candlestick.indicator.main",
+        IndicatorPane::Sub => "widget.candlestick.indicator.sub",
     }
 }
 
-/// The short name an indicator is written under in a test selector.
+/// The short name indicators are written under in test selectors and kit keys.
 fn indicator_name(id: IndicatorId) -> &'static str {
     match id {
         IndicatorId::Ma => "MA",
@@ -816,5 +982,36 @@ fn indicator_name(id: IndicatorId) -> &'static str {
         IndicatorId::Macd => "MACD",
         IndicatorId::Rsi => "RSI",
         IndicatorId::Kdj => "KDJ",
+    }
+}
+
+/// The name one setting is written under in a test selector or a kit key.
+fn setting_name(key: SettingKey) -> &'static str {
+    match key {
+        SettingKey::Period => "PERIOD",
+        SettingKey::ShortPeriod => "SHORT",
+        SettingKey::LongPeriod => "LONG",
+        SettingKey::SignalPeriod => "SIGNAL",
+        SettingKey::Smoothing1 => "SMOOTHING1",
+        SettingKey::Smoothing2 => "SMOOTHING2",
+        SettingKey::Lines => "LINES",
+        SettingKey::Dif => "DIF",
+        SettingKey::Dea => "DEA",
+        SettingKey::K => "K",
+        SettingKey::D => "D",
+        SettingKey::J => "J",
+        SettingKey::DifColor => "DIF_COLOR",
+        SettingKey::DeaColor => "DEA_COLOR",
+        SettingKey::KColor => "K_COLOR",
+        SettingKey::DColor => "D_COLOR",
+        SettingKey::JColor => "J_COLOR",
+    }
+}
+
+/// The short name one region of the chart is written under in a test selector.
+fn pane_name(pane: IndicatorPane) -> &'static str {
+    match pane {
+        IndicatorPane::Main => "MAIN",
+        IndicatorPane::Sub => "SUB",
     }
 }

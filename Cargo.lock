@@ -1428,7 +1428,6 @@ dependencies = [
  "app_config_provider",
  "base_ui",
  "futures",
- "gpui-kit",
  "i18n",
  "instrument_selector_ui",
  "log",
@@ -1442,8 +1441,8 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

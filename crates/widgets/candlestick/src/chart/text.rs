@@ -5,20 +5,38 @@
 //! change with the candle being described. Both are therefore shaped once and
 //! reused:
 //!
-//! - [`ChartTextCache`] keeps the last [`TEXT_CACHE_CAPACITY`] `(text, colour)`
+//! - [`ChartTextCache`] keeps the last [`TEXT_CACHE_CAPACITY`] `(text, style)`
 //!   layouts, so ticks that did not move are not re-shaped as the chart pans,
 //! - [`ReadoutCache`] keeps the single most recent line together with every
 //!   input that produced it, so a pointer moving *within* one candle re-uses the
 //!   shaped line instead of re-shaping it on every mouse move.
 //!
-//! Both caches are keyed on the window's text style as well as on their own
-//! inputs: a style or font change invalidates shaped text even when the numbers
-//! did not change.
+//! Both caches are keyed on the whole [`TextStyle`], which carries the colour and
+//! the size as well as the font: a colour or font change invalidates shaped text
+//! even when the numbers did not change.
+//!
+//! # The atlas lease
+//!
+//! A [`ShapedTextHandle`] names glyph tiles leased from the engine's shared
+//! atlas. An atlas generation change (a device-scale change, a glyph-capacity
+//! escape, a font-stack switch) or a per-tile eviction leaves those tiles
+//! pointing at reused texture, and the engine drops such runs at encode time
+//! rather than drawing the wrong pixels. A handle that no longer satisfies its
+//! lease is therefore **re-shaped** by both caches, and [`ChartTextCache::has_stale`]
+//! / [`ReadoutCache::has_stale`] are what the canvas asks before it decides a
+//! frame changed nothing: a canvas kept over a dead lease would lose its text
+//! for good.
+//!
+//! # Multi-coloured text
+//!
+//! The engine shapes one line per [`TextStyle`], so a line with two colours (the
+//! OHLCV readout: muted keys, candle-coloured numbers) is a sequence of shaped
+//! runs laid out left to right. [`ReadoutPresentation`] carries them with their
+//! x offsets, measured once when the line is shaped.
 
 use std::sync::Arc;
 
-use base_ui::style::{components::ChartColors, theme::Theme};
-use gpui_kit::{Hsla, Pixels, ShapedLine, SharedString, TextRun, TextStyle, Window, px};
+use base_ui::theme::components::ChartColors;
 use market_participants_connector::market::timeframe::TimeFrame;
 use market_participants_model::{
     decimal::{Price, ProfitOrLoss, Quantity, Tick},
@@ -26,6 +44,11 @@ use market_participants_model::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use time::UtcOffset;
+use ui_core::{
+    app::App,
+    paint::color::Color,
+    text::{ShapedTextHandle, TextStyle},
+};
 
 use crate::{model::CandlePrices, time::format_crosshair_time};
 
@@ -36,6 +59,8 @@ pub(crate) const READOUT_FONT_SIZE: f32 = 11.0;
 /// Height of one text row: axis ticks, tags, legends and the readout all use it.
 pub(crate) const TEXT_ROW_HEIGHT: f32 = 14.0;
 const TEXT_CACHE_CAPACITY: usize = 256;
+/// The CSS font weight of the readout's keys (`O`/`H`/`L`/`C`/`V`).
+const READOUT_KEY_WEIGHT: u16 = 700;
 
 /// What a candle's traded size reads as when it published none.
 ///
@@ -43,86 +68,118 @@ const TEXT_CACHE_CAPACITY: usize = 256;
 /// so the label says the number is missing rather than inventing one.
 const MISSING_VOLUME: &str = "—";
 
-/// Resolves [`format_volume`] once and keeps the result.
-struct CachedTextLine {
-    text: SharedString,
-    color: Hsla,
-    line: Arc<ShapedLine>,
+/// The style `text` is shaped in at `size` and `color`.
+pub(crate) fn style_of(size: f32, color: Color) -> TextStyle {
+    let mut style = TextStyle::new(size);
+    style.color = color;
+    style
 }
 
-/// Shaped axis labels, keyed by text and colour.
+/// One shaped line and the style it was shaped in.
+struct CachedTextLine {
+    text: SmolStr,
+    style: TextStyle,
+    handle: Arc<ShapedTextHandle>,
+}
+
+/// Shaped axis labels, keyed by text and style.
 pub(crate) struct ChartTextCache {
-    text_style: Option<TextStyle>,
     entries: Vec<CachedTextLine>,
 }
 
-impl Default for ChartTextCache {
-    fn default() -> Self {
+impl ChartTextCache {
+    pub(crate) fn new() -> Self {
         Self {
-            text_style: None,
             entries: Vec::with_capacity(TEXT_CACHE_CAPACITY),
         }
     }
-}
 
-impl ChartTextCache {
     pub(crate) fn clear(&mut self) {
-        self.text_style = None;
         self.entries.clear();
     }
 
-    /// Shapes `text` in `color`, or returns the line that was shaped before.
+    /// Shapes `text` in `style`, or returns the line that was shaped before.
+    ///
+    /// A handle whose atlas lease is gone is dropped and shaped again: the glyphs
+    /// it named have been reused, so drawing it would be drawing another line's
+    /// pixels.
     pub(crate) fn line(
         &mut self,
-        text: SharedString,
-        color: Hsla,
-        window: &Window,
-    ) -> Arc<ShapedLine> {
-        let text_style = window.text_style();
-        if self.text_style.as_ref() != Some(&text_style) {
-            self.text_style = Some(text_style.clone());
-            self.entries.clear();
-        }
+        app: &mut App,
+        text: &str,
+        style: &TextStyle,
+    ) -> Arc<ShapedTextHandle> {
         if let Some(index) = self
             .entries
             .iter()
-            .position(|entry| entry.text == text && entry.color == color)
+            .position(|entry| entry.text == text && entry.style == *style)
         {
-            // Refresh the entry's recency by moving it to the back, which is
-            // what makes the capacity below evict the least recently used label.
+            // Refresh the entry's recency by moving it to the back, which is what
+            // makes the capacity below evict the least recently used label.
             let entry = self.entries.remove(index);
-            let line = entry.line.clone();
-            self.entries.push(entry);
-            return line;
+            if !entry.handle.is_stale() {
+                let handle = Arc::clone(&entry.handle);
+                self.entries.push(entry);
+                return handle;
+            }
         }
 
-        let text_len = text.len();
-        let line = Arc::new(window.text_system().shape_line(
-            text.clone(),
-            px(AXIS_FONT_SIZE),
-            &[TextRun {
-                len: text_len,
-                font: text_style.font(),
-                color,
-                ..Default::default()
-            }],
-            None,
-        ));
+        let handle = Arc::new(shape_line(app, text, style));
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
         }
         self.entries.push(CachedTextLine {
-            text,
-            color,
-            line: line.clone(),
+            text: SmolStr::new(text),
+            style: style.clone(),
+            handle: Arc::clone(&handle),
         });
-        line
+        handle
     }
 
-    /// The width `text` occupies, shaped in `color`.
-    pub(crate) fn width(&mut self, text: &str, color: Hsla, window: &Window) -> Pixels {
-        self.line(SharedString::new(text), color, window).width()
+    /// The width `text` occupies, shaped in `style`.
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+        self.line(app, text, style).size().width
     }
+
+    /// Whether any line this cache holds can no longer be drawn from the atlas.
+    pub(crate) fn has_stale(&self) -> bool {
+        self.entries.iter().any(|entry| entry.handle.is_stale())
+    }
+
+    /// Drops every line whose atlas lease is gone.
+    ///
+    /// Called when a frame is about to repaint. The lines that frame asks for are
+    /// re-shaped on demand by [`Self::line`], and a line it does not ask for again
+    /// would otherwise keep [`Self::has_stale`] true — which would rebuild the canvas
+    /// on every later frame for a label nobody draws any more.
+    pub(crate) fn drop_stale(&mut self) {
+        self.entries.retain(|entry| !entry.handle.is_stale());
+    }
+
+    /// The text of every line this cache holds, in insertion order.
+    ///
+    /// Test-only: the canvas read points see glyph counts rather than words, so a
+    /// test that asserts *which* labels a frame shaped reads them here.
+    #[cfg(test)]
+    pub(crate) fn texts(&self) -> Vec<SmolStr> {
+        self.entries
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect()
+    }
+}
+
+/// Shapes one line, drawing nothing rather than failing a frame when the engine
+/// refuses the text: a label is not worth a dropped frame, and the next frame
+/// tries again.
+///
+/// An empty line is the engine's own minimum: it needs no glyphs, so the only
+/// thing that can still refuse it is a missing font stack, which is a broken
+/// host rather than a broken chart.
+fn shape_line(app: &mut App, text: &str, style: &TextStyle) -> ShapedTextHandle {
+    app.shape_text(text, style, None, &[])
+        .or_else(|_| app.shape_text("", style, None, &[]))
+        .expect("an empty line always shapes")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,25 +221,37 @@ impl ReadoutSpan {
     }
 }
 
+/// One shaped run of the readout line, and where it starts.
+pub(crate) struct ReadoutRun {
+    pub handle: Arc<ShapedTextHandle>,
+    /// The run's x offset from the start of the readout line.
+    pub x: f32,
+}
+
 /// The readout line and the crosshair's time tag, already shaped.
 #[derive(Clone)]
 pub(crate) struct ReadoutPresentation {
-    pub time_label: SharedString,
-    pub line: Arc<ShapedLine>,
+    pub time_label: SmolStr,
+    /// The line's runs, left to right.
+    pub runs: Arc<[ReadoutRun]>,
+    /// The line's total width, which is the last run's offset plus its width.
+    pub width: f32,
 }
 
-/// Every input that decides what the readout looks like.
-struct ReadoutCacheInput<'a> {
-    candle: &'a ListingCandlestick,
-    previous_close: Option<Price>,
-    price_tick: Tick,
-    interval: TimeFrame,
+/// The inputs the readout line is shaped from, apart from the candle itself.
+pub(crate) struct ReadoutSpec<'a> {
+    /// The price increment every price in the line is rounded to.
+    pub price_tick: Tick,
+    /// The interval the crosshair's date is read with.
+    pub interval: TimeFrame,
     /// The zone the crosshair's date is read in.
-    zone: UtcOffset,
-    volume_unit: &'a SharedString,
-    text_style: &'a TextStyle,
-    muted_color: Hsla,
-    candle_color: Hsla,
+    pub zone: UtcOffset,
+    /// The text the candle's traded size is read in.
+    pub volume_unit: &'a str,
+    /// The colour of the line's keys and separators.
+    pub muted_color: Color,
+    /// The colour of the line's numbers.
+    pub candle_color: Color,
 }
 
 struct ReadoutCacheEntry {
@@ -191,24 +260,30 @@ struct ReadoutCacheEntry {
     price_tick: Tick,
     interval: TimeFrame,
     zone: UtcOffset,
-    volume_unit: SharedString,
-    text_style: TextStyle,
-    muted_color: Hsla,
-    candle_color: Hsla,
+    volume_unit: SmolStr,
+    muted_color: Color,
+    candle_color: Color,
+    text_scale: f32,
     presentation: ReadoutPresentation,
 }
 
 impl ReadoutCacheEntry {
-    fn matches(&self, input: &ReadoutCacheInput<'_>) -> bool {
-        self.candle == *input.candle
-            && self.previous_close == input.previous_close
-            && self.price_tick == input.price_tick
-            && self.interval == input.interval
-            && self.zone == input.zone
-            && self.volume_unit == *input.volume_unit
-            && self.text_style == *input.text_style
-            && self.muted_color == input.muted_color
-            && self.candle_color == input.candle_color
+    fn matches(
+        &self,
+        candle: &ListingCandlestick,
+        previous_close: Option<Price>,
+        spec: &ReadoutSpec<'_>,
+        text_scale: f32,
+    ) -> bool {
+        self.candle == *candle
+            && self.previous_close == previous_close
+            && self.price_tick == spec.price_tick
+            && self.interval == spec.interval
+            && self.zone == spec.zone
+            && self.volume_unit == spec.volume_unit
+            && self.muted_color == spec.muted_color
+            && self.candle_color == spec.candle_color
+            && self.text_scale == text_scale
     }
 }
 
@@ -223,70 +298,92 @@ impl ReadoutCache {
         self.entry = None;
     }
 
-    /// Shapes the readout for `candle`, reading its traded size in `volume_unit`.
+    /// Whether the shaped line this cache holds can no longer be drawn.
+    pub(crate) fn has_stale(&self) -> bool {
+        self.entry.as_ref().is_some_and(|entry| {
+            entry
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.handle.is_stale())
+        })
+    }
+
+    /// Drops a line whose atlas lease is gone, so a repainting frame re-shapes it.
+    ///
+    /// [`Self::presentation`] already re-shapes a stale line when it is asked for one;
+    /// this is for the frames that do not ask (a chart with no candle in range would
+    /// otherwise keep [`Self::has_stale`] true and rebuild the canvas every frame).
+    pub(crate) fn drop_stale(&mut self) {
+        if self.has_stale() {
+            self.entry = None;
+        }
+    }
+
+    /// The text of the line this cache holds, run by run.
+    ///
+    /// Test-only: the canvas read points see glyph counts rather than words, and a
+    /// test that asserts *which* candle the readout described needs the words.
+    #[cfg(test)]
+    pub(crate) fn described_text(&self) -> Option<SmolStr> {
+        let entry = self.entry.as_ref()?;
+        let mut text = String::new();
+        for run in entry.presentation.runs.iter() {
+            text.push_str(run.handle.line().text.as_str());
+        }
+        Some(SmolStr::new(text))
+    }
+
+    /// The crosshair's time tag the cached line was shaped with (test read point).
+    #[cfg(test)]
+    pub(crate) fn described_time_label(&self) -> Option<SmolStr> {
+        Some(self.entry.as_ref()?.presentation.time_label.clone())
+    }
+
+    /// Shapes the readout for `candle`, reading its traded size in
+    /// [`ReadoutSpec::volume_unit`].
     ///
     /// The unit is the text the candle's own quantity is labelled with — an asset
     /// name, a contract count — so the size the label shows says what it counts
     /// instead of leaving the reader to assume one.
     pub(crate) fn presentation(
         &mut self,
+        app: &mut App,
         candle: &ListingCandlestick,
         previous: Option<&ListingCandlestick>,
-        price_tick: Tick,
-        interval: TimeFrame,
-        zone: UtcOffset,
-        volume_unit: &SharedString,
-        theme: &Theme,
-        window: &Window,
+        spec: &ReadoutSpec<'_>,
     ) -> ReadoutPresentation {
         let previous_close = previous.map(|candle| CandlePrices::of(candle).close());
-        let text_style = window.text_style();
-        let muted_color = theme.roles.fg.muted.hsla;
-        let candle_color = candle_color(candle, &theme.components.chart);
-        let cache_input = ReadoutCacheInput {
-            candle,
-            previous_close,
-            price_tick,
-            interval,
-            zone,
-            volume_unit,
-            text_style: &text_style,
-            muted_color,
-            candle_color,
-        };
+        let text_scale = app.text_scale();
         if let Some(entry) = self
             .entry
             .as_ref()
-            .filter(|entry| entry.matches(&cache_input))
+            .filter(|entry| entry.matches(candle, previous_close, spec, text_scale))
+            && !entry
+                .presentation
+                .runs
+                .iter()
+                .any(|run| run.handle.is_stale())
         {
             return entry.presentation.clone();
         }
 
+        let (runs, width) = shape_readout(app, candle, previous, spec);
         let presentation = ReadoutPresentation {
-            time_label: SharedString::new(
-                format_crosshair_time(candle.timestamp, interval, zone).as_str(),
-            ),
-            line: Arc::new(shape_readout(
-                candle,
-                previous,
-                price_tick,
-                volume_unit,
-                muted_color,
-                candle_color,
-                &text_style,
-                window,
-            )),
+            time_label: format_crosshair_time(candle.timestamp, spec.interval, spec.zone),
+            runs,
+            width,
         };
         self.entry = Some(ReadoutCacheEntry {
             candle: candle.clone(),
             previous_close,
-            price_tick,
-            interval,
-            zone,
-            volume_unit: volume_unit.clone(),
-            text_style,
-            muted_color,
-            candle_color,
+            price_tick: spec.price_tick,
+            interval: spec.interval,
+            zone: spec.zone,
+            volume_unit: SmolStr::new(spec.volume_unit),
+            muted_color: spec.muted_color,
+            candle_color: spec.candle_color,
+            text_scale,
             presentation: presentation.clone(),
         });
         presentation
@@ -349,55 +446,46 @@ fn format_traded_size(candle: &ListingCandlestick, volume_unit: &str) -> SmolStr
     )
 }
 
+/// Shapes every span of the readout and lays them out left to right.
+///
+/// Returns the runs with their x offsets and the line's total width.
 fn shape_readout(
+    app: &mut App,
     candle: &ListingCandlestick,
     previous: Option<&ListingCandlestick>,
-    price_tick: Tick,
-    volume_unit: &str,
-    muted_color: Hsla,
-    candle_color: Hsla,
-    text_style: &TextStyle,
-    window: &Window,
-) -> ShapedLine {
-    let spans = readout_spans(candle, previous, price_tick, volume_unit);
-    let text_capacity = spans.iter().map(|span| span.text.len()).sum();
-    let mut text = String::with_capacity(text_capacity);
-    let mut runs = Vec::with_capacity(spans.len());
-    let font = text_style.font();
-    let bold_font = font.clone().bold();
-    for span in spans {
-        let color = match span.tone {
-            ReadoutTone::Muted => muted_color,
-            ReadoutTone::Candle => candle_color,
-        };
-        runs.push(TextRun {
-            len: span.text.len(),
-            font: if span.bold {
-                bold_font.clone()
-            } else {
-                font.clone()
-            },
-            color,
-            ..Default::default()
-        });
-        text.push_str(&span.text);
-    }
+    spec: &ReadoutSpec<'_>,
+) -> (Arc<[ReadoutRun]>, f32) {
+    let spans = readout_spans(candle, previous, spec.price_tick, spec.volume_unit);
+    let muted = style_of(READOUT_FONT_SIZE, spec.muted_color);
+    let key = TextStyle {
+        weight: READOUT_KEY_WEIGHT,
+        ..muted.clone()
+    };
+    let candle_style = style_of(READOUT_FONT_SIZE, spec.candle_color);
 
-    window.text_system().shape_line(
-        SharedString::new(text.as_str()),
-        px(READOUT_FONT_SIZE),
-        &runs,
-        None,
-    )
+    let mut runs = Vec::with_capacity(spans.len());
+    let mut x = 0.0;
+    for span in spans {
+        let style = match (span.tone, span.bold) {
+            (ReadoutTone::Muted, true) => &key,
+            (ReadoutTone::Muted, false) => &muted,
+            (ReadoutTone::Candle, _) => &candle_style,
+        };
+        let handle = Arc::new(shape_line(app, &span.text, style));
+        let width = handle.size().width;
+        runs.push(ReadoutRun { handle, x });
+        x += width;
+    }
+    (runs.into(), x)
 }
 
 /// The colour a candle's numbers are drawn in: its own direction, not the
 /// previous candle's.
-fn candle_color(candle: &ListingCandlestick, chart: &ChartColors) -> Hsla {
+pub(crate) fn candle_color(candle: &ListingCandlestick, chart: &ChartColors) -> Color {
     if CandlePrices::of(candle).is_up() {
-        chart.bullish.hsla
+        chart.bullish
     } else {
-        chart.bearish.hsla
+        chart.bearish
     }
 }
 
@@ -499,6 +587,7 @@ fn format_volume_with_unit(inner: u128, scale: u128, divisor: u128, suffix: &str
 mod tests {
     use std::str::FromStr;
 
+    use base_ui::theme::{appearance::Appearance, resolved::Theme};
     use market_participants_connector::catalog::test_support;
     use market_participants_model::{
         decimal::{Price, Quantity},
@@ -774,144 +863,122 @@ mod tests {
 
     #[test]
     fn candle_color_should_follow_the_candle_direction() {
-        let theme = Theme::default();
-        let chart = &theme.components.chart;
+        let theme = Theme::of(Appearance::Light);
+        let chart = theme.components().chart;
         let rising = candle_with_ohlcv(1, "100", "110", "90", "105", "1");
         let falling = candle_with_ohlcv(2, "105", "110", "90", "100", "1");
         let flat = candle_with_ohlcv(3, "100", "100", "100", "100", "1");
 
         assert_eq!(
             [
-                candle_color(&rising, chart),
-                candle_color(&falling, chart),
-                candle_color(&flat, chart),
+                candle_color(&rising, &chart),
+                candle_color(&falling, &chart),
+                candle_color(&flat, &chart),
             ],
-            [chart.bullish.hsla, chart.bearish.hsla, chart.bullish.hsla]
+            [chart.bullish, chart.bearish, chart.bullish]
         );
     }
 
-    /// A minimal view that exists only to give the cache a real window.
-    struct CacheProbe;
+    /// A fresh cache has nothing to lose to an atlas generation change.
+    #[test]
+    fn an_empty_text_cache_has_no_stale_line() {
+        assert!(!ChartTextCache::new().has_stale());
+        assert!(!ReadoutCache::default().has_stale());
+    }
 
-    impl gpui_kit::Render for CacheProbe {
-        fn render(
-            &mut self,
-            _window: &mut gpui_kit::Window,
-            _cx: &mut gpui_kit::Context<Self>,
-        ) -> impl gpui_kit::IntoElement {
-            gpui_kit::div()
+    /// The inputs one harness readout is shaped from.
+    fn readout_spec(volume_unit: &str) -> ReadoutSpec<'_> {
+        ReadoutSpec {
+            price_tick: tick("0.01"),
+            interval: TimeFrame::Minute1,
+            zone: UtcOffset::UTC,
+            volume_unit,
+            muted_color: Color::BLACK,
+            candle_color: Color::WHITE,
         }
     }
 
-    /// The unit a size is read in is part of the cache key: the same candle with
-    /// two different units must not reuse the first presentation.
+    /// The words a shaped readout line holds, run by run.
+    fn presentation_text(presentation: &ReadoutPresentation) -> String {
+        presentation
+            .runs
+            .iter()
+            .map(|run| run.handle.line().text.as_str())
+            .collect()
+    }
+
+    /// The unit a size is read in is part of the cache key: the same candle with two
+    /// different units must not reuse the first presentation.
     ///
     /// Without this, a chart whose quantity unit changes (a relabelled asset, a
-    /// contract renamed) would keep printing the old unit until the candle
-    /// changed.
-    #[gpui_kit::test]
-    fn the_readout_cache_should_key_on_the_volume_unit(cx: &mut gpui_kit::TestAppContext) {
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-        });
-        let (_, window) = cx.add_window_view(|_, _| CacheProbe);
+    /// contract renamed) would keep printing the old unit until the candle changed.
+    #[test]
+    fn the_readout_cache_should_key_on_the_volume_unit() {
+        let mut app = ui_core::test_support::app::TestApp::new();
         let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "1234");
         let previous = candle_with_ohlcv(0, "95", "105", "90", "100", "10");
+        let mut cache = ReadoutCache::default();
 
-        let (first, second) = window.update(|window, _| {
-            let theme = Theme::default();
-            let mut cache = ReadoutCache::default();
-            let first = cache.presentation(
-                &candle,
-                Some(&previous),
-                tick("0.01"),
-                TimeFrame::Minute1,
-                UtcOffset::UTC,
-                &SharedString::new_static("BTC"),
-                &theme,
-                window,
-            );
-            let second = cache.presentation(
-                &candle,
-                Some(&previous),
-                tick("0.01"),
-                TimeFrame::Minute1,
-                UtcOffset::UTC,
-                &SharedString::new_static("Contracts"),
-                &theme,
-                window,
-            );
-            (first, second)
-        });
+        let first = cache.presentation(
+            app.app_mut(),
+            &candle,
+            Some(&previous),
+            &readout_spec("BTC"),
+        );
+        let second = cache.presentation(
+            app.app_mut(),
+            &candle,
+            Some(&previous),
+            &readout_spec("Contracts"),
+        );
 
+        let first_text = presentation_text(&first);
+        let second_text = presentation_text(&second);
         assert!(
-            first.line.text.contains("BTC"),
-            "the first presentation reads the size in BTC: {:?}",
-            first.line.text
+            first_text.contains("BTC"),
+            "the first presentation reads the size in BTC: {first_text}"
         );
         assert!(
-            second.line.text.contains("Contracts"),
-            "the second presentation reads the size in Contracts: {:?}",
-            second.line.text
+            second_text.contains("Contracts"),
+            "the second presentation reads the size in Contracts: {second_text}"
         );
         assert_ne!(
-            first.line.text, second.line.text,
+            first_text, second_text,
             "a different unit must produce a different readout text"
         );
         assert!(
-            !Arc::ptr_eq(&first.line, &second.line),
+            !Arc::ptr_eq(&first.runs, &second.runs),
             "the cache must re-shape rather than return the first entry"
         );
     }
 
-    /// The cache returns the very same shaped line when every input matches.
+    /// The cache returns the very same shaped runs when every input matches.
     ///
-    /// This is what makes a pointer moving *within* one candle cheap: the second
-    /// call must not re-shape. It is also the only test that pins the hit path —
-    /// the unit test above pins the miss path.
-    #[gpui_kit::test]
-    fn the_readout_cache_should_reuse_the_same_line_for_the_same_candle(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            base_ui::style::theme::install(cx);
-            i18n::global::embedded::install(cx).expect("embedded locales should load");
-        });
-        let (_, window) = cx.add_window_view(|_, _| CacheProbe);
+    /// This is what makes a pointer moving *within* one candle cheap: the second call
+    /// must not re-shape. It is also the only test that pins the hit path — the unit
+    /// test above pins the miss path.
+    #[test]
+    fn the_readout_cache_should_reuse_the_same_line_for_the_same_candle() {
+        let mut app = ui_core::test_support::app::TestApp::new();
         let candle = candle_with_ohlcv(1, "100", "110", "90", "105", "1234");
         let previous = candle_with_ohlcv(0, "95", "105", "90", "100", "10");
+        let mut cache = ReadoutCache::default();
 
-        let (first, second) = window.update(|window, _| {
-            let theme = Theme::default();
-            let mut cache = ReadoutCache::default();
-            let first = cache.presentation(
-                &candle,
-                Some(&previous),
-                tick("0.01"),
-                TimeFrame::Minute1,
-                UtcOffset::UTC,
-                &SharedString::new_static("BTC"),
-                &theme,
-                window,
-            );
-            let second = cache.presentation(
-                &candle,
-                Some(&previous),
-                tick("0.01"),
-                TimeFrame::Minute1,
-                UtcOffset::UTC,
-                &SharedString::new_static("BTC"),
-                &theme,
-                window,
-            );
-            (first, second)
-        });
+        let first = cache.presentation(
+            app.app_mut(),
+            &candle,
+            Some(&previous),
+            &readout_spec("BTC"),
+        );
+        let second = cache.presentation(
+            app.app_mut(),
+            &candle,
+            Some(&previous),
+            &readout_spec("BTC"),
+        );
 
         assert!(
-            Arc::ptr_eq(&first.line, &second.line),
+            Arc::ptr_eq(&first.runs, &second.runs),
             "identical inputs must reuse the shaped line instead of re-shaping it"
         );
         assert_eq!(
