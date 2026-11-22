@@ -17,6 +17,13 @@
 //! reach the table through [`Table::set_rows`], which is what rebuilds the row window
 //! when the accepted snapshot grows, shrinks, or is cleared.
 //!
+//! # The table is display-only
+//!
+//! The old dataset was a table to read, not a table to pick: it had no selection state,
+//! no click handling and no selected-row styling. The kit table defaults to
+//! multi-select, so the pane turns selection off explicitly in `table_options`; a
+//! test pins that, so the interaction is not added by accident.
+//!
 //! # The directory
 //!
 //! Which markets report liquidations, and whether one of them is loaded, is the
@@ -25,6 +32,20 @@
 //! the answer on every load and re-runs the load when the injected
 //! [`catalog_generation`](widget::services::WidgetServices::catalog_generation) signal
 //! moves (`crates/widgets/AGENTS.md` §8.3).
+//!
+//! # A generation is one number for the whole directory
+//!
+//! The signal says *that* the directory published a new generation, not *which venue*
+//! changed (§8.3 has no per-venue version). So **any** write reloads this pane, even a
+//! commit that only touched a venue it does not read: the rows are dropped and the
+//! stream is reopened against the new catalogue. That is the accepted trade — a row
+//! names and writes its listing at the generation its stream resolved against, so
+//! keeping rows across a generation the pane cannot attribute would be showing data
+//! from a retired catalogue — and the price is a visible reload on unrelated venue
+//! commits. Narrowing it needs the composition root to publish the scope of a change,
+//! which the frozen contract does not offer. The test
+//! `an_unrelated_directory_generation_should_reload_the_pane` pins the current
+//! behaviour.
 //!
 //! # The table's static copy
 //!
@@ -249,6 +270,13 @@ fn cell_text(
 /// text node whose text and colour are read on the frames that draw it: the cell
 /// registers its dependencies inside `bind_text` / `bind_style` rather than resolving
 /// anything here (AGENTS §4.4 / §9).
+///
+/// Every cell draws in a theme foreground. The engine's `TextStyle` colour is
+/// `BLACK` by default and the cell box's `foreground` does not inherit into the text
+/// node, so a cell that bound no colour would be unreadable on a dark appearance (and
+/// differ from the old table, which resolved `theme.roles.fg.default` for every cell).
+/// The listing column overrides that default with the direction colour of the
+/// liquidation's side.
 fn build_cell(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -263,12 +291,11 @@ fn build_cell(
 ) {
     let text = NodeBuilder::text(SmolStr::default(), TextStyle::new(font_size));
 
-    match column {
-        // The route and the listing name are words: they follow the language, and the
-        // listing cell is drawn in the direction colour of the liquidation's side.
+    let text = match column {
+        // The route and the listing name are words, so they follow the language.
         0 | 1 => {
             let translate = translate.clone();
-            let text = text.bind_text(move |read| {
+            text.bind_text(move |read| {
                 let _language = *read.read(&language);
                 let snapshot = read.read(&rows);
                 cell_text(
@@ -277,47 +304,43 @@ fn build_cell(
                     UtcOffset::UTC,
                     &translate,
                 )
-            });
-            let text = if column == 1 {
-                let theme = theme.clone();
-                text.bind_style(move |read| {
-                    let role = {
-                        let snapshot = read.read(&rows);
-                        displayed_row(&snapshot, row).map_or(Role::FgDefault, |row| {
-                            match row.order().position_side {
-                                PositionSide::Long => Role::MarketUp,
-                                _ => Role::MarketDown,
-                            }
-                        })
-                    };
-                    StylePatch {
-                        foreground: Some(theme.role(read, role)),
-                        ..StylePatch::default()
-                    }
-                })
-            } else {
-                text
-            };
-            let _ = text.build(tree, parent);
+            })
         }
         // The numbers are read in the display time zone, which is a settings read: the
         // cell resolves it on the frames that draw it, so moving the setting redraws it.
         2..=4 => {
             let translate = translate.clone();
-            let text = text.bind_text(move |read| {
+            text.bind_text(move |read| {
                 let zone = {
                     let config = read.read(&config);
                     data_time_zone(&config)
                 };
                 let snapshot = read.read(&rows);
                 cell_text(displayed_row(&snapshot, row), column, zone, &translate)
-            });
-            let _ = text.build(tree, parent);
+            })
         }
-        _ => {
-            let _ = text.build(tree, parent);
+        _ => text,
+    };
+
+    let theme = theme.clone();
+    let text = text.bind_style(move |read| {
+        let role = if column == 1 {
+            let snapshot = read.read(&rows);
+            displayed_row(&snapshot, row).map_or(Role::FgDefault, |row| {
+                match row.order().position_side {
+                    PositionSide::Long => Role::MarketUp,
+                    _ => Role::MarketDown,
+                }
+            })
+        } else {
+            Role::FgDefault
+        };
+        StylePatch {
+            foreground: Some(theme.role(read, role)),
+            ..StylePatch::default()
         }
-    }
+    });
+    let _ = text.build(tree, parent);
 }
 
 /// The columns the table declares, in header order.
@@ -600,6 +623,18 @@ impl WidgetView for ForceOrderWidget {
     }
 }
 
+/// The options the force-order dataset needs from the kit table: a fixed row height
+/// (the dataset declares one) and **no row selection**.
+///
+/// The old `TableDataSet` drew rows to read, not rows to pick: it had no selection
+/// state, no click handling and no selected-row styling. The kit table defaults to
+/// [`SelectionMode::Multi`], so the pane turns selection off explicitly here — the one
+/// place the decision is made, which is what
+/// `tests::the_table_should_not_offer_row_selection` pins.
+fn table_options(row_height: f32) -> TableOptions {
+    TableOptions::fixed(row_height).selection(SelectionMode::None)
+}
+
 impl ForceOrderWidget {
     /// Builds a widget over the collaborators a caller hands it.
     fn assemble(
@@ -694,7 +729,7 @@ impl ForceOrderWidget {
             theme,
             "ForceOrderTable",
             columns(&self.translate),
-            TableOptions::fixed(row_height).selection(SelectionMode::Multi),
+            table_options(row_height),
             cells,
             t_smol!(self.translate, "common.no_data"),
         );
@@ -888,7 +923,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use base_ui::{kit::table::ColumnWidth, theme::appearance::Appearance};
+    use app_config::time_zone::DataTimeZone;
+    use base_ui::{
+        kit::{layer::Layer, list::RowHeight, overlay::AnimationRouter, table::ColumnWidth},
+        theme::appearance::Appearance,
+    };
     use market_participants_connector::{
         catalog::{batch::CatalogEntry, error::CatalogError, test_support},
         market::domain::DisconnectReason,
@@ -905,7 +944,9 @@ mod tests {
     };
     use ui_core::{
         app::App,
-        node::signal::SignalScope,
+        event::Action,
+        node::{signal::SignalScope, tree::NodeKind},
+        paint::color::Color,
         window::{WindowId, WindowOptions},
     };
     use widget::{
@@ -959,6 +1000,13 @@ mod tests {
         }
     }
 
+    /// The same liquidation on the other side of the book.
+    fn short_entry(timestamp: i64) -> ForceOrderEntry {
+        let mut entry = entry(timestamp);
+        entry.order.position_side = PositionSide::Short;
+        entry
+    }
+
     /// A price tick of one cent and a quantity step of one thousandth, so a label
     /// that keeps the listing's precision is told apart from the canonical form.
     fn precision() -> ListingPrecision {
@@ -971,6 +1019,13 @@ mod tests {
     fn snapshot(timestamp: i64) -> ForceOrderSnapshot {
         let mut state = ForceOrderState::new(1);
         state.merge(&[entry(timestamp)]);
+        state.snapshot()
+    }
+
+    /// Two liquidations, one per side: display row 0 is the short (newest) one.
+    fn both_sides_snapshot() -> ForceOrderSnapshot {
+        let mut state = ForceOrderState::new(2);
+        state.merge(&[entry(1), short_entry(2)]);
         state.snapshot()
     }
 
@@ -1372,6 +1427,33 @@ mod tests {
             self.harness
                 .text_of(node.expect("the header cell is mounted"))
         }
+
+        /// The foreground colour the cell's text node draws in.
+        ///
+        /// The style pass writes the patch, so the frame that draws the cell has to have
+        /// run: `drain` is what makes the patch readable.
+        fn cell_foreground(&mut self, row: usize, column: usize) -> Color {
+            self.drain();
+            let cell = self
+                .widget
+                .table
+                .as_ref()
+                .and_then(|table| table.cell_node(self.harness.app(), row, column))
+                .unwrap_or_else(|| panic!("row {row} column {column} is mounted"));
+            let tree = self.harness.tree();
+            let mut stack = vec![cell];
+            while let Some(node) = stack.pop() {
+                let target = tree.get(node).expect("a cell node");
+                if matches!(target.kind(), NodeKind::Text(_)) {
+                    return target
+                        .style_patch()
+                        .foreground
+                        .expect("the cell text binds a foreground colour");
+                }
+                stack.extend(target.children().iter().copied());
+            }
+            panic!("row {row} column {column} has a text node");
+        }
     }
 
     /// A widget whose service has to actually answer.
@@ -1410,24 +1492,25 @@ mod tests {
             let mut app = App::new(runtime.handle().clone());
             let window = app.create_window(WindowOptions::default());
             let scope = app.signal_scope();
-            let language = app.signal_scoped(scope, LanguageCode::En);
-            let config = app.signal_scoped(scope, Config::default());
-            let catalog_generation = app.signal_scoped(scope, 0_u64);
-            let reduce_motion = app.signal_scoped(scope, false);
             let theme = ThemeHandle::new(&mut app, Appearance::Light);
-            let services = Rc::new(WidgetServices {
-                translate: product_translate(LanguageCode::En),
-                language,
-                config,
-                theme,
-                market_participants: None,
-                catalog_generation,
-                kytrix_service: None,
-                open_url: Rc::new(|_| {}),
-                sound: Rc::new(|_| None),
-                reduce_motion,
-                runtime: runtime.handle().clone(),
-            });
+            // The composition root's three singletons, composed exactly as the
+            // application root composes them; this host keeps no handles of its own.
+            let layer = Rc::new(Layer::new());
+            let animation = Rc::new(AnimationRouter::new());
+            let router =
+                Rc::new(FrameRouter::new(&mut app).expect("the host owns the frame hook slot"));
+            let services = Rc::new(
+                WidgetServices::builder(
+                    &mut app,
+                    runtime.handle().clone(),
+                    product_translate(LanguageCode::En),
+                    theme,
+                    layer,
+                    router,
+                    animation,
+                )
+                .build(),
+            );
 
             let fixture = test_support::Fixture::with_source(
                 route(),
@@ -1445,7 +1528,7 @@ mod tests {
             let status = WidgetStatus::new(&mut app, scope);
             let recovery = WidgetAction::new("common.retry", |_| {});
             let directory_handle: Rc<dyn MarketDirectory> = Rc::new(directory.clone());
-            let mut cx = WidgetCx::new(&mut app, window, &services, scope, FrameRouter::default());
+            let mut cx = WidgetCx::new(&mut app, window, &services, scope);
             let widget = ForceOrderWidget::with_source(
                 source,
                 directory_handle,
@@ -1472,13 +1555,7 @@ mod tests {
             &mut self,
             body: impl FnOnce(&mut ForceOrderWidget, &mut WidgetCx<'_>) -> R,
         ) -> R {
-            let mut cx = WidgetCx::new(
-                &mut self.app,
-                self.window,
-                &self.services,
-                self.scope,
-                FrameRouter::default(),
-            );
+            let mut cx = WidgetCx::new(&mut self.app, self.window, &self.services, self.scope);
             body(&mut self.widget, &mut cx)
         }
 
@@ -1557,7 +1634,7 @@ mod tests {
     // -------------------------------------------------------------- table dataset
 
     /// The table keeps the five-column dataset semantics: five columns, the declared
-    /// weights and alignments, the accepted rows, and multi-select.
+    /// weights and alignments, and the accepted rows.
     #[test]
     fn the_table_should_keep_the_five_column_dataset_semantics() {
         let mut fixture = Fixture::new(PendingForceOrderSource, true);
@@ -1583,6 +1660,21 @@ mod tests {
             "the headers are the localized dataset's"
         );
         assert_eq!(table.rows(), 2, "the accepted row count reaches the table");
+    }
+
+    /// The old dataset was a table to read, so the pane keeps row selection off: the
+    /// kit table's own default is multi-select, which would be a new interaction (and
+    /// a new a11y/selection state) rather than a migration of the old one.
+    #[test]
+    fn the_table_should_not_offer_row_selection() {
+        let options = table_options(30.0);
+
+        assert_eq!(
+            options.selection,
+            SelectionMode::None,
+            "the old dataset had no selection: rows are display-only"
+        );
+        assert_eq!(options.row_height, RowHeight::Fixed(30.0));
     }
 
     /// Every cached column of a row is filled, and the route is the user-visible one
@@ -2128,6 +2220,42 @@ mod tests {
         );
     }
 
+    /// A generation is one number for the whole directory, not a per-venue version, so
+    /// a commit that only touched a venue this pane does not read still reloads it: the
+    /// rows go and the stream reopens. That is the accepted cost of the coarse signal
+    /// (the module documentation states it); this test pins the behaviour so it stays a
+    /// decision rather than an accident.
+    #[test]
+    fn an_unrelated_directory_generation_should_reload_the_pane() {
+        let source = CountingForceOrderSource::default();
+        let subscriptions = Arc::clone(&source.subscriptions);
+        let mut fixture = ServiceFixture::new(source, true);
+        fixture.settle_until("the first stream", |_| {
+            subscriptions.load(Ordering::Acquire) == 1
+        });
+        fixture.accept_snapshot(snapshot(1));
+        assert!(fixture.has_content(), "the pane is showing its rows");
+        let routes = Arc::clone(&fixture.widget.routes);
+        let reading = subscriptions.load(Ordering::Acquire);
+
+        // Nothing in the directory moved for this pane; only the published generation
+        // did, which is all a commit to an unrelated venue leaves behind here.
+        fixture.bump_generation();
+
+        assert!(
+            !fixture.has_content(),
+            "the rows were written at the generation that moved, so they are dropped"
+        );
+        assert_eq!(fixture.status(), WidgetState::Connecting);
+        assert_eq!(
+            fixture.widget.routes, routes,
+            "the routes this pane reads did not change"
+        );
+        fixture.settle_until("the reload to open a new stream", |_| {
+            subscriptions.load(Ordering::Acquire) > reading
+        });
+    }
+
     /// A failure is terminal: a directory generation write does not revive a failed pane.
     #[test]
     fn a_venue_commit_should_not_revive_a_failed_pane() {
@@ -2192,6 +2320,111 @@ mod tests {
         assert_eq!(fixture.settled_cell_text(0, 4), "00:00:00.001");
     }
 
+    /// Every cell draws its text in a theme foreground, and the listing cell draws in
+    /// the direction colour of the liquidation's side.
+    ///
+    /// A cell that binds no colour draws in the engine's default `TextStyle` foreground
+    /// (black): the kit cell box's `FgDefault` does not inherit into the text node, so
+    /// four of the five columns would be unreadable on a dark appearance and differ
+    /// from the old table, which resolved `theme.roles.fg.default` for every cell.
+    #[test]
+    fn the_cells_should_draw_in_the_theme_colours() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.accept_snapshot(both_sides_snapshot());
+        fixture.build_body();
+
+        let theme = fixture.harness.services().theme.clone();
+        let light = theme.theme_for(Appearance::Light);
+        let foreground = light.role(Role::FgDefault);
+        let up = light.role(Role::MarketUp);
+        let down = light.role(Role::MarketDown);
+        assert_ne!(up, down, "the two sides are drawn in different colours");
+
+        for row in 0..2 {
+            for column in [0, 2, 3, 4] {
+                assert_eq!(
+                    fixture.cell_foreground(row, column),
+                    foreground,
+                    "row {row} column {column} draws in the theme's default foreground"
+                );
+            }
+        }
+        assert_eq!(
+            fixture.cell_foreground(0, 1),
+            down,
+            "display row 0 is the newest liquidation, and it is short"
+        );
+        assert_eq!(
+            fixture.cell_foreground(1, 1),
+            up,
+            "display row 1 is the older liquidation, and it is long"
+        );
+    }
+
+    /// The colour is read through the theme on the frame that draws the cell, so an
+    /// appearance switch redraws it in the new appearance's foreground (AGENTS §7/G3).
+    #[test]
+    fn the_cells_should_follow_the_theme_appearance() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.accept_snapshot(both_sides_snapshot());
+        fixture.build_body();
+
+        let theme = fixture.harness.services().theme.clone();
+        let light = theme.theme_for(Appearance::Light).role(Role::FgDefault);
+        let dark = theme.theme_for(Appearance::Dark).role(Role::FgDefault);
+        assert_ne!(
+            light, dark,
+            "the two appearances draw different default foregrounds"
+        );
+        assert_eq!(fixture.cell_foreground(0, 0), light);
+
+        assert!(theme.set_appearance(fixture.harness.app_mut(), Appearance::Dark));
+        fixture.sync();
+
+        for column in [0, 2, 3, 4] {
+            assert_eq!(
+                fixture.cell_foreground(0, column),
+                dark,
+                "column {column} redraws in the dark appearance's foreground"
+            );
+        }
+        assert_eq!(
+            fixture.cell_foreground(0, 1),
+            theme.theme_for(Appearance::Dark).role(Role::MarketDown)
+        );
+    }
+
+    /// The numbers are read in the display time zone, which the cell resolves inside
+    /// `bind_text`: moving the setting redraws the time column without touching the
+    /// data the stream delivered.
+    #[test]
+    fn moving_the_display_zone_should_redraw_the_time_column() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.accept_snapshot(snapshot(1));
+        fixture.build_body();
+        assert_eq!(fixture.settled_cell_text(0, 4), "00:00:00.001");
+
+        let config_signal = fixture.harness.services().config;
+        let mut config = (*fixture.harness.app().read(&config_signal)).clone();
+        config.data_time_zone = DataTimeZone::from_hours(8).expect("UTC+8 is an offered offset");
+        assert!(
+            fixture.harness.app_mut().write(&config_signal, config),
+            "the setting move is a change"
+        );
+        fixture.sync();
+
+        assert_eq!(
+            fixture.settled_cell_text(0, 4),
+            "08:00:00.001",
+            "the time column redraws in the zone the settings now name"
+        );
+        assert_eq!(
+            fixture.settled_cell_text(0, 2),
+            "100.00",
+            "the price is a number rather than a clock"
+        );
+    }
+
     /// A language switch rebuilds the table's static copy — its headers and its empty
     /// sentence are resolved text rather than bindings — while the accepted rows stay.
     #[test]
@@ -2229,6 +2462,69 @@ mod tests {
             fixture.harness.text_of(empty).contains("暂无数据"),
             "the empty sentence is read in the language showing now: {:?}",
             fixture.harness.text_of(empty)
+        );
+    }
+
+    /// A language switch replaces the table's subtree: the old table's nodes are
+    /// removed from the tree before the new one is mounted, so the switch does not
+    /// leave a second table behind.
+    #[test]
+    fn a_language_change_should_not_leak_the_old_table() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.accept_snapshot(snapshot(1));
+        fixture.build_body();
+        let nodes = fixture.harness.node_count();
+        let previous = fixture
+            .table()
+            .outer_node()
+            .expect("the table mounted its nodes");
+
+        fixture.harness.switch_language(LanguageCode::ZhCn);
+        fixture.sync();
+
+        assert_eq!(
+            fixture.harness.node_count(),
+            nodes,
+            "the rebuilt table replaces the old one instead of adding to it"
+        );
+        assert!(
+            fixture.harness.tree().get(previous).is_err(),
+            "the old table's subtree was removed from the tree"
+        );
+    }
+
+    /// `release` hands the table back to the kit component: the handlers the table
+    /// registered are removed with it, which is what keeps the application from holding
+    /// the table (and its row contents) after the surface nodes are gone.
+    #[test]
+    fn releasing_the_widget_should_release_the_table() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.accept_snapshot(snapshot(1));
+        fixture.build_body();
+        let select = Action::Custom(SmolStr::new_static("ForceOrderTable:body.select"));
+        let sort = Action::Custom(SmolStr::new_static("ForceOrderTable.sort"));
+        assert!(
+            fixture.harness.app().has_action_handler(&select),
+            "the mounted table registers its row handler"
+        );
+        assert!(
+            fixture.harness.app().has_action_handler(&sort),
+            "the mounted table registers its sort handler"
+        );
+
+        fixture.with_cx(|widget, cx| widget.release(cx));
+
+        assert!(
+            fixture.widget.table.is_none(),
+            "release drops the widget's table"
+        );
+        assert!(
+            !fixture.harness.app().has_action_handler(&select),
+            "a table left un-released keeps its row handler registered"
+        );
+        assert!(
+            !fixture.harness.app().has_action_handler(&sort),
+            "a table left un-released keeps its sort handler registered"
         );
     }
 
