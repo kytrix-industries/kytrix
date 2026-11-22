@@ -283,7 +283,8 @@ impl WidgetView for GlobalShippingChokepointWidget {
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
         // A host without the Kytrix service has nothing to subscribe to and nothing to
-        // read; the pane reports the neutral notice and waits. Every application supplies
+        // read over; `load` reports that as the failure it is rather than leaving the pane
+        // waiting on a connection nobody is going to install. Every application supplies
         // one.
         let binding =
             cx.services()
@@ -326,6 +327,22 @@ impl WidgetView for GlobalShippingChokepointWidget {
         }
         if !kept {
             self.clear_picture();
+        }
+        // A host with no Kytrix connection has nothing to subscribe over. That is a
+        // failure between the application and the service, not a link that is still being
+        // established: reporting `Connecting` here would leave the spinner waiting for a
+        // connection nobody is going to install, with no way to say so. The retry is the
+        // recovery, because the missing connection is not something this pane can repair.
+        if self.binding.is_none() {
+            let recovery = self.recovery.clone();
+            self.status.report(
+                cx.app_mut(),
+                WidgetState::failed(
+                    Arc::new(AisStreamError::Service(KytrixServiceError::Closed)),
+                    recovery,
+                ),
+            );
+            return;
         }
         self.status.report(cx.app_mut(), WidgetState::Connecting);
         // The picture the retry keeps on screen is not being continued either: a
@@ -453,7 +470,9 @@ impl WidgetView for GlobalShippingChokepointWidget {
             InputEvent::PointerDown {
                 position, button, ..
             } => {
-                if *button != PointerButton::Primary {
+                // The pane routes every event it sees to this hook, not only the ones over
+                // the map, so a press beside the canvas is not a press that starts a pan.
+                if *button != PointerButton::Primary || !self.map.contains(*position) {
                     return false;
                 }
                 self.credit_pressed = self.map.attribution_contains(*position);
@@ -461,6 +480,13 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 true
             }
             InputEvent::PointerUp { position, .. } => {
+                // A release this pane did not begin is not its event: the map is handed
+                // only the ones a press started on it. A release that arrives off the box
+                // still ends the drag, because the press that began it is still held.
+                if !self.map.is_dragging() && !self.credit_pressed && !self.map.contains(*position)
+                {
+                    return false;
+                }
                 // The credit is a link: it opens only when the press began on it and ended
                 // on it, so dragging the map across the corner does not open a browser.
                 if self.credit_pressed && self.map.attribution_contains(*position) {
@@ -488,9 +514,23 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 }
                 true
             }
+            InputEvent::PointerCancel { .. } => {
+                // A cancelled session is neither a click nor a release: the engine reports
+                // it when the system takes the pointer away (capture lost, window lost
+                // focus, a modal opened), and there is no `Up` to follow it. The credit is
+                // not opened and the drag the press began ends here — without this the map
+                // keeps panning on the next move for a button nothing is holding.
+                let held = self.map.is_dragging() || self.credit_pressed;
+                self.credit_pressed = false;
+                self.map.pointer_up();
+                held
+            }
             InputEvent::Scroll {
                 position, delta, ..
             } => {
+                if !self.map.contains(*position) {
+                    return false;
+                }
                 if self.map.zoom_by_wheel(*position, delta.y) {
                     // The camera moved under a stationary pointer, so which vessel it is on
                     // moved with it.
@@ -502,6 +542,9 @@ impl WidgetView for GlobalShippingChokepointWidget {
                 true
             }
             InputEvent::Magnify { factor, center, .. } => {
+                if !self.map.contains(*center) {
+                    return false;
+                }
                 if self.map.zoom_by_pinch(*center, *factor) {
                     self.map.track_pointer(*center, &self.painted);
                     let _ = cx.request_frame();

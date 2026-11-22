@@ -30,7 +30,7 @@ use kytrix_service_provider::service::{
 use network::transport::error::TransportError;
 use smol_str::SmolStr;
 use ui_core::{
-    event::{Action, Event, InputEvent, PointerButton},
+    event::{Action, Event, InputEvent, PointerButton, ScrollPhase, ScrollUnit},
     math::Point,
     node::builder::NodeBuilder,
     test_support::record::PrimitiveKind,
@@ -561,6 +561,65 @@ fn pointer_leave(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) 
     });
 }
 
+/// Sends one primary press to the pane, reporting whether it was consumed.
+fn pointer_down(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
+    harness.with_cx(|cx| {
+        pane.widget.dispatch(
+            &Event::Input(InputEvent::PointerDown {
+                position,
+                button: PointerButton::Primary,
+                modifiers: ui_core::event::Modifiers::default(),
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    })
+}
+
+/// Sends one primary release to the pane, reporting whether it was consumed.
+fn pointer_up(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point) -> bool {
+    harness.with_cx(|cx| {
+        pane.widget.dispatch(
+            &Event::Input(InputEvent::PointerUp {
+                position,
+                button: PointerButton::Primary,
+                modifiers: ui_core::event::Modifiers::default(),
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    })
+}
+
+/// Sends one cancelled pointer session to the pane, reporting whether it was consumed.
+fn pointer_cancel(harness: &mut WidgetTestApp, pane: &mut Pane) -> bool {
+    harness.with_cx(|cx| {
+        pane.widget.dispatch(
+            &Event::Input(InputEvent::PointerCancel {
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    })
+}
+
+/// Sends one wheel notch to the pane, reporting whether it was consumed.
+fn wheel(harness: &mut WidgetTestApp, pane: &mut Pane, position: Point, step: f32) -> bool {
+    harness.with_cx(|cx| {
+        pane.widget.dispatch(
+            &Event::Input(InputEvent::Scroll {
+                position,
+                delta: Point::new(0.0, step),
+                unit: ScrollUnit::Line,
+                phase: ScrollPhase::Discrete,
+                modifiers: ui_core::event::Modifiers::default(),
+                timestamp: std::time::Instant::now(),
+            }),
+            cx,
+        )
+    })
+}
+
 #[test]
 fn the_config_should_be_at_the_first_schema_version() {
     assert_eq!(
@@ -582,6 +641,36 @@ fn a_pane_nobody_signed_in_for_should_wait_for_a_sign_in() {
             assert_eq!(key, "widget.global_shipping_chokepoint.sign_in");
         }
         other => panic!("a signed-out pane waits for a sign-in, got {other:?}"),
+    }
+}
+
+/// A host with no Kytrix connection has nothing to subscribe over.
+///
+/// That is a failure between the application and the service, not a link that is still
+/// being established: a pane that reported `Connecting` here would spin for a connection
+/// nobody is going to install and would never say what is wrong.
+#[test]
+fn a_host_without_a_kytrix_service_should_fail_the_pane_with_the_retry() {
+    let mut harness = harness();
+    sign_in(&mut harness, ACCOUNT);
+    let mounted = harness
+        .try_mount::<GlobalShippingChokepointWidget>(GlobalShippingChokepointConfig)
+        .expect("the pane mounts without a service");
+
+    match mounted.status().state(harness.app()) {
+        WidgetState::Failed(failure) => {
+            assert_eq!(
+                failure.action().label_key(),
+                "common.retry",
+                "what is missing is the connection, so the reader is offered the retry"
+            );
+            assert_eq!(
+                failure.text(&product_translate(LanguageCode::En)),
+                "The Kytrix service connector is closed",
+                "the failure names the connection it could not use"
+            );
+        }
+        other => panic!("a pane with no Kytrix connection fails, got {other:?}"),
     }
 }
 
@@ -1005,6 +1094,49 @@ fn a_lease_that_moved_should_repaint_the_labels() {
     );
 }
 
+/// A lease that moved rebuilds the canvas once, and the frame after it is steady.
+///
+/// The stale entries a rebuild leaves behind — the labels of the language that was left,
+/// the card of a pointer that moved away — are dropped by the question that finds them.
+/// Keeping them would answer "stale" on every later frame and rebuild the canvas, and
+/// every mesh it registers, for glyphs nothing on screen names any more (I3).
+#[test]
+fn a_moved_lease_should_settle_back_into_a_steady_frame() {
+    let mut harness = harness();
+    let mut pane = pane(&mut harness);
+    paint_one_vessel(&mut harness, &mut pane);
+    // Two sets of entries nothing draws from again: the other language's labels...
+    harness.switch_language(LanguageCode::ZhCn);
+    frame(&mut harness, &mut pane);
+    // ...and the card's rows, once the pointer left the vessel they describe.
+    let at = hull_of(&pane, 1);
+    pointer_move(&mut harness, &mut pane, at);
+    frame(&mut harness, &mut pane);
+    pointer_leave(&mut harness, &mut pane, at);
+    frame(&mut harness, &mut pane);
+
+    // The atlas generation moves: every handle the canvas holds is stale, and the frame
+    // that follows is owed a rebuild.
+    let stack = harness.app().font_stack().clone();
+    harness.app_mut().set_font_stack(stack);
+    frame(&mut harness, &mut pane);
+
+    let settled = canvas_handle(&harness, &pane);
+    let requests = harness.frame_requests();
+    sync(&mut harness, &mut pane);
+    harness.drain();
+
+    assert!(
+        !harness.rendered(),
+        "the frame after the rebuild draws nothing"
+    );
+    assert_eq!(harness.frame_requests(), requests, "and asks for nothing");
+    assert!(
+        Arc::ptr_eq(&settled, &canvas_handle(&harness, &pane)),
+        "the canvas of the rebuilt frame is the one kept"
+    );
+}
+
 #[test]
 fn the_legend_should_hold_only_the_types_the_picture_holds() {
     let mut harness = harness();
@@ -1224,6 +1356,103 @@ fn the_credit_should_open_the_copyright_page() {
     });
 
     assert_eq!(opened.borrow().as_slice(), [ATTRIBUTION_URL]);
+}
+
+/// A cancelled pointer session ends the drag it began and drops its credit press.
+///
+/// The engine reports a cancel instead of the release when the system takes the pointer
+/// away (capture lost, focus lost, a modal opened). Treating it as nothing would leave the
+/// map panning on a button nothing is holding, and would open the credit on a release that
+/// was never a click.
+#[test]
+fn a_cancelled_pointer_should_not_pan_or_open_the_credit() {
+    let opened = Rc::new(RefCell::new(Vec::<String>::new()));
+    let recorded = Rc::clone(&opened);
+    let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En))
+        .with_open_url(move |url: &str| {
+            recorded.borrow_mut().push(url.to_owned());
+        });
+    sign_in(&mut harness, ACCOUNT);
+    let mut pane = pane_with_source(&mut harness, RecordingSource::default());
+    load(&mut harness, &mut pane);
+    push(&mut harness, &mut pane, keyframe(7, 1, vec![position(1)]));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+
+    let bounds = pane.widget.map.bounds().expect("the map was laid out");
+    // The press starts on the credit, which is the one interaction a cancelled session
+    // must not commit.
+    let credit = Point::new(
+        bounds.origin.x + 12.0,
+        bounds.origin.y + bounds.size.height - 10.0,
+    );
+    assert!(pointer_down(&mut harness, &mut pane, credit));
+    assert!(
+        pointer_cancel(&mut harness, &mut pane),
+        "the cancel belongs to the session the press began"
+    );
+    pointer_up(&mut harness, &mut pane, credit);
+    assert!(
+        opened.borrow().is_empty(),
+        "a cancelled press is not a click on the credit"
+    );
+
+    // The drag the press began is not still held: a later move does not pan the map.
+    let before = pane.widget.map.camera();
+    pointer_move(
+        &mut harness,
+        &mut pane,
+        Point::new(credit.x + 40.0, credit.y - 40.0),
+    );
+    assert_eq!(
+        pane.widget.map.camera(),
+        before,
+        "a cancelled drag does not keep panning"
+    );
+}
+
+/// A press beside the canvas is not the map's: it begins no drag and consumes no wheel.
+///
+/// The pane hands this hook every event it routes, while the old element-level handlers
+/// only saw the events over the canvas. The box the map is laid out in is what makes the
+/// difference visible: without it a press 40 px outside the map starts a pan that moves
+/// the camera on the next move, and a wheel beside it zooms a map it is not over.
+#[test]
+fn a_pointer_outside_the_canvas_should_not_be_the_map_s() {
+    let mut harness = harness();
+    let mut pane = pane(&mut harness);
+    paint_one_vessel(&mut harness, &mut pane);
+    let bounds = pane.widget.map.bounds().expect("the map was laid out");
+    let outside = Point::new(
+        bounds.origin.x - 40.0,
+        bounds.origin.y + bounds.size.height / 2.0,
+    );
+    let before = pane.widget.map.camera();
+
+    assert!(
+        !pointer_down(&mut harness, &mut pane, outside),
+        "a press outside the map is not the map's to consume"
+    );
+    pointer_move(
+        &mut harness,
+        &mut pane,
+        Point::new(outside.x + 30.0, outside.y),
+    );
+    assert_eq!(
+        pane.widget.map.camera(),
+        before,
+        "a press outside the map does not begin a pan"
+    );
+
+    assert!(
+        !wheel(&mut harness, &mut pane, outside, 1.0),
+        "a wheel outside the map is not the map's to consume"
+    );
+    assert_eq!(
+        pane.widget.map.camera(),
+        before,
+        "a wheel outside the map does not zoom it"
+    );
 }
 
 #[test]

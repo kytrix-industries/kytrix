@@ -338,14 +338,27 @@ impl MapTextCache {
         self.line(app, "X", style).size().height
     }
 
-    /// Whether any line this cache holds can no longer be drawn from the atlas.
+    /// Whether any line this cache holds can no longer be drawn from the atlas, dropping
+    /// the ones that cannot.
     ///
     /// This is what the map asks before it decides a frame changed nothing: the engine
     /// drops stale runs at encode time, so a canvas kept over a dead lease would lose its
-    /// labels permanently. Nothing is stale in the steady state, so the scan of a couple
-    /// of hundred handles is the whole cost of the guard.
-    fn has_stale(&self) -> bool {
-        self.entries.iter().any(|entry| entry.handle.is_stale())
+    /// labels permanently.
+    ///
+    /// The stale entries are dropped on the way out. A line the frame that follows does
+    /// not draw against — the other language's labels after a switch, a card whose
+    /// pointer has moved away, a legend entry the picture no longer holds — would
+    /// otherwise keep this answer true for good, which turns every later frame into a
+    /// rebuild and breaks the steady state (I3): the canvas, and every mesh it registers,
+    /// would be rebuilt for a lease that nothing on screen names any more. The canvas
+    /// that was built from them is rebuilt by the frame that asks this question, so
+    /// nothing is left naming glyphs that are gone.
+    fn has_stale(&mut self) -> bool {
+        let stale = self.entries.iter().any(|entry| entry.handle.is_stale());
+        if stale {
+            self.entries.retain(|entry| !entry.handle.is_stale());
+        }
+        stale
     }
 }
 
@@ -1131,6 +1144,23 @@ impl MapCanvas {
     pub(super) fn attribution_contains(&self, position: Point) -> bool {
         self.attribution.is_some_and(|rect| rect.contains(position))
     }
+
+    /// Whether one window position is inside the box the map is drawn in.
+    ///
+    /// A widget's `dispatch` sees every event the pane hands it, not only the ones over
+    /// its own canvas: the pointer and gesture events are gated on this so a press beside
+    /// the map is not a press on it.
+    pub(super) fn contains(&self, position: Point) -> bool {
+        self.bounds.is_some_and(|bounds| bounds.contains(position))
+    }
+
+    /// Whether a press this map began is still held.
+    ///
+    /// A release or a cancel belongs to the map while this is true even when it arrives
+    /// off the box: the drag a press began follows the pointer, not the canvas.
+    pub(super) fn is_dragging(&self) -> bool {
+        self.dragging
+    }
 }
 
 /// The metres per pixel one land tier was chosen for.
@@ -1390,8 +1420,14 @@ fn hover_values(details: &VesselDetails, translate: &Translate) -> [SmolStr; 16]
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use base_ui::theme::appearance::Appearance;
-    use ui_core::{node::builder::NodeBuilder, test_support::record::PrimitiveKind};
+    use i18n::{language::codes::LanguageCode, translate::Translate};
+    use ui_core::{
+        node::builder::NodeBuilder, paint::primitive::Primitive,
+        test_support::record::PrimitiveKind,
+    };
     use widget::test_support::{CanvasPrimitive, WidgetTestApp};
 
     use super::*;
@@ -1466,6 +1502,29 @@ mod tests {
     /// A canvas node laid out in a page of a fixed size.
     fn harness() -> CanvasHarness {
         let mut app = WidgetTestApp::new();
+        let page = page(&mut app);
+        let mut map = MapCanvas::new();
+        app.with_cx(|cx| map.build(cx, page))
+            .expect("the canvas builds");
+        app.drain();
+        CanvasHarness { app, map, page }
+    }
+
+    /// The translator the product ships, for the tests that read the catalogue's copy.
+    fn product_translate() -> Translate {
+        Translate::new(
+            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            LanguageCode::En,
+        )
+    }
+
+    /// A canvas whose frame is drawn from the product catalogue, place names and all.
+    ///
+    /// The fixture catalogue [`harness`] composes has none of this widget's copy, so it
+    /// draws a map with no names on it: the tests that are about the labels need the
+    /// product's own words.
+    fn labelled_harness() -> CanvasHarness {
+        let mut app = WidgetTestApp::with_translate(product_translate());
         let page = page(&mut app);
         let mut map = MapCanvas::new();
         app.with_cx(|cx| map.build(cx, page))
@@ -1680,5 +1739,170 @@ mod tests {
             baseline,
             "the canvas returns its land tiers and its per-frame meshes"
         );
+    }
+
+    /// A camera change is one of the key's inputs, so the next frame is a new canvas.
+    ///
+    /// The old test of this covered only the first painted frame; a key that dropped the
+    /// camera would keep the canvas of the previous one and the map would never move.
+    #[test]
+    fn a_moved_camera_should_repaint_the_map() {
+        let mut harness = harness();
+        harness.sync(&[], &[]);
+        harness.app.drain();
+        let before = harness.canvas_handle();
+
+        assert!(harness.map.pan(Point::new(12.0, -8.0)), "the camera moved");
+        harness.sync(&[], &[]);
+        harness.app.drain();
+
+        assert!(
+            !Arc::ptr_eq(&before, &harness.canvas_handle()),
+            "a moved camera is another canvas, not the one that was drawn before it"
+        );
+    }
+
+    /// The land is registered once and drawn from on every painted frame.
+    ///
+    /// The per-frame layers own one geometry id each and are returned when they are
+    /// replaced; the coastline is not rebuilt with them. A cache that forgot its tier
+    /// would leak one registered land mesh per painted frame.
+    #[test]
+    fn a_painted_frame_should_not_register_the_land_again() {
+        let mut harness = harness();
+        let baseline = harness.app.app().geometry().len();
+        harness.sync(&[], &[]);
+        harness.app.drain();
+        let registered = harness.app.app().geometry().len();
+        assert!(
+            registered > baseline,
+            "the first painted frame registers the coastline"
+        );
+
+        assert!(harness.map.pan(Point::new(12.0, -8.0)), "the camera moved");
+        harness.sync(&[], &[]);
+        harness.app.drain();
+
+        assert_eq!(
+            harness.app.app().geometry().len(),
+            registered,
+            "a painted frame re-uses the land tier it registered and swaps only its own meshes"
+        );
+    }
+
+    /// A vessel is one more mesh on the frame, not a change to a layer that was not drawn.
+    #[test]
+    fn a_vessel_should_be_drawn_as_its_own_mesh() {
+        let mut without_vessel = harness();
+        without_vessel.sync(&[], &[]);
+        without_vessel.app.drain();
+        let without = geometry_draws(&without_vessel);
+
+        let mut with_vessel = harness();
+        with_vessel.sync(&[vessel(1)], &[ShipType::Tanker]);
+        with_vessel.app.drain();
+
+        assert_eq!(
+            geometry_draws(&with_vessel),
+            without + 1,
+            "the hull is the one more mesh a picture holding a vessel draws"
+        );
+    }
+
+    /// The land is drawn through the projection's own transform, not in Mercator space.
+    ///
+    /// The static mesh holds Mercator coordinates; a draw with an identity transform would
+    /// put a few units of longitude at the canvas origin. This pins the mapping the
+    /// uniform is supposed to be: `(0, 0)` where the projection puts it, one degree east a
+    /// step right, and one degree north a step **up** the canvas (Mercator grows north, the
+    /// canvas grows down).
+    #[test]
+    fn the_land_should_be_drawn_where_the_projection_puts_it() {
+        let mut harness = harness();
+        harness.sync(&[], &[]);
+        harness.app.drain();
+
+        let bounds = harness.bounds();
+        let projection = harness.map.projection().expect("the map has a projection");
+        let land = harness
+            .map
+            .tiers
+            .iter()
+            .flatten()
+            .next()
+            .expect("the painted frame registered a land tier");
+        let transform = harness
+            .canvas_handle()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Geometry(draw) if draw.id == land.id => Some(draw.transform),
+                _ => None,
+            })
+            .expect("the registered tier is drawn");
+
+        let zero = projection.screen([0.0, 0.0]);
+        let at = transform.apply(Point::new(0.0, 0.0));
+        assert!(
+            (at.x - (bounds.origin.x + zero[0])).abs() < 1e-3
+                && (at.y - (bounds.origin.y + zero[1])).abs() < 1e-3,
+            "the land's Mercator origin lands where the projection says: {at:?}"
+        );
+        let unit = projection.screen([1.0, 1.0]);
+        let east = transform.apply(Point::new(1.0, 0.0));
+        let north = transform.apply(Point::new(0.0, 1.0));
+        assert!(
+            (east.x - at.x - (unit[0] - zero[0])).abs() < 1e-3,
+            "one degree east is one projected pixel step to the right"
+        );
+        assert!(
+            (north.y - at.y - (unit[1] - zero[1])).abs() < 1e-3,
+            "one degree north is one projected pixel step up the canvas"
+        );
+        assert!(
+            north.y < at.y,
+            "Mercator grows north while the canvas grows down"
+        );
+    }
+
+    /// Every country or city name is shaped once for its halo, in the map's paper colour.
+    ///
+    /// The ring is eight copies of the name pushed before the name itself, each shaped as a
+    /// line of its own style; the text cache is where that is observable, because the canvas
+    /// only records glyph counts and not which text a run came from. (The engine's shaping
+    /// cache keeps the brush of the first line shaped for a text, so those copies are drawn
+    /// in the label's ink today rather than the paper colour — registered as F22 in the W6b
+    /// ledger. That the copies are shaped at all is what this pins.)
+    #[test]
+    fn every_place_name_should_be_ringed_by_its_halo() {
+        let mut harness = labelled_harness();
+        harness.sync(&[], &[]);
+        harness.app.drain();
+
+        let theme = harness.app.services().theme.theme_for(Appearance::Light);
+        let colors = MapColors::resolve(theme);
+        let halo_lines = harness
+            .map
+            .text
+            .entries
+            .iter()
+            .filter(|entry| entry.style.color == colors.halo)
+            .collect::<Vec<_>>();
+        assert!(
+            !halo_lines.is_empty(),
+            "a country or city name is shaped for its halo"
+        );
+        for halo in halo_lines {
+            assert!(
+                harness
+                    .map
+                    .text
+                    .entries
+                    .iter()
+                    .any(|entry| entry.text == halo.text && entry.style.color == colors.text),
+                "{} is drawn under its halo",
+                halo.text
+            );
+        }
     }
 }
