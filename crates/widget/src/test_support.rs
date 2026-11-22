@@ -1067,6 +1067,44 @@ mod tests {
         harness.drain();
     }
 
+    /// Two widget instances live in one application, each with its own signal scope and
+    /// surface: the host is a pane host, not a single-widget fixture. Closing one pane
+    /// removes only its own nodes and frame route — what a multi-pane action key has to
+    /// survive (P3-1h: keys are prefixed by the instance scope).
+    #[test]
+    fn two_widget_instances_live_side_by_side() {
+        let mut harness = WidgetTestApp::new();
+        let first = harness.mount::<WaitingWidget>(());
+        let second = harness.mount::<WaitingWidget>(());
+        harness.drain();
+
+        assert_ne!(
+            first.scope().index(),
+            second.scope().index(),
+            "each mount mints its own signal scope"
+        );
+        assert_ne!(first.surface(), second.surface());
+        assert_eq!(harness.router().len(), 2);
+        assert!(harness.tree().get(first.surface()).is_ok());
+        assert!(harness.tree().get(second.surface()).is_ok());
+
+        let released = first.release(harness.app_mut());
+        assert!(released > 0);
+        assert!(
+            harness.tree().get(first.surface()).is_err(),
+            "the closed pane's nodes are gone"
+        );
+        assert!(
+            harness.tree().get(second.surface()).is_ok(),
+            "the other pane is untouched"
+        );
+        assert_eq!(harness.router().len(), 1);
+        assert!(!second.is_released());
+
+        second.release(harness.app_mut());
+        assert!(harness.tree().get(second.surface()).is_err());
+    }
+
     /// The failure path: the fixture refuses its own recovery, and the framework's
     /// banner is shown above content.
     #[test]

@@ -1,7 +1,18 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.10（2026-11-22）
+> **版本**：v2.11（2026-11-22）
+>
+> **v2.11 变更摘要（2026-11-22）**：**P3-1h（W2a 审查 F1 High：多 pane 组件 key）完成**。§13 新增
+> **`WidgetCx::unique_key(&self, suffix: &str) -> SmolStr`**：kit 组件的 `key` 是**应用级** Action 身份
+> （`Button::on_click` 由它派生 `"<key>.click"`）与调试 id 前缀，两个 pane 用同一常量 key 会互相覆盖、先释放/先重建的一方
+> 再把对方 handler 摘掉（W2a 实测：同一 App 两个 pane 建 header 后释放第一个，第二个的 `MarketTradeInstrument.click`
+> handler 已不存在）。key 格式 **`"{suffix}@{scope}"`**（scope = 本实例 `SignalScope` 下标）：**同一实例同 suffix 恒同
+> key**（重建 / 语言切换后仍按同一身份摘登记），**跨 pane 必不同**（引擎每次 mount 追加 scope 槽且从不回收下标，release
+> 后也不复用）；后缀是 widget 内的控件位置名，行内重复控件把行身份拼进后缀。生命周期与释放配对写入 §13.3 / §13.10；
+> `crates/widgets/AGENTS.md` 增硬规则（kit key 必须经 `cx.unique_key`，禁止常量）与多 pane 测试写法（§1 硬约束 11 / §5 /
+> §9 / §11 / §12 / §15.5）。`WidgetCx::new` 形状不变（身份取自上下文已持有的 scope，W1/W2 已迁移代码零返工）；`ui_core`
+> 与 `crates/widgets/**` 不改。契约测试 164 → **170**（+6）。逐条登记 `.docs/gui-migration/design-changes.md` §19。
 >
 > **v2.10 变更摘要（2026-11-22）**：**P3-1g（测试支撑补齐批）完成**。§13.2 的 `WidgetTestApp` 增加测试装置面：
 > ① **`advance(Duration) -> bool`** 推进**引擎时钟**并跑一轮（`router.tick` + 一帧），返回本轮是否提交像素——E10
@@ -3762,7 +3773,7 @@ impl App {
 | 模块 | 职责 | 关键类型 |
 |---|---|---|
 | `view.rs` | 契约本体：widget 实现什么、框架何时调用 | `WidgetView` / `ReloadHandle` / `HeaderGroup` |
-| `cx.rs` | 唯一应用层上下文：服务、窗口、节点树、信号、帧请求、组合根三单例访问器 | `WidgetCx<'a>` |
+| `cx.rs` | 唯一应用层上下文：服务、窗口、节点树、信号、帧请求、组合根三单例访问器、每实例唯一组件 key | `WidgetCx<'a>` |
 | `any.rs` | 类型擦除句柄：`NodeId` 即擦除后的句柄 + 单态化 vtable | `AnyWidget` / `WidgetVTable`（私有） |
 | `status.rs` | 状态机：5 状态和、去重写入、notice/failure/action | `WidgetState` / `Notice` / `Failure` / `WidgetAction` / `WidgetStatus` |
 | `surface.rs` | 展示规则唯一实现：banner / 正文槽 / 占位（§13.6） | `WidgetSurface` |
@@ -3834,7 +3845,7 @@ pub trait WidgetView: Sized + 'static {
 }
 
 // ── cx.rs ──────────────────────────────────────────────────────────────────
-pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a Rc<WidgetServices>, SignalScope */ }
+pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a Rc<WidgetServices>, SignalScope（每实例唯一） */ }
 impl<'a> WidgetCx<'a> {
     pub fn new(
         app: &'a mut App,
@@ -3860,6 +3871,10 @@ impl<'a> WidgetCx<'a> {
     pub fn account(&self) -> Option<SmolStr>;                          // config_ref 派生
     pub fn data_time_zone(&self) -> time::UtcOffset;
     pub fn scope(&self) -> SignalScope;
+
+    /// kit 组件 key：`"{suffix}@{scope}"`。**同一实例同 suffix 恒返回同一 key**，
+    /// 两个实例必不同；kit key / action 名只允许从这里取（P3-1h；§13.3）。
+    pub fn unique_key(&self, suffix: &str) -> SmolStr;
 
     // 组合根三单例（应用级唯一；widget 不得自建，见 §13.9 R-10）
     pub fn layer(&self) -> &base_ui::kit::layer::Layer;
@@ -4164,6 +4179,20 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 隐藏（`StylePatch.visible=false`），不重建、不丢节点身份与依赖边。语言相关文本必须在 `bind_text` 里读
 `services.language`（读即登记依赖），否则语言切换不会重绘。
 
+**组件 key 的生命周期与释放配对（P3-1h）**：kit 组件的 `key` 是**应用级** Action 身份（`Button::on_click` 由 key 派生
+`Action::Custom("<key>.click")`，`App::on_action` 同 Action **后写覆盖**）与调试 id 前缀。唯一合法来源是
+`WidgetCx::unique_key(后缀)`：格式 `"{suffix}@{scope}"`，scope 是该 widget 实例的 `SignalScope` 下标。
+
+- **同一实例同后缀 → 恒返回同一 key**：scope 在实例生命周期内不变，`sync` / `header` 里的静态块重建（§13.10）、语言切换后
+  重建都拿回同一个身份，重建后的注册与重建前的释放能配成一对。
+- **不同实例 → 必不同 key**：每次 `AnyWidget::mount` 铸一个 scope，引擎的 `new_scope` 只向作用域表**追加**（从不回收下标，
+  `crates/ui_core/src/node/signal.rs`），因此同一 App 的两个 pane（以及「先释放一个、再挂一个」）绝不共享前缀；release 一个
+  pane 只 `off_action` 自己那个 `"<key>.click"`，不会摘掉另一个 pane 的 handler（W2a F1 的回归面）。
+- **后缀是 widget 内的控件位置名**：一个控件一个后缀；行内重复控件把行身份拼进后缀（`format_smolstr!("row.{index}.sound")`）。
+- **释放配对**：`WidgetView::release`（或重建前）用 build 时的同一个 key / 组件句柄调组件 `release`——kit 的 `release` =
+  `off_action("<key>.click")` + `release_scope`。只手工 `off_action` 会漏组件信号作用域（W2a F2：header 每次重建 +10 live 槽）。
+- **禁止常量 key**：跨 pane 共享的常量 key 是契约禁止项（`crates/widgets/AGENTS.md` §1 硬约束 11）。
+
 ### 13.4 错误面
 
 - 所有可失败 API 用 `ui_core::error::EngineError`（树/窗口/节点）；**无字符串错误**。
@@ -4232,7 +4261,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1g 实测 **164 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1h 实测 **170 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
     **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
@@ -4261,6 +4290,14 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
   - **服务聚合句柄**（P3-1f）：上下文借出组合根那一个 `Rc`，同一实例、同一份单例
     （`cx::the_context_hands_over_the_composition_root_s_services`：`ptr::eq` 两次调用同址 + `Rc::ptr_eq` 宿主实例 +
     经句柄 clone 出的 `layer` 与宿主层栈同址）。
+  - **每实例唯一组件 key**（P3-1h）：同一实例同 suffix 跨调用恒同 key
+    （`cx::the_same_suffix_in_one_instance_keeps_one_key`）；key 形状 = `"{suffix}@{scope}"`
+    （`cx::the_key_carries_the_instance_scope_and_the_widget_local_suffix`）；同 App 两实例同 suffix 不同
+    （`cx::two_instances_in_one_application_mint_different_keys`）；同实例不同 suffix 不同
+    （`cx::different_suffixes_in_one_instance_stay_distinct`）；**释放隔离**
+    （`cx::releasing_one_pane_leaves_the_other_pane_s_action_handler`：两个 panes 用真实 kit `Button` 注册
+    `"<key>.click"`，release 第一个后第二个的 `App::has_action_handler` 仍为真）；同一 `WidgetTestApp` 两 widget 实例并存
+    （`test_support::two_widget_instances_live_side_by_side`：不同 scope / surface，release 一个不动另一个的节点、帧路由）。
   - **时间与 E10 定时器**（P3-1g）：`advance` 到点派发 `App::after` 回调，回调不写渲染状态时该轮空闲、不出帧
     （`advance_dispatches_a_due_timer_without_asking_for_a_frame`：`frame_index` / `frame_requests` 不变、`rendered() == false`）；
     不到 deadline 不触发（`advance_does_not_fire_a_timer_before_its_delay`：半程 idle，第二个半程精确到点）；回调写入被
@@ -4294,6 +4331,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-10 | P3-1e 对 P3-1d 冻结面的增量（P3-0b §F2 裁决） | `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` / `animation_router: Rc<AnimationRouter>`——三个组合根单例的**唯一**注入点，`SelectorHost` 因此可从 `&WidgetServices` + `cx` 访问器组装（此前 6 个 selector widget 无合法 host 来源）；`WidgetServices::builder(app, runtime, translate, theme, layer, frame_router, animation_router)` 为装配缝（四信号铸在一个 scope，可选槽用 setter）；`WidgetCx` 新增 `layer()`/`frame_router()`/`animation()` 并**删除** `router()` 与独立 router 字段（`WidgetCx::new` 5→4 参数，`AnyWidget::mount`/`mount_in_scope` 去掉 `&FrameRouter` 形参：单例只从服务取，杜绝两份真相）；`WidgetTestApp` 自建三单例、经 builder 注入并增 `layer()`/`animation()` 访问器（`router()` 保留，返回宿主实例）；`base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与 `FrameRouter::installed` 同型）。测试 156 → 160。W 批未开工，不构成迁移负担，登记于 design-changes §16 |
 | R-11 | P3-1f 对 P3-1e 冻结面的增量 | `WidgetCx` 改为持有 `&Rc<WidgetServices>`、新增 `services_rc()`（`WidgetCx::new` 的 `services` 形参由 `&WidgetServices` 改为 `&Rc<WidgetServices>`；`AnyWidget` 与 `WidgetTestApp` 本来就持 `Rc`，mount / 测试调用点形状不变），`WidgetTestApp` 增 `services_rc()` 观测面——widget 在 `body` 里构造**拥有服务聚合的宿主**（`SelectorHost`）时取组合根那一个 `Rc`，不重建聚合；静态文案重建通法由 §13.10 冻结；事件过滤应用义务由 §13.11 冻结（引擎面 E21：`App::drain_events_where` + `test_support::diagnostics::signal_slot_stats`，P3-0b2 越界改 `ui_core` 已获 Lead 批准并登记 `ledger.md`）。测试 160 → 161。W 批未开工，不构成迁移负担，登记于 design-changes §17 |
 | R-12 | P3-1g 对 P3-1f 冻结面的增量（测试装置；无引擎面变更） | `WidgetTestApp` 增 `advance(Duration) -> bool`（推进**引擎时钟** + 一轮 `router.tick` + `TestApp::drain`，返回本轮是否提交像素）与观测面 `frame_index()` / `frame_requests()` / `rendered()`。E10 定时器 deadline 只在引擎钟推进后到期：**不读 wall clock、不真实 sleep**；到期回调在帧入口派发、写入参与同一帧；未到期轮是空闲轮（I3：不出帧、不增长帧请求）。`TestApp::advance` 已存在，本批**不改 `ui_core`**；`crates/widgets/**` 也未改——W2c 分支自建的 `ClockHost`（`TestApp` + `WidgetServices::builder` + 假墙钟）在合入后删除、改用本装置；W2b 的倒计时 timer 缺口（`test-ledger/w2-pizza.md` §8：到期 → 回调 → 再武装不可自动化）可据此补测（widget 自己的「现在」仍由测试写那个状态）。测试 161 → 164，登记于 design-changes §18 |
+| R-13 | P3-1h 对 P3-1g 冻结面的增量（纯增量；`WidgetCx::new` 形状不变） | §13.2 新增 `WidgetCx::unique_key(&self, suffix: &str) -> SmolStr`：格式 `"{suffix}@{scope}"`，scope 取上下文**已持有**的 `SignalScope` 下标——不新增 `instance_id` 形参（`WidgetCx::new` 仍 4 参数，W1/W2 已迁移 widget 的测试夹具零返工）；引擎 `new_scope` 只追加 scope 槽、从不回收下标，故同一 App 内实例前缀唯一、release 后也不复用。语义 / 生命周期 / 释放配对见 §13.3，静态块重建的 key 稳定性见 §13.10；硬规则见 `crates/widgets/AGENTS.md` §1-11 / §5 / §9 / §11 / §15.5。`WidgetTestApp` 本身已支持两个 `mount` 实例并存，本批只补契约测试。测试 164 → 170。**残余（不阻断）**：① 已迁移 W1/W2 代码里的常量 / 按 parent 手拼的 kit key 由各自 W 批改为 `unique_key`（登记 AGENTS §15.5，本批不改 `crates/widgets/**`）；② 前缀是 **App 内**实例身份，不得持久化 / 跨进程 / 跨 App 复用（instance id 与 scope 下标都不是稳定业务身份）；③ 同一实例内「同后缀 = 同 key」由调用方保证后缀按控件位置唯一，契约不检测重复后缀。不改 `ui_core`，登记于 design-changes §19 |
 
 ### 13.10 静态文案重建通法（kit 未补绑定面之前的冻结写法）
 
@@ -4307,6 +4345,11 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
    `cx.tree().get(node_or_parent).is_err()` 视为**已被 pane 卸载**（header 行重建是常态），直接返回——否则 `remove_node`
    返回 `StaleNode`，整次重建失败且控件消失。顺序与 §13.3 的 E16 一致（节点先删、后释放 scope）。
 4. **按现值重建**：同一 key 规则 / 同一父节点重建，并把新的 key 值记回去。
+
+**重建的控制用同一 key（P3-1h）**：第 1 步记的字段里应包含 `cx.unique_key(后缀)` 的结果（或直接保存组件句柄 / 由它派生的
+`Action`）。后缀不随重建变，同一实例内 key 因而恒定：重建前的 `release` 与重建后的注册指向同一个 `"<key>.click"`，不会
+留下上一个控件的 handler 或作用域；跨 pane 的同一控件后缀相同但前缀不同，不会互相摘除（§13.3）。行内 / 重复控件把行
+身份拼进后缀（`format_smolstr!("row.{index}.sound")`），前缀仍是实例身份。
 
 **行内静态组件**（表格 / 列表行闭包，没有 `App`）：结构更新只能在容器上做——`list::set_count(app, count)` 重建可见窗口
 （保留滚动位置），再 `cx.request_frame()`（count 未变，别处不会为这次重建出帧）。行内动态文本仍各走 `bind_text`；
@@ -4539,4 +4582,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.10**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾 + P3-1d 上下文/宿主补缝 + P3-1e 组合根三单例 + P3-1f 服务句柄/静态文案通法 + P3-1g 测试时钟）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.11**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾 + P3-1d 上下文/宿主补缝 + P3-1e 组合根三单例 + P3-1f 服务句柄/静态文案通法 + P3-1g 测试时钟 + P3-1h 每实例组件 key）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
