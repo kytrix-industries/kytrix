@@ -46,6 +46,11 @@
 //! was given — clone them into the kit component being built (an `Overlay`, a dialog,
 //! a selector host), never construct replacements.
 //!
+//! A host that owns the aggregate itself (a selector host, a dialog's presenter) takes
+//! it through [`WidgetCx::services_rc`]: the `Rc` the composition root built, cloned —
+//! never a copy of the collaborator set. The widget and its host therefore share one
+//! aggregate, just as they share the three singletons inside it.
+//!
 //! # Language dependency
 //!
 //! The engine registers a dependency only for reads that happen inside a
@@ -67,6 +72,8 @@
 //! read it, and the next frame draws the new language. A read outside a `bind_*`
 //! closure — for example in [`WidgetView::load`](crate::view::WidgetView::load) —
 //! is not tracked, which is correct: loading does not draw.
+
+use std::rc::Rc;
 
 use app_config::settings::Config;
 use base_ui::{
@@ -99,17 +106,22 @@ use super::{frame::FrameRouter, services::WidgetServices};
 pub struct WidgetCx<'a> {
     app: &'a mut App,
     window: WindowId,
-    services: &'a WidgetServices,
+    services: &'a Rc<WidgetServices>,
     scope: SignalScope,
 }
 
 impl<'a> WidgetCx<'a> {
     /// Assembles a context. The framework is the only caller; tests reach it
     /// through [`WidgetTestApp`](crate::test_support::WidgetTestApp).
+    ///
+    /// The aggregate is taken as the `Rc` the composition root owns, not as a bare
+    /// reference: a widget that builds a host owning services takes the handle from
+    /// [`WidgetCx::services_rc`] and clones it, so the host works over the one
+    /// aggregate the application built.
     pub fn new(
         app: &'a mut App,
         window: WindowId,
-        services: &'a WidgetServices,
+        services: &'a Rc<WidgetServices>,
         scope: SignalScope,
     ) -> Self {
         Self {
@@ -160,12 +172,25 @@ impl<'a> WidgetCx<'a> {
     }
 
     /// The injected services.
-    pub const fn services(&self) -> &WidgetServices {
+    pub fn services(&self) -> &WidgetServices {
+        self.services
+    }
+
+    /// The injected services as the shared handle the composition root handed over.
+    ///
+    /// A widget that builds a **host owning services** (a selector host, a dialog's
+    /// presenter) needs the `Rc` itself: clone this handle into the host
+    /// (`Rc::clone(cx.services_rc())`) so the two work over the application's one
+    /// aggregate. Assembling a second `WidgetServices` — or copying its fields — would
+    /// give the host a collaborator set that drifts from the application's (the three
+    /// singletons inside are the same instances, the signals are the same slots, but
+    /// the aggregate identity is what a later field would be missing from).
+    pub fn services_rc(&self) -> &Rc<WidgetServices> {
         self.services
     }
 
     /// The translation context: the widget's only source of interface text.
-    pub const fn translate(&self) -> &Translate {
+    pub fn translate(&self) -> &Translate {
         &self.services.translate
     }
 
@@ -173,13 +198,13 @@ impl<'a> WidgetCx<'a> {
     ///
     /// Read it inside a `bind_*` closure to follow language changes; see the module
     /// documentation.
-    pub const fn language(&self) -> Signal<LanguageCode> {
+    pub fn language(&self) -> Signal<LanguageCode> {
         self.services.language
     }
 
     /// The theme handle. Colours must be read through it inside a `bind_style`
     /// closure (the engine's G3 rule), not captured at build time.
-    pub const fn theme(&self) -> &ThemeHandle {
+    pub fn theme(&self) -> &ThemeHandle {
         &self.services.theme
     }
 
@@ -329,7 +354,7 @@ impl<'a> WidgetCx<'a> {
     }
 
     /// The Tokio runtime the widget's streams and RPC calls are driven on.
-    pub const fn runtime(&self) -> &Handle {
+    pub fn runtime(&self) -> &Handle {
         &self.services.runtime
     }
 }
@@ -346,6 +371,8 @@ impl std::fmt::Debug for WidgetCx<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
     use ui_core::{
         math::Rect,
@@ -440,5 +467,31 @@ mod tests {
             harness.tree().get(node).expect("the node exists").kind(),
             NodeKind::Canvas(_)
         ));
+    }
+
+    /// A widget that builds a host owning services takes the composition root's
+    /// aggregate, not a copy: the context hands out the one `Rc` the application built,
+    /// and cloning it reaches the same singletons the context reads.
+    #[test]
+    fn the_context_hands_over_the_composition_root_s_services() {
+        let mut harness = WidgetTestApp::new();
+
+        let same_handle = harness.with_cx(|cx| std::ptr::eq(cx.services_rc(), cx.services_rc()));
+        assert!(
+            same_handle,
+            "the context hands out one handle, not a fresh one per call"
+        );
+
+        let from_context = harness.with_cx(|cx| Rc::clone(cx.services_rc()));
+        assert!(
+            Rc::ptr_eq(&from_context, harness.services_rc()),
+            "the handle is the composition root's instance, not a copy of it"
+        );
+
+        let layer = Rc::clone(&from_context.layer);
+        assert!(
+            std::ptr::eq(&*layer, harness.layer()),
+            "a host built over that handle shares the application's layer stack"
+        );
     }
 }

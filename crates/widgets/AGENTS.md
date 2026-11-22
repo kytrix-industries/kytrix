@@ -205,6 +205,7 @@ cx.app() / cx.app_mut()              // &App / &mut App
 cx.tree() / cx.tree_mut()            // &NodeTree / &mut NodeTree
 cx.window() / cx.window_mut()        // WindowId / &mut Window
 cx.services() / cx.translate() / cx.language() / cx.theme()
+cx.services_rc()                    // Rc<WidgetServices>：自建 selector host 等宿主时 clone 传入
 cx.config_ref(|config| ...)          // 不克隆地读设置快照（read 不登记依赖）
 cx.account() / cx.data_time_zone()   // 由设置快照派生
 cx.scope() / cx.layer() / cx.frame_router() / cx.animation()
@@ -392,6 +393,8 @@ if generation != self.seen {
   `theme.clone()` + `layer.clone()` + `animation.clone()`（`cx.theme()` / `cx.layer()` / `cx.animation()`），`sync` 由
   `cx.frame_router()` 上的路由驱动（widget 自己的 `sync` 里调 `component.sync(cx.app_mut())` 即可，不要再注册第二个
   `App::on_frame`）。三个 `Rc` 句柄 clone 的是同一个组合根实例，widget 不新建（§5）。
+- **需要整个服务聚合的宿主**（`SelectorHost` 一类拥有 `Rc<WidgetServices>` 的宿主）用 `Rc::clone(cx.services_rc())`
+  取组合根那一个 `Rc`：不重建聚合、不逐字段复制，宿主与 widget 共用同一实例（P3-1f）。
 - **表格 / 列表的行闭包没有 `App`**：行内容里的动态值只能来自挂在节点上的 `bind_*`（读主题 / 设置信号）或行模型字段；
   需要 App 的结构性更新放到 widget 的 `sync`（`set_rows` / `set_items` / `push`）。
 - **释放顺序**：`WidgetView::release` 里 release 自己建的 kit 组件（节点仍在，可解绑 / 停动画），**不要自己删 surface 节点**；
@@ -555,19 +558,76 @@ Windows 上稳定 `CVT1100 duplicate resource` + `LNK1123`。P5 删除 gpui 依�
 
 ---
 
-## 15. 契约缺口登记（P3-1d 实测，kit 后续批处理）
+## 15. 契约缺口登记（kit / theme 后续批处理）
 
-W1（`news` / `force_order`）实迁暴露的两个 **kit 侧**缺口由 P3-1d 登记。**归属是 kit 后续批，不是 widget 批**：
-widget 侧不得各自重建组件库、另造绑定面或自实现容器。
+W1（`news` / `force_order`）实迁与 P3-1f 契约补充暴露的 **kit 侧、theme 侧**缺口登记于此。**归属是 kit 后续批（组件）
+与 theme 后续批（排版令牌），不是 widget 批**：widget 侧不得各自重建组件库、另造绑定面或自实现容器。
 
-1. **kit 静态文案组件没有绑定面**：`Badge` / `Button`（`label` / `icon`）/ `EmptyState`（`text`）的文案是构建期
-   `SmolStr` / `IconKind`；`kit::table` 的 `Column::header` / `empty_text` 同理——它们不带 `bind_text` 闭包。AGENTS §7
-   要求语言在 `bind_*` 里读，因此当前唯一通法是 widget 在 `sync` 里检测语言 / 选项 / 可用性变化 →
-   `remove_node` + 组件 `release` + 重建自己建的那一小块（surface 对静态 notice 已有先例；W1 的 header 声音按钮与空态、
-   `force_order` 的表格都这么做，并各有测试）。**登记 kit 后续批补 `bind_text` / `*_key` 形式的绑定面**；补上之前 W 批
-   按「重建自己建的节点」实现，不把这段重建逻辑抽成 widget 间共享封装、不改 kit 组件语义。
-2. **`kit::list` 无 separator、无像素 overscan**：旧 `DequeUnsizedList::separator` 与 `LIST_OVERDRAW = 150 px` 没有
-   对等能力。当前通法：行内容里自建 `kit::separator`（`index > 0`）近似 separator；`ListOptions::variable(row_height)`
-   + 默认 overscan **行数**近似像素缓冲（**已知差异**，W1 真窗口验收不据此判缺陷）。**登记 kit 后续批**：`list` 增加
-   separator 钩子与像素级 overscan 估计；在此之前 widget 不自己实现虚拟列表 / 滚动容器，也不改 `kit::list` 的
-   `ListOptions`。
+### 15.1 静态文案重建通法（kit 未补绑定面之前的唯一写法）
+
+`Badge` / `Button`（`label` / `icon`）/ `EmptyState`（`text`）的文案是**构建期** `SmolStr` / `IconKind`，`kit::table` 的
+`Column::header` / `empty_text` 同理——它们不带 `bind_text` 闭包；而 §7 要求文本在 `bind_*` 里读语言。两者相遇时的唯一
+通法是**重建（rebuilt, not re-bound）**，每个静态块四步：
+
+1. **记 key**：块构建时记下它按哪些值建的（`empty_language` / `(language, enabled, available)` / `rows_language`），
+   不记节点 id；记在 widget 自己的字段里，跨帧存活。
+2. **`sync` 比较**：在 widget 的 `sync` 里读现值（`*cx.read(&cx.language())`、`cx.config_ref`、宿主可用性），相等就直接
+   返回——稳态不写信号、不请求帧（I3）。
+3. **存活守卫摘节点 + release**：值变了，先摘自己建的节点、再释放组件作用域与 action handler。
+   - **摘节点前查存活**：`if cx.tree().get(node).is_err() { return Ok(()); }`。header 行由 pane 重建，旧控件节点已随行
+     消失；直接 `remove_node` 会返回 `StaleNode`，整次重建失败、控件再也没有（W1a2 F2 的实测缺陷）。
+   - **父节点同样查存活**：pane 重建 header 行后旧 `parent` 也是陈旧句柄；`cx.tree().get(parent).is_err()` 时直接放弃
+     重建（控件已随行消失，没有可重建的目标）。
+   - **顺序 = 「节点先删 → 组件 `release`」**：与框架 E16 / `remove_node_with_scope` 的顺序一致；`Button::release` 释放
+     组件作用域与 `"{key}.click"` action handler。
+4. **按现值重建**：用同一 key 规则 / 同一父节点的现值重建组件，并把新的 key 值记回去（`sound_built = (language, enabled, available)`）。
+
+**行内静态组件（表格 / 列表的行闭包）**没有 `App`，也不该在行闭包里做结构性更新：用容器的 `list::set_count` **重建可见
+窗口**。`news` 在 `sync` 里比较 `rows_language`，语言变了就 `list.set_count(cx.app_mut(), count)`（保留滚动位置）并
+`cx.request_frame()`（count 没变，别的路径不会为这次重建请求帧）；行里的动态文本仍各走 `bind_text`，只有分类徽标这种
+静态组件随行重建。语言切换是低频事件，重新测量可见行的代价是当前 kit 面的真实成本（§15.2）。
+
+三处参考实现（`crates/widgets/news/src/view.rs` 模块文档「Static copy is rebuilt, not re-bound」）：正文空态
+`sync_empty_state`、header 声音控件 `sync_sound_button` + `release_sound_button`、行内徽标 `rebuild_rows_for_language`；
+共用的摘节点助手是 `remove_own_node`。对应测试：`the_body_should_say_when_the_feed_is_empty`（空态）、
+`the_rows_should_be_rebuilt_when_the_language_moves`（行 + header）、
+`the_header_control_should_survive_the_pane_rebuilding_its_row`（存活守卫）。
+
+**不要**把这四步抽成 widget 间共享封装（D-10：不抽跨 widget 抽象），也**不要**在 widget 里复制 kit 外观（W1a 手写的
+badge pill 已按审查 F3 改为 `kit::badge::Badge`）。
+
+### 15.2 kit 静态文案绑定面（kit 后续批）
+
+缺绑定面的直接代价（登记，不在 widget 批解决）：
+
+- 语言 / 选项 / 可用性变化必须**重建可见块**：`news` 切语言要重建可见行（重新测量），而不是一个 `bind_text` 重算文本；
+- 重建逻辑每个 widget 各写一遍（§15.1 的三处示例 + 各自测试），`sync` 里多一份「上次按什么值建的」状态；
+- 行内静态组件只能整窗重建（`set_count`）——重建次数与批量增长的合并写法相关（见 §15.3 的 `List::push`）。
+
+**kit 后续批计划**：给 `Badge` / `Button`（`label` + `icon`）/ `EmptyState` / `kit::table::Column` 增 `bind_text` /
+`*_key` 形式的绑定面（或等价的 `Signal` 文本槽）。补上之后，widget 的对应块改回 `bind_*`、删除 §15.1 的重建状态与它们的
+测试。在此之前 W 批一律按 §15.1 写：**不改 kit 组件语义、不另造绑定面、不把重建逻辑下沉到共享封装**。
+
+### 15.3 `kit::list` 无 separator、无像素 overscan（kit 后续批）
+
+旧 `DequeUnsizedList::separator` 与 `LIST_OVERDRAW = 150 px` 没有对等能力。当前通法：行内容里自建 `kit::separator`
+（`index > 0`）近似 separator；`ListOptions::variable(row_height)` + 默认 overscan **行数**近似像素缓冲（**已知差异**，
+W1 真窗口验收不据此判缺陷）。**登记 kit 后续批**：`list` 增加 separator 钩子与像素级 overscan 估计；在此之前 widget
+不自己实现虚拟列表 / 滚动容器，也不改 `kit::list` 的 `ListOptions`。
+
+W1a2 追加登记的两处 `list` 代价：① **`List::push` 每条都重建可见窗口**（`list.rs` 自述的已知差异），双端列表 burst 时
+应合并为一次 `set_items`（或等 kit 增 `push_many`），W 批不自己实现增量缓冲；② **行容器默认 padding**
+（`padding_x=6 / padding_y=2`）叠加行内容 `padding(8.0)` → 水平 14 px、垂直 10 px，与旧 `px_2 py_2` 有视觉偏移，登记为
+已知差异，等 kit 补 `ListOptions::padding_*`。
+
+### 15.4 正文 / 次要文本排版令牌（theme 后续批）
+
+`base_ui::theme` 目前只有**控件尺寸阶梯**（`theme/components.rs` 的 `SizeTokens.font_size = 12/14`），**没有正文排版
+令牌**；W1a 的正文因此写了字面 px（标题 / 内容 `13.0`、时间 `11.0`），既违反 §7「尺寸 / 字号取 `base_ui::theme` 令牌或
+kit 尺寸档，不写字面 px」，也与旧实现漂移（旧：标题 / 内容走主题正文档，时间 `text_xs()` = 12 px）。
+
+W1a2 的当前写法：`UnifiedSize::Medium.text_size()`（14，标题 / 内容）/ `UnifiedSize::Small.text_size()`（12，时间）——
+即**借用控件尺寸档**，不是正文档；时间回到旧 12 px，标题 / 内容比旧正文档大一档。**登记 theme 后续批**：`theme` 增
+正文 / 次要文本 / 标题的排版令牌（body / secondary / caption 三级）；在此之前 W 批统一走 kit 尺寸档（或具名常量）并
+登记与旧实现的偏差，**不写裸 px**。
+
