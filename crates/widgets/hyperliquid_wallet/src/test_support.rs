@@ -1,4 +1,4 @@
-//! What the service and the pane are tested through.
+//! What the service and the pane are tested through — GUI-free.
 //!
 //! The venue is faked rather than the service: a fake answers what Hyperliquid would answer, and
 //! every reading the service makes — which routes it read, how often it re-read a timeline,
@@ -10,6 +10,28 @@
 //! publication. The listings it publishes are Hyperliquid's own: a listing is identified by the
 //! route and the venue's asset index, so a fixture that used another venue's identifiers would
 //! be a catalog this build refuses.
+//!
+//! # The seam is the service's source, not the widget host
+//!
+//! The old toolkit harness lived here too: it installed an application-global connector, a theme
+//! and a Tokio runtime, and drove a pane by sleeping on the wall clock until a predicate held.
+//! None of that survives the frozen widget contract:
+//!
+//! - The service is driven on the test's **own** runtime. [`runtime`] spawns the real
+//!   `WalletService` over a [`TestSource`] on the runtime the test is running, so a
+//!   `#[tokio::test(start_paused = true)]` test owns the paused clock its subject reads;
+//!   [`next_reliable`], [`wait_for_status`], [`until`] and [`latest_reading`] wait by yielding to
+//!   that runtime, never by sleeping.
+//! - The pane is driven through `widget::test_support::WidgetTestApp` in the view's own tests: it
+//!   builds the framework services, the fixture directory and the frame pump, so there is no
+//!   application-global connector or theme to install here. A frame-host test delivers live
+//!   updates by awaiting [`TestSource::publish`] on the runtime the host handed its services, and
+//!   states the effect it wants with the host's own `drain` / `drain_runtime` / `advance`.
+//! - The catalog is a value (`Arc<Catalog>`) rather than an installed global: [`fixture`] publishes
+//!   the fixture routes into it and every builder here reads from it. A test that fakes the
+//!   pane's directory seam hands the same catalog to its own fixture directory.
+//!
+//! Everything below is `#[cfg(test)]`-only (declared by `lib.rs`); production never sees it.
 
 use std::{
     collections::VecDeque,
@@ -17,7 +39,6 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use gpui_kit::{App, TestAppContext};
 use market_participants_connector::{
     account::{
         domain::{
@@ -90,8 +111,6 @@ pub(super) const VENUE: &str = "hyperliquid";
 pub(super) const PERPETUAL_SCOPE: &str = "core-perp";
 /// The scope of the test spot route.
 pub(super) const SPOT_SCOPE: &str = "core-spot";
-/// A wallet that is monitored whenever a test needs one.
-pub(super) const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
 /// The token codes every fixture catalog registers, which is what a test reading names.
 const FIXTURE_CODES: &[&str] = &["ETH", "BTC", "HYPE", "SOL", "USDC", "USDT", "USDH"];
 
@@ -861,8 +880,6 @@ impl WalletSubscription for FakeSubscription {
 struct FakeState {
     spot: HyperliquidSpotState,
     perpetual: HyperliquidPerpetualState,
-    /// The perpetual state one route answers with, when a test set one.
-    perpetual_by_route: AHashMap<VenueRoute, HyperliquidPerpetualState>,
     pairs: Vec<HyperliquidSpotPair>,
     fills: Vec<HyperliquidUserFill>,
     ledger: Vec<HyperliquidLedgerEvent>,
@@ -893,7 +910,6 @@ impl Default for FakeState {
             perpetual: HyperliquidPerpetualState {
                 positions: Vec::new(),
             },
-            perpetual_by_route: AHashMap::new(),
             pairs: Vec::new(),
             fills: Vec::new(),
             ledger: Vec::new(),
@@ -964,18 +980,6 @@ impl TestSource {
         }
     }
 
-    /// Republishes these routes' listings, which is what a venue that restated them answers with.
-    ///
-    /// A reading is resolved from the catalog its stream fetches, so a test about what a stream
-    /// opened *after* a market was loaded again resolves at republishes here: the next stream reads
-    /// the listings the venue is publishing now.
-    pub(super) fn restate(&self, routes: &[(VenueRoute, Vec<CatalogEntry>)]) {
-        for (route, entries) in routes {
-            test_support::publish_fixture_route(&self.catalog, route, entries.clone())
-                .expect("the test route should publish its listings");
-        }
-    }
-
     pub(super) fn spot(&self, state: HyperliquidSpotState) -> &Self {
         self.with(|state_mut| state_mut.spot = state);
         self
@@ -983,22 +987,6 @@ impl TestSource {
 
     pub(super) fn perpetual(&self, state: HyperliquidPerpetualState) -> &Self {
         self.with(|state_mut| state_mut.perpetual = state);
-        self
-    }
-
-    /// The perpetual state one route answers with.
-    ///
-    /// One partition's positions are not another's, so a test that reads a merge across partitions
-    /// says what each of them holds; a route with nothing set here answers with the plain
-    /// `perpetual` state, which is what every single-route test uses.
-    pub(super) fn perpetual_on(
-        &self,
-        route: &VenueRoute,
-        state: HyperliquidPerpetualState,
-    ) -> &Self {
-        self.with(|state_mut| {
-            state_mut.perpetual_by_route.insert(route.clone(), state);
-        });
         self
     }
 
@@ -1064,11 +1052,6 @@ impl TestSource {
         for sender in self.senders(kind) {
             let _ = sender.send(Ok(update.clone())).await;
         }
-    }
-
-    /// Pushes one live update to a subscription that is open, as a value a runtime can own.
-    pub(super) async fn deliver(self, kind: SubscriptionKind, update: HyperliquidWalletUpdate) {
-        self.publish(kind, update).await;
     }
 
     /// Reports a subscription failure, as a refused subscription would.
@@ -1155,11 +1138,7 @@ impl WalletSource for TestSource {
         }
         Ok(self.with(|state| {
             state.counters.perpetual_states += 1;
-            state
-                .perpetual_by_route
-                .get(route)
-                .cloned()
-                .unwrap_or_else(|| state.perpetual.clone())
+            state.perpetual.clone()
         }))
     }
 
@@ -1284,219 +1263,6 @@ impl WalletSource for TestSource {
     }
 }
 
-/// A venue that never answers a wallet read, for a pane that is driven by hand.
-///
-/// Opening a subscription is not a wallet read: a venue that answers nothing yet still has
-/// sockets, so a pane under this source has streams that report they are connecting and no
-/// reading behind them.
-#[derive(Clone, Copy)]
-pub(super) struct PendingSource;
-
-pub(super) struct PendingSubscription;
-
-impl WalletSource for PendingSource {
-    type Subscription = PendingSubscription;
-
-    /// The fixture route a reading is addressed to, so a stream parks on its reads rather than
-    /// failing for having no route to read.
-    fn wallet_routes(&self) -> Vec<VenueRoute> {
-        vec![perpetual_route()]
-    }
-
-    async fn fetch_spot_state(
-        &self,
-        _route: &VenueRoute,
-        _address: &WalletAddress,
-    ) -> Result<HyperliquidSpotState, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_perpetual_state(
-        &self,
-        _route: &VenueRoute,
-        _address: &WalletAddress,
-    ) -> Result<HyperliquidPerpetualState, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_spot_pairs(
-        &self,
-        _route: &VenueRoute,
-    ) -> Result<Vec<HyperliquidSpotPair>, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_fills(
-        &self,
-        _address: &WalletAddress,
-        _aggregate_by_time: bool,
-        _routes: &[VenueRoute],
-    ) -> Result<Vec<HyperliquidUserFill>, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_fills_by_time(
-        &self,
-        _address: &WalletAddress,
-        _start_timestamp: i64,
-        _end_timestamp: i64,
-        _routes: &[VenueRoute],
-    ) -> Result<Vec<HyperliquidUserFill>, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_ledger(
-        &self,
-        _address: &WalletAddress,
-        _start_time: i64,
-        _routes: &[VenueRoute],
-    ) -> Result<Vec<HyperliquidLedgerEvent>, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_open_orders(
-        &self,
-        _route: &VenueRoute,
-        _address: &WalletAddress,
-    ) -> Result<Vec<HyperliquidOpenOrder>, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_historical_orders(
-        &self,
-        _address: &WalletAddress,
-        _routes: &[VenueRoute],
-    ) -> Result<Vec<HyperliquidHistoricalOrder>, AccountError> {
-        std::future::pending().await
-    }
-
-    async fn fetch_catalog(
-        &self,
-        _route: &VenueRoute,
-    ) -> Result<Arc<[CatalogEntry]>, AccountError> {
-        std::future::pending().await
-    }
-
-    fn display_generation(&self) -> DisplaySnapshot {
-        Catalog::new().cached_display()
-    }
-
-    async fn subscribe_fills(
-        &self,
-        _address: &WalletAddress,
-        _routes: &[VenueRoute],
-    ) -> Result<Self::Subscription, AccountError> {
-        Ok(PendingSubscription)
-    }
-
-    async fn subscribe_ledger(
-        &self,
-        _address: &WalletAddress,
-        _routes: &[VenueRoute],
-    ) -> Result<Self::Subscription, AccountError> {
-        Ok(PendingSubscription)
-    }
-
-    async fn subscribe_fast_contexts(
-        &self,
-        _routes: &[VenueRoute],
-    ) -> Result<Self::Subscription, AccountError> {
-        Ok(PendingSubscription)
-    }
-}
-
-impl WalletSubscription for PendingSubscription {
-    async fn recv(&mut self) -> Option<Result<HyperliquidWalletUpdate, AccountError>> {
-        std::future::pending().await
-    }
-}
-
-/// Installs a market participants connector whose routes publish the test listings.
-///
-/// The pane asks the registry which routes a watch may name and which one an unconfigured pane
-/// starts on, so a test loads the venue whose routes the fake venue answers for and then
-/// publishes those routes' catalogs into the same directory the pane reads them from.
-pub(super) fn install_connector(cx: &mut App, routes: &[(VenueRoute, Vec<CatalogEntry>)]) {
-    install_connector_with(cx, routes, true);
-}
-
-/// The same, with the venue loaded or left out of the loaded venues entirely.
-///
-/// A venue that is not loaded is the state a pane nobody has loaded yet is
-/// in, and the catalogs the fixture published for its routes are then beside the
-/// point: the pane waits for the routes, not for the listings.
-pub(super) fn install_connector_with(
-    cx: &mut App,
-    routes: &[(VenueRoute, Vec<CatalogEntry>)],
-    loaded: bool,
-) {
-    // The directory the pane reads is the one the root owns, so it carries the
-    // terms of the assets this venue's fixtures are denominated in: a canonical
-    // identity is a digest of its terms, and a catalog that named an asset the
-    // directory cannot describe would be refused rather than published.
-    let catalog = Arc::new(Catalog::new());
-    publish_test_terms(&catalog, FIXTURE_CODES);
-    let connector =
-        market_participants_connector::test_support::install_root(cx, Arc::clone(&catalog));
-    // The pane reads the routes of a venue the user loaded, so the test loads the one the
-    // fake venue answers for: the scopes of the test set, not of the whole venue list.
-    if loaded {
-        connector
-            .load_fixture(
-                &market_participants_connector::test_support::definitions(&[venue()]),
-                &[],
-                &[],
-            )
-            .expect("the venue's routes should load");
-    }
-    test_support::commit_fixture_routes(
-        &catalog,
-        CatalogRouteUpdate::new(test_route_sources(routes), test_route_registrations(routes)),
-        &test_support::requirements(&test_route_list(routes)),
-    )
-    .expect("the test routes should publish");
-    // Loading the venue is one commit of every catalog route: the pane reads the
-    // catalog of a market the user loaded, so the test loads it the way the load
-    // action does.
-    test_support::publish_fixture_catalogs(cx, routes);
-}
-
-/// The catalog sources of one candidate test route set.
-pub(super) fn test_route_sources(
-    routes: &[(VenueRoute, Vec<CatalogEntry>)],
-) -> Vec<CatalogSourceBinding> {
-    routes
-        .iter()
-        .map(|(route, entries)| {
-            test_support::binding(&source_id(route), test_support::listing(entries.clone()))
-        })
-        .collect()
-}
-
-/// The route registrations of one candidate test route set.
-pub(super) fn test_route_registrations(
-    routes: &[(VenueRoute, Vec<CatalogEntry>)],
-) -> Vec<CatalogRouteRegistration> {
-    routes
-        .iter()
-        .map(|(route, _)| test_support::registration(route, &source_id(route)))
-        .collect()
-}
-
-/// The routes of one candidate test route set.
-pub(super) fn test_route_list(routes: &[(VenueRoute, Vec<CatalogEntry>)]) -> Vec<VenueRoute> {
-    routes.iter().map(|(route, _)| route.clone()).collect()
-}
-
-/// Installs what a windowed test draws: the metadata a list or a canvas asks for.
-pub(super) fn install_metadata(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-        widget_tokio_runtime::global::install(cx).expect("the test Tokio runtime should build");
-    });
-}
-
 /// The routes one test session publishes, with the listings every test reading names.
 ///
 /// One route publishes a perpetual and the other a spot pair, so a test that reports a reading
@@ -1512,34 +1278,6 @@ pub(super) fn test_routes() -> Vec<(VenueRoute, Vec<CatalogEntry>)> {
             vec![spot_entry(&spot_route(), "HYPE", "USDC", "0.001", "0.001")],
         ),
     ]
-}
-
-/// The routes of a venue that also deployed a DEX: the two core partitions and one deployed one.
-///
-/// `test_routes` stays the two-route set most tests are about, and this is the shape a real
-/// Hyperliquid account has — which is the only way to read a fan-out, a three-catalog union or a
-/// partition-level failure the way the venue actually produces them.
-pub(super) fn deployed_routes() -> Vec<(VenueRoute, Vec<CatalogEntry>)> {
-    let deployed = deployed_route();
-    vec![
-        (
-            spot_route(),
-            vec![spot_entry(&spot_route(), "HYPE", "USDC", "0.001", "0.001")],
-        ),
-        (
-            perpetual_route(),
-            vec![perp_entry(&perpetual_route(), "ETH", "0.1", "0.001")],
-        ),
-        (
-            deployed.clone(),
-            vec![perp_entry(&deployed, "SOL", "0.01", "0.001")],
-        ),
-    ]
-}
-
-/// The deployed DEX the tests read beside the core partitions.
-pub(super) fn deployed_route() -> VenueRoute {
-    route("perp-dex/xyz")
 }
 
 /// The config that follows the given addresses.
@@ -1575,17 +1313,6 @@ pub(super) fn empty_timeline() -> Arc<TimelineSnapshot> {
         window_end: super::timeline::WINDOW_MILLIS,
         fills: Arc::from([]),
     })
-}
-
-/// A reading of the open-orders tab.
-pub(super) fn open_orders_snapshot(
-    orders: Vec<HyperliquidOpenOrder>,
-    precision: DisplayPrecision,
-) -> Arc<DetailSnapshot> {
-    Arc::new(
-        DetailSnapshot::new(DetailData::OpenOrders(orders), precision)
-            .expect("a published listing should validate"),
-    )
 }
 
 /// A reading of the spot tab.
@@ -1732,45 +1459,4 @@ pub(super) async fn latest_reading(
         tokio::task::yield_now().await;
     }
     panic!("the expected reading should be published");
-}
-
-/// Pushes one live update to a subscription, from a test that owns a GPUI frame.
-///
-/// The send goes through the widget's own runtime rather than being awaited inline: a GPUI test
-/// thread is not a Tokio worker, so pumping the runtime is what lets the frame that receives it run.
-/// This only *schedules* the delivery — it does not wait for anything, because there is nothing
-/// here to wait for: the send completing is not the reading arriving, and every caller states the
-/// effect it wants with its own `settle_until` right after (for example "the totals to follow the
-/// venue"). A predicate that is true on the first round would be an empty wait wearing the name of
-/// a condition.
-pub(super) fn publish(
-    cx: &mut TestAppContext,
-    source: &TestSource,
-    kind: SubscriptionKind,
-    update: HyperliquidWalletUpdate,
-) {
-    let handle = cx.update(|cx: &mut App| widget_tokio_runtime::global::handle(cx));
-    handle.run(source.clone().deliver(kind, update));
-}
-
-/// Drives a pane until a predicate about it holds.
-///
-/// The pane's work lives on two runtimes — its own Tokio runtime and GPUI's — so a test that
-/// wants a reading to land gives both a turn: the sleep lets the widget runtime make progress,
-/// and `run_until_parked` is what runs the frame that received it.
-pub(super) fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&App) -> bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut rounds = 0_usize;
-    loop {
-        cx.run_until_parked();
-        if cx.update(|cx| ready(cx)) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{what} should happen after {rounds} rounds"
-        );
-        rounds += 1;
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
 }
