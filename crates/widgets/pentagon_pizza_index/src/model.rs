@@ -24,11 +24,11 @@
 //! maximum, and offers [`PizzaLevel::number`] separately for the one place the
 //! service's own numbering is what a reader has to see.
 
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use kytrix_proto::types::v1 as proto_types;
+use smol_str::SmolStr;
 use thiserror::Error;
-use widget::error::LocalizedError;
+use widget::error::TranslatedError;
 
 /// One rung of the readiness ladder, ordered from the calmest to the most severe.
 ///
@@ -96,8 +96,8 @@ impl PizzaLevel {
     }
 
     /// The rung's own name in the language showing now.
-    pub(super) fn name(self, cx: &App) -> SharedString {
-        t!(cx, self.name_key())
+    pub(super) fn name(self, translate: &Translate) -> SmolStr {
+        t_smol!(translate, self.name_key())
     }
 }
 
@@ -170,17 +170,19 @@ pub(super) enum PizzaDataError {
     UnknownLevel { level: u32 },
 }
 
-impl LocalizedError for PizzaDataError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for PizzaDataError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::MissingObservation => t!(cx, "error.pentagon_pizza_index.missing_observation"),
+            Self::MissingObservation => {
+                t_smol!(translate, "error.pentagon_pizza_index.missing_observation")
+            }
             // The level is the service's own number and the pane has no name for
             // it: a sentence showing it is the only honest thing to say, and it is
             // still a sentence about what arrived rather than about the service's
             // formatting.
             Self::UnknownLevel { level } => {
-                t!(
-                    cx,
+                t_smol!(
+                    translate,
                     "error.pentagon_pizza_index.unknown_level",
                     level = level
                 )

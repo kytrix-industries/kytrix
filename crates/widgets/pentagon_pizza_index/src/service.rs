@@ -38,7 +38,7 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
-use gpui_kit::{App, SharedString};
+use i18n::{t_smol, translate::Translate};
 use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector, engine::KytrixServiceError,
@@ -47,7 +47,7 @@ use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::{sync::mpsc, time::Instant};
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::{StreamGeneration, WidgetProtocol},
     runtime::{ServiceContext, WidgetService},
     stream::{StreamPublishError, StreamPublisher},
@@ -144,11 +144,11 @@ pub(super) enum PizzaFetchError {
     Data(#[from] PizzaDataError),
 }
 
-impl LocalizedError for PizzaFetchError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for PizzaFetchError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::Data(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Data(error) => error.translated_message(translate),
         }
     }
 }
@@ -162,11 +162,11 @@ pub(super) enum PizzaServiceError {
     StreamBusy,
 }
 
-impl LocalizedError for PizzaServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for PizzaServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::StreamClosed => i18n::t!(cx, "error.pentagon_pizza_index.unavailable"),
-            Self::StreamBusy => i18n::t!(cx, "error.pentagon_pizza_index.busy"),
+            Self::StreamClosed => t_smol!(translate, "error.pentagon_pizza_index.unavailable"),
+            Self::StreamBusy => t_smol!(translate, "error.pentagon_pizza_index.busy"),
         }
     }
 }
