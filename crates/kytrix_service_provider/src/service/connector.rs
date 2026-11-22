@@ -9,11 +9,7 @@ use std::{
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
 #[cfg(test)]
 use app_config::network::{NetworkRouteGeneration, ResolvedProxy};
-use app_config_provider::{
-    events::{ConfigEventBridge, ConfigTopics},
-    notification::ConfigNotification,
-};
-use gpui_kit::App;
+use app_config_provider::notification::ConfigNotification;
 use kytrix_proto as proto_response;
 use kytrix_proto::{
     AddEthereumWalletSelectionRequest, AddSolanaWalletSelectionRequest, AddXUserSelectionRequest,
@@ -35,12 +31,12 @@ use network::transport::{
 #[cfg(test)]
 use smol_str::SmolStr;
 use tokio::{
+    runtime::Handle,
     sync::{Notify, mpsc, oneshot, watch},
     time::{Instant, timeout, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
     ethereum_wallet::{
@@ -63,6 +59,8 @@ use super::{
 use crate::auth::test_support::test_transport;
 #[cfg(test)]
 use crate::service::engine::{ErrorCode, PendingRpc, XProfileEvent};
+#[cfg(test)]
+use crate::test_support::test_handle;
 use crate::{
     account_profile::AccountProfile,
     auth::{
@@ -92,20 +90,6 @@ use crate::{
 pub struct KytrixServiceConnector {
     inner: Arc<KytrixServiceConnectorInner>,
 }
-
-impl gpui_kit::Global for KytrixServiceConnector {}
-
-/// Keeps the Kytrix service bridge alive for the life of the application.
-///
-/// The bridge holds `Subscription`s, which are neither `Send` nor `Sync`, while
-/// the connector is an `Arc` shared with background work: the subscription lives
-/// here, owned by the application, and only the notification it publishes into
-/// travels with the connector.
-struct ServiceConfigBridge {
-    _bridge: ConfigEventBridge,
-}
-
-impl gpui_kit::Global for ServiceConfigBridge {}
 
 impl KytrixAccountSession {
     pub fn profile(&self) -> &AccountProfile {
@@ -580,7 +564,7 @@ impl KytrixServiceConnector {
 
     #[cfg(test)]
     pub(super) fn spawn_for_test(
-        runtime: &Runtime,
+        runtime: &Handle,
         config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
     ) -> Self {
@@ -597,7 +581,7 @@ impl KytrixServiceConnector {
     }
 
     #[cfg(test)]
-    pub(super) fn spawn_with_urls(runtime: &Runtime, websocket_url: Url) -> Self {
+    pub(super) fn spawn_with_urls(runtime: &Handle, websocket_url: Url) -> Self {
         let transport = test_transport();
         let auth = AuthSession::for_test(Arc::clone(&transport));
         let credential_invalidations = auth.session_changes();
@@ -611,59 +595,19 @@ impl KytrixServiceConnector {
         )
     }
 
-    #[cfg(test)]
-    pub(super) fn spawn_with_urls_config(
-        runtime: &Runtime,
-        websocket_url: Url,
-        config: ConfigNotification<Config>,
-        transport: Arc<TransportHub>,
-        auth: AuthSession,
-        credential_invalidations: watch::Receiver<SessionChange>,
-    ) -> Self {
-        Self::spawn_with_config(
-            runtime,
-            websocket_url,
-            config,
-            credential_invalidations,
-            transport,
-            auth,
-        )
-    }
-
     /// Connects the application to the Kytrix service.
     ///
-    /// This is the owner's single install point: it creates the auth session (D1),
-    /// the bridge, and the notification's reconfigure consumer.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `ConfigManager` was not installed, because the bridge the connector
-    /// routes with reads that manager's events. The composition root installs the
-    /// manager before it calls this; see [`ConfigEventBridge::install`].
-    pub fn install(
-        cx: &mut App,
-        runtime: &Runtime,
-        config: ConfigNotification<Config>,
-        transport: Arc<TransportHub>,
-    ) -> Result<Self, AuthError> {
-        let auth = AuthSession::spawn(config.clone(), Arc::clone(&transport), runtime.clone())?;
-        Ok(Self::install_with_auth(
-            cx, runtime, config, transport, auth,
-        ))
-    }
-
-    /// Connects the application to the Kytrix service without a toolkit context.
-    ///
-    /// This is the production entry point for an engine application: it creates the auth
-    /// session (D1), and the caller owns the configuration notification. Publishing the
-    /// network projection after each settings commit is the composition root's job
-    /// ([`ConfigNotification::publish`]); there is no toolkit configuration-event bridge.
+    /// This is the production entry point: it creates the auth session (D1) and starts
+    /// the supervisor over the runtime it is handed. The caller owns the configuration
+    /// notification and republishes the network projection after every settings commit
+    /// ([`ConfigNotification::publish`]); the connector's forwarding task is that
+    /// notification's single waiter.
     ///
     /// # Errors
     ///
     /// The auth session (its actor thread) could not be started.
     pub fn spawn(
-        runtime: Runtime,
+        runtime: Handle,
         config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
     ) -> Result<Self, AuthError> {
@@ -686,7 +630,7 @@ impl KytrixServiceConnector {
     /// then serves the signed-out status a UI test reads.
     #[cfg(feature = "test-support")]
     pub fn spawn_signed_out(
-        runtime: Runtime,
+        runtime: Handle,
         config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
     ) -> Result<Self, AuthError> {
@@ -701,49 +645,18 @@ impl KytrixServiceConnector {
         ))
     }
 
-    /// Installs the connector over the signed-out in-memory test session.
-    ///
-    /// The toolkit test harness's installation path; the engine application uses
-    /// [`Self::spawn`] and the headless host [`Self::spawn_signed_out`].
-    #[cfg(feature = "test-support")]
-    pub fn install_for_test(
-        cx: &mut App,
-        runtime: &Runtime,
-        config: ConfigNotification<Config>,
-        transport: Arc<TransportHub>,
-    ) -> Result<Self, AuthError> {
-        let auth = AuthSession::for_test_signed_out()?;
-        Ok(Self::install_with_auth(
-            cx, runtime, config, transport, auth,
-        ))
-    }
-
-    /// Completes installation over a caller-supplied auth session.
-    ///
-    /// Exists so a test can install the connector without starting the real auth
-    /// session; the production caller is [`Self::install`], and the test construction
-    /// is `install_for_test`.
-    pub(crate) fn install_with_auth(
-        cx: &mut App,
-        runtime: &Runtime,
+    #[cfg(test)]
+    pub(super) fn spawn_with_urls_config(
+        runtime: &Handle,
+        websocket_url: Url,
         config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
         auth: AuthSession,
+        credential_invalidations: watch::Receiver<SessionChange>,
     ) -> Self {
-        let bridge = ConfigEventBridge::install(
-            cx,
-            ConfigTopics::NETWORK,
-            config.clone(),
-            Arc::new(
-                |config: &app_config::settings::Config, _previous: &Config| config.network_config(),
-            ),
-        );
-        cx.set_global(ServiceConfigBridge { _bridge: bridge });
-
-        let credential_invalidations = auth.session_changes();
         Self::spawn_with_config(
             runtime,
-            KYTRIX_SERVICE_WS_URL.clone(),
+            websocket_url,
             config,
             credential_invalidations,
             transport,
@@ -752,7 +665,7 @@ impl KytrixServiceConnector {
     }
 
     pub(super) fn spawn_with_config(
-        runtime: &Runtime,
+        runtime: &Handle,
         websocket_url: Url,
         config: ConfigNotification<Config>,
         credential_invalidations: watch::Receiver<SessionChange>,
@@ -785,7 +698,7 @@ impl KytrixServiceConnector {
             transport_policy: supervisor_lifecycle.policy().clone(),
             runtime: runtime.clone(),
         };
-        let supervisor_task = runtime.run(async move {
+        let supervisor_task = runtime.spawn(async move {
             let Ok(_operation) = supervisor_lifecycle.begin_operation() else {
                 return;
             };
@@ -794,7 +707,7 @@ impl KytrixServiceConnector {
         let config_task = {
             let notification = config.clone();
             let commands = commands.clone();
-            runtime.run(async move {
+            runtime.spawn(async move {
                 loop {
                     let _ = notification.wait().await;
                     if commands.send(SupervisorCommand::Reconfigure).await.is_err() {
@@ -1431,8 +1344,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_rpcs_use_the_service_websocket() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         assert_eq!(connector.fetch_etf().await.unwrap().timestamp, 42);
         assert_eq!(
@@ -1489,8 +1401,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         assert_eq!(
             connector.fetch_pentagon_pizza_index().await,
@@ -1515,8 +1426,7 @@ mod tests {
                 pentagon_pizza_index: None,
             },
         ));
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         assert_eq!(
             connector.fetch_pentagon_pizza_index().await,
@@ -1543,8 +1453,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         assert_eq!(
             connector.fetch_coin_market_cap_fear_and_greed_index().await,
@@ -1571,8 +1480,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         assert_eq!(
             connector.fetch_coin_market_cap_fear_and_greed_index().await,
@@ -1597,8 +1505,7 @@ mod tests {
                 financial_calendar: None,
             },
         ));
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         assert_eq!(
             connector.fetch_financial_calendar().await,
@@ -1619,8 +1526,7 @@ mod tests {
     async fn ethereum_wallet_mutation_response_loss_is_unknown_and_is_not_retried() {
         let mut server = TestServiceServer::spawn(false).await;
         server.drop_next_response();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1644,8 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn ethereum_wallet_selections_map_the_service_response() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1670,8 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn solana_wallet_selections_map_the_service_response() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1704,8 +1608,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1737,8 +1640,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1763,8 +1665,7 @@ mod tests {
     async fn an_ethereum_wallet_selections_server_error_maps_to_the_api_error() {
         let mut server = TestServiceServer::spawn(false).await;
         server.fail_next_request();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1789,8 +1690,7 @@ mod tests {
     async fn a_solana_wallet_selections_server_error_maps_to_the_api_error() {
         let mut server = TestServiceServer::spawn(false).await;
         server.fail_next_request();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1814,8 +1714,7 @@ mod tests {
     #[tokio::test]
     async fn ethereum_wallet_selection_add_is_confirmed() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1841,8 +1740,7 @@ mod tests {
     #[tokio::test]
     async fn solana_wallet_selection_add_is_confirmed() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1868,8 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_ethereum_wallet_address_is_rejected_before_the_service_is_called() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1890,8 +1787,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_solana_wallet_address_is_rejected_before_the_service_is_called() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1920,8 +1816,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1952,8 +1847,7 @@ mod tests {
                 },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -1977,8 +1871,7 @@ mod tests {
     async fn an_ethereum_wallet_add_server_error_is_rejected() {
         let mut server = TestServiceServer::spawn(false).await;
         server.fail_next_request();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2004,8 +1897,7 @@ mod tests {
     async fn a_solana_wallet_add_server_error_is_rejected() {
         let mut server = TestServiceServer::spawn(false).await;
         server.fail_next_request();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2031,8 +1923,7 @@ mod tests {
     async fn solana_wallet_mutation_response_loss_is_unknown_and_is_not_retried() {
         let mut server = TestServiceServer::spawn(false).await;
         server.drop_next_response();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2056,8 +1947,7 @@ mod tests {
     #[tokio::test]
     async fn ethereum_wallet_selection_delete_is_confirmed() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2080,8 +1970,7 @@ mod tests {
     #[tokio::test]
     async fn solana_wallet_selection_delete_is_confirmed() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2104,8 +1993,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_ethereum_wallet_delete_address_is_rejected_before_the_service_is_called() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2126,8 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_solana_wallet_delete_address_is_rejected_before_the_service_is_called() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2153,8 +2040,7 @@ mod tests {
                 proto_response::AddEthereumWalletSelectionResponse { selection: None },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2182,8 +2068,7 @@ mod tests {
                 proto_response::AddSolanaWalletSelectionResponse { selection: None },
             ),
         );
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2211,8 +2096,7 @@ mod tests {
     async fn confirmed_x_add_without_a_profile_is_confirmed_as_pending() {
         let mut server = TestServiceServer::spawn(false).await;
         server.answer_x_add_with_pending_selection();
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2296,11 +2180,8 @@ mod tests {
     async fn connector_shutdown_completes_and_is_idempotent() {
         let config = ConfigNotification::new(Arc::new(Config::default()));
         let transport = test_transport();
-        let connector = KytrixServiceConnector::spawn_for_test(
-            &Runtime::for_test(),
-            config,
-            Arc::clone(&transport),
-        );
+        let connector =
+            KytrixServiceConnector::spawn_for_test(&test_handle(), config, Arc::clone(&transport));
 
         connector.shutdown().await;
         connector.shutdown().await;
@@ -2317,106 +2198,10 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// Exercises [`KytrixServiceConnector::install_with_auth`], the test seam: the
-    /// public [`KytrixServiceConnector::install`] is the thin wrapper that spawns the
-    /// auth session before calling it.
-    #[gpui_kit::test]
-    fn install_with_auth_should_bridge_network_writes_and_take_its_config_task_on_shutdown(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
-        use app_config::settings::Language;
-        use app_config_provider::manager::ConfigManager;
-        use gpui_kit::BorrowAppContext as _;
-
-        let runtime = Runtime::for_test();
-        let transport = test_transport();
-        let notification = cx.update(|cx| {
-            let manager = ConfigManager::in_memory(app_config::settings::Config::default(), cx);
-            let notification = ConfigNotification::new(Arc::new(manager.read().network_config()));
-            cx.set_global(manager);
-            notification
-        });
-        let connector = cx.update(|cx| {
-            KytrixServiceConnector::install_with_auth(
-                cx,
-                &runtime,
-                notification.clone(),
-                Arc::clone(&transport),
-                AuthSession::for_test(Arc::clone(&transport)),
-            )
-        });
-
-        cx.update(|cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(
-                    |config| {
-                        config.proxies.insert(
-                            SmolStr::new_static("install-bridge"),
-                            app_config::network::ProxyConfig {
-                                addr: SmolStr::new_static("127.0.0.1"),
-                                port: 9,
-                                authorization: app_config::network::ProxyAuthorizationConfig::None,
-                                resolve_dns_at_remote: false,
-                            },
-                        );
-                    },
-                    cx,
-                );
-            });
-        });
-        assert!(
-            connector
-                .network_notification()
-                .current()
-                .proxies
-                .contains_key(&SmolStr::new_static("install-bridge")),
-            "a network write should reach the projection the connector routes with"
-        );
-
-        let before_language = connector.network_notification().current();
-        cx.update(|cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(|config| config.language = Language::En, cx);
-            });
-        });
-        assert!(
-            Arc::ptr_eq(
-                &before_language,
-                &connector.network_notification().current()
-            ),
-            "a write outside the network domain must not publish a network projection"
-        );
-
-        assert!(
-            connector
-                .inner()
-                .config_task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some(),
-            "install must start the configuration forwarding task"
-        );
-
-        runtime.handle().block_on(async {
-            connector.shutdown().await;
-            transport.shutdown().await;
-        });
-        assert!(
-            connector
-                .inner()
-                .config_task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "shutdown must take the configuration forwarding task"
-        );
-    }
-
     #[tokio::test]
     async fn typed_service_subscriptions_should_not_receive_other_capability_events() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let index = financial_index_topic("SPX");
 
         let mut news = connector
@@ -2597,8 +2382,7 @@ mod tests {
     async fn global_shipping_chokepoint_subscription_should_release_the_remote_topic_when_dropped()
     {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2637,8 +2421,7 @@ mod tests {
     async fn a_second_global_shipping_chokepoint_subscription_should_start_from_the_session_snapshot()
      {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let session = connector
             .acquire_account_session(TEST_ACCOUNT_ID)
             .await
@@ -2699,8 +2482,7 @@ mod tests {
     #[tokio::test]
     async fn replacing_typed_subscriptions_should_update_the_remote_topic_set() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let news = vec![ServiceTopic::News];
         let dji = index_service_topic("DJI");
         let ndx = index_service_topic("NDX");
@@ -2778,8 +2560,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_empty_ack_should_not_lose_a_concurrent_news_resubscribe() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         let news = connector
             .subscribe_news()
@@ -2857,7 +2638,7 @@ mod tests {
         let auth = AuthSession::for_test(Arc::clone(&transport));
         let credential_invalidations = auth.session_changes();
         let connector = KytrixServiceConnector::spawn_with_urls_config(
-            &Runtime::for_test(),
+            &test_handle(),
             server.url.clone(),
             notification.clone(),
             Arc::clone(&transport),
@@ -2966,7 +2747,7 @@ mod tests {
         let auth = AuthSession::for_test(Arc::clone(&transport));
         let credential_invalidations = auth.session_changes();
         let connector = KytrixServiceConnector::spawn_with_urls_config(
-            &Runtime::for_test(),
+            &test_handle(),
             server.url.clone(),
             manager.notification(),
             Arc::clone(&transport),
@@ -3029,7 +2810,7 @@ mod tests {
         let auth = AuthSession::for_test(Arc::clone(&transport));
         let credential_invalidations = auth.session_changes();
         let connector = KytrixServiceConnector::spawn_with_urls_config(
-            &Runtime::for_test(),
+            &test_handle(),
             server.url.clone(),
             manager.notification(),
             Arc::clone(&transport),
@@ -3103,8 +2884,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_last_subscription_should_not_leave_an_idle_connection() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
 
         server.fail_next_request();
         let topic = ServiceTopic::News;
@@ -3135,8 +2915,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_topic_ack_should_be_rejected_through_the_websocket_facade() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         server.duplicate_topics_in_next_ack();
 
         assert!(matches!(
@@ -3159,8 +2938,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_server_oneof_should_be_rejected_through_the_websocket_facade() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         server.send_unknown_oneof_instead_of_next_ack();
 
         assert!(matches!(
@@ -3182,8 +2960,7 @@ mod tests {
     #[tokio::test]
     async fn index_facade_should_reference_count_and_expire_its_replay_cache() {
         let mut server = TestServiceServer::spawn(false).await;
-        let connector =
-            KytrixServiceConnector::spawn_with_urls(&Runtime::for_test(), server.url.clone());
+        let connector = KytrixServiceConnector::spawn_with_urls(&test_handle(), server.url.clone());
         let index = financial_index_topic("SPX");
         let service_topic = ServiceTopic::FinancialIndex(index.clone());
 

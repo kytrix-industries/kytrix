@@ -28,11 +28,11 @@ use app_config::network::Config;
 use app_config_provider::notification::ConfigNotification;
 use network::transport::hub::TransportHub;
 use tokio::{
+    runtime::Handle,
     task::JoinHandle,
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
     error::{DownloadError, DownloadFailure},
@@ -54,7 +54,7 @@ pub struct DownloadProviderDeps {
     /// The application's transport: the routes, the clients and the operation barrier.
     pub transport: Arc<TransportHub>,
     /// The application runtime every transfer runs on.
-    pub runtime: Runtime,
+    pub runtime: Handle,
 }
 
 /// One download as the manager holds it.
@@ -110,7 +110,7 @@ pub struct DownloadProvider {
 /// The shared body of one manager.
 struct Inner {
     transport: Arc<TransportHub>,
-    runtime: Runtime,
+    runtime: Handle,
     config: ConfigNotification<Config>,
     state: Mutex<State>,
     /// The delete tasks that have not finished yet.
@@ -415,7 +415,7 @@ impl Inner {
 
         let inner = Arc::downgrade(self);
         let runtime = self.runtime.clone();
-        let delete = self.runtime.run(async move {
+        let delete = self.runtime.spawn(async move {
             let outcome = if wait_for_attempts(pending).await {
                 remove_download_files(&runtime, &request.destination).await
             } else {
@@ -495,7 +495,7 @@ impl Inner {
         let resolving = self.runtime.clone();
         let transfer_cancellation = cancellation.clone();
         let transfer_progress = Arc::clone(&progress);
-        let downloading = self.runtime.run(async move {
+        let downloading = self.runtime.spawn(async move {
             fetch::download(
                 &transport,
                 &config,
@@ -512,7 +512,7 @@ impl Inner {
         let publishing_inner = Arc::downgrade(self);
         let publishing_cancellation = cancellation;
         let publishing_progress = Arc::clone(&progress);
-        let publishing = self.runtime.run(async move {
+        let publishing = self.runtime.spawn(async move {
             let mut sampled_at = Instant::now();
             let mut sampled = starting_from;
             loop {
@@ -537,7 +537,7 @@ impl Inner {
         });
 
         let outcome_inner = Arc::downgrade(self);
-        let outcome = self.runtime.run(async move {
+        let outcome = self.runtime.spawn(async move {
             let result = match downloading.await {
                 Ok(result) => result,
                 Err(error) => Err(DownloadError::Task(error)),
@@ -763,14 +763,14 @@ async fn wait_for_attempts(pending: Vec<JoinHandle<()>>) -> bool {
 /// has no file name this task could not have created a file there, so there is
 /// nothing to remove.
 async fn remove_download_files(
-    runtime: &Runtime,
+    runtime: &Handle,
     destination: &Path,
 ) -> Result<(), DownloadFailure> {
     let Some(part) = crate::partial::path(destination) else {
         return Ok(());
     };
     let files = vec![part, destination.to_path_buf()];
-    let removal = runtime.blocking(move || {
+    let removal = runtime.spawn_blocking(move || {
         let mut failure = None;
         for path in &files {
             if let Err(error) = std::fs::remove_file(path)
@@ -828,13 +828,13 @@ mod tests {
     use tokio::{net::TcpListener, time::Sleep};
     use url::Url;
     use uuid::Uuid;
-    use widget_tokio_runtime::runtime::Runtime;
 
     use super::{DownloadProvider, DownloadProviderDeps};
     use crate::{
         error::DownloadFailure,
         request::DownloadRequest,
         task::{DownloadEvent, DownloadId, DownloadStatus},
+        test_support::test_handle,
     };
 
     /// How much of a paced payload each frame carries.
@@ -1066,13 +1066,12 @@ mod tests {
     /// The accept loop runs on the shared test runtime for the rest of the
     /// process; a test only needs the address.
     fn spawn_server(server: Arc<Server>) -> SocketAddr {
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let listener = runtime
-            .handle()
             .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
             .expect("a loopback port is free");
         let address = listener.local_addr().expect("the listener has an address");
-        drop(runtime.run(async move {
+        drop(runtime.spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
@@ -1102,13 +1101,12 @@ mod tests {
     /// A transfer to it stays in flight writing nothing, which is what a stalled
     /// download looks like from the manager's side.
     fn spawn_stalled_server() -> SocketAddr {
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let listener = runtime
-            .handle()
             .block_on(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
             .expect("a loopback port is free");
         let address = listener.local_addr().expect("the listener has an address");
-        drop(runtime.run(async move {
+        drop(runtime.spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
@@ -1148,7 +1146,7 @@ mod tests {
                     allow_plaintext: true,
                     extra_root_certificates: Vec::new(),
                 })),
-                runtime: Runtime::for_test(),
+                runtime: test_handle(),
             },
             ConfigNotification::new(Arc::new(Config::default())),
         )

@@ -1,9 +1,9 @@
 //! The translation context handed to code that renders localized text.
 //!
-//! [`Translate`] replaces reading the translator and the language out of GPUI global
-//! state: the host builds the handle once and hands it to the code that renders, so
-//! nothing about translating a message depends on a process-wide installation.
-//! [`t_smol!`](crate::t_smol) is the macro that pairs with it.
+//! [`Translate`] keeps the catalogue and the language it renders in one handle: the host
+//! builds it once and hands it to the code that renders, so nothing about translating a
+//! message depends on process-wide state. [`t_smol!`](crate::t_smol) is the macro that
+//! pairs with it.
 
 use std::{cell::Cell, fmt::Display, rc::Rc};
 
@@ -14,9 +14,9 @@ use crate::{language::codes::LanguageCode, translator::types::I18n};
 /// A cloneable handle to a translator and the language it renders.
 ///
 /// Cloning shares both the catalogue and the selected language, so a host that switches
-/// the language through one clone switches it for every clone it has handed out. The
-/// handle is the replacement for the GPUI globals [`t!`](crate::t) reads: a renderer
-/// receives it as an argument instead of reaching into application state.
+/// the language through one clone switches it for every clone it has handed out. A
+/// renderer receives the handle as an argument instead of reaching into application
+/// state.
 ///
 /// # Thread affinity
 ///
@@ -86,9 +86,9 @@ impl Translate {
     /// locale defines it.
     ///
     /// A message missing from every locale renders as nothing rather than failing, the
-    /// same rule [`t!`](crate::t) follows, so a broken key shows up as a gap instead of
-    /// a crash. Use [`Translate::try_translate`] to tell a missing message from one that
-    /// is deliberately empty.
+    /// same rule [`t_smol!`](crate::t_smol) follows, so a broken key shows up as a gap
+    /// instead of a crash. Use [`Translate::try_translate`] to tell a missing message
+    /// from one that is deliberately empty.
     pub fn translate(&self, key: &str) -> SmolStr {
         self.try_translate(key).unwrap_or_default()
     }
@@ -120,14 +120,26 @@ impl Translate {
     }
 }
 
+/// Expands `name = value` to `value` and a bare `name` to the local variable of
+/// that name.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __i18n_value {
+    ($name:ident = $value:expr) => {
+        $value
+    };
+    ($name:ident) => {
+        $name
+    };
+}
+
 /// Translates a message through an explicitly injected [`Translate`] context, returning
 /// a [`SmolStr`].
 ///
-/// This is the macro new code uses in place of [`t!`](crate::t): the context is an
-/// argument instead of a GPUI global, and the text needs no gpui type. Its arguments
-/// work exactly like the ones [`t!`](crate::t) takes — a placeholder is bound either to
-/// an expression or to a local variable of that name, and a message that is missing
-/// from every loaded locale translates to an empty string.
+/// The context is an argument of the macro, so a renderer never reads process-wide
+/// state. A placeholder is bound either to an expression or to a local variable of that
+/// name, and a message that is missing from every loaded locale translates to an empty
+/// string.
 ///
 /// ```text
 /// t_smol!(translate, "menu.market")             // a message without placeholders
@@ -159,18 +171,7 @@ impl Translate {
 /// # Ok::<(), i18n::error::types::Error>(())
 /// ```
 ///
-/// # Migrating from the GPUI global
-///
-/// [`t!`](crate::t) reads the translator and the language out of GPUI globals and returns
-/// a gpui `SharedString`. Two changes are needed to move a call site:
-///
-/// ```text
-/// // Before: the renderer reached into process state.
-/// let text = t!(cx, "error.network.timeout");
-///
-/// // After: the host hands the context in, and the text is a `SmolStr`.
-/// let text = t_smol!(translate, "error.network.timeout");
-/// ```
+/// # Building the context
 ///
 /// The host builds the handle where it builds the rest of the application, e.g. from the
 /// catalogue embedded in the binary:
@@ -178,7 +179,7 @@ impl Translate {
 /// ```
 /// use std::rc::Rc;
 ///
-/// use i18n::{language::codes::LanguageCode, global::embedded, translate::Translate};
+/// use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 ///
 /// # fn build() -> Result<Translate, i18n::error::types::Error> {
 /// let translate = Translate::new(Rc::new(embedded::load()?), LanguageCode::En);
@@ -186,9 +187,6 @@ impl Translate {
 /// # }
 /// # build().expect("the embedded locales load");
 /// ```
-///
-/// [`t!`](crate::t) is removed in P5, together with the GPUI globals it reads; new code
-/// uses this macro.
 #[macro_export]
 macro_rules! t_smol {
     ($translate:expr, $key:expr $(,)?) => {
@@ -275,7 +273,7 @@ price: \"%{amount} 美元\"";
 
     /// The catalogue has no plural rule: a count-sensitive sentence is one key per form,
     /// and the message takes the count like any other placeholder. This pins the shape —
-    /// [`t!`](crate::t) has no plural capability either, so the new macro is equivalent.
+    /// the macro has no plural capability, so the key-per-form call is the whole story.
     #[test]
     fn a_count_sensitive_message_takes_one_key_per_form() {
         let translate = translate();
@@ -336,11 +334,11 @@ price: \"%{amount} 美元\"";
             t_smol!(translate, "menu.market").as_str(),
             catalogue
                 .translate(LanguageCode::En, "menu.market")
-                .as_ref()
+                .as_str()
         );
         assert_eq!(
             t_smol!(translate, "price", amount = amount).as_str(),
-            shared.as_ref()
+            shared.as_str()
         );
         assert_eq!(t_smol!(translate, "never.defined"), "");
     }

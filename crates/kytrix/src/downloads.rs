@@ -30,11 +30,11 @@ use download_provider::{
 };
 use network::transport::hub::TransportHub;
 use settings_ui::translation_downloads::{DownloadService, UnloadFailure};
+use tokio::runtime::Handle;
 use ui_core::{app::App, node::signal::Signal};
 use updater_ui::download::{
     DownloadService as UpdaterDownloads, DownloadSubscription as UpdaterDownloadSubscription,
 };
-use widget_tokio_runtime::runtime::Runtime;
 
 /// The process-wide download manager and the settings page's view of it.
 pub(crate) struct Downloads {
@@ -48,7 +48,7 @@ impl Downloads {
     pub(crate) fn new(
         app: &mut App,
         transport: Arc<TransportHub>,
-        runtime: Runtime,
+        runtime: Handle,
         network: ConfigNotification<Config>,
     ) -> Self {
         Self {

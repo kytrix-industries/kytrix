@@ -6,9 +6,9 @@ use app_config::network::{
     Config, ConfigError, NetworkRouteGeneration, ProxyRoute, ResolvedProxy, RouteTarget,
 };
 use market_participants_model::identifier::VenueId;
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 use crate::system_proxy;
 
@@ -78,7 +78,7 @@ pub async fn resolve_async(
     config: &Config,
     target: &RouteTarget,
     destination: &Url,
-    runtime: &Runtime,
+    runtime: &Handle,
 ) -> Result<ResolvedProxy, ConfigError> {
     resolve_async_cancellable(
         config,
@@ -98,7 +98,7 @@ pub async fn resolve_async_cancellable(
     target: &RouteTarget,
     destination: &Url,
     cancellation: CancellationToken,
-    runtime: &Runtime,
+    runtime: &Handle,
 ) -> Result<ResolvedProxy, ConfigError> {
     resolve_route_async_cancellable(config, target, destination, cancellation, runtime)
         .await
@@ -112,7 +112,7 @@ pub async fn resolve_route_async_cancellable(
     target: &RouteTarget,
     destination: &Url,
     cancellation: CancellationToken,
-    runtime: &Runtime,
+    runtime: &Handle,
 ) -> Result<ResolvedRoute, ConfigError> {
     if !matches!(proxy_route(config, target), ProxyRoute::System) {
         return resolve_route(config, target, destination);
@@ -123,9 +123,7 @@ pub async fn resolve_route_async_cancellable(
     let task_target = target.clone();
     // The runtime is the one that owns the blocking pool, so the OS calls and
     // the PAC evaluation run there whatever executor the caller is on.
-    let task = runtime
-        .clone()
-        .blocking(move || resolve_route(&config, &task_target, &destination));
+    let task = runtime.spawn_blocking(move || resolve_route(&config, &task_target, &destination));
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(ConfigError::InvalidSystemProxy { target: target.clone() }),
@@ -145,7 +143,7 @@ pub fn system_route_fingerprint(config: &Config, target: &RouteTarget) -> u64 {
 /// Session actors call this before comparing their cached System route fence.
 pub async fn refresh_system_proxy_fingerprint(
     cancellation: CancellationToken,
-    runtime: &Runtime,
+    runtime: &Handle,
 ) -> Option<u64> {
     system_proxy::refresh_os_proxy_fingerprint(cancellation, runtime).await
 }
@@ -203,7 +201,7 @@ impl ProxyResolver {
         &self,
         venue: &VenueId,
         destination: &Url,
-        runtime: &Runtime,
+        runtime: &Handle,
     ) -> Result<(ResolvedProxy, NetworkRouteGeneration), ConfigError> {
         self.resolve_for_target_with_generation(&RouteTarget::Venue(*venue), destination, runtime)
             .await
@@ -213,7 +211,7 @@ impl ProxyResolver {
         &self,
         target: &RouteTarget,
         destination: &Url,
-        runtime: &Runtime,
+        runtime: &Handle,
     ) -> Result<ResolvedProxy, ConfigError> {
         self.resolve_for_target_with_generation(target, destination, runtime)
             .await
@@ -224,7 +222,7 @@ impl ProxyResolver {
         &self,
         target: &RouteTarget,
         destination: &Url,
-        runtime: &Runtime,
+        runtime: &Handle,
     ) -> Result<(ResolvedProxy, NetworkRouteGeneration), ConfigError> {
         let config = (self.config)();
         let generation = route_generation(&config, target);
@@ -254,10 +252,30 @@ mod tests {
         ProxyConfig, ProxyRoute, ResolvedProxy, RouteTarget, ServiceTarget,
     };
     use smol_str::SmolStr;
+    use tokio::runtime::Handle;
     use url::Url;
-    use widget_tokio_runtime::runtime::Runtime;
 
     use super::{ProxyResolver, resolve};
+
+    /// The runtime every test in the process shares.
+    ///
+    /// A handle to a runtime built inside one test would be shut down when the test
+    /// ends, failing the blocking work a still-running peer started; one runtime for
+    /// the whole test binary is what makes the handle a stand-in for the application
+    /// runtime rather than a second one.
+    fn test_handle() -> Handle {
+        static SHARED: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+        SHARED
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a test runtime builds")
+            })
+            .handle()
+            .clone()
+    }
 
     #[test]
     fn resolve_should_materialize_direct_and_named_routes() {
@@ -298,7 +316,7 @@ mod tests {
             capability: KytrixServiceCapability::XMedia,
         };
         let destination = Url::parse("https://pbs.twimg.com/media/test.jpg").unwrap();
-        let application = Runtime::for_test();
+        let application = test_handle();
         let mut config = Config::default();
         let current = Arc::new(std::sync::RwLock::new(Arc::new(Config::default())));
         let resolver = ProxyResolver::new({

@@ -27,7 +27,7 @@ use crate::{composition::Composition, shell::root::Shell};
 /// The translator over the product catalogue.
 pub(crate) fn translate(language: LanguageCode) -> Translate {
     Translate::new(
-        Rc::new(i18n::global::embedded::load().expect("the embedded catalogue loads")),
+        Rc::new(i18n::embedded::load().expect("the embedded catalogue loads")),
         language,
     )
 }

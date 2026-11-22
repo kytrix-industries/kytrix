@@ -18,14 +18,17 @@ use market_participants_model::{
     listing::route::VenueListingKey,
 };
 
-use crate::catalog::{
-    batch::CatalogEntry,
-    display::types::DisplayError,
-    error::{CatalogError, ListingInstrumentError},
-    test_support::{
-        self, FIXTURE_CODES, Fixture, SPOT_SOURCE, VENUE, entry, listing_key, spot_route,
-        spot_token,
+use crate::{
+    catalog::{
+        batch::CatalogEntry,
+        display::types::DisplayError,
+        error::{CatalogError, ListingInstrumentError},
+        test_support::{
+            self, FIXTURE_CODES, Fixture, SPOT_SOURCE, VENUE, entry, listing_key, spot_route,
+            spot_token,
+        },
     },
+    test_support::test_handle,
 };
 
 /// The venue symbols of the two fixture listings, and the instruments they trade.
@@ -136,9 +139,7 @@ async fn a_cached_read_should_never_fetch() {
         &[btc_entry()],
         FIXTURE_CODES,
     );
-    fixture
-        .catalog()
-        .set_runtime(widget_tokio_runtime::runtime::Runtime::for_test());
+    fixture.catalog().set_runtime(test_handle());
     let catalog = fixture.catalog();
 
     let captured = catalog.cached_display();

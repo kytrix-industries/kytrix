@@ -30,7 +30,7 @@ use download_provider::{
     request::DownloadRequest,
     task::{DownloadEvent, DownloadId, DownloadStatus, DownloadTask},
 };
-use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use ui_core::{
     math::Size,
     node::{id::NodeId, tree::NodeTree},

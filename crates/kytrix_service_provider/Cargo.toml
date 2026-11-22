@@ -20,7 +20,6 @@ base64.workspace = true
 bs58.workspace = true
 bytes.workspace = true
 futures.workspace = true
-gpui-kit.workspace = true
 keyring.workspace = true
 kytrix_proto.workspace = true
 log.workspace = true
@@ -53,12 +52,10 @@ tokio = { workspace = true, features = [
 tokio-util.workspace = true
 url.workspace = true
 uuid.workspace = true
-widget_tokio_runtime.workspace = true
 yawc.workspace = true
 
 [dev-dependencies]
 app_config_provider = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 network = { workspace = true, features = ["test-support"] }

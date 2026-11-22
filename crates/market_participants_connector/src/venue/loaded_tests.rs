@@ -12,19 +12,17 @@
 
 use std::sync::Arc;
 
-use gpui_kit::TestAppContext;
 use market_participants_model::{
     identifier::{VenueId, VenueScopeId},
     listing::route::VenueRoute,
     routing::CapabilityId,
 };
-use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
     definition::{CapabilitySupport, ScopeEntry},
-    loaded::{LoadedVenues, VenuesUpdated},
+    loaded::LoadedVenues,
     metadata::VenueMetadata,
-    test_support::{fixture_application, fixture_connector, load},
+    test_support::{fixture_connector, load},
 };
 use crate::{
     adapter::ProtocolRequest,
@@ -39,10 +37,7 @@ use crate::{
         BINANCE_VENUE, CORE_PERP_SCOPE, HYPERLIQUID_VENUE, OKX_VENUE, PERPETUAL_SCOPE, SPOT_SCOPE,
         SWAP_SCOPE,
     },
-    test_support::{
-        CatalogFixture, FixtureAnswer, dex_meta, info_fixture_server, refusing_fixture_server,
-        spot_meta_answer,
-    },
+    test_support::{CatalogFixture, dex_meta, info_fixture_server, spot_meta_answer},
 };
 
 /// One built-in venue identity.
@@ -386,173 +381,5 @@ async fn a_request_for_an_unloaded_scope_is_refused_without_a_request() {
     );
 
     connector.shutdown().await;
-    server.abort();
-}
-
-/// Only a commit notifies, and one commit notifies exactly once.
-///
-/// The announcement is what every subscriber — the menu, the selector, every pane —
-/// wakes up on, so the contract is about the count as much as about the event: a root
-/// nobody has loaded announces nothing, a load that is refused while staging commits
-/// nothing and therefore announces nothing, and a load that commits announces once —
-/// not while it is in flight, and not once per route or per catalog.
-#[gpui_kit::test]
-fn only_a_commit_notifies(cx: &mut TestAppContext) {
-    cx.executor().allow_parking();
-    let runtime = Runtime::for_test();
-    let (info, _requests, info_server) = runtime.handle().block_on(info_fixture_server(
-        vec![r#"[null,{"name":"xyz"}]"#.to_owned()],
-        spot_meta_answer(&["USD", "USDC", "BTC"]),
-        dex_meta(&["BTC"]),
-        vec![("xyz".to_owned(), dex_meta(&["xyz:ABC"]))],
-    ));
-    let (refused, _refused_requests, refused_server) =
-        runtime
-            .handle()
-            .block_on(refusing_fixture_server(vec![FixtureAnswer::refused(
-                422,
-                "",
-                "no such market",
-            )]));
-    let fixture = cx.update(|cx| fixture_application(cx, &refused, &info));
-    let hyperliquid = venue(HYPERLIQUID_VENUE);
-
-    // A commit reaches a subscriber as a message the application's own executor
-    // delivers, so every "nothing was announced" below is read after the executor has
-    // been given the thread: what is asserted is the root's answer rather than the
-    // pump's.
-    cx.run_until_parked();
-    assert!(
-        fixture.announcements().is_empty(),
-        "a root nobody has loaded announces nothing"
-    );
-
-    // A load that is refused while staging is not a commit: the venue never enters the
-    // view, so nothing is announced for it.
-    let binance = venue(BINANCE_VENUE);
-    assert!(
-        fixture.load(&binance).is_err(),
-        "the fixture refuses the catalogue request this load stages against"
-    );
-    cx.run_until_parked();
-    assert!(
-        fixture.announcements().is_empty(),
-        "a load that commits nothing announces nothing"
-    );
-
-    fixture
-        .load(&hyperliquid)
-        .expect("the venue loads from the fixture reading");
-    assert!(
-        fixture.announcements().is_empty(),
-        "nothing is announced while the load is in flight"
-    );
-
-    let announced = fixture.wait_for_announcements(cx, 1);
-    assert_eq!(
-        announced,
-        vec![VenuesUpdated {
-            venue: hyperliquid,
-            revision: 1,
-        }],
-        "one commit is one announcement, naming the venue and the revision it published"
-    );
-    info_server.abort();
-    refused_server.abort();
-}
-
-/// A commit that *shrinks* a venue's scope set still notifies — exactly once.
-///
-/// A refresh that finds fewer deployments is a successful commit rather than a
-/// removal: the interface has to hear it, because a pane that is not told keeps
-/// offering a scope the venue no longer publishes. The revision has to move with it,
-/// so a subscriber that dedups by `(venue, revision)` cannot drop the shrink.
-#[gpui_kit::test]
-fn a_shrinking_commit_notifies(cx: &mut TestAppContext) {
-    cx.executor().allow_parking();
-    let runtime = Runtime::for_test();
-    let (info, _requests, server) = runtime.handle().block_on(info_fixture_server(
-        // One load is one reading: the first names two deployments, the refresh one.
-        vec![
-            r#"[null,{"name":"xyz"},{"name":"abc"}]"#.to_owned(),
-            r#"[null,{"name":"xyz"}]"#.to_owned(),
-        ],
-        spot_meta_answer(&["USD", "USDC", "BTC"]),
-        dex_meta(&["BTC"]),
-        vec![
-            ("xyz".to_owned(), dex_meta(&["xyz:ABC"])),
-            ("abc".to_owned(), dex_meta(&["abc:DEF"])),
-        ],
-    ));
-    let fixture = cx.update(|cx| fixture_application(cx, &info, &info));
-    let hyperliquid = venue(HYPERLIQUID_VENUE);
-    let shrinking = route(&hyperliquid, "perp-dex/abc");
-
-    fixture
-        .load(&hyperliquid)
-        .expect("the first connection commits both deployments");
-    let first = fixture.wait_for_announcements(cx, 1);
-    assert_eq!(first.len(), 1, "the first commit announces exactly once");
-    assert!(
-        fixture.connector().venues().scope(&shrinking).is_some(),
-        "the first reading published the deployment the refresh drops"
-    );
-
-    fixture
-        .load(&hyperliquid)
-        .expect("the refresh commits the one deployment the venue still publishes");
-    assert_eq!(
-        fixture.announcements().len(),
-        1,
-        "nothing is announced while the refresh is in flight"
-    );
-
-    let announced = fixture.wait_for_announcements(cx, 2);
-    assert_eq!(
-        announced.len(),
-        2,
-        "a shrinking commit is a commit and announces exactly once"
-    );
-    assert_eq!(
-        announced[1].venue, hyperliquid,
-        "the announcement names the venue that shrank"
-    );
-    assert_eq!(
-        announced[1].revision, 2,
-        "with the next revision of that venue, not the one it had while loaded: {announced:?}"
-    );
-    assert!(
-        fixture.connector().venues().scope(&shrinking).is_none(),
-        "the scope the venue no longer publishes left the view"
-    );
-
-    // The limit of a shrink is a commit that publishes no scope at all: the venue
-    // leaves the view, and the removal is a commit like any other — one announcement,
-    // with a revision no earlier commit of that venue used, so a subscriber that
-    // dedups by `(venue, revision)` cannot drop it.
-    fixture
-        .connector()
-        .load_fixture(
-            &crate::test_support::definitions(std::slice::from_ref(&hyperliquid)),
-            &[(hyperliquid, Vec::new())],
-            &[],
-        )
-        .expect("the removal commits");
-    assert!(
-        fixture.connector().venues().loaded(&hyperliquid).is_none(),
-        "a venue that publishes no scope leaves the view"
-    );
-    let announced = fixture.wait_for_announcements(cx, 3);
-    assert_eq!(
-        announced.len(),
-        3,
-        "a removal is a successful commit and is announced exactly once"
-    );
-    assert_eq!(
-        announced[2].revision, 3,
-        "with the next revision of that venue, not the one it had while loaded: {announced:?}"
-    );
-
-    fixture.shutdown();
     server.abort();
 }

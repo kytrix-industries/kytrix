@@ -61,7 +61,7 @@ use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
     theme::{appearance::Appearance, handle::ThemeHandle},
 };
-use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use market_participants_connector::{
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
@@ -73,6 +73,7 @@ use settings_ui::{
     session::{SettingsStore, SettingsWriteError},
     translation_downloads::{TranslationDownloads, TranslationDownloadsDeps},
 };
+use tokio::runtime::Handle;
 use ui_core::{app::App, node::signal::Signal};
 use updater_ui::updater::UpdaterDeps;
 use widget::{frame::FrameRouter, services::WidgetServices};
@@ -379,19 +380,13 @@ impl Composition {
         let market_notification = ConfigNotification::new(Arc::new(
             MarketParticipantNetworkSnapshot::new(initial.as_ref().clone()),
         ));
-        let service_runtime = widget_tokio_runtime::runtime::Runtime::from_handle(runtime.clone());
-
         let market_participants = install_market_participants(
-            &service_runtime,
+            &runtime,
             Arc::clone(&transport),
             market_notification.clone(),
         );
-        let accounts = spawn_connector(
-            accounts,
-            &service_runtime,
-            network.clone(),
-            Arc::clone(&transport),
-        )?;
+        let accounts =
+            spawn_connector(accounts, &runtime, network.clone(), Arc::clone(&transport))?;
 
         let services = Rc::new(
             WidgetServices::builder(
@@ -439,7 +434,7 @@ impl Composition {
         let downloads = Rc::new(Downloads::new(
             app,
             Arc::clone(&transport),
-            service_runtime,
+            runtime.clone(),
             network,
         ));
         let translation_downloads = TranslationDownloads::new(
@@ -557,7 +552,7 @@ impl Composition {
 /// Connects the application to the account service over this build's session.
 fn spawn_connector(
     accounts: Accounts,
-    runtime: &widget_tokio_runtime::runtime::Runtime,
+    runtime: &Handle,
     network: ConfigNotification<NetworkConfig>,
     transport: Arc<TransportHub>,
 ) -> Result<Arc<KytrixServiceConnector>, InitializationError> {
@@ -599,17 +594,18 @@ fn prediction_translator(
 /// Builds the market participants root the title bar's venue menu loads through.
 ///
 /// The connector is built over the process transport and the market-participants network
-/// projection of the settings, and it starts no work: no venue is loaded at startup, the
-/// user's own load is the only thing that fetches. The projection is republished after every
-/// commit that changes the network or venue settings (see [`ConfigHub::publish`]).
+/// projection of the settings. It starts no load: no venue is fetched at startup, the
+/// user's own load is the only thing that fetches. The projection is republished after
+/// every commit that changes the network or venue settings (see [`ConfigHub::publish`]),
+/// and the root's invalidation task closes the pooled connections the new projection no
+/// longer serves.
 fn install_market_participants(
-    runtime: &widget_tokio_runtime::runtime::Runtime,
+    runtime: &Handle,
     transport: Arc<TransportHub>,
     notification: ConfigNotification<MarketParticipantNetworkSnapshot>,
 ) -> Option<MarketParticipantsConnector> {
-    let input = MarketParticipantsConnectorInput::new(transport, notification).with_runtime(
-        widget_tokio_runtime::runtime::Runtime::from_handle(runtime.handle().clone()),
-    );
+    let input = MarketParticipantsConnectorInput::new(transport, notification)
+        .with_runtime(runtime.clone());
     match MarketParticipantsConnector::new(input) {
         Ok(connector) => Some(connector),
         Err(error) => {

@@ -1234,7 +1234,6 @@ mod tests {
         test_support::record::PrimitiveKind,
         text::TextStyle,
     };
-    use widget_tokio_runtime::runtime::Runtime;
 
     use super::{CanvasPrimitive, FixtureFailure, WaitingWidget, WidgetTestApp};
     use crate::{
@@ -1515,7 +1514,7 @@ mod tests {
     #[test]
     fn a_headless_market_participants_directory_can_be_injected() {
         let harness = WidgetTestApp::new();
-        let runtime = Runtime::from_handle(harness.services().runtime.clone());
+        let runtime = harness.services().runtime.clone();
         let notification =
             ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::default()));
         let participants = MarketParticipantsConnector::new(

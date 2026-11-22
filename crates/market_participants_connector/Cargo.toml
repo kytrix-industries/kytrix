@@ -26,7 +26,6 @@ const-hex.workspace = true
 ed25519-dalek = { workspace = true, features = ["pem"] }
 flate2.workspace = true
 futures.workspace = true
-gpui-kit.workspace = true
 hmac = { workspace = true, features = ["zeroize"] }
 jiff.workspace = true
 k256 = { workspace = true, features = ["ecdsa"] }
@@ -57,7 +56,6 @@ smol_str = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"] }
 tokio.workspace = true
-widget_tokio_runtime.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 yawc.workspace = true
@@ -76,7 +74,6 @@ app_config_provider = { workspace = true, features = ["test-support"] }
 # workspace build, where another member's dev-dependency happens to unify the
 # feature on.
 market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 # The live Longbridge suite speaks the venue's wire itself rather than through the

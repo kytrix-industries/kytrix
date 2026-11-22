@@ -45,12 +45,12 @@ pub(crate) use tokio::{
 pub(crate) use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 pub(crate) use url::Url;
-#[cfg(test)]
-use widget_tokio_runtime::runtime::Runtime;
 
 use super::*;
 #[cfg(test)]
 pub(crate) use crate::auth::session::AuthSession;
+#[cfg(test)]
+use crate::test_support::test_handle;
 
 /// The transport policy every test session shares.
 ///
@@ -312,7 +312,7 @@ pub(super) fn oauth_authority(origin: Url, transport: Arc<TransportHub>) -> Arc<
         config: ConfigNotification::new(Arc::new(Config::default())),
         transport,
         account_origin: origin,
-        runtime: Runtime::for_test(),
+        runtime: test_handle(),
     })
 }
 

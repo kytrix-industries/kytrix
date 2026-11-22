@@ -7,11 +7,15 @@
 //! 鼠标事件序列（移入链接后 `hovered_link()` 为 `Some`，移出块后归零），在这里再写一遍
 //! 只是把同一段事件序列和同一个断言维护两次，不会覆盖新的行为。
 
+use std::rc::Rc;
+
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled as _,
+    AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled as _,
     TestAppContext, VisualTestContext, Window, div,
 };
-use i18n::{global::embedded, language::codes::LanguageCode, t};
+use i18n::{
+    embedded, language::codes::LanguageCode, t_smol, translate::Translate, translator::types::I18n,
+};
 
 use super::{
     document::LinkId,
@@ -72,15 +76,14 @@ const PLACEHOLDER_MESSAGES: &[&str] = &[
     "widget.solana_wallet.logged_out",
 ];
 
-/// 安装产品自己的目录，与启动时装的是同一份。
-fn install_catalogue(cx: &mut App) {
-    embedded::install(cx).expect("the embedded locales should load");
+/// 载入产品自己的目录，与启动时装的是同一份。
+fn catalogue() -> Rc<I18n> {
+    Rc::new(embedded::load().expect("the embedded locales should load"))
 }
 
-/// 装上目录，并交出它带的语言。
-fn install_and_languages(cx: &mut TestAppContext) -> Vec<LanguageCode> {
-    cx.update(install_catalogue);
-    let languages = cx.update(|cx| cx.global::<i18n::translator::types::I18n>().languages());
+/// 交出目录带的语言。
+fn install_and_languages(i18n: &Rc<I18n>) -> Vec<LanguageCode> {
+    let languages = i18n.languages();
     assert_eq!(
         languages.len(),
         2,
@@ -399,23 +402,27 @@ fn blank_lines_should_read_as_blank_lines(cx: &mut TestAppContext) {
 /// 这份 fixture 自己填那个参数，而不是借 `widget::venue`：`widget` 依赖 `base_ui`，反向
 /// 依赖不成立。填进来的值照着真实那个值的形状写：每个市场参与者一行、写成它的
 /// logo（`?size=16` 的行内图片，路径就是 `brands/` 下的那一张）加上加粗的名字。
-fn assert_message_draws_centered(cx: &mut TestAppContext, language: LanguageCode, key: &str) {
-    let message = cx.update(|cx| {
-        cx.set_global::<LanguageCode>(language);
-        t!(
-            cx,
-            key,
-            markets = "![](file://brands/Binance/binance.png?size=16) **Binance**\n\
-                       ![](file://brands/OKX/okx.png?size=16) **OKX**"
-        )
-    });
+fn assert_message_draws_centered(
+    cx: &mut TestAppContext,
+    i18n: &Rc<I18n>,
+    language: LanguageCode,
+    key: &str,
+) {
+    let translate = Translate::new(Rc::clone(i18n), LanguageCode::En);
+    translate.set_language(language);
+    let message = t_smol!(
+        translate,
+        key,
+        markets = "![](file://brands/Binance/binance.png?size=16) **Binance**\n\
+                   ![](file://brands/OKX/okx.png?size=16) **OKX**"
+    );
     assert!(
         message.starts_with("<p align=\"center\">") && message.ends_with(ALIGN_TAG_CLOSE),
         "`{key}` in {language} should reach the component as the tag pair the catalogue wrote: \
          `{message:?}`"
     );
 
-    let (view, cx) = harness(cx, message.as_ref());
+    let (view, cx) = harness(cx, message.as_str());
     let text = plain_text(cx, &view);
     assert!(
         !text.is_empty(),
@@ -442,11 +449,12 @@ fn assert_message_draws_centered(cx: &mut TestAppContext, language: LanguageCode
 /// 时才成立**（标签对可以跨空行）——写错的代价是整段文案不显示，不是报错。
 #[gpui_kit::test]
 fn every_alert_message_should_draw_as_an_aligned_paragraph(cx: &mut TestAppContext) {
-    let languages = install_and_languages(cx);
+    let i18n = catalogue();
+    let languages = install_and_languages(&i18n);
 
     for language in languages {
         for key in ALERT_MESSAGES {
-            assert_message_draws_centered(cx, language, key);
+            assert_message_draws_centered(cx, &i18n, language, key);
         }
     }
 }
@@ -457,11 +465,12 @@ fn every_alert_message_should_draw_as_an_aligned_paragraph(cx: &mut TestAppConte
 /// 两条断言与 alert 那条共用；只有这几句带参数，所以它们多验一件事：参数被填进去之后整段仍然成立。
 #[gpui_kit::test]
 fn every_placeholder_message_should_draw_as_an_aligned_paragraph(cx: &mut TestAppContext) {
-    let languages = install_and_languages(cx);
+    let i18n = catalogue();
+    let languages = install_and_languages(&i18n);
 
     for language in languages {
         for key in PLACEHOLDER_MESSAGES {
-            assert_message_draws_centered(cx, language, key);
+            assert_message_draws_centered(cx, &i18n, language, key);
         }
     }
 }

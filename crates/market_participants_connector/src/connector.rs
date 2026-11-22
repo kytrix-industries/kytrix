@@ -10,7 +10,6 @@
 //! one critical section, and the only caller is the user's load action.
 
 use std::{
-    cell::Cell,
     future::Future,
     sync::{
         Arc,
@@ -19,22 +18,16 @@ use std::{
 };
 
 use ahash::AHashMap;
-use app_config::settings::Config;
-use app_config_provider::{
-    events::{ConfigEventBridge, ConfigTopics},
-    manager::ConfigManager,
-    notification::ConfigNotification,
-};
+use app_config_provider::notification::ConfigNotification;
 use futures::future::BoxFuture;
-use gpui_kit::{App, AppContext};
 use market_participants_model::{
     identifier::{VenueId, VenueScopeId},
     listing::route::VenueRoute,
 };
-use network::transport::hub::{TransportHub, TransportPolicy};
+use network::transport::hub::TransportHub;
 use parking_lot::Mutex;
 use smol_str::SmolStr;
-use widget_tokio_runtime::runtime::Runtime;
+use tokio::runtime::Handle;
 
 use crate::{
     account,
@@ -57,7 +50,7 @@ use crate::{
     venue::{
         config::{LoadCancellation, VenueConfig, VenueConversation},
         definition::{self, ScopeEntry, VenueDefinition},
-        loaded::{LoadedVenues, VenueEventSource, VenuesUpdated},
+        loaded::LoadedVenues,
         metadata::{VenueMetadata, VenueReading},
         specs,
     },
@@ -70,7 +63,7 @@ use crate::{
 pub struct MarketParticipantsConnectorInput {
     transport: Arc<TransportHub>,
     snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
-    runtime: Option<Runtime>,
+    runtime: Option<Handle>,
 }
 
 impl MarketParticipantsConnectorInput {
@@ -93,7 +86,7 @@ impl MarketParticipantsConnectorInput {
     }
 
     /// Attaches the application runtime every market-participant operation runs on.
-    pub fn with_runtime(mut self, runtime: Runtime) -> Self {
+    pub fn with_runtime(mut self, runtime: Handle) -> Self {
         self.runtime = Some(runtime);
         self
     }
@@ -112,8 +105,6 @@ pub enum MarketParticipantsConnectorError {
     Initialization(#[source] MarketParticipantError),
     #[error("a Tokio runtime is required for this market-participant operation")]
     RuntimeUnavailable,
-    #[error("the application settings are not installed")]
-    ConfigurationUnavailable,
     #[error("route descriptor validation failed: {0}")]
     RouteDescriptors(#[source] routing::RegistryError),
 }
@@ -222,20 +213,6 @@ impl MarketParticipantsConnectorError {
     }
 }
 
-impl gpui_kit::Global for MarketParticipantsConnector {}
-
-/// Keeps the market-participants bridge alive for the life of the application.
-///
-/// The bridge holds `Subscription`s, which are neither `Send` nor `Sync`, while
-/// the connector is an `Arc` shared with background work: the subscription lives
-/// here, owned by the application, and only the notification it publishes into
-/// travels with the connector.
-struct MarketParticipantsConfigBridge {
-    _bridge: ConfigEventBridge,
-}
-
-impl gpui_kit::Global for MarketParticipantsConfigBridge {}
-
 /// The state every market-participants capability handle shares.
 ///
 /// The fields are public because the `account`, `market` and `trading` handles are
@@ -266,19 +243,12 @@ pub(crate) struct MarketParticipantsConnectorInner {
     /// left while its venue was loading — so the token is kept per venue and
     /// observed by the stage between its steps.
     pub cancellations: Mutex<AHashMap<VenueId, LoadCancellation>>,
-    /// The task that turns a committed venue update into an emission.
-    ///
-    /// A load runs on the application runtime and a subscriber lives on the
-    /// application's executor, so the announcement crosses between the two here.
-    pub event_task: Mutex<Option<gpui_kit::Task<()>>>,
-    /// The receiver of the boundary this root owns before an application
-    /// attaches its own.
-    pub event_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<VenuesUpdated>>>,
     /// The task that invalidates pooled connections whenever the runtime
     /// projection is published again.
     ///
-    /// Only [`MarketParticipantsConnector::install`] starts it: a root built from
-    /// typed runtime inputs has no configuration owner to wait on.
+    /// Every root starts it: the projection has exactly one consumer, and a
+    /// publication is the only signal that the settings moved. `shutdown` takes
+    /// the task before it closes the pool.
     pub config_task: Mutex<Option<OwnedTask>>,
     pub closed: AtomicBool,
 }
@@ -529,7 +499,6 @@ impl MarketParticipantsConnectorInner {
         );
         let bindings = bindings_of(&staged.registrations, sources);
         let scopes: Vec<Arc<ScopeEntry>> = staged.scopes.iter().cloned().map(Arc::new).collect();
-        let revision = Cell::new(0_u64);
         let mut venues = self.venues.lock_for_commit();
         let mut registry = self.gateway.registry().write();
         self.catalog
@@ -541,21 +510,12 @@ impl MarketParticipantsConnectorInner {
                 bindings,
                 |generation| {
                     registry.commit_venue_routes(&venue, staged.descriptors);
-                    revision.set(venues.replace(
-                        venue,
-                        scopes,
-                        generation.id(),
-                        Arc::clone(&staged.metadata),
-                    ));
+                    venues.replace(venue, scopes, generation.id(), Arc::clone(&staged.metadata));
                 },
             )
             .map_err(|error| VenueLoadError::from_commit(&venue, scope, error))?;
         drop(registry);
         drop(venues);
-        // The lock is released before the commit is announced, so a subscriber
-        // that reads the venue table in its handler cannot deadlock against the
-        // commit that woke it.
-        self.venues.announce(venue, revision.get());
         Ok(())
     }
 
@@ -647,7 +607,6 @@ impl MarketParticipantsConnectorInner {
             );
         }
         let scopes: Vec<Arc<ScopeEntry>> = entries.into_iter().map(Arc::new).collect();
-        let revision = Cell::new(0_u64);
         let metadata = Arc::new(VenueMetadata::empty());
         let mut venues = self.venues.lock_for_commit();
         let mut registry = self.gateway.registry().write();
@@ -665,12 +624,7 @@ impl MarketParticipantsConnectorInner {
                 bindings,
                 |generation| {
                     registry.commit_venue_routes(venue, descriptors);
-                    revision.set(venues.replace(
-                        *venue,
-                        scopes,
-                        generation.id(),
-                        Arc::clone(&metadata),
-                    ));
+                    venues.replace(*venue, scopes, generation.id(), Arc::clone(&metadata));
                 },
             )
             .map_err(|error| {
@@ -680,7 +634,6 @@ impl MarketParticipantsConnectorInner {
             })?;
         drop(registry);
         drop(venues);
-        self.venues.announce(*venue, revision.get());
         // The fixture commit is recorded the way the load transaction records one:
         // the entry it published, the generation it pinned and the deployments its
         // metadata named.
@@ -738,99 +691,16 @@ impl VenueConversation for GatewayConversation {
 }
 
 impl MarketParticipantsConnector {
-    /// Builds the shared market participants root from the installed application services
-    /// and installs it in GPUI global state.
-    ///
-    /// The connector subscribes the market-participants runtime projection to the
-    /// settings manager's network and venue events, so a settings change
-    /// reconfigures the market-participants runtime without rebuilding the
-    /// connector; a background task then closes every pooled connection the new
-    /// projection no longer serves.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the application Tokio runtime or the settings manager is not
-    /// installed, or when the market-participants runtime cannot be built from the current
-    /// settings.
-    pub fn install(cx: &mut App) -> Result<(), MarketParticipantsConnectorError> {
-        let runtime = widget_tokio_runtime::global::try_handle(cx)
-            .ok_or(MarketParticipantsConnectorError::RuntimeUnavailable)?;
-        let manager = cx
-            .try_global::<ConfigManager>()
-            .ok_or(MarketParticipantsConnectorError::ConfigurationUnavailable)?;
-        let config = manager.read();
-        let initial = Arc::new(MarketParticipantNetworkSnapshot::new(Config::clone(
-            &config,
-        )));
-        let notification = ConfigNotification::new(initial);
-        let bridge = ConfigEventBridge::install(
-            cx,
-            ConfigTopics::NETWORK_AND_VENUES,
-            notification.clone(),
-            Arc::new(
-                |config: &Config, previous: &MarketParticipantNetworkSnapshot| {
-                    MarketParticipantNetworkSnapshot::from_previous(
-                        Config::clone(config),
-                        Some(previous),
-                    )
-                },
-            ),
-        );
-
-        let transport = Arc::new(TransportHub::new(TransportPolicy::default()));
-        let connector = Self::new(
-            MarketParticipantsConnectorInput::new(transport, notification.clone())
-                .with_runtime(runtime.clone()),
-        )?;
-        let pool = Arc::clone(&connector.inner.pool);
-        let config_task = runtime.run(async move {
-            loop {
-                let snapshot = notification.wait().await;
-                pool.invalidate_stale(&snapshot).await;
-            }
-        });
-        *connector.inner.config_task.lock() = Some(OwnedTask::new(config_task));
-
-        cx.set_global(MarketParticipantsConfigBridge { _bridge: bridge });
-        connector.attach_events(cx);
-        cx.set_global(connector);
-
-        Ok(())
-    }
-
-    /// Attaches the venue event boundary to this root.
-    ///
-    /// A root built from typed runtime inputs — a test's, an embedder's — has no
-    /// application until this is called, so it has no boundary to announce a
-    /// commit through. Attaching one is what makes a load legal there: a commit
-    /// with no boundary attached reports rather than commits silently.
-    pub fn attach_events(&self, cx: &mut App) {
-        let events = cx.new(|_| VenueEventSource);
-        self.inner.venues.attach_events(events.clone());
-        let Some(mut receiver) = self.inner.event_receiver.lock().take() else {
-            log::error!("the venue event boundary of this root is already attached");
-            return;
-        };
-        // A load runs on the application runtime, which holds no GPUI context,
-        // so the announcement travels back as a message and is emitted on the
-        // entity here, on the application own executor.
-        let task = cx.spawn(move |cx: &mut gpui_kit::AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                while let Some(update) = receiver.recv().await {
-                    cx.update_entity(&events, |_, cx| cx.emit(update));
-                }
-            }
-        });
-        *self.inner.event_task.lock() = Some(task);
-    }
-
     /// Builds the shared market participants root from typed runtime inputs.
     ///
     /// The root owns its catalogue: a fetch of a venue's catalogs and every read
     /// of the published generation answer from the same [`Catalog`], and the
-    /// application runtime is attached to it here so a fetch driven from a GPUI
-    /// task crosses the same blocking boundary as one driven by a service.
+    /// application runtime is attached to it here so a fetch crosses the same
+    /// blocking boundary whatever executor drives it. The network projection is
+    /// the caller's ([`ConfigNotification`]): it routes every request, and a
+    /// publication — which the composition root makes after each settings commit
+    /// that moved the network or venue settings — closes the pooled connections
+    /// the new projection no longer serves.
     pub fn new(
         input: MarketParticipantsConnectorInput,
     ) -> Result<Self, MarketParticipantsConnectorError> {
@@ -866,6 +736,13 @@ impl MarketParticipantsConnector {
         catalog.set_runtime(runtime.clone());
         let initial_snapshot = snapshot.current();
         let pool = Arc::new(ConnectionPool::with_transport(Arc::clone(&transport)));
+        // The projection has exactly one consumer: a publication means the settings
+        // moved, so every pooled connection the new projection no longer serves is
+        // closed. The task lives as long as the root and `shutdown` takes it; it is
+        // started only after the root's own construction succeeded, so a refused
+        // construction leaves no detached task waiting on a projection.
+        let config_notification = snapshot.clone();
+        let task_runtime = runtime.clone();
         let router = MarketParticipantGateway::adapter_router(&initial_snapshot)
             .map_err(MarketParticipantsConnectorError::from_internal)?;
         let gateway = MarketParticipantGateway::with_shared_resources(
@@ -876,13 +753,16 @@ impl MarketParticipantsConnector {
             runtime,
         )
         .map_err(MarketParticipantsConnectorError::from_internal)?;
-        // The root owns the venue event boundary from the moment it exists:
-        // every commit is announced into it, and an application that installs
-        // the root attaches the entity that turns those announcements into
-        // emissions. A commit can therefore never be silently unannounced.
+        let invalidating_pool = Arc::clone(&pool);
+        let config_task = task_runtime.spawn(async move {
+            loop {
+                let next = config_notification.wait().await;
+                invalidating_pool.invalidate_stale(&next).await;
+            }
+        });
+        // The root owns the venue table from the moment it exists: a commit writes
+        // it, the route registry and the directory pointer in one critical section.
         let venues = LoadedVenues::new();
-        let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
-        venues.attach_update_sink(event_sender);
         let inner = Arc::new(MarketParticipantsConnectorInner {
             gateway,
             pool,
@@ -890,9 +770,7 @@ impl MarketParticipantsConnector {
             venues,
             loads: Mutex::new(AHashMap::new()),
             cancellations: Mutex::new(AHashMap::new()),
-            event_task: Mutex::new(None),
-            event_receiver: Mutex::new(Some(event_receiver)),
-            config_task: Mutex::new(None),
+            config_task: Mutex::new(Some(OwnedTask::new(config_task))),
             closed: AtomicBool::new(false),
         });
         Ok(Self { inner })
@@ -1090,8 +968,7 @@ mod tests {
         network::ResolvedProxy,
         settings::Config,
     };
-    use app_config_provider::{manager::ConfigManager, notification::ConfigNotification};
-    use gpui_kit::TestAppContext;
+    use app_config_provider::notification::ConfigNotification;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId},
         listing::route::VenueRoute,
@@ -1099,8 +976,7 @@ mod tests {
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
     use smol_str::SmolStr;
-    use tokio::time::timeout;
-    use widget_tokio_runtime::{global, runtime::Runtime};
+    use tokio::{runtime::Handle, time::timeout};
 
     use super::{MarketParticipantsConnector, MarketParticipantsConnectorInput};
     use crate::{
@@ -1109,6 +985,7 @@ mod tests {
             physical::ConnectionProtocol,
         },
         runtime::MarketParticipantNetworkSnapshot,
+        test_support::test_handle,
     };
 
     fn binance() -> VenueId {
@@ -1131,7 +1008,7 @@ mod tests {
                 Arc::new(TransportHub::new(TransportPolicy::default())),
                 notification,
             )
-            .with_runtime(Runtime::for_test()),
+            .with_runtime(test_handle()),
         )
         .expect("the root builds from typed runtime inputs")
     }
@@ -1258,7 +1135,7 @@ mod tests {
                 Arc::new(TransportHub::new(TransportPolicy::default())),
                 notification,
             )
-            .with_runtime(Runtime::for_test()),
+            .with_runtime(test_handle()),
         )
         .expect("the root builds from typed runtime inputs");
 
@@ -1307,8 +1184,8 @@ mod tests {
     /// test, so the wait is a bounded poll on that runtime: it returns as soon as the task
     /// closed the connection, and names the connection that stayed open when no
     /// publication reached it.
-    fn wait_for_close(runtime: &Runtime, connection: &Connection, subject: &str) {
-        let closed = runtime.handle().block_on(async {
+    fn wait_for_close(runtime: &Handle, connection: &Connection, subject: &str) {
+        let closed = runtime.block_on(async {
             timeout(INVALIDATION_BOUND, async {
                 while !connection.is_closed() {
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1322,27 +1199,31 @@ mod tests {
         );
     }
 
-    /// The configuration notification has exactly one consumer — the task `install`
-    /// starts — and a publication that moves a venue closes the pooled connections of
-    /// that venue and no other.
+    /// The configuration notification has exactly one consumer — the invalidation task
+    /// a constructed root starts — and a publication that moves a venue closes the pooled
+    /// connections of that venue and no other.
     ///
-    /// Both entries are built from what the installed snapshot serves, so whether each
-    /// survives is decided by the projection the bridge publishes. The first write moves
+    /// Both entries are built from what the constructed snapshot serves, so whether each
+    /// survives is decided by the projection the owner publishes. The first write moves
     /// OKX's region: the OKX connection closes, which is how the test knows the task
     /// consumed the publication, and Binance's stays open, which is the negative an
     /// invalidation that closed every venue would fail. The second write moves Binance's
     /// stream origin, and Binance's connection closes with it.
-    #[gpui_kit::test]
-    fn installing_the_root_starts_the_task_that_invalidates_connections(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            global::install(cx).expect("the application Tokio runtime installs");
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
-            MarketParticipantsConnector::install(cx)
-                .expect("the root installs over the installed configuration manager");
-        });
-        let connector = cx.update(|cx| cx.global::<MarketParticipantsConnector>().clone());
-        let runtime = cx.update(|cx| global::handle(cx));
+    #[test]
+    fn a_moved_projection_closes_only_the_connections_it_no_longer_serves() {
+        let runtime = test_handle();
+        let mut config = Config::default();
+        let notification = ConfigNotification::new(Arc::new(
+            MarketParticipantNetworkSnapshot::new(config.clone()),
+        ));
+        let connector = MarketParticipantsConnector::new(
+            MarketParticipantsConnectorInput::new(
+                Arc::new(TransportHub::new(TransportPolicy::default())),
+                notification.clone(),
+            )
+            .with_runtime(runtime.clone()),
+        )
+        .expect("the root builds from typed runtime inputs");
         let snapshot = connector.runtime_snapshot();
         let binance_venue = binance();
         let binance_spot = spot();
@@ -1353,7 +1234,7 @@ mod tests {
         );
         let protocol = ConnectionProtocol::new(no_response_id);
         let pool = Arc::clone(&connector.inner.pool);
-        let (binance_connection, okx_connection) = runtime.handle().block_on(async {
+        let (binance_connection, okx_connection) = runtime.block_on(async {
             let binance_connection = pool
                 .get_or_create_fixture(
                     fixture_key(&snapshot, &binance_spot, &protocol),
@@ -1373,16 +1254,14 @@ mod tests {
             "both connections are pooled before anything is published"
         );
 
-        // A write that names OKX's region closes the OKX connection and leaves Binance's:
-        // the task demonstrably consumed the publication, and it invalidated only the
-        // venue the publication moved.
-        cx.update_global::<ConfigManager, _>(|manager, cx| {
-            let landed = manager.update(
-                |config| config.set_okx_region(&okx_venue, OkxRegion::Europe),
-                cx,
-            );
-            assert!(landed, "the configured OKX row takes a service region");
-        });
+        // A publication that moves OKX's region closes the OKX connection and leaves
+        // Binance's: the task demonstrably consumed the publication, and it invalidated
+        // only the venue the publication moved.
+        config.set_okx_region(&okx_venue, OkxRegion::Europe);
+        notification.publish(Arc::new(MarketParticipantNetworkSnapshot::from_previous(
+            config.clone(),
+            Some(&snapshot),
+        )));
         wait_for_close(
             &runtime,
             &okx_connection,
@@ -1393,34 +1272,27 @@ mod tests {
             "a configuration write that did not name Binance kept its connection open"
         );
 
-        // A write that names the venue itself closes that venue's connection.
-        cx.update_global::<ConfigManager, _>(|manager, cx| {
-            let landed = manager.update(
-                |config| {
-                    config.set_binance_market_origins(
-                        &binance_venue,
-                        BinanceMarket::Spot,
-                        &BinanceOrigins::new(
-                            BinanceMarket::Spot,
-                            BinanceHttpOrigin::Api,
-                            BinanceWebsocketOrigin::StreamAlt,
-                        ),
-                    )
-                },
-                cx,
-            );
-            assert!(
-                landed,
-                "the configured Binance spot market takes its other stream"
-            );
-        });
+        // A publication that moves the venue itself closes that venue's connection.
+        config.set_binance_market_origins(
+            &binance_venue,
+            BinanceMarket::Spot,
+            &BinanceOrigins::new(
+                BinanceMarket::Spot,
+                BinanceHttpOrigin::Api,
+                BinanceWebsocketOrigin::StreamAlt,
+            ),
+        );
+        notification.publish(Arc::new(MarketParticipantNetworkSnapshot::from_previous(
+            config,
+            Some(&snapshot),
+        )));
         wait_for_close(
             &runtime,
             &binance_connection,
             "the Binance connection of the moved stream origin",
         );
 
-        runtime.handle().block_on(connector.shutdown());
+        runtime.block_on(connector.shutdown());
     }
 }
 #[cfg(test)]

@@ -148,7 +148,7 @@ fn a_static_message_longer_than_the_inline_capacity_allocates_nothing() {
     let i18n = i18n();
 
     assert_eq!(
-        i18n.translate(LanguageCode::En, "credential").as_ref(),
+        i18n.translate(LanguageCode::En, "credential").as_str(),
         LONG_MESSAGE,
         "the measured message is the long one"
     );
@@ -166,7 +166,7 @@ fn a_static_message_within_the_inline_capacity_allocates_nothing() {
     let i18n = i18n();
 
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.market").as_str(),
         "Market",
         "the measured message fits in the inline buffer"
     );
@@ -198,7 +198,7 @@ fn the_counter_observes_the_allocations_of_an_interpolated_message() {
     );
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "price", &[("amount", &last)])
-            .as_ref(),
+            .as_str(),
         format!("{last} USD"),
         "the control message renders its argument"
     );

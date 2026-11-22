@@ -4,8 +4,8 @@
 //! has to be answered in a test without a venue behind it. What a route answers
 //! is a property of its catalog, so the answer is built here, next to the rules
 //! that decide it: a test names the listings a route publishes — or says that the
-//! route does not answer at all — and installs the result through
-//! [`crate::test_support::install_root`], which wires it into a fixture root.
+//! route does not answer at all — and publishes them into the catalogue a fixture
+//! root owns.
 //!
 //! Enabled by the `test-support` feature, which is a dev-dependency feature only
 //! and never part of a release build.
@@ -1291,52 +1291,6 @@ pub fn at(millis: i64) -> UnixMillis {
 pub fn refused(route: &VenueRoute, error: CatalogValidationError) -> CatalogError {
     CatalogError::invalid_catalog(route.clone(), error)
 }
-/// Installs a fixture root as the global, publishing `entries` on the fixture
-/// spot route.
-///
-/// A widget test installs this once and then drives the widget with the route,
-/// the listing keys and the catalogue the fixture hands back, so no widget suite
-/// builds a second fake of the directory. The catalogue is published here the way
-/// the connection action publishes it, so the widget starts against a connected
-/// market rather than against one nothing has loaded.
-pub fn install(cx: &mut gpui_kit::App, entries: Vec<CatalogEntry>) -> Fixture {
-    let fixture = Fixture::new(entries);
-    crate::test_support::install_root(cx, Arc::clone(fixture.catalog_arc()));
-    widget_tokio_runtime::global::handle(cx)
-        .handle()
-        .block_on(fixture.catalog().refresh_for_test(fixture.route()))
-        .expect("the fixture route should publish its catalog");
-    fixture
-}
-
-/// Installs a fixture root whose route always fails.
-pub fn install_failing(cx: &mut gpui_kit::App) -> Fixture {
-    let fixture = Fixture::failing();
-    crate::test_support::install_root(cx, Arc::clone(fixture.catalog_arc()));
-    fixture
-}
-
-/// Publishes one route's fixtures into the catalogue the installed root owns.
-///
-/// A widget test that publishes its own route set — its own descriptors, its own
-/// fixture vocabulary — connects them the way the connection action does: the
-/// registration is followed by a load of every catalog route. The batch goes
-/// through the catalogue's own publication path, so a fixture snapshot is the
-/// same kind of value a fetch produces, and the terms of every asset the fixture
-/// names travel with it: a canonical identity is a digest of its terms, so a
-/// batch that carried only identities could not be displayed. Nothing here
-/// awaits, because a fixture is built from inside the test's own context, which
-/// has no thread to block on.
-pub fn publish_fixture_catalogs(cx: &gpui_kit::App, routes: &[(VenueRoute, Vec<CatalogEntry>)]) {
-    let catalog = cx
-        .global::<crate::connector::MarketParticipantsConnector>()
-        .catalog();
-    for (route, listings) in routes {
-        publish_fixture_route(catalog, route, listings.clone())
-            .expect("the fixture route should publish its listings");
-    }
-}
-
 /// Publishes one fixture's listings as the route's snapshot, without a fetch.
 ///
 /// This is the fixture form of a load: the listings travel the same validation

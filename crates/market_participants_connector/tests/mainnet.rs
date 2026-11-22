@@ -25,6 +25,7 @@ use market_participants_connector::{
     catalog::store::Catalog,
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
     runtime::MarketParticipantNetworkSnapshot,
+    test_support::test_handle,
 };
 use market_participants_model::{
     identifier::{VenueId, VenueScopeId},
@@ -35,7 +36,6 @@ use network::transport::hub::{TransportHub, TransportPolicy};
 use smol_str::SmolStr;
 use tokio::time::timeout;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 const PROXY_ENV: &str = "KYTRIX_NETWORK_TEST_PROXY";
 const DEFAULT_PROXY: &str = "socks5h://127.0.0.1:7890";
@@ -104,7 +104,7 @@ fn mainnet_input() -> MarketParticipantsConnectorInput {
         Arc::new(TransportHub::new(TransportPolicy::default())),
         notification,
     )
-    .with_runtime(Runtime::for_test())
+    .with_runtime(test_handle())
 }
 
 /// One loaded connector together with the routes its venues registered.

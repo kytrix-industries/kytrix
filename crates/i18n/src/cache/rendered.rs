@@ -1,6 +1,6 @@
 use std::fmt::{self, Display};
 
-use gpui_kit::SharedString;
+use smol_str::SmolStr;
 
 use crate::language::codes::LanguageCode;
 
@@ -15,13 +15,13 @@ struct Entry {
     language: LanguageCode,
     key: Box<str>,
     values: Box<[Box<str>]>,
-    text: SharedString,
+    text: SmolStr,
 }
 
 /// Rendered messages, keyed by language, message key and argument values.
 ///
-/// Returning a cached [`SharedString`] costs one clone, and a heap-backed
-/// `SharedString` clones by bumping the reference count of its `Arc<str>`, so no
+/// Returning a cached [`SmolStr`] costs one clone, and a heap-backed
+/// `SmolStr` clones by bumping the reference count of its `Arc<str>`, so no
 /// text is copied and no template is walked again.
 ///
 /// The cache is a short vector rather than a map: interface messages carry few
@@ -41,7 +41,7 @@ impl RenderedCache {
         language: LanguageCode,
         key: &str,
         arguments: &[(&str, &dyn Display)],
-    ) -> Option<SharedString> {
+    ) -> Option<SmolStr> {
         for entry in &self.entries {
             if entry.language != language
                 || &*entry.key != key
@@ -75,7 +75,7 @@ impl RenderedCache {
         language: LanguageCode,
         key: &str,
         arguments: &[(&str, &dyn Display)],
-        text: SharedString,
+        text: SmolStr,
     ) {
         self.entries.push(Entry {
             language,

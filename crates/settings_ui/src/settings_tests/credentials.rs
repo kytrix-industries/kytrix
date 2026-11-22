@@ -582,7 +582,7 @@ fn the_clear_alert_should_name_the_credentials_it_clears() {
 /// two markets are two dialogs, and a title that named only the venue would not say which one.
 #[test]
 fn the_dialog_titles_should_name_the_trading_surface() {
-    let messages = i18n::global::embedded::load().expect("embedded locales should load");
+    let messages = i18n::embedded::load().expect("embedded locales should load");
     let cases = [
         (
             CredentialsKind::BinanceSpot,
@@ -615,13 +615,13 @@ fn the_dialog_titles_should_name_the_trading_surface() {
         assert!(
             messages
                 .try_translate(LanguageCode::En, kind.title_key())
-                .is_some_and(|text| text.as_ref() == english),
+                .is_some_and(|text| text.as_str() == english),
             "{kind:?}'s title should be written in English"
         );
         assert!(
             messages
                 .try_translate(LanguageCode::ZhCn, kind.title_key())
-                .is_some_and(|text| text.as_ref() == chinese),
+                .is_some_and(|text| text.as_str() == chinese),
             "{kind:?}'s title should be written in Chinese"
         );
     }

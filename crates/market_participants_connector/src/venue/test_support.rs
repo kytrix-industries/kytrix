@@ -12,26 +12,15 @@
 //! addresses themselves stay the ones the venues publish, which is what
 //! `app_config`'s test-support seam moves and nothing else.
 //!
-//! [`fixture_application`] adds what a test about the notification contract needs:
-//! an application the root is installed in, so the venue event boundary exists and a
-//! commit is announced to a subscriber rather than to nobody.
 
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use app_config::market_participants::fixture::{self, FixtureAddress};
 use app_config_provider::notification::ConfigNotification;
-use gpui_kit::{App, TestAppContext};
 use market_participants_model::identifier::VenueId;
 use tokio::time::timeout;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
-use super::loaded::VenuesUpdated;
 use crate::{
     catalog::store::Catalog,
     connector::{MarketParticipantsConnector, VenueLoadError},
@@ -89,88 +78,4 @@ pub(crate) async fn load(
     timeout(REQUEST_TIMEOUT, connector.load_venue(*venue))
         .await
         .unwrap_or_else(|_| panic!("loading {venue} should not time out"))
-}
-
-/// One fixture application: the installed root, the runtime its loads run on, and
-/// every commit its subscribers have been told about.
-pub(crate) struct FixtureApplication {
-    connector: MarketParticipantsConnector,
-    runtime: Runtime,
-    announcements: Rc<RefCell<Vec<VenuesUpdated>>>,
-}
-
-impl FixtureApplication {
-    /// The root every capability of this application is read through.
-    pub(crate) fn connector(&self) -> &MarketParticipantsConnector {
-        &self.connector
-    }
-
-    /// Loads one venue through the load action, on the root's own runtime.
-    ///
-    /// A load is the root's own work and this thread is not inside a runtime, so
-    /// driving it here is what makes what it reported the test's to read.
-    pub(crate) fn load(&self, venue: &VenueId) -> Result<(), VenueLoadError> {
-        self.runtime.handle().block_on(load(&self.connector, venue))
-    }
-
-    /// The commits announced so far, in the order the interface received them.
-    pub(crate) fn announcements(&self) -> Vec<VenuesUpdated> {
-        self.announcements.borrow().clone()
-    }
-
-    /// Closes the fixture root and every connection it owns.
-    pub(crate) fn shutdown(&self) {
-        self.runtime.handle().block_on(self.connector.shutdown());
-    }
-
-    /// Waits until `expected` commits have reached the subscriber, and answers what
-    /// it has seen.
-    ///
-    /// A commit reaches the interface as a message the application's own executor
-    /// delivers, so waiting for one means handing the thread back until the answer
-    /// that woke it arrives. The wait is bounded by the fixture timeout, so a commit
-    /// that never reports fails the test here instead of hanging it.
-    pub(crate) fn wait_for_announcements(
-        &self,
-        cx: &mut TestAppContext,
-        expected: usize,
-    ) -> Vec<VenuesUpdated> {
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        while self.announcements.borrow().len() < expected {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {expected} announcements"
-            );
-            cx.run_until_parked();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        self.announcements()
-    }
-}
-
-/// Installs one fixture application over `catalogs` and `info`.
-///
-/// The venue event boundary is the one [`MarketParticipantsConnector::install`] attaches: the
-/// entity exists exactly when a root is installed in an application, and every commit
-/// is announced through it, so counting its emissions counts what the menu, the
-/// selector and every pane receive. The root is built from typed runtime inputs
-/// rather than by that install path because the fixture servers speak plain HTTP on a
-/// loopback socket while the install path takes the production transport policy, which
-/// refuses it; the boundary and the subscriber are the same either way.
-pub(crate) fn fixture_application(cx: &mut App, catalogs: &str, info: &str) -> FixtureApplication {
-    let (connector, _catalog) = fixture_connector(catalogs, info);
-    connector.attach_events(cx);
-    let events = connector.venues().events();
-    let announcements: Rc<RefCell<Vec<VenuesUpdated>>> = Rc::new(RefCell::new(Vec::new()));
-    cx.subscribe(&events, {
-        let announcements = Rc::clone(&announcements);
-        move |_, update: &VenuesUpdated, _| announcements.borrow_mut().push(update.clone())
-    })
-    .detach();
-    cx.set_global(connector.clone());
-    FixtureApplication {
-        connector,
-        runtime: Runtime::for_test(),
-        announcements,
-    }
 }

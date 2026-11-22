@@ -19,7 +19,6 @@ log = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 # Workspace members
 app_config = { workspace = true }

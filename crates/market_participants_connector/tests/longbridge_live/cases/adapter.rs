@@ -31,13 +31,13 @@ use market_participants_connector::{
     error::{AuthError, MarketParticipantError},
     market::error::MarketError,
     runtime::MarketParticipantNetworkSnapshot,
+    test_support::test_handle,
 };
 use market_participants_model::{identifier::VenueId, listing::route::VenueRoute};
 use network::transport::hub::{TransportHub, TransportPolicy};
 use smol_str::SmolStr;
 use tokio::time::timeout;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
     bounds::{CASE_TIMEOUT, READ_TIMEOUT, SETUP_TIMEOUT, SUBSCRIPTION_TIMEOUT},
@@ -420,7 +420,7 @@ fn live_connector(case: &str, values: &Credentials) -> (MarketParticipantsConnec
             Arc::new(TransportHub::new(TransportPolicy::default())),
             notification,
         )
-        .with_runtime(Runtime::for_test()),
+        .with_runtime(test_handle()),
         Arc::clone(&catalog),
     )
     .expect("the market participants root builds from a typed runtime snapshot");

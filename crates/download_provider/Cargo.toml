@@ -17,7 +17,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-widget_tokio_runtime.workspace = true
 
 [dev-dependencies]
 hyper = { workspace = true, features = ["http1", "server"] }

@@ -32,7 +32,7 @@ const HEIGHT: f32 = 360.0;
 /// The translator the product ships.
 fn translate(language: LanguageCode) -> i18n::translate::Translate {
     i18n::translate::Translate::new(
-        std::rc::Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+        std::rc::Rc::new(i18n::embedded::load().expect("the embedded locales load")),
         language,
     )
 }

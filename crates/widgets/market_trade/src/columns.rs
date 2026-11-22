@@ -282,7 +282,7 @@ mod tests {
 
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
-            std::rc::Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            std::rc::Rc::new(i18n::embedded::load().expect("the embedded locales load")),
             language,
         )
     }

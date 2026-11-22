@@ -1,5 +1,3 @@
-use gpui_kit::SharedString;
-
 use super::{builder::Builder, types::I18n};
 use crate::{error::types::Error, language::codes::LanguageCode};
 
@@ -39,11 +37,11 @@ fn i18n() -> I18n {
 fn translates_in_the_language_it_is_given() {
     let i18n = i18n();
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.market").as_str(),
         "Market"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "menu.market").as_str(),
         "行情"
     );
 }
@@ -55,7 +53,7 @@ fn interpolates_arguments() {
 
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "greeting", &[("name", &name)])
-            .as_ref(),
+            .as_str(),
         "Hello, Ada!"
     );
 }
@@ -67,7 +65,7 @@ fn interpolation_uses_the_template_of_the_language_it_is_given() {
 
     assert_eq!(
         i18n.translate_with(LanguageCode::ZhCn, "greeting", &[("name", &name)])
-            .as_ref(),
+            .as_str(),
         "你好，Ada！"
     );
 }
@@ -89,8 +87,8 @@ fn repeated_translation_reuses_the_rendered_message() {
         &[("count", &count), ("name", &name)],
     );
 
-    assert_eq!(first.as_ref(), "You have 3 items in Cart.");
-    assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
+    assert_eq!(first.as_str(), "You have 3 items in Cart.");
+    assert!(std::ptr::eq(first.as_str(), second.as_str()));
 }
 
 #[test]
@@ -99,17 +97,17 @@ fn different_argument_values_get_distinct_renderings() {
 
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "price", &[("amount", &"10")])
-            .as_ref(),
+            .as_str(),
         "10 USD"
     );
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "price", &[("amount", &"20")])
-            .as_ref(),
+            .as_str(),
         "20 USD"
     );
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "price", &[("amount", &"10")])
-            .as_ref(),
+            .as_str(),
         "10 USD"
     );
 }
@@ -131,7 +129,7 @@ fn arguments_in_a_different_order_reuse_the_rendering() {
         &[("name", &name), ("count", &count)],
     );
 
-    assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
+    assert!(std::ptr::eq(first.as_str(), second.as_str()));
 }
 
 #[test]
@@ -145,7 +143,7 @@ fn unused_arguments_do_not_change_the_rendering() {
             "greeting",
             &[("name", &name), ("unused", &1)]
         )
-        .as_ref(),
+        .as_str(),
         "Hello, Ada!"
     );
 }
@@ -154,7 +152,7 @@ fn unused_arguments_do_not_change_the_rendering() {
 fn missing_arguments_render_as_empty_text() {
     let i18n = i18n();
     assert_eq!(
-        i18n.translate(LanguageCode::En, "greeting").as_ref(),
+        i18n.translate(LanguageCode::En, "greeting").as_str(),
         "Hello, !"
     );
 }
@@ -164,7 +162,7 @@ fn messages_missing_everywhere_translate_to_empty_text() {
     let i18n = i18n();
 
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "menu.quant").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "menu.quant").as_str(),
         ""
     );
     assert!(
@@ -172,7 +170,7 @@ fn messages_missing_everywhere_translate_to_empty_text() {
             .is_none()
     );
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "never.defined").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "never.defined").as_str(),
         ""
     );
     assert!(
@@ -188,11 +186,11 @@ fn messages_of_the_given_language_win_over_the_fallback() {
 
     assert_eq!(
         i18n.translate_with(LanguageCode::ZhCn, "greeting", &[("name", &name)])
-            .as_ref(),
+            .as_str(),
         "你好，Ada！"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "menu.market").as_str(),
         "行情"
     );
 }
@@ -208,12 +206,12 @@ fn the_fallback_supplies_messages_the_language_lacks() {
         .build()
         .expect("both locales are loaded");
 
-    assert_eq!(i18n.translate(LanguageCode::ZhCn, "b").as_ref(), "zh");
+    assert_eq!(i18n.translate(LanguageCode::ZhCn, "b").as_str(), "zh");
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "shared").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "shared").as_str(),
         "shared"
     );
-    assert_eq!(i18n.translate(LanguageCode::ZhCn, "a").as_ref(), "en");
+    assert_eq!(i18n.translate(LanguageCode::ZhCn, "a").as_str(), "en");
 }
 
 #[test]
@@ -226,8 +224,8 @@ fn without_a_fallback_missing_messages_stay_empty() {
         .build()
         .expect("both locales are loaded");
 
-    assert_eq!(i18n.translate(LanguageCode::ZhCn, "b").as_ref(), "zh");
-    assert_eq!(i18n.translate(LanguageCode::ZhCn, "shared").as_ref(), "");
+    assert_eq!(i18n.translate(LanguageCode::ZhCn, "b").as_str(), "zh");
+    assert_eq!(i18n.translate(LanguageCode::ZhCn, "shared").as_str(), "");
     assert_eq!(i18n.fallback(), None);
 }
 
@@ -248,9 +246,9 @@ fn a_static_message_longer_than_the_inline_capacity_is_handed_out_as_one_shared_
     let (Some(first), Some(second)) = (first, second) else {
         panic!("the message is defined in the English locale");
     };
-    assert_eq!(first.as_ref(), LONG_MESSAGE);
+    assert_eq!(first.as_str(), LONG_MESSAGE);
     assert!(
-        std::ptr::eq(first.as_ref(), second.as_ref()),
+        std::ptr::eq(first.as_str(), second.as_str()),
         "both translations return the text stored in the template"
     );
 }
@@ -264,12 +262,11 @@ fn a_static_message_within_the_inline_capacity_keeps_its_text() {
 
     assert_eq!(
         i18n.try_translate(LanguageCode::En, "menu.market")
-            .as_ref()
-            .map(SharedString::as_str),
+            .as_deref(),
         Some("Market")
     );
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.market").as_str(),
         "Market"
     );
 }
@@ -287,9 +284,9 @@ fn the_fallback_language_is_handed_out_as_one_shared_value() {
     let (Some(first), Some(second)) = (first, second) else {
         panic!("the fallback locale defines the message");
     };
-    assert_eq!(first.as_ref(), LONG_MESSAGE);
+    assert_eq!(first.as_str(), LONG_MESSAGE);
     assert!(
-        std::ptr::eq(first.as_ref(), second.as_ref()),
+        std::ptr::eq(first.as_str(), second.as_str()),
         "both translations return the fallback text stored in the template"
     );
 }
@@ -300,25 +297,23 @@ fn an_empty_message_stays_empty_and_a_missing_key_stays_missing() {
 
     let empty = i18n.try_translate(LanguageCode::En, "blank");
     assert_eq!(
-        empty.as_ref().map(SharedString::as_str),
+        empty.as_deref(),
         Some(""),
         "a deliberately empty message is not a missing one"
     );
-    assert_eq!(i18n.translate(LanguageCode::En, "blank").as_ref(), "");
+    assert_eq!(i18n.translate(LanguageCode::En, "blank").as_str(), "");
     assert_eq!(i18n.try_translate(LanguageCode::En, "never.defined"), None);
     assert_eq!(
-        i18n.translate(LanguageCode::En, "never.defined").as_ref(),
+        i18n.translate(LanguageCode::En, "never.defined").as_str(),
         ""
     );
 }
 
-/// Guards the thread-safety of the text this diff put inside [`Template`]:
-/// `Template::Static` held a `Box<str>` and now holds a `SharedString`, whose
-/// heap representation is an `Arc<str>` today. A representation change to
-/// something `Rc`-backed would leave the translator no longer `Send + Sync`, and
-/// nothing else would notice: [`gpui_kit::Global`] requires only `'static`, so
-/// installing the translator in GPUI state compiles either way. Cross-thread use
-/// is what would then start failing, at a distance from the cause.
+/// Guards the thread-safety of the text the templates hold: `Template::Static`
+/// stores a `SmolStr`, whose heap representation is an `Arc<str>` today. A
+/// representation change to something `Rc`-backed would leave the translator no
+/// longer `Send + Sync`, and cross-thread use is what would then start failing,
+/// at a distance from the cause.
 #[test]
 fn the_translator_stays_shareable_across_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -346,19 +341,19 @@ fn an_interpolated_message_still_renders_through_the_cache() {
         "items",
         &[("count", &count), ("name", &name)],
     );
-    assert_eq!(first.as_ref(), "You have 3 items in Cart.");
+    assert_eq!(first.as_str(), "You have 3 items in Cart.");
     assert!(
-        std::ptr::eq(first.as_ref(), cached.as_ref()),
+        std::ptr::eq(first.as_str(), cached.as_str()),
         "a repeated rendering should come from the cache"
     );
 
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "greeting", &[("name", &"Grace")])
-            .as_ref(),
+            .as_str(),
         "Hello, Grace!"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::En, "greeting").as_ref(),
+        i18n.translate(LanguageCode::En, "greeting").as_str(),
         "Hello, !",
         "a placeholder without an argument renders as empty text"
     );
@@ -397,8 +392,8 @@ fn the_builder_checks_the_language_it_is_given() {
         .build()
         .expect("both locales are loaded");
 
-    assert_eq!(i18n.translate(LanguageCode::ZhCn, "b").as_ref(), "zh");
-    assert_eq!(i18n.translate(LanguageCode::En, "a").as_ref(), "en");
+    assert_eq!(i18n.translate(LanguageCode::ZhCn, "b").as_str(), "zh");
+    assert_eq!(i18n.translate(LanguageCode::En, "a").as_str(), "en");
     assert_eq!(i18n.fallback(), None);
 }
 
@@ -443,7 +438,7 @@ fn nested_keys_are_flattened() {
         .build()
         .expect("a locale is loaded");
 
-    assert_eq!(i18n.translate(LanguageCode::En, "a.b.c").as_ref(), "deep");
+    assert_eq!(i18n.translate(LanguageCode::En, "a.b.c").as_str(), "deep");
 }
 
 #[test]
@@ -514,7 +509,7 @@ fn a_locale_file_loads_from_disk() {
         .expect("the locale is loaded");
 
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.market").as_str(),
         "Market"
     );
 }

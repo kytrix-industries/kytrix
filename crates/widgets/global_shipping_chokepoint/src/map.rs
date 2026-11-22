@@ -1513,7 +1513,7 @@ mod tests {
     /// The translator the product ships, for the tests that read the catalogue's copy.
     fn product_translate() -> Translate {
         Translate::new(
-            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            Rc::new(i18n::embedded::load().expect("the embedded locales load")),
             LanguageCode::En,
         )
     }

@@ -2323,7 +2323,7 @@ mod tests {
     /// build it with no application at all, which is the point of the injected context.
     fn translate(language: LanguageCode) -> Translate {
         Translate::new(
-            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            Rc::new(i18n::embedded::load().expect("the embedded locales load")),
             language,
         )
     }
@@ -3638,7 +3638,7 @@ mod tests {
     /// is covered by the arm that names it.
     #[test]
     fn every_message_key_the_error_mappings_name_should_be_defined_in_every_locale() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+        let i18n = i18n::embedded::load().expect("the embedded locales load");
         let keys = message_keys(include_str!("./error.rs"));
 
         assert!(
@@ -3707,7 +3707,7 @@ mod tests {
 
     #[test]
     fn every_message_placeholder_should_be_supplied_by_the_mapping_that_names_it() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+        let i18n = i18n::embedded::load().expect("the embedded locales load");
         let mut mappings = message_arguments(include_str!("./error.rs"));
         for source in WIDGET_MESSAGE_SOURCES {
             mappings.extend(message_arguments(source));

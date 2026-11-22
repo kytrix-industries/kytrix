@@ -165,7 +165,7 @@ fn every_line_list_row_should_require_at_least_one_line() {
 // is the only place the omission would surface.
 #[test]
 fn every_catalog_key_should_be_defined_and_non_empty_in_every_language() {
-    let i18n = i18n::global::embedded::load().expect("the embedded locales should load");
+    let i18n = i18n::embedded::load().expect("the embedded locales should load");
 
     for language in i18n.languages() {
         let keys = i18n

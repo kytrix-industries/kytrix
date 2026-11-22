@@ -85,7 +85,7 @@ pub(crate) const FAILURE: AuthError = AuthError::MissingCredential;
 /// asserts the sentence the user reads rather than a fixture of this crate's making.
 pub(crate) fn translate(language: LanguageCode) -> Translate {
     Translate::new(
-        Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+        Rc::new(i18n::embedded::load().expect("the embedded locales load")),
         language,
     )
 }

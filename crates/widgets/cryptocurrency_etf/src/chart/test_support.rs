@@ -28,7 +28,7 @@ pub(crate) const FUNDS: [&str; 2] = ["AAA", "BBB"];
 /// root injects.
 pub(crate) fn translate(language: LanguageCode) -> Translate {
     Translate::new(
-        Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+        Rc::new(i18n::embedded::load().expect("the embedded locales load")),
         language,
     )
 }
