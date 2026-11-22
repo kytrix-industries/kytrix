@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::{App, TestAppContext};
 use kytrix_service_provider::service::{
     engine::{EthereumWalletTransfer, KytrixServiceError},
     ethereum_wallet::{
@@ -33,30 +32,6 @@ use crate::{
 
 /// The account every fixture scope belongs to.
 pub(crate) const ACCOUNT: &str = "test-account";
-
-/// Lets a widget and its service run until what a test is waiting for has happened.
-///
-/// Two executors are involved: a widget sends its commands from GPUI's own, and the
-/// service answers on the application runtime. So both are given a turn — the widget
-/// first, because a command that has not been sent is a service with nothing to answer.
-pub(crate) fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&App) -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        cx.run_until_parked();
-        let handle = cx.update(runtime_handle);
-        handle.block_on(async { tokio::task::yield_now().await });
-        if cx.update(|cx| ready(cx)) {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what} should happen");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// The installed application runtime's handle.
-fn runtime_handle(cx: &mut App) -> tokio::runtime::Handle {
-    widget_tokio_runtime::global::handle(cx).handle().clone()
-}
 
 /// One reported transfer.
 pub(crate) fn transfer(event_id: &str, timestamp: i64) -> EthereumWalletTransfer {
