@@ -6,23 +6,27 @@ edition.workspace = true
 
 [dependencies]
 app_config = { workspace = true }
-app_config_provider = { workspace = true }
 base_ui = { workspace = true }
-gpui-kit = { workspace = true }
+bytes = { workspace = true }
 i18n = { workspace = true }
 kytrix_proto = { workspace = true }
 kytrix_service_provider = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+ui_core = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+# The engine's node/canvas inspection the chart tests read, and the framework's
+# headless host (`WidgetTestApp`), which is what every interface test drives the
+# widget through. Only the test build opens either feature.
+ui_core = { workspace = true, features = ["test-support"] }
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

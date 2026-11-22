@@ -1,355 +1,353 @@
-//! What a chart does with the pointer, and what it does with the box it is given.
+//! The canvas one chart draws: the box it fills, the pointer it follows, and the labels
+//! it rewrites when the language moves under it.
 //!
-//! A tooltip is not an element: it is drawn by the same canvas as the bars, on the
-//! frame that follows the pointer move that asked for it. So what is worth pinning is
-//! the path from a move to the hover a frame draws with — the position the move
-//! queues, the commit that frame performs, and the box the frame draws in.
+//! These are the interface tests of the chart: they go through the engine's own
+//! `WidgetTestApp` (the headless host a widget is driven by), because what they assert is
+//! what the engine ended up holding — a canvas node, its primitives, and the frames a
+//! change is worth.
 
-use std::rc::Rc;
-
-use gpui_kit::{
-    Bounds, Context, IntoElement, Modifiers, ParentElement, Pixels, Render, Size, Styled,
-    TestAppContext, VisualTestContext, Window, div, point, px, size,
-};
+use base_ui::style_builder::StyleBuilder;
 use i18n::language::codes::LanguageCode;
+use ui_core::{
+    math::Point,
+    node::{builder::NodeBuilder, id::NodeId},
+    window::WindowId,
+};
+use widget::test_support::WidgetTestApp;
 
 use super::{
-    axes::point_x,
-    canvas::{ChartState, CryptocurrencyEtfChart},
-    test_support::dataset,
+    axes::nearest_index,
+    canvas::CryptocurrencyEtfChart,
+    paint::Hover,
+    test_support::{dataset, translate},
 };
 use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 
-/// How many days the chart in these tests is drawn from.
-const DAYS: usize = 12;
+const WIDTH: f32 = 640.0;
+const HEIGHT: f32 = 360.0;
 
-/// One chart, as a window mounts it.
-///
-/// It renders the chart the way the pane does, commit included: the pane applies the
-/// pointer position a move queued before it builds the frame, because two things in
-/// that frame are drawn from it — the chart, and the row of readings above it.
-struct Harness {
+/// One chart, drawn into a page of a fixed size.
+struct ChartHarness {
+    app: WidgetTestApp,
     chart: CryptocurrencyEtfChart,
+    window: WindowId,
 }
 
-impl Render for Harness {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.chart.sync_locale(cx);
-        self.chart.commit_pointer();
-        div().size_full().child(self.chart.entity(cx))
+impl ChartHarness {
+    fn sync(&mut self) -> bool {
+        let Self { app, chart, .. } = self;
+        app.with_cx(|cx| chart.sync(cx)).expect("the chart syncs")
+    }
+
+    fn sync_locale(&mut self) -> bool {
+        let Self { app, chart, .. } = self;
+        app.with_cx(|cx| chart.sync_locale(cx))
+    }
+
+    fn canvas(&self) -> &ui_core::paint::canvas::Canvas {
+        self.chart
+            .canvas_for_test(self.app.app(), self.window)
+            .expect("the chart drew a canvas")
+    }
+
+    fn layout(&self) -> super::axes::ChartLayout {
+        self.chart
+            .layout_for_test()
+            .expect("the chart was laid out")
+    }
+
+    fn release(&mut self) {
+        let Self { app, chart, .. } = self;
+        app.with_cx(|cx| chart.release(cx));
     }
 }
 
-/// Mounts one chart in a window of its own.
-///
-/// A canvas resolves its layout in prepaint, so a frame has to be drawn before
-/// anything is known about where the plot is.
-fn chart_window(
-    cx: &mut TestAppContext,
-) -> (
-    Rc<ChartState>,
-    gpui_kit::Entity<Harness>,
-    &mut VisualTestContext,
-) {
-    cx.executor().allow_parking();
-    cx.update(|cx| {
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-    });
-    let (harness, cx) = cx.add_window_view(|_, cx| {
-        let chart = CryptocurrencyEtfChart::new(
+/// Builds a chart over a page of `width` × `height`, and lays it out.
+fn harness_in(width: f32, height: f32, flows: &[f64]) -> ChartHarness {
+    let mut app = WidgetTestApp::with_translate(translate(LanguageCode::En));
+    let window = app.window();
+    let page = page(&mut app, width, height);
+    let mut chart = app.with_cx(|cx| {
+        CryptocurrencyEtfChart::new(
             cx,
-            dataset(&[1_000.0; DAYS]),
+            dataset(flows),
             CryptocurrencyEtfFundSelection::All,
             CryptocurrencyEtfWindow::All,
-        );
-        Harness { chart }
+        )
     });
-    let state = harness.read_with(cx, |harness, _| harness.chart.state());
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
-    (state, harness, cx)
+    app.with_cx(|cx| chart.build(cx, page))
+        .expect("the chart builds");
+    // The first frame lays the page (and the canvas inside it) out.
+    app.drain();
+    ChartHarness { app, chart, window }
 }
 
-/// The box the last frame laid the plot out in.
-fn plot(state: &ChartState) -> Bounds<Pixels> {
-    let plot = state
-        .boxes()
-        .expect("a laid-out frame records where its plot is")
-        .plot;
+fn harness() -> ChartHarness {
+    harness_in(WIDTH, HEIGHT, &[1_000.0, -500.0, 2_000.0])
+}
+
+/// A box of a fixed size, which is the shapes a chart is laid out in.
+fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+    app.with_cx(|cx| {
+        let root = cx.tree().root();
+        NodeBuilder::boxed()
+            .id("TEST_ETF_PAGE")
+            .style(
+                StyleBuilder::new()
+                    .width(width)
+                    .height(height)
+                    .flex_col()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the page builds")
+    })
+}
+
+/// The middle of the plot, which is over one of the fixture's days.
+fn middle_of_plot(harness: &ChartHarness) -> Point {
+    let plot = harness.layout().plot;
+    Point::new(
+        plot.origin.x + plot.size.width / 2.0,
+        plot.origin.y + plot.size.height / 2.0,
+    )
+}
+
+#[test]
+fn a_chart_should_fill_the_box_it_is_given() {
+    let mut harness = harness();
+    assert!(harness.sync(), "the first frame paints");
+
+    let layout = harness.layout();
+    assert_eq!(
+        layout.content.size.width, WIDTH,
+        "the content box is the pane's, when the labels fit it"
+    );
+    assert_eq!(layout.content.size.height, HEIGHT);
+    assert_eq!(
+        harness.canvas().bounds(),
+        layout.content,
+        "the canvas covers what the frame drew"
+    );
     assert!(
-        plot.size.width > Pixels::ZERO && plot.size.height > Pixels::ZERO,
-        "the plot has to have room before a pointer can be over it"
+        !harness.canvas().is_empty(),
+        "a chart of three days draws axes, a grid and three bars"
     );
-    plot
-}
-
-/// Delivers the frame a pointer move asked for.
-///
-/// The move itself only queues a position: the frame that follows is what applies it,
-/// and that frame is the one the next-frame callback requests. A test has no frame
-/// loop, so it delivers both halves by hand.
-fn draw_the_frame_the_pointer_asked_for(cx: &mut VisualTestContext) {
-    cx.update(|window, cx| {
-        window.simulate_next_frame(cx);
-        window.refresh();
-    });
-    cx.run_until_parked();
-}
-
-#[gpui_kit::test]
-fn a_chart_should_fill_the_box_it_is_given(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-    let boxes = state.boxes().expect("a laid-out frame records every box");
-    let window = cx.update(|window, _| window.bounds());
-
-    assert_eq!(
-        boxes.content.size.height, window.size.height,
-        "a chart grows into the height it is given rather than keeping its floor"
-    );
-    assert_eq!(
-        boxes.time_axis.bottom(),
-        boxes.content.bottom(),
-        "the time axis sits on the content's bottom edge, with nothing below it"
-    );
-    assert_eq!(boxes.content.origin, window.origin);
-    assert_eq!(
-        boxes.right_axis.right(),
-        boxes.content.right(),
-        "and the right axis reaches the content's right edge"
-    );
-}
-
-/// The box the frame the chart prepared last draws its content in.
-///
-/// It is the prepared layout rather than the one a pointer resolves against,
-/// because those are two different questions and only the first is what a resize
-/// has to change. The state a pointer reads is only refreshed by a frame that
-/// reuses a prepared frame, so it can lag the frame a resize produced.
-fn drawn_content(state: &ChartState) -> Size<Pixels> {
-    state
-        .cache
-        .borrow()
-        .layout
-        .expect("a prepared frame records the box it was prepared from")
-        .content
-        .size
-}
-
-#[gpui_kit::test]
-fn a_chart_should_follow_a_pane_that_shrank(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-    let wide = drawn_content(&state);
     assert!(
-        wide.width > px(700.0) && wide.height > px(400.0),
-        "the fixture window has to be wider than the box it shrinks to: {wide:?}"
+        !harness.sync(),
+        "a frame that changed nothing builds nothing (I3)"
     );
+}
 
-    cx.simulate_resize(size(px(700.0), px(400.0)));
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
+#[test]
+fn a_chart_in_a_smaller_box_should_draw_a_smaller_plot() {
+    let mut small = harness_in(320.0, 240.0, &[1_000.0, 2_000.0]);
+    assert!(small.sync());
+    let mut wide = harness_in(WIDTH, HEIGHT, &[1_000.0, 2_000.0]);
+    assert!(wide.sync());
 
     assert_eq!(
-        drawn_content(&state),
-        size(px(700.0), px(400.0)),
-        "a pane that shrank redraws the chart at the box it now has"
+        small.layout().content.size.width,
+        WIDTH,
+        "the content keeps its own floor, so the labels are never crushed"
     );
-}
-
-#[gpui_kit::test]
-fn a_chart_should_follow_a_pane_that_shrank_below_its_own_minimum(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-
-    cx.simulate_resize(size(px(360.0), px(240.0)));
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
-
     assert_eq!(
-        drawn_content(&state),
-        size(px(640.0), px(360.0)),
-        "a pane below the chart's floor gets the floor rather than the box it had before"
+        small.layout().content.size.height,
+        HEIGHT,
+        "and so does its height"
     );
-}
-
-#[gpui_kit::test]
-fn a_pointer_over_the_plot_should_hover_the_day_under_it(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-    let plot = plot(&state);
-
-    cx.simulate_mouse_move(plot.center(), None, Modifiers::default());
-    draw_the_frame_the_pointer_asked_for(cx);
-
-    let hover = state
-        .hovered()
-        .expect("a pointer inside the plot hovers a day");
-    assert!(hover.index < DAYS);
     assert_eq!(
-        hover.cursor_y,
-        px(f32::from(plot.center().y).round()),
-        "the hover remembers how high the pointer was, to the pixel"
+        small.layout().plot.size.width,
+        wide.layout().plot.size.width,
+        "a pane narrower than the chart's floor clips it rather than squeezing the plot"
     );
 }
 
-#[gpui_kit::test]
-fn the_pointer_should_land_on_the_nearest_day(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-    let plot = plot(&state);
+#[test]
+fn a_pointer_over_the_plot_should_hover_the_day_under_it() {
+    let mut harness = harness();
+    assert!(harness.sync());
 
-    for (index, expected) in [(0, 0), (5, 5), (DAYS - 1, DAYS - 1)] {
-        cx.simulate_mouse_move(
-            point(point_x(plot, DAYS, index), plot.center().y),
-            None,
-            Modifiers::default(),
-        );
-        draw_the_frame_the_pointer_asked_for(cx);
-
-        assert_eq!(
-            state.hovered().map(|hover| hover.index),
-            Some(expected),
-            "a pointer on the {index}th day hovers it"
-        );
-    }
-}
-
-#[gpui_kit::test]
-fn a_pointer_off_the_plot_should_not_hover_anything(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-    let plot = plot(&state);
-
-    cx.simulate_mouse_move(
-        point(plot.center().x, plot.bottom() + plot.size.height),
-        None,
-        Modifiers::default(),
-    );
-    draw_the_frame_the_pointer_asked_for(cx);
-
+    let position = middle_of_plot(&harness);
     assert!(
-        state.hovered().is_none(),
-        "a pointer below the plot is not a pointer on a day"
+        harness.chart.point_at(position),
+        "the pointer is over a day"
     );
-}
-
-#[gpui_kit::test]
-fn a_leaving_pointer_should_stop_hovering(cx: &mut TestAppContext) {
-    let (state, _, cx) = chart_window(cx);
-    let plot = plot(&state);
-    cx.simulate_mouse_move(plot.center(), None, Modifiers::default());
-    draw_the_frame_the_pointer_asked_for(cx);
-    assert!(state.hovered().is_some());
-
-    cx.simulate_mouse_move(
-        point(plot.center().x, plot.bottom() + plot.size.height),
-        None,
-        Modifiers::default(),
+    let hover = harness.chart.hover_for_test().expect("the day is hovered");
+    assert_eq!(
+        Some(hover.index),
+        nearest_index(harness.layout().plot, 3, position.x),
+        "the reading the pointer is nearest to"
     );
-    draw_the_frame_the_pointer_asked_for(cx);
-
     assert!(
-        state.hovered().is_none(),
-        "a hover that no longer has a day under it is dropped"
+        !harness.chart.point_at(position),
+        "the same day is the same frame"
+    );
+    assert!(harness.sync(), "the hovered day is drawn");
+}
+
+#[test]
+fn a_pointer_off_the_plot_should_not_hover_anything() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    let layout = harness.layout();
+
+    assert!(!harness.chart.point_at(Point::new(1.0, 1.0)));
+    assert_eq!(harness.chart.hover_for_test(), None);
+    let below = Point::new(layout.plot.origin.x + 10.0, layout.time_axis.origin.y + 2.0);
+    assert!(
+        !harness.chart.point_at(below),
+        "the time axis is not the plot"
+    );
+    assert_eq!(harness.chart.hover_for_test(), None);
+}
+
+#[test]
+fn a_leaving_pointer_should_stop_hovering() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    assert!(harness.chart.point_at(middle_of_plot(&harness)));
+    assert!(harness.chart.hover_for_test().is_some());
+
+    assert!(harness.chart.clear_hover(), "the pointer left the plot");
+    assert!(!harness.chart.clear_hover(), "and leaving twice is no news");
+    assert_eq!(harness.chart.hover_for_test(), None);
+}
+
+#[test]
+fn a_hover_should_draw_a_crosshair_and_a_tooltip_on_the_canvas() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    let quiet = harness.canvas().primitives().len();
+
+    assert!(harness.chart.point_at(middle_of_plot(&harness)));
+    assert!(harness.sync(), "the hovered frame paints");
+    let hovered = harness.canvas().primitives().len();
+    assert!(
+        hovered > quiet,
+        "a hover adds a crosshair, a marker and a tooltip ({quiet} → {hovered})"
     );
 }
 
-#[gpui_kit::test]
-fn a_move_that_changes_nothing_should_not_ask_for_a_frame(cx: &mut TestAppContext) {
-    let (_, harness, cx) = chart_window(cx);
-    let plot = plot(&harness.read_with(cx, |harness, _| harness.chart.state()));
+#[test]
+fn a_pointers_height_should_be_kept_at_whole_pixels() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    let plot = harness.layout().plot;
+    let y = plot.origin.y + 10.4;
 
-    cx.simulate_mouse_move(plot.center(), None, Modifiers::default());
-    draw_the_frame_the_pointer_asked_for(cx);
     assert!(
         harness
-            .read_with(cx, |harness, _| harness.chart.hover_index())
-            .is_some()
-    );
-
-    // A move inside the same day, by less than a pixel, is not a change: the chart
-    // must not ask for a frame of its own for it.
-    cx.simulate_mouse_move(
-        point(plot.center().x + px(1.0), plot.center().y + px(0.2)),
-        None,
-        Modifiers::default(),
-    );
-    let committed = cx.update(|window, cx| {
-        window.simulate_next_frame(cx);
-        harness.update(cx, |harness, _| harness.chart.commit_pointer())
-    });
-    assert!(
-        !committed,
-        "a pointer that moved within one day and one pixel is not a new reading"
-    );
-
-    // A whole pixel higher is.
-    cx.simulate_mouse_move(
-        point(plot.center().x + px(1.0), plot.center().y + px(1.4)),
-        None,
-        Modifiers::default(),
-    );
-    let committed = cx.update(|window, cx| {
-        window.simulate_next_frame(cx);
-        harness.update(cx, |harness, _| harness.chart.commit_pointer())
-    });
-    assert!(committed, "a pointer that moved a pixel is a new reading");
-}
-
-#[gpui_kit::test]
-fn a_language_change_should_rewrite_the_labels_a_chart_is_already_showing(cx: &mut TestAppContext) {
-    let (_, harness, cx) = chart_window(cx);
-    let english = cx.update(|_, cx| {
-        harness
-            .read(cx)
             .chart
-            .metrics()
-            .expect("a window with days has a reading")
-    });
-    assert_eq!(english.caption.as_ref(), "ETF net inflow");
-
-    cx.update(|window, cx| {
-        cx.set_global(LanguageCode::ZhCn);
-        window.refresh();
-    });
-    cx.run_until_parked();
-
-    let chinese = cx.update(|_, cx| {
-        harness
-            .read(cx)
-            .chart
-            .metrics()
-            .expect("a window with days has a reading")
-    });
-    assert_eq!(
-        chinese.caption.as_ref(),
-        "ETF 净流入",
-        "an answer arrives every eight hours, so a chart has to be relabelled without one"
+            .point_at(Point::new(plot.origin.x + plot.size.width / 2.0, y))
     );
-    assert_eq!(chinese.date.as_ref(), "2024-01-12");
+    let hover = harness.chart.hover_for_test().expect("the day is hovered");
+    assert_eq!(
+        hover,
+        Hover {
+            index: hover.index,
+            cursor_y: y.round(),
+        },
+        "a pointer that moved less than a pixel is not a change worth a frame"
+    );
 }
 
-#[gpui_kit::test]
-fn the_pointer_should_be_kept_out_of_a_window_it_is_no_longer_over(cx: &mut TestAppContext) {
-    let (state, harness, cx) = chart_window(cx);
-    let plot = plot(&state);
-    cx.simulate_mouse_move(plot.center(), None, Modifiers::default());
-    draw_the_frame_the_pointer_asked_for(cx);
-    assert!(state.hovered().is_some());
+#[test]
+fn a_language_change_should_rewrite_the_labels_a_chart_is_already_showing() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    let english_primitives = harness.canvas().primitives().len();
 
-    // The window is replaced by a chart of one day: the hover it was holding has no
-    // day under it any more, and a marker for it would be drawn past the end.
-    cx.update(|window, cx| {
-        harness.update(cx, |harness, cx| {
-            harness.chart.set_view(
-                cx,
-                dataset(&[1_000.0]),
-                CryptocurrencyEtfFundSelection::All,
-                CryptocurrencyEtfWindow::All,
-            );
-        });
-        window.refresh();
-    });
-    cx.run_until_parked();
-
+    harness.app.switch_language(LanguageCode::ZhCn);
     assert!(
-        state.hovered().is_none(),
-        "a hover past the end of a replaced window is dropped rather than clamped"
+        harness.sync_locale(),
+        "another language is another set of labels"
+    );
+    assert!(
+        !harness.sync_locale(),
+        "and it is resolved once, not every frame"
+    );
+    assert!(harness.sync(), "the new labels are drawn");
+    assert!(
+        !harness.canvas().is_empty(),
+        "the same chart says the same things in another language ({english_primitives} primitives before)"
+    );
+}
+
+#[test]
+fn a_chart_should_keep_the_readings_it_was_given() {
+    let harness = harness();
+    let metrics = harness
+        .chart
+        .metrics()
+        .expect("a window with days has a reading");
+
+    assert_eq!(metrics.date.as_str(), "2024-01-03");
+    assert_eq!(metrics.flow.as_str(), "+$2.00B");
+    assert_eq!(metrics.net_assets.as_deref(), Some("$2.50B"));
+}
+
+#[test]
+fn releasing_a_chart_should_leave_no_geometry_behind() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        1,
+        "the net-asset line is a registered mesh"
+    );
+
+    harness.release();
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        0,
+        "the mesh is the chart's own, so it goes with it"
+    );
+}
+
+#[test]
+fn a_chart_should_not_draw_before_it_is_laid_out() {
+    let mut app = WidgetTestApp::with_translate(translate(LanguageCode::En));
+    let page = page(&mut app, WIDTH, HEIGHT);
+    let mut chart = app.with_cx(|cx| {
+        CryptocurrencyEtfChart::new(
+            cx,
+            dataset(&[1_000.0]),
+            CryptocurrencyEtfFundSelection::All,
+            CryptocurrencyEtfWindow::All,
+        )
+    });
+    app.with_cx(|cx| chart.build(cx, page))
+        .expect("the chart builds");
+
+    // No frame has laid the page out yet: the canvas node has no box, so there is
+    // nothing to draw into and nothing to draw.
+    assert!(
+        !app.with_cx(|cx| chart.sync(cx)).expect("the chart syncs"),
+        "a chart that was not laid out draws nothing"
+    );
+}
+
+#[test]
+fn the_plot_should_be_a_rectangle_inside_the_content() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    let layout = harness.layout();
+
+    assert!(layout.plot.size.width > 0.0 && layout.plot.size.height > 0.0);
+    assert!(
+        layout.plot.origin.x >= layout.content.origin.x
+            && layout.plot.origin.x + layout.plot.size.width
+                <= layout.content.origin.x + layout.content.size.width,
+        "the plot is inside the content box"
+    );
+    assert_eq!(
+        layout.left_axis.origin.y, layout.plot.origin.y,
+        "both axes share the plot's rows"
+    );
+    assert_eq!(
+        layout.right_axis.origin.x,
+        layout.plot.origin.x + layout.plot.size.width,
+        "the right axis starts where the plot ends"
     );
 }

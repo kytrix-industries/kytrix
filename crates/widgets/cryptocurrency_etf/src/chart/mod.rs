@@ -1,7 +1,7 @@
 //! The chart side of the ETF pane: one canvas, and the four layers it is drawn in.
 //!
-//! A chart has the same three parts, separated here because they change at
-//! different times:
+//! A chart has the same three parts, separated here because they change at different
+//! times:
 //!
 //! - **what it plots** is replaced when a snapshot arrives, which is at most twice
 //!   a day;
@@ -13,12 +13,14 @@
 //! The canvas draws its axes, dates, crosshair and tooltip itself rather than
 //! assembling elements: a chart's labels move with its data, and a tooltip that
 //! followed the pointer through a popover layer would escape the clipping that keeps
-//! it inside the plot.
+//! it inside the plot. The engine's only self-drawing entry point is a `Canvas`, so
+//! that is what the chart produces.
 //!
 //! `axes` is where everything lands, `text` is what turns values into shaped lines,
-//! `palette` is the chart's fixed geometry, `data` is the resolved view, `paint` is
-//! the two passes one frame runs, and `canvas` is the element and the state it keeps
-//! between frames.
+//! `palette` is the chart's fixed geometry, `data` is the resolved view, `paint` turns
+//! one frame into canvas primitives, `units` is the one piece of `Rect` arithmetic the
+//! engine does not spell, and `canvas` is the node and the state it keeps between
+//! frames.
 
 mod axes;
 mod canvas;
@@ -26,10 +28,10 @@ mod data;
 mod paint;
 mod palette;
 mod text;
+mod units;
 
 pub(crate) use canvas::CryptocurrencyEtfChart;
 pub(crate) use data::Metrics;
-pub(crate) use palette::flow;
 
 #[cfg(test)]
 mod axes_tests;

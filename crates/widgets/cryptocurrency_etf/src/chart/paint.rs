@@ -1,20 +1,44 @@
 //! Painting one ETF chart.
 //!
-//! One frame is two passes, and the split is what makes a resize and a hover cheap:
+//! A frame is built from three parts, separated because they change at different
+//! times:
 //!
-//! - [`prepare`] folds the window into the pixel boxes and paths a frame draws,
-//!   using the box the element was given. It runs only when that box changed or a
-//!   new snapshot arrived.
-//! - [`paint`] turns those boxes into quads and those paths into strokes, plus the
+//! - [`measure`] shapes the axis labels and answers how wide each axis has to be,
+//!   which is what the layout is built from;
+//! - [`prepare`] folds the resolved window into the boxes and points a frame draws,
+//!   using the box the layout gave it. It runs only when that box changed or a new
+//!   snapshot arrived;
+//! - [`paint`] turns those boxes into quads and those points into a line, plus the
 //!   crosshair and the tooltip, which are the only parts that follow the pointer.
 //!
 //! Everything a label *says* was written when the snapshot arrived; this module
-//! places text, it never formats it.
+//! places text, it never formats it. The output is one engine [`Canvas`], because
+//! that is the engine's only self-drawing entry point: a chart's labels move with its
+//! data, and a tooltip that followed the pointer through a popover layer would escape
+//! the clipping that keeps it inside the plot.
+//!
+//! # The net-assets line is static geometry
+//!
+//! The engine has no path builder: a line is a registered mesh (`GeometryDesc`) drawn
+//! with [`GeometryDraw`](ui_core::paint::primitive::GeometryDraw). [`line_geometry`]
+//! builds that mesh — a two-pixel-wide ribbon, one quad per segment and a square at
+//! every joint — and the chart registers it once per prepared frame, releasing the
+//! previous one. The ribbon carries no anti-aliasing distance (every vertex is marked
+//! as interior), so the line is drawn with a hard edge rather than the feather the
+//! old path painter gave it; that is registered as a W3c difference.
 
-use base_ui::style::theme::{Theme, ThemeExt};
-use gpui_kit::{
-    App, Bounds, ContentMask, Corners, Hsla, Path, PathBuilder, Pixels, Point, SharedString,
-    TextAlign, Window, fill, point as at, px, size,
+use base_ui::theme::{resolved::Theme, role::Role};
+use bytes::Bytes;
+use ui_core::{
+    app::App,
+    math::{Point, Rect, Transform},
+    paint::{
+        canvas::Canvas,
+        color::Color,
+        geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+        primitive::{ClipRect, GeometryDraw, Quad, QuadPaint},
+    },
+    text::TextStyle,
 };
 
 use super::{
@@ -22,13 +46,13 @@ use super::{
         AXIS_TICK_TEXT_INSET, AxisScale, ChartLayout, PositionedTimeTick, axis_label_y,
         flow_bar_bounds, marker_bounds, point_x, position_time_ticks, tooltip_bounds, value_y,
     },
-    canvas::ChartState,
     data::{PreparedData, PreparedPoint},
     palette::{
-        AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, CROSSHAIR_DASH, CROSSHAIR_PERIOD, LINE_WIDTH,
-        TOOLTIP_GAP, TooltipStyle, flow, tooltip_style,
+        AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, CROSSHAIR_DASH, CROSSHAIR_PERIOD, TOOLTIP_GAP,
+        TooltipStyle, flow, tooltip_style,
     },
-    text::ChartTextCache,
+    text::{ChartTextCache, label_style},
+    units::RectExt,
 };
 
 /// One point under the pointer, and how high the pointer was.
@@ -39,7 +63,7 @@ use super::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Hover {
     pub index: usize,
-    pub cursor_y: Pixels,
+    pub cursor_y: f32,
 }
 
 /// What the axes need before a layout can be built.
@@ -47,21 +71,12 @@ pub(crate) struct Hover {
 /// Nothing is known before the first frame — no text has been shaped, so no label
 /// has a width — and that is spelled out rather than guessed at: the layout then
 /// falls back to its own minimum axis width for that one frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Measurements {
-    pub left_axis_width: Pixels,
+    pub left_axis_width: f32,
     /// Absent while a single fund is shown, which is what keeps its width for the
     /// plot.
-    pub right_axis_width: Option<Pixels>,
-}
-
-impl Default for Measurements {
-    fn default() -> Self {
-        Self {
-            left_axis_width: Pixels::ZERO,
-            right_axis_width: None,
-        }
-    }
+    pub right_axis_width: Option<f32>,
 }
 
 /// The inputs one prepared frame was built from.
@@ -72,121 +87,93 @@ impl Default for Measurements {
 /// window all rebuild the data and move the revision with it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CacheKey {
-    pub bounds: Bounds<Pixels>,
+    pub bounds: Rect,
     pub revision: u64,
 }
 
 /// One flow bar, already placed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PreparedBar {
-    pub bounds: Bounds<Pixels>,
+    pub bounds: Rect,
     pub value: f64,
 }
 
-/// The boxes and paths one frame draws, prepared from its layout.
-#[derive(Default)]
+/// The boxes and points one frame draws, prepared from its layout.
+#[derive(Default, Debug, PartialEq)]
 pub(crate) struct PreparedFrame {
     pub bars: Box<[PreparedBar]>,
-    /// Whether the bars are far enough apart to be drawn as one layer.
-    pub bars_are_disjoint: bool,
     /// The net-asset line, when the window has more than one day to draw it over.
-    pub line: Option<Path<Pixels>>,
+    /// A day that is not a reading is `None`, which breaks the line rather than
+    /// drawing the segment across the gap.
+    pub line: Option<Box<[Option<Point>]>>,
     /// The single reading a window of one day has, which is a point rather than a
     /// line.
-    pub marker: Option<Point<Pixels>>,
+    pub marker: Option<Point>,
     pub time_ticks: Box<[PositionedTimeTick]>,
 }
 
-/// The two things a paint pass needs that only a frame can hand over.
-///
-/// Text is shaped through the cache rather than through the window, and the window
-/// cannot be borrowed while a shaped line is being told about its own
-/// accessibility, so both travel together.
-pub(crate) struct PaintContext<'a> {
-    pub text_cache: &'a mut ChartTextCache,
-    pub window: &'a mut Window,
-    pub app: &'a mut App,
-}
-
-impl PaintContext<'_> {
-    /// Draws one line of text, shaped through the cache.
-    fn text(
-        &mut self,
-        text: &str,
-        origin: Point<Pixels>,
-        color: Hsla,
-        align: TextAlign,
-        width: Pixels,
-        font_size: Pixels,
-        line_height: Pixels,
-    ) {
-        if width <= Pixels::ZERO {
-            return;
-        }
-        let window = &*self.window;
-        let line = self
-            .text_cache
-            .line(SharedString::new(text), font_size, color, window);
-        let _ = line.paint(
-            origin,
-            line_height,
-            align,
-            Some(width),
-            self.window,
-            self.app,
-        );
-    }
-
-    /// The width one axis-sized label draws at.
-    fn axis_text_width(&mut self, text: &str, color: Hsla) -> Pixels {
-        let window = &*self.window;
-        self.text_cache.width(text, AXIS_FONT_SIZE, color, window)
-    }
-
-    /// The width one tooltip line draws at.
-    fn tooltip_text_width(&mut self, text: &str, color: Hsla, font_size: Pixels) -> Pixels {
-        let window = &*self.window;
-        self.text_cache.width(text, font_size, color, window)
-    }
+/// Which way a label hangs off the box it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Align {
+    Left,
+    Center,
+    Right,
 }
 
 /// Measures the axis labels, which is what the layout is built from.
 ///
 /// Each axis is measured against everything drawn in it, its title included: a title
 /// wider than its axis would be drawn off the edge of the chart and clipped away, so
-/// the axis grows instead and the pane scrolls to the content that makes.
-pub(crate) fn measure(data: &PreparedData, context: &mut PaintContext<'_>) -> Measurements {
-    let muted = context.app.theme().components.chart.axis.hsla;
+/// the axis grows instead.
+pub(crate) fn measure(
+    app: &mut App,
+    data: &PreparedData,
+    text: &mut ChartTextCache,
+    theme: &Theme,
+) -> Measurements {
+    let style = label_style(
+        AXIS_FONT_SIZE,
+        AXIS_LINE_HEIGHT,
+        theme.components().chart.axis,
+    );
     Measurements {
         left_axis_width: widest_label_width(
+            app,
+            text,
+            &style,
             &data.flow,
-            Some(data.left_axis_title.as_ref()),
-            muted,
-            context,
+            Some(data.left_axis_title.as_str()),
         ),
         right_axis_width: data.net_assets.as_ref().map(|scale| {
-            widest_label_width(scale, Some(data.right_axis_title.as_ref()), muted, context)
+            widest_label_width(
+                app,
+                text,
+                &style,
+                scale,
+                Some(data.right_axis_title.as_str()),
+            )
         }),
     }
 }
 
 /// The widest label of one axis, counting its title.
 fn widest_label_width(
+    app: &mut App,
+    text: &mut ChartTextCache,
+    style: &TextStyle,
     scale: &AxisScale,
     title: Option<&str>,
-    color: Hsla,
-    context: &mut PaintContext<'_>,
-) -> Pixels {
+) -> f32 {
     scale
         .ticks
         .iter()
         .map(|tick| tick.label.as_str())
         .chain(title.filter(|title| !title.is_empty()))
-        .map(|label| context.axis_text_width(label, color))
-        .fold(Pixels::ZERO, Pixels::max)
+        .map(|label| text.width(app, label, style))
+        .fold(0.0, f32::max)
 }
 
-/// Folds the resolved window into the boxes and paths one frame draws.
+/// Folds the resolved window into the boxes and points one frame draws.
 pub(crate) fn prepare(data: &PreparedData, layout: ChartLayout) -> PreparedFrame {
     let point_count = data.points.len();
     let mut bars = Vec::with_capacity(point_count);
@@ -212,7 +199,7 @@ pub(crate) fn prepare(data: &PreparedData, layout: ChartLayout) -> PreparedFrame
             if point.net_assets.is_finite() {
                 (
                     None,
-                    Some(at(
+                    Some(Point::new(
                         point_x(layout.plot, 1, 0),
                         value_y(point.net_assets, scale.domain, layout.plot),
                     )),
@@ -222,18 +209,26 @@ pub(crate) fn prepare(data: &PreparedData, layout: ChartLayout) -> PreparedFrame
             }
         } else {
             (
-                build_line_path(
-                    data.points.iter().map(|point| point.net_assets),
-                    point_count,
-                    scale.domain,
-                    layout.plot,
+                Some(
+                    data.points
+                        .iter()
+                        .enumerate()
+                        .map(|(index, point)| {
+                            point.net_assets.is_finite().then(|| {
+                                Point::new(
+                                    point_x(layout.plot, point_count, index),
+                                    value_y(point.net_assets, scale.domain, layout.plot),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
                 ),
                 None,
             )
         }
     });
     PreparedFrame {
-        bars_are_disjoint: bars_are_disjoint(&bars),
         bars: bars.into_boxed_slice(),
         line,
         marker,
@@ -248,114 +243,186 @@ pub(crate) fn prepare(data: &PreparedData, layout: ChartLayout) -> PreparedFrame
     }
 }
 
-/// Builds the path of the net-asset line.
-fn build_line_path(
-    values: impl Iterator<Item = f64>,
-    point_count: usize,
-    domain: super::axes::ValueDomain,
-    plot: Bounds<Pixels>,
-) -> Option<Path<Pixels>> {
-    if point_count < 2 {
+/// The mesh of the net-asset line: a ribbon of `width` through the points.
+///
+/// A run of consecutive readings becomes one quad per segment plus a square at every
+/// joint, which is what keeps the ribbon continuous around a corner. A day that is
+/// not a reading is a break rather than a zero, so the runs on either side are drawn
+/// as separate lines — the segment across the gap is not drawn as if the gap were
+/// data.
+///
+/// Every vertex is marked as interior (a negative distance, which the engine's
+/// coverage shader reads as full coverage), because this mesh is not anti-aliased:
+/// the engine's `Ui` pipeline is a coverage-distance pipeline and a filled ribbon is
+/// its degenerate case.
+pub(crate) fn line_geometry(points: &[Option<Point>], width: f32) -> Option<GeometryDesc> {
+    let half = (width / 2.0).max(0.5);
+    let mut vertices = Vec::<[f32; 3]>::with_capacity(points.len() * 8);
+    let mut indices = Vec::<u32>::with_capacity(points.len() * 12);
+    // The mesh's AABB is accumulated from the corners themselves rather than from
+    // rectangles: a zero-size rect is "empty" to the geometry helpers, and a union of
+    // empty rects is the last one of them.
+    let mut min = Point::new(f32::INFINITY, f32::INFINITY);
+    let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut push_quad = |corners: [Point; 4]| {
+        let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+        for corner in corners {
+            vertices.push([corner.x, corner.y, -1.0]);
+            min = Point::new(min.x.min(corner.x), min.y.min(corner.y));
+            max = Point::new(max.x.max(corner.x), max.y.max(corner.y));
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    let square = |center: Point| {
+        [
+            Point::new(center.x - half, center.y - half),
+            Point::new(center.x + half, center.y - half),
+            Point::new(center.x + half, center.y + half),
+            Point::new(center.x - half, center.y + half),
+        ]
+    };
+
+    let mut run: Vec<Point> = Vec::with_capacity(points.len());
+    for slot in points.iter().chain(std::iter::once(&None)) {
+        let Some(point) = *slot else {
+            if run.len() == 1 {
+                // A run of one reading is a dot: a circle is not a quad, so it is
+                // drawn as the square the joint of a longer run would have.
+                push_quad(square(run[0]));
+            } else {
+                for window in run.windows(2) {
+                    let (from, to) = (window[0], window[1]);
+                    let delta = Point::new(to.x - from.x, to.y - from.y);
+                    let length = delta.x.hypot(delta.y);
+                    if !length.is_finite() || length <= f32::EPSILON {
+                        continue;
+                    }
+                    let normal = Point::new(-delta.y / length * half, delta.x / length * half);
+                    push_quad([
+                        Point::new(from.x + normal.x, from.y + normal.y),
+                        Point::new(to.x + normal.x, to.y + normal.y),
+                        Point::new(to.x - normal.x, to.y - normal.y),
+                        Point::new(from.x - normal.x, from.y - normal.y),
+                    ]);
+                }
+                for point in &run {
+                    push_quad(square(*point));
+                }
+            }
+            run.clear();
+            continue;
+        };
+        run.push(point);
+    }
+    let bounds = Rect::new(min.x, min.y, max.x - min.x, max.y - min.y).outset(half / 2.0);
+    if vertices.is_empty() || indices.is_empty() || !bounds.is_finite() {
         return None;
     }
-    let mut path = PathBuilder::stroke(LINE_WIDTH);
-    let mut started = false;
-    for (index, value) in values.enumerate() {
-        if !value.is_finite() {
-            // A day that is not a reading breaks the line, so the segment across
-            // the gap is not drawn as if the gap were data.
-            started = false;
-            continue;
-        }
-        let position = at(
-            point_x(plot, point_count, index),
-            value_y(value, domain, plot),
-        );
-        if started {
-            path.line_to(position);
-        } else {
-            path.move_to(position);
-            started = true;
-        }
-    }
-    path.build().ok()
+
+    let vertex_bytes = vertices
+        .iter()
+        .flat_map(|vertex| vertex.iter().flat_map(|value| value.to_le_bytes()))
+        .collect::<Vec<u8>>();
+    let index_bytes = indices
+        .iter()
+        .flat_map(|index| index.to_le_bytes())
+        .collect::<Vec<u8>>();
+    Some(GeometryDesc {
+        vertex_bytes: Bytes::from(vertex_bytes),
+        index_bytes: Bytes::from(index_bytes),
+        vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+        index_type: IndexType::U32,
+        topology: Topology::TriangleList,
+        bounds,
+        pipeline: GeometryPipeline::Ui,
+    })
 }
 
-/// Whether every bar has a column of its own, which is what lets a frame draw them
-/// as one layer instead of one insertion each.
-fn bars_are_disjoint(bars: &[PreparedBar]) -> bool {
-    let mut previous_right: Option<Pixels> = None;
-    for bar in bars {
-        if previous_right.is_some_and(|right| bar.bounds.origin.x < right) {
-            return false;
-        }
-        previous_right = Some(previous_right.map_or(bar.bounds.right(), |right: Pixels| {
-            right.max(bar.bounds.right())
-        }));
-    }
-    true
-}
-
-/// Draws the frame a chart prepared last.
+/// Draws one frame of a chart into a canvas.
 ///
-/// The state arrives whole rather than as a borrowed frame because a frame needs
-/// both halves of it at once — the prepared boxes, which are read, and the shaped
-/// text cache, which is written through — and they live in the same `RefCell`.
-/// Reading them here, in one place, is what keeps a frame from having to clone
-/// either.
+/// The canvas is built whole rather than patched: an engine canvas is a value, and a
+/// chart whose box, data or pointer moved is a different value. The chart keeps the
+/// last one it built and only rebuilds when [`CacheKey`] or the pointer says so.
 pub(crate) fn paint(
+    app: &mut App,
     data: &PreparedData,
+    prepared: &PreparedFrame,
     layout: ChartLayout,
     hover: Option<Hover>,
-    state: &ChartState,
-    window: &mut Window,
-    app: &mut App,
-) {
-    let prepared = std::cell::Ref::map(state.cache.borrow(), |cache| &cache.prepared);
-    let mut context = PaintContext {
-        text_cache: &mut state.text.borrow_mut(),
-        window,
-        app,
-    };
-    let context = &mut context;
-    paint_plot_rules(
-        layout,
-        context.app.theme().components.chart.grid.hsla,
-        context.window,
-    );
-    paint_value_grid(
-        data,
-        layout,
-        context.app.theme().components.chart.grid.hsla,
-        context.window,
-    );
-    paint_axes(data, layout, context);
-    paint_time_axis(&prepared.time_ticks, layout, context);
-    context.window.with_content_mask(
-        Some(ContentMask {
-            bounds: layout.plot,
-        }),
-        |window| {
-            paint_bars(&prepared, context.app.theme(), layout.plot, window);
-            let foreground = context.app.theme().roles.fg.default.hsla;
-            if let Some(path) = prepared.line.clone() {
-                window.paint_path(path, foreground);
-            } else if let Some(center) = prepared.marker {
-                window.paint_quad(fill(marker_bounds(center), foreground));
-            }
-            if let Some(hover) = hover.filter(|hover| hover.index < data.points.len()) {
-                paint_crosshair(
-                    hover.index,
-                    data.points.len(),
-                    layout.plot,
-                    context.app.theme().components.chart.crosshair.hsla,
-                    window,
-                );
-            }
-        },
-    );
+    theme: &Theme,
+    text: &mut ChartTextCache,
+    line: Option<(GeometryId, Color)>,
+) -> Canvas {
+    let mut context = PaintContext { app, theme, text };
+    let chart = theme.components().chart;
+    let mut canvas = Canvas::new(layout.content);
+    paint_plot_rules(&mut canvas, layout, chart.grid);
+    paint_value_grid(&mut canvas, data, layout, chart.grid);
+    paint_axes(&mut canvas, data, layout, &mut context);
+    paint_time_axis(&mut canvas, &prepared.time_ticks, layout, &mut context);
+    let _ = canvas.push_clip(ClipRect {
+        rect: layout.plot,
+        corner_radius: [0.0; 4],
+    });
+    paint_bars(&mut canvas, prepared, layout.plot, theme);
+    let foreground = theme.role(Role::FgDefault);
+    if let Some((id, color)) = line {
+        // The mesh is registered and released by the chart, which owns the geometry
+        // store entry for as long as the canvas that draws it is the current one.
+        canvas.push_geometry(GeometryDraw::full(id, Transform::IDENTITY, color));
+    } else if let Some(center) = prepared.marker {
+        push_quad(&mut canvas, marker_bounds(center), foreground);
+    }
     if let Some(hover) = hover.filter(|hover| hover.index < data.points.len()) {
-        paint_hover(data, hover, layout, context);
+        paint_crosshair(
+            &mut canvas,
+            hover.index,
+            data.points.len(),
+            layout.plot,
+            chart.crosshair,
+        );
+    }
+    let _ = canvas.pop_clip();
+    if let Some(hover) = hover.filter(|hover| hover.index < data.points.len()) {
+        paint_hover(&mut canvas, data, hover, layout, theme, &mut context);
+    }
+    canvas
+}
+
+/// Paints one frame with the shaped text and the theme it needs.
+struct PaintContext<'a> {
+    app: &'a mut App,
+    theme: &'a Theme,
+    text: &'a mut ChartTextCache,
+}
+
+impl PaintContext<'_> {
+    /// Places one line of text inside `[x, x + width]`, at the top edge `y`.
+    ///
+    /// Alignment is resolved here rather than by the shaper: a label's box is its
+    /// axis, and where inside that box it starts is what says which side of the plot
+    /// it names.
+    fn text(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: f32,
+        width: f32,
+        y: f32,
+        align: Align,
+        style: &TextStyle,
+    ) {
+        if width <= 0.0 {
+            return;
+        }
+        let line = self.text.line(self.app, text, style);
+        let line_width = line.size().width;
+        let origin_x = match align {
+            Align::Left => x,
+            Align::Center => x + (width - line_width) / 2.0,
+            Align::Right => x + width - line_width,
+        };
+        let _ = canvas.push_shaped_text(&line, Point::new(origin_x, y));
     }
 }
 
@@ -363,33 +430,42 @@ pub(crate) fn paint(
 ///
 /// There is no background: the pane body behind the canvas is the background, so the
 /// chart never paints over the body's rounded corners.
-fn paint_plot_rules(layout: ChartLayout, color: Hsla, window: &mut Window) {
-    let top = Bounds::new(layout.plot.origin, size(layout.plot.size.width, px(1.0)));
-    let bottom = Bounds::new(
-        at(layout.plot.origin.x, layout.plot.bottom() - px(1.0)),
-        size(layout.plot.size.width, px(1.0)),
+fn paint_plot_rules(canvas: &mut Canvas, layout: ChartLayout, color: Color) {
+    push_quad(
+        canvas,
+        Rect::new(
+            layout.plot.origin.x,
+            layout.plot.origin.y,
+            layout.plot.size.width,
+            1.0,
+        ),
+        color,
     );
-    window.paint_quad(fill(top, color));
-    window.paint_quad(fill(bottom, color));
+    push_quad(
+        canvas,
+        Rect::new(
+            layout.plot.origin.x,
+            layout.plot.bottom() - 1.0,
+            layout.plot.size.width,
+            1.0,
+        ),
+        color,
+    );
 }
 
 /// Draws the horizontal grid line of every tick of the flow axis.
 ///
 /// One axis drives the grid, not two: the flow axis is the one the bars are read
 /// against, and a second set of lines a few pixels away would read as neither.
-fn paint_value_grid(data: &PreparedData, layout: ChartLayout, color: Hsla, window: &mut Window) {
-    window.paint_layer(layout.plot, |window| {
-        for tick in &data.flow.ticks {
-            let y = value_y(tick.value, data.flow.domain, layout.plot);
-            window.paint_quad(fill(
-                Bounds::new(
-                    at(layout.plot.origin.x, y),
-                    size(layout.plot.size.width, px(1.0)),
-                ),
-                color,
-            ));
-        }
-    });
+fn paint_value_grid(canvas: &mut Canvas, data: &PreparedData, layout: ChartLayout, color: Color) {
+    for tick in &data.flow.ticks {
+        let y = value_y(tick.value, data.flow.domain, layout.plot);
+        push_quad(
+            canvas,
+            Rect::new(layout.plot.origin.x, y, layout.plot.size.width, 1.0),
+            color,
+        );
+    }
 }
 
 /// Draws both y-axes: the title above each, and a label per tick beside it.
@@ -397,34 +473,40 @@ fn paint_value_grid(data: &PreparedData, layout: ChartLayout, color: Hsla, windo
 /// Each title sits over its own axis at the top of the chart, and the title is where
 /// the unit comes from: the numbers an axis carries are bare, so what they count and
 /// what they are counted in are written once, above the axis they belong to.
-fn paint_axes(data: &PreparedData, layout: ChartLayout, context: &mut PaintContext<'_>) {
-    let color = context.app.theme().components.chart.axis.hsla;
-    let title_y = layout.content.origin.y + px(2.0);
-    let inset = px(AXIS_TICK_TEXT_INSET);
+fn paint_axes(
+    canvas: &mut Canvas,
+    data: &PreparedData,
+    layout: ChartLayout,
+    context: &mut PaintContext<'_>,
+) {
+    let color = context.theme.components().chart.axis;
+    let style = label_style(AXIS_FONT_SIZE, AXIS_LINE_HEIGHT, color);
+    let title_y = layout.content.origin.y + 2.0;
+    let inset = AXIS_TICK_TEXT_INSET;
     // The flow axis is the one every chart of a flow has, whatever is selected.
     context.text(
-        data.left_axis_title.as_ref(),
-        at(layout.left_axis.origin.x, title_y),
-        color,
-        TextAlign::Right,
-        (layout.left_axis.size.width - inset).max(Pixels::ZERO),
-        AXIS_FONT_SIZE,
-        AXIS_LINE_HEIGHT,
+        canvas,
+        data.left_axis_title.as_str(),
+        layout.left_axis.origin.x,
+        (layout.left_axis.size.width - inset).max(0.0),
+        title_y,
+        Align::Right,
+        &style,
     );
-    paint_value_axis(&data.flow, AxisSide::Left, layout, context);
+    paint_value_axis(canvas, &data.flow, AxisSide::Left, layout, context, &style);
     // The net-asset axis is the one only the whole complex has: a single fund has a
     // flow but no assets of its own to report.
     if let Some(scale) = data.net_assets.as_ref() {
         context.text(
-            data.right_axis_title.as_ref(),
-            at(layout.right_axis.origin.x + inset, title_y),
-            color,
-            TextAlign::Left,
-            (layout.right_axis.size.width - inset).max(Pixels::ZERO),
-            AXIS_FONT_SIZE,
-            AXIS_LINE_HEIGHT,
+            canvas,
+            data.right_axis_title.as_str(),
+            layout.right_axis.origin.x + inset,
+            (layout.right_axis.size.width - inset).max(0.0),
+            title_y,
+            Align::Left,
+            &style,
         );
-        paint_value_axis(scale, AxisSide::Right, layout, context);
+        paint_value_axis(canvas, scale, AxisSide::Right, layout, context, &style);
     }
 }
 
@@ -442,53 +524,57 @@ enum AxisSide {
 /// assets against the right, and a reader who mixed them up would be off by
 /// whatever the two happen to differ by.
 fn paint_value_axis(
+    canvas: &mut Canvas,
     scale: &AxisScale,
     side: AxisSide,
     layout: ChartLayout,
     context: &mut PaintContext<'_>,
+    style: &TextStyle,
 ) {
     let axis = match side {
         AxisSide::Left => layout.left_axis,
         AxisSide::Right => layout.right_axis,
     };
     let (align, origin_x) = match side {
-        AxisSide::Left => (TextAlign::Right, axis.origin.x),
-        AxisSide::Right => (TextAlign::Left, axis.origin.x + px(AXIS_TICK_TEXT_INSET)),
+        AxisSide::Left => (Align::Right, axis.origin.x),
+        AxisSide::Right => (Align::Left, axis.origin.x + AXIS_TICK_TEXT_INSET),
     };
-    let width = (axis.size.width - px(AXIS_TICK_TEXT_INSET)).max(Pixels::ZERO);
+    let width = (axis.size.width - AXIS_TICK_TEXT_INSET).max(0.0);
     for tick in &scale.ticks {
         let y = axis_label_y(value_y(tick.value, scale.domain, layout.plot), axis);
         context.text(
+            canvas,
             tick.label.as_str(),
-            at(origin_x, y),
-            context.app.theme().components.chart.axis.hsla,
-            align,
+            origin_x,
             width,
-            AXIS_FONT_SIZE,
-            AXIS_LINE_HEIGHT,
+            y,
+            align,
+            style,
         );
     }
 }
 
 /// Draws the date of every labelled position under the plot.
-///
-/// Every label is already placed inside the time axis by the layout, so nothing
-/// here needs a mask: a date that hung over the edge of the chart would be clipped
-/// by the pane, and the placement is what keeps that from happening.
 fn paint_time_axis(
+    canvas: &mut Canvas,
     ticks: &[PositionedTimeTick],
     layout: ChartLayout,
     context: &mut PaintContext<'_>,
 ) {
+    let style = label_style(
+        AXIS_FONT_SIZE,
+        AXIS_LINE_HEIGHT,
+        context.theme.components().chart.axis,
+    );
     for tick in ticks {
         context.text(
+            canvas,
             tick.label.as_str(),
-            at(tick.origin_x, layout.time_axis.origin.y + px(4.0)),
-            context.app.theme().components.chart.axis.hsla,
-            TextAlign::Center,
+            tick.origin_x,
             tick.width,
-            AXIS_FONT_SIZE,
-            AXIS_LINE_HEIGHT,
+            layout.time_axis.origin.y + 4.0,
+            Align::Center,
+            &style,
         );
     }
 }
@@ -496,23 +582,19 @@ fn paint_time_axis(
 /// Draws every bar of the window.
 ///
 /// Bars are a presentation layer: later bars may cover earlier ones when slots are
-/// dense. When they do not touch, one layer holds the whole series and the scene
-/// builder can batch it; when they do, each is drawn in turn so that the later day
-/// is the one on top, which is the order the series is read in.
-fn paint_bars(prepared: &PreparedFrame, theme: &Theme, plot: Bounds<Pixels>, window: &mut Window) {
-    if prepared.bars.is_empty() {
-        return;
-    }
-    let paint = |window: &mut Window| {
-        let muted = theme.roles.market.flat.hsla;
-        for bar in &prepared.bars {
-            window.paint_quad(fill(bar.bounds, flow(theme, bar.value, muted)));
+/// dense, and the canvas draws them in the series order, so the later day is the one
+/// on top — the order the series is read in.
+fn paint_bars(canvas: &mut Canvas, prepared: &PreparedFrame, plot: Rect, theme: &Theme) {
+    let muted = theme.role(Role::MarketFlat);
+    for bar in &prepared.bars {
+        let color = flow(theme, bar.value, muted);
+        // A bar is a slice of the plot: one that reaches past the edge (a value at
+        // the very end of the axis) is drawn clipped, like the old content mask did.
+        let clipped = bar.bounds.intersect(plot);
+        if clipped.is_empty() {
+            continue;
         }
-    };
-    if prepared.bars_are_disjoint {
-        window.paint_layer(plot, paint);
-    } else {
-        paint(window);
+        push_quad(canvas, clipped, color);
     }
 }
 
@@ -523,26 +605,19 @@ fn paint_bars(prepared: &PreparedFrame, theme: &Theme, plot: Bounds<Pixels>, win
 /// with the hand rather than with the data. The pointer's height is still what the
 /// tooltip hangs from, which is the one thing about it a reader needs.
 fn paint_crosshair(
+    canvas: &mut Canvas,
     index: usize,
     point_count: usize,
-    plot: Bounds<Pixels>,
-    color: Hsla,
-    window: &mut Window,
+    plot: Rect,
+    color: Color,
 ) {
     let x = point_x(plot, point_count, index);
-    // Dash segments are disjoint, so one layer replaces one ordering-tree insertion
-    // per segment.
-    window.paint_layer(plot, |window| {
-        let mut cursor_y = plot.origin.y;
-        while cursor_y < plot.bottom() {
-            let height = CROSSHAIR_DASH.min(plot.bottom() - cursor_y);
-            window.paint_quad(fill(
-                Bounds::new(at(x, cursor_y), size(px(1.0), height)),
-                color,
-            ));
-            cursor_y += CROSSHAIR_PERIOD;
-        }
-    });
+    let mut cursor_y = plot.origin.y;
+    while cursor_y < plot.bottom() {
+        let height = CROSSHAIR_DASH.min(plot.bottom() - cursor_y);
+        push_quad(canvas, Rect::new(x, cursor_y, 1.0, height), color);
+        cursor_y += CROSSHAIR_PERIOD;
+    }
 }
 
 /// Draws the square at the hovered reading and the tooltip that names it.
@@ -550,54 +625,67 @@ fn paint_crosshair(
 /// The marker sits on the net-asset line, which is the series the hover follows;
 /// the flow of the same day is the bar the crosshair already stands on.
 fn paint_hover(
+    canvas: &mut Canvas,
     data: &PreparedData,
     hover: Hover,
     layout: ChartLayout,
+    theme: &Theme,
     context: &mut PaintContext<'_>,
 ) {
     let point = &data.points[hover.index];
     let point_count = data.points.len();
     if let (Some(scale), true) = (data.net_assets.as_ref(), point.net_assets.is_finite()) {
-        let center = at(
+        let center = Point::new(
             point_x(layout.plot, point_count, hover.index),
             value_y(point.net_assets, scale.domain, layout.plot),
         );
-        context.window.paint_quad(fill(
-            marker_bounds(center),
-            context.app.theme().roles.fg.default.hsla,
-        ));
+        push_quad(canvas, marker_bounds(center), theme.role(Role::FgDefault));
     }
     paint_tooltip(
+        canvas,
+        data,
         point,
-        data.show_net_assets,
         hover,
         point_count,
         layout,
+        theme,
         context,
     );
 }
 
 /// Draws the tooltip of one day: the date, its flow, and what the funds hold.
 fn paint_tooltip(
+    canvas: &mut Canvas,
+    data: &PreparedData,
     point: &PreparedPoint,
-    show_net_assets: bool,
     hover: Hover,
     point_count: usize,
     layout: ChartLayout,
+    theme: &Theme,
     context: &mut PaintContext<'_>,
 ) {
-    let style = tooltip_style(context.window);
-    let lines = tooltip_lines(point, show_net_assets, context.app.theme());
-    let content_width = lines
+    let style = tooltip_style(theme.tokens());
+    let lines = tooltip_lines(point, data.show_net_assets, theme);
+    let line_styles = lines
         .iter()
         .map(|line| {
-            line.iter().fold(Pixels::ZERO, |width, (text, color)| {
-                width + context.tooltip_text_width(text, *color, style.font_size)
-            })
+            line.iter()
+                .map(|(_, color)| label_style(style.font_size, style.line_height, *color))
+                .collect::<Vec<_>>()
         })
-        .fold(Pixels::ZERO, Pixels::max);
+        .collect::<Vec<_>>();
+    let mut content_width = 0.0f32;
+    for (line, styles) in lines.iter().zip(&line_styles) {
+        let width = line
+            .iter()
+            .zip(styles)
+            .fold(0.0, |width, ((text, _), line_style)| {
+                width + context.text.width(context.app, text, line_style)
+            });
+        content_width = content_width.max(width);
+    }
     let bounds = tooltip_bounds(
-        at(
+        Point::new(
             point_x(layout.plot, point_count, hover.index),
             hover.cursor_y,
         ),
@@ -605,25 +693,26 @@ fn paint_tooltip(
         layout.plot,
         TOOLTIP_GAP,
     );
-    paint_tooltip_surface(bounds, style, context);
-    let text_width = (bounds.size.width - style.padding * 2.0).max(Pixels::ZERO);
-    for (index, line) in lines.iter().enumerate() {
+    paint_tooltip_surface(canvas, bounds, style, theme);
+    let text_width = (bounds.size.width - style.padding * 2.0).max(0.0);
+    for (index, (line, styles)) in lines.iter().zip(&line_styles).enumerate() {
         let y = bounds.origin.y + style.padding + style.line_height * index as f32;
         let mut cursor_x = bounds.origin.x + style.padding;
-        for (text, color) in line.iter() {
+        for ((text, _), line_style) in line.iter().zip(styles) {
+            let width = context.text.width(context.app, text, line_style);
             context.text(
+                canvas,
                 text,
-                at(cursor_x, y),
-                *color,
-                TextAlign::Left,
+                cursor_x,
                 text_width,
-                style.font_size,
-                style.line_height,
+                y,
+                Align::Left,
+                line_style,
             );
             // The next run of the line starts where this one ended, which is the only
             // placement a line drawn in more than one colour can use: the two runs are
             // one reading, not two columns.
-            cursor_x += context.tooltip_text_width(text, *color, style.font_size);
+            cursor_x += width;
         }
     }
 }
@@ -639,35 +728,45 @@ pub(crate) fn tooltip_lines<'a>(
     point: &'a PreparedPoint,
     show_net_assets: bool,
     theme: &Theme,
-) -> Vec<Vec<(&'a str, Hsla)>> {
-    let foreground = theme.components.tooltip.foreground.hsla;
+) -> Vec<Vec<(&'a str, Color)>> {
+    let foreground = theme.components().tooltip.foreground;
     let mut lines = vec![
-        vec![(point.header_date.as_ref(), foreground)],
+        vec![(point.header_date.as_str(), foreground)],
         vec![
-            (point.flow_tooltip_caption.as_ref(), foreground),
+            (point.flow_tooltip_caption.as_str(), foreground),
             (
-                point.flow_label.as_ref(),
+                point.flow_label.as_str(),
                 flow(theme, point.flow, foreground),
             ),
         ],
     ];
     if show_net_assets {
-        lines.push(vec![(point.net_assets_tooltip.as_ref(), foreground)]);
+        lines.push(vec![(point.net_assets_tooltip.as_str(), foreground)]);
     }
     lines
 }
 
-fn paint_tooltip_surface(
-    bounds: Bounds<Pixels>,
-    style: TooltipStyle,
-    context: &mut PaintContext<'_>,
-) {
-    let corner_radii = Corners::all(style.radius).clamp_radii_for_quad_size(bounds.size);
-    context.window.paint_quad(
-        fill(
-            bounds,
-            context.app.theme().components.tooltip.background.hsla,
-        )
-        .corner_radii(corner_radii),
-    );
+fn paint_tooltip_surface(canvas: &mut Canvas, bounds: Rect, style: TooltipStyle, theme: &Theme) {
+    let radius = style
+        .radius
+        .max(0.0)
+        .min(bounds.size.width / 2.0)
+        .min(bounds.size.height / 2.0);
+    canvas.push_quad(Quad {
+        bounds,
+        corner_radius: [radius; 4],
+        paint: QuadPaint::Solid {
+            fill: theme.components().tooltip.background,
+            border: None,
+        },
+    });
+}
+
+/// Pushes one solid quad.
+fn push_quad(canvas: &mut Canvas, bounds: Rect, fill: Color) {
+    canvas.push_quad(Quad {
+        bounds,
+        corner_radius: [0.0; 4],
+        paint: QuadPaint::Solid { fill, border: None },
+    });
 }
