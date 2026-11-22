@@ -1,10 +1,19 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.5（2026-11-22）
+> **版本**：v2.6（2026-11-22）
 >
+> **v2.6 变更摘要（2026-11-22）**：**P3-1c（P3-1b 复核收尾批）完成**。§13 契约补齐两处 W1 前置：① `WidgetServices`
+> 新增 `catalog_generation: Signal<u64>`（目录已发布世代；组合根写、框架 surface 根读），widget 在 `sync` 比较世代并重跑
+> `load`——「目录变更 → 重跑 `load`」由此只有一条通法，且等待目录、没有正文的 widget 也会被唤醒（§13.5/§13.9 R-8）；
+> ② `MarkdownNode::mount` 的 `expect` 改为 `Result<Self, EngineError>`（失败面统一，`ui/placeholder.rs` 的富文本 notice
+> 传播错误）。同时收口：mount 的 surface 失败也释放 scope（N4，新增 `WidgetTestApp::try_mount_in_scope` 观测缝）、
+> 行内图片占位块登记为**资产批次事项**（N3，W1 真窗口验收不据此判缺陷）、`App::frame_hook_installed` +
+> `EngineError::FrameHookInstalled` 的写作用域越界**已获 Lead 批准**并登记 `ledger.md`（N8）。测试 142 → **146**。
+> 逐条登记 `.docs/gui-migration/design-changes.md` §14。
 > **v2.5 变更摘要（2026-11-22）**：**P3-1b（P3-1 审查必修批）完成**。§13 契约按审查 3×P1 + 8×P2 收口：`WidgetServices`
-> 扩 4 槽（`kytrix_service` / `open_url` / `sound` / `reduce_motion`，前两项与目录同为 `Option`/注入闭包）+ `WidgetCx` 新增
+> 扩 4 槽（`kytrix_service: Option<KytrixServiceConnector>`（与 `market_participants` 同为 `Option`）/ `open_url`、
+> `sound`（`Rc` 注入闭包）/ `reduce_motion: Signal<bool>`）+ `WidgetCx` 新增
 > 不克隆的 `config_ref` / `account` / `window_mut` / `set_canvas`；`Notice::MarketNotLoaded` 由 `kit::markdown` 富文本呈现；
 > `AnyWidget::mount` 失败回滚、`header` released 守卫、`FrameRouter` 单槽占用报错（引擎新增
 > `App::frame_hook_installed` + `EngineError::FrameHookInstalled`）；§13.8 覆盖口径修正并补齐 4 条缺失测试。contract 变更逐条登记
@@ -251,11 +260,12 @@ pub(crate) use windows as backend;
    `test_support` 由 `feature = "test-support"` 门控（不进发布物，I7）。
 3. **白名单语义**：下表是「应用层允许依赖的类型与入口」，深路径省略 `ui_core::` 前缀；`error::EngineError` 是所有可失败
    API 的返回错误（缺它无法写应用代码）。**E1–E15 的公开面已全部实现**（P1 完成 E1–E6，§11.1–§11.6；P2 完成 E7–E15，
-   §11.9–§11.15），应用现在即可依赖。**P2 未新增 `EngineError` 变体**（仍 **35** 个，§2.9）。
+   §11.9–§11.15），应用现在即可依赖。**P2 未新增 `EngineError` 变体**；P3-1b 为 `FrameRouter` 单槽可观测性新增
+   `FrameHookInstalled`（现 **36** 个，§2.9，Lead 批准保留）。
 
 | 类别 | 可依赖类型 / 入口（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
 |---|---|---|
-| 错误 | `error::EngineError`（顶层 **35** 个变体，§2.9；含 E1–E6 新增的 `TextShapeStandalone` / `InvalidTextScale` / `VirtualListExtents` / `InvalidVirtualExtent` / `UnsupportedWindowCapability` / `WindowIcon`） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` 同时覆盖「不能作为文本命中目标」，§11.5），禁止字符串错误穿透 |
+| 错误 | `error::EngineError`（顶层 **36** 个变体，§2.9；含 E1–E6 新增的 `TextShapeStandalone` / `InvalidTextScale` / `VirtualListExtents` / `InvalidVirtualExtent` / `UnsupportedWindowCapability` / `WindowIcon`，以及 P3-1b 的 `FrameHookInstalled`） | 所有 `Result` 的错误类型；应用按变体分类处理（`StaleNode` 同时覆盖「不能作为文本命中目标」，§11.5），禁止字符串错误穿透 |
 | 应用 | `app::{App, AppHandle, Application, StylePassReport}`、`window::{WindowId, Window, WindowOptions, FrameIndex, FrameOutcome, FramePresentation, Decorations}`、`window::{WindowControl, WindowState, WindowResizeEdge}`（**三端可见**：E6 已移除 `cfg(target_os = "linux")`）、`window::ImeContentType`、`App::{on_frame, create_window, window, window_mut, frame, set_drag_regions, request_node_repaint, take_resource_results, handle, runtime_handle, close_window, set_title, request_window_control, set_traffic_light_position, traffic_light_inset, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override, unload_resource, modal_scope, set_a11y_patch, after, after_scoped, cancel_timer, on_animation_complete}`、`Window::{state, text_byte_index_at, text_caret_rect, set_drag_regions, set_canvas, scene, set_image_resource, scale_epoch}` | 启动、建窗、帧驱动、窗口 chrome（E6：装饰 / 标题 / 系统按钮 / 交通灯 / 状态回报）；**E7**：`unload_resource` / `set_image_resource` / `scale_epoch`（图片生命周期与 DPI 世代）；**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（一次性定时器与动画完成）；**E12**：`modal_scope`（模态作用域根）；**E15**：`set_a11y_patch`（a11y 增量写）。`AppHandle::{wake, send, spawn}` 是**唯一跨线程入口**（`platform` 私有，应用看不到 `PlatformDispatcher`） |
 | 节点 | `node::id::NodeId`、`node::builder::NodeBuilder`、`node::tree::{NodeTree, Node, NodeKind, LayoutBox}`、`node::image::{ImageFit, ImageSource, ImageContent}`、`node::dirty::DirtyFlags`、`NodeTree::{new, root, get, append_child, remove, set_style, set_layout_override, invalidate_measure, hit_test, text_selection_rects, text_caret_rect, len, is_empty, debug_id}`、`NodeBuilder::{image, image_pending, image_modulation}`、`Window::{tree, tree_mut}` | 建树与增删子节点（`NodeTree::{append_child, remove}`）；**E7 图片节点**：`NodeKind::Image(Box<ImageContent>)`（叶子）、`ImageFit::{Fill, Contain, Cover}`、`ImageSource::{Ready, Pending}`、`NodeBuilder::{image, image_pending, image_modulation}`（§11.9）。**没有 `NodeHandle` / `Children` / 声明式子节点 `Slot`**（`node::id::Slot<T>` 是私有 arena 槽，且 workspace lint 禁止半公开）。`NodeTree::{text_byte_index_at, text_line, set_image_resource}` 是 `pub(crate)`，公开入口只有 `Window::*`（§11.5 / §11.9） |
 | 状态 | `node::signal::{Signal, SignalId, Derived, Transient, SignalScope}`、`node::dependency::ReadCtx`、`App::{signal, signal_scope, signal_scoped, window_signal, release_scope, transient, transient_scoped, derived, batch, write, write_with, update, update_with, read, read_with, write_transient, read_transient}` | 状态写入与依赖追踪。`read` 返回 `SignalRef<T>` 读守卫（守卫存活期写同一信号 **panic**）。**E8**：`transient_scoped(scope: SignalScope, initial)` 把瞬态值绑定到作用域，`release_scope` 返回**值槽位数**（信号 + 瞬态值）并在同批取消引用该瞬态值的动画槽（§11.10）。**没有 `TaskHandle`**：异步回投是 `AppHandle::{send, spawn}`；资源解码结果经 `App::take_resource_results()` 取回 |
@@ -605,16 +615,17 @@ pub enum EngineError {
 ```
 
 > 上面的 5 + 1 个变体只是示例；**冻结表以源码为准**：计数口径 = `crates/ui_core/src/error.rs` 的 `pub enum EngineError`
-> **顶层变体**（不含 `WaylandErrorKind` 的 4 个细分、`WindowIconCause` 的 3 个细分与 `DecodeCause` 等嵌套分类），共 **35 个**：
+> **顶层变体**（不含 `WaylandErrorKind` 的 4 个细分、`WindowIconCause` 的 3 个细分与 `DecodeCause` 等嵌套分类），共 **36 个**：
 > `UnsupportedGpu` / `DeviceLost` / `Wayland` / `ShaderLoad` / `Swapchain` / `Composition` / `FramePipeline` /
-> `InvalidDpiScale` / `StaleNode` / `CyclicDerived` / `InvalidMeasure` / `TextShape` / `TextShapeStandalone` /
-> `InvalidTextScale` / `AtlasExhausted` / `AtlasGrowthIncomplete` / `ClipDepthExceeded` / `GeometryRegister` /
-> `UnknownGeometry` / `GeometryRangeOutOfBounds` / `GeometryRangeUnaligned` / `GeometryRangeBytes` /
+> `FrameHookInstalled` / `InvalidDpiScale` / `StaleNode` / `CyclicDerived` / `InvalidMeasure` / `TextShape` /
+> `TextShapeStandalone` / `InvalidTextScale` / `AtlasExhausted` / `AtlasGrowthIncomplete` / `ClipDepthExceeded` /
+> `GeometryRegister` / `UnknownGeometry` / `GeometryRangeOutOfBounds` / `GeometryRangeUnaligned` / `GeometryRangeBytes` /
 > `GeometryTruncateGrows` / `AppInit` / `WindowCreate` / `Clipboard` / `NotScrollable` / `NotVirtualList` /
 > `VirtualListExtents` / `InvalidVirtualExtent` / `UnknownWindow` / `A11yInit` / `ResourceDecode` /
 > `UnsupportedWindowCapability` / `WindowIcon`。
 > 计数分解：迁移前基线 29 + E1 的 `TextShapeStandalone` + E1b 的 `InvalidTextScale` + E3 的 `VirtualListExtents` /
-> `InvalidVirtualExtent` + E6 的 `UnsupportedWindowCapability` / `WindowIcon` = **35**。`StaleNode` 的语义在 E5 扩展为
+> `InvalidVirtualExtent` + E6 的 `UnsupportedWindowCapability` / `WindowIcon` = **35**；P3-1b 的 `FrameHookInstalled` = **36**
+> （`FrameRouter` 单槽占用报错，Lead 已批准保留并登记 `ledger.md`）。`StaleNode` 的语义在 E5 扩展为
 > 「句柄不可用（从未存在 / 已卸载 / root）**或不能作为文本命中目标**」（§11.5），Display 文案同步、**不新增变体**。
 > `Composition` 是 2026-11-15 追加的 Windows DirectComposition **运行时**错误（几何 / `Commit` /
 > `SetContent` / 换链）；`AppInit` 只覆盖 `Composition::new` 的 COM 创建（DEVIATIONS §36 F-204）。
@@ -3966,6 +3977,7 @@ pub struct WidgetServices {
     pub config: Signal<Config>,                       // 设置快照（组合根泵入）
     pub theme: ThemeHandle,
     pub market_participants: Option<MarketParticipantsConnector>,   // P4 补缝后改必填
+    pub catalog_generation: Signal<u64>,                             // 目录已发布世代（0 = 尚未发布）
     pub kytrix_service: Option<KytrixServiceConnector>,              // P4 补缝后改必填
     pub open_url: Rc<dyn Fn(&str)>,                                  // 应用层 Command
     pub sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>,            // 应用层音效字节
@@ -4002,6 +4014,8 @@ impl WidgetTestApp {
     pub fn sync_surface(&mut self, surface: &mut WidgetSurface, has_content: bool);
     pub fn mount<W: WidgetView>(&mut self, config: W::Config) -> AnyWidget;
     pub fn try_mount<W: WidgetView>(&mut self, config: W::Config) -> Result<AnyWidget, EngineError>;
+    pub fn try_mount_in_scope<W: WidgetView>(&mut self, parent: NodeId, scope: SignalScope, config: W::Config)
+        -> Result<AnyWidget, EngineError>;                   // 失败路径探针：调用方持有 scope，可断言它被释放
     pub fn build_body(&mut self, parent: NodeId) -> NodeId;
     pub fn placeholder_parent(&mut self) -> NodeId;
     pub fn visible(&self, node: NodeId) -> bool;
@@ -4041,7 +4055,8 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
 
 **`AnyWidget::mount` 的不可交换顺序**（`any.rs`）：建 scope → 铸 `WidgetStatus` → 建 surface → 建 body 单元与
 `ReloadHandle`（`Weak` 自引用）→ `Widget::new` → 存入 body → 调 `load` → 注册 `FrameRouter` 路由。
-**失败回滚**：surface 建到一半失败时先删已建的根子树；`Widget::new` 返回 `Err` 时先 `surface.release`，再
+**失败回滚**：surface 建到一半失败时先删已建的根子树，再 `App::release_scope(scope)`（N4：scope 里已有状态单元与
+presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 `surface.release`，再
 `App::remove_node_with_scope(window, surface.root(), scope)`（节点先删、scope 后释放，与 release 同一顺序），
 不留半成品 shell、不注册路由、不泄漏 scope。
 
@@ -4060,6 +4075,9 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
 - 错误文案统一走 `TranslatedError`（`&Translate -> SmolStr`），`Failure` 只携带强类型句柄；`LocalizedError` 已删除。
 - `FrameRouter::tick` 把首个路由错误原样返回（其余路由仍执行）；`App::on_frame` 闭包裹住它并 `log::error!`。
 - 组合根缺失协作者（目录）由 `WidgetServices::market_participants()` 的 `Option` 表达，widget 自行映射为业务 notice/failure。
+- **P3-1b 的两个引擎增量（Lead 批准保留；写作用域越界已登记 `ledger.md`）**：`App::frame_hook_installed()` 与
+  `EngineError::FrameHookInstalled` 是 `FrameRouter` 单槽的**可观测面**——安装协议据此让第二个安装者收到错误，而不是
+  让先装的扇出被静默覆盖；`EngineError` 因此 35 → 36 变体（§2.9）。该观测面只在契约层安装期使用，不进入帧热路径。
 
 ### 13.5 语言与主题（依赖登记）
 
@@ -4067,6 +4085,9 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
   **先 `Translate::set_language`、后写信号**。widget 在 `bind_text`/`bind_style` 内 `rcx.read(&language)` 登记依赖。
 - **主题**：`ThemeHandle` 的 `role(cx, Role)` 只在 `bind_style` 里读（G3：挂载期常量颜色不会跟外观切换）。
 - **设置**：`WidgetServices::config` 是设置快照信号；时区经 `data_time_zone(&Config)`（`time_zone.rs`）。
+- **目录世代**：`WidgetServices::catalog_generation: Signal<u64>` 是目录已发布世代（组合根写、`WidgetSurface` 根读，`0` =
+  尚未发布）；写入即请求恰好一帧，并让每个已挂载 widget 的 `sync` 比较世代、变了就重跑 `load`——包括等待目录、还没有正文的
+  widget。这是「目录变更 → 重跑 `load`」的唯一通法；widget 不轮询 `catalog().generation_id()`，也不自建观察节点（§13.9 R-8）。
 
 ### 13.6 六行展示真值表（与 `surface.rs` 模块文档逐字一致）
 
@@ -4082,7 +4103,8 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
 实现约束：正文/占位用 `StylePatch.visible` + `A11yPatch.hidden` 切换（**不用** `display:none`，R-28）；banner 在
 不需要时**不建节点**（不占行）；占位子树在切到有内容时**释放**（spinner 动画不空转，I3）。占位里**富文本 notice**
 （`Notice::is_markdown()`：`common.market_not_loaded` 的 `<p align>` / `<kbd>` / 行内 logo）经 `kit::markdown` 的
-`MarkdownNode` 画成节点树，不得把 markdown/HTML 源码当纯文本画；普通 `Message` 仍由 `kit::empty_state` 画一句。
+`MarkdownNode` 画成节点树，不得把 markdown/HTML 源码当纯文本画；普通 `Message` 仍由 `kit::empty_state` 画一句。行内图片
+（市场 logo / `bank` 图标）在资产批接入前由 `PlaceholderImagePaint` 画成**占位色块**（R-4，不影响文字 / `<kbd>` / 粗体）。
 
 ### 13.7 FrameRouter 与 I3
 
@@ -4105,18 +4127,23 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1b 实测 **142 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1c 实测 **146 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）。
   - **surface**：占位切换 / banner / 禁用恢复 / 点击恢复；语言重建（`a_waiting_placeholder_should_come_back_in_the_language_showing_now`、
     `a_failure_banner_should_read_in_the_language_showing_now`）；**语言信号依赖登记 → 写信号出帧**
     （`writing_the_language_signal_requests_the_redrawing_frame`）；a11y `hidden`（`the_swapped_out_subtree_is_hidden_from_assistive_technology`）；
     富文本 notice 画成节点树（`a_rich_notice_is_drawn_as_rich_text`）。
+  - **目录世代**（P3-1c）：surface 根登记依赖 → 写信号出帧（`writing_the_directory_generation_requests_the_redrawing_frame`）；
+    等待目录的消费方在世代变化后 `sync` 重跑 `load` 并长出正文、无变化不出帧
+    （`services::a_directory_generation_change_reaches_a_widget_waiting_for_it` /
+    `an_unchanged_directory_generation_schedules_no_frame`）。
   - **路由**：扇出 / 注销 / 弱句柄自注销 / 空路由不出帧；**单槽占用报错**
     （`a_second_router_cannot_install_itself`、`a_second_router_constructor_reports_the_occupied_slot`）。
   - **擦除与生命周期**：`a_minimal_widget_runs_the_whole_lifecycle`（mount → waiting → loading → ready → waiting(zh) →
     **failed** → release 幂等，无路由/节点残留）；`a_released_widget_leaves_no_frame_route`；
     `any_widget_answers_through_the_vtable_only`；mount 失败回滚（`a_refused_construction_removes_the_shell_it_built`）；
+    **surface 失败释放 scope**（`a_refused_surface_construction_releases_the_scope_it_minted`；`WidgetTestApp::try_mount_in_scope`）；
     release 后 `header` 安全（`a_released_widget_answers_no_header_controls`）。
   - **binding**：收件箱与 RPC 回投；**替换 `call` 会 abort 旧调用且其回复无收件人**
     （`replacing_a_call_cancels_the_previous_one` 断言旧请求 `respond` 失败、inbox 只收到新 `RequestId`）；cancel/shutdown。
@@ -4126,12 +4153,13 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
 | # | 项 | 说明 |
 |---|---|---|
 | R-1 | `WidgetServices::{market_participants, kytrix_service}` 为 `Option` | 两者都是 application-shell 对象：`MarketParticipantsConnector` 的构造需 `widget_tokio_runtime::Runtime`，`KytrixServiceConnector::install` 需工具包 `App` + `ConfigNotification`，两个 crate 都仍依赖 `gpui-kit`，契约层测试无法在零工具包上下文构造。组合根永远给 `Some`；读市场的 widget 在 `None` 时映射为业务 notice/failure，读服务的 widget 映射为业务 failure。**需裁决**：P4 给两个 connector 增 gpui-free fixture 缝后改回必填 |
-| R-2 | `WidgetServices` 形状相对 P3-0 变更 | `config: ConfigManager` → `Signal<Config>`（P3-0 R4 已预告）；新增 `theme`（P3-1）与 `kytrix_service`/`open_url`/`sound`/`reduce_motion`（P3-1b）；见 design-changes。P3-0 的 5 字段不复存在 |
+| R-2 | `WidgetServices` 形状相对 P3-0 变更 | `config: ConfigManager` → `Signal<Config>`（P3-0 R4 已预告）；新增 `theme`（P3-1）、`kytrix_service`/`open_url`/`sound`/`reduce_motion`（P3-1b）与 `catalog_generation`（P3-1c）；见 design-changes。P3-0 的 5 字段不复存在 |
 | R-3 | 正文一次建树 | 引擎无 `.cached()`；widget 若按帧重建 body 会破坏节点身份/依赖边。20 crate 迁移时以此为准。`WidgetView::sync` 里才「有内容」的 body 晚一帧出现（framework 在 sync 前采样 `has_content`），widget 自行 `request_frame` |
-| R-4 | notice 的 markdown 文案 | **P3-1b 已收口**：`Notice::is_markdown()`（`MarketNotLoaded`）由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），普通 `Message` 由 `kit::empty_state` 画一句。**残余**：行内图片的绘制是占位方块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路属资产批次（P4/P5），不影响文字与 kbd 的正确呈现 |
+| R-4 | notice 的 markdown 文案 | **P3-1b 已收口**：`Notice::is_markdown()`（`MarketNotLoaded`）由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），普通 `Message` 由 `kit::empty_state` 画一句。**残余（P3-1c 裁决：登记为资产批次事项，不阻塞 W1）**：行内图片的绘制是占位色块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路属资产批次（P4/P5），不影响文字与 kbd 的正确呈现；**W1 真窗口验收不据此判缺陷** |
 | R-5 | `AnyWidget` 内部唯一 downcast | 类型擦除在 vtable 单态化函数内部完成，公开面无 downcast/trait object；安全由 mount 时同一 `W` 填充保证 |
 | R-6 | a11y 角色 | 引擎 `A11yRole` 无 `Alert`；banner 用 `GenericContainer` + `A11yLive::Assertive` 表达告警语义 |
 | R-7 | P3-1b 对 P3-1 冻结面的增量 | 相对 `2e4d3d6` 的必须变更（W1 开工前收口）：`WidgetCx::config` → `config_ref`（不克隆；`Arc<Config>` 出口删除）、新增 `account`/`window_mut`/`set_canvas`；`WidgetServices` 6 → 10 字段；`Notice::is_markdown`；`FrameRouter::new/install` → `Result`；引擎新增 `App::frame_hook_installed` 与 `EngineError::FrameHookInstalled`；`WidgetTestApp` 新增 `with_translate`/`try_mount`/`tree`/`a11y_hidden` 等并删除假 `recovery_action`。P3-1b 之前没有下游代码（W 批未开工），故不构成迁移负担，登记于 design-changes §13 |
+| R-8 | P3-1c 对 P3-1b 冻结面的增量 | `WidgetServices` 新增 `catalog_generation: Signal<u64>`（目录已发布世代：组合根写、`WidgetSurface` 根读；widget 在 `sync` 比较后重跑 `load`，等待目录、无正文的 widget 也会被唤醒——「目录变更 → 重跑 `load`」的唯一通法）；`MarkdownNode::mount` → `Result<Self, EngineError>`（N5：富文本占位的失败面统一）；mount 的 surface 失败释放 scope（N4）；`WidgetTestApp::try_mount_in_scope`（失败路径观测缝）。W 批仍未开工，故不构成迁移负担，登记于 design-changes §14 |
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 
@@ -4328,4 +4356,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.5**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.6**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*

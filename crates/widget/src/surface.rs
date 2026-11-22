@@ -152,6 +152,7 @@ impl WidgetSurface {
 
         let root_deps = status.signal();
         let root_language = language;
+        let root_generation = cx.services().catalog_generation;
         let root = NodeBuilder::boxed()
             .id("WIDGET_SURFACE")
             .style(
@@ -163,12 +164,19 @@ impl WidgetSurface {
                     .min_height_0()
                     .build(),
             )
-            // The root is the surface's dependency anchor: a state report or a
-            // language switch invalidates it, which is what requests the frame that
-            // runs `sync`. It draws nothing itself.
+            // The root is the surface's dependency anchor: a state report, a language
+            // switch or a new catalogue generation invalidates it, which is what
+            // requests the frame that runs `sync`. It draws nothing itself.
+            //
+            // The directory dependency belongs here rather than in the widget's body:
+            // a widget waiting for the market has no body, yet it is exactly the one
+            // that must re-check the gate when the directory publishes. The widget
+            // compares the value in `sync` and reloads; it never schedules the frame
+            // itself.
             .bind_style(move |read| {
                 let _state = read.read(&root_deps);
                 let _language = read.read(&root_language);
+                let _generation = read.read(&root_generation);
                 StylePatch::default()
             })
             .build(cx.tree_mut(), parent)?;
@@ -819,6 +827,28 @@ mod tests {
             harness.app().frame_requests() > requests,
             "the surface read the language signal while rendering, so writing it \
              requests a frame (no state re-report involved)"
+        );
+    }
+
+    /// The surface root is the directory dependency anchor: a widget waiting for the
+    /// market has no body of its own, so the framework registers the generation read
+    /// here — a published generation is what schedules the frame which lets the widget
+    /// re-check its gate.
+    #[test]
+    fn writing_the_directory_generation_requests_the_redrawing_frame() {
+        let mut harness = WidgetTestApp::new();
+        let mut surface = harness.build_surface();
+        harness.report(WidgetState::waiting(Notice::message("test.waiting")));
+        harness.sync_surface(&mut surface, false);
+        let requests = harness.app().frame_requests();
+        let generation = harness.services().catalog_generation;
+
+        assert!(harness.app_mut().write(&generation, 1));
+
+        assert!(
+            harness.app().frame_requests() > requests,
+            "the surface root read the generation signal while rendering, so the write \
+             requests a frame (no widget body involved)"
         );
     }
 

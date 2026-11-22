@@ -19,6 +19,19 @@
 //! ([`WidgetCx::config_ref`](crate::cx::WidgetCx::config_ref)) or the signal (inside a
 //! `bind_*` closure that must follow a setting).
 //!
+//! # The directory generation
+//!
+//! [`WidgetServices::catalog_generation`] is the published market-directory generation
+//! as a signal. The composition root writes the value of a `CatalogGenerationId`
+//! whenever the catalogue publishes a new generation (`0` = nothing published yet),
+//! and the framework's surface root reads it while it renders: a write therefore
+//! schedules exactly one frame, and every mounted widget's `sync` runs on it —
+//! including a widget that is still waiting for the directory and has no body that
+//! could read anything. A widget that follows the directory compares the signal with
+//! the value it saw in `new` and runs `load` again when it moved
+//! (`crates/widgets/AGENTS.md` §8.3); it never reads the connector's
+//! `generation_id()` itself.
+//!
 //! # Why two collaborators are optional
 //!
 //! Both [`WidgetServices::market_participants`] and
@@ -121,6 +134,15 @@ pub struct WidgetServices {
     /// The application root always supplies it; a headless test that does not read
     /// the directory leaves it absent. See the module documentation.
     pub market_participants: Option<MarketParticipantsConnector>,
+    /// The published market-directory generation, as an engine signal.
+    ///
+    /// The composition root writes `CatalogGenerationId::get()` whenever a venue
+    /// commit publishes a new generation; `0` = nothing published yet. The
+    /// framework's surface root reads it while it renders, so a write schedules the
+    /// frame that runs every widget's `sync`. A widget that follows the directory
+    /// compares it with the value it saw and reloads when it moved; see the module
+    /// documentation.
+    pub catalog_generation: Signal<u64>,
     /// The Kytrix service connection, when the host has one.
     ///
     /// The application root always supplies it; a headless test leaves it absent.
@@ -167,13 +189,29 @@ mod tests {
     use app_config::settings::{Appearance, Config};
     use base_ui::theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle};
     use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+    use smol_str::{SmolStr, format_smolstr};
     use tokio::runtime::Handle;
     use ui_core::{
         app::App,
-        node::signal::{Signal, SignalScope},
+        error::EngineError,
+        node::{
+            builder::NodeBuilder,
+            id::NodeId,
+            signal::{Signal, SignalScope},
+        },
+        text::TextStyle,
     };
 
     use super::WidgetServices;
+    use crate::{
+        category::WidgetCategory,
+        config::WidgetConfigChange,
+        cx::WidgetCx,
+        identity::{WidgetId, WidgetInstanceId},
+        status::{Notice, WidgetAction, WidgetState, WidgetStatus},
+        test_support::WidgetTestApp,
+        view::{ReloadHandle, WidgetView},
+    };
 
     const MESSAGES_EN: &str = "common:\n  close: Close\n";
     const MESSAGES_ZH: &str = "common:\n  close: 关闭\n";
@@ -192,6 +230,7 @@ mod tests {
         let scope = app.signal_scope();
         let language = app.signal_scoped(scope, LanguageCode::En);
         let config = app.signal_scoped(scope, Config::default());
+        let catalog_generation = app.signal_scoped(scope, 0_u64);
         let reduce_motion = app.signal_scoped(scope, false);
         let theme = ThemeHandle::new(&mut app, ThemeAppearance::Light);
         let translate = Translate::new(
@@ -221,6 +260,7 @@ mod tests {
             config,
             theme,
             market_participants: None,
+            catalog_generation,
             kytrix_service: None,
             open_url,
             sound,
@@ -247,6 +287,11 @@ mod tests {
         assert!(
             services.market_participants().is_none(),
             "a headless host leaves the directory absent"
+        );
+        assert_eq!(
+            *app.read(&services.catalog_generation),
+            0,
+            "no catalogue generation has been published yet"
         );
         assert!(
             services.kytrix_service().is_none(),
@@ -347,5 +392,144 @@ mod tests {
         let (_app, services, _opened) = compose();
         let handle: &Handle = &services.runtime;
         assert!(handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread);
+    }
+
+    /// A consumer in the shape `force_order` has: it waits for the directory, reloads
+    /// when a generation is published, and only then grows a body. The body reads the
+    /// reload counter rather than the generation, so the frame scheduled by the write
+    /// has to come from the framework's own dependency.
+    struct DirectoryConsumer {
+        status: WidgetStatus,
+        generation: Signal<u64>,
+        seen: u64,
+        reloads: Signal<u64>,
+        ready: bool,
+    }
+
+    impl WidgetView for DirectoryConsumer {
+        type Config = ();
+
+        const ID: WidgetId = WidgetId::new_static("test.directory_consumer");
+        const DISPLAY_NAME: &'static str = "test.directory_consumer";
+        const CATEGORY: WidgetCategory = WidgetCategory::Market;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            _config: Self::Config,
+            status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            _recovery: WidgetAction,
+            cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            let generation = cx.services().catalog_generation;
+            let seen = *cx.read(&generation);
+            let reloads = cx.signal(0_u64);
+            Ok(Self {
+                status,
+                generation,
+                seen,
+                reloads,
+                ready: false,
+            })
+        }
+
+        fn load(&mut self, cx: &mut WidgetCx<'_>) {
+            let state = if self.ready {
+                WidgetState::Ready
+            } else {
+                WidgetState::waiting(Notice::message("test.waiting"))
+            };
+            self.status.report(cx.app_mut(), state);
+        }
+
+        fn has_content(&self) -> bool {
+            self.ready
+        }
+
+        fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            let reloads = self.reloads;
+            NodeBuilder::text(SmolStr::default(), TextStyle::new(13.0))
+                .bind_text(move |read| {
+                    let reloads = *read.read(&reloads);
+                    format_smolstr!("reloaded {reloads}")
+                })
+                .build(cx.tree_mut(), parent)?;
+            Ok(())
+        }
+
+        fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            let generation = *cx.read(&self.generation);
+            if generation != self.seen {
+                self.seen = generation;
+                self.ready = true;
+                cx.update(&self.reloads, |reloads| *reloads += 1);
+                self.load(cx);
+                cx.request_frame()?;
+            }
+            Ok(())
+        }
+    }
+
+    /// The directory reaches a widget through the generation signal. A widget still
+    /// waiting for the directory has no body, so nothing it built can register the
+    /// dependency: the surface root carries it, the write schedules the frame that
+    /// runs `sync`, and the consumer reloads and grows its body.
+    #[test]
+    fn a_directory_generation_change_reaches_a_widget_waiting_for_it() {
+        let mut harness = WidgetTestApp::new();
+        let widget = harness.mount::<DirectoryConsumer>(());
+        harness.drain();
+
+        assert_eq!(
+            widget.status().state(harness.app()),
+            WidgetState::waiting(Notice::message("test.waiting"))
+        );
+        let requests = harness.app().frame_requests();
+        let generation = harness.services().catalog_generation;
+
+        assert!(harness.app_mut().write(&generation, 1));
+
+        assert!(
+            harness.app().frame_requests() > requests,
+            "the surface root carries the directory dependency, so a generation write \
+             schedules the frame that runs sync"
+        );
+
+        harness.drain();
+        harness.drain();
+
+        assert_eq!(widget.status().state(harness.app()), WidgetState::Ready);
+        let content = harness
+            .find_by_debug_prefix(widget.surface(), "WIDGET_CONTENT")
+            .expect("the content slot exists");
+        assert!(
+            harness.text_of(content).contains("reloaded 1"),
+            "the consumer reloaded once and drew the body it became ready with: {:?}",
+            harness.text_of(content)
+        );
+    }
+
+    /// A generation that did not move is not a write, so it schedules no frame: the
+    /// directory costs a frame only when it actually published (I3).
+    #[test]
+    fn an_unchanged_directory_generation_schedules_no_frame() {
+        let mut harness = WidgetTestApp::new();
+        let _widget = harness.mount::<DirectoryConsumer>(());
+        harness.drain();
+        let generation = harness.services().catalog_generation;
+        let settled = harness.app().frame_requests();
+
+        assert!(
+            !harness.app_mut().write(&generation, 0),
+            "the generation did not move"
+        );
+        harness.drain();
+
+        assert_eq!(
+            harness.app().frame_requests(),
+            settled,
+            "an unchanged generation scheduled no frame"
+        );
     }
 }

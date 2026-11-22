@@ -149,7 +149,7 @@ impl Placeholder {
             let window = cx.window();
             let theme = cx.theme().clone();
             let markdown =
-                MarkdownNode::mount(cx.app_mut(), window, parent, theme, Arc::new(document));
+                MarkdownNode::mount(cx.app_mut(), window, parent, theme, Arc::new(document))?;
 
             return Ok(Self {
                 spinner: None,

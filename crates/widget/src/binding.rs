@@ -459,6 +459,7 @@ mod tests {
             let scope = app.signal_scope();
             let language = app.signal_scoped(scope, i18n::language::codes::LanguageCode::En);
             let config = app.signal_scoped(scope, app_config::settings::Config::default());
+            let catalog_generation = app.signal_scoped(scope, 0_u64);
             let reduce_motion = app.signal_scoped(scope, false);
             let theme = base_ui::theme::handle::ThemeHandle::new(
                 &mut app,
@@ -473,6 +474,7 @@ mod tests {
                 config,
                 theme,
                 market_participants: None,
+                catalog_generation,
                 kytrix_service: None,
                 open_url: Rc::new(|_| {}),
                 sound,

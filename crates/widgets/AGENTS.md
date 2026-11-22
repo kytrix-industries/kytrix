@@ -249,6 +249,9 @@ cx.handle() / cx.spawn(future) / cx.runtime()
   供给；它**是富文本**（对齐段落 + `<kbd>` 图标 + 一行一个市场名和 logo），surface 用 `base_ui::kit::markdown` 画，
   widget 不拼文本、不插值、不自己渲染。
 - 等待占位**没有动作按钮**，所以文案只能是一句话（和它指向的控件图标）；「未加载」是等待，不是失败。
+- **行内图片是占位色块**：`common.market_not_loaded` 的市场 logo 与 `<kbd>` 图标在资产批接入前由
+  `PlaceholderImagePaint` 画成灰块；文字、`<kbd>` 与粗体已经正确。**W1 真窗口验收不据此判缺陷**（资产批次事项，
+  设计 §13.9 R-4）。
 
 ### 6.3 六行展示真值表（框架唯一实现）
 
@@ -308,6 +311,7 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 | `config: Signal<Config>` | 设置快照 | `bind_*` 里读才跟随；`sync`/`load` 里用 `cx.config_ref(..)` |
 | `theme: ThemeHandle` | 语义色 | 只在 `bind_style` 里读 |
 | `market_participants: Option<MarketParticipantsConnector>` | 市场目录 | 应用根永远 `Some`；headless 测试为 `None`，widget 自己映射为业务 notice/failure。**P4 补缝后改必填** |
+| `catalog_generation: Signal<u64>` | 目录已发布世代（组合根写、框架 surface 根读） | widget 在 `sync` 里比较它判断目录是否发布过新世代（§8.3）；`0` = 尚未发布；不在 `body` 里轮询 `catalog()` |
 | `kytrix_service: Option<KytrixServiceConnector>` | Kytrix 服务连接（news / x / wallets…） | 同上，`None` → 自己的业务失败 |
 | `open_url: Rc<dyn Fn(&str)>` | 打开外部链接 | 调用即可，不碰浏览器 / shell |
 | `sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>` | 应用层音效字节 | `None` = 本宿主无音频（测试通常如此），不是错误 |
@@ -327,12 +331,36 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 - `Ready` 水位由**协议自己**定义：拿到完整快照不等于业务成功，widget 自己维护 `pending_snapshot` / `ready_received`。
 - 长任务由服务的流监督器持有；不 `detach` 无终点的任务，不写自动重连 / 退避。
 
-### 8.3 目录前置检查
+### 8.3 目录：前置检查与世代变化
 
-`WidgetView::load` 的**最前面**检查自己需要的市场是否已加载（`services.market_participants()` 的 `LoadedVenues`）；
-不在就 `report(waiting(Notice::MarketNotLoaded { venues, supported }))` 并返回。widget **不加载目录、不触发发现、不重试、
-不轮询**。目录更新由组合根 / pane 以 `FrameRouter` 路由或事件驱动重跑 `load`（P4 接线）；在契约层，widget 只在 `load`
-与 `sync` 里读当前目录，不缓存「当时的配置」。
+**前置检查（`load` 的第一件事）**：`WidgetView::load` 的**最前面**检查自己需要的市场是否已加载
+（`services.market_participants()` 的 `LoadedVenues`）；不在就
+`report(waiting(Notice::MarketNotLoaded { venues, supported }))` 并返回。widget **不加载目录、不触发发现、不重试**。
+
+**目录变了怎么知道（唯一写法）**：组合根把目录的已发布世代写进注入信号
+`services.catalog_generation: Signal<u64>`（值 = `CatalogGenerationId::get()`，`0` = 尚未发布；P4 组合根在
+`VenuesUpdated` 到达后写）。框架的 surface 根在渲染时读这个信号，所以**一次写入恰好请求一帧**，并让每个已挂载
+widget 的 `sync` 跑到——包括还没有正文、正卡在「等待市场」的 widget。widget 侧只做比较：
+
+```rust
+// new：记下构造时看到的世代（`cx.read` 不登记依赖——构造不画）。
+let generation = cx.services().catalog_generation;
+let seen = *cx.read(&generation);
+
+// sync：世代动了就更新记录并重跑 load；重跑会重新做前置检查、重建 route / 订阅。
+let generation = *cx.read(&self.generation);
+if generation != self.seen {
+    self.seen = generation;
+    self.market_reloaded = true;
+    self.load(cx);
+}
+```
+
+- **不要**在 `body` / `sync` 里轮询 `catalog().generation_id()`（connector 属组合根，widget 不持有）、不要自建观察节点、
+  不要订阅 connector 事件、不要缓存「当时的目录」。目录派生数据只经 `load` 重跑后由 `sync` 写回，再走 `bind_*` 重绘。
+- `load` 重跑要分清「目录刷新」与「用户恢复」：前者保留用户正在看的内容（只重建 route / 订阅），后者清掉不再可信的旧数据。
+- 稳态不出帧：`catalog_generation` 只在目录真的发布新世代时变；`sync` 里没变就什么都不写（I3）。
+- 契约层保证：surface 根读该信号（`surface.rs` 的依赖锚点），因此「等待目录」的 widget 不需要正文就能被唤醒。
 
 ---
 
@@ -375,9 +403,11 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 
 - **unit test 与被测代码同模块**（`#[cfg(test)] mod tests`），可访问私有字段；不建集中式 `tests.rs`。
 - 契约层装置是 `widget::test_support::WidgetTestApp`（`#[cfg(test)]` 或 feature `test-support`）：
-  - 组合与生产相同的 `WidgetServices`（目录 / 服务为 `None`，`open_url` / `sound` 是 no-op，`reduce_motion` = false）；
+  - 组合与生产相同的 `WidgetServices`（目录 / 服务为 `None`，`catalog_generation` = 0，`open_url` / `sound` 是 no-op，
+    `reduce_motion` = false）；
   - `WidgetTestApp::new()`（fixture 目录）或 `with_translate(...)`（产品目录文案）；
-  - `mount::<W>(config)` / `try_mount`、`build_surface` / `sync_surface`、`report` / `switch_language`；
+  - `mount::<W>(config)` / `try_mount` / `try_mount_in_scope(parent, scope, config)`（拒绝挂载失败路径的探针）、
+    `build_surface` / `sync_surface`、`report` / `switch_language`；
   - `drain()` = `router.tick` + `TestApp::drain`（生产泵序；`TestApp::drain` 本身不跑 `on_frame`）；
   - 断言面：`visible` / `text_of` / `has_text` / `has_canvas` / `has_inline_boxes` / `node_count` / `find_by_debug_prefix` /
     `click_recovery` / `enable_a11y_capture` + `a11y_hidden`。

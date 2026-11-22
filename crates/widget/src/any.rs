@@ -351,11 +351,50 @@ impl AnyWidget {
         config_change: WidgetConfigChange,
     ) -> Result<Self, EngineError> {
         let scope = app.signal_scope();
+        Self::mount_in_scope::<W>(
+            app,
+            window,
+            parent,
+            services,
+            router,
+            instance_id,
+            config,
+            config_change,
+            scope,
+        )
+    }
+
+    /// The mount itself, over a scope the caller minted.
+    ///
+    /// [`AnyWidget::mount`] mints the scope and delegates. The split is what makes
+    /// the failure path observable: the host keeps the scope, so a test can assert
+    /// that a refused mount released it instead of leaving the state cell behind.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mount_in_scope<W: WidgetView>(
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        services: &Rc<WidgetServices>,
+        router: &FrameRouter,
+        instance_id: WidgetInstanceId,
+        config: W::Config,
+        config_change: WidgetConfigChange,
+        scope: SignalScope,
+    ) -> Result<Self, EngineError> {
         let status = WidgetStatus::new(app, scope);
 
         let surface = {
             let mut cx = WidgetCx::new(app, window, services, scope, router.clone());
-            WidgetSurface::build(&mut cx, parent, status)?
+            match WidgetSurface::build(&mut cx, parent, status) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    // The state cell is everything this attempt minted before the
+                    // surface refused; the scope belongs to the attempt, so it goes
+                    // with it rather than being left orphaned.
+                    app.release_scope(scope);
+                    return Err(error);
+                }
+            }
         };
 
         let body: ErasedBody = Rc::new(RefCell::new(None));
@@ -679,6 +718,36 @@ mod tests {
         assert!(
             harness.router().is_empty(),
             "no frame route is registered for a widget that does not exist"
+        );
+    }
+
+    /// A surface refused by a stale parent releases the scope the mount minted: the
+    /// state cell and the presentation signal are dropped, not orphaned. The host
+    /// owns the scope, which is what makes the leak observable at all.
+    #[test]
+    fn a_refused_surface_construction_releases_the_scope_it_minted() {
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+        let window = harness.window();
+        harness
+            .app_mut()
+            .remove_node(window, parent)
+            .expect("the placeholder host is removable");
+        let scope = harness.app_mut().signal_scope();
+
+        let error = match harness.try_mount_in_scope::<WaitingWidget>(parent, scope, ()) {
+            Ok(_) => panic!("a stale parent refuses the surface"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, EngineError::StaleNode { .. }),
+            "the surface build reports the stale parent: {error:?}"
+        );
+        assert_eq!(
+            harness.app_mut().release_scope(scope),
+            0,
+            "the refused mount released the scope it minted"
         );
     }
 

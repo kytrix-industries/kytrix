@@ -168,6 +168,7 @@ impl WidgetTestApp {
         let scope = app.app_mut().signal_scope();
         let language = app.app_mut().signal_scoped(scope, LanguageCode::En);
         let config = app.app_mut().signal_scoped(scope, Config::default());
+        let catalog_generation = app.app_mut().signal_scoped(scope, 0_u64);
         let reduce_motion = app.app_mut().signal_scoped(scope, false);
         let theme = ThemeHandle::new(app.app_mut(), base_ui::theme::appearance::Appearance::Light);
         let runtime = app.app().runtime_handle().clone();
@@ -178,6 +179,7 @@ impl WidgetTestApp {
             config,
             theme,
             market_participants: None,
+            catalog_generation,
             kytrix_service: None,
             open_url: Rc::new(|_| {}),
             sound,
@@ -368,6 +370,33 @@ impl WidgetTestApp {
             WidgetInstanceId::new(),
             config,
             crate::config::WidgetConfigChange::default(),
+        )
+    }
+
+    /// Mounts a widget under `parent` over a scope the caller minted.
+    ///
+    /// The failure path is what this seam is for: a stale `parent` refuses the
+    /// surface, and the caller still holds the scope, so it can assert that the
+    /// refused attempt released the state cell it minted (a leaked scope has no
+    /// other observable).
+    pub fn try_mount_in_scope<W: WidgetView>(
+        &mut self,
+        parent: NodeId,
+        scope: SignalScope,
+        config: W::Config,
+    ) -> Result<AnyWidget, EngineError> {
+        let services = Rc::clone(&self.services);
+        let router = self.router.clone();
+        AnyWidget::mount_in_scope::<W>(
+            self.app.app_mut(),
+            self.window,
+            parent,
+            &services,
+            &router,
+            WidgetInstanceId::new(),
+            config,
+            crate::config::WidgetConfigChange::default(),
+            scope,
         )
     }
 
