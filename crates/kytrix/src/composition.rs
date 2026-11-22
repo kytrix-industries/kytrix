@@ -66,7 +66,7 @@ use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
     theme::{appearance::Appearance, handle::ThemeHandle},
 };
-use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{embedded, translate::Translate};
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use market_participants_connector::{
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
