@@ -167,6 +167,16 @@ impl AnimationRouter {
         Self::default()
     }
 
+    /// 该路由是否已经把 kit 的完成回调装进某个 `App`（[`AnimationRouter::install`] 已执行）。
+    ///
+    /// 用来断言「浮层用的是组合根那一个路由」而不是各建一个：只有真正被 `Overlay::new` /
+    /// `Tooltip::new` 用过的路由会返回 `true`。与契约层 `widget::FrameRouter::installed` 同型，
+    /// 是安装协议的可观测面（引擎的 `App::on_animation_complete` 本身没有「槽是否已占」的读取口）。
+    #[must_use]
+    pub fn installed(&self) -> bool {
+        self.inner.borrow().installed
+    }
+
     /// 把 kit 的统一完成回调装进 `app`（幂等：同一 router 只装一次）。
     fn install(&self, app: &mut App) {
         if self.inner.borrow().installed {
