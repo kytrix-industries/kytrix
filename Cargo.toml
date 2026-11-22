@@ -93,14 +93,13 @@ dispatch2 = "0.3.1"
 ed25519-dalek = "3.0.0"
 either = "1.19.0"
 embed-resource = "3.0.12"
-# P4-5：应用日志 sink。gpui-kit 之前提供的初始化随外壳迁移消失，`log` 宏需要实现；
+# P4-5：应用日志 sink。外壳不再由工具包提供初始化，`log` 宏需要实现；
 # env_logger 由 `RUST_LOG` 配置，未设置时按 `info` 输出到 stderr。
 env_logger = "0.11.12"
 etagere = "0.3.0"
 flate2 = "1.1.11"
 fontique = "0.12.0"
 futures = "0.3.34"
-gpui-kit = { version = "0.9.1", default-features = false }
 hmac = "0.13.0"
 http = "1.5.0"
 hyper = "1.12.0"
@@ -125,8 +124,7 @@ llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
 # W6：`global_shipping_chokepoint` 的海岸线资产要在装载期三角化（偶奇填充、带洞）。
-# lyon 已在 `Cargo.lock`（gpui-kit 的传递依赖 1.0.19），这里只把它提为直接依赖，
-# 不引入新 crate；引擎与 base_ui 都不做 tessellation（设计 §5.5）。
+# 只有该 widget 消费 lyon；引擎与 base_ui 都不做 tessellation（设计 §5.5）。
 lyon = "1.0.19"
 # P13 图片色彩管理（D-8）：image 0.25.10 的**非可选**依赖（`Cargo.lock` 已在 0.8.1），
 # 这里只是把它提到直接依赖；不引入新的编译单元。
@@ -238,11 +236,9 @@ rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false }
 rmp-serde = "1.3.1"
 rodio = { version = "0.23.0", default-features = false }
-rust-embed = "8.13.0"
 # P2-1b：`base_ui` 的 build.rs 在**构建期**把 Phosphor SVG 光栅化成白色字形 PNG（设计 §8.5 / §5.6：
-# 引擎不依赖 usvg / resvg，图标转换归应用层）。0.46.0 与 `gpui-pre` 已在 `Cargo.lock` 的版本一致
-# （不引入新的 crate / 编译单元）；关掉默认特性（text / system-fonts / raster-images）——图标是纯
-# 路径，不需要字体与内嵌位图解码。
+# 引擎不依赖 usvg / resvg，图标转换归应用层）。resvg 与 usvg 同版 0.46.0，只引入一对编译单元；
+# 关掉默认特性（text / system-fonts / raster-images）——图标是纯路径，不需要字体与内嵌位图解码。
 resvg = { version = "0.46.0", default-features = false }
 usvg = { version = "0.46.0", default-features = false }
 semver = "1.0.28"

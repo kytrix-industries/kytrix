@@ -13,8 +13,8 @@
 <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 
 **Kytrix**, pronounced **Key-Tricks**, stands for "The key tricks to reading the market". It is a blazing-fast
-financial terminal built with Rust and GPUI that brings crypto, US equities, ETFs, global financial indices, and
-commodities
+financial terminal built with Rust on its own GPU-accelerated native UI engine that brings crypto, US equities, ETFs,
+global financial indices, and commodities
 together on one screen: live quotes, order books, trade-by-trade data, candlesticks, X (Twitter) feeds, news,
 charting, and a range of monitoring tools — all here, all in one interface, so you no longer have to switch between
 apps and screens.
@@ -25,7 +25,7 @@ apps and screens.
 
 ## Why Kytrix
 
-- **Blazing Fast.** Rust + GPUI, GPU-accelerated native rendering, no WebView.
+- **Blazing Fast.** Rust + a purpose-built GPU-accelerated native UI engine, no WebView.
 - **High performance, high reliability, and real-time delivery.** Market quotes, messages, and breaking news — delivered
   in a flash.
 - **Composable widgets.** Split panes, arrange them freely, save multiple workspaces, and build a terminal that matches
