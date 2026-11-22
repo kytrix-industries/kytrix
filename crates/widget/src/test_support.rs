@@ -339,6 +339,17 @@ impl WidgetTestApp {
         &self.services
     }
 
+    /// The services aggregate as the shared handle this host owns, like the
+    /// composition root does.
+    ///
+    /// A widget that builds a host owning services takes the same handle through
+    /// [`WidgetCx::services_rc`]; a test compares the two with `Rc::ptr_eq` to pin that
+    /// the widget works over the application's one aggregate rather than a copy.
+    #[must_use]
+    pub fn services_rc(&self) -> &Rc<WidgetServices> {
+        &self.services
+    }
+
     /// The composition root's one layer stack the services carry.
     ///
     /// A test asserts an overlay opened through the widget context against this

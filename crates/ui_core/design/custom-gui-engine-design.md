@@ -1,7 +1,21 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.8（2026-11-22）
+> **版本**：v2.9（2026-11-22）
+>
+> **v2.9 变更摘要（2026-11-22）**：**P3-1f（P3 契约补充批）完成**。§13 补三处 W 批前置：① `WidgetCx` 改为持有
+> `&Rc<WidgetServices>`，新增 **`WidgetCx::services_rc()`**（`Rc<WidgetServices>` 的借用句柄）——widget 在 `body` 里
+> 构造 `SelectorHost` 一类**拥有服务聚合的宿主**时 clone 这一个 `Rc`，不重建聚合、不逐字段复制（P3-0b2 遗留的
+> 「widget 侧无 `Rc<WidgetServices>` 入口」至此收口，W2/W4/W5/W7/W9 的硬前置）；`WidgetCx::new` 形参由
+> `&WidgetServices` 改为 `&Rc<WidgetServices>`（其余访问器不变，`services()` 仍借出 `&WidgetServices`）；② §13.10
+> **静态文案重建通法**正式冻结（记 key → `sync` 比较 → 存活守卫摘节点 + 组件 release → 按现值重建；行内静态组件用
+> `list::set_count` 重建可见窗口）——kit 的 `Badge` / `Button` / `EmptyState` / 表头在补出 `bind_text` 之前，这是唯一
+> 合法写法（代价与 kit 后续批计划见 AGENTS §15.2）；③ §13.11 **事件过滤应用义务**：只拥有「自己窗口的文本 / 按键 / IME」
+> 的消费者用 `App::drain_events_where(keep)` 取走自己那部分，其余事件**留在队列**里给组合根（`App::drain_events` 会把
+> 整窗、整队列事件取走并吞掉，对话框不得再这样用）。引擎面随 P3-0b2 新增 `App::drain_events_where` +
+> `test_support::diagnostics::signal_slot_stats`（E21，**Lead 已批准 P3-0b2 越界改 `ui_core`**，登记 `ledger.md`；
+> 逐条规格 `.docs/gui-migration/spec-deltas/E21.md`），§1.3 白名单同步。测试 160 → **161**。逐条登记
+> `.docs/gui-migration/design-changes.md` §17。
 >
 > **v2.8 变更摘要（2026-11-22）**：**P3-1e（P3-0b 审查 F2：组合根资源槽批）完成**。§13 把三个**应用级组合根单例**放进
 > 冻结契约：① `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` /
@@ -281,6 +295,10 @@ pub(crate) use windows as backend;
    API 的返回错误（缺它无法写应用代码）。**E1–E15 的公开面已全部实现**（P1 完成 E1–E6，§11.1–§11.6；P2 完成 E7–E15，
    §11.9–§11.15），应用现在即可依赖。**P2 未新增 `EngineError` 变体**；P3-1b 为 `FrameRouter` 单槽可观测性新增
    `FrameHookInstalled`（现 **36** 个，§2.9，Lead 批准保留）。
+   **P3 期的引擎增量**（逐条在 `ledger.md` 登记、Lead 已批准越界改 `ui_core`）：`App::remove_node_with_scope`
+   （E16 的「先删子树、后释放 scope」唯一入口）、`App::pointer_position`（E17）、`App::frame_hook_installed`（P3-1b）、
+   **`App::drain_events_where` 与 `test_support::diagnostics::signal_slot_stats`（E21，P3-0b2）**——E21 的 API 形状 /
+   语义 / 测试面见 `.docs/gui-migration/spec-deltas/E21.md`，应用义务见 §13.11。
 
 | 类别 | 可依赖类型 / 入口（深路径省略 `ui_core::`） | 一句话用途 / 边界 |
 |---|---|---|
@@ -293,9 +311,9 @@ pub(crate) use windows as backend;
 | 文本 | `text::{TextStyle, TextStyleExtras, TextContent, TextRun, TextDecoration, TextAlign, TextSlant, TextWrap, TextDirection, TextOverflow, TextLineBreak, FontStack, FontStackStatus, TextDiagnostic, InlineBoxSpec, InlineBoxPaint, InlineAlign, ShapedLine, ShapedTextHandle, ShapedTextLine, ShapedTextItem, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration, ThinSlice, FeatureSet, FontVariationSet, TextFeature, TextFontVariation, TextPassReport, TextLayoutReport}`；`App::{refresh_text, layout_text, font_stack, font_stack_version, set_font_stack, reload_system_fonts, text_diagnostics, font_stack_status, shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`；`TextContent::{runs, with_runs}`、`TextStyle::{decoration, with_decoration}` | 文本组件。**`ShapedLine` 类型公开但节点文本路径的应用拿不到实例**（`NodeTree::text_line` 是 `pub(crate)`）；无节点归属的 shaping 用 `App::shape_text` 拿 `ShapedTextHandle`（E1），富文本 runs / 装饰 / InlineBox 绘制与诊断为 E2（§11.2） |
 | 资源 | `resources::{ResourceId, ResourceCache, ResourceImage, DecodeState, ResourceStats, PendingResource}`、`App::{resources, resources_mut, take_resource_results, unload_resource}`、`Window::set_image_resource` | 图标 / 图片 / 远程头像；`ResourceImage.tile` 恒有效直到 unload（图片 tile 不参与 E1d 的编码期逐 tile 判活，§11.8）。**E7 生命周期**：`insert_async*` 产出 `PendingResource`，`poll()` 的结果交给 `App` 后，**挂载了 Pending 图片的节点自动转 Ready**（无需应用插手）；`App::unload_resource` 是**唯一**能让图片节点失效的卸载入口（裸 `resources_mut().unload()` 不触发节点失效，R-19） |
 | 交互 | `interaction::{FocusScope, ScrollHandle, ScrollConfig, ScrollState, ScrollAxis, VirtualList, VirtualListConfig, VirtualListState, ItemAlign, Overlay, OverlayOptions, OverlayPlacement, OverlayDismiss, AnchorSide, DragState, DragInfo, DragPhase, AnimationId, Easing, AnimatedValue, AnimationSpec, ActionCtx, InputThresholds}`、`app::{AnimationCompletion, AnimationEndKind, TimerId}`、`App::{make_scroll, set_scroll_content, scroll_to, scroll_by, scroll_state, capture_pointer, focused, hovered, key_down, set_focus, focus_next, focus_prev, make_virtual_list, set_virtual_items, set_virtual_extents, scroll_to_item, virtual_list_state, virtual_row_index, create_overlay, close_overlay, place_overlay, bring_overlay_to_front, overlays, drag_state, drag, cancel_drag, animate, cancel_animation, animations_running, after, after_scoped, cancel_timer, on_animation_complete, modal_scope}` | 通用交互机制。`VirtualListConfig { extent, extents, overscan }`：`extents = None` 等高行、`Some(..)` 逐项高度（E3 已实现，§11.3；`VirtualListConfig` 因 `Box<[f32]>` **不再是 `Copy`**）。**E10**：`after` / `after_scoped` / `cancel_timer` / `on_animation_complete`（**单槽**，kit 层 `AnimationRouter` 是唯一注册者，§11.12）；**E12**：`OverlayOptions{.., trap_focus, a11y: A11yOverride}`（新增 `a11y` 字段 ⇒ `OverlayOptions` **不再是 `Copy`**）、`App::modal_scope`。**没有 `AnimationClock`**：动画是 `App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)` |
-| 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, on_action, off_action, bind_key, unbind_key, bind_key_scoped, unbind_key_scoped, unbind_scope_keys, has_action_handler, scoped_key_binding_count, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource`。**E8**：`bind_key_scoped(window, scope: NodeId, binding) -> Result<(), EngineError>`（破坏性变更：旧签名返回 `()`）、`unbind_key_scoped`、`unbind_scope_keys`；作用域键绑定按焦点祖先链**内→外**求值，无 handler 不吞键（§11.10）。`has_action_handler` / `scoped_key_binding_count` 是 `test-support` 只读观测面 |
+| 事件 | `event::{Event, InputEvent, InputOutcome, Action, ActionSource, KeyBinding, Key, KeyCode, Modifiers, PointerButton, ImeEvent}`、`layout::hit_test::HitResult`、`App::{drain_events, drain_events_where, on_action, off_action, bind_key, unbind_key, bind_key_scoped, unbind_key_scoped, unbind_scope_keys, has_action_handler, scoped_key_binding_count, dispatch_action, dispatch_action_focused}` | 事件处理与快捷键。`Action` 是 `{ FocusNext, FocusPrev, Dismiss, Custom(SmolStr) }`：**应用动作只能是字符串 key**（没有强类型变体表）；「怎么触发」在 `ActionSource`。**E8**：`bind_key_scoped(window, scope: NodeId, binding) -> Result<(), EngineError>`（破坏性变更：旧签名返回 `()`）、`unbind_key_scoped`、`unbind_scope_keys`；作用域键绑定按焦点祖先链**内→外**求值，无 handler 不吞键（§11.10）。`has_action_handler` / `scoped_key_binding_count` 是 `test-support` 只读观测面。**E21**：`App::drain_events_where(keep: impl FnMut(WindowId, &Event) -> bool) -> Vec<(WindowId, Event)>` 只取走 `keep` 认可的事件，其余**留在队列**（原顺序、丢弃计数不变）——给只拥有「自己窗口的文本 / 按键 / IME」的消费者（对话框输入框），其余事件由组合根的 `drain_events` 照常读到（§13.11、`spec-deltas/E21.md`） |
 | 无障碍 | `a11y::{A11yRole, A11yOrientation, A11yNode, A11yLabel, A11yAction, A11yOverride, A11yPatch, A11yActionCtx, A11yActionData, A11yDiagnostic, A11yTreeSnapshot, A11yLive, A11ySort}`、`NodeBuilder::{a11y, bind_a11y}`、`App::{on_a11y_action, off_a11y_action, a11y_diagnostics, set_a11y_patch, modal_scope}` | 自定义组件声明语义。`a11y` 接受**整值** `A11yOverride`（不是 `(role, label 闭包)`）。**E15**：`A11yRole` 共 **43** 个变体（`A11yRole::ALL: [Self; 43]`，§11.15），`A11yOrientation::{Horizontal, Vertical}`；`App::set_a11y_patch(window, node, A11yPatch)` 是运行期 a11y 增量的公开写入口（内部 `request_frame`，§11.15） |
-| 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}` | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）**。E1–E6 新增观测面：`FrameRecord.stale_canvas_runs`、`Window::inline_box_image_diagnostics()`、`App::frame_requests()`（§6.3 / §6.8） |
+| 测试（`test-support` feature） | `test_support::app::{TestApp, TestWindow}`、`test_support::probe::{Probe, Selector}`、`test_support::record::{FrameRecord, RenderedFrame, QuadRecord, PrimitiveRecord, PrimitiveKind, PaintLog, LanePaintEntry, LaneOutcome, DeltaRecord, FrameStats}`、`test_support::script::{FrameScript, ScriptFrame, FrameSample, ScriptReport, A11yCapture, A11yDelivery}`、`test_support::snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme, SnapshotImage, SnapshotDiff, SnapshotError, GoldenError, Tolerance, PixelBounds}`、`test_support::{a11y, acceptance, gui_smoke, pixels, diagnostics}`、**`test_support::diagnostics::{SignalSlotStats, signal_slot_stats}`（E21）** | 布局与图形测试（§6.2–§6.5）。**没有 `TestApp::mount`、没有 `TestApp::new(renderer: None)`、没有 `Probe::a11y()`，`Selector` 只有 `Id` / `Text` / `Path`（无 `Role`）**。E1–E6 新增观测面：`FrameRecord.stale_canvas_runs`、`Window::inline_box_image_diagnostics()`、`App::frame_requests()`（§6.3 / §6.8）。**E21**：`signal_slot_stats(app) -> SignalSlotStats { slots, live, free }` 是值槽位表的分配统计——槽位在作用域释放时归还空闲栈并被下次分配复用，因此「反复开关一个面板后 `slots` / `live` 不增长」可断言（泄漏面：根作用域信号永不回收，P3-0b F1）；只在 `feature = "test-support"` 下存在 |
 
 **E1–E6 已实现的公开面（P1 完成；均可依赖）**：
 
@@ -3805,12 +3823,12 @@ pub trait WidgetView: Sized + 'static {
 }
 
 // ── cx.rs ──────────────────────────────────────────────────────────────────
-pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a WidgetServices, SignalScope */ }
+pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a Rc<WidgetServices>, SignalScope */ }
 impl<'a> WidgetCx<'a> {
     pub fn new(
         app: &'a mut App,
         window: WindowId,
-        services: &'a WidgetServices,
+        services: &'a Rc<WidgetServices>,   // 组合根那一个 Rc（P3-1f；此前是 &WidgetServices）
         scope: SignalScope,
     ) -> Self;
 
@@ -3821,6 +3839,9 @@ impl<'a> WidgetCx<'a> {
     pub fn tree_mut(&mut self) -> &mut NodeTree;
 
     pub fn services(&self) -> &WidgetServices;
+    /// 服务聚合的共享句柄。**拥有服务聚合的宿主**（`SelectorHost` 等）clone 它，
+    /// 不重建聚合、不逐字段复制（P3-1f；§13.10）。
+    pub fn services_rc(&self) -> &Rc<WidgetServices>;
     pub fn translate(&self) -> &Translate;
     pub fn language(&self) -> Signal<LanguageCode>;
     pub fn theme(&self) -> &ThemeHandle;
@@ -4055,6 +4076,7 @@ impl WidgetTestApp {
     pub fn with_sound(self, impl Fn(&'static str) -> Option<Bytes> + 'static) -> Self;   // 注入音频字节源
     pub fn app(&self) -> &App;  pub fn app_mut(&mut self) -> &mut App;
     pub fn services(&self) -> &WidgetServices;
+    pub fn services_rc(&self) -> &Rc<WidgetServices>;    // 宿主取同一实例（P3-1f）
     pub fn router(&self) -> &FrameRouter;                     // 组合根那一个，经 builder 注入
     pub fn layer(&self) -> &base_ui::kit::layer::Layer;       // 同上（测试断言落在宿主实例上）
     pub fn animation(&self) -> &base_ui::kit::overlay::AnimationRouter;  // 同上
@@ -4190,7 +4212,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1e 实测 **160 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1f 实测 **161 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
     **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
@@ -4216,6 +4238,9 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
     （`an_overlay_opened_through_the_widget_context_registers_in_the_layer_stack`）；首个浮层装上宿主那一个完成路由
     （`the_animation_router_handed_to_a_widget_owns_the_completion_slot`）；层查询 + `layer`/`frame_router`/`animation`
     三访问器返回宿主实例（`the_widget_context_queries_the_layer_stack_it_was_handed`）。
+  - **服务聚合句柄**（P3-1f）：上下文借出组合根那一个 `Rc`，同一实例、同一份单例
+    （`cx::the_context_hands_over_the_composition_root_s_services`：`ptr::eq` 两次调用同址 + `Rc::ptr_eq` 宿主实例 +
+    经句柄 clone 出的 `layer` 与宿主层栈同址）。
   - **路由**：扇出 / 注销 / 弱句柄自注销 / 空路由不出帧；**单槽占用报错**
     （`a_second_router_cannot_install_itself`、`a_second_router_constructor_reports_the_occupied_slot`）。
   - **擦除与生命周期**：`a_minimal_widget_runs_the_whole_lifecycle`（mount → waiting → loading → ready → waiting(zh) →
@@ -4240,6 +4265,56 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-8 | P3-1c 对 P3-1b 冻结面的增量 | `WidgetServices` 新增 `catalog_generation: Signal<u64>`（目录已发布世代：组合根写、`WidgetSurface` 根读；widget 在 `sync` 比较后重跑 `load`，等待目录、无正文的 widget 也会被唤醒——「目录变更 → 重跑 `load`」的唯一通法）；`MarkdownNode::mount` → `Result<Self, EngineError>`（N5：富文本占位的失败面统一）；mount 的 surface 失败释放 scope（N4）；`WidgetTestApp::try_mount_in_scope`（失败路径观测缝）。W 批仍未开工，故不构成迁移负担，登记于 design-changes §14 |
 | R-9 | P3-1d 对 P3-1c 冻结面的增量 | `Notice::is_markdown` 由 `const fn(&self)` 改为 `fn(&self, &Translate)`（判定基于解析后的目录值；契约只增语义、不删变体）；`WidgetTestApp` 新增注入构造器 `with_market_participants`/`with_kytrix_service`/`with_open_url`/`with_sound` 与 `drain_runtime`/`run_until_idle`，宿主改为拥有 `WidgetServices.runtime` 的 current-thread runtime（App 引擎 runtime 不变）；`WidgetSurface` 根新增 `services.config` 依赖锚点；`crates/widget` 增两个 test-only dev-dependency（`app_config_provider`/`widget_tokio_runtime`，供 headless 目录连接器注入测试）。W 批未开工，不构成迁移负担，登记于 design-changes §15 |
 | R-10 | P3-1e 对 P3-1d 冻结面的增量（P3-0b §F2 裁决） | `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` / `animation_router: Rc<AnimationRouter>`——三个组合根单例的**唯一**注入点，`SelectorHost` 因此可从 `&WidgetServices` + `cx` 访问器组装（此前 6 个 selector widget 无合法 host 来源）；`WidgetServices::builder(app, runtime, translate, theme, layer, frame_router, animation_router)` 为装配缝（四信号铸在一个 scope，可选槽用 setter）；`WidgetCx` 新增 `layer()`/`frame_router()`/`animation()` 并**删除** `router()` 与独立 router 字段（`WidgetCx::new` 5→4 参数，`AnyWidget::mount`/`mount_in_scope` 去掉 `&FrameRouter` 形参：单例只从服务取，杜绝两份真相）；`WidgetTestApp` 自建三单例、经 builder 注入并增 `layer()`/`animation()` 访问器（`router()` 保留，返回宿主实例）；`base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与 `FrameRouter::installed` 同型）。测试 156 → 160。W 批未开工，不构成迁移负担，登记于 design-changes §16 |
+| R-11 | P3-1f 对 P3-1e 冻结面的增量 | `WidgetCx` 改为持有 `&Rc<WidgetServices>`、新增 `services_rc()`（`WidgetCx::new` 的 `services` 形参由 `&WidgetServices` 改为 `&Rc<WidgetServices>`；`AnyWidget` 与 `WidgetTestApp` 本来就持 `Rc`，mount / 测试调用点形状不变），`WidgetTestApp` 增 `services_rc()` 观测面——widget 在 `body` 里构造**拥有服务聚合的宿主**（`SelectorHost`）时取组合根那一个 `Rc`，不重建聚合；静态文案重建通法由 §13.10 冻结；事件过滤应用义务由 §13.11 冻结（引擎面 E21：`App::drain_events_where` + `test_support::diagnostics::signal_slot_stats`，P3-0b2 越界改 `ui_core` 已获 Lead 批准并登记 `ledger.md`）。测试 160 → 161。W 批未开工，不构成迁移负担，登记于 design-changes §17 |
+
+### 13.10 静态文案重建通法（kit 未补绑定面之前的冻结写法）
+
+`Badge` / `Button`（`label` / `icon`）/ `EmptyState`（`text`）与 `kit::table::Column` 的 `header` / `empty_text` 在**构建期**
+取定文案（`SmolStr` / `IconKind`），没有 `bind_text` 闭包；而 §13.5 要求语言在 `bind_*` 里读。两者相遇时冻结为**重建
+（rebuilt, not re-bound）**：每个静态块四步，widget 侧完整写法见 `crates/widgets/AGENTS.md` §15.1。
+
+1. **记 key**：块构建时把「按哪些值建的」记进 widget 自己的字段（语言 / 选项 / 宿主可用性），跨帧存活；不记节点 id。
+2. **`sync` 比较**：widget 的 `sync` 读现值，与记录相等就直接返回——不写信号、不请求帧（I3）。
+3. **存活守卫摘节点 + 组件 `release`**：先摘自己建的节点、再释放组件作用域与 action handler。摘节点/重建前
+   `cx.tree().get(node_or_parent).is_err()` 视为**已被 pane 卸载**（header 行重建是常态），直接返回——否则 `remove_node`
+   返回 `StaleNode`，整次重建失败且控件消失。顺序与 §13.3 的 E16 一致（节点先删、后释放 scope）。
+4. **按现值重建**：同一 key 规则 / 同一父节点重建，并把新的 key 值记回去。
+
+**行内静态组件**（表格 / 列表行闭包，没有 `App`）：结构更新只能在容器上做——`list::set_count(app, count)` 重建可见窗口
+（保留滚动位置），再 `cx.request_frame()`（count 未变，别处不会为这次重建出帧）。行内动态文本仍各走 `bind_text`；
+**不得**在行闭包里重建行结构，也**不得**把这段逻辑抽象成 widget 间共享封装（D-10）。
+
+参考实现（`crates/widgets/news`）：正文空态 `sync_empty_state`、header 声音控件 `sync_sound_button` /
+`release_sound_button`、行内徽标 `rebuild_rows_for_language`，共用摘节点助手 `remove_own_node`；测试
+`the_body_should_say_when_the_feed_is_empty` / `the_rows_should_be_rebuilt_when_the_language_moves` /
+`the_header_control_should_survive_the_pane_rebuilding_its_row`。
+
+**kit 后续批计划**：给上述组件补 `bind_text` / `*_key` 绑定面（或等价的 `Signal` 文本槽）；补上后对应块改回 `bind_*`、
+删除重建状态与其测试。在此之前 W 批一律按本节写，不改 kit 组件语义、不另造绑定面（代价与偏差登记 AGENTS §15.2/§15.4）。
+
+### 13.11 事件所有权与 `App::drain_events_where`（应用义务）
+
+**引擎语义（E21）**：平台事件进入 `App` 的**有界观测队列**（`EVENT_QUEUE_CAPACITY = 1024`，溢出丢最旧并计入
+`App::events_dropped`；交互分发在同一时刻已由引擎完成，丢掉最旧事件不会让交互状态错乱）。
+
+- `App::drain_events()` 取走**全部**事件（组合根每帧的观察面）；
+- `App::drain_events_where(keep)` 只取走 `keep(window, &event)` 认可的事件，其余**留在队列里**（原顺序、丢弃计数不变）。
+
+**应用义务**（冻结）：
+
+1. **组合根 / pane 是全量 `drain_events` 的唯一所有者**：它取走事件，再按窗口把需要的部分交给 widget 的 `dispatch`。
+2. 只拥有「自己窗口的文本 / 按键 / IME」的消费者（模态对话框的输入框、`base_ui::kit::input` 的宿主）**必须**用
+   `drain_events_where(|target, event| target == 自己窗口 && is_text_input(event))`，并在需要时附加「自己是该窗口的
+   modal scope」条件；**不得**用 `drain_events()`——它会把其它窗口、指针 / 尺寸 / 焦点 / 关闭等事件一并吞掉，多窗场景丢键。
+3. 消费者关闭（`finish` / release）后**不得再取任何事件**；它自己的输入组件 release 时摘掉已挂的 handler。
+4. `keep` 必须是**无副作用的纯谓词**：它只拿到 `WindowId` 与 `&Event`（与 `App` 的可变借用同时存在），不读状态、不写状态。
+
+**错误面**：两个方法都**不返回 `Result`**（空队列返回空 `Vec`，`keep` 不产生错误）；越界使用是契约违反，不是错误路径。
+**测试面**：引擎 `ui_core::app::event_queue::tests::a_filtered_drain_leaves_the_rest_queued_in_order`（取自己那部分、其余原序
+留在队列、丢弃计数不变）；消费方 `instrument_selector_ui` 的
+`the_filter_takes_its_own_text_and_leaves_every_other_event_queued`（文本进输入框、`Resized` 仍可被应用读到）与
+`opening_and_closing_the_dialog_a_hundred_times_reclaims_everything`（`signal_slot_stats`：100 轮开关后槽位 / 存活数 / 节点数
+不增长）。逐条规格见 `.docs/gui-migration/spec-deltas/E21.md`。
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 
