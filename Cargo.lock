@@ -5270,9 +5270,7 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
  "i18n",
  "log",
  "market_participants_connector",
@@ -5281,8 +5279,8 @@ dependencies = [
  "smol_str",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

@@ -172,6 +172,18 @@ pub(crate) fn drain_events(app: &mut App) -> Vec<(WindowId, Event)> {
     app.events.drain()
 }
 
+/// 只取走 `keep` 认可的事件，其余**留在队列里**（原顺序）。
+///
+/// 消费者：`App::drain_events_where`（只拥有「自己窗口的文本 / 按键 / IME」的消费者 ——
+/// 见 `base_ui::kit::input::InputNode::dispatch` 的「外壳 drain 之后逐条转发」契约）。
+#[must_use]
+pub(crate) fn drain_events_where(
+    app: &mut App,
+    keep: impl FnMut(WindowId, &Event) -> bool,
+) -> Vec<(WindowId, Event)> {
+    app.events.drain_where(keep)
+}
+
 /// 平台层投递一个事件（`crate::platform::native` 唯一写入点）。
 ///
 /// `Event::Input` 除了进观测缓冲，还会**立刻**走一次交互分发（P10 §5.3）；观测缓冲只用于

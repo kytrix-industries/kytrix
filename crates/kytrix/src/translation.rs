@@ -10,7 +10,7 @@
 //! owns the batching, the deadline and the cancellation; this module only adapts its seam to
 //! the model crate and installs the result.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ai_translator::{
     batch::{BatchSegment, translate_batch},
@@ -20,9 +20,23 @@ use app_config::settings::Language;
 use app_config_provider::manager::ConfigManager;
 use gpui_kit::App;
 use instrument_selector_ui::prediction_translation::{
-    self, LocalTranslator, TranslatedSegment, TranslationCancel, TranslationFailure,
-    TranslationSegment, TranslationSetup,
+    LocalTranslator, TranslatedSegment, TranslationCancel, TranslationFailure, TranslationSegment,
+    TranslationSetup,
 };
+
+/// The translator the composition root hands to the prediction-event dialog.
+///
+/// The engine has no process-wide, type-keyed global store: the aggregate the
+/// composition root builds is what a dialog is opened with (design §11.7). The
+/// application root therefore owns the one engine this build has and passes it in;
+/// until the composition root (P4) moves to the engine, this startup slot is where
+/// it lives.
+static PREDICTION_TRANSLATOR: OnceLock<Arc<dyn LocalTranslator>> = OnceLock::new();
+
+/// The prediction-event dialog's translator, when startup published one.
+pub(crate) fn prediction_translator() -> Option<Arc<dyn LocalTranslator>> {
+    PREDICTION_TRANSLATOR.get().cloned()
+}
 
 /// The local model engine behind the prediction-event dialog's translation seam.
 struct AiTranslator;
@@ -131,15 +145,15 @@ pub(crate) fn translate(
 /// dialog translates through.
 ///
 /// The empty probe keeps the whole translation path in the binary without loading the GGUF
-/// at startup. The engine is then installed as the process-wide translator global the dialog
-/// looks up when it opens; a failed probe installs nothing and returns the error to the
-/// caller.
+/// at startup. The engine is then stored as the composition root's translator, which the
+/// application root hands to the dialog it opens; a failed probe publishes nothing and
+/// returns the error to the caller.
 pub(crate) fn install(cx: &mut App) -> Result<(), TranslationError> {
     // Empty content is answered before the model is touched. The call keeps the whole
     // translation path in the binary without loading the GGUF at startup.
     let _ = translate(cx, "en", "")?;
 
-    prediction_translation::install(cx, Arc::new(AiTranslator));
+    let _ = PREDICTION_TRANSLATOR.set(Arc::new(AiTranslator));
 
     Ok(())
 }
@@ -183,8 +197,8 @@ mod tests {
             cx.set_global(manager);
             super::install(cx).expect("the empty probe and the install should succeed");
             assert!(
-                instrument_selector_ui::prediction_translation::translator(cx).is_some(),
-                "the dialog's translator must be installed at startup"
+                super::prediction_translator().is_some(),
+                "the dialog's translator must be published at startup"
             );
         });
     }

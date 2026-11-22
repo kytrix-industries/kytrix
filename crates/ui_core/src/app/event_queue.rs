@@ -53,6 +53,26 @@ impl EventQueue {
         self.items.drain(..).collect()
     }
 
+    /// 取走 `keep` 认可的事件；其余**留在队列里**（顺序不变，丢弃计数不变）。
+    ///
+    /// 这是「事件属于谁」的引擎侧口径：一个只拥有自己窗口一部分事件的消费者（模态对话框把
+    /// 文本 / 按键 / IME 交给自己的输入框）取走它那部分，应用的观测面仍然完整。
+    pub(crate) fn drain_where(
+        &mut self,
+        mut keep: impl FnMut(WindowId, &Event) -> bool,
+    ) -> Vec<(WindowId, Event)> {
+        let mut taken = Vec::new();
+        self.items.retain(|(window, event)| {
+            if keep(*window, event) {
+                taken.push((*window, event.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
     /// 当前条数。
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -134,5 +154,33 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.dropped(), 0);
+    }
+
+    #[test]
+    fn a_filtered_drain_leaves_the_rest_queued_in_order() {
+        let mut queue = EventQueue::new();
+        let other = WindowId::for_test(2);
+        queue.push(window(), Event::FocusChanged { focused: true });
+        queue.push(other, Event::CloseRequested);
+        queue.push(
+            window(),
+            Event::Resized {
+                size: crate::math::Size::new(8.0, 8.0),
+            },
+        );
+
+        let taken = queue.drain_where(|target, _| target == window());
+
+        assert_eq!(
+            taken.len(),
+            2,
+            "only the events addressed to the asked-for window are taken"
+        );
+        assert_eq!(
+            queue.drain(),
+            vec![(other, Event::CloseRequested)],
+            "the rest stays queued, so the application still observes it"
+        );
+        assert_eq!(queue.dropped(), 0, "filtering is not dropping");
     }
 }

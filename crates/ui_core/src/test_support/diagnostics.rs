@@ -246,6 +246,27 @@ fn quantize(value: f32) -> u32 {
     }
 }
 
+/// 值槽位表（信号 + 瞬态值）的分配统计。
+///
+/// 槽位在作用域释放时归还空闲栈并被下次分配复用，因此「反复开关一个面板后 `slots` / `live`
+/// 不增长」是可断言的（泄漏面：用根作用域铸造的信号永不回收）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalSlotStats {
+    /// 分配过的槽位总数（存活 + 空闲）。
+    pub slots: usize,
+    /// 存活槽位数。
+    pub live: usize,
+    /// 空闲（已回收、可复用）槽位数。
+    pub free: usize,
+}
+
+/// 值槽位统计的公开捕获入口（自由函数：`impl App` 只能在 `app.rs`）。
+#[must_use]
+pub fn signal_slot_stats(app: &App) -> SignalSlotStats {
+    let (slots, live, free) = app.signal_slot_counts_for_test();
+    SignalSlotStats { slots, live, free }
+}
+
 /// 依赖图（`SignalId → Owner`）的明文快照。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DependencyGraphDump {
