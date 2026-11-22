@@ -2,10 +2,12 @@
 
 use market_participants_model::decimal::Tick;
 use time::UtcOffset;
+use ui_core::paint::color::Color;
+use widget::test_support::WidgetTestApp;
 
 use super::text::{
     ChartTextCache, NOT_A_READING, format_axis_time, format_compact, format_price, format_quantity,
-    format_ratio, format_share, format_tooltip_time, labelled_value,
+    format_ratio, format_share, format_tooltip_time, label_style, labelled_value,
 };
 
 fn tick(value: &str) -> Tick {
@@ -126,5 +128,34 @@ fn a_labelled_value_should_name_the_series_before_the_number() {
 
 #[test]
 fn an_empty_cache_should_hold_nothing_stale() {
-    assert!(!ChartTextCache::default().has_stale());
+    let mut cache = ChartTextCache::default();
+
+    assert!(!cache.has_stale());
+}
+
+/// A shaped line leases glyph tiles from the atlas. When the atlas is rebuilt, the lease is
+/// gone and the cache has to say so — once. A stale line that was not drawn again (a
+/// tooltip whose pointer moved away) must not keep the answer true: that would turn every
+/// later frame into a rebuild (I3).
+#[test]
+fn a_cache_should_report_a_stale_lease_once_and_then_drop_it() {
+    let mut harness = WidgetTestApp::new();
+    let style = label_style(10.0, 14.0, Color::WHITE);
+    let mut cache = ChartTextCache::default();
+    harness.with_cx(|cx| cache.line(cx.app_mut(), "12,345", &style));
+    assert!(
+        !cache.has_stale(),
+        "a line shaped for the current atlas is fresh"
+    );
+
+    // An atlas reset under the same font stack: every handle shaped before it is leased
+    // from an atlas that no longer exists, and nothing in the requested text changed.
+    let stack = harness.app().font_stack().clone();
+    harness.app_mut().set_font_stack(stack);
+
+    assert!(cache.has_stale(), "a lease the atlas dropped is reported");
+    assert!(
+        !cache.has_stale(),
+        "and the dropped line is not kept to say it again"
+    );
 }

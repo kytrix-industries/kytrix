@@ -164,6 +164,22 @@ fn middle_of_plot(harness: &ChartHarness) -> Point {
     )
 }
 
+/// The atlas generation the chart's glyphs were rasterized in, if it draws any.
+///
+/// The leases a canvas holds are what an atlas reset invalidates, so reading the
+/// generation back is how a test tells a canvas that was rebuilt from one that was kept.
+fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
+    harness
+        .canvas()
+        .primitives()
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => run.glyphs.first(),
+            _ => None,
+        })
+        .map(|glyph| glyph.tile.generation)
+}
+
 /// Every primitive kind the canvas holds.
 fn kinds(canvas: &ui_core::paint::canvas::Canvas) -> Vec<&'static str> {
     canvas
@@ -364,6 +380,44 @@ fn a_language_switch_should_rewrite_the_labels() {
             harness.chart.set_locale(&translate)
         }),
         "the same language is not a change"
+    );
+}
+
+/// The labels are drawn from shaped handles that lease glyph tiles from the atlas. When a
+/// lease is gone — the atlas was reset, a font stack changed, a tile was evicted — the
+/// engine refuses to encode those runs rather than draw reused texture, so a chart that
+/// kept the canvas it already had would lose its labels for good. A moved lease is a frame
+/// the chart owes.
+#[test]
+fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync(), "the first frame paints");
+    let labels = harness.canvas().primitives().len();
+    let generation =
+        glyph_generation(&harness).expect("a chart of three intervals labels its axes");
+
+    // An atlas reset under the same font stack: every handle the canvas was built from is
+    // leased from an atlas that no longer exists, while the glyphs shape back the same.
+    let stack = harness.app.app().font_stack().clone();
+    harness.app.app_mut().set_font_stack(stack);
+
+    assert!(
+        harness.sync(),
+        "a label whose lease moved is a frame the chart owes, not an idle one"
+    );
+    assert_ne!(
+        glyph_generation(&harness),
+        Some(generation),
+        "every label was shaped for the atlas that exists now"
+    );
+    assert_eq!(
+        harness.canvas().primitives().len(),
+        labels,
+        "and none of them disappeared with the old lease"
+    );
+    assert!(
+        !harness.sync(),
+        "with fresh leases the frame is steady again (I3)"
     );
 }
 

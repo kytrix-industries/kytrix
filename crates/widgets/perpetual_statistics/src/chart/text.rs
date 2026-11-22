@@ -118,18 +118,27 @@ impl ChartTextCache {
         self.line(app, text, style).size().width
     }
 
-    /// Whether any line this cache holds can no longer be drawn from the atlas.
+    /// Whether any line this cache holds can no longer be drawn from the atlas, dropping
+    /// the ones that cannot.
     ///
     /// This is what the chart asks before it decides a frame changed nothing: a canvas
     /// is a value and the chart keeps the one it built, but the *glyphs* a canvas names
     /// are leased from a shared atlas, and an atlas generation change or a per-tile
     /// eviction leaves every handle the canvas was built from pointing at reused
     /// texture. The engine drops such runs at encode time, so a chart that did not
-    /// rebuild would lose its axis, date and tooltip labels permanently. Nothing is
-    /// stale in the steady state, so the scan of a few dozen handles is the whole cost
-    /// of the guard.
-    pub(crate) fn has_stale(&self) -> bool {
-        self.entries.iter().any(|entry| entry.handle.is_stale())
+    /// rebuild would lose its axis, date and tooltip labels permanently.
+    ///
+    /// The stale entries are dropped on the way out. A label the frame that follows does
+    /// not draw against — a tooltip whose pointer has moved away since — would otherwise
+    /// keep this answer true for good, which turns every later frame into a rebuild and
+    /// breaks the steady state (I3). The canvas that was built from them is rebuilt by
+    /// the frame that asks this question, so nothing is left naming glyphs that are gone.
+    pub(crate) fn has_stale(&mut self) -> bool {
+        let stale = self.entries.iter().any(|entry| entry.handle.is_stale());
+        if stale {
+            self.entries.retain(|entry| !entry.handle.is_stale());
+        }
+        stale
     }
 }
 

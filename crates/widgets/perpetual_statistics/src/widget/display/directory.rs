@@ -46,14 +46,15 @@ use market_participants_model::{
 };
 use smol_str::SmolStr;
 
-/// The venues whose loader can answer with perpetual statistics.
+/// The venues whose loader can answer with one capability's series.
 ///
-/// This is the one static answer a pane may read: every metric this pane can draw is
-/// served by one venue set, which is the open-interest capability's off the definition
-/// table, and that is the same answer whether or not anything is loaded and whichever
-/// metric is picked.
-pub(super) fn market_venues() -> Vec<VenueId> {
-    venues_supporting(CapabilityId::OpenInterest)
+/// This is the one static answer a pane may read: the definition table is what says which
+/// venues serve a capability, and that is the same answer whether or not anything is
+/// loaded. It is asked per capability rather than once for the crate: the five widgets are
+/// five different capabilities, and a venue added for one of them must not be counted as
+/// one that can answer for the others.
+pub(super) fn market_venues(capability: CapabilityId) -> Vec<VenueId> {
+    venues_supporting(capability)
 }
 
 /// The units one chart's series are measured in, named the way the catalogue names them.
@@ -112,36 +113,50 @@ pub(crate) trait StatisticsDirectory {
 }
 
 /// The application directory: the injected market-participants connector.
-pub(super) struct ConnectorDirectory(MarketParticipantsConnector);
+pub(super) struct ConnectorDirectory {
+    connector: MarketParticipantsConnector,
+    /// The capability the pane's series is served under.
+    ///
+    /// Which venues can answer at all, and whether a route still publishes the stored
+    /// listing, are questions about the capability rather than about the pane's own metric:
+    /// the five widgets share one directory shape, and the ones that differ are asked for
+    /// the capability they plot.
+    capability: CapabilityId,
+}
 
 impl ConnectorDirectory {
-    pub(super) const fn new(connector: MarketParticipantsConnector) -> Self {
-        Self(connector)
+    pub(super) const fn new(
+        connector: MarketParticipantsConnector,
+        capability: CapabilityId,
+    ) -> Self {
+        Self {
+            connector,
+            capability,
+        }
     }
 }
 
 impl StatisticsDirectory for ConnectorDirectory {
     fn loaded_scopes(&self) -> Arc<[LoadedScope]> {
-        LoadedScope::all(self.0.venues())
+        LoadedScope::all(self.connector.venues())
     }
 
     fn any_market_loaded(&self) -> bool {
-        let loaded = self.0.venues();
-        market_venues()
+        let loaded = self.connector.venues();
+        market_venues(self.capability)
             .iter()
             .any(|venue| loaded.loaded(venue).is_some())
     }
 
     fn is_loaded(&self, route: &VenueRoute) -> bool {
-        self.0.venues().scope(route).is_some()
+        self.connector.venues().scope(route).is_some()
     }
 
     fn listing_support(&self, listing: &VenueListingKey) -> ListingSupport {
-        let capability = CapabilityId::OpenInterest;
-        if !offers_route(&self.loaded_scopes(), &listing.route, capability) {
+        if !offers_route(&self.loaded_scopes(), &listing.route, self.capability) {
             return ListingSupport::Unsupported;
         }
-        match self.0.catalog().resolve_listing(listing) {
+        match self.connector.catalog().resolve_listing(listing) {
             Ok(resolved)
                 if resolved.instrument.kind() != InstrumentKind::Perpetual
                     || resolved.status.is_terminal() =>
@@ -166,7 +181,7 @@ impl StatisticsDirectory for ConnectorDirectory {
     fn units(&self, rules: &TradingRules, translate: &Translate) -> ChartUnits {
         // One capture names both axes, so a chart never mixes two publications even if the
         // catalog is republished while it is labelled.
-        let generation = self.0.catalog().cached_display();
+        let generation = self.connector.catalog().cached_display();
         ChartUnits {
             base: quantity_unit_label(&rules.common.quantity.unit, &generation, translate),
             quote: asset_display(&generation, &rules.common.price.quote_asset, translate),

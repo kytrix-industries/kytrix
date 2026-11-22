@@ -362,7 +362,8 @@ impl<D: ChartData> Chart<D> {
         // without moving anything in the key. The engine drops such runs at encode time,
         // so a frame that kept this canvas would show a chart with its axis, interval and
         // tooltip labels missing — for good. A stale cache is a rebuild.
-        if self.cache.painted == Some(painted) && !self.cache.text.has_stale() {
+        let painted_already = self.cache.painted == Some(painted);
+        if painted_already && !self.cache.text.has_stale() {
             return Ok(false);
         }
 

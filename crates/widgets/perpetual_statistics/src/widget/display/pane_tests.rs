@@ -27,6 +27,7 @@ use market_participants_model::{
         rules::{ListingPrecision, TradingRules},
     },
     market::selection::InstrumentSelection,
+    routing::CapabilityId,
 };
 use smol_str::SmolStr;
 use ui_core::node::{builder::NodeBuilder, id::NodeId, tree::NodeKind};
@@ -39,7 +40,7 @@ use widget::{
 };
 
 use super::{
-    COUNTDOWN_TICK, PaneScaffold, StatisticsConfig, StatisticsWidget, TIMEFRAMES,
+    COUNTDOWN_TICK, PaneScaffold, StatisticsConfig, StatisticsMetric, StatisticsWidget, TIMEFRAMES,
     directory::{ChartUnits, ListingSupport, StatisticsDirectory, market_venues},
 };
 use crate::{
@@ -49,7 +50,12 @@ use crate::{
         StatisticsFetchError, StatisticsStatus, StatisticsStreamKey, StatisticsStreamMessage,
         test_support::{FakeSource, FetchPlan, perpetual_listing, perpetual_route},
     },
-    widget::open_interest::OpenInterestWidgetSeries,
+    widget::{
+        long_short_account_ratio::LongShortAccountRatioWidgetSeries,
+        open_interest::OpenInterestWidgetSeries, taker_volume::TakerVolumeWidgetSeries,
+        top_trader_account_ratio::TopTraderAccountRatioWidgetSeries,
+        top_trader_position_ratio::TopTraderPositionRatioWidgetSeries,
+    },
 };
 
 type Widget = StatisticsWidget<OpenInterestWidgetSeries>;
@@ -166,7 +172,9 @@ fn supported() -> ListingSupport {
 struct FixtureDirectory {
     loaded: Rc<RefCell<Vec<VenueRoute>>>,
     support: Rc<RefCell<ListingSupport>>,
-    capabilities: Rc<RefCell<Vec<market_participants_model::routing::CapabilityId>>>,
+    capabilities: Rc<RefCell<Vec<CapabilityId>>>,
+    /// The capability the pane under test plots, which is what its gate asks the venues for.
+    capability: CapabilityId,
     units: ChartUnits,
 }
 
@@ -179,14 +187,20 @@ impl FixtureDirectory {
                 Vec::new()
             })),
             support: Rc::new(RefCell::new(support)),
-            capabilities: Rc::new(RefCell::new(vec![
-                market_participants_model::routing::CapabilityId::OpenInterest,
-            ])),
+            capabilities: Rc::new(RefCell::new(vec![CapabilityId::OpenInterest])),
+            capability: CapabilityId::OpenInterest,
             units: ChartUnits {
                 base: SmolStr::new_static("BTC"),
                 quote: SmolStr::new_static("USDT"),
             },
         }
+    }
+
+    /// The same directory answering for another series' capability: the loaded route
+    /// declares that series, and the gate asks about the venues that serve it.
+    fn offering(self, capability: CapabilityId) -> Self {
+        *self.capabilities.borrow_mut() = vec![capability];
+        Self { capability, ..self }
     }
 
     fn load(&self) {
@@ -225,7 +239,7 @@ impl StatisticsDirectory for FixtureDirectory {
         self.loaded
             .borrow()
             .iter()
-            .any(|route| market_venues().contains(&route.venue))
+            .any(|route| market_venues(self.capability).contains(&route.venue))
     }
 
     fn is_loaded(&self, route: &VenueRoute) -> bool {
@@ -839,6 +853,10 @@ fn a_failed_pane_should_stop_counting_down() {
     fixture.report_status(ready(1, 1_060_000));
     fixture.sync();
     assert!(fixture.countdown().is_some());
+    assert!(
+        fixture.widget.countdown_is_armed_for_test(),
+        "a ready pane is waiting for its next tick"
+    );
 
     fixture.report_status(failed());
     fixture.sync();
@@ -848,8 +866,18 @@ fn a_failed_pane_should_stop_counting_down() {
         None,
         "a failure has nothing to count down to"
     );
+    assert!(
+        !fixture.widget.countdown_is_armed_for_test(),
+        "a failure cancels the tick it was waiting for"
+    );
+    // The engine holds the only clock the tick reads, so a tick that was cancelled is a
+    // round that fires nothing: the clock moving does not bring the countdown back.
+    fixture.harness.drain();
     fixture.clock.set(1_000_000 + 10_000);
-    let _ = fixture.harness.advance(COUNTDOWN_TICK);
+    assert!(
+        !fixture.harness.advance(COUNTDOWN_TICK),
+        "a cancelled countdown draws nothing when its tick would have been due"
+    );
     assert_eq!(
         fixture.countdown(),
         None,
@@ -1009,6 +1037,16 @@ fn an_empty_window_should_say_there_is_no_data() {
         text.contains("No data"),
         "the overlay says there is no data: {text}"
     );
+    // The overlay is built after the canvas, so it is drawn over the axes rather than under
+    // them: the tree draws a node's children in order.
+    assert_eq!(
+        children_of(&fixture, "TEST_PERPETUAL_STATISTICS_CHART_HOST"),
+        [
+            "TEST_PERPETUAL_STATISTICS_CHART",
+            "TEST_PERPETUAL_STATISTICS_EMPTY"
+        ],
+        "the empty-window sentence is drawn after the chart, not behind it"
+    );
     // The chart is still there behind it: an empty window draws its axes.
     assert!(fixture.canvas().is_some_and(|canvas| !canvas.is_empty()));
 }
@@ -1087,6 +1125,78 @@ fn a_directory_generation_should_rerun_load() {
 }
 
 #[test]
+fn the_charts_name_should_be_in_the_catalogue_in_every_language() {
+    // The chart's canvas names itself through this key: a missing one translates to an
+    // empty a11y label rather than failing, so the catalogue is what has to hold it.
+    for language in [LanguageCode::En, LanguageCode::ZhCn] {
+        let translate = product_translate(language);
+        let name = translate.translate("widget.perpetual_statistics.chart");
+        assert!(
+            !name.is_empty(),
+            "the chart's name resolves in {language:?}"
+        );
+    }
+}
+
+#[test]
+fn a_directory_generation_should_keep_the_window_the_pane_is_showing() {
+    let mut fixture = Fixture::new(config(), true, supported(), [FetchPlan::Success(1)]);
+    fixture.load();
+    fixture.settle();
+    fixture.report_status(ready(1, 1_060_000));
+    fixture.report_snapshot(snapshot(1));
+    fixture.sync();
+    fixture.paint();
+    let primitives = fixture
+        .canvas()
+        .expect("the pane drew a chart")
+        .primitives()
+        .len();
+    assert!(fixture.has_content());
+
+    fixture.directory.load();
+    fixture.bump_generation(1);
+    fixture.sync();
+    fixture.harness.drain();
+
+    assert!(
+        fixture.has_content(),
+        "a directory publication does not blank the window the user is reading (AGENTS §8.3)"
+    );
+    assert_eq!(
+        fixture.widget.chart_revision(),
+        Some(1),
+        "the window on screen is not rebuilt by a publication"
+    );
+    assert_eq!(
+        fixture.state(),
+        WidgetState::Ready,
+        "a ready pane stays ready across a publication"
+    );
+    assert_eq!(
+        fixture
+            .canvas()
+            .expect("the chart is still drawn")
+            .primitives()
+            .len(),
+        primitives,
+        "the labels and the lines are still on the canvas"
+    );
+
+    // The stream that is polling the window is still the one filling it: a window after the
+    // publication is applied rather than counted as one the pane has already overtaken.
+    fixture.report_snapshot(snapshot(2));
+    fixture.report_status(ready(2, 1_060_000));
+    fixture.sync();
+
+    assert_eq!(
+        fixture.widget.chart_revision(),
+        Some(2),
+        "the reloaded window keeps receiving the stream's windows"
+    );
+}
+
+#[test]
 fn a_market_that_was_taken_away_should_send_the_pane_back_to_waiting() {
     let mut fixture = Fixture::new(config(), true, supported(), [FetchPlan::Success(1)]);
     fixture.load();
@@ -1132,6 +1242,10 @@ fn the_pane_should_be_built_and_released_without_leaking() {
     fixture.sync();
     let live = fixture.harness.signal_slot_stats().live;
     let nodes = fixture.harness.node_count();
+    assert!(
+        fixture.widget.countdown_is_armed_for_test(),
+        "the countdown the release has to cancel is waiting for a tick"
+    );
 
     fixture.harness.with_cx(|cx| fixture.widget.release(cx));
 
@@ -1149,6 +1263,10 @@ fn the_pane_should_be_built_and_released_without_leaking() {
         "the chart's meshes go with it"
     );
     assert_eq!(fixture.countdown(), None, "the countdown is cancelled");
+    assert!(
+        !fixture.widget.countdown_is_armed_for_test(),
+        "release takes the pending tick with it"
+    );
 }
 
 #[test]
@@ -1295,6 +1413,64 @@ fn an_old_payload_should_decode_to_the_defaults() {
 }
 
 #[test]
+fn every_widget_of_this_crate_should_state_its_own_identity_and_series() {
+    let translate = product_translate(LanguageCode::En);
+    let ids = [
+        assert_widget::<OpenInterestWidgetSeries>(
+            &translate,
+            "kytrix.open_interest",
+            "widget.names.open_interest",
+            "widget.descriptions.open_interest",
+            "widgets/open_interest.png",
+            MetricKind::OpenInterest,
+        ),
+        assert_widget::<TakerVolumeWidgetSeries>(
+            &translate,
+            "kytrix.taker_volume",
+            "widget.names.taker_volume",
+            "widget.descriptions.taker_volume",
+            "widgets/taker_volume.png",
+            MetricKind::TakerVolume,
+        ),
+        assert_widget::<TopTraderAccountRatioWidgetSeries>(
+            &translate,
+            "kytrix.top_trader_account_ratio",
+            "widget.names.top_trader_account_ratio",
+            "widget.descriptions.top_trader_account_ratio",
+            "widgets/top_trader_account_ratio.png",
+            MetricKind::TopTraderAccountRatio,
+        ),
+        assert_widget::<TopTraderPositionRatioWidgetSeries>(
+            &translate,
+            "kytrix.top_trader_position_ratio",
+            "widget.names.top_trader_position_ratio",
+            "widget.descriptions.top_trader_position_ratio",
+            "widgets/top_trader_position_ratio.png",
+            MetricKind::TopTraderPositionRatio,
+        ),
+        assert_widget::<LongShortAccountRatioWidgetSeries>(
+            &translate,
+            "kytrix.long_short_account_ratio",
+            "widget.names.long_short_account_ratio",
+            "widget.descriptions.long_short_account_ratio",
+            "widgets/long_short_account_ratio.png",
+            MetricKind::LongShortAccountRatio,
+        ),
+    ];
+
+    let mut unique = ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 5, "five widgets have five identities");
+    for id in unique {
+        assert!(
+            id.starts_with("kytrix."),
+            "`{id}` is one of this application's widget ids"
+        );
+    }
+}
+
+#[test]
 fn a_pane_without_a_directory_should_report_that_it_cannot_read() {
     let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
     let widget = harness
@@ -1312,6 +1488,103 @@ fn a_pane_without_a_directory_should_report_that_it_cannot_read() {
 }
 
 // ---------------------------------------------------------------------- helpers
+
+/// One widget's identity, checked against the values this crate ships, and the pane it
+/// builds checked against the series it names. Returns the identity the caller compares.
+fn assert_widget<M: StatisticsMetric>(
+    translate: &Translate,
+    id: &str,
+    name: &str,
+    description: &str,
+    icon: &str,
+    metric: MetricKind,
+) -> String {
+    assert_eq!(M::ID.as_str(), id, "the persisted identity");
+    assert_eq!(M::DISPLAY_NAME, name, "the name key");
+    assert_eq!(M::DESCRIPTION, Some(description), "the description key");
+    assert_eq!(M::ICON, icon, "the gallery picture");
+    assert_eq!(M::METRIC, metric, "the series this widget plots");
+    assert_eq!(
+        M::METRIC.capability(),
+        metric.capability(),
+        "a series is served under its own capability"
+    );
+    for key in [name, description] {
+        assert!(
+            !translate.translate(key).is_empty(),
+            "`{key}` is in the catalogue"
+        );
+    }
+    assert_polls::<M>(metric);
+    M::ID.as_str().to_owned()
+}
+
+/// Builds one pane over the fixture directory and answers what it polls: the stream key it
+/// would accept, and the chart it drew, both have to name the series its widget names.
+fn assert_polls<M: StatisticsMetric>(metric: MetricKind) {
+    let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+    let directory = FixtureDirectory::new(true, supported()).offering(metric.capability());
+    let status = harness.status();
+    let recovery = WidgetAction::new("common.retry", |_| {});
+    let change = WidgetConfigChange::new(|_| {});
+    let handle: Rc<dyn StatisticsDirectory> = Rc::new(directory);
+    let mut pane = harness.with_cx(|cx| {
+        StatisticsWidget::<M>::with_source(
+            config(),
+            FakeSource::new([FetchPlan::Success(1)]),
+            Some(handle),
+            PaneScaffold {
+                status,
+                config_change: change,
+                recovery,
+                now: Rc::new(|| 1_000_000),
+            },
+            cx,
+        )
+    });
+    harness.with_cx(|cx| pane.load(cx));
+    for _ in 0..6 {
+        harness.drain_runtime();
+    }
+    harness.with_cx(|cx| pane.sync(cx)).expect("the pane syncs");
+
+    assert_eq!(
+        pane.current_key().map(|key| key.metric),
+        Some(metric),
+        "a pane polls the series its widget names"
+    );
+    let chart = pane
+        .chart_for_test()
+        .expect("a supported route builds its chart");
+    let drawn = match metric {
+        MetricKind::OpenInterest => matches!(chart, ChartDispatch::OpenInterest(_)),
+        MetricKind::TakerVolume => matches!(chart, ChartDispatch::TakerVolume(_)),
+        MetricKind::TopTraderAccountRatio
+        | MetricKind::TopTraderPositionRatio
+        | MetricKind::LongShortAccountRatio => matches!(chart, ChartDispatch::Ratio(_)),
+    };
+    assert!(drawn, "the chart is the one this series draws");
+}
+
+/// The debug ids of a node's children, in the order the tree draws them.
+fn children_of(fixture: &Fixture, parent: &str) -> Vec<String> {
+    let tree = fixture.harness.tree();
+    let mut stack = vec![tree.root()];
+    while let Some(node) = stack.pop() {
+        let Ok(target) = tree.get(node) else {
+            continue;
+        };
+        if tree.debug_id(node) == Some(parent) {
+            return target
+                .children()
+                .iter()
+                .map(|child| tree.debug_id(*child).unwrap_or_default().to_owned())
+                .collect();
+        }
+        stack.extend(target.children().iter().copied());
+    }
+    panic!("no node with the debug id `{parent}`");
+}
 
 /// Whether a node with this debug id is under `parent`.
 fn node_under(cx: &mut widget::cx::WidgetCx<'_>, parent: NodeId, id: &str) -> bool {

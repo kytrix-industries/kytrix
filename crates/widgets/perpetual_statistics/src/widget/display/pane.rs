@@ -24,9 +24,12 @@
 //! the directory's answers: the connector the composition root injects in the application,
 //! and a fixture in a test (see [`StatisticsDirectory`]). A directory generation written
 //! into `services.catalog_generation` is the one signal that says the directory moved, so
-//! the pane compares it in `sync` and runs `load` again when it did (AGENTS §8.3). The pane
-//! never loads the directory, never polls the catalogue and never subscribes to a venue
-//! event.
+//! the pane compares it in `sync` and re-reads the directory when it did (AGENTS §8.3). A
+//! publication keeps the window the user is reading: it re-runs the gate and the directory's
+//! answers, and the stream that is polling the window stays as it is, because that is what
+//! keeps a published catalogue from counting the window on screen as one the pane has
+//! already overtaken (see [`StatisticsWidget::reload`]). The pane never loads the directory,
+//! never polls the catalogue and never subscribes to a venue event.
 //!
 //! # Why replies are matched by request identity
 //!
@@ -440,7 +443,10 @@ where
     ) -> Result<Self, EngineError> {
         let directory: Option<Rc<dyn StatisticsDirectory>> =
             cx.services().market_participants().map(|connector| {
-                Rc::new(ConnectorDirectory::new(connector.clone())) as Rc<dyn StatisticsDirectory>
+                Rc::new(ConnectorDirectory::new(
+                    connector.clone(),
+                    M::METRIC.capability(),
+                )) as Rc<dyn StatisticsDirectory>
             });
         // The answer is read through the directory the composition root injects; a host
         // without one leaves the source absent and `load` reports that.
@@ -527,6 +533,14 @@ where
             )
             .build(cx.tree_mut(), root)?;
 
+        // The canvas is the host's first child on purpose: the empty-window overlay below
+        // is built after it, so the sentence is drawn over the axes rather than under them
+        // (the old body appended its overlay last for the same reason).
+        self.chart_host = Some(host);
+        if let Some(chart) = self.chart.as_mut() {
+            chart.build(cx, host)?;
+        }
+
         // A window the venue published with no interval in it draws axes and nothing else,
         // which reads exactly like a chart that has not arrived: the overlay says which of
         // the two it is, over the plot.
@@ -559,11 +573,6 @@ where
         EmptyState::new(theme, "StatisticsEmpty")
             .bind_text(self.empty_text)
             .build(cx.tree_mut(), overlay)?;
-
-        self.chart_host = Some(host);
-        if let Some(chart) = self.chart.as_mut() {
-            chart.build(cx, host)?;
-        }
         Ok(())
     }
 
@@ -575,8 +584,9 @@ where
 
         // The published directory generation is the one signal that says the directory
         // moved. A change can matter in either direction — the market this pane waits for
-        // has been loaded, or the one it was reading has gone — and `load` is what decides
-        // which, because it re-runs the precondition.
+        // has been loaded, or the one it was reading has gone — and `reload` is what decides
+        // which, because it re-runs the precondition; a pane that is already showing a
+        // window keeps it.
         let generation = cx.services().catalog_generation;
         let generation = *cx.read(&generation);
         if generation != self.seen_generation {
@@ -584,7 +594,7 @@ where
             // A failure is terminal: a directory publication does not revive a failed
             // pane — only the user's own recovery does.
             if !self.status.is_failed(cx.app()) {
-                self.load(cx);
+                self.reload(cx);
             }
         }
 
@@ -766,6 +776,49 @@ where
         self.config.selection.as_ref().map(|selection| {
             StatisticsStreamKey::new(M::METRIC, selection.listing.clone(), self.config.timeframe)
         })
+    }
+
+    /// Re-reads the directory after it published a new generation (AGENTS §8.3).
+    ///
+    /// A publication says the catalogue behind a window moved, not that the readings in it
+    /// did: the window on screen is the same listing over the same interval, and the stream
+    /// that is filling it resolves the listing against the catalogue on every fetch, so its
+    /// next fetch is the published generation's. Replacing that stream is what a reload
+    /// here must *not* do: the service numbers the windows of one stream, so a replacement
+    /// starts again at its first revision, and the window on screen would be counted as one
+    /// the pane had already overtaken — the chart would freeze on the old window until the
+    /// new stream's numbering caught up.
+    ///
+    /// What a publication does re-run is the pane's gate and the answers it takes from the
+    /// directory: the route's question about the stored listing, and the units its labels
+    /// are written in. Content is dropped here only when the directory says the pane can no
+    /// longer read it — the market it follows is not loaded (the neutral notice), or the
+    /// route no longer publishes the listing (nothing chosen). A fetch that fails after the
+    /// publication is the ordinary failure path, which keeps the chart under the banner.
+    fn reload(&mut self, cx: &mut WidgetCx<'_>) {
+        if self.directory.is_none() {
+            self.report_unavailable(cx);
+            return;
+        }
+        if !self.market_ready(cx) {
+            self.wait_for_market(cx);
+            return;
+        }
+        // A pane with no window of its own has nothing to keep: what it was waiting for is
+        // what the publication may have settled, so it starts over the way a load does.
+        if !self.has_content() {
+            self.start(false, cx);
+            return;
+        }
+        let Some(selection) = self.config.selection.clone() else {
+            return;
+        };
+        let support = self
+            .directory
+            .as_ref()
+            .map(|directory| directory.listing_support(&selection.listing))
+            .unwrap_or(ListingSupport::Unknown);
+        self.settle_selection(&selection, support, cx);
     }
 
     /// Whether this pane has something to fetch.
@@ -1186,7 +1239,7 @@ where
     /// The venues the waiting notice lists: every venue whose loader can answer with these
     /// statistics.
     pub(crate) fn listed_venues() -> Vec<market_participants_model::identifier::VenueId> {
-        market_venues()
+        market_venues(M::METRIC.capability())
     }
 
     /// Reports the neutral notice for the market this pane follows, and drops the chart it
@@ -1603,6 +1656,13 @@ where
         self.countdown.label(app)
     }
 
+    /// Whether the countdown is waiting for a tick to fire, as a test reads the cancellation
+    /// of one back: a cancelled countdown is a pane that is woken by nothing.
+    #[cfg(test)]
+    pub(crate) fn countdown_is_armed_for_test(&self) -> bool {
+        self.countdown.is_armed()
+    }
+
     /// Whether the pane reports a pending refresh, as a test reads it back.
     #[cfg(test)]
     pub(crate) fn refresh_pending_for_test(&self) -> bool {
@@ -1668,5 +1728,13 @@ impl Countdown {
     /// The label this countdown's node is drawing.
     fn label(&self, app: &App) -> Option<SmolStr> {
         app.read(&self.label).clone()
+    }
+
+    /// Whether a tick is waiting to fire.
+    ///
+    /// The id is what a deadline change and `release` cancel, so holding one is exactly the
+    /// "a tick will wake this pane" the cancellation tests assert against.
+    fn is_armed(&self) -> bool {
+        self.timer.borrow().is_some()
     }
 }
