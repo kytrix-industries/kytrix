@@ -11378,11 +11378,13 @@ dependencies = [
 name = "widget_gallery_ui"
 version = "0.0.3"
 dependencies = [
+ "app_config",
  "base_ui",
- "gpui-kit",
  "i18n",
+ "log",
+ "smol_str",
+ "ui_core",
  "widget",
- "widget_registry",
 ]
 
 [[package]]
