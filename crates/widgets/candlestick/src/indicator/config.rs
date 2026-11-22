@@ -8,11 +8,11 @@
 
 use std::fmt;
 
-use gpui_kit::{Hsla, hsla};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{MapAccess, Visitor, value::MapAccessDeserializer},
 };
+use ui_core::paint::color::{Color, ColorResolver};
 
 use super::{
     INDICATOR_CATALOG, IndicatorId, IndicatorPane, SettingKey, default_line_color, definition_of,
@@ -34,6 +34,11 @@ pub(crate) const PERIOD_MAX: u32 = 500;
 /// Stored as `f32` rather than eight-bit sRGB so a colour the picker chose round-trips exactly.
 /// Every component is a fraction in `0..=1`; a value read from disk is normalized into that range.
 ///
+/// HSL rather than the engine's [`Color`] because this is the disk format: the components are
+/// what a stored configuration holds, and the engine has no HSL constructor to decode them into.
+/// The panel and the chart paint with [`Color`], so the two conversions below are the only bridge
+/// between the two: HSL→sRGB when a line is drawn, sRGB→HSL when a colour is stored.
+///
 /// The stored shape is a map with named components. A legacy `[u8; 4]` sRGB array
 /// must not decode: serde's derived struct deserializer would accept a sequence
 /// and read the bytes as four fractions, which is why [`Deserialize`] is
@@ -46,20 +51,110 @@ pub(crate) struct LineColor {
     pub a: f32,
 }
 
-impl From<Hsla> for LineColor {
-    fn from(color: Hsla) -> Self {
+impl From<Color> for LineColor {
+    /// The HSL of `color`'s sRGB value.
+    ///
+    /// The colour a line takes is an engine colour — the theme's chart-series palette or the
+    /// picker's commit — and may be in any colour space. It is first read as the sRGB the engine
+    /// paints (see [`srgb_components`]) and then turned into the HSL components a stored line
+    /// holds, which is the exact inverse of the `Color` conversion below for an in-range colour.
+    fn from(color: Color) -> Self {
+        let [r, g, b, a] = srgb_components(color);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let lightness = (max + min) / 2.0;
+        let delta = max - min;
+        if delta <= f32::EPSILON {
+            // Grey has no hue to report and no scale to divide by.
+            return Self {
+                h: 0.0,
+                s: 0.0,
+                l: lightness,
+                a,
+            };
+        }
+        let saturation = if lightness > 0.5 {
+            delta / (2.0 - max - min)
+        } else {
+            delta / (max + min)
+        };
+        let hue = if (max - r).abs() <= f32::EPSILON {
+            (g - b) / delta + if g < b { 6.0 } else { 0.0 }
+        } else if (max - g).abs() <= f32::EPSILON {
+            (b - r) / delta + 2.0
+        } else {
+            (r - g) / delta + 4.0
+        };
         Self {
-            h: color.h,
-            s: color.s,
-            l: color.l,
-            a: color.a,
+            h: hue / 6.0,
+            s: saturation,
+            l: lightness,
+            a,
         }
     }
 }
 
-impl From<LineColor> for Hsla {
+impl From<LineColor> for Color {
+    /// The sRGB colour these HSL components describe.
+    ///
+    /// The standard `hsl()` formula: a hue measured in turns (0 = 0°, 1 = 360°), saturation and
+    /// lightness clamped into their ranges. This is the colour a line is painted in, so it is the
+    /// one visual answer both the chart and the panel's well show.
     fn from(color: LineColor) -> Self {
-        hsla(color.h, color.s, color.l, color.a)
+        let hue = color.h.rem_euclid(1.0) * 6.0;
+        let saturation = color.s.clamp(0.0, 1.0);
+        let lightness = color.l.clamp(0.0, 1.0);
+        let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+        let second = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+        let (red, green, blue) = match hue as u32 {
+            0 => (chroma, second, 0.0),
+            1 => (second, chroma, 0.0),
+            2 => (0.0, chroma, second),
+            3 => (0.0, second, chroma),
+            4 => (second, 0.0, chroma),
+            _ => (chroma, 0.0, second),
+        };
+        let base = lightness - chroma / 2.0;
+        Self::srgb(
+            red + base,
+            green + base,
+            blue + base,
+            color.a.clamp(0.0, 1.0),
+        )
+    }
+}
+
+/// The un-premultiplied sRGB components of `color`, alpha included.
+///
+/// The engine's [`Color`] may name any colour space, while a stored line is spelled in sRGB: a
+/// colour that is already sRGB hands its components over untouched (a picker colour must round-trip
+/// exactly), and every other space is resolved to the linear sRGB the engine paints and encoded
+/// back through the sRGB transfer function. A fully transparent colour has no components to keep,
+/// and dividing by its alpha would produce infinities.
+fn srgb_components(color: Color) -> [f32; 4] {
+    if let Color::Srgb { r, g, b, alpha } = color {
+        return [r, g, b, alpha];
+    }
+    let resolved = ColorResolver.resolve(color).components;
+    let alpha = resolved[3];
+    if alpha <= 0.0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    [
+        linear_to_srgb(resolved[0] / alpha),
+        linear_to_srgb(resolved[1] / alpha),
+        linear_to_srgb(resolved[2] / alpha),
+        alpha,
+    ]
+}
+
+/// Linear sRGB → sRGB encoding: the inverse of the IEC 61966-2-1 curve the engine decodes with.
+fn linear_to_srgb(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
     }
 }
 
@@ -291,6 +386,7 @@ impl CandlestickIndicatorConfig {
     }
 
     /// The entry of `id`, if the configuration holds one.
+    #[cfg(test)]
     pub(crate) fn entry(&self, id: IndicatorId) -> Option<&IndicatorEntry> {
         self.entries.iter().find(|entry| entry.id == id)
     }
@@ -391,7 +487,7 @@ impl CandlestickIndicatorConfig {
     /// Panics if `palette` is empty: the panel always passes the current
     /// appearance's non-empty palette, and a line added without one would have no
     /// colour to store.
-    pub(crate) fn add_line(&mut self, id: IndicatorId, palette: &[Hsla]) -> bool {
+    pub(crate) fn add_line(&mut self, id: IndicatorId, palette: &[Color]) -> bool {
         debug_assert!(!palette.is_empty());
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
             return false;

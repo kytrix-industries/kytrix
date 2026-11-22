@@ -3,7 +3,7 @@
 //! Every expected number below is hand-computed from the design's §7.2
 //! formulas, so a change to a formula fails here rather than on screen.
 
-use gpui_kit::{Hsla, hsla};
+use ui_core::paint::color::Color;
 
 use super::{
     CandlestickIndicatorConfig, IndicatorId, IndicatorInput, IndicatorLine, IndicatorLineConfig,
@@ -624,21 +624,21 @@ fn computed_lines_should_carry_the_configured_colours() {
     let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
     assert_eq!(
         line_of(series_of(&series, IndicatorId::Ma), "MA3").color,
-        hsla(0.11, 0.5, 0.4, 0.75)
+        Color::from(ma_color)
     );
 
     let config = config_with(IndicatorId::Ema, lines_with_colors(&[(3, ema_color)]));
     let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
     assert_eq!(
         line_of(series_of(&series, IndicatorId::Ema), "EMA3").color,
-        hsla(0.22, 0.5, 0.4, 0.75)
+        Color::from(ema_color)
     );
 
     let config = config_with(IndicatorId::Rsi, lines_with_colors(&[(3, rsi_color)]));
     let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
     assert_eq!(
         line_of(series_of(&series, IndicatorId::Rsi), "RSI3").color,
-        hsla(0.33, 0.5, 0.4, 0.75)
+        Color::from(rsi_color)
     );
 
     let mut config = config_with(
@@ -672,16 +672,16 @@ fn computed_lines_should_carry_the_configured_colours() {
     let series = compute_indicators(&flat_inputs(&[1.0; 5]), &config);
 
     let macd = series_of(&series, IndicatorId::Macd);
-    assert_eq!(line_of(macd, "DIF").color, hsla(0.44, 0.5, 0.4, 0.75));
-    assert_eq!(line_of(macd, "DEA").color, hsla(0.55, 0.5, 0.4, 0.75));
+    assert_eq!(line_of(macd, "DIF").color, Color::from(dif_color));
+    assert_eq!(line_of(macd, "DEA").color, Color::from(dea_color));
     assert_eq!(
         line_of(macd, "MACD").color,
-        Hsla::from(default_line_color(2)),
+        Color::from(default_line_color(2)),
         "the histogram line keeps the fixed third colour; neither its bars nor the legend draw it"
     );
 
     let kdj = series_of(&series, IndicatorId::Kdj);
-    assert_eq!(line_of(kdj, "K").color, hsla(0.66, 0.5, 0.4, 0.75));
-    assert_eq!(line_of(kdj, "D").color, hsla(0.77, 0.5, 0.4, 0.75));
-    assert_eq!(line_of(kdj, "J").color, hsla(0.88, 0.5, 0.4, 0.75));
+    assert_eq!(line_of(kdj, "K").color, Color::from(k_color));
+    assert_eq!(line_of(kdj, "D").color, Color::from(d_color));
+    assert_eq!(line_of(kdj, "J").color, Color::from(j_color));
 }

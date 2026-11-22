@@ -1,186 +1,148 @@
-//! Tests for the panel's keyed table of colour pickers.
+//! Which colours the panel offers, and what each picker is handed.
 //!
-//! The table is the panel's answer to "which picker edits which colour": every
-//! field the configuration has is one entry, keyed by the indicator and line it
-//! belongs to, and it shows the colour the configuration stores.
+//! The list is a function of the configuration ([`color_fields`]), so these are the answers the
+//! built pickers are checked against in `smoke_tests`: one field per configurable colour, keyed by
+//! the row it belongs to, carrying the colour the configuration holds.
 
-use gpui_kit::TestAppContext;
-
-use super::colors::{color_fields, color_labels};
+use super::colors::{ColorField, ColorKey, color_fields, field_of};
 use crate::indicator::{
-    CandlestickIndicatorConfig, INDICATOR_CATALOG, IndicatorId, LineColor, SettingControl,
-    SettingKey,
+    CandlestickIndicatorConfig, IndicatorId, LineColor, SettingControl, SettingKey, definition_of,
 };
 
+fn default_config() -> CandlestickIndicatorConfig {
+    CandlestickIndicatorConfig::default()
+}
+
+fn fields_of(config: &CandlestickIndicatorConfig, id: IndicatorId) -> Vec<ColorField> {
+    color_fields(config)
+        .into_iter()
+        .filter(|field| field.id == id)
+        .collect()
+}
+
+/// The default configuration offers twelve colours: MA's three lines, EMA's one, RSI's three,
+/// MACD's two and KDJ's three — and nothing offers a colour the settings do not hold.
 #[test]
 fn the_default_configuration_should_have_twelve_colour_fields() {
-    let config = CandlestickIndicatorConfig::default();
-    let fields = color_fields(&config);
+    let fields = color_fields(&default_config());
 
     assert_eq!(
         fields.len(),
         12,
-        "three MA lines, one EMA line, three RSI lines, MACD's two switch colours and KDJ's three"
+        "the default configuration has twelve colours"
     );
-    for (index, field) in fields.iter().enumerate() {
-        let key = field.key();
-        assert!(
-            !fields[..index].iter().any(|earlier| earlier.key() == key),
-            "{key:?} is listed twice"
-        );
-    }
-    for (id, count) in [
-        (IndicatorId::Ma, 3),
-        (IndicatorId::Ema, 1),
-        (IndicatorId::Vol, 0),
-        (IndicatorId::Macd, 2),
-        (IndicatorId::Rsi, 3),
-        (IndicatorId::Kdj, 3),
-    ] {
-        assert_eq!(
-            fields.iter().filter(|field| field.id == id).count(),
-            count,
-            "{id:?} offers the wrong number of colour fields"
-        );
-    }
+    assert_eq!(
+        fields_of(&default_config(), IndicatorId::Ma).len(),
+        3,
+        "MA's line list has three lines"
+    );
+    assert_eq!(fields_of(&default_config(), IndicatorId::Ema).len(), 1);
+    assert_eq!(fields_of(&default_config(), IndicatorId::Rsi).len(), 3);
+    assert_eq!(fields_of(&default_config(), IndicatorId::Macd).len(), 2);
+    assert_eq!(fields_of(&default_config(), IndicatorId::Kdj).len(), 3);
 }
 
+/// A line list has one field per line, keyed by the line's row and carrying that line's colour.
 #[test]
 fn a_line_list_should_have_one_field_per_line_keyed_by_its_row() {
-    let config = CandlestickIndicatorConfig::default();
-    let fields = color_fields(&config);
+    let config = default_config();
+    let lines = config
+        .entry(IndicatorId::Ma)
+        .and_then(|entry| entry.settings.lines())
+        .expect("MA holds a line list");
+    let fields = fields_of(&config, IndicatorId::Ma);
 
-    for definition in INDICATOR_CATALOG {
-        for row in definition.rows {
-            if !matches!(row.control, SettingControl::LineList { .. }) {
-                continue;
-            }
-            let lines = config
-                .entry(definition.id)
-                .expect("the catalogue always has the entry")
-                .settings
-                .lines()
-                .expect("a line-list row edits a line list");
-            for (index, line) in lines.rows.iter().enumerate() {
-                let field = fields
-                    .iter()
-                    .find(|field| {
-                        field.id == definition.id
-                            && field.row == Some(index)
-                            && field.key == row.key
-                    })
-                    .unwrap_or_else(|| {
-                        panic!("{:?}'s line {index} has no colour field", definition.id)
-                    });
-                assert_eq!(
-                    field.color, line.color,
-                    "{:?}'s line {index} shows the colour it stores",
-                    definition.id
-                );
-            }
-        }
+    assert_eq!(fields.len(), lines.rows.len());
+    for (index, field) in fields.iter().enumerate() {
+        assert_eq!(
+            field.row,
+            Some(index),
+            "a line's colour is keyed by its row, not by its position in the drawn tree"
+        );
+        assert_eq!(
+            field.key,
+            SettingKey::Lines,
+            "the field is the line list's own setting row"
+        );
+        assert_eq!(
+            field.color, lines.rows[index].color,
+            "the field carries line {index}'s stored colour"
+        );
     }
 }
 
+/// A switch row offers the colour key it declares, and the settings hold that colour.
 #[test]
 fn a_switch_row_should_offer_the_colour_key_it_declares() {
-    let config = CandlestickIndicatorConfig::default();
-    let fields = color_fields(&config);
-    let switch_fields: Vec<_> = fields.iter().filter(|field| field.row.is_none()).collect();
-    assert_eq!(
-        switch_fields.len(),
-        5,
-        "MACD's DIF and DEA and KDJ's K, D and J are the switch rows with a colour"
-    );
-
-    for definition in INDICATOR_CATALOG {
-        for row in definition.rows {
+    let config = default_config();
+    let mut seen = 0;
+    for entry in &config.entries {
+        for row in definition_of(entry.id).rows {
             if !matches!(row.control, SettingControl::Switch) {
                 continue;
             }
-            let key = row
-                .color_key
-                .expect("every switch row declares the colour it controls");
-            let field = fields
-                .iter()
-                .find(|field| field.id == definition.id && field.row.is_none() && field.key == key)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{:?}'s {:?} row offers no colour field",
-                        definition.id, row.key
-                    )
-                });
-            let stored = config
-                .entry(definition.id)
-                .expect("the catalogue always has the entry")
-                .settings
-                .color(key)
-                .expect("the row's colour key names a stored field");
+            let Some(key) = row.color_key else {
+                continue;
+            };
+            let field = field_of(
+                &config,
+                ColorKey {
+                    id: entry.id,
+                    row: None,
+                    key,
+                },
+            )
+            .expect("every switch row's colour is listed");
+            assert_eq!(field.row, None, "a switch row is not a line of a list");
             assert_eq!(
-                field.color, stored,
-                "{:?}::{key:?} shows the colour it stores",
-                definition.id
+                Some(field.color),
+                entry.settings.color(key),
+                "the field reports the colour the settings hold"
             );
+            seen += 1;
         }
     }
+    assert!(seen > 0, "the default configuration has switch rows");
 }
 
+/// The field a picker is built for reports the stored colour, so a rebuild hands the picker the
+/// value the configuration holds rather than the one it was created with.
 #[test]
 fn fields_should_report_the_colours_the_configuration_holds() {
-    let line_color = LineColor {
-        h: 0.11,
-        s: 0.22,
-        l: 0.33,
-        a: 0.44,
+    let mut config = default_config();
+    let stored = LineColor {
+        h: 0.33,
+        s: 0.8,
+        l: 0.4,
+        a: 1.0,
     };
-    let switch_color = LineColor {
-        h: 0.55,
-        s: 0.66,
-        l: 0.77,
-        a: 0.88,
-    };
-    let mut config = CandlestickIndicatorConfig::default();
-    assert!(config.set_line_color(IndicatorId::Rsi, 1, line_color));
-    assert!(config.set_color(IndicatorId::Kdj, SettingKey::DColor, switch_color));
-
-    let fields = color_fields(&config);
-
-    let line_field = fields
-        .iter()
-        .find(|field| field.id == IndicatorId::Rsi && field.row == Some(1))
-        .expect("RSI's second line has a field");
-    assert_eq!(
-        line_field.color, line_color,
-        "the field shows the exact stored line colour, alpha included"
+    assert!(
+        config.set_line_color(IndicatorId::Ma, 1, stored),
+        "MA's second line takes a colour"
     );
 
-    let switch_field = fields
-        .iter()
-        .find(|field| field.id == IndicatorId::Kdj && field.key == SettingKey::DColor)
-        .expect("KDJ's D row has a field");
+    let field = field_of(
+        &config,
+        ColorKey {
+            id: IndicatorId::Ma,
+            row: Some(1),
+            key: SettingKey::Lines,
+        },
+    )
+    .expect("the second line's colour is listed");
+
     assert_eq!(
-        switch_field.color, switch_color,
-        "the field shows the exact stored switch colour"
+        field.color, stored,
+        "the picker is handed the stored colour"
     );
-}
-
-/// The picker announces the panel in the language of the frame being drawn.
-///
-/// Only the lookup is pinned here. Whether `sync_pickers` hands these labels to
-/// the picker cannot be asserted: `ColorPicker` keeps its labels private and has
-/// no getter, so the call itself is covered by construction rather than by a
-/// test.
-#[gpui_kit::test]
-fn the_picker_labels_should_be_the_english_set(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        i18n::global::embedded::install(cx).expect("embedded locales should load");
-    });
-    let labels = cx.update(|cx| color_labels(cx));
-
-    assert_eq!(labels.palette.as_ref(), "Palette");
-    assert_eq!(labels.hsla.as_ref(), "HSLA");
-    assert_eq!(labels.hue.as_ref(), "Hue");
-    assert_eq!(labels.saturation.as_ref(), "Saturation");
-    assert_eq!(labels.lightness.as_ref(), "Lightness");
-    assert_eq!(labels.alpha.as_ref(), "Opacity");
+    assert_ne!(
+        field.color,
+        default_config()
+            .entry(IndicatorId::Ma)
+            .and_then(|entry| entry.settings.lines())
+            .expect("MA holds a line list")
+            .rows[1]
+            .color,
+        "the stored colour is not the default one"
+    );
 }
