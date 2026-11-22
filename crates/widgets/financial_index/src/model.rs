@@ -18,14 +18,13 @@
 use std::sync::Arc;
 
 use ahash::{HashSet, HashSetExt};
-use gpui_kit::{App, SharedString};
-use i18n::{language::codes::LanguageCode, t};
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::{FinancialIndexEvent, FinancialIndexTopic};
 use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
-use widget::error::LocalizedError;
+use widget::error::TranslatedError;
 
 /// The most indices one pane may follow.
 ///
@@ -78,48 +77,56 @@ pub(super) enum FinancialIndexInvalidReason {
     NameFormat,
 }
 
-impl LocalizedError for FinancialIndexDataError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for FinancialIndexDataError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
             Self::SelectionCapacity { limit } => {
-                t!(
-                    cx,
+                t_smol!(
+                    translate,
                     "error.financial_index.selection_capacity",
                     limit = limit
                 )
             }
             Self::ManifestCapacity { limit } => {
-                t!(
-                    cx,
+                t_smol!(
+                    translate,
                     "error.financial_index.manifest_too_large",
                     limit = limit
                 )
             }
-            Self::Invalid(reason) => reason.localized_message(cx),
+            Self::Invalid(reason) => reason.translated_message(translate),
         }
     }
 }
 
-impl LocalizedError for FinancialIndexInvalidReason {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for FinancialIndexInvalidReason {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::InvalidCode => t!(cx, "error.financial_index.invalid_code"),
+            Self::InvalidCode => t_smol!(translate, "error.financial_index.invalid_code"),
             Self::DuplicateCategory { code } => {
-                t!(cx, "error.financial_index.duplicate_category", code = code)
+                t_smol!(
+                    translate,
+                    "error.financial_index.duplicate_category",
+                    code = code
+                )
             }
             Self::DuplicateFinancialIndex { code } => {
-                t!(cx, "error.financial_index.duplicate_index", code = code)
+                t_smol!(
+                    translate,
+                    "error.financial_index.duplicate_index",
+                    code = code
+                )
             }
-            Self::UnknownCategory { index, category } => t!(
-                cx,
+            Self::UnknownCategory { index, category } => t_smol!(
+                translate,
                 "error.financial_index.unknown_category",
                 index = index,
                 category = category
             ),
-            Self::MissingName => t!(cx, "error.financial_index.missing_name"),
+            Self::MissingName => t_smol!(translate, "error.financial_index.missing_name"),
             Self::NameFormat => {
-                t!(
-                    cx,
+                t_smol!(
+                    translate,
                     "error.financial_index.name_format",
                     limit = MAX_NAME_CHARS
                 )
@@ -398,14 +405,14 @@ pub(super) fn selection_topics(selection: &[SelectedFinancialIndex]) -> Arc<[Fin
 }
 
 /// A price, in the cents the service publishes.
-pub(super) fn format_price(cents: u32) -> SharedString {
+pub(super) fn format_price(cents: u32) -> SmolStr {
     let major = cents / 100;
     let minor = cents % 100;
-    SharedString::new(format_smolstr!("{major}.{minor:02}").as_str())
+    format_smolstr!("{major}.{minor:02}")
 }
 
 /// A signed move, in the cents the service publishes.
-pub(super) fn format_signed_cents(cents: i64) -> SharedString {
+pub(super) fn format_signed_cents(cents: i64) -> SmolStr {
     let magnitude = cents.unsigned_abs();
     let major = magnitude / 100;
     let minor = magnitude % 100;
@@ -416,15 +423,15 @@ pub(super) fn format_signed_cents(cents: i64) -> SharedString {
     } else {
         ""
     };
-    SharedString::new(format_smolstr!("{sign}{major}.{minor:02}").as_str())
+    format_smolstr!("{sign}{major}.{minor:02}")
 }
 
 /// A signed move, in percent, which a zero open does not have.
-pub(super) fn format_percent(percent: Option<f64>) -> SharedString {
+pub(super) fn format_percent(percent: Option<f64>) -> SmolStr {
     match percent {
-        Some(value) if value > 0.0 => SharedString::new(format_smolstr!("+{value:.2}%").as_str()),
-        Some(value) => SharedString::new(format_smolstr!("{value:.2}%").as_str()),
-        None => SharedString::new_static("--"),
+        Some(value) if value > 0.0 => format_smolstr!("+{value:.2}%"),
+        Some(value) => format_smolstr!("{value:.2}%"),
+        None => SmolStr::new_static("--"),
     }
 }
 
