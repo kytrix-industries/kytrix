@@ -2689,10 +2689,9 @@ name = "empty"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
- "gpui-kit",
  "i18n",
  "serde",
+ "ui_core",
  "widget",
 ]
 

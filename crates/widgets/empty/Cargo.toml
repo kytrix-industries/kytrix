@@ -6,14 +6,17 @@ edition.workspace = true
 
 [dependencies]
 app_config = { workspace = true }
-base_ui = { workspace = true }
-gpui-kit = { workspace = true }
-i18n = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+ui_core = { workspace = true }
 widget = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
+# The product catalogue the hint is authored in: the pane's copy is asserted as the
+# reader gets it, not as a fixture string.
+i18n = { workspace = true }
+# The framework's test host (`WidgetTestApp`), which is what every interface test of
+# this crate drives the widget through.
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
