@@ -21,6 +21,15 @@
 //! download lands in a temporary file and is renamed into place, and a reader only ever sees
 //! whole files. What it holds is bounded by count and by size, evicted oldest first, so it
 //! cannot grow with a session — a picture evicted and asked for again is simply fetched again.
+//!
+//! # Route resolution runs on the fetching task
+//!
+//! The route a media host is reached over is resolved synchronously by the pane's own task. For
+//! a System route that evaluation reads the OS proxy settings and, for PAC, downloads and
+//! executes the PAC document, so it is blocking work on the task that asked for the client.
+//! This is a registered degradation: the previous implementation crossed the application
+//! runtime's blocking pool before awaiting the route, and a media client built here can now
+//! hold its caller for the length of the OS/PAC read.
 
 use std::{
     fs,
@@ -31,7 +40,6 @@ use std::{
 };
 
 use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
-use app_config_provider::notification::ConfigNotification;
 use network::transport::{http::HttpClientClass, hub::TransportHub};
 use reqwest::{Client, Response, StatusCode, header::LOCATION};
 use sha2::{Digest, Sha256};
@@ -40,7 +48,6 @@ use thiserror::Error;
 use tokio::{fs::File, io::AsyncWriteExt, sync::OnceCell, time::Instant};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 /// The largest body this pane accepts, which is also the largest file the cache keeps.
 pub(super) const MEDIA_MAX_BYTES: u64 = 32 * 1_024 * 1_024;
@@ -130,29 +137,19 @@ pub(super) trait MediaTransport: Clone + Send + Sync + 'static {
 }
 
 /// The application's shared transports, resolving the route a media host is reached over.
+///
+/// The route is resolved from a snapshot of the application's network settings taken when the
+/// transport is built, and it is resolved on the task that asks for the client: see the module
+/// documentation for what that costs.
 #[derive(Clone)]
 pub(super) struct SharedTransport {
     hub: Arc<TransportHub>,
-    config: ConfigNotification<Config>,
-    /// The application runtime the route resolution crosses its blocking boundary on.
-    ///
-    /// A picture is fetched from the pane's own task, which holds no Tokio context:
-    /// evaluating the OS proxy for the image host is blocking work, and it is the
-    /// runtime's blocking pool that performs it.
-    runtime: Runtime,
+    config: Config,
 }
 
 impl SharedTransport {
-    pub(super) fn new(
-        hub: Arc<TransportHub>,
-        config: ConfigNotification<Config>,
-        runtime: Runtime,
-    ) -> Self {
-        Self {
-            hub,
-            config,
-            runtime,
-        }
+    pub(super) fn new(hub: Arc<TransportHub>, config: Config) -> Self {
+        Self { hub, config }
     }
 }
 
@@ -160,21 +157,17 @@ impl MediaTransport for SharedTransport {
     async fn client(
         &self,
         destination: &Url,
-        cancellation: &CancellationToken,
+        _cancellation: &CancellationToken,
     ) -> Result<Client, MediaError> {
-        let config = self.config.current();
-        let route = network::proxy::resolve_async_cancellable(
-            &config,
+        let route = network::proxy::resolve(
+            &self.config,
             // What a media request is addressed through is the Kytrix service that serves it,
             // which is what its line is configured under — see the applications page.
             &RouteTarget::Service(ServiceTarget::KytrixService {
                 capability: KytrixServiceCapability::XMedia,
             }),
             destination,
-            cancellation.child_token(),
-            &self.runtime,
         )
-        .await
         .map_err(|error| MediaError::Route(format_smolstr!("{error}")))?;
         self.hub
             .http()
