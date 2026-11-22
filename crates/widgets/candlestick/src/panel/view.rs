@@ -1,157 +1,659 @@
-//! The panel view itself: the configured indicators and the controls that edit
-//! them.
+//! The panel itself: its state, its build / sync / release life, and what it asks the widget to do.
 //!
-//! The panel is an entity of its own rather than a corner of the widget's body:
-//! editing a setting is then one entity's change instead of a repaint of the
-//! chart, and the panel's state — which indicators are open, which field is in
-//! error, the scroll position — is not part of the chart's. It holds the widget
-//! weakly and reads the configuration from it every frame, so the widget stays
-//! the one owner of what is stored; the strong edge the other way (the widget
-//! keeps the panel alive) is what keeps this entity from being dropped the
-//! moment it is built, and the weak one here keeps the two from forming a cycle.
+//! The panel is a sub-view of the candlestick widget, not an entity of its own: it has no
+//! `Render` and no deferred work, it builds its nodes into the widget's body once, and afterwards
+//! the frame's `sync` keeps it current. It never stores the indicator configuration — the widget
+//! owns it, and the panel reads the copy it is handed on every sync. A control that the user
+//! operates writes a [`PanelEdit`]; `sync` applies the edit to a copy of the published
+//! configuration and reports the result through [`PanelRequest::SetIndicator`] into the signal the
+//! widget minted, which is the widget's cue to store and publish it (a change that is not
+//! published only lives in memory). The rows themselves are rebuilt from the configuration the
+//! widget publishes next, which is why the panel never disagrees with the chart about a value.
 //!
-//! The panel's own dimensions are its business; the width it takes out of the
-//! body is [`PANEL_WIDTH`], and the body decides where it goes.
+//! # The three signals
+//!
+//! - `requests` is the widget's: the panel writes committed configuration changes into it.
+//! - `edits` and `invalid` are the panel's own, minted in the panel's scope by [`build`] and
+//!   released by [`release`]. `edits` is how a control's callback — which runs with an
+//!   application context and no panel — hands over what the user did; `invalid` is the field
+//!   currently in error, which every row's hint and error frame read.
+//!
+//! # Rebuilds
+//!
+//! The row tree is a function of `(configuration, language)`: which indicators exist, how many
+//! lines a list has, and what a control's copy says. The panel remembers the pair it built and
+//! rebuilds the block when either moves (AGENTS §15.1 — a kit component's copy is build-time).
+//! Expansion is the panel's own state and rebuilds the block it opens or folds. A field being
+//! typed into is never rebuilt: typing does not change the configuration.
+//!
+//! [`build`]: IndicatorPanel::build
+//! [`release`]: IndicatorPanel::release
 
 use base_ui::{
-    animation::ANIMATION_TICK,
-    scroll_bar::Scrollbar,
-    style::{roles::Roles, theme::ThemeExt},
+    kit::{
+        button::Button,
+        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
+        toggle::Toggle,
+    },
+    style_builder::StyleBuilder,
+    theme::role::Role,
 };
-use gpui_kit::{
-    AnyElement, App, Context, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    base::{Easing, Transition, transition},
-    div,
-    prelude::FluentBuilder,
-    px,
+use i18n::language::codes::LanguageCode;
+use ui_core::{
+    error::EngineError,
+    event::{Action, Event},
+    interaction::{ScrollConfig, ScrollHandle},
+    math::Size,
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+    },
+    paint::{color::Color, style::StylePatch},
 };
-use i18n::t;
-use smol_str::format_smolstr;
+use widget::cx::WidgetCx;
 
 use super::{
-    colors::{self, ColorKey, LinePicker},
-    inputs::{self, InputKey, LineInput},
-    rows,
+    colors::{ColorKey, FieldPicker},
+    inputs::{FieldInput, InputKey},
+    rows::{self, BuiltRows, Wiring},
 };
-use crate::{
-    indicator::{
-        CandlestickIndicatorConfig, INDICATOR_CATALOG, IndicatorDefinition, IndicatorId,
-        IndicatorPane, LineColor, SettingControl, SettingKey,
-    },
-    view::CandlestickWidget,
+use crate::indicator::{
+    CandlestickIndicatorConfig, INDICATOR_CATALOG, IndicatorId, LineColor, SettingKey,
 };
 
 /// The width the panel takes out of the pane body.
 ///
-/// Fixed rather than draggable, and the budget is counted from the widest thing in
-/// it: a line row. The panel's own [`PANEL_PADDING`] takes 16, a card's 1px border and
-/// [`CARD_PADDING`] take 18 more, and [`rows::SETTING_INSET`] takes 24 inside the row,
-/// which leaves 202 for the row's content. The controls take 102 of those — a 60px
-/// period field, a 20px colour picker and a 22px delete button — and the three 8px gaps
-/// between them take 24, so the spacer that holds the controls at the right edge still
-/// has 76 to give. The delete button's 22 rather than a stated width is the icon's 12
-/// plus its own two 4px paddings and 1px borders: the button is as wide as what it
-/// draws, so the number tracks the size it is given. A pane narrower than this presses
-/// the chart down to its own minimum plot width and the body clips the panel's right
-/// edge — the panel's visibility is decided by whether it is open, not by how wide the
-/// pane is, because `Render` cannot measure the box it is drawn in.
+/// Fixed rather than draggable. The body gives the panel a column of exactly this width and hides
+/// or shows that column, so opening and closing the panel never resizes the chart's plot.
 pub(crate) const PANEL_WIDTH: f32 = 260.0;
 
-/// The padding around the panel's rows.
-///
-/// It is also the margin a card has on every side: the column is inset by this, and
-/// the gap the column puts between two cards is [`ROW_GAP`], which is stated as the
-/// same number. A card inset by less than the gap beside it reads as if the gap were
-/// the card's margin and the padding something else — which is what the panel looked
-/// like while the two numbers were 4 and 8.
+/// The padding around the panel's cards.
 const PANEL_PADDING: f32 = 8.0;
-/// The padding inside one indicator's card, on all four sides.
+/// The gap between two cards, and between a section heading and the first card under it.
+const CARD_GAP: f32 = 8.0;
+
+/// The selector the panel's root node carries.
+const PANEL_ROOT_SELECTOR: &str = "TEST_CANDLESTICK_INDICATOR_PANEL";
+/// The selector the panel's scroll container carries.
+const PANEL_SCROLL_SELECTOR: &str = "TEST_CANDLESTICK_INDICATOR_PANEL_SCROLL";
+/// The selector the column the cards are built into carries.
+const PANEL_CONTENT_SELECTOR: &str = "TEST_CANDLESTICK_INDICATOR_PANEL_CONTENT";
+
+/// What the panel asks the widget to do.
 ///
-/// The same number as [`PANEL_PADDING`]: what the eye compares is a card's own inset
-/// to the space around it, and a card that held its content 4px from its edge while
-/// the next card began 8px below it looked like two different margins.
-pub(super) const CARD_PADDING: f32 = PANEL_PADDING;
-/// The gap between two cards, and between a section heading and the first card
-/// under it.
+/// The panel never stores the configuration, so a committed change is a request: the widget
+/// stores it, publishes it, and hands it back on the next sync.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PanelRequest {
+    /// A control committed an edit; this is the configuration to store and publish.
+    SetIndicator(CandlestickIndicatorConfig),
+}
+
+/// One thing a control, or the panel's own keyboard-free interaction, did.
 ///
-/// One gap for both: the column is one flex container whose `gap` places the
-/// headings and the cards alike, so the space above a group of cards is the space
-/// between them.
+/// Written by callbacks into the panel's `edits` signal and applied by `sync` to a copy of the
+/// published configuration. An expansion never reaches the configuration: it only changes which
+/// rows the panel draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum PanelEdit {
+    /// Enable or disable one indicator.
+    SetEnabled { id: IndicatorId, enabled: bool },
+    /// Turn one named switch on or off.
+    SetSwitch {
+        id: IndicatorId,
+        key: SettingKey,
+        on: bool,
+    },
+    /// Append one line to an indicator's line list.
+    AddLine(IndicatorId),
+    /// Remove one line from an indicator's line list.
+    RemoveLine { id: IndicatorId, index: usize },
+    /// Write a period the user typed: a line's, or one named setting's.
+    SetPeriod { key: InputKey, period: u32 },
+    /// Write a colour the user confirmed: a line's, or one switch row's.
+    SetColor { key: ColorKey, color: Color },
+    /// Open or fold one indicator's settings; never reaches the configuration.
+    ToggleExpanded(IndicatorId),
+}
+
+impl PanelEdit {
+    /// Applies one committed edit to `config`, and returns whether the configuration took it.
+    ///
+    /// `palette` is the current appearance's chart-series palette, which is where a line the user
+    /// adds takes its first colour from. Whether the value really moved is decided by comparing
+    /// the whole configuration afterwards, not here: an edit can be accepted and change nothing.
+    fn apply(self, config: &mut CandlestickIndicatorConfig, palette: &[Color]) -> bool {
+        match self {
+            Self::SetEnabled { id, enabled } => {
+                let Some(entry) = config.entries.iter_mut().find(|entry| entry.id == id) else {
+                    return false;
+                };
+                if entry.enabled == enabled {
+                    return false;
+                }
+                entry.enabled = enabled;
+                true
+            }
+            Self::SetSwitch { id, key, on } => config.set_switch(id, key, on),
+            Self::AddLine(id) => config.add_line(id, palette),
+            Self::RemoveLine { id, index } => config.remove_line(id, index),
+            Self::SetPeriod { key, period } => match key.row {
+                Some(index) => config.set_line_period(key.id, index, period),
+                None => config.set_setting_period(key.id, key.key, period),
+            },
+            Self::SetColor { key, color } => match key.row {
+                Some(index) => config.set_line_color(key.id, index, LineColor::from(color)),
+                None => config.set_color(key.id, key.key, LineColor::from(color)),
+            },
+            Self::ToggleExpanded(_) => false,
+        }
+    }
+}
+
+/// One control the built rows own.
 ///
-/// The same number as [`CARD_PADDING`]: the gap between two cards and the inset each
-/// card holds its content by are one measure, so no two neighbours in the panel look
-/// further apart than two others.
-const ROW_GAP: f32 = CARD_PADDING;
+/// The panel keeps the component handle rather than only its node: the kit's `release` unregisters
+/// the action handler **and** releases the component's signal scope, which is what keeps a
+/// rebuild from leaking a slot per control.
+pub(super) enum Control {
+    Button(Button),
+    Toggle(Toggle),
+    Input(FieldInput),
+    Picker(FieldPicker),
+}
+
+impl Control {
+    /// Routes one platform event into the control.
+    fn dispatch(&mut self, cx: &mut WidgetCx<'_>, event: &Event) -> bool {
+        match self {
+            Self::Button(button) => button.dispatch(cx.app_mut(), event),
+            Self::Toggle(toggle) => toggle.dispatch(cx.app_mut(), event),
+            Self::Input(input) => input.dispatch(cx, event),
+            Self::Picker(picker) => picker.dispatch(cx, event),
+        }
+    }
+
+    /// Releases the control's handlers and signal scope. The row it was built into is removed by
+    /// the panel before this runs.
+    fn release(self, cx: &mut WidgetCx<'_>) {
+        match self {
+            Self::Button(button) => {
+                let _ = button.release(cx.app_mut());
+            }
+            Self::Toggle(toggle) => {
+                let _ = toggle.release(cx.app_mut());
+            }
+            Self::Input(input) => input.release(cx),
+            Self::Picker(picker) => picker.release(cx),
+        }
+    }
+}
 
 /// The indicator settings panel.
 pub(crate) struct IndicatorPanel {
-    /// The chart the settings belong to. Weak: the widget owns this entity, so a
-    /// strong edge here would be a cycle.
-    widget: WeakEntity<CandlestickWidget>,
-    /// Which indicators are open. Not persisted (design D9), so opening the panel
-    /// always starts with every indicator that has settings expanded.
+    /// The widget's signal: where a committed configuration change is handed over.
+    requests: Signal<Option<PanelRequest>>,
+    /// The panel's own control edits and error mark, minted in [`IndicatorPanel::build`] and
+    /// released with the panel's scope.
+    edits: Option<Signal<Option<PanelEdit>>>,
+    invalid: Option<Signal<Option<InputKey>>>,
+    /// One hover mirror per catalogue indicator, read by that card's `bind_style`.
+    hover: Vec<(IndicatorId, Signal<bool>)>,
+    /// The scope the panel's signals belong to.
+    scope: Option<SignalScope>,
+    /// The panel's shell: the root, the scroll container and the card column.
+    root: Option<NodeId>,
+    scroll: Option<NodeId>,
+    content: Option<NodeId>,
+    scroll_handle: Option<ScrollHandle>,
+    scrollbar: Option<ScrollBar>,
+    /// The controls of the built rows, in build order.
+    controls: Vec<Control>,
+    /// The application-level action handlers the node rows registered.
+    actions: Vec<Action>,
+    /// The card node of each indicator, for the pointer mirror.
+    cards: Vec<(IndicatorId, NodeId)>,
+    /// Which indicators are open. Not persisted (design D9): opening the panel always starts with
+    /// every indicator that has settings expanded.
     expanded: Vec<(IndicatorId, bool)>,
-    /// The text fields the period rows edit, one per editable period.
-    inputs: Vec<LineInput>,
-    /// The colour pickers the colour settings edit, one per configurable colour.
-    pickers: Vec<LinePicker>,
-    /// The field whose text is not a period it may take, if there is one. Draws
-    /// the red frame and the hint; nothing is written back while it is set.
-    invalid: Option<InputKey>,
-    /// A field whose text has to be put back to the stored value on the next
-    /// frame: restoring it needs the window, so it waits for the frame that has
-    /// one.
-    pending_reset: Option<InputKey>,
-    /// The next number a field's elements are told apart by. Handed out once and
-    /// never reused, so a field drawn again is a new element.
-    next_slot: u64,
-    scroll: ScrollHandle,
-    /// How many frames this panel has drawn.
-    ///
-    /// A test that asks whether the panel was rebuilt reads this: `debug_bounds`
-    /// answers "was this drawn in the frame that painted it", not "was this
-    /// rebuilt", and the panel is a child entity that is only drawn when it is
-    /// notified.
-    #[cfg(test)]
-    renders: usize,
+    /// The configuration and language the current rows were built from, so a steady frame does
+    /// no work and a moved value rebuilds the block.
+    built_config: Option<CandlestickIndicatorConfig>,
+    built_language: Option<LanguageCode>,
+    /// The scrollable content size written last, so a steady frame writes nothing.
+    scroll_content: Option<Size>,
+    /// The card the pointer is on, so a hover write happens only when it moves.
+    hovered_card: Option<IndicatorId>,
 }
 
 impl IndicatorPanel {
-    /// The panel over `widget`.
+    /// Creates the panel's state: no nodes, no work.
     ///
-    /// It takes no configuration: what it draws is read from the widget on the
-    /// frame that draws it, so "who owns the settings" has one answer.
-    pub(crate) fn new(widget: WeakEntity<CandlestickWidget>, _cx: &mut Context<Self>) -> Self {
+    /// `requests` is the widget's signal: the panel writes a committed configuration change into
+    /// it, and the widget stores, publishes and hands the configuration back on the next sync.
+    pub(crate) fn new(requests: Signal<Option<PanelRequest>>) -> Self {
         Self {
-            widget,
-            // From the catalogue rather than a literal: an indicator added to it
-            // would otherwise start folded, which no compile error would catch.
+            requests,
+            edits: None,
+            invalid: None,
+            hover: Vec::new(),
+            scope: None,
+            root: None,
+            scroll: None,
+            content: None,
+            scroll_handle: None,
+            scrollbar: None,
+            controls: Vec::new(),
+            actions: Vec::new(),
+            cards: Vec::new(),
+            // From the catalogue rather than a literal: an indicator added to it would otherwise
+            // start folded, which no compile error would catch.
             expanded: INDICATOR_CATALOG
                 .iter()
                 .map(|definition| (definition.id, true))
                 .collect(),
-            inputs: Vec::new(),
-            pickers: Vec::new(),
-            invalid: None,
-            pending_reset: None,
-            next_slot: 0,
-            scroll: ScrollHandle::new(),
-            #[cfg(test)]
-            renders: 0,
+            built_config: None,
+            built_language: None,
+            scroll_content: None,
+            hovered_card: None,
         }
     }
 
-    /// The settings to draw, read from the widget on the frame that draws them.
-    pub(super) fn indicator_config(&self, cx: &App) -> Option<CandlestickIndicatorConfig> {
-        Some(self.widget.upgrade()?.read(cx).indicator_config().clone())
+    /// Builds the panel's nodes into `parent`.
+    ///
+    /// Only the shell — the root, its scroll container and the card column — is built here: the
+    /// cards are a function of the configuration, which the first `sync` is handed. The call is
+    /// idempotent: a second `build` while the shell is alive does nothing, and a shell whose root
+    /// was removed is released and rebuilt.
+    pub(crate) fn build(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        if let Some(root) = self.root
+            && cx.tree().get(root).is_ok()
+        {
+            return Ok(());
+        }
+        if self.root.is_some() || self.scope.is_some() {
+            self.release(cx);
+        }
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let scope = cx.app_mut().signal_scope();
+        let edits = cx.app_mut().signal_scoped(scope, None);
+        let invalid = cx.app_mut().signal_scoped(scope, None);
+        let mut hover = Vec::with_capacity(INDICATOR_CATALOG.len());
+        for definition in INDICATOR_CATALOG {
+            hover.push((definition.id, cx.app_mut().signal_scoped(scope, false)));
+        }
+        self.scope = Some(scope);
+        self.edits = Some(edits);
+        self.invalid = Some(invalid);
+        self.hover = hover;
+
+        let root_theme = theme.clone();
+        let root = NodeBuilder::boxed()
+            .id(PANEL_ROOT_SELECTOR)
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .height_full()
+                    .min_height_0()
+                    .flex_col()
+                    .relative()
+                    .build(),
+            )
+            // The body's own background belongs to the framework; this is a region inside the
+            // body, which is allowed to state its own surface.
+            .bind_style(move |read| StylePatch {
+                background: Some(root_theme.role(read, Role::SurfaceRaised)),
+                ..StylePatch::default()
+            })
+            .build(cx.tree_mut(), parent)?;
+        let scroll = NodeBuilder::boxed()
+            .id(PANEL_SCROLL_SELECTOR)
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .flex_1()
+                    .min_height_0()
+                    .width_full()
+                    .relative()
+                    .overflow_hidden()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)?;
+        let handle = cx
+            .app_mut()
+            .make_scroll(window, scroll, ScrollConfig::default())?;
+        let content = NodeBuilder::boxed()
+            .id(PANEL_CONTENT_SELECTOR)
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .flex_col()
+                    .gap(CARD_GAP)
+                    .padding(PANEL_PADDING)
+                    // The column keeps its natural height inside the clipped scroll container;
+                    // its measured height is what makes the panel scrollable.
+                    .flex_none()
+                    .build(),
+            )
+            .build(cx.tree_mut(), scroll)?;
+        let scrollbar_key = cx.unique_key("panel.scrollbar");
+        let scrollbar = ScrollBar::new(
+            cx.app_mut(),
+            theme,
+            scrollbar_key,
+            ScrollbarAxis::Vertical,
+            ScrollbarOptions::default(),
+        );
+        scrollbar.build(cx.tree_mut(), root)?;
+        scrollbar.attach(cx.app_mut(), window, scroll);
+        self.root = Some(root);
+        self.scroll = Some(scroll);
+        self.content = Some(content);
+        self.scroll_handle = Some(handle);
+        self.scrollbar = Some(scrollbar);
+        // The card column has no measured height until the frame that lays the shell out, so the
+        // scroll range cannot be written yet: ask for the frame that can.
+        cx.request_frame()?;
+        Ok(())
+    }
+
+    /// Keeps the panel current from `config`, and returns whether anything changed.
+    ///
+    /// A steady frame does no work: no signal write, no node rebuild, no frame request. A stale
+    /// root (the widget removed the column) is a release, not an error — the panel stays idle
+    /// until it is built again.
+    pub(crate) fn sync(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        config: &CandlestickIndicatorConfig,
+    ) -> Result<bool, EngineError> {
+        let Some(root) = self.root else {
+            return Ok(false);
+        };
+        if cx.tree().get(root).is_err() {
+            self.release(cx);
+            return Ok(false);
+        }
+        let (Some(edits), Some(invalid)) = (self.edits, self.invalid) else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        let mut intents: Vec<PanelEdit> = Vec::with_capacity(2);
+        // A control's callback cannot reach the panel; what it did is taken out of the signal on
+        // the first sync after the frame it asked for. The read is taken out of the signal before
+        // the write: an engine signal is not copied on read, so a write while a read guard is
+        // alive would alias the value it is reading.
+        let edit = *cx.read(&edits);
+        if let Some(edit) = edit {
+            cx.write(&edits, None);
+            intents.push(edit);
+        }
+        for control in &mut self.controls {
+            match control {
+                Control::Input(input) => {
+                    if let Some(edit) = input.sync(cx, invalid) {
+                        intents.push(edit);
+                    }
+                }
+                Control::Picker(picker) => picker.sync(cx)?,
+                Control::Toggle(toggle) => {
+                    toggle.sync(cx.app_mut())?;
+                }
+                Control::Button(button) => {
+                    button.sync(cx.app_mut())?;
+                }
+            }
+        }
+        if let Some(scrollbar) = &self.scrollbar {
+            scrollbar.sync(cx.app_mut())?;
+        }
+        let mut expansion = false;
+        let mut next: Option<CandlestickIndicatorConfig> = None;
+        if !intents.is_empty() {
+            let theme = cx.theme().clone();
+            let palette = theme
+                .theme_for(theme.current(cx.app()))
+                .components()
+                .chart
+                .series;
+            for intent in intents {
+                match intent {
+                    PanelEdit::ToggleExpanded(id) => {
+                        self.toggle_expanded(id);
+                        expansion = true;
+                    }
+                    intent => {
+                        let next = next.get_or_insert_with(|| config.clone());
+                        intent.apply(next, &palette);
+                    }
+                }
+            }
+        }
+        // Only a configuration that really moved is handed over: every field commits when its
+        // caret leaves, and most of those commits change nothing.
+        if let Some(next) = next
+            && next != *config
+        {
+            cx.write(&self.requests, Some(PanelRequest::SetIndicator(next)));
+            changed = true;
+        }
+        let language = *cx.read(&cx.language());
+        if expansion
+            || self.built_language != Some(language)
+            || self.built_config.as_ref() != Some(config)
+        {
+            self.rebuild_rows(cx, config, language)?;
+            changed = true;
+            cx.request_frame()?;
+        }
+        changed |= self.sync_hover(cx);
+        changed |= self.sync_scroll(cx)?;
+        Ok(changed)
+    }
+
+    /// Forwards one platform event to the panel's controls; returns whether one consumed it.
+    ///
+    /// The widget offers the event here before its own handlers see it: a focused period field
+    /// and an open colour picker both own their keystrokes.
+    pub(crate) fn dispatch(&mut self, cx: &mut WidgetCx<'_>, event: &Event) -> bool {
+        let Some(root) = self.root else {
+            return false;
+        };
+        if cx.tree().get(root).is_err() {
+            return false;
+        }
+        let mut consumed = false;
+        for control in &mut self.controls {
+            consumed |= control.dispatch(cx, event);
+        }
+        consumed
+    }
+
+    /// Releases every kit component the panel built and its own signal scope, and removes the
+    /// nodes it built.
+    ///
+    /// Safe to call when [`IndicatorPanel::build`] was never called, and safe to call twice: the
+    /// components are taken out of their fields first, so each scope is released exactly once, and
+    /// a root that is already gone is not removed again.
+    ///
+    /// Nodes go before components: a kit component's `bind_*` closures read signals its own scope
+    /// owns, so the nodes that hold those closures have to be gone before the scope is released.
+    /// The panel removes its own subtree here rather than leaving it to the widget, so a panel
+    /// that is released but not handed straight to [`IndicatorPanel::root`] cannot leave a dead
+    /// tree painting stale content next to a fresh one.
+    pub(crate) fn release(&mut self, cx: &mut WidgetCx<'_>) {
+        if let Some(root) = self.root.take()
+            && cx.tree().get(root).is_ok()
+        {
+            let window = cx.window();
+            let _ = cx.app_mut().remove_node(window, root);
+        }
+        for control in self.controls.drain(..) {
+            control.release(cx);
+        }
+        for action in self.actions.drain(..) {
+            cx.app_mut().off_action(&action);
+        }
+        if let Some(scrollbar) = self.scrollbar.take() {
+            scrollbar.release(cx.app_mut());
+        }
+        if let Some(scope) = self.scope.take() {
+            cx.app_mut().release_scope(scope);
+        }
+        self.scroll = None;
+        self.content = None;
+        self.scroll_handle = None;
+        self.edits = None;
+        self.invalid = None;
+        self.hover.clear();
+        self.cards.clear();
+        self.built_config = None;
+        self.built_language = None;
+        self.scroll_content = None;
+        self.hovered_card = None;
+    }
+
+    /// The panel's own root node, while it is built.
+    ///
+    /// `None` before the first [`IndicatorPanel::build`] and after [`IndicatorPanel::release`],
+    /// which removes the subtree itself. The widget uses this only for the alive-guarded removal
+    /// it would otherwise do itself; a release has already done it.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> Option<NodeId> {
+        self.root
+    }
+
+    /// Rebuilds the row tree from `config` in `language`, releasing the previous one.
+    ///
+    /// Expansion never leaves the panel, which is why this is the method that consumes it: the
+    /// other edits were applied to the working copy `sync` builds and are already on their way to
+    /// the widget, so the rows built here still show the configuration that was published.
+    fn rebuild_rows(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        config: &CandlestickIndicatorConfig,
+        language: LanguageCode,
+    ) -> Result<(), EngineError> {
+        let Some(content) = self.content else {
+            return Ok(());
+        };
+        let Some(edits) = self.edits else {
+            return Ok(());
+        };
+        let Some(invalid) = self.invalid else {
+            return Ok(());
+        };
+        let window = cx.window();
+        // Nodes first, then the components that built them: a handler reads signals its component
+        // scope owns, so the closures have to be gone before the scope is.
+        let children: Vec<NodeId> = cx.tree().get(content)?.children().to_vec();
+        for child in children {
+            let _ = cx.app_mut().remove_node(window, child);
+        }
+        for control in self.controls.drain(..) {
+            control.release(cx);
+        }
+        for action in self.actions.drain(..) {
+            cx.app_mut().off_action(&action);
+        }
+        self.cards.clear();
+        // A mark on a field that is no longer drawn would keep the panel believing a row is in
+        // error, and would outlive the line it was about.
+        cx.write(&invalid, None);
+        let theme = cx.theme().clone();
+        let built: BuiltRows = rows::build_rows(
+            cx,
+            config,
+            &theme,
+            Wiring { edits, invalid },
+            self.hover.clone(),
+            self.expanded.clone(),
+            content,
+        )?;
+        self.controls = built.controls;
+        self.actions = built.actions;
+        self.cards = built.cards;
+        self.hovered_card = None;
+        self.built_config = Some(config.clone());
+        self.built_language = Some(language);
+        Ok(())
+    }
+
+    /// Mirrors which folded card the pointer is on into that card's hover signal.
+    fn sync_hover(&mut self, cx: &mut WidgetCx<'_>) -> bool {
+        let mut current = cx.app().hovered(cx.window());
+        let mut inside = None;
+        while let Some(node) = current {
+            if let Some((id, _)) = self.cards.iter().find(|(_, card)| *card == node) {
+                inside = Some(*id);
+                break;
+            }
+            current = cx.tree().get(node).ok().and_then(|node| node.parent());
+        }
+        // An open card draws no hover at all: the controls under its title are controls of their
+        // own, and a box around them that lit up would say the whole box is one control.
+        let target = inside.filter(|id| {
+            let definition = crate::indicator::definition_of(*id);
+            !(self.is_expanded(*id) && !definition.rows.is_empty())
+        });
+        if target == self.hovered_card {
+            return false;
+        }
+        if let Some(previous) = self.hovered_card.take()
+            && let Some((_, signal)) = self.hover.iter().find(|(id, _)| *id == previous)
+        {
+            cx.write(signal, false);
+        }
+        if let Some(id) = target {
+            if let Some((_, signal)) = self.hover.iter().find(|(candidate, _)| *candidate == id) {
+                cx.write(signal, true);
+            }
+            self.hovered_card = Some(id);
+        }
+        true
+    }
+
+    /// Publishes the card column's measured height as the scroll container's content size.
+    ///
+    /// The measurement is one frame behind a rebuild — the column is laid out by the frame the
+    /// rebuild requested — so the range settles on the frame after the rows changed, and a steady
+    /// frame writes nothing.
+    fn sync_scroll(&mut self, cx: &mut WidgetCx<'_>) -> Result<bool, EngineError> {
+        let (Some(scroll), Some(content), Some(handle)) =
+            (self.scroll, self.content, self.scroll_handle)
+        else {
+            return Ok(false);
+        };
+        let (viewport, height) = {
+            let tree = cx.tree();
+            let Ok(scroll_node) = tree.get(scroll) else {
+                return Ok(false);
+            };
+            let viewport = scroll_node.layout().bounds.size;
+            let Ok(content_node) = tree.get(content) else {
+                return Ok(false);
+            };
+            (viewport, content_node.layout().bounds.size.height)
+        };
+        if viewport.height <= 0.0 || !height.is_finite() {
+            return Ok(false);
+        }
+        let size = Size::new(viewport.width, height.max(viewport.height));
+        if self.scroll_content == Some(size) {
+            return Ok(false);
+        }
+        cx.app_mut().set_scroll_content(&handle, size)?;
+        self.scroll_content = Some(size);
+        Ok(true)
     }
 
     /// Whether `id`'s settings are open.
-    ///
-    /// An indicator the list does not name is open: that is the same answer the
-    /// constructor gives, so a catalogue entry added later starts open rather
-    /// than folded and unreachable.
     fn is_expanded(&self, id: IndicatorId) -> bool {
         self.expanded
             .iter()
@@ -160,613 +662,15 @@ impl IndicatorPanel {
     }
 
     /// Opens or folds `id`'s settings.
-    pub(super) fn toggle_expanded(&mut self, id: IndicatorId, cx: &mut Context<Self>) {
-        if let Some((_, open)) = self
+    fn toggle_expanded(&mut self, id: IndicatorId) {
+        match self
             .expanded
             .iter_mut()
             .find(|(candidate, _)| *candidate == id)
         {
-            *open = !*open;
+            Some((_, open)) => *open = !*open,
+            // An indicator the panel has not seen starts open, so the first toggle folds it.
+            None => self.expanded.push((id, false)),
         }
-        cx.notify();
-    }
-
-    /// Enables or disables one indicator.
-    pub(super) fn set_enabled(&mut self, id: IndicatorId, enabled: bool, cx: &mut Context<Self>) {
-        let Some(mut next) = self.indicator_config(cx) else {
-            return;
-        };
-        let Some(entry) = next.entries.iter_mut().find(|entry| entry.id == id) else {
-            return;
-        };
-        entry.enabled = enabled;
-        self.write(next, cx);
-    }
-
-    /// Reads one named switch out of `id`'s settings.
-    fn switch(&self, id: IndicatorId, key: SettingKey, cx: &App) -> bool {
-        self.indicator_config(cx)
-            .and_then(|config| config.entry(id)?.settings.switch(key))
-            .unwrap_or(false)
-    }
-
-    /// Turns one named switch of `id` on or off.
-    pub(super) fn set_switch(
-        &mut self,
-        id: IndicatorId,
-        key: SettingKey,
-        on: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut next) = self.indicator_config(cx) else {
-            return;
-        };
-        if next.set_switch(id, key, on) {
-            self.write(next, cx);
-        }
-    }
-
-    /// Appends a line to `id`'s list.
-    pub(super) fn add_line(&mut self, id: IndicatorId, cx: &mut Context<Self>) {
-        let Some(mut next) = self.indicator_config(cx) else {
-            return;
-        };
-        let palette = cx.theme().components.chart.series.map(|color| color.hsla);
-        if next.add_line(id, &palette) {
-            self.write(next, cx);
-        }
-    }
-
-    /// Removes one line from `id`'s list.
-    ///
-    /// The last line stays: at the minimum its catalogue row declares the panel
-    /// draws no delete button at all, and the configuration refuses the removal
-    /// anyway, so an action that slipped past the panel cannot empty the list.
-    pub(super) fn remove_line(&mut self, id: IndicatorId, index: usize, cx: &mut Context<Self>) {
-        let Some(mut next) = self.indicator_config(cx) else {
-            return;
-        };
-        if next.remove_line(id, index) {
-            self.write(next, cx);
-        }
-    }
-
-    /// Records the text a field holds while it is being typed into.
-    ///
-    /// Typing never writes: a half-typed number is a value the user has not given
-    /// yet, and the configuration only ever holds a period the panel accepted.
-    /// What this decides is whether the row is in error, so the red frame and the
-    /// hint follow the text as it is typed.
-    pub(super) fn on_input_change(&mut self, key: InputKey, text: &str, cx: &mut Context<Self>) {
-        let invalid = self
-            .field_bounds(key, cx)
-            .is_some_and(|(min, max)| parse_period(text, min, max).is_none())
-            .then_some(key);
-        if self.invalid != invalid {
-            self.invalid = invalid;
-            cx.notify();
-        }
-    }
-
-    /// Commits a field when the caret leaves it.
-    ///
-    /// A period is written back through the widget, which is the one place that
-    /// publishes; anything else leaves the configuration alone and asks the next
-    /// frame to put the stored value back into the field and take the red frame
-    /// down.
-    pub(super) fn on_input_blur(&mut self, key: InputKey, text: &str, cx: &mut Context<Self>) {
-        let Some((min, max)) = self.field_bounds(key, cx) else {
-            return;
-        };
-        let Some(period) = parse_period(text, min, max) else {
-            self.invalid = Some(key);
-            self.pending_reset = Some(key);
-            cx.notify();
-            return;
-        };
-        if self.invalid == Some(key) {
-            self.invalid = None;
-        }
-        let Some(mut next) = self.indicator_config(cx) else {
-            return;
-        };
-        let applied = match key.row {
-            Some(index) => next.set_line_period(key.id, index, period),
-            None => next.set_setting_period(key.id, key.key, period),
-        };
-        if applied {
-            self.write(next, cx);
-        }
-    }
-
-    /// The range the field `key` names accepts.
-    fn field_bounds(&self, key: InputKey, cx: &App) -> Option<(u32, u32)> {
-        let config = self.indicator_config(cx)?;
-        let field = inputs::field_of(&config, key)?;
-        Some((field.min, field.max))
-    }
-
-    /// Hands an edited configuration to the widget.
-    ///
-    /// The panel keeps no copy of what it changed: the next frame draws what the
-    /// widget reports, so the field the user just left and the chart cannot
-    /// disagree. `publish` is the widget's, because a change that is not
-    /// published only lives in memory.
-    ///
-    /// A configuration that says what the stored one already says is dropped
-    /// here: every field of the panel commits when it is left, and most of those
-    /// commits change nothing. The widget would not publish again, but the panel
-    /// would still draw another frame.
-    fn write(&mut self, next: CandlestickIndicatorConfig, cx: &mut Context<Self>) {
-        if self
-            .indicator_config(cx)
-            .is_some_and(|current| current == next)
-        {
-            return;
-        }
-        if let Some(widget) = self.widget.upgrade() {
-            widget.update(cx, |widget, cx| widget.set_indicator_config(next, cx));
-        }
-        cx.notify();
-    }
-
-    /// Puts a field the user left in error back to the stored value.
-    ///
-    /// The frame between the blur and this one keeps the red row, so the user
-    /// sees which field was refused; this frame is the one that has a window, and
-    /// therefore the one that can write text into an input.
-    fn restore_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.pending_reset.take() else {
-            return;
-        };
-        let Some(period) = self
-            .indicator_config(cx)
-            .and_then(|config| inputs::field_of(&config, key))
-            .map(|field| field.period)
-        else {
-            return;
-        };
-        let text = format_smolstr!("{period}");
-        if let Some(input) = self
-            .inputs
-            .iter()
-            .find(|input| input.id == key.id && input.row == key.row && input.key == key.key)
-        {
-            input.entity.update(cx, |state, cx| {
-                state.update_value(text.as_str(), window, cx);
-            });
-        }
-        if self.invalid == Some(key) {
-            self.invalid = None;
-        }
-    }
-
-    /// Creates, reuses and drops the input entities the fields need this frame.
-    ///
-    /// Three rules, each of which is a bug if it is missing: a field drawn again
-    /// gets the entity it had (a rebuilt one loses the caret), a field whose
-    /// stored value moved under it gets a new one (the old one shows a number
-    /// that is no longer stored), and a field whose line is gone loses its entity
-    /// (the table would otherwise grow without bound and a line added later would
-    /// come back holding the deleted line's text).
-    fn sync_inputs(
-        &mut self,
-        config: &CandlestickIndicatorConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let fields = inputs::input_fields(config);
-        self.inputs.retain(|input| {
-            fields.iter().any(|field| {
-                field.id == input.id
-                    && field.row == input.row
-                    && field.key == input.key
-                    && field.period == input.built_from
-            })
-        });
-        for field in &fields {
-            if self.inputs.iter().any(|input| {
-                input.id == field.id && input.row == field.row && input.key == field.key
-            }) {
-                continue;
-            }
-            let slot = self.next_slot;
-            self.next_slot += 1;
-            self.inputs
-                .push(LineInput::connect(field, slot, window, cx));
-        }
-        // A mark on a field that is no longer drawn would keep the panel
-        // believing a row is in error, and would outlive the line it was about.
-        let live = |key: &InputKey| {
-            fields
-                .iter()
-                .any(|field| field.id == key.id && field.row == key.row && field.key == key.key)
-        };
-        self.invalid = self.invalid.filter(|key| live(key));
-        self.pending_reset = self.pending_reset.filter(|key| live(key));
-    }
-
-    /// Creates, reuses and drops the colour pickers the settings need this frame.
-    ///
-    /// Retention follows the same rule as the inputs': a field drawn again keeps
-    /// its entity, and a field the configuration no longer holds loses it. What
-    /// differs is the colour: a picker whose stored colour moved is written back
-    /// rather than rebuilt, because the picker's own state — the tab it is on,
-    /// the caret in its hex field — belongs to the user, and `set_color` emits no
-    /// change, so writing the stored colour back cannot loop through its handler.
-    fn sync_pickers(
-        &mut self,
-        config: &CandlestickIndicatorConfig,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let fields = colors::color_fields(config);
-        let labels = colors::color_labels(cx);
-        self.pickers
-            .retain(|picker| fields.iter().any(|field| field.key() == picker.key()));
-        for field in &fields {
-            let color = Hsla::from(field.color);
-            if let Some(picker) = self
-                .pickers
-                .iter()
-                .find(|picker| picker.key() == field.key())
-            {
-                picker.entity().update(cx, |picker, cx| {
-                    picker.set_labels(labels.clone(), cx);
-                    if picker.color() != color {
-                        picker.set_color(color, window, cx);
-                    }
-                });
-                continue;
-            }
-            let slot = self.next_slot;
-            self.next_slot += 1;
-            self.pickers
-                .push(LinePicker::connect(field, slot, &labels, window, cx));
-        }
-    }
-
-    /// Stores the colour the picker confirmed, and publishes it once.
-    ///
-    /// The key says which control the picker edits: a line list applies the
-    /// colour to that line, and a switch row to the one field its colour key
-    /// names. A key the configuration no longer holds is ignored, because the
-    /// picker that reported it is about to be dropped with its line.
-    ///
-    /// The picker reports a colour only when the user confirms it in its panel,
-    /// so this is one write per interaction and the widget's own publish is the
-    /// only one: a panel dismissed without confirming never reaches here.
-    pub(super) fn commit_color(&mut self, key: ColorKey, color: Hsla, cx: &mut Context<Self>) {
-        let Some(mut next) = self.indicator_config(cx) else {
-            return;
-        };
-        let applied = match key.row {
-            Some(index) => next.set_line_color(key.id, index, LineColor::from(color)),
-            None => next.set_color(key.id, key.key, LineColor::from(color)),
-        };
-        if !applied {
-            return;
-        }
-        if let Some(widget) = self.widget.upgrade() {
-            widget.update(cx, |widget, cx| widget.set_indicator_config(next, cx));
-        }
-    }
-
-    /// The picker of one colour field, if the panel holds it.
-    fn color_picker(
-        &self,
-        id: IndicatorId,
-        row: Option<usize>,
-        key: SettingKey,
-    ) -> Option<&LinePicker> {
-        self.pickers
-            .iter()
-            .find(|picker| picker.key() == ColorKey { id, row, key })
-    }
-
-    /// One indicator's card: its node row, and its settings while it is open, in
-    /// the one box that holds everything the indicator draws.
-    ///
-    /// The card is returned whole rather than as the rows it is made of, because
-    /// the box is what says "these rows belong to this indicator": an expanded
-    /// card that stopped at the node row would draw the settings of one indicator
-    /// between the cards of two. Its padding is the inset the node row starts
-    /// from; a settings row under it is that much plus `rows::SETTING_INSET`, so
-    /// that its first control lands on the line the square inside that checkbox is
-    /// drawn on.
-    fn indicator_card(
-        &self,
-        index: usize,
-        definition: &'static IndicatorDefinition,
-        config: &CandlestickIndicatorConfig,
-        panel: &WeakEntity<IndicatorPanel>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<AnyElement> {
-        let entry = config.entry(definition.id)?;
-        let expanded = self.is_expanded(definition.id);
-        // Whether the card is showing anything under its node row. An indicator
-        // with nothing to configure has no caret to open, so its card is its node
-        // row for as long as the panel is on screen: it counts as folded, and it
-        // answers the pointer like every other card that is only a title.
-        let open = expanded && !definition.rows.is_empty();
-        let node = rows::node_row(index, definition, entry.enabled, expanded, panel, cx);
-        let mut settings = Vec::with_capacity(definition.rows.len() + 1);
-        if open {
-            // Enumerated because a period row is named after its place in the
-            // definition: two of an indicator's rows can both be periods, so the
-            // key alone would not tell their labels apart.
-            for (row_index, row) in definition.rows.iter().enumerate() {
-                match row.control {
-                    SettingControl::LineList { .. } => {
-                        let Some(lines) = entry.settings.lines() else {
-                            continue;
-                        };
-                        if let Some(list) = rows::line_list(
-                            index,
-                            definition.id,
-                            row,
-                            lines,
-                            &self.inputs,
-                            &self.pickers,
-                            self.invalid,
-                            panel,
-                            cx,
-                        ) {
-                            settings.push(list);
-                        }
-                    }
-                    SettingControl::Period { .. } => {
-                        let Some(input) = self.line_input(definition.id, None, row.key) else {
-                            continue;
-                        };
-                        settings.push(rows::period_row(
-                            row_index,
-                            row,
-                            input,
-                            self.is_invalid(definition.id, None, row.key),
-                            cx,
-                        ));
-                    }
-                    SettingControl::Switch => {
-                        // The catalogue gives every switch row a colour, which is
-                        // what puts a picker on its right. A switch without one
-                        // would be a row the panel cannot draw as designed.
-                        let color_key = row
-                            .color_key
-                            .expect("every switch row declares the colour it controls");
-                        let Some(picker) = self.color_picker(definition.id, None, color_key) else {
-                            continue;
-                        };
-                        settings.push(rows::switch_row(
-                            index,
-                            definition.id,
-                            row,
-                            self.switch(definition.id, row.key, cx),
-                            picker,
-                            panel,
-                            cx,
-                        ));
-                    }
-                }
-            }
-        }
-        let mut children = Vec::with_capacity(settings.len() + 1);
-        children.push(node);
-        children.extend(settings);
-        // The card answers the pointer while it is folded — which includes an
-        // indicator that has nothing to open, since its card is only ever a title.
-        // An expanded card attaches no listener at all: the settings under the
-        // title are controls of their own, and a box around them that lit up would
-        // say the whole box is one control.
-        Some(card(index, definition.id, !open, children, window, cx))
-    }
-
-    /// The entity of one field, if the panel drew it this frame.
-    fn line_input(
-        &self,
-        id: IndicatorId,
-        row: Option<usize>,
-        key: SettingKey,
-    ) -> Option<&LineInput> {
-        self.inputs
-            .iter()
-            .find(|input| input.id == id && input.row == row && input.key == key)
-    }
-
-    /// Whether the row of one field is the one in error.
-    fn is_invalid(&self, id: IndicatorId, row: Option<usize>, key: SettingKey) -> bool {
-        self.invalid == Some(InputKey { id, row, key })
-    }
-}
-
-/// Reads a period out of the text a field holds.
-///
-/// `trim` because a field the user leaves with a trailing space holds a number
-/// they typed rather than a different answer; the range is inclusive on both
-/// ends, which is what the hint's sentence names.
-fn parse_period(text: &str, min: u32, max: u32) -> Option<u32> {
-    text.trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|period| (min..=max).contains(period))
-}
-
-/// The colours one card is painted in, given what it is and whether the pointer is
-/// on it.
-///
-/// A pure function so the three states the user asked for are one piece of logic a
-/// test can call: a folded card under the pointer, a folded card at rest, and a card
-/// whose settings are open (which draws no hover at all). The hover is a veil
-/// composited over the resting surface rather than a colour of its own, so one
-/// recipe darkens a light surface and lightens a dark one by itself.
-pub(super) fn card_colors(roles: &Roles, folded: bool, hovered: bool) -> (Hsla, Hsla) {
-    let background = roles.surface.sunken.hsla;
-    if !folded || !hovered {
-        return (background, roles.line.divider.hsla);
-    }
-    (
-        background.blend(roles.veil.hover.hsla),
-        roles.line.strong.hsla,
-    )
-}
-
-/// One indicator's card: the box holding its node row and everything under it.
-///
-/// A card is drawn in one of two states, and the difference is not only colour:
-/// a folded card answers the pointer (its background and border lift), while an
-/// expanded one draws no hover at all — its listener is not attached, so the
-/// pointer over it lands on nothing that reacts. That is why `on_hover` is
-/// conditional rather than attached always, and why the state it writes lives in
-/// the window under `(card_id, "hover")`: the panel is redrawn on every change, so
-/// a field on it would be a second copy per frame.
-fn card(
-    index: usize,
-    id: IndicatorId,
-    folded: bool,
-    children: Vec<AnyElement>,
-    window: &mut Window,
-    cx: &mut App,
-) -> AnyElement {
-    let card_id = rows::card_id(index);
-    let hover_state = window.use_keyed_state((card_id.clone(), "hover"), cx, |_, _| false);
-    let hovered = *hover_state.read(cx);
-    let (background, border) = card_colors(&cx.theme().roles, folded, hovered);
-    let bg = transition(
-        (card_id.clone(), "bg"),
-        background,
-        Transition::new(ANIMATION_TICK).easing(Easing::EaseInOut),
-        window,
-        cx,
-    );
-    let border_color = transition(
-        (card_id.clone(), "border"),
-        border,
-        Transition::new(ANIMATION_TICK).easing(Easing::EaseInOut),
-        window,
-        cx,
-    );
-
-    div()
-        .debug_selector(move || rows::card_selector(id))
-        .id(card_id)
-        .w_full()
-        .flex()
-        .flex_col()
-        .rounded_sm()
-        .border_1()
-        .border_color(border_color)
-        .bg(bg)
-        .p(px(CARD_PADDING))
-        .children(children)
-        .when(folded, |card| {
-            card.on_hover(move |hovered, _, cx| hover_state.write(cx, *hovered))
-        })
-        .into_any_element()
-}
-
-impl Render for IndicatorPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(test)]
-        {
-            self.renders += 1;
-        }
-        let Some(config) = self.indicator_config(cx) else {
-            // The chart is gone, so the settings it would edit are too. This
-            // entity is dropped with it.
-            return div().size_full().min_h_0().into_any_element();
-        };
-        self.restore_pending(window, cx);
-        self.sync_inputs(&config, window, cx);
-        self.sync_pickers(&config, window, cx);
-        let panel = cx.entity().downgrade();
-        let mut content = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(ROW_GAP))
-            .p(px(PANEL_PADDING));
-        for pane in [IndicatorPane::Main, IndicatorPane::Sub] {
-            content = content.child(rows::section_title(pane, t!(cx, section_key(pane)), cx));
-            for (index, definition) in INDICATOR_CATALOG.iter().enumerate() {
-                if definition.pane != pane {
-                    continue;
-                }
-                let card = self.indicator_card(index, definition, &config, &panel, window, cx);
-                content = content.children(card);
-            }
-        }
-
-        div()
-            .debug_selector(|| "TEST_CANDLESTICK_INDICATOR_PANEL".into())
-            .relative()
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            // The body's own background belongs to the framework; this is a
-            // region inside the body, which is allowed to state its own surface.
-            .bg(cx.theme().roles.surface.raised.hsla)
-            .child(
-                div()
-                    .id(ElementId::Name(SharedString::new_static(
-                        "CandlestickIndicatorPanelScroll",
-                    )))
-                    .size_full()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .child(content),
-            )
-            .child(Scrollbar::vertical(self.scroll.clone()))
-            .into_any_element()
-    }
-}
-
-/// The heading key of one region of the chart.
-fn section_key(pane: IndicatorPane) -> &'static str {
-    match pane {
-        IndicatorPane::Main => "widget.candlestick.indicator.main",
-        IndicatorPane::Sub => "widget.candlestick.indicator.sub",
-    }
-}
-
-#[cfg(test)]
-impl IndicatorPanel {
-    /// How many frames this panel has drawn.
-    pub(super) fn rendered_frames(&self) -> usize {
-        self.renders
-    }
-
-    /// How many input entities the panel is holding.
-    pub(super) fn input_count(&self) -> usize {
-        self.inputs.len()
-    }
-
-    /// The entity of one field, so that a test can drive what the window would.
-    pub(super) fn input_entity(
-        &self,
-        id: IndicatorId,
-        row: Option<usize>,
-        key: SettingKey,
-    ) -> Option<gpui_kit::Entity<base_ui::input::InputState>> {
-        self.line_input(id, row, key)
-            .map(|input| input.entity.clone())
-    }
-
-    /// How many colour pickers the panel is holding.
-    pub(super) fn color_picker_count(&self) -> usize {
-        self.pickers.len()
-    }
-
-    /// The picker of one colour field, so that a test can drive what a user does.
-    pub(super) fn color_picker_entity(
-        &self,
-        key: ColorKey,
-    ) -> Option<gpui_kit::Entity<base_ui::color_picker::ColorPicker>> {
-        self.pickers
-            .iter()
-            .find(|picker| picker.key() == key)
-            .map(|picker| picker.entity().clone())
     }
 }

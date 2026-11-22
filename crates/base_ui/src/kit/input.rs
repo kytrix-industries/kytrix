@@ -27,7 +27,9 @@
 //!
 //! 编辑产生的 `Change` / `Blur` 由外壳**读状态信号**观察（`InputState::text` / `is_focused` /
 //! `error`）；`PressEnter` 通过 [`InputSpec::submit`] 动作表达（单行输入在焦点节点上派发）。
-//! 图标 / 清空按钮 / 密码可见性切换都依赖「图标与资源」批次，本模块不引入。
+//! 前缀图标 / 密码可见性切换仍属后续批；**清空**能力在 P2-11 补上（[`InputNode::set_clearable`]
+//! 建自绘清空控件，[`InputNode::clear`] 是程序化读点），失焦提交用
+//! [`InputNode::set_submit_on_blur`] 打开（W7 的 period 提交缺口）。
 //!
 //! # 已知边界（引擎没有公开 API，不做变通实现）
 //!
@@ -64,12 +66,14 @@
 //!   两者差异见 `kit-text.md` §4.2.13。
 
 use std::{
+    cell::{Cell, RefCell},
+    fmt,
     ops::Range,
     sync::{Arc, OnceLock},
 };
 
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::LengthPercentageAuto;
+use taffy::style::{Display, LengthPercentageAuto};
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
@@ -96,6 +100,7 @@ use ui_core::{
 };
 
 use crate::{
+    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
     style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
@@ -1172,7 +1177,7 @@ impl InputState {
 }
 
 /// 挂载一次输入框后返回的节点句柄与状态（所有字段在 [`build`] 里一次确定）。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct InputNode {
     /// 可聚焦容器：背景 / 边框 / 内边距 / 点击动作。
     pub root: NodeId,
@@ -1195,6 +1200,30 @@ pub struct InputNode {
     /// caret 颜色来源：外观切换后 `sync` 按 `ThemeHandle` 的当前外观重取（信号依赖在
     /// `caret` 节点的 `bind_style` 里登记，外观写入时该节点标脏 → 出一帧 → `sync` 重画画布）。
     theme: ThemeHandle,
+    /// 清空控件（[`InputNode::set_clearable`] 之后；`None` = 没有清空能力）。
+    ///
+    /// 它是 `kit::Button`（图标 + a11y 名字 + 自己的信号作用域），不是本模块自绘的点击壳：
+    /// `release` / `release` 一侧必须归还它的作用域（W2a F2 的泄漏）。
+    clear: RefCell<Option<Button>>,
+    /// 失焦提交开关（[`InputNode::set_submit_on_blur`]；`false` = 旧语义，只有 Enter 提交）。
+    submit_on_blur: Cell<bool>,
+}
+
+/// 手写 `Debug`：`clear` 里的 `Button` 没有 `Debug`，且节点的调试面只需要身份与两个开关
+/// （不是可用的 `Debug` 输出）。
+impl fmt::Debug for InputNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InputNode")
+            .field("name", &self.spec.name)
+            .field("root", &self.root)
+            .field("text", &self.text)
+            .field("placeholder", &self.placeholder)
+            .field("caret", &self.caret)
+            .field("clearable", &self.clear.borrow().is_some())
+            .field("submit_on_blur", &self.submit_on_blur.get())
+            .finish()
+    }
 }
 
 /// 在 `tree` 的 `parent` 下挂载输入框，返回节点句柄。
@@ -1482,6 +1511,8 @@ pub fn build(
         spec,
         scroll: Arc::new(OnceLock::new()),
         theme: theme.clone(),
+        clear: RefCell::new(None),
+        submit_on_blur: Cell::new(false),
     }
 }
 
@@ -1659,20 +1690,26 @@ impl InputNode {
         });
     }
 
-    /// 摘除 [`InputNode::install`] 注册的点击定位 / 拖选处理器（释放面；幂等）。
+    /// 摘除 [`InputNode::install`] 注册的点击定位 / 拖选处理器，以及清空控件的作用域与 handler
+    /// （释放面；幂等）。
     ///
-    /// 输入框**不持有**信号作用域：编辑状态与占位符信号由调用方创建、归调用方所有（见
-    /// [`build`] 的参数说明），因此释放面只摘本模块注册的两个 Action handler；节点卸载与
+    /// 输入框**不持有**编辑状态的信号作用域：编辑状态与占位符信号由调用方创建、归调用方所有
+    /// （见 [`build`] 的参数说明），因此释放面只摘本模块注册的 Action handler（清空控件是
+    /// `kit::Button`，它自己的信号作用域要连带归还 —— W2a F2 的泄漏面）；节点卸载与调用方
     /// 作用域回收由调用方负责。**先卸载节点再 release**（handler 闭包捕获了状态信号，信号
     /// 已释放后再求值会读死句柄）。
     ///
-    /// 返回摘除的 handler 数：正常输入框首次 2、重复调用 0；构建期 `disabled` 的输入框
-    /// `install` 是 no-op，release 也返回 0。
+    /// 返回摘除的 handler / 作用域数：正常输入框首次 2（清空控件开着时再加 1）、重复调用 0；
+    /// 构建期 `disabled` 的输入框 `install` 是 no-op，release 也返回 0。
     pub fn release(&self, app: &mut App) -> usize {
-        [click_action(&self.spec), drag_action(&self.spec)]
+        let mut released = [click_action(&self.spec), drag_action(&self.spec)]
             .iter()
             .filter(|action| app.off_action(action))
-            .count()
+            .count();
+        if let Some(button) = self.clear.borrow_mut().take() {
+            released += button.release(app);
+        }
+        released
     }
 
     /// 运行时写值（旧 `set_value` 的**程序化契约**；生产调用点在 P2-5 接线时直接换过来）。
@@ -1718,10 +1755,123 @@ impl InputNode {
         changed
     }
 
-    /// 每轮同步（外壳在帧之前调用）：焦点镜像、IME 开关与 caret 区域、caret/选区 Canvas。
+    /// 程序化清空正文（清空控件点击走同一条路径；P2-11 的 `clear` 读点）。
     ///
-    /// 返回是否写入了状态或换了画布。文本尚未在最近一帧 shape 时（刚编辑过）caret 几何要等
-    /// 下一帧的 text pass，本方法保留旧画布并在下一轮再同步（最多落后一个泵轮）。
+    /// 走 [`InputNode::update_value`] 的**程序化契约**（与旧 `base.clean()` 同义）：绕过
+    /// `readonly` / `disabled`（禁用输入框的清空控件本身不响应点击，见
+    /// [`InputNode::set_clearable`]）、清空撤销 / 重做历史、取消 IME 组合、光标与选区回到开头。
+    /// 返回正文是否真的变了（已经是空正文时 `false`）。
+    pub fn clear(&self, app: &mut App) -> bool {
+        self.update_value(app, "")
+    }
+
+    /// 加 / 去清空能力（P2-11；W8a F4② / W8b 的 `clearable`，旧 `Input::clearable(true)`）。
+    ///
+    /// `true` = 在输入框右侧建一个 `kit::Button` 清空控件（X 图标、`ghost` / `small`、可访问名
+    /// `Clear`）：正文为空时 `display: none`（不占位、不命中），有正文时显示并可点 —— 与旧
+    /// `ClearButton`「`has_value && clearable` 才渲染」的可见行为一致。点击调用
+    /// [`InputNode::clear`]（程序化清空）。输入框禁用时控件仍显示（旧语义）但按钮一并禁用。
+    ///
+    /// `false` = 摘掉清空控件：`Button::release`（归还它自己的信号作用域与 handler）+ 节点卸载。
+    /// 幂等（重复设同一个值返回 `false`）；根节点已卸载时返回 `false` 且不改能力。
+    /// 必须在 [`InputNode::install`] 之后调用（控件挂在已挂载的根上）。
+    ///
+    /// 已知面：控件是**常驻节点**（显示 / 隐藏切 `display`），因此清空能力只在正文非空时改变
+    /// 行宽；空输入框的布局与不带清空能力时一致。
+    pub fn set_clearable(&mut self, app: &mut App, clearable: bool) -> bool {
+        if self.clear.borrow().is_some() == clearable {
+            return false;
+        }
+        let Some(window) = self.root.window() else {
+            return false;
+        };
+        if !clearable {
+            if let Some(button) = self.clear.borrow_mut().take() {
+                if let Some(node) = button.node()
+                    && app
+                        .window(window)
+                        .is_some_and(|target| target.tree().get(node).is_ok())
+                {
+                    let _ = app.remove_node(window, node);
+                }
+                button.release(app);
+            }
+            return true;
+        }
+        let node = self.clone();
+        let key = format_smolstr!("{}.clear", self.spec.name);
+        let button = Button::new(app, self.theme.clone(), key)
+            .icon(IconKind::X)
+            .a11y_label(SmolStr::new_static("Clear"))
+            .ghost()
+            .small()
+            .on_click(move |ctx| {
+                node.clear(ctx.app_mut());
+            });
+        if button.build(app, window, self.root).is_err() {
+            return false;
+        }
+        *self.clear.borrow_mut() = Some(button);
+        self.sync_clear_button(app);
+        true
+    }
+
+    /// 打开 / 关闭**失焦提交**（P2-11；W7 的 period 提交缺口）。
+    ///
+    /// `true` = [`InputNode::sync`] 观察到本输入框**从聚焦变失焦**时，把 [`InputSpec::submit`]
+    /// 动作（若有）以 `ActionSource::Programmatic` 派发到本输入框根节点 —— 与 Enter 提交是同一
+    /// 个动作身份，widget 只需注册一次 handler，不必在自己的 `sync` 里比 `last_focused` 再补一次
+    /// 提交。只对**单行**输入生效（多行输入的 Enter 是换行，失焦提交会与那条语义冲突）。
+    /// `false`（默认）= 旧语义：只有 Enter 派发 submit。返回开关是否真的变了。
+    pub fn set_submit_on_blur(&self, submit_on_blur: bool) -> bool {
+        self.submit_on_blur.replace(submit_on_blur) != submit_on_blur
+    }
+
+    /// 清空控件的显示 / 禁用态同步（正文空 ⇒ `display: none`；输入框禁用 ⇒ 按钮禁用）。
+    ///
+    /// 返回是否改了控件状态。控件不存在时是 no-op（没有清空能力）。
+    fn sync_clear_button(&self, app: &mut App) -> bool {
+        let Some(button) = self.clear.borrow().clone() else {
+            return false;
+        };
+        let Some(node) = button.node() else {
+            return false;
+        };
+        let mut changed = button.set_disabled(app, self.spec.disabled);
+        let display = if app.read(&self.state).text().is_empty() {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        let Some(window) = node.window() else {
+            return changed;
+        };
+        let Some(target) = app.window_mut(window) else {
+            return changed;
+        };
+        let tree = target.tree_mut();
+        let Ok(current) = tree.get(node) else {
+            return changed;
+        };
+        let mut style = current.style().clone();
+        if style.inner.display != display {
+            style.inner.display = display;
+            let _ = tree.set_style(node, style);
+            changed = true;
+        }
+        changed
+    }
+
+    /// 每轮同步（外壳在帧之前调用）：焦点镜像、失焦提交、IME 开关与 caret 区域、caret/选区
+    /// Canvas、清空控件的显示态。
+    ///
+    /// 返回是否写入了状态 / 换了画布 / 改了控件。文本尚未在最近一帧 shape 时（刚编辑过）caret
+    /// 几何要等下一帧的 text pass，本方法保留旧画布并在下一轮再同步（最多落后一个泵轮）。
+    ///
+    /// **失焦提交**（[`InputNode::set_submit_on_blur`]）：本方法观察到「上次镜像为聚焦、本帧
+    /// 引擎焦点已离开」时，把 `spec.submit` 以 `ActionSource::Programmatic` 派发到本输入框根节点
+    /// —— 在**同一次 `sync`** 内完成提交，widget 不用再自己比 `last_focused` 并把提交推迟到
+    /// 下一次路由（W7 的「period 提交晚一帧」）。
     pub fn sync(&self, app: &mut App) -> bool {
         let Some(window) = self.root.window() else {
             return false;
@@ -1737,6 +1887,11 @@ impl InputNode {
             next.set_focused(focused);
             state_changed = true;
         }
+        let blur_submit = was_focused
+            && !focused
+            && self.submit_on_blur.get()
+            && !self.spec.multiline
+            && self.spec.submit.is_some();
         let ime_target = focused && !self.spec.disabled && !self.spec.readonly;
         if ime_target {
             app.set_ime_enabled(window, true);
@@ -1763,8 +1918,25 @@ impl InputNode {
         if state_changed {
             app.write(&self.state, next);
         }
+        // 失焦提交在焦点镜像**写回之后**派发：handler 看到的状态与新焦点一致；派发在 canvas
+        // 计算之后，handler 的写入不会被本轮的 `next` 覆盖。
+        let submitted = if blur_submit {
+            if let Some(submit) = &self.spec.submit {
+                app.dispatch_action(
+                    window,
+                    self.root,
+                    submit.clone(),
+                    ActionSource::Programmatic,
+                )
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let canvas_changed = canvas.is_some_and(|canvas| self.apply_canvas(app, window, canvas));
-        state_changed || scroll_changed || canvas_changed
+        let clear_changed = self.sync_clear_button(app);
+        state_changed || scroll_changed || canvas_changed || clear_changed || submitted
     }
 
     /// 单行 caret 可见性滚动：把文本内容宽 + 当前 caret 的几何交给引擎横向滚动容器。
@@ -2124,7 +2296,7 @@ fn utf8_from_utf16_units(text: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::{cell::Cell, rc::Rc, sync::Arc, time::Instant};
 
     use smol_str::SmolStr;
     use ui_core::{
@@ -2357,6 +2529,59 @@ mod tests {
 
         fn window_ref(&self) -> &ui_core::window::Window {
             self.app.app().window(self.window()).expect("窗口存在")
+        }
+
+        /// 从输入框根向下按调试 id 找节点（清空控件等）。
+        fn find(&self, debug_id: &str) -> Option<NodeId> {
+            let tree = self
+                .app
+                .app()
+                .window(self.window())
+                .expect("窗口存在")
+                .tree();
+            let mut stack = vec![self.node.root];
+            while let Some(node) = stack.pop() {
+                if tree.debug_id(node) == Some(debug_id) {
+                    return Some(node);
+                }
+                if let Ok(target) = tree.get(node) {
+                    stack.extend(target.children().iter().rev().copied());
+                }
+            }
+            None
+        }
+
+        /// 节点的 `display`（清空控件的显示 / 隐藏切换）。
+        fn display_of(&self, node: NodeId) -> taffy::style::Display {
+            self.app
+                .app()
+                .window(self.window())
+                .expect("窗口存在")
+                .tree()
+                .get(node)
+                .expect("节点存在")
+                .style()
+                .inner
+                .display
+        }
+
+        /// 在主键点击节点的中心（先注入 down/up，不额外 drain）。
+        fn click_node(&mut self, node: NodeId) {
+            let bounds = self.app.probe().bounds(node).expect("节点已布局");
+            let point = Point::new(
+                bounds.origin.x + bounds.size.width * 0.5,
+                bounds.origin.y + bounds.size.height * 0.5,
+            );
+            let _ = self.app.inject(InputEvent::pointer_down(
+                point,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
+            let _ = self.app.inject(InputEvent::pointer_up(
+                point,
+                PointerButton::Primary,
+                Modifiers::empty(),
+            ));
         }
     }
 
@@ -2999,6 +3224,86 @@ mod tests {
             0,
             "禁用的输入框没有注册 handler"
         );
+    }
+
+    /// P2-11（W8a F4② / W8b 的 `clearable`）：清空控件只在正文非空时显示；点它清空正文（程序化
+    /// 清空语义）；关掉能力后控件节点与 `Button` 的作用域 / handler 一并归还。
+    #[test]
+    fn a_clearable_input_shows_a_clear_control_only_while_it_has_text() {
+        let mut harness = harness(spec(), focused_state("50"));
+        assert!(harness.node.set_clearable(harness.app.app_mut(), true));
+        assert!(
+            !harness.node.set_clearable(harness.app.app_mut(), true),
+            "重复开启幂等"
+        );
+        let clear = harness.find("test.clear:interactive").expect("清空控件");
+        harness.sync();
+        harness.drain();
+        assert_eq!(
+            harness.display_of(clear),
+            taffy::style::Display::Flex,
+            "有正文 ⇒ 清空控件显示"
+        );
+
+        harness.click_node(clear);
+        harness.sync();
+        harness.drain();
+        assert_eq!(harness.state().text(), "", "点清空控件把正文清空");
+        assert_eq!(
+            harness.display_of(clear),
+            taffy::style::Display::None,
+            "空正文 ⇒ 清空控件隐藏"
+        );
+
+        assert!(harness.node.set_clearable(harness.app.app_mut(), false));
+        assert!(
+            harness.find("test.clear:interactive").is_none(),
+            "关掉能力后控件节点被摘除"
+        );
+        assert!(
+            !harness.node.set_clearable(harness.app.app_mut(), false),
+            "重复关闭幂等"
+        );
+        assert_eq!(
+            harness.node.release(harness.app.app_mut()),
+            2,
+            "清空控件已归还，release 只剩两个 handler"
+        );
+    }
+
+    /// P2-11（W7 的 period 提交缺口）：失焦提交开关 —— 焦点离开的**同一次 sync** 派发
+    /// `spec.submit` 一次；后续 sync 不重复；默认关闭时行为不变（只有 Enter 提交）。
+    #[test]
+    fn blur_dispatches_the_submit_action_when_the_switch_is_on() {
+        let hits = Rc::new(Cell::new(0u32));
+        let submit = Action::Custom(SmolStr::new_static("base_ui.input.blur.submit"));
+        let mut spec = spec();
+        spec.submit = Some(submit.clone());
+        let mut harness = harness(spec, focused_state("50"));
+        let counter = hits.clone();
+        harness.app.app_mut().on_action(submit, move |_ctx| {
+            counter.set(counter.get() + 1);
+        });
+        assert!(harness.node.set_submit_on_blur(true));
+        assert!(
+            !harness.node.set_submit_on_blur(true),
+            "重复设置失焦提交开关幂等"
+        );
+
+        harness.focus();
+        assert_eq!(hits.get(), 0, "聚焦本身不提交");
+        let window = harness.window();
+        assert!(harness.app.app_mut().set_focus(window, None));
+        harness.sync();
+        assert_eq!(hits.get(), 1, "失焦的同一轮 sync 提交一次");
+        harness.sync();
+        assert_eq!(hits.get(), 1, "后续 sync 不重复提交");
+
+        assert!(harness.node.set_submit_on_blur(false));
+        harness.focus();
+        assert!(harness.app.app_mut().set_focus(window, None));
+        harness.sync();
+        assert_eq!(hits.get(), 1, "开关关闭后失焦不提交（旧语义）");
     }
 
     #[test]

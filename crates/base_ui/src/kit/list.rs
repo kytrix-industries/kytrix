@@ -62,7 +62,17 @@
 //! `disabled` 由行基线声明）。E9 的逻辑父领养**只认显式声明的集合角色**（`Row` / `Cell` /
 //! `TreeItem`），所以裸列表的 a11y 父子仍是物理父子（行的父 = 虚拟窗口），不会被 `Table` /
 //! `Tree` 的领养规则误领养（回归测试 `a_plain_list_is_not_adopted_by_collection_semantics`）。
-//! 组合控件（表格 / 树）通过 [`List::set_row_a11y`] 在行基线上叠加集合角色。
+//! 组合控件（表格 / 树 / 菜单）通过 [`List::set_row_a11y`] 在行基线上叠加集合角色；应用的普通
+//! 列表也用同一个公开入口给行容器补可访问名或覆盖角色（W8a F3：行的 a11y 身份属于**行容器**，
+//! widget 不得在行内容根上另行声明 `A11yRole::Row` —— 行容器本来就是 `ListBoxOption`）。补丁
+//! 闭包拿到的是 [`ReadCtx`](ui_core::node::dependency::ReadCtx)，因此行文案可以读语言 / 选中
+//! 信号，写信号即让这些行重新求值，**不需要重建行**（E15 D4 的推荐形态）。
+//!
+//! # 像素滚动（P2-11）
+//!
+//! [`List::scroll_by`] 是给「内容整体平移、读者看的那一行要留在原像素位置」的调用方的入口
+//! （W5b-G1：盘口 live ask 每级 22 px 的补偿）：偏移越界由引擎夹到可用范围，滚走之后
+//! `keep_on_newest` 的下一次 `push` 不再跟随尾部（读者位置由偏移重新判定），滚回尾部后恢复。
 //!
 //! # 双端列表（deque）
 //!
@@ -95,6 +105,7 @@ use ui_core::{
     math::Point,
     node::{
         builder::NodeBuilder,
+        dependency::ReadCtx,
         id::NodeId,
         signal::{Signal, SignalScope},
         tree::{NodeKind, NodeTree},
@@ -669,7 +680,9 @@ struct ListInner {
     /// 不可交互行（树用它表达 `TreeItem::disabled`）：命中 / 选中 / 激活都跳过。
     disabled: RefCell<BTreeSet<usize>>,
     /// 行级 a11y 补丁（表 / 树在列表基线上叠加角色 / 标签 / 展开态）。
-    row_a11y: RefCell<Option<Rc<dyn Fn(usize) -> A11yPatch>>>,
+    ///
+    /// 公开入口是 [`List::set_row_a11y`]；这里存的是它的闭包（`ReadCtx` 让补丁可以读信号）。
+    row_a11y: RefCell<Option<Rc<dyn Fn(&mut ReadCtx<'_>, usize) -> A11yPatch>>>,
     heights: RefCell<RowHeights>,
     /// 重建 / 首帧建行发生在哪一帧（F2）：该帧的布局跑在 text pass **之前**，行内容里的文本
     /// 尚未 shape（量到 0），含文本的行的实测因此不可信 —— `sync` 只在 `frame_index` 前进
@@ -762,10 +775,21 @@ impl List {
         self.inner.disabled.borrow().contains(&index)
     }
 
-    /// 行级 a11y 补丁（组合控件用：表格在列表基线上叠加 `Row` / 单元格语义，树叠加标签 /
-    /// 展开态）。补丁里 `Some` 的字段覆盖列表基线（`selected` / `pos_in_set` /
-    /// `size_of_set` / `disabled`），`None` 保留基线。
-    pub(crate) fn set_row_a11y(&self, row_a11y: impl Fn(usize) -> A11yPatch + 'static) {
+    /// 行级 a11y 补丁：在列表行基线上叠加可访问名 / 角色 / 展开态等语义（P2-11 公开缝）。
+    ///
+    /// 行容器的 a11y 身份由内核声明：虚拟窗口是 `List`、每行是 `ListBoxOption`；`selected` /
+    /// `pos_in_set` / `size_of_set` / `disabled` 来自行基线。本方法的补丁里 `Some` 的字段**覆盖**
+    /// 这些基线（`None` 保留基线），用于：
+    ///
+    /// - 组合控件叠加集合角色（表格的行 `Row`、树的 `TreeItem`、菜单的 `MenuItem`）；
+    /// - 应用的普通列表把行文案挂到**行容器**上（W8a F3：不要再给行内容根声明 `Row`，那只属于
+    ///   真实表格 / 网格；裸列表的行容器本身就是可读的选项语义）。
+    ///
+    /// 闭包的 `&mut ReadCtx` 是 `bind_a11y` 的同一个读上下文：读信号会登记成该行的依赖边，写
+    /// 信号后行补丁重新求值（语言 / 选中集变化不需要重建行）。应该在建树之前调用一次（`build`
+    /// 之前），行挂载时按当时的闭包求值；之后再换闭包不重发已挂载行的补丁（引擎没有对应的失效
+    /// 通道，`App::set_a11y_patch` 是逐节点的显式动态通道）。
+    pub fn set_row_a11y(&self, row_a11y: impl Fn(&mut ReadCtx<'_>, usize) -> A11yPatch + 'static) {
         *self.inner.row_a11y.borrow_mut() = Some(Rc::new(row_a11y));
     }
 
@@ -1117,6 +1141,31 @@ impl List {
         app.scroll_to_item(&list, index, align)
     }
 
+    /// 相对滚动（垂直，逻辑像素；正数向下、负数向上）。
+    ///
+    /// W5b-G1 的入口：旧盘口面板在 live ask 增删一级（`ROW_HEIGHT` = 22 px）时按行高平移偏移，
+    /// 让读者正在读的那一行留在原像素位置，而不是整体跳一行。引擎在写入前把目标偏移夹到
+    /// `[0, 内容高 − 视口高]`，越界量被吃掉（不会滚出空白 / 负偏移）；内容比视口短或列表还没
+    /// `attach` 时是 no-op。`delta` 非有限时 [`EngineError::NotScrollable`]（引擎拒绝 NaN / inf
+    /// 偏移，否则偏移会每帧自请求重绘）。
+    ///
+    /// 固定行高与变高列表走同一条路径（内容高由引擎的 extents 提供，变高列表在
+    /// [`List::sync`] 实测回写之后就是真实前缀和）。锚点语义：偏移是唯一真值 —— 滚动离开
+    /// 尾部后 [`List::push`] 的 `keep_on_newest` 判定（`at_newest`）不再成立，push 保持读者
+    /// 读的那一条；滚回尾部（偏移到最大）后恢复跟随。
+    ///
+    /// 行内容时机与 [`List::scroll_to_item`] 相同：帧内新挂载的行由下一帧 [`List::sync`] 补
+    /// 内容（见模块文档〈行内容的挂载时机〉）。
+    ///
+    /// # Errors
+    /// `StaleNode`（节点已卸载）/ `NotScrollable`（不是滚动容器 / 非有限偏移）。
+    pub fn scroll_by(&self, app: &mut App, delta: f32) -> Result<(), EngineError> {
+        let Some(handle) = self.inner.geometry.borrow().handle else {
+            return Ok(());
+        };
+        app.scroll_by(&handle, Point::new(0.0, delta))
+    }
+
     /// 帧驱动同步：补行内容 → 镜像悬停 → 实测行高回写 → 滚动条几何。
     ///
     /// 返回 `true` = 本次真的改了东西（写信号 / 挂内容 / 行高变化）。无变化时不写状态、
@@ -1424,7 +1473,7 @@ impl List {
                     };
                     let row_a11y = a11y_inner.row_a11y.borrow().clone();
                     if let Some(row_a11y) = row_a11y {
-                        merge_a11y(&mut patch, row_a11y(index));
+                        merge_a11y(&mut patch, row_a11y(cx, index));
                     }
                     patch
                 })
@@ -1782,15 +1831,17 @@ mod ui_tests {
 
     use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
+        a11y::{A11yPatch, A11yRole},
         error::EngineError,
         event::{InputEvent, Modifiers, PointerButton},
-        node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
+        node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
         test_support::app::TestApp,
         text::TextStyle,
     };
 
     use super::{List, ListOptions, RowHeight, SelectionMode};
     use crate::{
+        kit::test_support::a11y_of,
         style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
@@ -1818,6 +1869,11 @@ mod ui_tests {
         let mut app = TestApp::new();
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
         let list = List::new(app.app_mut(), theme, "list", options, content);
+        mounted_harness(app, list, rows)
+    }
+
+    /// 把已建好的（可能已 `set_row_a11y` 的）列表挂进固定尺寸父节点并收敛。
+    fn mounted_harness(mut app: TestApp, list: List, rows: usize) -> Harness {
         list.set_initial_count(app.app_mut(), rows);
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
@@ -2132,6 +2188,56 @@ mod ui_tests {
         assert_eq!(row.selected, Some(true), "选中态进 a11y");
     }
 
+    /// P2-11（W8a F3）：应用可以给**行容器**补可访问名 / 覆盖角色（公开缝
+    /// [`List::set_row_a11y`]）；补丁在行基线上合并，未覆盖字段（`pos_in_set` / `size_of_set`）
+    /// 保留。补丁读信号 ⇒ 文案变化只让行重新求值 a11y，不重建行。
+    #[test]
+    fn an_application_row_a11y_patch_overrides_the_row_baseline() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let label = app.app_mut().signal(SmolStr::new_static("Feed row"));
+        let list = List::new(
+            app.app_mut(),
+            theme,
+            "row-a11y",
+            ListOptions::fixed(ROW_EXTENT),
+            text_row,
+        );
+        list.set_row_a11y(move |cx: &mut ReadCtx<'_>, index| A11yPatch {
+            role: Some(A11yRole::Group),
+            label: Some(format_smolstr!("{} #{index}", cx.read(&label))),
+            ..A11yPatch::default()
+        });
+        let mut harness = mounted_harness(app, list, 4);
+        harness.app.enable_a11y_capture();
+        let _ = harness.app.drain().expect("frame");
+        let row0 = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        {
+            let snapshot = harness.app.a11y().expect("a11y snapshot");
+            let row = a11y_of(snapshot, row0);
+            assert_eq!(row.role, A11yRole::Group, "覆盖行基线的 ListBoxOption");
+            assert_eq!(row.label_text(), Some("Feed row #0"));
+            assert_eq!(row.pos_in_set, Some(0), "未覆盖的基线字段保留");
+            assert_eq!(row.size_of_set, Some(4));
+        }
+
+        // 写信号 = 语言 / 文案切换：同一行节点重新求值补丁（`bind_a11y` 的依赖边）。
+        assert!(
+            harness
+                .app
+                .app_mut()
+                .write(&label, SmolStr::new_static("列表行"))
+        );
+        let _ = harness.app.drain().expect("a11y frame");
+        assert_eq!(
+            harness.list.row_node(harness.app.app(), 0),
+            Some(row0),
+            "行容器不重建"
+        );
+        let snapshot = harness.app.a11y().expect("a11y snapshot");
+        assert_eq!(a11y_of(snapshot, row0).label_text(), Some("列表行 #0"));
+    }
+
     /// E9 回归：纯列表保持 `List` / `ListBoxOption`，**不被**表格 / 树的集合领养规则误领养
     /// （行父仍是虚拟窗口；快照里不出现任何集合角色）。
     #[test]
@@ -2296,6 +2402,111 @@ mod ui_tests {
         }
         let offset = harness.list.offset(harness.app.app()).expect("offset");
         assert!(offset > 300.0, "滚轮下滚后偏移增大：{offset}");
+    }
+
+    /// P2-11（W5b-G1）：像素级相对滚动 —— 偏移按 delta 走、前缀行回收；上下越界由引擎夹紧。
+    #[test]
+    fn scrolling_by_pixels_moves_the_window_and_clamps_at_both_ends() {
+        let mut harness = harness(20); // 内容 600、视口 120 ⇒ 可用范围 0..=480
+        harness
+            .list
+            .scroll_by(harness.app.app_mut(), 100.0)
+            .expect("像素下滚");
+        let _ = harness.app.drain().expect("frame");
+        let _ = harness.list.sync(harness.app.app_mut()).expect("sync");
+        assert_eq!(harness.list.offset(harness.app.app()), Some(100.0));
+        let mounted = harness.list.mounted_rows(harness.app.app());
+        assert!(
+            !mounted.iter().any(|(index, _)| *index == 0),
+            "100 px 之后首行离开窗口"
+        );
+        assert_eq!(
+            row_texts(harness.app.app(), harness.app.window_id(), &harness.list, 3),
+            vec![SmolStr::new_static("row3")],
+            "第 3 行进入窗口（100 / 30）"
+        );
+
+        harness
+            .list
+            .scroll_by(harness.app.app_mut(), -1_000.0)
+            .expect("向上越界");
+        let _ = harness.app.drain().expect("frame");
+        assert_eq!(
+            harness.list.offset(harness.app.app()),
+            Some(0.0),
+            "负目标夹到 0，不产生负偏移"
+        );
+
+        harness
+            .list
+            .scroll_by(harness.app.app_mut(), 10_000.0)
+            .expect("向下越界");
+        let _ = harness.app.drain().expect("frame");
+        assert_eq!(
+            harness.list.offset(harness.app.app()),
+            Some(480.0),
+            "目标夹到 内容 600 − 视口 120"
+        );
+    }
+
+    /// `scroll_by` 在变高列表上用实测前缀和（`set_virtual_extents` 回写后的内容高）算可用范围。
+    #[test]
+    fn scrolling_by_pixels_uses_the_measured_heights() {
+        let mut harness = harness_with(
+            ListOptions::variable(ROW_EXTENT),
+            12,
+            |tree, parent, index| {
+                let height = if index.is_multiple_of(2) { 40.0 } else { 20.0 };
+                NodeBuilder::boxed()
+                    .style(
+                        StyleBuilder::new()
+                            .width_full()
+                            .height(height)
+                            .flex_none()
+                            .build(),
+                    )
+                    .build(tree, parent)?;
+                Ok(())
+            },
+        );
+        // 实测行高：可见窗口内 0..N 逐行回写，未挂载行仍持有估计值 30（不是 6 × 44 + 6 × 24）。
+        // 断言口径用**当前 extents 快照**的总高：scroll_by 的夹紧来自它，而不是 `行数 × 估计`。
+        assert_eq!(harness.list.row_heights().get(0), Some(44.0));
+        let heights = harness.list.row_heights();
+        let total: f32 = (0..12).map(|index| heights.get(index).unwrap_or(0.0)).sum();
+        assert_ne!(total, 12.0 * ROW_EXTENT, "至少一行脱离了估计值");
+        harness
+            .list
+            .scroll_by(harness.app.app_mut(), 50.0)
+            .expect("像素下滚");
+        let _ = harness.app.drain().expect("frame");
+        assert_eq!(harness.list.offset(harness.app.app()), Some(50.0));
+
+        harness
+            .list
+            .scroll_by(harness.app.app_mut(), 10_000.0)
+            .expect("向下越界");
+        let _ = harness.app.drain().expect("frame");
+        assert_eq!(
+            harness.list.offset(harness.app.app()),
+            Some((total - BOX_HEIGHT).max(0.0)),
+            "夹紧到实测内容 {total} − 视口 {BOX_HEIGHT}"
+        );
+    }
+
+    /// 非有限 delta 是强类型错误（引擎拒绝 NaN / inf 偏移，否则每帧自请求重绘）。
+    #[test]
+    fn scrolling_by_a_non_finite_delta_is_rejected() {
+        let mut harness = harness(4);
+        assert!(matches!(
+            harness.list.scroll_by(harness.app.app_mut(), f32::NAN),
+            Err(EngineError::NotScrollable { .. })
+        ));
+        assert_eq!(
+            harness.list.offset(harness.app.app()),
+            Some(0.0),
+            "被拒后偏移不变"
+        );
     }
 
     #[test]
@@ -3090,6 +3301,55 @@ mod deque_tests {
             "滚走的读者不被跟随拖走：原第 2 条移到下标 1"
         );
         assert_eq!(list.count(app.app()), 8);
+    }
+
+    /// P2-11：像素滚动改变读者位置 —— 滚离尾部后 `keep_on_newest` 的下一次 push 不再跟随，
+    /// 滚回尾部（偏移到最大）后恢复跟随。
+    #[test]
+    fn scrolling_by_pixels_leaves_and_rejoins_the_newest_reader() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let data: Rc<RefCell<VecDeque<usize>>> = Rc::new(RefCell::new((0..8).collect()));
+        let list = fixed_deque(&mut app, false, data.clone());
+        mount_list(&mut app, &list, 8, window);
+        // 内容 240、视口 120 ⇒ 最大偏移 120（读者在最新一条上）。
+        list.scroll_to_item(app.app_mut(), 7, ItemAlign::End)
+            .expect("scroll end");
+        let _ = app.drain().expect("frame");
+        assert_eq!(list.offset(app.app()), Some(120.0));
+        list.scroll_by(app.app_mut(), -ROW_EXTENT)
+            .expect("scroll up");
+        let _ = app.drain().expect("frame");
+        assert_eq!(list.offset(app.app()), Some(90.0), "滚离尾部一行");
+        {
+            let mut data = data.borrow_mut();
+            data.pop_front();
+            data.push_back(8);
+        }
+        list.push(app.app_mut()).expect("push");
+        settle(&mut app, &list);
+        assert_eq!(
+            list.offset(app.app()),
+            Some(60.0),
+            "读者读的那一条（原下标 3）移到 2：push 保持读者"
+        );
+
+        list.scroll_by(app.app_mut(), 10_000.0)
+            .expect("scroll to tail");
+        let _ = app.drain().expect("frame");
+        assert_eq!(list.offset(app.app()), Some(120.0), "回到尾部");
+        {
+            let mut data = data.borrow_mut();
+            data.pop_front();
+            data.push_back(9);
+        }
+        list.push(app.app_mut()).expect("push");
+        settle(&mut app, &list);
+        assert_eq!(
+            list.offset(app.app()),
+            Some(120.0),
+            "回到最新一条 ⇒ push 跟随尾部"
+        );
     }
 
     #[test]

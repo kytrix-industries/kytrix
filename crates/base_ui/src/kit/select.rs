@@ -455,6 +455,15 @@ impl Select {
         self.inner.items.borrow().clone()
     }
 
+    /// 占位符文案（空选中时触发器显示的那一句话；P2-11 读点，W7 G-READ）。
+    ///
+    /// 返回**配置值**（[`SelectOptions::placeholder`]），不是触发器当前渲染的文本：有选中条目
+    /// 时触发器显示的是条目标签（[`Select::chosen`] 是读选中项的正路）。构建前后都可读。
+    #[must_use]
+    pub fn placeholder_text(&self) -> SmolStr {
+        self.inner.options.placeholder.clone()
+    }
+
     /// 换一批条目（选中集按 id 保留，找不到的丢弃）。
     ///
     /// # Errors
@@ -534,6 +543,15 @@ impl Select {
     /// 禁用 / 启用触发器。
     pub fn set_disabled(&self, app: &mut App, disabled: bool) -> bool {
         self.inner.trigger.set_disabled(app, disabled)
+    }
+
+    /// 触发器是否禁用（P2-11 读点，W7 G-READ：头部「市场没加载时选择器应拒绝输入」的断言面）。
+    ///
+    /// 读的是触发器自己的禁用信号（[`Select::set_disabled`] 与构建期 `disabled` 的同一条真值），
+    /// 不是条目禁用态：单条目的 `SelectItem::disabled` 用 [`Select::items`] 读。
+    #[must_use]
+    pub fn is_disabled(&self, app: &App) -> bool {
+        *app.read(&self.inner.trigger.disabled_signal())
     }
 
     /// 建触发器节点（标签 / 文本 + 清空 + 箭头）。
@@ -1882,6 +1900,29 @@ mod tests {
             options.contains(&"Alpha".to_owned()),
             "选项角色：{options:?}"
         );
+    }
+
+    #[test]
+    fn the_read_points_report_the_items_the_placeholder_and_the_disabled_state() {
+        let mut harness = Harness::new();
+        let select = harness.select(SelectOptions::default().placeholder("请选择"));
+        harness.mount(&select, items());
+
+        let items = select.items();
+        assert_eq!(items.len(), 3, "items() 是该选择器当前条目");
+        assert_eq!(items[0].id, "a");
+        assert_eq!(items[0].label, "Alpha");
+        assert!(items[2].disabled, "条目自己的禁用态也读得回");
+        assert_eq!(select.placeholder_text(), "请选择", "占位符读点");
+
+        assert!(!select.is_disabled(harness.app.app()), "触发器默认可用");
+        assert!(select.set_disabled(harness.app.app_mut(), true));
+        assert!(
+            select.is_disabled(harness.app.app()),
+            "set_disabled 之后读回禁用"
+        );
+        assert!(select.set_disabled(harness.app.app_mut(), false));
+        assert!(!select.is_disabled(harness.app.app()));
     }
 
     #[test]

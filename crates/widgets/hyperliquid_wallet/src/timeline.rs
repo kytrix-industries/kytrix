@@ -7,42 +7,61 @@
 //! absolutely positioned divs would be a hundred elements the layout engine has to place on
 //! every frame, and none of them would be cheaper to draw than a rectangle.
 //!
+//! The canvas is a **value**: the node is built once by the row factory and every frame that
+//! has something new to draw hands it a [`Canvas`] through
+//! [`WidgetCx::set_canvas`](widget::cx::WidgetCx::set_canvas). What a frame *keeps* is the
+//! prepared key beside the canvas, so a steady `sync` — a snapshot that has not moved, at the
+//! same box, in the same appearance, language and with the pointer where it was — writes no
+//! canvas and asks for no frame (I3). Everything the drawing is a function of is in that key:
+//! the snapshot's identity, the node's bounds, the axis geometry the labels give, the hovered
+//! marker, the colours an appearance resolves, the language and the raster scale the labels
+//! were shaped at.
+//!
 //! # What is cached, and against what
 //!
 //! The geometry of a timeline is a pure function of three things — the buckets, the plot width
 //! and the width of the start label — so it is cached against exactly those three and thrown
-//! away when one of them changes. Shaped text is cached the same way, against the text, its
-//! colour and its size, which is what keeps the ten-second refresh from re-shaping the same
-//! labels.
+//! away when one of them changes. Shaped text is cached the same way, against the text and its
+//! style (which carries the colour and the size), which is what keeps a frame that only moves
+//! the pointer from re-shaping the same labels. A handle whose atlas lease has gone is
+//! re-shaped rather than drawn: the engine refuses to encode stale glyph runs, and the frame
+//! that ran into one is rebuilt instead of kept.
 //!
-//! # Why the marker surface is a hover card rather than a tooltip
+//! # The reader's fills are drawn, not laid out
 //!
-//! A bucket's fills are a list a reader scrolls, so the surface that shows them has to stay
-//! open while the pointer is inside it. A tooltip closes as soon as the pointer leaves its
-//! trigger, which is why this module builds its own hover card on the popup primitive: the
-//! open and close delays belong to the primitive, and the rows are a uniform list with a
-//! scrollbar of their own.
+//! A marker's fills used to be a hover card on the toolkit's popup primitive with a scrollable
+//! uniform list in it; both are gone. The pointer's position is passed in by the row, the
+//! margin the marker occupies is hit-tested here, and the newest fills of that one bucket are
+//! painted over the axis as a compact panel — up to [`TOOLTIP_VISIBLE_ROWS`] of them, fewer if
+//! the band is too short to hold them. Two behaviours of the old card are therefore gone with
+//! it, and they are the only behavioural differences of this port:
+//!
+//! - **no hover delays**: the open/close delays belonged to the popup primitive, so the panel
+//!   is drawn for the marker under the pointer immediately. The panel still keeps itself open
+//!   while the pointer is inside *it*, because two positions inside one panel are one drawing;
+//! - **no scrollable list**: the panel draws the newest rows it has room for instead of a
+//!   scroll handle per bucket. That is also why the old per-bucket `UniformListScrollHandle`
+//!   map and its release are gone.
+//!
+//! The old timeline also scrolled horizontally below its minimum content width; the row now
+//! gives the canvas the list's width and a narrow pane simply draws a narrower plot (the
+//! bucket count follows the width, down to one bucket).
+//!
+//! # The axis labels are furniture
+//!
+//! The two ends of the axis are its time ticks, so they are read in the chart's own axis
+//! colour, not in a text role: a chart's labels are its furniture. The letter inside a marker
+//! is painted in the window's own background, which reads as a cut-out whatever colour the
+//! marker is.
 
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use ahash::AHashMap;
 use base_ui::{
-    button::Button,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    scroll_bar::Scrollbar,
-    size::UnifiedSizable,
-    style::theme::ThemeExt,
-    tooltip::TooltipExt,
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
 };
-use gpui_kit::{
-    Anchor, AnyElement, App, Bounds, ContentMask, ElementId, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Pixels, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement,
-    Styled, TextAlign, TextRun, TextStyle, UniformListScrollHandle, Window, base::HoverCard,
-    canvas, div, fill, point, prelude::FluentBuilder, px, rems, size, transparent_black,
-    uniform_list,
-};
-use i18n::t;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::account::{
     domain::HyperliquidUserFill, shared::HyperliquidFillDirection,
 };
@@ -56,59 +75,69 @@ use market_participants_model::{
     },
 };
 use smol_str::{SmolStr, format_smolstr};
-use widget::time_zone::data_time_zone;
-
-use super::model::{
-    AgeBucket, DisplayPrecision, TimelineSnapshot, absolute_time, age_bucket, now_millis,
+use ui_core::{
+    a11y::{A11yPatch, A11yRole},
+    app::App,
+    error::EngineError,
+    math::{Point, Rect},
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    paint::{
+        canvas::Canvas,
+        color::Color,
+        primitive::{Border, ClipRect, Quad, QuadPaint},
+        style::StylePatch,
+    },
+    text::{ShapedTextHandle, TextStyle},
 };
+use widget::cx::WidgetCx;
 
-/// The height of one wallet's timeline, its header included.
-pub(super) const HEIGHT: f32 = 136.0;
-/// The narrowest a timeline is drawn at.
+use super::model::{AgeBucket, DisplayPrecision, TimelineSnapshot, age_bucket, now_millis};
+
+/// The height of one wallet's timeline band.
 ///
-/// Below this the markers of six hours would overlap, so a narrower viewport scrolls instead
-/// of compressing the axis.
-pub(super) const MIN_CONTENT_WIDTH: f32 = 560.0;
+/// The row builds a box of this height under the account line and the canvas fills it; the
+/// geometry below is centred in it, so the axis does not depend on where in the row it sits.
+pub(super) const HEIGHT: f32 = 136.0;
+
 /// The window a timeline covers, which is also the window one request asks for.
 pub(super) const WINDOW_MILLIS: i64 = 6 * 60 * 60 * 1_000;
-/// The horizontal padding around a timeline inside its scrolling viewport.
-pub(super) const HORIZONTAL_PADDING: f32 = 16.0;
 
 /// The width one bucket occupies, which decides how many of them there are.
 const BUCKET_WIDTH: f32 = 24.0;
 /// The gap between the axis and the label at either end of it.
 const AXIS_LABEL_GAP: f32 = 8.0;
-/// How much room the scrollbar under a timeline takes.
-const SCROLLBAR_THICKNESS: Pixels = px(4.0);
-const HEADER_HEIGHT: f32 = 20.0;
-const BODY_HEIGHT: f32 = HEIGHT - HEADER_HEIGHT;
-const AXIS_Y: f32 = 58.0;
+/// Where the axis sits inside the band: the middle of it.
+const AXIS_Y: f32 = HEIGHT / 2.0;
 const AXIS_LINE_HEIGHT: f32 = 1.0;
 const AXIS_TICK_HEIGHT: f32 = 8.0;
-const AXIS_FONT_SIZE_REMS: f32 = 0.75;
 const MARKER_MIN_SIZE: f32 = 18.0;
 const MARKER_MAX_SIZE: f32 = 24.0;
 const MARKER_GAP: f32 = 6.0;
 const MARKER_AXIS_GAP: f32 = 4.0;
 const MARKER_RADIUS_RATIO: f32 = 0.22;
-const MARKER_BORDER_WIDTH: f32 = 1.0;
 const MARKER_FONT_RATIO: f32 = 0.68;
+/// The smallest a letter inside a marker is drawn.
+const MARKER_MIN_FONT_SIZE: f32 = 10.0;
 const CONNECTOR_WIDTH: f32 = 1.0;
+/// The widest the panel of a marker's fills is drawn.
 const TOOLTIP_WIDTH: f32 = 320.0;
-const TOOLTIP_ROW_HEIGHT: f32 = 32.0;
+const TOOLTIP_ROW_HEIGHT: f32 = 18.0;
+/// How many fills of a bucket the panel shows at most.
 const TOOLTIP_VISIBLE_ROWS: usize = 6;
-const TEXT_CACHE_CAPACITY: usize = 256;
-/// How long the pointer rests on a marker before its fills are shown.
-const HOVER_OPEN_DELAY: Duration = Duration::from_millis(150);
-/// How long the pointer may be outside the card before it closes, which is what lets it cross
-/// the gap between the marker and the card.
-const HOVER_CLOSE_DELAY: Duration = Duration::from_millis(250);
+const TOOLTIP_PADDING: f32 = 4.0;
+/// The gap between the panel and the marker it opens beside, and between it and the band.
+const TOOLTIP_GAP: f32 = 4.0;
+/// The panel's corner radius: the toolkit's `rounded_sm` at this application's rem.
+const TOOLTIP_CORNER_RADIUS: f32 = 4.0;
+/// How many shaped lines one timeline keeps.
+///
+/// The two axis labels, the two marker letters and three lines for each of the panel's rows:
+/// twice the working set of one frame, so a language or appearance change does not evict the
+/// lines the frame before was drawn from.
+const TEXT_CACHE_CAPACITY: usize = 64;
 
-type TooltipRowsByBucket = AHashMap<(Side, usize), Arc<[TooltipRow]>>;
-type SharedTooltipRows = Arc<TooltipRowsByBucket>;
-/// Called when the viewport a timeline is drawn in changes, with that viewport's width and the
-/// width of the axis inside it.
-pub(super) type OnMeasure = Rc<dyn Fn(f32, f32, &mut App)>;
+/// The debug id of the canvas node one row's timeline is drawn on.
+const TIMELINE_SELECTOR: &str = "TEST_HYPERLIQUID_WALLET_TIMELINE";
 
 /// One side of one bucket: the fills that were traded in that slot of the axis.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,153 +159,65 @@ pub(super) enum FillDirection {
     Unknown,
 }
 
-/// One fill of a bucket, as the card shows it.
+/// One fill of a bucket, as the panel shows it.
 ///
 /// A row carries the units it was read with rather than text: what a quantity counts and what
-/// its price is quoted in are properties of the listing, so a card that is drawn while another
+/// its price is quoted in are properties of the listing, so a panel that is drawn while another
 /// reading arrives still names its own units.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TooltipRow {
-    pub timestamp: i64,
-    pub listing: VenueListingKey,
-    pub kind: InstrumentKind,
-    pub quantity: MarketQuantity,
-    pub price: MarketPrice,
-    pub direction: FillDirection,
+struct TooltipRow {
+    timestamp: i64,
+    listing: VenueListingKey,
+    kind: InstrumentKind,
+    quantity: MarketQuantity,
+    price: MarketPrice,
+    direction: FillDirection,
 }
 
 impl TooltipRow {
     /// The quantity of this row, named in the unit its listing publishes it in.
-    pub(super) fn quantity_text(&self, precision: &DisplayPrecision, cx: &App) -> SmolStr {
+    fn quantity_text(&self, precision: &DisplayPrecision, translate: &Translate) -> SmolStr {
         let value = precision
             .format_listing_quantity(&self.listing, self.quantity.value)
-            .unwrap_or_else(|_| SmolStr::new(self.quantity.value.to_string().as_str()));
-        match precision.quantity_unit_label(&self.quantity.unit, cx) {
+            .unwrap_or_else(|_| format_smolstr!("{}", self.quantity.value));
+        match precision.quantity_unit_label(&self.quantity.unit, translate) {
             Some(unit) => format_smolstr!("{value} {unit}"),
             None => value,
         }
     }
 
     /// The price of this row, in the quote asset its listing publishes it against.
-    pub(super) fn price_text(&self, precision: &DisplayPrecision, cx: &App) -> SmolStr {
+    fn price_text(&self, precision: &DisplayPrecision, translate: &Translate) -> SmolStr {
         let value = precision
             .format_listing_price(&self.listing, self.price.value)
-            .unwrap_or_else(|_| SmolStr::new(self.price.value.to_string().as_str()));
+            .unwrap_or_else(|_| format_smolstr!("{}", self.price.value));
         format_smolstr!(
             "{value} {}",
-            precision.asset_label(&self.price.quote_asset, cx)
+            precision.asset_label(&self.price.quote_asset, translate)
         )
     }
 }
 
-/// One wallet's timeline: what it is showing, and the geometry it was last drawn at.
-///
-/// The scroll handles are kept per bucket rather than per frame, which is what keeps a card
-/// that is open where the reader left it across the ten-second refresh.
-#[derive(Clone)]
-pub(super) struct TimelineEntry {
-    snapshot: Option<Arc<TimelineSnapshot>>,
-    buckets: Arc<[TimelineBucket]>,
-    tooltip_scrolls: Rc<AHashMap<(Side, usize), UniformListScrollHandle>>,
-    scroll: ScrollHandle,
-    width: f32,
-    plot_width: f32,
-    paint_cache: Rc<RefCell<TimelinePaintCache>>,
-}
-
-impl Default for TimelineEntry {
-    fn default() -> Self {
-        Self {
-            snapshot: None,
-            buckets: Arc::from([]),
-            tooltip_scrolls: Rc::new(AHashMap::new()),
-            scroll: ScrollHandle::default(),
-            width: MIN_CONTENT_WIDTH,
-            plot_width: MIN_CONTENT_WIDTH,
-            paint_cache: Rc::new(RefCell::new(TimelinePaintCache::default())),
-        }
-    }
-}
-
-impl TimelineEntry {
-    /// Takes a published snapshot, and says whether anything a frame draws changed.
-    ///
-    /// The ten-second cadence publishes the same window whenever a wallet has not traded, so an
-    /// unchanged snapshot is recognised by identity rather than by comparing fills.
-    pub(super) fn replace_snapshot(&mut self, snapshot: &Arc<TimelineSnapshot>) -> bool {
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, snapshot))
-        {
-            return false;
-        }
-        self.sync_buckets(snapshot, self.plot_width);
-        self.snapshot = Some(snapshot.clone());
-        true
-    }
-
-    /// Records the width the timeline was laid out at, and rebuckets if it changed.
-    pub(super) fn set_dimensions(&mut self, width: f32, plot_width: f32) -> bool {
-        let width = finite_width(width);
-        let plot_width = finite_width(plot_width);
-        let bucket_count_changed = bucket_count(self.plot_width) != bucket_count(plot_width);
-        if !bucket_count_changed
-            && (self.width - width).abs() <= 0.5
-            && (self.plot_width - plot_width).abs() <= 0.5
-        {
-            return false;
-        }
-        self.width = width;
-        self.plot_width = plot_width;
-        if let Some(snapshot) = self.snapshot.clone() {
-            self.sync_buckets(&snapshot, plot_width);
-        }
-        true
-    }
-
-    fn sync_buckets(&mut self, snapshot: &TimelineSnapshot, plot_width: f32) {
-        let mut paint_cache = self.paint_cache.borrow_mut();
-        sync_buckets(
-            snapshot,
-            plot_width,
-            &mut self.buckets,
-            &mut self.tooltip_scrolls,
-            &mut paint_cache,
-        );
-    }
-}
-
-/// What one wallet's row needs besides its own geometry.
-pub(super) struct TimelineRowArgs {
-    /// The precision the wallet's own overview was valued at, when it has one.
-    pub precision: Option<DisplayPrecision>,
-    /// The neutral text to show while there is nothing to draw.
-    pub loading: SharedString,
-    /// Why this wallet's timeline failed, once it has.
-    pub failure: Option<SharedString>,
-    /// The control that asks for this wallet's timeline again.
-    pub retry: Option<AnyElement>,
-    pub on_measure: OnMeasure,
-}
-
 /// One marker's place on the axis, and the connector that joins it to the axis.
+///
+/// Coordinates are the canvas' own: the origin is the top-left of the box the node was laid
+/// out in, and painting translates the whole geometry by that box's origin.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MarkerGeometry {
     side: Side,
     bucket_index: usize,
-    bounds: Bounds<Pixels>,
-    connector: Bounds<Pixels>,
+    bounds: Rect,
+    connector: Rect,
 }
 
 /// Where everything on one timeline is drawn.
 #[derive(Debug, PartialEq)]
 struct TimelineGeometry {
-    axis: Bounds<Pixels>,
-    start_tick: Bounds<Pixels>,
-    end_tick: Bounds<Pixels>,
+    axis: Rect,
+    start_tick: Rect,
+    end_tick: Rect,
     markers: Arc<[MarkerGeometry]>,
-    marker_size: Pixels,
+    marker_size: f32,
 }
 
 impl TimelineGeometry {
@@ -286,21 +227,18 @@ impl TimelineGeometry {
         let slot_width = plot_width / bucket_count as f32;
         let marker_size = marker_size(slot_width);
         let axis_left = start_label_width.max(0.0) + AXIS_LABEL_GAP;
-        let axis_y = AXIS_Y;
-        let axis = Bounds::new(
-            point(px(axis_left), px(axis_y)),
-            size(px(plot_width), px(AXIS_LINE_HEIGHT)),
+        let axis = Rect::new(axis_left, AXIS_Y, plot_width, AXIS_LINE_HEIGHT);
+        let start_tick = Rect::new(
+            axis_left,
+            AXIS_Y - AXIS_TICK_HEIGHT / 2.0,
+            AXIS_LINE_HEIGHT,
+            AXIS_TICK_HEIGHT,
         );
-        let start_tick = Bounds::new(
-            point(px(axis_left), px(axis_y - AXIS_TICK_HEIGHT / 2.0)),
-            size(px(AXIS_LINE_HEIGHT), px(AXIS_TICK_HEIGHT)),
-        );
-        let end_tick = Bounds::new(
-            point(
-                px(axis_left + plot_width - AXIS_LINE_HEIGHT),
-                px(axis_y - AXIS_TICK_HEIGHT / 2.0),
-            ),
-            size(px(AXIS_LINE_HEIGHT), px(AXIS_TICK_HEIGHT)),
+        let end_tick = Rect::new(
+            axis_left + plot_width - AXIS_LINE_HEIGHT,
+            AXIS_Y - AXIS_TICK_HEIGHT / 2.0,
+            AXIS_LINE_HEIGHT,
+            AXIS_TICK_HEIGHT,
         );
 
         let mut markers = Vec::with_capacity(buckets.len());
@@ -314,37 +252,33 @@ impl TimelineGeometry {
                 .min((axis_left + plot_width - marker_size).max(axis_left));
             let (top, connector_top, connector_height) = match bucket.side {
                 Side::Buy => {
-                    let bottom = axis_y - MARKER_AXIS_GAP;
+                    let bottom = AXIS_Y - MARKER_AXIS_GAP;
                     (
                         bottom - marker_size,
                         bottom,
-                        (axis_y - bottom).max(AXIS_LINE_HEIGHT),
+                        (AXIS_Y - bottom).max(AXIS_LINE_HEIGHT),
                     )
                 }
                 Side::Sell => {
-                    let top = axis_y + AXIS_LINE_HEIGHT + MARKER_AXIS_GAP;
+                    let top = AXIS_Y + AXIS_LINE_HEIGHT + MARKER_AXIS_GAP;
                     (
                         top,
-                        axis_y + AXIS_LINE_HEIGHT,
-                        (top - (axis_y + AXIS_LINE_HEIGHT)).max(AXIS_LINE_HEIGHT),
+                        AXIS_Y + AXIS_LINE_HEIGHT,
+                        (top - (AXIS_Y + AXIS_LINE_HEIGHT)).max(AXIS_LINE_HEIGHT),
                     )
                 }
             };
-            let marker_bounds = Bounds::new(
-                point(px(left), px(top)),
-                size(px(marker_size), px(marker_size)),
-            );
-            let connector = Bounds::new(
-                point(
-                    px(center_x - CONNECTOR_WIDTH / 2.0),
-                    px(connector_top.min(top + marker_size)),
-                ),
-                size(px(CONNECTOR_WIDTH), px(connector_height)),
+            let bounds = Rect::new(left, top, marker_size, marker_size);
+            let connector = Rect::new(
+                center_x - CONNECTOR_WIDTH / 2.0,
+                connector_top.min(top + marker_size),
+                CONNECTOR_WIDTH,
+                connector_height,
             );
             markers.push(MarkerGeometry {
                 side: bucket.side,
                 bucket_index: bucket.index,
-                bounds: marker_bounds,
+                bounds,
                 connector,
             });
         }
@@ -354,8 +288,26 @@ impl TimelineGeometry {
             start_tick,
             end_tick,
             markers: markers.into(),
-            marker_size: px(marker_size),
+            marker_size,
         }
+    }
+
+    /// The marker of one bucket side, once the geometry was built.
+    fn marker(&self, side: Side, bucket_index: usize) -> Option<&MarkerGeometry> {
+        self.markers
+            .iter()
+            .find(|marker| marker.side == side && marker.bucket_index == bucket_index)
+    }
+
+    /// The marker under `point`, if any.
+    ///
+    /// The markers of one bucket are painted in order, so the last one that contains the
+    /// point is the one a reader is pointing at.
+    fn marker_at(&self, point: Point) -> Option<&MarkerGeometry> {
+        self.markers
+            .iter()
+            .rev()
+            .find(|marker| marker.bounds.contains(point))
     }
 }
 
@@ -377,883 +329,19 @@ fn finite_width(width: f32) -> f32 {
     }
 }
 
-/// One shaped line, kept until the text, colour or size it was shaped for changes.
-#[derive(Clone)]
-struct CachedTextLine {
-    text: SharedString,
-    color: Hsla,
-    font_size: Pixels,
-    line: Arc<ShapedLine>,
-}
-
-impl CachedTextLine {
-    fn matches(&self, text: &SharedString, color: Hsla, font_size: Pixels) -> bool {
-        self.text == *text && self.color == color && self.font_size == font_size
-    }
-}
-
-/// The axis labels one frame is drawn with, and how wide they came out.
-struct AxisLabelMetrics {
-    labels: (SharedString, SharedString),
-    text_style: TextStyle,
-    font_size: Pixels,
-    widths: (f32, f32),
-}
-
-struct GeometryCacheEntry {
-    buckets: Arc<[TimelineBucket]>,
-    plot_width: f32,
-    start_label_width: f32,
-    geometry: Arc<TimelineGeometry>,
-}
-
-struct TooltipRowsCacheEntry {
-    fills: Arc<[HyperliquidUserFill]>,
-    buckets: Arc<[TimelineBucket]>,
-    rows: SharedTooltipRows,
-}
-
-/// Everything one timeline remembers between frames.
+/// The width the plot is drawn at inside a canvas `width` wide.
 ///
-/// It is bounded: one geometry, one set of card rows, and a fixed number of shaped lines.
-pub(super) struct TimelinePaintCache {
-    geometry: Option<GeometryCacheEntry>,
-    tooltip_rows: Option<TooltipRowsCacheEntry>,
-    axis_labels: Option<AxisLabelMetrics>,
-    text_style: Option<TextStyle>,
-    text_lines: Vec<CachedTextLine>,
-}
-
-impl Default for TimelinePaintCache {
-    fn default() -> Self {
-        Self {
-            geometry: None,
-            tooltip_rows: None,
-            axis_labels: None,
-            text_style: None,
-            text_lines: Vec::with_capacity(TEXT_CACHE_CAPACITY),
-        }
-    }
-}
-
-impl TimelinePaintCache {
-    fn clear_geometry(&mut self) {
-        self.geometry = None;
-    }
-
-    fn geometry(
-        &mut self,
-        buckets: &Arc<[TimelineBucket]>,
-        plot_width: f32,
-        start_label_width: f32,
-    ) -> Arc<TimelineGeometry> {
-        let plot_width = finite_width(plot_width);
-        let matches = self.geometry.as_ref().is_some_and(|entry| {
-            Arc::ptr_eq(&entry.buckets, buckets)
-                && entry.plot_width.to_bits() == plot_width.to_bits()
-                && entry.start_label_width.to_bits() == start_label_width.to_bits()
-        });
-        if matches && let Some(entry) = self.geometry.as_ref() {
-            return entry.geometry.clone();
-        }
-
-        let geometry = Arc::new(TimelineGeometry::new(
-            buckets,
-            plot_width,
-            start_label_width,
-        ));
-        self.geometry = Some(GeometryCacheEntry {
-            buckets: buckets.clone(),
-            plot_width,
-            start_label_width,
-            geometry: geometry.clone(),
-        });
-        geometry
-    }
-
-    fn tooltip_rows(
-        &mut self,
-        snapshot: &TimelineSnapshot,
-        buckets: &Arc<[TimelineBucket]>,
-        precision: Option<&DisplayPrecision>,
-    ) -> SharedTooltipRows {
-        let matches = self.tooltip_rows.as_ref().is_some_and(|entry| {
-            Arc::ptr_eq(&entry.fills, &snapshot.fills) && Arc::ptr_eq(&entry.buckets, buckets)
-        });
-        if matches && let Some(entry) = self.tooltip_rows.as_ref() {
-            return entry.rows.clone();
-        }
-
-        let rows = buckets
-            .iter()
-            .map(|bucket| {
-                (
-                    (bucket.side, bucket.index),
-                    tooltip_rows(snapshot, bucket, precision).into(),
-                )
-            })
-            .collect::<TooltipRowsByBucket>();
-        let rows: SharedTooltipRows = Arc::new(rows);
-        self.tooltip_rows = Some(TooltipRowsCacheEntry {
-            fills: snapshot.fills.clone(),
-            buckets: buckets.clone(),
-            rows: rows.clone(),
-        });
-        rows
-    }
-
-    /// The width of the two axis labels, shaped once per text style and language.
-    fn axis_label_widths(
-        &mut self,
-        labels: (SharedString, SharedString),
-        window: &Window,
-    ) -> (f32, f32) {
-        let font_size = rems(AXIS_FONT_SIZE_REMS).to_pixels(window.rem_size());
-        let text_style = window.text_style();
-        let matches = self.axis_labels.as_ref().is_some_and(|entry| {
-            entry.labels == labels && entry.text_style == text_style && entry.font_size == font_size
-        });
-        if matches && let Some(entry) = self.axis_labels.as_ref() {
-            return entry.widths;
-        }
-
-        let widths = (
-            axis_label_width(&labels.0, font_size, &text_style, window),
-            axis_label_width(&labels.1, font_size, &text_style, window),
-        );
-        self.axis_labels = Some(AxisLabelMetrics {
-            labels,
-            text_style,
-            font_size,
-            widths,
-        });
-        widths
-    }
-
-    /// The width of the axis inside a viewport of `total_width`.
-    pub(super) fn plot_width(
-        &mut self,
-        total_width: f32,
-        labels: (SharedString, SharedString),
-        window: &Window,
-    ) -> f32 {
-        let (start_width, end_width) = self.axis_label_widths(labels, window);
-        axis_line_width(total_width.max(MIN_CONTENT_WIDTH), start_width, end_width)
-    }
-
-    /// A shaped line for one label, from the cache when it is already there.
-    fn line(
-        &mut self,
-        text: SharedString,
-        color: Hsla,
-        font_size: Pixels,
-        window: &Window,
-    ) -> Arc<ShapedLine> {
-        let text_style = window.text_style();
-        if self.text_style.as_ref() != Some(&text_style) {
-            self.text_style = Some(text_style.clone());
-            self.text_lines.clear();
-        }
-        if let Some(index) = self
-            .text_lines
-            .iter()
-            .position(|entry| entry.matches(&text, color, font_size))
-        {
-            let entry = self.text_lines.remove(index);
-            let line = entry.line.clone();
-            self.text_lines.push(entry);
-            return line;
-        }
-
-        let line = Arc::new(window.text_system().shape_line(
-            text.clone(),
-            font_size,
-            &[TextRun {
-                len: text.len(),
-                font: text_style.font(),
-                color,
-                ..Default::default()
-            }],
-            None,
-        ));
-        if self.text_lines.len() >= TEXT_CACHE_CAPACITY {
-            self.text_lines.remove(0);
-        }
-        self.text_lines.push(CachedTextLine {
-            text,
-            color,
-            font_size,
-            line: line.clone(),
-        });
-        line
-    }
-}
-
-/// Rebuilds the visible buckets when a snapshot or a plot width changes.
-///
-/// Scroll handles of buckets that survive the rebuild are kept, so a card that is open does not
-/// jump back to its first row every ten seconds.
-fn sync_buckets(
-    snapshot: &TimelineSnapshot,
-    plot_width: f32,
-    buckets: &mut Arc<[TimelineBucket]>,
-    tooltip_scrolls: &mut Rc<AHashMap<(Side, usize), UniformListScrollHandle>>,
-    paint_cache: &mut TimelinePaintCache,
-) {
-    let next = build_buckets(snapshot, plot_width.max(1.0));
-    if buckets.as_ref() == next.as_slice() {
-        return;
-    }
-
-    let tooltip_scrolls = Rc::make_mut(tooltip_scrolls);
-    tooltip_scrolls.retain(|(side, index), _| {
-        next.iter()
-            .any(|bucket| bucket.side == *side && bucket.index == *index)
-    });
-    let additional_scrolls = next.len().saturating_sub(tooltip_scrolls.len());
-    tooltip_scrolls.reserve(additional_scrolls);
-    for bucket in &next {
-        tooltip_scrolls
-            .entry((bucket.side, bucket.index))
-            .or_default();
-    }
-    *buckets = next.into();
-    paint_cache.clear_geometry();
-}
-
-#[derive(Clone)]
-struct TimelinePaintState {
-    bounds: Bounds<Pixels>,
-    geometry: Arc<TimelineGeometry>,
-    start_line: Arc<ShapedLine>,
-    end_line: Arc<ShapedLine>,
-    buy_line: Arc<ShapedLine>,
-    sell_line: Arc<ShapedLine>,
-}
-
-fn timeline_canvas(
-    geometry: Arc<TimelineGeometry>,
-    labels: (SharedString, SharedString),
-    paint_cache: Rc<RefCell<TimelinePaintCache>>,
-) -> impl IntoElement {
-    let prepaint_geometry = geometry;
-    let (prepaint_start_label, prepaint_end_label) = labels;
-    canvas(
-        move |bounds, window, cx| {
-            let mut cache = paint_cache.borrow_mut();
-            let axis_font_size = rems(AXIS_FONT_SIZE_REMS).to_pixels(window.rem_size());
-            let marker_font_size =
-                (prepaint_geometry.marker_size * MARKER_FONT_RATIO).max(px(10.0));
-            // The two ends of the axis are its time ticks, so they are read in the chart's own
-            // axis colour (§8.7), not in a text role: a chart's labels are its furniture.
-            let axis_label = cx.theme().components.chart.axis.hsla;
-            // The letter inside a marker is painted in the window's own background, which reads
-            // as a cut-out whatever colour the marker is.
-            let marker_text = cx.theme().roles.surface.sunken.hsla;
-            TimelinePaintState {
-                bounds,
-                geometry: prepaint_geometry.clone(),
-                start_line: cache.line(
-                    prepaint_start_label.clone(),
-                    axis_label,
-                    axis_font_size,
-                    window,
-                ),
-                end_line: cache.line(
-                    prepaint_end_label.clone(),
-                    axis_label,
-                    axis_font_size,
-                    window,
-                ),
-                buy_line: cache.line(
-                    SharedString::new_static("B"),
-                    marker_text,
-                    marker_font_size,
-                    window,
-                ),
-                sell_line: cache.line(
-                    SharedString::new_static("S"),
-                    marker_text,
-                    marker_font_size,
-                    window,
-                ),
-            }
-        },
-        move |_, state, window, app| paint_timeline(state, window, app),
-    )
-    .size_full()
-}
-
-fn paint_timeline(state: TimelinePaintState, window: &mut Window, app: &mut App) {
-    if state.bounds.size.width <= px(0.0) || state.bounds.size.height <= px(0.0) {
-        return;
-    }
-    // Read out of the style before anything is painted: a shaped line borrows the application
-    // mutably, and a colour read after that would borrow it again.
-    let (axis, marker_border, buy, sell) = {
-        let theme = app.theme();
-        (
-            theme.components.chart.grid.hsla,
-            theme.roles.line.divider.hsla,
-            theme.roles.market.up.hsla,
-            theme.roles.market.down.hsla,
-        )
-    };
-    let origin = state.bounds.origin;
-    let geometry = &state.geometry;
-    window.with_content_mask(
-        Some(ContentMask {
-            bounds: state.bounds,
-        }),
-        |window| {
-            window.paint_quad(fill(window.pixel_snap_bounds(geometry.axis + origin), axis));
-            window.paint_quad(fill(
-                window.pixel_snap_bounds(geometry.start_tick + origin),
-                axis,
-            ));
-            window.paint_quad(fill(
-                window.pixel_snap_bounds(geometry.end_tick + origin),
-                axis,
-            ));
-
-            // Connectors first, so a bucket whose two sides meet at the axis still shows a
-            // continuous join under both markers.
-            window.paint_layer(state.bounds, |window| {
-                for marker in geometry.markers.iter() {
-                    window.paint_quad(fill(
-                        window.pixel_snap_bounds(marker.connector + origin),
-                        axis,
-                    ));
-                }
-            });
-            window.paint_layer(state.bounds, |window| {
-                for marker in geometry.markers.iter() {
-                    let color = match marker.side {
-                        Side::Buy => buy,
-                        Side::Sell => sell,
-                    };
-                    let bounds = window.pixel_snap_bounds(marker.bounds + origin);
-                    let radius = (bounds.size.width.as_f32() * MARKER_RADIUS_RATIO)
-                        .min(bounds.size.width.as_f32() / 2.0);
-                    window.paint_quad(
-                        fill(bounds, color)
-                            .corner_radii(px(radius))
-                            .border_widths(px(MARKER_BORDER_WIDTH))
-                            .border_color(marker_border),
-                    );
-                }
-            });
-
-            let marker_line_height = geometry.marker_size;
-            for marker in geometry.markers.iter() {
-                let bounds = window.pixel_snap_bounds(marker.bounds + origin);
-                let line = match marker.side {
-                    Side::Buy => &state.buy_line,
-                    Side::Sell => &state.sell_line,
-                };
-                let _ = line.paint(
-                    bounds.origin,
-                    marker_line_height,
-                    TextAlign::Center,
-                    Some(bounds.size.width),
-                    window,
-                    app,
-                );
-            }
-
-            let axis_font_size = rems(AXIS_FONT_SIZE_REMS).to_pixels(window.rem_size());
-            let start_width = state.start_line.width();
-            let start_origin = window.pixel_snap_point(point(
-                geometry.axis.left() - px(AXIS_LABEL_GAP) - start_width + origin.x,
-                geometry.axis.top() - axis_font_size / 2.0 + origin.y,
-            ));
-            let end_origin = window.pixel_snap_point(point(
-                geometry.axis.right() + px(AXIS_LABEL_GAP) + origin.x,
-                geometry.axis.top() - axis_font_size / 2.0 + origin.y,
-            ));
-            let _ = state.start_line.paint(
-                start_origin,
-                axis_font_size,
-                TextAlign::Left,
-                None,
-                window,
-                app,
-            );
-            let _ = state.end_line.paint(
-                end_origin,
-                axis_font_size,
-                TextAlign::Left,
-                None,
-                window,
-                app,
-            );
-        },
-    );
-}
-
-/// One wallet's timeline row: the axis, its markers, and the way to read it again.
-pub(super) fn render_row(
-    entry: &TimelineEntry,
-    args: TimelineRowArgs,
-    window: &Window,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let timeline_width = finite_width(entry.width.max(MIN_CONTENT_WIDTH));
-    let labels = axis_labels(cx);
-    let (start_label_width, _) = entry
-        .paint_cache
-        .borrow_mut()
-        .axis_label_widths(labels.clone(), window);
-    let geometry = entry.snapshot.as_ref().map_or_else(
-        || {
-            Arc::new(TimelineGeometry::new(
-                &[],
-                entry.plot_width,
-                start_label_width,
-            ))
-        },
-        |_| {
-            entry.paint_cache.borrow_mut().geometry(
-                &entry.buckets,
-                entry.plot_width,
-                start_label_width,
-            )
-        },
-    );
-
-    let body = match entry.snapshot.as_ref() {
-        None => centered_body(
-            args.failure.clone().unwrap_or_else(|| args.loading.clone()),
-            if args.failure.is_some() {
-                theme.roles.status.danger.base.hsla
-            } else {
-                theme.roles.fg.muted.hsla
-            },
-        ),
-        Some(snapshot) => {
-            let canvas = timeline_canvas(geometry.clone(), labels, entry.paint_cache.clone());
-            let tooltip_rows = entry.paint_cache.borrow_mut().tooltip_rows(
-                snapshot,
-                &entry.buckets,
-                args.precision.as_ref(),
-            );
-            let markers = geometry
-                .markers
-                .iter()
-                .filter_map(|marker| {
-                    let rows = tooltip_rows
-                        .get(&(marker.side, marker.bucket_index))
-                        .cloned()?;
-                    Some(render_marker(
-                        args.precision.clone(),
-                        &entry.tooltip_scrolls,
-                        rows,
-                        *marker,
-                        cx,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            div()
-                .relative()
-                .w(px(timeline_width))
-                .h(px(BODY_HEIGHT))
-                .child(canvas)
-                .children(markers)
-                .into_any_element()
-        }
-    };
-
-    let header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_end()
-        .gap_2()
-        .h(px(HEADER_HEIGHT))
-        .text_xs()
-        .when_some(args.failure.clone(), |this, failure| {
-            let color = theme.roles.status.danger.base.hsla;
-            this.child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_color(color)
-                    .child(failure),
-            )
-        })
-        .when_some(args.retry, |this, retry| this.child(retry));
-
-    let timeline = div()
-        .id(ElementId::Name(SharedString::new_static(
-            "HyperliquidWalletTimeline",
-        )))
-        .w(px(timeline_width + HORIZONTAL_PADDING))
-        .flex_none()
-        .h(px(HEIGHT))
-        .px_2()
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(header)
-        .child(body);
-
-    let measure_cache = entry.paint_cache.clone();
-    let on_measure = args.on_measure.clone();
-    let measure_labels = axis_labels(cx);
-    let measure = canvas(
-        move |bounds, window, cx| {
-            let viewport_width = bounds.size.width.as_f32();
-            if !viewport_width.is_finite() || viewport_width <= 0.0 {
-                return;
-            }
-            let width = (viewport_width - HORIZONTAL_PADDING).max(1.0);
-            let plot_width =
-                measure_cache
-                    .borrow_mut()
-                    .plot_width(width, measure_labels.clone(), window);
-            on_measure(width, plot_width, cx);
-        },
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .inset_0();
-
-    let viewport = div()
-        .id(ElementId::Name(SharedString::new_static(
-            "HyperliquidWalletTimelineViewport",
-        )))
-        .absolute()
-        .inset_0()
-        .bottom(SCROLLBAR_THICKNESS)
-        .min_w_0()
-        .min_h_0()
-        .overflow_x_scroll()
-        .track_scroll(&entry.scroll)
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(measure)
-        .child(timeline);
-
-    div()
-        .relative()
-        .min_w_0()
-        .flex_1()
-        .child(viewport)
-        .child(
-            div()
-                .id(ElementId::Name(SharedString::new_static(
-                    "HyperliquidWalletTimelineScrollbar",
-                )))
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .h(SCROLLBAR_THICKNESS)
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(Scrollbar::horizontal(entry.scroll.clone())),
-        )
-        .into_any_element()
-}
-
-/// The control that asks for one wallet's timeline again.
-pub(super) fn retry_button(
-    label: SharedString,
-    color: Hsla,
-    on_retry: impl Fn(&mut App) + 'static,
-) -> AnyElement {
-    Button::new(ElementId::Name(SharedString::new_static(
-        "HyperliquidTimelineRetry",
-    )))
-    .ghost()
-    .small()
-    .aria_label(label.clone())
-    .with_tooltip(label)
-    .on_click(move |_, _, cx| {
-        cx.stop_propagation();
-        on_retry(cx);
-    })
-    .child(
-        Icon::new(IconKind::ArrowsClockwise)
-            .size_3()
-            .text_color(color),
-    )
-    .into_any_element()
-}
-
-/// The two labels the axis is drawn between.
-fn axis_labels(cx: &App) -> (SharedString, SharedString) {
-    (
-        t!(cx, "widget.hyperliquid_wallet.timeline_start"),
-        t!(cx, "widget.hyperliquid_wallet.timeline_end"),
-    )
-}
-
-fn centered_body(message: SharedString, color: Hsla) -> AnyElement {
-    div()
-        .h(px(BODY_HEIGHT))
-        .w_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_4()
-        .text_center()
-        .text_xs()
-        .text_color(color)
-        .child(message)
-        .into_any_element()
-}
-
-/// One bucket marker: a transparent hit area over the painted square, and the card that lists
-/// what was filled in it.
-fn render_marker(
-    precision: Option<DisplayPrecision>,
-    tooltip_scrolls: &AHashMap<(Side, usize), UniformListScrollHandle>,
-    rows: Arc<[TooltipRow]>,
-    marker: MarkerGeometry,
-    cx: &App,
-) -> AnyElement {
-    let side_key = match marker.side {
-        Side::Buy => 0_u64,
-        Side::Sell => 1_u64,
-    };
-    // One timeline's markers are siblings, so what a marker's id has to carry is the bucket it
-    // sits in and which side of the book it is: everything the card draws hangs under that id.
-    let marker_id = (marker.bucket_index as u64).rotate_left(17) ^ side_key;
-    let visible_rows = rows.len().clamp(1, TOOLTIP_VISIBLE_ROWS);
-    let show_scrollbar = rows.len() > TOOLTIP_VISIBLE_ROWS;
-    let height = px(TOOLTIP_ROW_HEIGHT * visible_rows as f32);
-    let scroll = tooltip_scrolls
-        .get(&(marker.side, marker.bucket_index))
-        .cloned()
-        .unwrap_or_default();
-    let side = marker.side;
-    // The count decides the sentence: a marker holding one fill is not "1 fills".
-    let side_label = match side {
-        Side::Buy => t!(cx, "widget.hyperliquid_wallet.buy"),
-        Side::Sell => t!(cx, "widget.hyperliquid_wallet.sell"),
-    };
-    let label = if rows.len() == 1 {
-        t!(
-            cx,
-            "widget.hyperliquid_wallet.timeline_marker_one",
-            side = side_label,
-            value = rows.len()
-        )
-    } else {
-        t!(
-            cx,
-            "widget.hyperliquid_wallet.timeline_marker",
-            side = side_label,
-            value = rows.len()
-        )
-    };
-    let trigger = div()
-        .id(ElementId::Name(SharedString::new_static(
-            "HyperliquidTimelineMarkerTrigger",
-        )))
-        .w(marker.bounds.size.width)
-        .h(marker.bounds.size.height)
-        .flex_none()
-        .bg(transparent_black())
-        .aria_label(label)
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .on_any_mouse_down(|_, window, _| window.prevent_default());
-
-    // The wrapper keeps the trigger's hit area aligned with the marker the canvas painted: the
-    // card's style belongs to the floating surface, not to the body's flex flow.
-    div()
-        .absolute()
-        .w(marker.bounds.size.width)
-        .h(marker.bounds.size.height)
-        .left(marker.bounds.origin.x)
-        .top(marker.bounds.origin.y)
-        .child(
-            HoverCard::new(ElementId::NamedInteger(
-                SharedString::new_static("HyperliquidTimelineMarkerCard"),
-                marker_id,
-            ))
-            .anchor(match side {
-                Side::Buy => Anchor::TopCenter,
-                Side::Sell => Anchor::BottomCenter,
-            })
-            .open_delay(HOVER_OPEN_DELAY)
-            .close_delay(HOVER_CLOSE_DELAY)
-            .trigger(trigger)
-            .content({
-                move |_, _, cx| {
-                    let theme = cx.theme();
-                    // The moment a row is read at is the moment the card was built, so a card
-                    // that stays open does not renumber itself under the reader.
-                    let now = now_millis().unwrap_or(0);
-                    let list_rows = rows.clone();
-                    let list = uniform_list(
-                        ElementId::Name(SharedString::new_static("HyperliquidTimelineTooltipRows")),
-                        list_rows.len(),
-                        move |range, _, cx| {
-                            range
-                                .map(|index| {
-                                    tooltip_row(
-                                        &list_rows[index],
-                                        side,
-                                        precision.as_ref(),
-                                        now,
-                                        cx,
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    )
-                    .h(height)
-                    .w_full()
-                    .track_scroll(&scroll);
-
-                    div()
-                        .id(ElementId::Name(SharedString::new_static(
-                            "HyperliquidTimelineMarkerCardBody",
-                        )))
-                        .relative()
-                        .w(px(TOOLTIP_WIDTH))
-                        .h(height)
-                        .overflow_hidden()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(theme.roles.line.divider.hsla)
-                        .bg(theme.roles.surface.overlay.hsla)
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right(if show_scrollbar {
-                                    SCROLLBAR_THICKNESS
-                                } else {
-                                    px(0.0)
-                                })
-                                .bottom_0()
-                                .overflow_hidden()
-                                .child(list),
-                        )
-                        .when(show_scrollbar, |this| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .w(SCROLLBAR_THICKNESS)
-                                    .child(Scrollbar::vertical(scroll.clone())),
-                            )
-                        })
-                }
-            }),
-        )
-        .into_any_element()
-}
-
-/// One fill of a bucket, as the card draws it.
-///
-/// The time a row shows is the age it had when the card was built, and the moment it happened
-/// is its accessible name: a row is read as "when", and the absolute moment is what that is
-/// relative to.
-fn tooltip_row(
-    row: &TooltipRow,
-    side: Side,
-    precision: Option<&DisplayPrecision>,
-    now: i64,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let (quantity, price) = precision.map_or_else(
-        || {
-            (
-                SharedString::new(row.quantity.value.to_string().as_str()),
-                SharedString::new(row.price.value.to_string().as_str()),
-            )
-        },
-        |precision| {
-            (
-                SharedString::new(row.quantity_text(precision, cx).as_str()),
-                SharedString::new(row.price_text(precision, cx).as_str()),
-            )
-        },
-    );
-    let (market_label, market_color) = fill_label(row, side, cx);
-    let quantity_text = format_smolstr!("{quantity} @ {price}");
-
-    div()
-        .h(px(TOOLTIP_ROW_HEIGHT))
-        .w_full()
-        .px_2()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .text_xs()
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .child(SharedString::new(quantity_text.as_str())),
-        )
-        .child(
-            div()
-                .flex_none()
-                .text_color(market_color)
-                .child(market_label),
-        )
-        .child(
-            div()
-                .id(ElementId::NamedInteger(
-                    SharedString::new_static("HyperliquidTimelineTooltipRowTime"),
-                    marker_row_id(row.timestamp),
-                ))
-                .flex_none()
-                .aria_label(absolute_time(row.timestamp, data_time_zone(cx)))
-                .text_color(theme.roles.fg.muted.hsla)
-                .child(age_text(cx, now, row.timestamp)),
-        )
-        .into_any_element()
-}
-
-/// The age of a moment, as the one relative time every row of this widget is read by.
-pub(super) fn age_text(cx: &App, now: i64, timestamp: i64) -> SharedString {
-    match age_bucket(now, timestamp) {
-        AgeBucket::Seconds(value) => {
-            t!(cx, "widget.hyperliquid_wallet.age_seconds", value = value)
-        }
-        AgeBucket::Minutes(value) => {
-            t!(cx, "widget.hyperliquid_wallet.age_minutes", value = value)
-        }
-        AgeBucket::Hours(value) => {
-            t!(cx, "widget.hyperliquid_wallet.age_hours", value = value)
-        }
-        AgeBucket::Days(value) => {
-            t!(cx, "widget.hyperliquid_wallet.age_days", value = value)
-        }
-    }
-}
-
-/// How many buckets a plot of `width` is divided into.
-pub(super) fn bucket_count(width: f32) -> usize {
-    if !width.is_finite() || width <= 0.0 {
-        return 1;
-    }
-    (width / BUCKET_WIDTH).floor().max(1.0) as usize
-}
-
-/// How long one bucket covers.
-pub(super) fn bucket_width_millis(width: f32) -> i64 {
-    // A sub-millisecond bucket could not represent another timestamp boundary.
-    let count = bucket_count(width).min(WINDOW_MILLIS as usize) as i64;
-    (WINDOW_MILLIS + count - 1) / count
+/// The canvas *is* the plot: the row lays it out across the list's width and the two end
+/// labels are shaped into the margins of the axis in [`TimelinePaint::sync`]. The guard is the
+/// one old entry point had — a layout that has not run yet answers `0`, and a non-finite box
+/// must not reach the bucket math — so a canvas that is not laid out yet draws nothing rather
+/// than one degenerate plot.
+pub(super) fn plot_width(width: f32) -> f32 {
+    finite_width(width)
 }
 
 /// The width of the axis itself, once both labels have their room.
-pub(super) fn axis_line_width(
-    total_width: f32,
-    start_label_width: f32,
-    end_label_width: f32,
-) -> f32 {
+fn axis_line_width(total_width: f32, start_label_width: f32, end_label_width: f32) -> f32 {
     if !total_width.is_finite() || total_width <= 0.0 {
         return 1.0;
     }
@@ -1261,8 +349,23 @@ pub(super) fn axis_line_width(
     (total_width - occupied).max(1.0)
 }
 
+/// How many buckets a plot of `width` is divided into.
+fn bucket_count(width: f32) -> usize {
+    if !width.is_finite() || width <= 0.0 {
+        return 1;
+    }
+    (width / BUCKET_WIDTH).floor().max(1.0) as usize
+}
+
+/// How long one bucket covers.
+fn bucket_width_millis(width: f32) -> i64 {
+    // A sub-millisecond bucket could not represent another timestamp boundary.
+    let count = bucket_count(width).min(WINDOW_MILLIS as usize) as i64;
+    (WINDOW_MILLIS + count - 1) / count
+}
+
 /// Assigns every fill of a snapshot to the slot of the side it was traded on.
-pub(super) fn build_buckets(snapshot: &TimelineSnapshot, width: f32) -> Vec<TimelineBucket> {
+fn build_buckets(snapshot: &TimelineSnapshot, width: f32) -> Vec<TimelineBucket> {
     let count = bucket_count(width);
     let bucket_width = bucket_width_millis(width);
     let window = snapshot.window_end.saturating_sub(snapshot.window_start);
@@ -1299,10 +402,10 @@ pub(super) fn build_buckets(snapshot: &TimelineSnapshot, width: f32) -> Vec<Time
 }
 
 /// The fills of one bucket, newest first.
-pub(super) fn tooltip_rows(
+fn tooltip_rows(
     snapshot: &TimelineSnapshot,
     bucket: &TimelineBucket,
-    precision: Option<&DisplayPrecision>,
+    precision: &DisplayPrecision,
 ) -> Vec<TooltipRow> {
     let mut indices = bucket.fill_indices.clone();
     indices.sort_by(|left, right| {
@@ -1327,9 +430,7 @@ pub(super) fn tooltip_rows(
             TooltipRow {
                 timestamp: fill.timestamp,
                 listing: fill.listing.clone(),
-                kind: precision.map_or(InstrumentKind::Perpetual, |precision| {
-                    precision.listing_kind(&fill.listing)
-                }),
+                kind: precision.listing_kind(&fill.listing),
                 quantity: fill.quantity.clone(),
                 price: fill.price.clone(),
                 direction: perpetual_direction(fill),
@@ -1338,68 +439,12 @@ pub(super) fn tooltip_rows(
         .collect()
 }
 
-/// The label and colour of one fill's card row.
-///
-/// A fill is read by what it did to a position, so a perpetual fill is named by the move it
-/// made; a spot fill names the market it happened on.
-fn fill_label(row: &TooltipRow, side: Side, cx: &App) -> (SharedString, gpui_kit::Hsla) {
-    let theme = cx.theme();
-    match row.kind {
-        InstrumentKind::Spot => (
-            t!(cx, "widget.hyperliquid_wallet.spot"),
-            theme.roles.fg.default.hsla,
-        ),
-        InstrumentKind::Perpetual => match (side, row.direction) {
-            (_, FillDirection::LongToShort) => (
-                t!(cx, "widget.hyperliquid_wallet.long_to_short"),
-                theme.roles.market.down.hsla,
-            ),
-            (_, FillDirection::ShortToLong) => (
-                t!(cx, "widget.hyperliquid_wallet.short_to_long"),
-                theme.roles.market.up.hsla,
-            ),
-            (_, FillDirection::Liquidated) => (
-                t!(cx, "widget.hyperliquid_wallet.liquidated"),
-                theme.roles.market.down.hsla,
-            ),
-            (_, FillDirection::AutoDeleveraged) => (
-                t!(cx, "widget.hyperliquid_wallet.auto_deleveraged"),
-                theme.roles.fg.default.hsla,
-            ),
-            (Side::Buy, FillDirection::Long) => (
-                t!(cx, "widget.hyperliquid_wallet.open_long"),
-                theme.roles.market.up.hsla,
-            ),
-            (Side::Buy, FillDirection::Short) => (
-                t!(cx, "widget.hyperliquid_wallet.close_short"),
-                theme.roles.market.down.hsla,
-            ),
-            (Side::Sell, FillDirection::Long) => (
-                t!(cx, "widget.hyperliquid_wallet.close_long"),
-                theme.roles.market.up.hsla,
-            ),
-            (Side::Sell, FillDirection::Short) => (
-                t!(cx, "widget.hyperliquid_wallet.open_short"),
-                theme.roles.market.down.hsla,
-            ),
-            (_, FillDirection::Unknown) => (
-                t!(cx, "widget.hyperliquid_wallet.unknown"),
-                theme.roles.fg.default.hsla,
-            ),
-        },
-        InstrumentKind::Future | InstrumentKind::Option | InstrumentKind::Outcome => (
-            t!(cx, "widget.hyperliquid_wallet.unknown"),
-            theme.roles.fg.default.hsla,
-        ),
-    }
-}
-
 /// Whether a fill opened or closed a long or a short position.
 ///
 /// The venue's own answer is used when it gave one, and a fill that only says where the
 /// position started is read from that: a settlement, or a fill with no direction at all, is
 /// still on the side the position was on when it happened.
-pub(super) fn perpetual_direction(fill: &HyperliquidUserFill) -> FillDirection {
+fn perpetual_direction(fill: &HyperliquidUserFill) -> FillDirection {
     match fill.direction.as_ref() {
         Some(HyperliquidFillDirection::OpenLong | HyperliquidFillDirection::CloseLong) => {
             FillDirection::Long
@@ -1444,73 +489,1040 @@ fn side_rank(side: Side) -> u8 {
     }
 }
 
-/// A stable element id for a moment, for the row that shows it.
-fn marker_row_id(timestamp: i64) -> u64 {
-    (timestamp as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+/// What a fill's panel row says about the position it moved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FillTone {
+    Up,
+    Down,
+    Neutral,
 }
 
-fn axis_label_width(
-    label: &SharedString,
-    font_size: Pixels,
-    text_style: &TextStyle,
-    window: &Window,
-) -> f32 {
-    window
-        .text_system()
-        .shape_line(
-            label.clone(),
-            font_size,
-            &[TextRun {
-                len: label.len(),
-                font: text_style.font(),
-                ..Default::default()
-            }],
-            None,
+/// The label and tone of one fill's panel row.
+///
+/// A fill is read by what it did to a position, so a perpetual fill is named by the move it
+/// made; a spot fill names the market it happened on.
+fn fill_label(row: &TooltipRow, side: Side, translate: &Translate) -> (SmolStr, FillTone) {
+    match row.kind {
+        InstrumentKind::Spot => (
+            t_smol!(translate, "widget.hyperliquid_wallet.spot"),
+            FillTone::Neutral,
+        ),
+        InstrumentKind::Perpetual => match (side, row.direction) {
+            (_, FillDirection::LongToShort) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.long_to_short"),
+                FillTone::Down,
+            ),
+            (_, FillDirection::ShortToLong) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.short_to_long"),
+                FillTone::Up,
+            ),
+            (_, FillDirection::Liquidated) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.liquidated"),
+                FillTone::Down,
+            ),
+            (_, FillDirection::AutoDeleveraged) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.auto_deleveraged"),
+                FillTone::Neutral,
+            ),
+            (Side::Buy, FillDirection::Long) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.open_long"),
+                FillTone::Up,
+            ),
+            (Side::Buy, FillDirection::Short) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.close_short"),
+                FillTone::Down,
+            ),
+            (Side::Sell, FillDirection::Long) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.close_long"),
+                FillTone::Up,
+            ),
+            (Side::Sell, FillDirection::Short) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.open_short"),
+                FillTone::Down,
+            ),
+            (_, FillDirection::Unknown) => (
+                t_smol!(translate, "widget.hyperliquid_wallet.unknown"),
+                FillTone::Neutral,
+            ),
+        },
+        InstrumentKind::Future | InstrumentKind::Option | InstrumentKind::Outcome => (
+            t_smol!(translate, "widget.hyperliquid_wallet.unknown"),
+            FillTone::Neutral,
+        ),
+    }
+}
+
+/// The age of a moment, as the one relative time every row of this widget is read by.
+fn age_text(translate: &Translate, now: i64, timestamp: i64) -> SmolStr {
+    match age_bucket(now, timestamp) {
+        AgeBucket::Seconds(value) => {
+            t_smol!(
+                translate,
+                "widget.hyperliquid_wallet.age_seconds",
+                value = value
+            )
+        }
+        AgeBucket::Minutes(value) => {
+            t_smol!(
+                translate,
+                "widget.hyperliquid_wallet.age_minutes",
+                value = value
+            )
+        }
+        AgeBucket::Hours(value) => {
+            t_smol!(
+                translate,
+                "widget.hyperliquid_wallet.age_hours",
+                value = value
+            )
+        }
+        AgeBucket::Days(value) => {
+            t_smol!(
+                translate,
+                "widget.hyperliquid_wallet.age_days",
+                value = value
+            )
+        }
+    }
+}
+
+/// The two labels the axis is drawn between.
+fn axis_labels(translate: &Translate) -> (SmolStr, SmolStr) {
+    (
+        t_smol!(translate, "widget.hyperliquid_wallet.timeline_start"),
+        t_smol!(translate, "widget.hyperliquid_wallet.timeline_end"),
+    )
+}
+
+/// The colours one frame of a timeline is drawn with, resolved from the theme.
+///
+/// The canvas bakes them in, which is why the appearance is one of the prepared key's inputs:
+/// a canvas built for the light appearance is the wrong value for the dark one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineColors {
+    /// The axis line, its ticks and the connectors: chart grid, not a text colour.
+    axis: Color,
+    /// The two end labels: chart furniture, read in the axis colour.
+    axis_label: Color,
+    /// Marker outlines and the panel's edge.
+    divider: Color,
+    up: Color,
+    down: Color,
+    /// The letter inside a marker, painted in the surface it cuts out of.
+    marker_text: Color,
+    neutral: Color,
+    muted: Color,
+    /// The panel a marker's fills are drawn on, which sits over everything else.
+    panel: Color,
+}
+
+impl TimelineColors {
+    fn resolve(theme: &Theme) -> Self {
+        Self {
+            axis: theme.role(Role::ChartGrid),
+            axis_label: theme.role(Role::ChartAxis),
+            divider: theme.role(Role::LineDivider),
+            up: theme.role(Role::MarketUp),
+            down: theme.role(Role::MarketDown),
+            marker_text: theme.role(Role::SurfaceSunken),
+            neutral: theme.role(Role::FgDefault),
+            muted: theme.role(Role::FgMuted),
+            panel: theme.role(Role::SurfaceOverlay),
+        }
+    }
+
+    fn tone(self, tone: FillTone) -> Color {
+        match tone {
+            FillTone::Up => self.up,
+            FillTone::Down => self.down,
+            FillTone::Neutral => self.neutral,
+        }
+    }
+}
+
+fn text_style(font_size: f32, color: Color) -> TextStyle {
+    let mut style = TextStyle::new(font_size);
+    style.color = color;
+    style
+}
+
+fn solid_quad(bounds: Rect, fill: Color) -> Quad {
+    Quad {
+        bounds,
+        corner_radius: [0.0; 4],
+        paint: QuadPaint::Solid { fill, border: None },
+    }
+}
+
+/// What a timeline is showing, and the buckets its fills were assigned to.
+struct TimelineData {
+    snapshot: Option<Arc<TimelineSnapshot>>,
+    buckets: Arc<[TimelineBucket]>,
+    /// The plot width the buckets were assigned for.
+    plot_width: f32,
+}
+
+impl Default for TimelineData {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            buckets: Arc::from([]),
+            plot_width: 1.0,
+        }
+    }
+}
+
+impl TimelineData {
+    /// Takes a published snapshot, and says whether anything a frame draws changed.
+    ///
+    /// The ten-second cadence publishes the same window whenever a wallet has not traded, so an
+    /// unchanged snapshot is recognised by identity rather than by comparing fills.
+    fn replace_snapshot(&mut self, snapshot: Option<&Arc<TimelineSnapshot>>) -> bool {
+        let same = match (&self.snapshot, snapshot) {
+            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return false;
+        }
+        self.snapshot = snapshot.cloned();
+        self.buckets = match &self.snapshot {
+            Some(snapshot) => build_buckets(snapshot, self.plot_width.max(1.0)).into(),
+            None => Arc::from([]),
+        };
+        true
+    }
+
+    /// Records the plot width the timeline was laid out at, and rebuckets if it changed.
+    ///
+    /// A width that moved by less than half a pixel is the same width — layout rounding must
+    /// not throw the buckets away — but a move that crosses a bucket boundary is a new plot
+    /// even when the pixel width barely changed.
+    fn set_plot_width(&mut self, plot_width: f32) -> bool {
+        let plot_width = finite_width(plot_width);
+        let rebucket = bucket_count(self.plot_width) != bucket_count(plot_width);
+        if !rebucket && (self.plot_width - plot_width).abs() <= 0.5 {
+            return false;
+        }
+        self.plot_width = plot_width;
+        if rebucket && let Some(snapshot) = self.snapshot.clone() {
+            self.buckets = build_buckets(&snapshot, plot_width).into();
+        }
+        true
+    }
+
+    fn bucket(&self, side: Side, index: usize) -> Option<&TimelineBucket> {
+        self.buckets
+            .iter()
+            .find(|bucket| bucket.side == side && bucket.index == index)
+    }
+
+    fn tooltip_row_count(&self, side: Side, index: usize) -> usize {
+        self.bucket(side, index)
+            .map_or(0, |bucket| bucket.fill_indices.len())
+    }
+}
+
+/// One shaped line, kept until the text or the style it was shaped for changes.
+struct CachedTextLine {
+    text: SmolStr,
+    style: TextStyle,
+    line: Arc<ShapedTextHandle>,
+}
+
+impl CachedTextLine {
+    fn matches(&self, text: &str, style: &TextStyle) -> bool {
+        self.text == text && self.style == *style
+    }
+}
+
+/// The geometry one prepared frame was laid out from.
+struct GeometryCacheEntry {
+    buckets: Arc<[TimelineBucket]>,
+    plot_width: f32,
+    start_label_width: f32,
+    geometry: Arc<TimelineGeometry>,
+}
+
+/// Everything one timeline remembers between frames.
+///
+/// It is bounded: one geometry and a fixed number of shaped lines.
+#[derive(Default)]
+struct PaintCache {
+    geometry: Option<GeometryCacheEntry>,
+    text_lines: Vec<CachedTextLine>,
+}
+
+impl PaintCache {
+    fn geometry(
+        &mut self,
+        buckets: &Arc<[TimelineBucket]>,
+        plot_width: f32,
+        start_label_width: f32,
+    ) -> Arc<TimelineGeometry> {
+        let plot_width = finite_width(plot_width);
+        let matches = self.geometry.as_ref().is_some_and(|entry| {
+            Arc::ptr_eq(&entry.buckets, buckets)
+                && entry.plot_width.to_bits() == plot_width.to_bits()
+                && entry.start_label_width.to_bits() == start_label_width.to_bits()
+        });
+        if matches && let Some(entry) = self.geometry.as_ref() {
+            return entry.geometry.clone();
+        }
+
+        let geometry = Arc::new(TimelineGeometry::new(
+            buckets,
+            plot_width,
+            start_label_width,
+        ));
+        self.geometry = Some(GeometryCacheEntry {
+            buckets: buckets.clone(),
+            plot_width,
+            start_label_width,
+            geometry: geometry.clone(),
+        });
+        geometry
+    }
+
+    /// A shaped line for `text`, from the cache when it is already there.
+    ///
+    /// A handle whose atlas lease has gone is dropped and shaped again: the glyphs it named
+    /// have been reused, so drawing it would be drawing another line's pixels.
+    fn line(&mut self, app: &mut App, text: &str, style: &TextStyle) -> Arc<ShapedTextHandle> {
+        if let Some(index) = self
+            .text_lines
+            .iter()
+            .position(|entry| entry.matches(text, style))
+        {
+            // Refreshing recency by moving the entry to the back is what makes the capacity
+            // below evict the least recently used line.
+            let entry = self.text_lines.remove(index);
+            if !entry.line.is_stale() {
+                let line = entry.line.clone();
+                self.text_lines.push(entry);
+                return line;
+            }
+        }
+
+        let line = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
+            // Text that cannot be shaped at all is drawn as nothing rather than failing the
+            // frame: a label is not worth a dropped frame, and the next frame tries again.
+            app.shape_text("", style, None, &[])
+                .expect("an empty line always shapes")
+        }));
+        if self.text_lines.len() >= TEXT_CACHE_CAPACITY {
+            self.text_lines.remove(0);
+        }
+        self.text_lines.push(CachedTextLine {
+            text: SmolStr::new(text),
+            style: style.clone(),
+            line: line.clone(),
+        });
+        line
+    }
+}
+
+/// The width of the two axis labels, and the lines they were shaped with.
+struct LabelMetrics {
+    labels: (SmolStr, SmolStr),
+    color: Color,
+    font_size: f32,
+    text_scale: f32,
+    start: Arc<ShapedTextHandle>,
+    end: Arc<ShapedTextHandle>,
+}
+
+impl LabelMetrics {
+    fn matches(
+        &self,
+        labels: &(SmolStr, SmolStr),
+        color: Color,
+        font_size: f32,
+        text_scale: f32,
+    ) -> bool {
+        self.labels == *labels
+            && self.color == color
+            && self.font_size == font_size
+            && self.text_scale == text_scale
+    }
+}
+
+/// The inputs one canvas was built from.
+///
+/// Everything a frame reads has to be in here, or a change to it would keep serving the canvas
+/// from before the change: the snapshot's identity, the box the node was laid out in, the two
+/// label widths the axis geometry was a function of, the hovered marker, the colours the
+/// appearance resolves, the language and the raster scale the labels were shaped at.
+struct PreparedKey {
+    snapshot: Option<Arc<TimelineSnapshot>>,
+    bounds: Rect,
+    axis_width: f32,
+    start_label_width: f32,
+    hovered: Option<(Side, usize)>,
+    colors: TimelineColors,
+    language: LanguageCode,
+    text_scale: f32,
+}
+
+impl PreparedKey {
+    fn matches(
+        &self,
+        snapshot: &Option<Arc<TimelineSnapshot>>,
+        bounds: Rect,
+        axis_width: f32,
+        start_label_width: f32,
+        hovered: Option<(Side, usize)>,
+        colors: TimelineColors,
+        language: LanguageCode,
+        text_scale: f32,
+    ) -> bool {
+        let same_snapshot = match (&self.snapshot, snapshot) {
+            (Some(current), Some(next)) => Arc::ptr_eq(current, next),
+            (None, None) => true,
+            _ => false,
+        };
+        same_snapshot
+            && self.bounds == bounds
+            && self.axis_width == axis_width
+            && self.start_label_width == start_label_width
+            && self.hovered == hovered
+            && self.colors == colors
+            && self.language == language
+            && self.text_scale == text_scale
+    }
+}
+
+/// One wallet's timeline: the canvas node it draws into, what it last drew, and the caches a
+/// frame reuses.
+pub(super) struct TimelinePaint {
+    node: Option<NodeId>,
+    data: TimelineData,
+    cache: PaintCache,
+    labels: Option<LabelMetrics>,
+    /// What the canvas on screen was built from.
+    prepared: Option<PreparedKey>,
+    /// The shaped lines the canvas on screen was built from.
+    ///
+    /// A canvas is a value and the timeline keeps the one it built, but the *glyphs* a canvas
+    /// names are leased from a shared atlas: an atlas generation change or a per-tile eviction
+    /// leaves the handles it was built from pointing at reused texture, and the engine drops
+    /// such runs at encode time. The lines recorded here are the ones whose lease a steady
+    /// frame has to check.
+    painted_text: Vec<Arc<ShapedTextHandle>>,
+    /// The marker the panel is open on, kept so the pointer can move from the marker into the
+    /// panel without the panel closing underneath it.
+    hovered: Option<(Side, usize)>,
+    /// The box the canvas was last cleared for, while the row has no reading to draw.
+    empty_bounds: Option<Rect>,
+    /// The language the canvas' accessible name was last written in.
+    a11y_language: Option<LanguageCode>,
+}
+
+impl TimelinePaint {
+    pub(super) fn new(node: NodeId) -> Self {
+        Self {
+            node: Some(node),
+            data: TimelineData::default(),
+            cache: PaintCache::default(),
+            labels: None,
+            prepared: None,
+            painted_text: Vec::new(),
+            hovered: None,
+            empty_bounds: None,
+            a11y_language: None,
+        }
+    }
+
+    /// Repaints only when the frame this one would be is not the one already drawn.
+    ///
+    /// `hover` is the pointer inside the canvas, in the canvas' own coordinates, when the row
+    /// is hovered. A canvas whose box the layout has not given yet has no width to divide into
+    /// buckets, so it is left alone and the next `sync` draws it.
+    pub(super) fn sync(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        snapshot: Option<&Arc<TimelineSnapshot>>,
+        precision: &DisplayPrecision,
+        language: Signal<LanguageCode>,
+        hover: Option<Point>,
+    ) -> Result<(), EngineError> {
+        let Some(node) = self.node else {
+            return Ok(());
+        };
+        let Ok(target) = cx.tree().get(node) else {
+            return Ok(());
+        };
+        let bounds = target.layout().bounds;
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 || !bounds.is_finite() {
+            // The frame that laid the node out has not run yet; the next one will.
+            return Ok(());
+        }
+
+        let Some(snapshot) = snapshot else {
+            // The row's own overlay says why there is nothing to draw: an empty canvas is what
+            // the node holds until a reading arrives, and a second frame for the same box is
+            // not a change.
+            if self.empty_bounds == Some(bounds) {
+                return Ok(());
+            }
+            cx.set_canvas(node, Canvas::new(bounds))?;
+            self.empty_bounds = Some(bounds);
+            self.prepared = None;
+            self.painted_text.clear();
+            self.hovered = None;
+            self.data.replace_snapshot(None);
+            return Ok(());
+        };
+        self.empty_bounds = None;
+
+        let appearance = cx.theme().current(cx.app());
+        let colors = TimelineColors::resolve(cx.theme().theme_for(appearance));
+        let tokens = *cx.theme().tokens();
+        let text_scale = cx.app().text_scale();
+        let language_now = *cx.read(&language);
+        let translate = cx.translate().clone();
+
+        let plot_width = plot_width(bounds.size.width);
+        self.data.replace_snapshot(Some(snapshot));
+        self.data.set_plot_width(plot_width);
+
+        let (labels, label_widths) = self.ensure_labels(
+            cx.app_mut(),
+            axis_labels(&translate),
+            tokens.small.font_size,
+            colors.axis_label,
+            text_scale,
+        );
+        // A canvas too narrow to keep both labels beside the axis draws the axis alone rather
+        // than over painting the box it was given.
+        let (start_label_width, end_label_width) =
+            if label_widths.0 + label_widths.1 + AXIS_LABEL_GAP * 2.0 < plot_width {
+                label_widths
+            } else {
+                (0.0, 0.0)
+            };
+        let axis_width = axis_line_width(plot_width, start_label_width, end_label_width);
+        let geometry = self
+            .cache
+            .geometry(&self.data.buckets, axis_width, start_label_width);
+        let hovered = self.resolve_hover(hover, &geometry, bounds);
+
+        let prepared = self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.matches(
+                &self.data.snapshot,
+                bounds,
+                axis_width,
+                start_label_width,
+                hovered,
+                colors,
+                language_now,
+                text_scale,
+            )
+        }) && !self.painted_text.iter().any(|handle| handle.is_stale());
+        if prepared {
+            return Ok(());
+        }
+
+        // A canvas is an image to assistive technology: the title the row's account line says
+        // in words is what its drawing is called.
+        if self.a11y_language != Some(language_now) {
+            cx.set_a11y_patch(
+                node,
+                A11yPatch {
+                    role: Some(A11yRole::Image),
+                    label: Some(t_smol!(
+                        translate,
+                        "widget.hyperliquid_wallet.timeline_title"
+                    )),
+                    ..A11yPatch::default()
+                },
+            )?;
+            self.a11y_language = Some(language_now);
+        }
+
+        let marker_font = (geometry.marker_size * MARKER_FONT_RATIO).max(MARKER_MIN_FONT_SIZE);
+        let frame = Frame {
+            app: cx.app_mut(),
+            bounds,
+            colors,
+            axis_font: tokens.small.font_size,
+            marker_font,
+            border_width: tokens.border_width,
+            translate: &translate,
+            precision,
+            now: now_millis().unwrap_or(0),
+            snapshot,
+            buckets: &self.data.buckets,
+            geometry: &geometry,
+            labels: if start_label_width > 0.0 {
+                labels
+            } else {
+                (None, None)
+            },
+            hovered,
+        };
+        let (canvas, whole, painted_text) = frame.paint(&mut self.cache);
+        cx.set_canvas(node, canvas)?;
+        if whole {
+            self.prepared = Some(PreparedKey {
+                snapshot: self.data.snapshot.clone(),
+                bounds,
+                axis_width,
+                start_label_width,
+                hovered,
+                colors,
+                language: language_now,
+                text_scale,
+            });
+            self.painted_text = painted_text;
+        } else {
+            // An incomplete canvas is not what the timeline draws: leaving the key unrecorded
+            // is what makes the next frame build it again (I3 still holds — a whole frame is
+            // still a short circuit).
+            self.prepared = None;
+            self.painted_text.clear();
+        }
+        Ok(())
+    }
+
+    /// Drops everything the timeline remembered about the row it was drawn in.
+    ///
+    /// The row's list removes the canvas node itself; a timeline that registered geometry
+    /// would hand it back here, and this one registers none (quads and glyph runs only).
+    pub(super) fn release(&mut self, _cx: &mut WidgetCx<'_>) {
+        self.node = None;
+        self.data = TimelineData::default();
+        self.cache = PaintCache::default();
+        self.labels = None;
+        self.prepared = None;
+        self.painted_text.clear();
+        self.hovered = None;
+        self.empty_bounds = None;
+        self.a11y_language = None;
+    }
+
+    /// Shapes the two end labels, or reuses the lines and widths a frame already has.
+    fn ensure_labels(
+        &mut self,
+        app: &mut App,
+        labels: (SmolStr, SmolStr),
+        font_size: f32,
+        color: Color,
+        text_scale: f32,
+    ) -> (
+        (Option<Arc<ShapedTextHandle>>, Option<Arc<ShapedTextHandle>>),
+        (f32, f32),
+    ) {
+        let current = self.labels.as_ref().is_some_and(|metrics| {
+            metrics.matches(&labels, color, font_size, text_scale)
+                && !metrics.start.is_stale()
+                && !metrics.end.is_stale()
+        });
+        if !current {
+            let style = text_style(font_size, color);
+            let start = self.cache.line(app, labels.0.as_str(), &style);
+            let end = self.cache.line(app, labels.1.as_str(), &style);
+            self.labels = Some(LabelMetrics {
+                labels,
+                color,
+                font_size,
+                text_scale,
+                start,
+                end,
+            });
+        }
+        let metrics = self.labels.as_ref().expect("the labels are ensured");
+        let widths = (metrics.start.size().width, metrics.end.size().width);
+        (
+            (Some(metrics.start.clone()), Some(metrics.end.clone())),
+            widths,
         )
-        .width()
-        .as_f32()
+    }
+
+    /// Records where the pointer is, answering the marker whose panel is open.
+    ///
+    /// Moving inside one marker is not a movement, and neither is moving from the marker into
+    /// the panel it opened: the marker's panel staying open is what lets a reader point at it.
+    fn resolve_hover(
+        &mut self,
+        hover: Option<Point>,
+        geometry: &TimelineGeometry,
+        bounds: Rect,
+    ) -> Option<(Side, usize)> {
+        let Some(point) = hover.filter(|point| point.x.is_finite() && point.y.is_finite()) else {
+            self.hovered = None;
+            return None;
+        };
+        if let Some(marker) = geometry.marker_at(point) {
+            let hovered = (marker.side, marker.bucket_index);
+            self.hovered = Some(hovered);
+            return Some(hovered);
+        }
+        let previous = self.hovered?;
+        let rows = self
+            .data
+            .tooltip_row_count(previous.0, previous.1)
+            .min(tooltip_row_limit(bounds.size.height));
+        if rows == 0 {
+            self.hovered = None;
+            return None;
+        }
+        let Some(marker) = geometry.marker(previous.0, previous.1) else {
+            self.hovered = None;
+            return None;
+        };
+        let panel = tooltip_panel(marker, bounds.size.width, bounds.size.height, rows);
+        if panel.contains(point) {
+            Some(previous)
+        } else {
+            self.hovered = None;
+            None
+        }
+    }
+}
+
+/// Builds the canvas node inside a list row.
+///
+/// There is no `App` in a row factory: the node is built empty (`Rect::default()`) and the
+/// first [`TimelinePaint::sync`] after it was laid out is what fills it in. The node registers
+/// a theme dependency so an appearance switch invalidates it and schedules the frame whose
+/// `sync` resolves the new colours (G3); the language dependency is the row's own bound title
+/// text, whose write schedules the same frame.
+pub(super) fn build_canvas(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    theme: ThemeHandle,
+) -> Result<NodeId, EngineError> {
+    NodeBuilder::canvas(Canvas::new(Rect::default()))
+        .id(TIMELINE_SELECTOR)
+        .style(
+            StyleBuilder::new()
+                .size_full()
+                .min_width_0()
+                .min_height_0()
+                .build(),
+        )
+        .tab_stop(false)
+        .bind_style(move |read| {
+            let _ = theme.appearance(read);
+            StylePatch::default()
+        })
+        .build(tree, parent)
+}
+
+fn tooltip_row_limit(height: f32) -> usize {
+    if !height.is_finite() || height <= 0.0 {
+        return 0;
+    }
+    let available = height - TOOLTIP_GAP * 2.0 - TOOLTIP_PADDING * 2.0;
+    let rows = (available / TOOLTIP_ROW_HEIGHT).floor().max(0.0) as usize;
+    rows.min(TOOLTIP_VISIBLE_ROWS)
+}
+
+/// Where the panel of one marker's fills is drawn, in the canvas' coordinates.
+fn tooltip_panel(marker: &MarkerGeometry, width: f32, height: f32, rows: usize) -> Rect {
+    let panel_width = TOOLTIP_WIDTH.min((width - TOOLTIP_GAP * 2.0).max(1.0));
+    let panel_height = (rows as f32 * TOOLTIP_ROW_HEIGHT + TOOLTIP_PADDING * 2.0)
+        .min((height - TOOLTIP_GAP * 2.0).max(1.0));
+    let center = marker.bounds.origin.x + marker.bounds.size.width / 2.0;
+    let left = (center - panel_width / 2.0).clamp(
+        TOOLTIP_GAP,
+        (width - panel_width - TOOLTIP_GAP).max(TOOLTIP_GAP),
+    );
+    let top = match marker.side {
+        Side::Buy => marker.bounds.origin.y - TOOLTIP_GAP - panel_height,
+        Side::Sell => marker.bounds.max().y + TOOLTIP_GAP,
+    }
+    .clamp(
+        TOOLTIP_GAP,
+        (height - panel_height - TOOLTIP_GAP).max(TOOLTIP_GAP),
+    );
+    Rect::new(left, top, panel_width, panel_height)
+}
+
+/// The shaped text one frame pushes, and whether every line reached the canvas.
+struct TextPainter<'a> {
+    app: &'a mut App,
+    cache: &'a mut PaintCache,
+    /// The lines this frame pushed, which are the canvas' text.
+    used: Vec<Arc<ShapedTextHandle>>,
+    whole: bool,
+}
+
+impl TextPainter<'_> {
+    /// The shaped line of `text`, or `None` for text that has nothing to draw.
+    fn line(&mut self, text: &str, style: &TextStyle) -> Option<Arc<ShapedTextHandle>> {
+        if text.is_empty() {
+            return None;
+        }
+        Some(self.cache.line(self.app, text, style))
+    }
+
+    /// Pushes one shaped line at `origin`.
+    ///
+    /// A refused line is one whose atlas lease died between being shaped and being pushed: its
+    /// glyphs have been reused, so the run is left out rather than drawn from stale texture,
+    /// and the pass is not a whole frame any more.
+    fn place(&mut self, canvas: &mut Canvas, line: &Arc<ShapedTextHandle>, origin: Point) {
+        if canvas.push_shaped_text(line, origin) {
+            self.used.push(line.clone());
+        } else {
+            self.whole = false;
+        }
+    }
+}
+
+/// One frame's drawing, ready to be built into a canvas.
+struct Frame<'a> {
+    app: &'a mut App,
+    bounds: Rect,
+    colors: TimelineColors,
+    axis_font: f32,
+    marker_font: f32,
+    border_width: f32,
+    translate: &'a Translate,
+    precision: &'a DisplayPrecision,
+    now: i64,
+    snapshot: &'a Arc<TimelineSnapshot>,
+    buckets: &'a [TimelineBucket],
+    geometry: &'a TimelineGeometry,
+    labels: (Option<Arc<ShapedTextHandle>>, Option<Arc<ShapedTextHandle>>),
+    hovered: Option<(Side, usize)>,
+}
+
+impl Frame<'_> {
+    /// Draws one frame of a timeline into a canvas.
+    ///
+    /// Commands below the connectors first: a bucket whose two sides meet at the axis still
+    /// shows a continuous join under both markers.
+    fn paint(self, cache: &mut PaintCache) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
+        let Self {
+            app,
+            bounds,
+            colors,
+            axis_font,
+            marker_font,
+            border_width,
+            translate,
+            precision,
+            now,
+            snapshot,
+            buckets,
+            geometry,
+            labels,
+            hovered,
+        } = self;
+        let origin = bounds.origin;
+        let mut canvas = Canvas::new(bounds);
+        // The masked drawing the reference did: the frame is clipped to the box the node ended
+        // up with, so a rounding error cannot paint over a sibling.
+        let _ = canvas.push_clip(ClipRect {
+            rect: bounds,
+            corner_radius: [0.0; 4],
+        });
+        let mut text = TextPainter {
+            app,
+            cache,
+            used: Vec::with_capacity(buckets.len() * 2 + TOOLTIP_VISIBLE_ROWS * 3),
+            whole: true,
+        };
+
+        for tick in [geometry.axis, geometry.start_tick, geometry.end_tick] {
+            canvas.push_quad(solid_quad(tick.translate(origin), colors.axis));
+        }
+        for marker in geometry.markers.iter() {
+            canvas.push_quad(solid_quad(marker.connector.translate(origin), colors.axis));
+        }
+
+        for marker in geometry.markers.iter() {
+            let fill = match marker.side {
+                Side::Buy => colors.up,
+                Side::Sell => colors.down,
+            };
+            let radius = (marker.bounds.size.width * MARKER_RADIUS_RATIO)
+                .min(marker.bounds.size.width / 2.0);
+            canvas.push_quad(Quad {
+                bounds: marker.bounds.translate(origin),
+                corner_radius: [radius; 4],
+                paint: QuadPaint::Solid {
+                    fill,
+                    border: Some(Border {
+                        width: border_width,
+                        color: colors.divider,
+                    }),
+                },
+            });
+        }
+
+        let letter_style = text_style(marker_font, colors.marker_text);
+        for marker in geometry.markers.iter() {
+            let letter = match marker.side {
+                Side::Buy => "B",
+                Side::Sell => "S",
+            };
+            let Some(line) = text.line(letter, &letter_style) else {
+                continue;
+            };
+            let size = line.size();
+            let center = Point::new(
+                marker.bounds.origin.x + (marker.bounds.size.width - size.width) / 2.0,
+                marker.bounds.origin.y + (marker.bounds.size.height - size.height) / 2.0,
+            );
+            text.place(&mut canvas, &line, center + origin);
+        }
+
+        if let Some(start) = &labels.0 {
+            let size = start.size();
+            let position = Point::new(
+                geometry.axis.origin.x - AXIS_LABEL_GAP - size.width,
+                geometry.axis.origin.y - size.height / 2.0,
+            );
+            text.place(&mut canvas, start, position + origin);
+        }
+        if let Some(end) = &labels.1 {
+            let size = end.size();
+            let position = Point::new(
+                geometry.axis.max().x + AXIS_LABEL_GAP,
+                geometry.axis.origin.y - size.height / 2.0,
+            );
+            text.place(&mut canvas, end, position + origin);
+        }
+
+        if let Some((side, index)) = hovered
+            && let Some(bucket) = buckets
+                .iter()
+                .find(|bucket| bucket.side == side && bucket.index == index)
+        {
+            TooltipFrame {
+                bounds,
+                colors,
+                border_width,
+                font: axis_font,
+                geometry,
+                snapshot,
+                precision,
+                translate,
+                now,
+                side,
+                bucket,
+            }
+            .paint(&mut canvas, &mut text);
+        }
+
+        let _ = canvas.pop_clip();
+        (canvas, text.whole, text.used)
+    }
+}
+
+/// The panel one hovered marker opens, drawn over the axis.
+struct TooltipFrame<'a> {
+    bounds: Rect,
+    colors: TimelineColors,
+    border_width: f32,
+    font: f32,
+    geometry: &'a TimelineGeometry,
+    snapshot: &'a TimelineSnapshot,
+    precision: &'a DisplayPrecision,
+    translate: &'a Translate,
+    now: i64,
+    side: Side,
+    bucket: &'a TimelineBucket,
+}
+
+impl TooltipFrame<'_> {
+    fn paint(self, canvas: &mut Canvas, text: &mut TextPainter<'_>) {
+        let Some(marker) = self.geometry.marker(self.side, self.bucket.index) else {
+            return;
+        };
+        let rows = tooltip_rows(self.snapshot, self.bucket, self.precision);
+        let limit = tooltip_row_limit(self.bounds.size.height);
+        let shown = rows.len().min(limit);
+        if shown == 0 {
+            return;
+        }
+        let panel = tooltip_panel(
+            marker,
+            self.bounds.size.width,
+            self.bounds.size.height,
+            shown,
+        );
+        let origin = self.bounds.origin;
+        canvas.push_quad(Quad {
+            bounds: panel.translate(origin),
+            corner_radius: [TOOLTIP_CORNER_RADIUS; 4],
+            paint: QuadPaint::Solid {
+                fill: self.colors.panel,
+                border: Some(Border {
+                    width: self.border_width,
+                    color: self.colors.divider,
+                }),
+            },
+        });
+        let _ = canvas.push_clip(ClipRect {
+            rect: panel.translate(origin),
+            corner_radius: [0.0; 4],
+        });
+
+        let quantity_style = text_style(self.font, self.colors.neutral);
+        let muted_style = text_style(self.font, self.colors.muted);
+        let right = origin.x + panel.max().x - TOOLTIP_PADDING;
+        for (offset, row) in rows.iter().take(shown).enumerate() {
+            let top =
+                origin.y + panel.origin.y + TOOLTIP_PADDING + offset as f32 * TOOLTIP_ROW_HEIGHT;
+            let quantity = format_smolstr!(
+                "{} @ {}",
+                row.quantity_text(self.precision, self.translate),
+                row.price_text(self.precision, self.translate)
+            );
+            let (label, tone) = fill_label(row, self.side, self.translate);
+            let label_style = text_style(self.font, self.colors.tone(tone));
+            let age = age_text(self.translate, self.now, row.timestamp);
+
+            let Some(quantity_line) = text.line(&quantity, &quantity_style) else {
+                continue;
+            };
+            let line_height = quantity_line.size().height;
+            let line_top = top + (TOOLTIP_ROW_HEIGHT - line_height) / 2.0;
+            text.place(
+                canvas,
+                &quantity_line,
+                Point::new(origin.x + panel.origin.x + TOOLTIP_PADDING, line_top),
+            );
+
+            let age_line = text.line(&age, &muted_style);
+            let label_line = text.line(&label, &label_style);
+            let age_width = age_line.as_ref().map_or(0.0, |line| line.size().width);
+            let label_width = label_line.as_ref().map_or(0.0, |line| line.size().width);
+            if let Some(line) = &age_line {
+                text.place(canvas, line, Point::new(right - age_width, line_top));
+            }
+            if let Some(line) = &label_line {
+                text.place(
+                    canvas,
+                    line,
+                    Point::new(right - age_width - AXIS_LABEL_GAP - label_width, line_top),
+                );
+            }
+        }
+
+        let _ = canvas.pop_clip();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use market_participants_model::market::{account::AssetAmount, units::QuantityUnit};
+    use ui_core::{node::tree::NodeKind, test_support::record::PrimitiveKind};
+    use widget::test_support::WidgetTestApp;
 
     use super::*;
-    use crate::test_support::{listing_key, market_price, perpetual_route, token};
+    use crate::test_support::{
+        address, empty_timeline, fill, listing_key, perpetual_route, precision_for, test_routes,
+    };
 
     /// The listing every test fill was traded on.
     fn listing() -> VenueListingKey {
-        listing_key(&perpetual_route(), "BTC")
-    }
-
-    fn fill(timestamp: i64, tid: u64, side: Side) -> HyperliquidUserFill {
-        HyperliquidUserFill {
-            address: "0x1111111111111111111111111111111111111111"
-                .parse()
-                .expect("address should be valid"),
-            listing: listing(),
-            side,
-            quantity: MarketQuantity::traded(
-                "1".parse().expect("quantity should be valid"),
-                QuantityUnit::Contracts,
-            )
-            .expect("a fill quantity is a traded quantity"),
-            price: market_price("1"),
-            timestamp,
-            start_position: SignedQuantity::ZERO,
-            closed_pnl: AssetAmount {
-                asset: token("USDC"),
-                value: SignedQuantity::ZERO,
-            },
-            fee: AssetAmount {
-                asset: token("USDC"),
-                value: SignedQuantity::ZERO,
-            },
-            hash: None,
-            tid,
-            liquidation: false,
-            direction: None,
-        }
+        listing_key(&perpetual_route(), "ETH")
     }
 
     fn snapshot(fills: Vec<HyperliquidUserFill>) -> TimelineSnapshot {
@@ -1521,11 +1533,25 @@ mod tests {
         }
     }
 
+    fn precision() -> DisplayPrecision {
+        precision_for(test_routes())
+    }
+
+    // ── the pure behaviour the old module specified ─────────────────────────
+
     #[test]
     fn each_fill_is_assigned_to_one_side_bucket() {
         let snapshot = snapshot(vec![
-            fill(1, 1, Side::Buy),
-            fill(WINDOW_MILLIS, 2, Side::Sell),
+            fill(&address("1"), &listing(), Side::Buy, "1", "1", 1, 1),
+            fill(
+                &address("1"),
+                &listing(),
+                Side::Sell,
+                "1",
+                "1",
+                WINDOW_MILLIS,
+                2,
+            ),
         ]);
 
         let assigned = build_buckets(&snapshot, 560.0)
@@ -1541,7 +1567,11 @@ mod tests {
         let snapshot = TimelineSnapshot {
             window_start: 100,
             window_end: 200,
-            fills: vec![fill(99, 1, Side::Buy), fill(201, 2, Side::Sell)].into(),
+            fills: vec![
+                fill(&address("1"), &listing(), Side::Buy, "1", "1", 99, 1),
+                fill(&address("1"), &listing(), Side::Sell, "1", "1", 201, 2),
+            ]
+            .into(),
         };
 
         assert!(build_buckets(&snapshot, 560.0).is_empty());
@@ -1549,13 +1579,16 @@ mod tests {
 
     #[test]
     fn tooltip_rows_are_newest_first() {
-        let snapshot = snapshot(vec![fill(1, 1, Side::Buy), fill(2, 2, Side::Buy)]);
+        let snapshot = snapshot(vec![
+            fill(&address("1"), &listing(), Side::Buy, "1", "1", 1, 1),
+            fill(&address("1"), &listing(), Side::Buy, "1", "1", 2, 2),
+        ]);
         let bucket = build_buckets(&snapshot, 560.0)
             .into_iter()
             .find(|bucket| bucket.side == Side::Buy)
             .expect("a buy bucket should exist");
 
-        let rows = tooltip_rows(&snapshot, &bucket, None);
+        let rows = tooltip_rows(&snapshot, &bucket, &precision());
 
         assert_eq!(rows[0].timestamp, 2);
     }
@@ -1579,7 +1612,7 @@ mod tests {
 
     #[test]
     fn direction_prefers_api_value_and_falls_back_to_position() {
-        let mut fill = fill(1, 1, Side::Buy);
+        let mut fill = fill(&address("1"), &listing(), Side::Buy, "1", "1", 1, 1);
 
         fill.direction = Some(HyperliquidFillDirection::OpenShort);
         assert_eq!(perpetual_direction(&fill), FillDirection::Short);
@@ -1610,7 +1643,17 @@ mod tests {
     fn tooltip_rows_keep_every_fill_of_a_bucket() {
         let snapshot = snapshot(
             (0..8)
-                .map(|index| fill(index, index as u64, Side::Buy))
+                .map(|index| {
+                    fill(
+                        &address("1"),
+                        &listing(),
+                        Side::Buy,
+                        "1",
+                        "1",
+                        index,
+                        index as u64,
+                    )
+                })
                 .collect::<Vec<_>>(),
         );
         let bucket = build_buckets(&snapshot, 560.0)
@@ -1618,8 +1661,8 @@ mod tests {
             .find(|bucket| bucket.side == Side::Buy)
             .expect("a buy bucket should exist");
 
-        assert_eq!(tooltip_rows(&snapshot, &bucket, None).len(), 8);
-        assert!(tooltip_rows(&snapshot, &bucket, None).len() > TOOLTIP_VISIBLE_ROWS);
+        assert_eq!(tooltip_rows(&snapshot, &bucket, &precision()).len(), 8);
+        assert!(tooltip_rows(&snapshot, &bucket, &precision()).len() > TOOLTIP_VISIBLE_ROWS);
     }
 
     #[test]
@@ -1653,13 +1696,13 @@ mod tests {
             .iter()
             .filter(|marker| marker.side == Side::Buy)
             .collect::<Vec<_>>();
-        assert!(buys[1].bounds.left() - buys[0].bounds.right() >= px(MARKER_GAP - 0.01));
+        assert!(buys[1].bounds.origin.x - buys[0].bounds.max().x >= MARKER_GAP - 0.01);
         assert!(
             geometry
                 .markers
                 .iter()
                 .filter(|marker| marker.side == Side::Buy)
-                .all(|marker| marker.connector.size.height > px(0.0))
+                .all(|marker| marker.connector.size.height > 0.0)
         );
     }
 
@@ -1677,7 +1720,7 @@ mod tests {
             let geometry = TimelineGeometry::new(&buckets, plot_width, 48.0);
             for pair in geometry.markers.windows(2) {
                 assert!(
-                    pair[1].bounds.left() - pair[0].bounds.right() >= px(MARKER_GAP - 0.01),
+                    pair[1].bounds.origin.x - pair[0].bounds.max().x >= MARKER_GAP - 0.01,
                     "plot width {plot_width} produced an overlapping marker pair"
                 );
             }
@@ -1718,8 +1761,8 @@ mod tests {
             panic!("expected one buy and one sell marker");
         };
 
-        assert_eq!(buy.bounds.left(), sell.bounds.left());
-        assert!(buy.bounds.bottom() < sell.bounds.top());
+        assert_eq!(buy.bounds.origin.x, sell.bounds.origin.x);
+        assert!(buy.bounds.max().y < sell.bounds.origin.y);
     }
 
     #[test]
@@ -1732,9 +1775,17 @@ mod tests {
 
     #[test]
     fn geometry_cache_reuses_the_same_snapshot_and_size() {
-        let snapshot = snapshot(vec![fill(1, 1, Side::Buy)]);
+        let snapshot = snapshot(vec![fill(
+            &address("1"),
+            &listing(),
+            Side::Buy,
+            "1",
+            "1",
+            1,
+            1,
+        )]);
         let buckets: Arc<[TimelineBucket]> = build_buckets(&snapshot, 472.0).into();
-        let mut cache = TimelinePaintCache::default();
+        let mut cache = PaintCache::default();
 
         let first = cache.geometry(&buckets, 472.0, 48.0);
         let second = cache.geometry(&buckets, 472.0, 48.0);
@@ -1744,9 +1795,17 @@ mod tests {
 
     #[test]
     fn geometry_cache_rebuilds_when_the_plot_width_changes() {
-        let snapshot = snapshot(vec![fill(1, 1, Side::Buy)]);
+        let snapshot = snapshot(vec![fill(
+            &address("1"),
+            &listing(),
+            Side::Buy,
+            "1",
+            "1",
+            1,
+            1,
+        )]);
         let buckets: Arc<[TimelineBucket]> = build_buckets(&snapshot, 472.0).into();
-        let mut cache = TimelinePaintCache::default();
+        let mut cache = PaintCache::default();
 
         let first = cache.geometry(&buckets, 472.0, 48.0);
         let second = cache.geometry(&buckets, 576.0, 48.0);
@@ -1755,54 +1814,459 @@ mod tests {
     }
 
     #[test]
-    fn entry_uses_arc_identity_for_snapshot_noop_detection() {
-        let snapshot = Arc::new(snapshot(vec![fill(1, 1, Side::Buy)]));
-        let mut entry = TimelineEntry::default();
+    fn data_uses_arc_identity_for_snapshot_noop_detection() {
+        let snapshot = Arc::new(snapshot(vec![fill(
+            &address("1"),
+            &listing(),
+            Side::Buy,
+            "1",
+            "1",
+            1,
+            1,
+        )]));
+        let mut data = TimelineData::default();
 
-        assert!(entry.replace_snapshot(&snapshot));
-        assert!(!entry.replace_snapshot(&snapshot.clone()));
-        assert!(!entry.replace_snapshot(&snapshot));
+        assert!(data.replace_snapshot(Some(&snapshot)));
+        assert!(!data.replace_snapshot(Some(&snapshot.clone())));
+        assert!(!data.replace_snapshot(Some(&snapshot)));
+        assert!(data.replace_snapshot(None));
+        assert!(!data.replace_snapshot(None));
     }
 
     #[test]
-    fn entry_dimension_changes_rebucket_and_retain_scroll_handles() {
-        let snapshot = Arc::new(snapshot(vec![fill(1, 1, Side::Buy)]));
-        let mut entry = TimelineEntry::default();
-        entry.replace_snapshot(&snapshot);
-        let handle = entry
-            .tooltip_scrolls
-            .get(&(Side::Buy, 0))
-            .cloned()
-            .expect("the first bucket should have a scroll handle");
+    fn a_dimension_change_rebuckets_the_fills() {
+        let snapshot = Arc::new(snapshot(vec![fill(
+            &address("1"),
+            &listing(),
+            Side::Buy,
+            "1",
+            "1",
+            1,
+            1,
+        )]));
+        let mut data = TimelineData::default();
+        data.replace_snapshot(Some(&snapshot));
+        let before = data.buckets.clone();
 
-        assert!(entry.set_dimensions(320.0, 320.0));
+        assert!(data.set_plot_width(320.0));
         assert!(
-            entry
-                .tooltip_scrolls
-                .values()
-                .any(|candidate| Rc::ptr_eq(&candidate.0, &handle.0))
+            !Arc::ptr_eq(&before, &data.buckets),
+            "the fills are assigned to the slots of the new plot width"
         );
-        assert!(!entry.set_dimensions(320.0, 320.0));
+        assert!(
+            !data.set_plot_width(320.0),
+            "the same width is not a change"
+        );
+        assert_eq!(data.buckets.len(), 1);
     }
 
     #[test]
     fn dimension_changes_rebucket_when_a_small_delta_crosses_a_bucket_boundary() {
-        let snapshot = Arc::new(snapshot(vec![fill(1, 1, Side::Buy)]));
-        let mut entry = TimelineEntry::default();
-        entry.replace_snapshot(&snapshot);
+        let snapshot = Arc::new(snapshot(vec![fill(
+            &address("1"),
+            &listing(),
+            Side::Buy,
+            "1",
+            "1",
+            1,
+            1,
+        )]));
+        let mut data = TimelineData::default();
+        data.replace_snapshot(Some(&snapshot));
 
-        assert!(entry.set_dimensions(600.0, 575.9));
-        assert_eq!(bucket_count(entry.plot_width), 23);
-        assert!(entry.set_dimensions(600.0, 576.1));
-        assert_eq!(bucket_count(entry.plot_width), 24);
+        assert!(data.set_plot_width(575.9));
+        assert_eq!(bucket_count(data.plot_width), 23);
+        assert!(data.set_plot_width(576.1));
+        assert_eq!(bucket_count(data.plot_width), 24);
     }
 
     #[test]
     fn a_non_finite_dimension_should_not_poison_the_plot_width() {
-        let mut entry = TimelineEntry::default();
+        let mut data = TimelineData::default();
+        assert!(data.set_plot_width(560.0));
 
-        assert!(entry.set_dimensions(f32::NAN, f32::INFINITY));
-        assert_eq!(entry.plot_width, 1.0);
-        assert_eq!(bucket_count(entry.plot_width), 1);
+        assert!(data.set_plot_width(f32::NAN));
+        assert_eq!(data.plot_width, 1.0);
+        assert_eq!(bucket_count(data.plot_width), 1);
+    }
+
+    // ── the canvas: what one frame actually paints ──────────────────────────
+
+    /// One timeline drawn into a page of a fixed size, the way a list row lays it out.
+    struct TimelineHarness {
+        app: WidgetTestApp,
+        node: NodeId,
+        paint: TimelinePaint,
+        precision: DisplayPrecision,
+        snapshot: Option<Arc<TimelineSnapshot>>,
+    }
+
+    /// The translator the product ships: what these tests assert is the catalogue's copy.
+    fn product_translate(language: LanguageCode) -> Translate {
+        Translate::new(
+            std::rc::Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            language,
+        )
+    }
+
+    impl TimelineHarness {
+        fn sync(&mut self, hover: Option<Point>) {
+            let Self {
+                app,
+                paint,
+                precision,
+                snapshot,
+                ..
+            } = self;
+            let language = app.services().language;
+            app.with_cx(|cx| paint.sync(cx, snapshot.as_ref(), precision, language, hover))
+                .expect("the timeline syncs");
+        }
+
+        fn canvas(&self) -> Option<Arc<Canvas>> {
+            self.app.canvas_handle(self.node)
+        }
+
+        fn primitives(&self) -> Vec<widget::test_support::CanvasPrimitive> {
+            self.app.canvas_primitives(self.node)
+        }
+
+        fn change_appearance(&mut self, appearance: base_ui::theme::appearance::Appearance) {
+            let theme = self.app.services().theme.clone();
+            assert!(
+                theme.set_appearance(self.app.app_mut(), appearance),
+                "the appearance switch is a change"
+            );
+        }
+    }
+
+    fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+        app.with_cx(|cx| {
+            let root = cx.tree().root();
+            NodeBuilder::boxed()
+                .id("TEST_HYPERLIQUID_WALLET_TIMELINE_PAGE")
+                .style(
+                    StyleBuilder::new()
+                        .width(width)
+                        .height(height)
+                        .flex_col()
+                        .build(),
+                )
+                .build(cx.tree_mut(), root)
+                .expect("the page builds")
+        })
+    }
+
+    /// Builds one timeline over a page, lays it out, and paints the first frame.
+    fn harness(snapshot: Option<Arc<TimelineSnapshot>>) -> TimelineHarness {
+        let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+        let window_page = page(&mut app, 720.0, HEIGHT);
+        let node = app
+            .with_cx(|cx| {
+                let theme = cx.theme().clone();
+                build_canvas(cx.tree_mut(), window_page, theme)
+            })
+            .expect("the canvas builds");
+        let mut harness = TimelineHarness {
+            app,
+            node,
+            paint: TimelinePaint::new(node),
+            precision: precision(),
+            snapshot,
+        };
+        // The first frame lays the page (and the canvas inside it) out; the sync after it is
+        // the frame that paints the box the canvas was measured for.
+        harness.app.drain();
+        harness.sync(None);
+        harness.app.drain();
+        harness
+    }
+
+    fn a_timeline() -> TimelineHarness {
+        harness(Some(Arc::new(snapshot(vec![
+            fill(&address("1"), &listing(), Side::Buy, "1", "100", 1, 1),
+            fill(&address("1"), &listing(), Side::Sell, "2", "101", 2, 2),
+            fill(&address("1"), &listing(), Side::Buy, "1", "100", 2, 3),
+        ]))))
+    }
+
+    fn quads(harness: &TimelineHarness) -> Vec<Rect> {
+        harness
+            .primitives()
+            .into_iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::Quad)
+            .filter_map(|primitive| primitive.bounds)
+            .collect()
+    }
+
+    fn glyph_runs(harness: &TimelineHarness) -> usize {
+        harness
+            .primitives()
+            .iter()
+            .filter(|primitive| primitive.kind == PrimitiveKind::GlyphRun)
+            .count()
+    }
+
+    #[test]
+    fn the_canvas_node_carries_the_private_debug_id() {
+        let harness = harness(None);
+
+        assert_eq!(
+            harness.app.tree().debug_id(harness.node),
+            Some(TIMELINE_SELECTOR)
+        );
+        assert!(matches!(
+            harness.app.tree().get(harness.node).expect("node").kind(),
+            NodeKind::Canvas(_)
+        ));
+    }
+
+    #[test]
+    fn a_canvas_that_was_never_written_paints_no_primitives() {
+        let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+        let page = page(&mut app, 720.0, HEIGHT);
+        let node = app
+            .with_cx(|cx| {
+                let theme = cx.theme().clone();
+                build_canvas(cx.tree_mut(), page, theme)
+            })
+            .expect("the canvas builds");
+        app.drain();
+
+        // The node was laid out, but no frame wrote a canvas: the node's own paint is still the
+        // one opaque canvas entry, and there is nothing inside it.
+        assert!(app.canvas_handle(node).is_some());
+        assert!(app.canvas_primitives(node).is_empty());
+        assert!(
+            app.paint_entries(node)
+                .iter()
+                .any(|entry| entry.kind == PrimitiveKind::Canvas),
+            "the self-drawn node is still an opaque canvas to the frame"
+        );
+    }
+
+    #[test]
+    fn a_steady_timeline_is_not_rewritten_and_asks_for_no_more_frames() {
+        let mut harness = a_timeline();
+        let before = harness.canvas().expect("the timeline drew a canvas");
+        let requests = harness.app.frame_requests();
+
+        harness.sync(None);
+        harness.app.drain();
+
+        assert!(!harness.app.rendered(), "a steady frame paints nothing");
+        assert_eq!(harness.app.frame_requests(), requests);
+        assert!(
+            Arc::ptr_eq(
+                &before,
+                &harness.canvas().expect("the timeline drew a canvas")
+            ),
+            "a steady frame keeps the canvas it is drawn from"
+        );
+    }
+
+    #[test]
+    fn switching_the_appearance_repaints_the_timeline_in_the_new_roles() {
+        let mut harness = a_timeline();
+        let light = harness.canvas().expect("the timeline drew a canvas");
+        let theme = harness.app.services().theme.clone();
+        let requests = harness.app.frame_requests();
+
+        harness.change_appearance(base_ui::theme::appearance::Appearance::Dark);
+        assert!(
+            harness.app.frame_requests() > requests,
+            "an appearance switch invalidates the canvas node and schedules the frame"
+        );
+        harness.sync(None);
+        harness.app.drain();
+
+        let dark = harness.canvas().expect("the timeline drew a canvas");
+        assert!(
+            !Arc::ptr_eq(&light, &dark),
+            "the redraw prepared a canvas of its own"
+        );
+        let expected = theme
+            .theme_for(base_ui::theme::appearance::Appearance::Dark)
+            .role(Role::MarketUp);
+        assert!(
+            harness
+                .primitives()
+                .iter()
+                .any(|primitive| primitive.color == Some(expected)),
+            "the mark of a buy bucket is painted in the dark role"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_with_no_fills_still_draws_the_axis() {
+        let harness = harness(Some(empty_timeline()));
+
+        let axis_quads = quads(&harness);
+        assert_eq!(axis_quads.len(), 3, "the axis line and its two ticks");
+        assert!(glyph_runs(&harness) >= 2, "the two end labels are drawn");
+    }
+
+    #[test]
+    fn a_marker_holds_the_pointer_and_draws_its_fills() {
+        let mut harness = harness(Some(Arc::new(snapshot(
+            (0..8)
+                .map(|index| {
+                    fill(
+                        &address("1"),
+                        &listing(),
+                        Side::Buy,
+                        "1",
+                        "100",
+                        index,
+                        index as u64,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))));
+        let before = harness.primitives().len();
+        // One bucket holds all eight fills: the oldest is at the left of the plot.
+        let marker = harness
+            .paint
+            .cache
+            .geometry
+            .as_ref()
+            .expect("the geometry is cached")
+            .geometry
+            .marker(Side::Buy, 0)
+            .copied()
+            .expect("the buy bucket has a marker");
+        let point = Point::new(
+            marker.bounds.origin.x + marker.bounds.size.width / 2.0,
+            marker.bounds.origin.y + marker.bounds.size.height / 2.0,
+        );
+
+        harness.sync(Some(point));
+        harness.app.drain();
+
+        let primitives = harness.primitives();
+        assert!(
+            primitives.len() > before,
+            "the panel is drawn over the axis"
+        );
+        assert!(
+            primitives.iter().any(|primitive| {
+                primitive.color
+                    == Some(
+                        harness
+                            .app
+                            .services()
+                            .theme
+                            .theme_for(base_ui::theme::appearance::Appearance::Light)
+                            .role(Role::SurfaceOverlay),
+                    )
+            }),
+            "the panel is the theme's overlay surface"
+        );
+        assert_eq!(
+            glyph_runs(&harness),
+            2 + 1 + TOOLTIP_VISIBLE_ROWS * 3,
+            "the two labels, the marker's letter, and three lines for each of the newest six fills"
+        );
+
+        // Moving off the marker and its panel closes it.
+        harness.sync(Some(Point::new(1.0, 1.0)));
+        harness.app.drain();
+        assert_eq!(
+            glyph_runs(&harness),
+            2 + 1,
+            "only the labels and the marker's letter are left"
+        );
+    }
+
+    #[test]
+    fn switching_the_language_repaints_the_labels() {
+        let mut harness = a_timeline();
+        let english = harness.canvas().expect("the timeline drew a canvas");
+
+        harness.app.switch_language(LanguageCode::ZhCn);
+        harness.sync(None);
+        harness.app.drain();
+
+        assert!(
+            !Arc::ptr_eq(
+                &english,
+                &harness.canvas().expect("the timeline drew a canvas")
+            ),
+            "the labels are shaped in the language showing now"
+        );
+        // A line is one glyph run per font it needs, and the Chinese start label mixes a digit
+        // with CJK, so the count is a lower bound rather than the English frame's count.
+        assert!(
+            glyph_runs(&harness) >= 2 + 2,
+            "the two labels and the two marker letters are drawn in the new language"
+        );
+    }
+
+    #[test]
+    fn a_canvas_that_the_layout_has_not_measured_is_left_alone() {
+        let mut app = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+        let page = page(&mut app, 720.0, HEIGHT);
+        let node = app
+            .with_cx(|cx| {
+                let theme = cx.theme().clone();
+                build_canvas(cx.tree_mut(), page, theme)
+            })
+            .expect("the canvas builds");
+        let mut paint = TimelinePaint::new(node);
+        let snapshot = Arc::new(snapshot(vec![fill(
+            &address("1"),
+            &listing(),
+            Side::Buy,
+            "1",
+            "100",
+            1,
+            1,
+        )]));
+        let precision = precision();
+        let language = app.services().language;
+
+        // No frame has been drained when the sync runs: the node has no box yet, so nothing is
+        // written and the next sync is what paints it.
+        app.with_cx(|cx| paint.sync(cx, Some(&snapshot), &precision, language, None))
+            .expect("the timeline syncs");
+        app.drain();
+
+        assert!(app.canvas_primitives(node).is_empty());
+    }
+
+    #[test]
+    fn releasing_the_timeline_reclaims_its_caches_and_value_slots() {
+        let mut harness = a_timeline();
+        let baseline = harness.app.signal_slot_stats();
+        let geometry = harness.app.app().geometry().len();
+        let drawn = harness.canvas().expect("the timeline drew a canvas");
+
+        {
+            let TimelineHarness { app, paint, .. } = &mut harness;
+            app.with_cx(|cx| paint.release(cx));
+        }
+
+        assert_eq!(
+            harness.app.app().geometry().len(),
+            geometry,
+            "the timeline registers no geometry to hand back"
+        );
+        assert_eq!(
+            harness.app.signal_slot_stats().live,
+            baseline.live,
+            "the timeline mints no value slots"
+        );
+        assert!(harness.paint.prepared.is_none());
+        assert!(harness.paint.painted_text.is_empty());
+
+        // A released timeline draws nothing more, even if the pane asks once more.
+        harness.sync(None);
+        harness.app.drain();
+        assert!(Arc::ptr_eq(
+            &drawn,
+            &harness
+                .canvas()
+                .expect("the row's node still holds its last canvas")
+        ));
     }
 }

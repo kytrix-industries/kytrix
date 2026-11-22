@@ -27,8 +27,7 @@ use std::{future::Future, sync::Arc};
 
 use ahash::{HashSet, HashSetExt};
 use futures::StreamExt;
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_connector::market::{
     domain::DisconnectReason, error::MarketError, provider::MarketCapability, streams::TickerStream,
 };
@@ -36,10 +35,11 @@ use market_participants_model::{
     listing::{route::VenueListingKey, rules::ListingPrecision},
     market::selection::ListingTicker,
 };
+use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::{task::JoinSet, time::Instant};
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     rpc::RpcRequestContext,
     runtime::{ServiceContext, WidgetService},
@@ -91,14 +91,14 @@ pub(super) enum WatchListServiceError {
     EntryNotActive,
 }
 
-impl LocalizedError for WatchListServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for WatchListServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
             Self::TooManyEntries { maximum, .. } => {
-                t!(cx, "error.watch_list.capacity", maximum = maximum)
+                t_smol!(translate, "error.watch_list.capacity", maximum = maximum)
             }
-            Self::DuplicateEntry { .. } => t!(cx, "error.watch_list.duplicate_entry"),
-            Self::EntryNotActive => t!(cx, "error.watch_list.entry_not_active"),
+            Self::DuplicateEntry { .. } => t_smol!(translate, "error.watch_list.duplicate_entry"),
+            Self::EntryNotActive => t_smol!(translate, "error.watch_list.entry_not_active"),
         }
     }
 }
