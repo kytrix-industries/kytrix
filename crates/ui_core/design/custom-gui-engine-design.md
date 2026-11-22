@@ -1,7 +1,18 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.9（2026-11-22）
+> **版本**：v2.10（2026-11-22）
+>
+> **v2.10 变更摘要（2026-11-22）**：**P3-1g（测试支撑补齐批）完成**。§13.2 的 `WidgetTestApp` 增加测试装置面：
+> ① **`advance(Duration) -> bool`** 推进**引擎时钟**并跑一轮（`router.tick` + 一帧），返回本轮是否提交像素——E10
+> `App::after` / `after_scoped` 的 deadline 只在引擎钟推进后到期；W2c 为倒计时测试自建的 `ClockHost`
+> （`TestApp` + `WidgetServices::builder` + 假墙钟）可删除，W2b 的倒计时 timer 缺口（到期 → 回调 → 再武装不可自动化）
+> 可据此补测；**不读 wall clock、不真实 sleep**；到期的定时器在帧入口
+> 派发，回调写入参与同一帧绘制；一次 `advance` = 一个引擎轮次（自续期定时器每轮触发一次）；② 观测面
+> **`frame_index()` / `frame_requests()` / `rendered()`**（I3：未到期的 `advance` 不出帧、不增长帧请求）；③ §13.8 补
+> 时钟语义与倒计时测试写法（引擎钟 ≠ widget 自己的「现在」；测试装置一轮的顺序是「路由 → 帧（定时器在帧入口）」，
+> 生产是「定时器 → 路由 → 帧」）；④ §13.9 新增 **R-12**，登记 W2c 的 `ClockHost` 可删除、W2b 的倒计时缺口可补（本批
+> **不改 `crates/widgets/**`**，只提供能力）。测试 161 → **164**。逐条登记 `.docs/gui-migration/design-changes.md` §18。
 >
 > **v2.9 变更摘要（2026-11-22）**：**P3-1f（P3 契约补充批）完成**。§13 补三处 W 批前置：① `WidgetCx` 改为持有
 > `&Rc<WidgetServices>`，新增 **`WidgetCx::services_rc()`**（`Rc<WidgetServices>` 的借用句柄）——widget 在 `body` 里
@@ -4085,6 +4096,10 @@ impl WidgetTestApp {
     pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R;
     pub fn tick(&mut self);            // router.tick
     pub fn drain(&mut self);           // tick + TestApp::drain（生产泵序）
+    pub fn advance(&mut self, by: std::time::Duration) -> bool;  // 推引擎钟 + 一轮（P3-1g）；返回本轮是否提交像素
+    pub fn frame_index(&self) -> FrameIndex;                     // 提交游标（0 = 未提交；P3-1g）
+    pub fn frame_requests(&self) -> u64;                         // I3 断言面（P3-1g）
+    pub fn rendered(&self) -> bool;                              // 最近一轮是否提交像素（P3-1g）
     pub fn drain_runtime(&mut self);   // services 的 current-thread runtime 推进一个 turn（不 sleep）
     pub fn run_until_idle(&mut self) -> usize;  // runtime turn 与 drain 交替，有界；返回 turn 数
     pub fn report(&mut self, state: WidgetState);
@@ -4201,6 +4216,11 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **空路由不出帧**：`new`/`install`/`tick` 都不请求帧；没有路由时 tick 是 no-op。稳态下 sync 不写信号即不出帧
   （测试 `an_empty_router_should_request_no_frame` / `a_steady_surface_requests_no_frame`）。
 - `TestApp::drain` 不跑 `on_frame`；`WidgetTestApp::drain` = `router.tick` + `TestApp::drain`（生产泵序）。
+- **时间推进只有一条路**（P3-1g）：`TestApp::advance(dt)` 推**引擎时钟**（不读 wall clock、不 sleep）；
+  `WidgetTestApp::advance(dt)` = `TestApp::advance(dt)` + `WidgetTestApp::drain`，即「引擎钟 + 一轮」，返回本轮是否提交
+  像素。E10 一次性定时器在 `App::frame` 入口派发（`TestApp::drain` 覆盖），因此回调写入参与同一帧绘制；测试里一次
+  `advance` 只派发一轮到期的定时器（自续期倒计时每轮触发一次，不按经过的 delay 补触发）。等待 / 超时不是测试装置的能力：
+  tokio 时间的测试仍用测试自己拥有的 `#[tokio::test(start_paused = true)]` runtime。
 
 ### 13.8 测试口径
 
@@ -4208,11 +4228,11 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
   `WIDGET_PLACEHOLDER` / `WIDGET_BANNER`；框架控件 key 前缀 `widget.placeholder.action.` / `widget.banner.action.`；
   富文本 notice 的 markdown 根是 `MARKDOWN`。
 - **断言面**：`Probe`（存在/布局盒/命中）+ `FrameRecord`（帧/图元）+ `WidgetTestApp`（状态/可见性/文本/内联盒/节点数/
-  `a11y_hidden`）。`TestApp::drain` 返回的 `&FrameRecord` 需 clone 或先作用域化再用。
+  `a11y_hidden`/`frame_index`/`frame_requests`/`rendered`）。`TestApp::drain` 返回的 `&FrameRecord` 需 clone 或先作用域化再用。
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1f 实测 **161 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1g 实测 **164 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
     **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
@@ -4241,6 +4261,13 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
   - **服务聚合句柄**（P3-1f）：上下文借出组合根那一个 `Rc`，同一实例、同一份单例
     （`cx::the_context_hands_over_the_composition_root_s_services`：`ptr::eq` 两次调用同址 + `Rc::ptr_eq` 宿主实例 +
     经句柄 clone 出的 `layer` 与宿主层栈同址）。
+  - **时间与 E10 定时器**（P3-1g）：`advance` 到点派发 `App::after` 回调，回调不写渲染状态时该轮空闲、不出帧
+    （`advance_dispatches_a_due_timer_without_asking_for_a_frame`：`frame_index` / `frame_requests` 不变、`rendered() == false`）；
+    不到 deadline 不触发（`advance_does_not_fire_a_timer_before_its_delay`：半程 idle，第二个半程精确到点）；回调写入被
+    **同一轮**呈现且是唯一帧请求（`a_timer_callback_s_write_is_presented_by_the_same_advance`：`frame_requests + 1`、
+    `frame_index + 1`、`bind_text` 读到新值）。时钟语义：只推引擎钟（`TestApp::advance`），不读 wall clock / 不 sleep；
+    测试装置一轮 =「`router.tick` → 帧（定时器在帧入口派发）」，生产 =「定时器 → `FrameRouter::tick` → 帧」——依赖
+    「同一轮 `sync` 已看到定时器写入」的断言要多 `advance` 一次（`crates/widgets/AGENTS.md` §11 同文）。
   - **路由**：扇出 / 注销 / 弱句柄自注销 / 空路由不出帧；**单槽占用报错**
     （`a_second_router_cannot_install_itself`、`a_second_router_constructor_reports_the_occupied_slot`）。
   - **擦除与生命周期**：`a_minimal_widget_runs_the_whole_lifecycle`（mount → waiting → loading → ready → waiting(zh) →
@@ -4266,6 +4293,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-9 | P3-1d 对 P3-1c 冻结面的增量 | `Notice::is_markdown` 由 `const fn(&self)` 改为 `fn(&self, &Translate)`（判定基于解析后的目录值；契约只增语义、不删变体）；`WidgetTestApp` 新增注入构造器 `with_market_participants`/`with_kytrix_service`/`with_open_url`/`with_sound` 与 `drain_runtime`/`run_until_idle`，宿主改为拥有 `WidgetServices.runtime` 的 current-thread runtime（App 引擎 runtime 不变）；`WidgetSurface` 根新增 `services.config` 依赖锚点；`crates/widget` 增两个 test-only dev-dependency（`app_config_provider`/`widget_tokio_runtime`，供 headless 目录连接器注入测试）。W 批未开工，不构成迁移负担，登记于 design-changes §15 |
 | R-10 | P3-1e 对 P3-1d 冻结面的增量（P3-0b §F2 裁决） | `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` / `animation_router: Rc<AnimationRouter>`——三个组合根单例的**唯一**注入点，`SelectorHost` 因此可从 `&WidgetServices` + `cx` 访问器组装（此前 6 个 selector widget 无合法 host 来源）；`WidgetServices::builder(app, runtime, translate, theme, layer, frame_router, animation_router)` 为装配缝（四信号铸在一个 scope，可选槽用 setter）；`WidgetCx` 新增 `layer()`/`frame_router()`/`animation()` 并**删除** `router()` 与独立 router 字段（`WidgetCx::new` 5→4 参数，`AnyWidget::mount`/`mount_in_scope` 去掉 `&FrameRouter` 形参：单例只从服务取，杜绝两份真相）；`WidgetTestApp` 自建三单例、经 builder 注入并增 `layer()`/`animation()` 访问器（`router()` 保留，返回宿主实例）；`base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与 `FrameRouter::installed` 同型）。测试 156 → 160。W 批未开工，不构成迁移负担，登记于 design-changes §16 |
 | R-11 | P3-1f 对 P3-1e 冻结面的增量 | `WidgetCx` 改为持有 `&Rc<WidgetServices>`、新增 `services_rc()`（`WidgetCx::new` 的 `services` 形参由 `&WidgetServices` 改为 `&Rc<WidgetServices>`；`AnyWidget` 与 `WidgetTestApp` 本来就持 `Rc`，mount / 测试调用点形状不变），`WidgetTestApp` 增 `services_rc()` 观测面——widget 在 `body` 里构造**拥有服务聚合的宿主**（`SelectorHost`）时取组合根那一个 `Rc`，不重建聚合；静态文案重建通法由 §13.10 冻结；事件过滤应用义务由 §13.11 冻结（引擎面 E21：`App::drain_events_where` + `test_support::diagnostics::signal_slot_stats`，P3-0b2 越界改 `ui_core` 已获 Lead 批准并登记 `ledger.md`）。测试 160 → 161。W 批未开工，不构成迁移负担，登记于 design-changes §17 |
+| R-12 | P3-1g 对 P3-1f 冻结面的增量（测试装置；无引擎面变更） | `WidgetTestApp` 增 `advance(Duration) -> bool`（推进**引擎时钟** + 一轮 `router.tick` + `TestApp::drain`，返回本轮是否提交像素）与观测面 `frame_index()` / `frame_requests()` / `rendered()`。E10 定时器 deadline 只在引擎钟推进后到期：**不读 wall clock、不真实 sleep**；到期回调在帧入口派发、写入参与同一帧；未到期轮是空闲轮（I3：不出帧、不增长帧请求）。`TestApp::advance` 已存在，本批**不改 `ui_core`**；`crates/widgets/**` 也未改——W2c 分支自建的 `ClockHost`（`TestApp` + `WidgetServices::builder` + 假墙钟）在合入后删除、改用本装置；W2b 的倒计时 timer 缺口（`test-ledger/w2-pizza.md` §8：到期 → 回调 → 再武装不可自动化）可据此补测（widget 自己的「现在」仍由测试写那个状态）。测试 161 → 164，登记于 design-changes §18 |
 
 ### 13.10 静态文案重建通法（kit 未补绑定面之前的冻结写法）
 
@@ -4511,4 +4539,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.6**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.10**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾 + P3-1d 上下文/宿主补缝 + P3-1e 组合根三单例 + P3-1f 服务句柄/静态文案通法 + P3-1g 测试时钟）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
