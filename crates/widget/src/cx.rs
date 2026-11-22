@@ -46,6 +46,28 @@
 //! was given — clone them into the kit component being built (an `Overlay`, a dialog,
 //! a selector host), never construct replacements.
 //!
+//! A host that owns the aggregate itself (a selector host, a dialog's presenter) takes
+//! it through [`WidgetCx::services_rc`]: the `Rc` the composition root built, cloned —
+//! never a copy of the collaborator set. The widget and its host therefore share one
+//! aggregate, just as they share the three singletons inside it.
+//!
+//! # Component keys
+//!
+//! A kit component's `key` is an **application-level** action identity: a
+//! `Button::on_click` registers `"<key>.click"` with [`App::on_action`], and a second
+//! live component that passes the same key silently replaces the first one's handler —
+//! then releasing either one unregisters it for both. A widget that builds controls
+//! into two panes must therefore never pass a constant key; it asks the context for
+//! one that carries the instance's identity:
+//!
+//! ```text
+//! let key = cx.unique_key("market_trade.header.sound"); // "market_trade.header.sound@7"
+//! ```
+//!
+//! [`WidgetCx::unique_key`] suffixes the widget-local name with the instance's signal
+//! scope, which the engine mints once per widget mount and never recycles: two panes
+//! cannot collide, and one instance mints the same key on every rebuild.
+//!
 //! # Language dependency
 //!
 //! The engine registers a dependency only for reads that happen inside a
@@ -68,13 +90,15 @@
 //! closure — for example in [`WidgetView::load`](crate::view::WidgetView::load) —
 //! is not tracked, which is correct: loading does not draw.
 
+use std::rc::Rc;
+
 use app_config::settings::Config;
 use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
     theme::handle::ThemeHandle,
 };
 use i18n::{language::codes::LanguageCode, translate::Translate};
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use tokio::runtime::Handle;
 use ui_core::{
     a11y::A11yPatch,
@@ -99,17 +123,22 @@ use super::{frame::FrameRouter, services::WidgetServices};
 pub struct WidgetCx<'a> {
     app: &'a mut App,
     window: WindowId,
-    services: &'a WidgetServices,
+    services: &'a Rc<WidgetServices>,
     scope: SignalScope,
 }
 
 impl<'a> WidgetCx<'a> {
     /// Assembles a context. The framework is the only caller; tests reach it
     /// through [`WidgetTestApp`](crate::test_support::WidgetTestApp).
+    ///
+    /// The aggregate is taken as the `Rc` the composition root owns, not as a bare
+    /// reference: a widget that builds a host owning services takes the handle from
+    /// [`WidgetCx::services_rc`] and clones it, so the host works over the one
+    /// aggregate the application built.
     pub fn new(
         app: &'a mut App,
         window: WindowId,
-        services: &'a WidgetServices,
+        services: &'a Rc<WidgetServices>,
         scope: SignalScope,
     ) -> Self {
         Self {
@@ -160,12 +189,25 @@ impl<'a> WidgetCx<'a> {
     }
 
     /// The injected services.
-    pub const fn services(&self) -> &WidgetServices {
+    pub fn services(&self) -> &WidgetServices {
+        self.services
+    }
+
+    /// The injected services as the shared handle the composition root handed over.
+    ///
+    /// A widget that builds a **host owning services** (a selector host, a dialog's
+    /// presenter) needs the `Rc` itself: clone this handle into the host
+    /// (`Rc::clone(cx.services_rc())`) so the two work over the application's one
+    /// aggregate. Assembling a second `WidgetServices` — or copying its fields — would
+    /// give the host a collaborator set that drifts from the application's (the three
+    /// singletons inside are the same instances, the signals are the same slots, but
+    /// the aggregate identity is what a later field would be missing from).
+    pub fn services_rc(&self) -> &Rc<WidgetServices> {
         self.services
     }
 
     /// The translation context: the widget's only source of interface text.
-    pub const fn translate(&self) -> &Translate {
+    pub fn translate(&self) -> &Translate {
         &self.services.translate
     }
 
@@ -173,13 +215,13 @@ impl<'a> WidgetCx<'a> {
     ///
     /// Read it inside a `bind_*` closure to follow language changes; see the module
     /// documentation.
-    pub const fn language(&self) -> Signal<LanguageCode> {
+    pub fn language(&self) -> Signal<LanguageCode> {
         self.services.language
     }
 
     /// The theme handle. Colours must be read through it inside a `bind_style`
     /// closure (the engine's G3 rule), not captured at build time.
-    pub const fn theme(&self) -> &ThemeHandle {
+    pub fn theme(&self) -> &ThemeHandle {
         &self.services.theme
     }
 
@@ -239,6 +281,51 @@ impl<'a> WidgetCx<'a> {
     /// belongs to it, and the framework releases the scope on teardown.
     pub const fn scope(&self) -> SignalScope {
         self.scope
+    }
+
+    /// Mints the stable, per-instance key a kit component's action identity and debug
+    /// id are built from.
+    ///
+    /// A kit component's `key` is **application-level**: `Button::on_click` registers
+    /// the action `"<key>.click"` with [`App::on_action`], and [`App::on_action`]
+    /// replaces an existing handler of the same action. Two live panes that build the
+    /// same constant key therefore share one handler (the later pane wins), and the
+    /// first pane to rebuild or release unregisters it for both — a click dispatches
+    /// into the wrong pane, or into nothing. This method is the only valid source of
+    /// such a key.
+    ///
+    /// The format is `"{suffix}@{scope}"`, where `scope` is this context's
+    /// [`WidgetCx::scope`] index and `suffix` is the caller's local name:
+    ///
+    /// ```text
+    /// cx.unique_key("market_trade.header.sound") // "market_trade.header.sound@7"
+    /// ```
+    ///
+    /// # Stability and uniqueness
+    ///
+    /// - **Same instance, same suffix → the same key.** The prefix is the widget's
+    ///   signal scope, fixed for the widget's lifetime, so a control rebuilt in
+    ///   `sync`/`header` (a static-text rebuild, a language switch) mints the key it
+    ///   already registered and can pair the new registration with the old release.
+    /// - **Different instances → different keys.** Every widget mount mints its own
+    ///   scope, and the engine appends a scope table entry per mount and never
+    ///   recycles an index, so no two widget instances of one application share a
+    ///   prefix — not even a released instance and one mounted later.
+    /// - **The suffix is the widget's namespace.** It names the component site *inside*
+    ///   the widget: two different controls need two different suffixes, and a repeated
+    ///   control (a table row's button) puts its row identity into the suffix
+    ///   (`format_smolstr!("row.{index}.sound")`).
+    ///
+    /// # Release pairing
+    ///
+    /// Keep the key (or the component handle, or the `Action` the component derived
+    /// from it) for as long as the component lives and release with that same identity:
+    /// a kit component's `release` unregisters exactly the handler its `build`
+    /// registered. A widget that unregisters by hand must use the same `Action`;
+    /// `off_action` alone fixes the handler but leaves the component's signal scope
+    /// behind.
+    pub fn unique_key(&self, suffix: &str) -> SmolStr {
+        format_smolstr!("{suffix}@{}", self.scope.index())
     }
 
     /// The application's one layer stack, for the overlays the widget builds.
@@ -329,7 +416,7 @@ impl<'a> WidgetCx<'a> {
     }
 
     /// The Tokio runtime the widget's streams and RPC calls are driven on.
-    pub const fn runtime(&self) -> &Handle {
+    pub fn runtime(&self) -> &Handle {
         &self.services.runtime
     }
 }
@@ -346,14 +433,19 @@ impl std::fmt::Debug for WidgetCx<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
+    use base_ui::kit::button::Button;
+    use smol_str::format_smolstr;
     use ui_core::{
+        event::Action,
         math::Rect,
-        node::{builder::NodeBuilder, tree::NodeKind},
+        node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         paint::canvas::Canvas,
     };
 
-    use crate::test_support::WidgetTestApp;
+    use crate::{cx::WidgetCx, test_support::WidgetTestApp};
 
     #[test]
     fn a_context_builds_nodes_in_the_widget_s_own_scope() {
@@ -440,5 +532,176 @@ mod tests {
             harness.tree().get(node).expect("the node exists").kind(),
             NodeKind::Canvas(_)
         ));
+    }
+
+    /// A widget that builds a host owning services takes the composition root's
+    /// aggregate, not a copy: the context hands out the one `Rc` the application built,
+    /// and cloning it reaches the same singletons the context reads.
+    #[test]
+    fn the_context_hands_over_the_composition_root_s_services() {
+        let mut harness = WidgetTestApp::new();
+
+        let same_handle = harness.with_cx(|cx| std::ptr::eq(cx.services_rc(), cx.services_rc()));
+        assert!(
+            same_handle,
+            "the context hands out one handle, not a fresh one per call"
+        );
+
+        let from_context = harness.with_cx(|cx| Rc::clone(cx.services_rc()));
+        assert!(
+            Rc::ptr_eq(&from_context, harness.services_rc()),
+            "the handle is the composition root's instance, not a copy of it"
+        );
+
+        let layer = Rc::clone(&from_context.layer);
+        assert!(
+            std::ptr::eq(&*layer, harness.layer()),
+            "a host built over that handle shares the application's layer stack"
+        );
+    }
+
+    /// Runs `body` with a context over a **second** widget instance of the same
+    /// application: a fresh signal scope (what `AnyWidget::mount` mints per pane), the
+    /// host's services and window. The contract's multi-pane assertions build their
+    /// peer context through this, since `WidgetTestApp::with_cx` is the first instance.
+    fn with_peer_cx<R>(
+        harness: &mut WidgetTestApp,
+        body: impl FnOnce(&mut WidgetCx<'_>) -> R,
+    ) -> R {
+        let services = Rc::clone(harness.services_rc());
+        let window = harness.window();
+        let scope = harness.app_mut().signal_scope();
+        let mut cx = WidgetCx::new(harness.app_mut(), window, &services, scope);
+        body(&mut cx)
+    }
+
+    /// Builds a control the way a widget's header builds one: the key comes from the
+    /// instance's own context, not from a constant.
+    fn build_keyed_button(cx: &mut WidgetCx<'_>, parent: NodeId, suffix: &str) -> (Button, Action) {
+        let key = cx.unique_key(suffix);
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let button = Button::new(cx.app_mut(), theme, key).on_click(|_| {});
+        button
+            .build(cx.app_mut(), window, parent)
+            .expect("the parent is alive");
+        let action = button
+            .action_identity()
+            .expect("a click callback registered the component's action");
+        (button, action)
+    }
+
+    /// A rebuilt or re-synced control mints the key it already used: the prefix is the
+    /// instance's scope, not a counter, so release/registration pairing stays exact.
+    #[test]
+    fn the_same_suffix_in_one_instance_keeps_one_key() {
+        let mut harness = WidgetTestApp::new();
+
+        let (within_one_call, again_in_one_call) =
+            harness.with_cx(|cx| (cx.unique_key("sound"), cx.unique_key("sound")));
+        assert_eq!(
+            within_one_call, again_in_one_call,
+            "two controls of one instance mint their own keys, not a fresh one per call"
+        );
+
+        let next_call = harness.with_cx(|cx| cx.unique_key("sound"));
+        assert_eq!(
+            within_one_call, next_call,
+            "a control rebuilt on a later frame must reclaim the key it registered"
+        );
+    }
+
+    /// The key documents its own origin: the widget-local suffix, then the instance's
+    /// scope index.
+    #[test]
+    fn the_key_carries_the_instance_scope_and_the_widget_local_suffix() {
+        let mut harness = WidgetTestApp::new();
+
+        let (key, scope) =
+            harness.with_cx(|cx| (cx.unique_key("market_trade.header.sound"), cx.scope()));
+
+        assert_eq!(
+            key,
+            format_smolstr!("market_trade.header.sound@{}", scope.index())
+        );
+        assert!(
+            key.starts_with("market_trade.header.sound@"),
+            "the suffix stays the prefix so a test can locate the control's debug id"
+        );
+    }
+
+    /// Two panes never share a key: the application's action registry is keyed by it.
+    #[test]
+    fn two_instances_in_one_application_mint_different_keys() {
+        let mut harness = WidgetTestApp::new();
+
+        let first = harness.with_cx(|cx| (cx.scope(), cx.unique_key("sound")));
+        let second = with_peer_cx(&mut harness, |cx| (cx.scope(), cx.unique_key("sound")));
+
+        assert_ne!(
+            first.0.index(),
+            second.0.index(),
+            "a widget mount mints its own signal scope"
+        );
+        assert_ne!(
+            first.1, second.1,
+            "two panes built the same suffix and must still get different keys"
+        );
+        assert_eq!(
+            second.1,
+            format_smolstr!("sound@{}", second.0.index()),
+            "each key is stamped with its own instance's scope"
+        );
+    }
+
+    /// The suffix is the widget's namespace: two controls of one instance have to
+    /// choose two names, and the keys stay distinct.
+    #[test]
+    fn different_suffixes_in_one_instance_stay_distinct() {
+        let mut harness = WidgetTestApp::new();
+
+        let (sound, confirm) =
+            harness.with_cx(|cx| (cx.unique_key("header.sound"), cx.unique_key("confirm")));
+
+        assert_ne!(sound, confirm);
+        assert_eq!(sound, harness.with_cx(|cx| cx.unique_key("header.sound")));
+    }
+
+    /// **The W2a F1 regression.** Two panes build the same header control; closing one
+    /// pane releases only its own handler. With a constant key the second pane's
+    /// handler would be unregistered by the first pane's release.
+    #[test]
+    fn releasing_one_pane_leaves_the_other_pane_s_action_handler() {
+        let mut harness = WidgetTestApp::new();
+        let root = harness.root();
+
+        let (first_button, first_action) =
+            harness.with_cx(|cx| build_keyed_button(cx, root, "market_trade.header.sound"));
+        let (second_button, second_action) = with_peer_cx(&mut harness, |cx| {
+            build_keyed_button(cx, root, "market_trade.header.sound")
+        });
+
+        assert_ne!(
+            first_action, second_action,
+            "each pane's control registered its own action identity"
+        );
+        assert!(harness.app().has_action_handler(&first_action));
+        assert!(harness.app().has_action_handler(&second_action));
+
+        // The widget's `release` hook releases its controls; the peer pane is still
+        // open and must keep its handler.
+        first_button.release(harness.app_mut());
+        assert!(
+            !harness.app().has_action_handler(&first_action),
+            "the closed pane's handler is unregistered"
+        );
+        assert!(
+            harness.app().has_action_handler(&second_action),
+            "releasing one pane removed another pane's handler — every instance uses the \
+             same action key"
+        );
+
+        second_button.release(harness.app_mut());
+        assert!(!harness.app().has_action_handler(&second_action));
     }
 }
