@@ -514,7 +514,9 @@ impl ShapedText {
 
     /// 光栅 + 装箱，产出只读快照（`content_width` 是 taffy 算出的内容宽，逻辑像素）。
     ///
-    /// `color`/`alignment` 由当前内容与样式现场给出（不在形状缓存键里）。`ellipsis` 只在
+    /// `color`/`alignment` 由当前内容与样式现场给出（不在形状缓存键里）。`color` 是本次的
+    /// **基础文本色**：parley 路径按它重写未被 `TextRun` 覆盖的 run（E24，见
+    /// [`current_run_color`]），数字快速路径与装饰/省略号本来就用它。`ellipsis` 只在
     /// `style.overflow == Ellipsis` 时使用。
     pub(crate) fn rasterize(
         &self,
@@ -744,7 +746,8 @@ pub(super) fn push_shaping_defaults<'a>(
     style: &TextStyle,
 ) {
     // v2.1 E2：默认画刷 = 兜底样式的文本色（逐 run 的 `push_run_style` 会覆盖自己区间）。
-    // 光栅期按每个 parley run 的 `style().brush.color` 取色，因此单 run 与多 run 同一条路径。
+    // 光栅期**不读**这里的画刷来决定基础色：`ShapeKey` 不含颜色，命中的布局可能来自另一种
+    // 基础色，`rasterize_parley` 按本次请求的 `style.color` 重写基础 run（E24）。
     builder.push_default(StyleProperty::Brush(ColorBrush { color: style.color }));
     builder.push_default(StyleProperty::FontSize(style.size));
     builder.push_default(StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(
@@ -1129,6 +1132,36 @@ fn decoration_span(
     (width > 0.0 && left.is_finite() && width.is_finite()).then_some((left, width))
 }
 
+/// 一个 style run 的**当前**文本色（E24，W6b 审查 F22）。
+///
+/// `ShapeKey` 不含基础色（R12-11：颜色不改变 glyph id / advance / 断行，红/绿两态共享一份
+/// 快照）；parley 布局里烘的却是 shape 期画刷。节点文本绘制期由 `bind_style.foreground` 重上色，
+/// Canvas 文本没有这条通道 ⇒ 旧实现里「同字符串换色（halo 副本）」永远画第一次的颜色。
+/// 光栅期按本次请求的 `base_color` 重算：
+///
+/// - style run **完全被某个 `TextRun` 覆盖** ⇒ 用 run 自己的颜色（E2：run 的颜色是具体值，
+///   换基础色不得覆盖它）；
+/// - style run 与所有 `TextRun` **不相交** ⇒ 用本次请求的 `base_color`（F22 的修复点）；
+/// - 与部分 run 相交（相邻同色 run 被 parley 合并成一个 style run）⇒ 没有唯一正确答案，
+///   保留 shaping 期画刷：至少不会把显式颜色擦成基础色。
+///
+/// 首次光栅（缓存 miss）三条分支都等价于 shaping 期画刷，因此不改变既有输出。
+fn current_run_color(
+    runs: &[TextRun],
+    range: &core::ops::Range<usize>,
+    shaped_color: Color,
+    base_color: Color,
+) -> Color {
+    let mut overlaps = false;
+    for run in runs {
+        if run.range.start <= range.start && range.end <= run.range.end {
+            return run.style.color;
+        }
+        overlaps |= run.range.start < range.end && range.start < run.range.end;
+    }
+    if overlaps { shaped_color } else { base_color }
+}
+
 /// 光栅一份已就位的 parley 布局。
 fn rasterize_parley(
     layout: &parley::Layout<ColorBrush>,
@@ -1150,8 +1183,8 @@ fn rasterize_parley(
         // 多个 TextRun（不同颜色）共享一个 `GlyphRun`，而 `Line::items()` 会按 style run 再切成
         // 多个 item（每个 item 只覆盖一种解析样式）。item 不暴露自己的文本区间，因此这里用
         // 「该 run 的 visual cluster 表 + 逐 item 消耗 cluster」还原 item 的字节区间。
-        // 这样 `ShapedGlyphRun.text_range` 与 `TextContent.runs[].range` 一致，颜色取 item 的
-        // 解析画刷（同一字体不同色的 run 不再被合并成一段）。
+        // 这样 `ShapedGlyphRun.text_range` 与 `TextContent.runs[].range` 一致，颜色按
+        // [`current_run_color`] 取**本次**请求的颜色（run 覆盖区间取 run 颜色，其余取基础色）。
         let mut cluster_cache: Option<(
             core::ops::Range<usize>,
             Vec<(core::ops::Range<usize>, usize)>,
@@ -1163,7 +1196,6 @@ fn rasterize_parley(
                     let parley_run = run.run();
                     let font = parley_run.font().clone();
                     let run_text_range = parley_run.text_range();
-                    let item_color = run.style().brush.color;
                     // item 的字节区间：消耗该 run 的 visual cluster 直到覆盖 item 的字形数。
                     let (cached_range, clusters) = cluster_cache.get_or_insert_with(|| {
                         let clusters: Vec<(core::ops::Range<usize>, usize)> = parley_run
@@ -1202,6 +1234,11 @@ fn rasterize_parley(
                         remaining = remaining.saturating_sub(*cluster_glyphs);
                     }
                     cluster_cursor = Some((run_text_range, cursor));
+                    // E24（F22）：颜色**不**取 shape 期烘进布局的画刷 —— `ShapeKey` 不含
+                    // `color`（R12-11），命中的快照可能是在另一种基础色下塑形的。按本次请求的
+                    // 基础色 + 该 style run 是否被 `TextRun` 覆盖现场重算。
+                    let item_color =
+                        current_run_color(runs, &item_range, run.style().brush.color, color);
                     // 光栅 ppem = parley 的 `Run::font_size()`（逻辑字号）× 设备 scale，
                     // **保留小数**：14 px @125% → 17.5 ppem。
                     let ppem = (parley_run.font_size() * scale).clamp(1.0, 512.0);
@@ -1917,6 +1954,27 @@ mod tests {
             .0
     }
 
+    /// E24：用指定**基础色**光栅同一份快照（颜色不在形状缓存键里，一份布局可被多种颜色复用）。
+    fn rasterize_line_in_color(
+        shaped: &super::ShapedText,
+        width: f32,
+        color: crate::paint::color::Color,
+    ) -> crate::text::ShapedLine {
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster: &mut raster,
+            glyph_atlas: &mut glyphs,
+            atlas: &mut atlas,
+            generation,
+            scale: 1.0,
+        };
+        shaped
+            .rasterize(width, shaped.style().alignment, color, &mut ctx, None)
+            .expect("rasterize")
+            .0
+    }
+
     fn all_glyph_positions(line: &crate::text::ShapedLine) -> Vec<(f32, f32)> {
         line.glyph_runs()
             .flat_map(|run| run.glyphs.iter())
@@ -2363,6 +2421,67 @@ mod tests {
         );
         assert_eq!(runs[1].color, blue);
         assert!(!runs[0].glyphs.is_empty() && !runs[1].glyphs.is_empty());
+    }
+
+    /// E24（W6b 审查 F22）：基础色不在形状缓存键里，光栅期必须按**本次**基础色重写
+    /// 未被 `TextRun` 覆盖的 style run；`TextRun` 自己的颜色是具体值，不得被基础色覆盖。
+    ///
+    /// 变异守护：把 `rasterize_parley` 的 `item_color` 改回 `run.style().brush.color`
+    /// （shape 期画刷）后本用例必须变红。
+    #[test]
+    fn base_color_recolor_keeps_explicit_run_colors() {
+        use crate::paint::color::Color;
+
+        let red = Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let green = Color::Srgb {
+            r: 0.0,
+            g: 1.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let blue = Color::Srgb {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            alpha: 1.0,
+        };
+        let mut harness = Harness::new();
+        // base = green（shape 期颜色），run 0..3 显式 red；3..6 未被 run 覆盖。
+        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_color(green))
+            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_color(red))]);
+        let shaped = harness.shape_content(&content);
+        let width = shaped.max_content_size().width;
+
+        // 换基础色（blue）光栅同一份快照：未覆盖区间跟随 blue，run 区间保持 red。
+        let blue_line = rasterize_line_in_color(&shaped, width, blue);
+        let blue_runs: Vec<_> = blue_line.glyph_runs().collect();
+        assert_eq!(blue_runs.len(), 2, "两个 style run：{:?}", blue_line);
+        assert_eq!(blue_runs[0].text_range, 0..3);
+        assert_eq!(blue_runs[1].text_range, 3..6);
+        assert_eq!(
+            blue_runs[0].color, red,
+            "TextRun 的颜色是具体值，换基础色不得覆盖它"
+        );
+        assert_eq!(
+            blue_runs[1].color, blue,
+            "未被 run 覆盖的区间必须用本次基础色（缓存命中仍画首次颜色的回归点）"
+        );
+
+        // 换回 shape 期基础色：未覆盖区间跟 green，run 仍是 red；布局（字形落点）逐位不变。
+        let green_line = rasterize_line_in_color(&shaped, width, green);
+        let green_runs: Vec<_> = green_line.glyph_runs().collect();
+        assert_eq!(green_runs[0].color, red);
+        assert_eq!(green_runs[1].color, green);
+        assert_eq!(
+            all_glyph_positions(&blue_line),
+            all_glyph_positions(&green_line),
+            "同一份布局快照只换颜色，字形落点必须逐位相同"
+        );
     }
 
     /// v2.1 E2：下划线/删除线的几何来自行 baseline + 装饰所属样式的字号；默认线色跟随文本色。

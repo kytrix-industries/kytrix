@@ -1428,7 +1428,6 @@ dependencies = [
  "app_config_provider",
  "base_ui",
  "futures",
- "gpui-kit",
  "i18n",
  "instrument_selector_ui",
  "log",
@@ -1442,8 +1441,8 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -2690,10 +2689,9 @@ name = "empty"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
- "gpui-kit",
  "i18n",
  "serde",
+ "ui_core",
  "widget",
 ]
 
@@ -11008,10 +11006,8 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
  "futures",
- "gpui-kit",
  "i18n",
  "instrument_selector_ui",
  "log",
@@ -11022,8 +11018,8 @@ dependencies = [
  "smol_str",
  "thiserror 2.0.21",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -12131,11 +12127,10 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
+ "bytes",
  "const-hex",
  "dirs 7.0.0",
- "gpui-kit",
  "i18n",
  "kytrix_service_provider",
  "log",
@@ -12149,10 +12144,10 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "ui_core",
  "url",
  "uuid",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

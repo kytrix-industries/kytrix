@@ -2921,6 +2921,10 @@ impl App {
     /// `max_width = None` = 不限宽（单行），`Some(w)` = 按 `w` 断行（等价
     /// `break_all_lines(Some(w))`）。
     ///
+    /// **颜色不在 shaping 输入里**（R12-11）：同一文本换成另一种 `style.color` 仍命中同一份布局
+    /// 快照（不重复塑形），但返回的句柄按**本次** `style.color` 光栅 —— Canvas 内文本没有节点
+    /// 绘制期的 `foreground` 重上色，这是 halo 副本 / 多色标签能真正换色的唯一通道（E24）。
+    ///
     /// `inline_boxes` 与节点路径同源（`TextContent.inline_boxes`）：落点经
     /// [`App::shaped_inline_boxes`] 读取；传空切片 = 无行内盒。E1 只保证落点可读，
     /// `InlineBoxPaint` 的绘制归 E2（`§11.2`）。
@@ -2984,6 +2988,12 @@ impl App {
         // 租约同步同样无条件执行：失败路径上发生的换代 / 淘汰必须立即对已发出的句柄可见。
         self.sync_atlas_generation_lease();
         result
+    }
+
+    /// 仅测试：本进程真正跑 parley 塑形的次数（E24 的「换色命中缓存」断言面）。
+    #[cfg(test)]
+    pub(crate) fn shape_count_for_test(&self) -> u32 {
+        self.text.shape_count()
     }
 
     /// 行内盒落点（v2.1 E1，`§11.1`）：顺序与 `shape_text` 传入的 `inline_boxes` 一一对应，
