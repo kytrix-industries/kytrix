@@ -188,6 +188,7 @@ struct SelectorComponents {
     dialog: Option<Dialog>,
     list: Option<List>,
     tree: Option<Tree>,
+    input: Option<InputNode>,
     spinner: Option<Spinner>,
     retry: Option<Button>,
 }
@@ -1453,7 +1454,6 @@ impl SelectorState {
     /// Takes the components out of the state, leaving the nodes to whoever releases them
     /// first (the dialog's overlay owns the content subtree).
     fn take_components(&mut self) -> SelectorComponents {
-        self.input = None;
         self.message_block = None;
         self.message_slot = None;
         self.message_built = None;
@@ -1461,6 +1461,7 @@ impl SelectorState {
             dialog: self.dialog.take(),
             list: self.list.take(),
             tree: self.tree.take(),
+            input: self.input.take(),
             spinner: self.spinner.take(),
             retry: self.retry_button.take(),
         }
@@ -1471,10 +1472,16 @@ impl SelectorState {
 ///
 /// Which order the components go in does not matter between themselves: the dialog's
 /// overlay is the only node owner, and it unmounts the content subtree every other
-/// component built into before any of them releases its scope.
+/// component built into before any of them releases its scope. The filter's input is the
+/// one component whose handlers are not a signal scope: `InputNode::release` detaches the
+/// click / drag actions `install` registered, and without it every selector a pane opens
+/// leaves that pair behind on the application's action table.
 fn release_components(app: &mut App, components: SelectorComponents) {
     if let Some(dialog) = components.dialog {
         dialog.release(app);
+    }
+    if let Some(input) = components.input {
+        input.release(app);
     }
     if let Some(list) = components.list {
         list.release(app);
@@ -2907,6 +2914,40 @@ mod tests {
         );
         assert!(!harness.app().has_action_handler(&first_action));
         assert!(harness.layer().is_empty(harness.window()));
+    }
+
+    /// The filter input registers its click / drag actions on the application rather than in a
+    /// signal scope, so releasing the selector has to detach them: otherwise every dialog a
+    /// pane opens leaves a pair of handlers behind.
+    #[test]
+    fn releasing_the_selector_should_detach_its_filter_handlers() {
+        let mut harness = harness();
+        let source = FakeSource::default();
+        source.set_manifest(test_support::manifest());
+        let (mut selector, _) = selector(&mut harness, source, &[]);
+        sync(&mut harness, &mut selector);
+        let filter = input(&selector);
+        let click = Action::Custom(format_smolstr!("base_ui.input.{}.click", filter.spec.name));
+        let drag = Action::Custom(format_smolstr!("base_ui.input.{}.drag", filter.spec.name));
+        assert!(
+            harness.app().has_action_handler(&click),
+            "the filter registers its click"
+        );
+        assert!(
+            harness.app().has_action_handler(&drag),
+            "the filter registers its drag"
+        );
+
+        harness.with_cx(|cx| selector.release(cx));
+
+        assert!(
+            !harness.app().has_action_handler(&click),
+            "the released selector left its filter's click handler behind"
+        );
+        assert!(
+            !harness.app().has_action_handler(&drag),
+            "the released selector left its filter's drag handler behind"
+        );
     }
 
     // ------------------------------------------------------------- the list

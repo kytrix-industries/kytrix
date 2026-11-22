@@ -23,6 +23,12 @@
 //! `kit::table` and a `kit::list` are different components rather than different styles of
 //! one.
 //!
+//! The grid keeps the old cells, not the old scrolling: the engine's list scrolls one axis, so
+//! a pane too narrow for the columns wraps them into more lines instead of scrolling sideways.
+//! The two-axis container the old grid had is registered as **E22**
+//! (`.docs/gui-migration/spec-deltas/E22.md`); until it exists, the columns, the fixed 160×88
+//! cells and the centred column block are the old geometry.
+//!
 //! # The rows are a signal, the cells are bindings
 //!
 //! Neither row factory has an application context (the table's cells and the grid's list
@@ -30,17 +36,30 @@
 //! `bind_style` closure over the signals the pane owns: the accepted rows, the navigation
 //! busy flag, the language, and the flash map. Structural changes (a new answer, a new
 //! selection) go through `Table::set_rows` / `List::set_count`, which rebuild the mounted
-//! window so the factories run against the new model.
+//! window so the factories run against the new model. Those are the only calls that change
+//! how many rows or cells a mounted container draws, so `sync` publishes to them whenever the
+//! row model changed — not only when the body is first built.
+//!
+//! # RPC answers are attributed by identity
+//!
+//! Both bridges replace the call before them, and a replaced call's answer can already be in
+//! the inbox. Each bridge therefore keeps its own in-flight command table (`Pending`): the
+//! identity `WidgetBinding::call` returns is what the answer must carry for the pane to apply
+//! it. An answer the table does not know is a late answer to a command the pane replaced — it
+//! is dropped and counted, never applied to whatever command happens to be in flight (AGENTS
+//! §4.4 / §8.2).
 //!
 //! # Where the flash lives
 //!
 //! A cell flashes when its index moves. The flash is driven by the pane rather than by an
 //! animated node, because the flash's opacity is a function of elapsed time that a test can
 //! read: the pane keeps the moves it has seen, writes the visible opacities into a signal
-//! and arms **one** one-shot timer (E10) per visible frame until every flash has run its
-//! course. A frame with nothing to draw writes nothing and leaves no timer behind (I3). The
-//! platform's reduce-motion setting turns the flash off entirely — it is movement, and a
-//! reader who asked for less of it does not want a market's worth of it.
+//! and arms a one-shot timer (E10) that fires the next frame while one is still visible. The
+//! engine's timer is one-shot, so the timer's callback marks itself fired and asks for a
+//! frame, and the following `sync` arms the next tick; a flash that has run its course leaves
+//! no timer behind (I3). The platform's reduce-motion setting turns the flash off entirely —
+//! it is movement, and a reader who asked for less of it does not want a market's worth of
+//! it.
 //!
 //! # The selector
 //!
@@ -50,6 +69,7 @@
 //! handle to the pane.
 
 use std::{
+    cell::Cell,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -80,19 +100,17 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::{
-        primitive::Border,
-        style::{PaintSpec, StylePatch},
-    },
+    paint::{primitive::Border, style::StylePatch},
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
 };
 use widget::{
-    binding::{Inbound, WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
     error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     view::{HeaderGroup, ReloadHandle, WidgetView},
@@ -122,18 +140,14 @@ const FLASH_PEAK: Duration = Duration::from_millis(100);
 const FLASH_TICK: Duration = Duration::from_millis(16);
 /// How tall the flash bar across the top of a grid cell is.
 const GRID_FLASH_HEIGHT: f32 = 6.0;
-/// The narrowest a grid cell may be, which decides how many cells a line holds.
-const GRID_MIN_CELL_WIDTH: u16 = 160;
+/// The width of one grid cell, which is also the unit the column count is fitted in.
+const GRID_CELL_WIDTH: f32 = 160.0;
 /// The height of one grid line, which is one cell tall.
-const GRID_MIN_CELL_HEIGHT: u16 = 88;
-/// The room the grid keeps for the list's own scroll bar.
-const GRID_SCROLLBAR_WIDTH: f32 = 8.0;
+const GRID_CELL_HEIGHT: f32 = 88.0;
 /// The table's columns, in header order.
 const COLUMN_COUNT: usize = 4;
 /// Column widths in header order, as a share of the pane.
 const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.4, 0.2, 0.2, 0.2];
-/// The space between two grid cells.
-const GRID_GAP: f32 = 8.0;
 
 /// Which of the two ways of drawing an answer a pane uses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -255,34 +269,32 @@ struct FlashVisual {
 /// The grid's fixed-cell layout.
 ///
 /// The viewport width alone decides the column count, and the remaining cells wrap into
-/// lines. The cells themselves stretch to the line's width: the engine's list is a
-/// single-axis virtualizer and cannot scroll a fixed-width grid both ways, so a line holds
-/// as many cells as the width has room for and each cell takes an equal share of it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// lines. The cells keep the width the old grid gave them and a line's cells are centred as
+/// one block, which is what the old canvas did: `floor(width / 160)` cells of exactly 160 px,
+/// with the unused remainder split between the two sides.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GridLayout {
     pub columns: usize,
     pub lines: usize,
-    pub cell_height: u16,
+    pub cell_height: f32,
 }
 
 /// Resolves the grid's columns from the width it has.
 pub(crate) fn grid_layout(viewport_width: f32, item_count: usize) -> GridLayout {
-    let cell_width = f32::from(GRID_MIN_CELL_WIDTH).max(1.0);
     if item_count == 0 {
         return GridLayout {
             columns: 0,
             lines: 0,
-            cell_height: GRID_MIN_CELL_HEIGHT,
+            cell_height: GRID_CELL_HEIGHT,
         };
     }
-    let usable = (viewport_width - GRID_SCROLLBAR_WIDTH).max(0.0);
-    let columns = ((usable / cell_width).floor() as usize)
+    let columns = ((viewport_width / GRID_CELL_WIDTH).floor() as usize)
         .max(1)
         .min(item_count);
     GridLayout {
         columns,
         lines: item_count.div_ceil(columns),
-        cell_height: GRID_MIN_CELL_HEIGHT,
+        cell_height: GRID_CELL_HEIGHT,
     }
 }
 
@@ -296,6 +308,17 @@ enum HeaderRequest {
     Choose,
     /// Draw the rows the other way.
     Mode(FinancialIndexDisplayMode),
+}
+
+/// The command the stream's binding has in flight, so an answer can be attributed to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamCommand {
+    /// Follow the scope for the first time after a load.
+    Load,
+    /// Reopen a scope whose stream failed.
+    Retry,
+    /// Follow nothing (nobody signed in, or nothing selected).
+    Stop,
 }
 
 /// What the pane's manifest read was asked for, so an answer can be matched to it.
@@ -334,11 +357,13 @@ struct GridBody {
     wrapper: NodeId,
     list: List,
     /// How many cells a line holds, which is what the row factory reads.
-    columns: Rc<std::cell::Cell<usize>>,
+    columns: Rc<Cell<usize>>,
     /// How many cells there are, which is what the row factory reads.
-    count: Rc<std::cell::Cell<usize>>,
+    count: Rc<Cell<usize>>,
     /// How many columns the mounted rows were built for.
     built_columns: usize,
+    /// How many lines the mounted list holds.
+    built_lines: usize,
 }
 
 /// The table's component.
@@ -372,8 +397,10 @@ pub struct FinancialIndexWidget {
     /// The executor bridge for the one-shot manifest reads, kept apart from the stream's so a
     /// catalogue read cannot replace the command that started the subscription.
     manifest: Option<WidgetBinding<FinancialIndexProtocol>>,
-    /// What the manifest read in flight was asked about.
-    manifest_pending: Option<ManifestSettlement>,
+    /// The stream command in flight, keyed by the identity its answer will carry.
+    stream_pending: Pending<StreamCommand>,
+    /// What the manifest read in flight was asked about, keyed by its identity.
+    manifest_pending: Pending<ManifestSettlement>,
     status: WidgetStatus,
     recovery: WidgetAction,
     config_change: WidgetConfigChange,
@@ -407,6 +434,9 @@ pub struct FinancialIndexWidget {
     flash_signal: Signal<Arc<HashMap<FinancialIndexTopic, FlashVisual>>>,
     /// The one-shot timer that moves a visible flash to its next frame.
     flash_timer: Option<TimerId>,
+    /// Whether the timer in [`Self::flash_timer`] has fired and the next sync has to arm the
+    /// following tick.
+    flash_timer_fired: Rc<Cell<bool>>,
     /// The node the body's frame was built as; the content is (re)built under it.
     content_slot: Option<NodeId>,
     /// The content under the frame, once the body has been built.
@@ -555,9 +585,13 @@ impl WidgetView for FinancialIndexWidget {
             self.rebuild_content(cx)?;
         }
 
+        // The rows a frame draws changed, and the container under the body draws them: telling
+        // only the cells would leave a row the user just selected invisible, and a row they
+        // just removed behind.
         if self.rows_dirty {
             self.rows_dirty = false;
             self.publish_rows(cx);
+            self.publish_rows_to_content(cx)?;
         }
         self.sync_grid_columns(cx)?;
         self.settle_flashes(cx);
@@ -691,7 +725,8 @@ impl FinancialIndexWidget {
             config,
             stream,
             manifest,
-            manifest_pending: None,
+            stream_pending: Pending::new(),
+            manifest_pending: Pending::new(),
             status,
             recovery,
             config_change,
@@ -710,6 +745,7 @@ impl FinancialIndexWidget {
             flashes: HashMap::new(),
             flash_signal,
             flash_timer: None,
+            flash_timer_fired: Rc::new(Cell::new(false)),
             content_slot: None,
             content: None,
             built_mode: None,
@@ -736,7 +772,9 @@ impl FinancialIndexWidget {
         self.ready = false;
         self.flashes.clear();
         if self.current_scope().is_none() {
-            self.manifest_pending = None;
+            // Nothing is going to be read for: the read that was in flight (if any) answers a
+            // command this pane has abandoned, and its answer is a late one.
+            self.manifest_pending.clear();
             self.follow(retry, cx);
             return;
         }
@@ -749,17 +787,16 @@ impl FinancialIndexWidget {
         // connecting while it is in flight — the request that follows is what connects.
         self.status.report(cx.app_mut(), WidgetState::Connecting);
         let _ = cx.request_frame();
+        let asked = self.config.selection.clone();
         let Some(binding) = self.manifest.as_mut() else {
             // There is no service to ask, so there is nothing to settle: following reports
             // the failure the reader can recover from.
             self.follow(retry, cx);
             return;
         };
-        self.manifest_pending = Some(ManifestSettlement {
-            asked: self.config.selection.clone(),
-            retry,
-        });
-        binding.call(cx, FinancialIndexRequest::FetchManifest);
+        let request_id = binding.call(cx, FinancialIndexRequest::FetchManifest);
+        self.manifest_pending
+            .track(request_id, ManifestSettlement { asked, retry });
     }
 
     /// Follows the scope the config now holds, or says what the pane is waiting for.
@@ -780,7 +817,8 @@ impl FinancialIndexWidget {
             // Nothing is followed, so nothing should stay subscribed on this pane's behalf: an
             // account that signed out must not keep a seat it is not using.
             if let Some(binding) = self.stream.as_mut() {
-                binding.call(cx, FinancialIndexRequest::Stop);
+                let request_id = binding.call(cx, FinancialIndexRequest::Stop);
+                self.stream_pending.track(request_id, StreamCommand::Stop);
             }
             let _ = cx.request_frame();
             return;
@@ -800,14 +838,13 @@ impl FinancialIndexWidget {
             return;
         };
         self.status.report(cx.app_mut(), WidgetState::Connecting);
-        binding.call(
-            cx,
-            if retry {
-                FinancialIndexRequest::Retry(scope)
-            } else {
-                FinancialIndexRequest::Load(scope)
-            },
-        );
+        let (command, request) = if retry {
+            (StreamCommand::Retry, FinancialIndexRequest::Retry(scope))
+        } else {
+            (StreamCommand::Load, FinancialIndexRequest::Load(scope))
+        };
+        let request_id = binding.call(cx, request);
+        self.stream_pending.track(request_id, command);
         let _ = cx.request_frame();
     }
 
@@ -834,32 +871,50 @@ impl FinancialIndexWidget {
     /// Applies the answer to a command the stream's service was given.
     ///
     /// The arrival of the stream's own reports is what a row draws its state from; an
-    /// accepted command is only the service saying it took the scope.
+    /// accepted command is only the service saying it took the scope. The answer is applied
+    /// only if the identity is the command this pane is waiting for: an answer to a command
+    /// that was replaced (a load for a scope the user has left, say) is a late answer, and it
+    /// must not fail the pane that is now waiting for something else.
     fn apply_stream_rpc(
         &mut self,
-        _request_id: widget::protocol::RequestId,
+        request_id: RequestId,
         result: WidgetRpcResult<FinancialIndexProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        let Some(command) = self.stream_pending.take(request_id) else {
+            log::debug!(
+                "the financial index pane ignored reply {request_id}: no command is waiting for it"
+            );
+            return;
+        };
+        let Err(error) = result else {
+            return;
+        };
+        if !matches!(command, StreamCommand::Load | StreamCommand::Retry) {
+            // A refused stop leaves nothing behind to report: the pane follows nothing.
+            return;
+        }
         if self.status.is_failed(cx.app()) || self.current_scope().is_none() {
             return;
         }
-        if let Err(error) = result {
-            let recovery = self.recovery.clone();
-            self.status.report(
-                cx.app_mut(),
-                WidgetState::failed(Arc::new(FinancialIndexFailure::Rpc(error)), recovery),
-            );
-            let _ = cx.request_frame();
-        }
+        let recovery = self.recovery.clone();
+        self.status.report(
+            cx.app_mut(),
+            WidgetState::failed(Arc::new(FinancialIndexFailure::Rpc(error)), recovery),
+        );
+        let _ = cx.request_frame();
     }
 
     /// Applies one answer the manifest's binding delivered.
     fn apply_manifest(&mut self, inbound: Inbound<FinancialIndexProtocol>, cx: &mut WidgetCx<'_>) {
-        let Inbound::Rpc { result, .. } = inbound else {
+        let Inbound::Rpc { request_id, result } = inbound else {
             return;
         };
-        let Some(pending) = self.manifest_pending.take() else {
+        let Some(pending) = self.manifest_pending.take(request_id) else {
+            log::debug!(
+                "the financial index pane ignored manifest reply {request_id}: no read is \
+                 waiting for it"
+            );
             return;
         };
         // An answer about a selection the user has left, or a pane that signed out while it
@@ -1056,20 +1111,35 @@ impl FinancialIndexWidget {
         cx.write(&self.busy_signal, busy);
     }
 
-    /// Tells the content under the frame how many rows there are.
+    /// Tells the content under the frame what the rows are now.
+    ///
+    /// A row was added, removed, or the width moved the columns: the mounted container has to
+    /// be told, because its factories only re-run against the model when its count changes.
+    /// Rows whose count did not change are left alone — their cells read the row signal, so a
+    /// quote that moved is a `bind_*` recompute rather than a rebuild.
     fn publish_rows_to_content(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let rows = self.rows.len();
         let width = self.viewport_width(cx);
         match self.content.as_mut() {
             Some(BodyContent::Grid(grid)) => {
                 let layout = grid_layout(width, rows);
+                if grid.built_columns == layout.columns
+                    && grid.count.get() == rows
+                    && grid.built_lines == layout.lines
+                {
+                    return Ok(());
+                }
                 grid.count.set(rows);
                 grid.columns.set(layout.columns.max(1));
                 grid.built_columns = layout.columns;
+                grid.built_lines = layout.lines;
                 grid.list.set_count(cx.app_mut(), layout.lines)?;
                 grid.list.sync(cx.app_mut())?;
             }
             Some(BodyContent::Table(table)) => {
+                if table.table.rows() == rows {
+                    return Ok(());
+                }
                 table.table.set_rows(cx.app_mut(), rows)?;
                 table.table.sync(cx.app_mut())?;
             }
@@ -1086,10 +1156,15 @@ impl FinancialIndexWidget {
             return Ok(());
         };
         let layout = grid_layout(width, rows);
-        if grid.built_columns == layout.columns && grid.columns.get() == layout.columns.max(1) {
+        if grid.built_columns == layout.columns
+            && grid.built_lines == layout.lines
+            && grid.count.get() == rows
+            && grid.columns.get() == layout.columns.max(1)
+        {
             return Ok(());
         }
         grid.built_columns = layout.columns;
+        grid.built_lines = layout.lines;
         grid.count.set(rows);
         grid.columns.set(layout.columns.max(1));
         grid.list.set_count(cx.app_mut(), layout.lines)?;
@@ -1129,13 +1204,25 @@ impl FinancialIndexWidget {
     }
 
     /// Arms the one-shot timer that moves a visible flash to its next frame.
+    ///
+    /// The engine's `App::after` timer is one-shot: it is dispatched once and removed from the
+    /// table. The callback therefore marks itself fired and asks for a frame; the `sync` that
+    /// frame routes arms the following tick while the flash is still visible. Without that
+    /// second half the pane would only ever be timed once, and a frame whose flash opacity did
+    /// not happen to change would leave the bar half-faded.
     fn arm_flash_timer(&mut self, cx: &mut WidgetCx<'_>) {
-        if self.flash_timer.is_some() {
+        if self.flash_timer.is_some() && !self.flash_timer_fired.get() {
             return;
         }
+        // The fired timer is gone from the engine's table; the id in the field only makes a
+        // `cancel_timer` that is now a no-op.
+        self.flash_timer_fired.set(false);
+        self.flash_timer = None;
+        let fired = Rc::clone(&self.flash_timer_fired);
         let window = cx.window();
         let app = cx.app_mut();
         match app.after(window, FLASH_TICK, move |app| {
+            fired.set(true);
             let _ = app.request_repaint(window);
         }) {
             Ok(timer) => self.flash_timer = Some(timer),
@@ -1158,7 +1245,11 @@ impl FinancialIndexWidget {
     ) -> Result<(), EngineError> {
         match request {
             HeaderRequest::Choose => {
-                if self.selector.is_some() {
+                // The control is drawn disabled without an account, and a disabled kit control
+                // only paints its state: the entry is the guard that keeps a handler that
+                // outlived the sign-out from opening a selector with nothing to list (AGENTS
+                // §4.2).
+                if self.account_id.is_none() || self.selector.is_some() {
                     return Ok(());
                 }
                 let confirmed = self.confirmed;
@@ -1267,7 +1358,7 @@ impl FinancialIndexWidget {
         self.built_language = None;
     }
 
-    /// Builds the grid: fixed-height lines of equal-width cells in the engine's virtual list.
+    /// Builds the grid: fixed-size cells in fixed-height lines of the engine's virtual list.
     fn build_grid(
         &mut self,
         parent: NodeId,
@@ -1285,9 +1376,11 @@ impl FinancialIndexWidget {
             .build(cx.tree_mut(), parent)?;
 
         let layout = grid_layout(self.viewport_width(cx), self.rows.len());
-        let columns = Rc::new(std::cell::Cell::new(layout.columns.max(1)));
+        let columns = Rc::new(Cell::new(layout.columns.max(1)));
         let columns_for_rows = Rc::clone(&columns);
-        let count = Rc::new(std::cell::Cell::new(self.rows.len()));
+        // The list has not been told about any rows yet: `publish_rows_to_content` is what
+        // mounts them, and it has to see that it still owes the container its count.
+        let count = Rc::new(Cell::new(0));
         let count_for_rows = Rc::clone(&count);
         let rows = self.rows_signal;
         let flash = self.flash_signal;
@@ -1297,11 +1390,18 @@ impl FinancialIndexWidget {
         let font_size = self.theme.tokens().small.font_size;
         let large_font_size = self.theme.tokens().large.font_size;
         let key = cx.unique_key("financial_index.grid");
+        // The cells are exactly as wide as the column count says they are, so the line padding
+        // would shrink the line's width behind the count's back: the grid owns its own layout.
+        let options = ListOptions {
+            padding_x: 0.0,
+            padding_y: 0.0,
+            ..ListOptions::fixed(GRID_CELL_HEIGHT).selection(SelectionMode::None)
+        };
         let list = List::new(
             cx.app_mut(),
             self.theme.clone(),
             key,
-            ListOptions::fixed(f32::from(GRID_MIN_CELL_HEIGHT)).selection(SelectionMode::None),
+            options,
             move |tree, parent, line| {
                 let sink = GridSink {
                     rows,
@@ -1326,6 +1426,7 @@ impl FinancialIndexWidget {
             columns,
             count,
             built_columns: layout.columns,
+            built_lines: 0,
         })
     }
 
@@ -1911,8 +2012,8 @@ fn price_role(quote: Option<FinancialIndexQuote>) -> Role {
 /// `bind_*` closures over the signals the pane owns (AGENTS §7/G3).
 struct GridSink {
     rows: Signal<Arc<[FinancialIndexRow]>>,
-    count: Rc<std::cell::Cell<usize>>,
-    columns: Rc<std::cell::Cell<usize>>,
+    count: Rc<Cell<usize>>,
+    columns: Rc<Cell<usize>>,
     flash: Signal<Arc<HashMap<FinancialIndexTopic, FlashVisual>>>,
     language: Signal<LanguageCode>,
     translate: Translate,
@@ -1922,8 +2023,9 @@ struct GridSink {
 }
 
 impl GridSink {
-    /// Builds one line of the grid: as many cells as the width has room for, and empty
-    /// spacers where a line is not full, so every cell on screen is the same width.
+    /// Builds one line of the grid: one position per column, empty where the line is not full,
+    /// so a cell keeps its column no matter how many rows there are. The line is centred as a
+    /// block, which is what the old grid did with the width the columns did not use.
     fn build(&self, tree: &mut NodeTree, parent: NodeId, line: usize) -> Result<(), EngineError> {
         let columns = self.columns.get().max(1);
         let count = self.count.get();
@@ -1931,10 +2033,11 @@ impl GridSink {
             .style(
                 StyleBuilder::new()
                     .flex_row()
-                    .size_full()
+                    .justify_center()
+                    .width_full()
+                    .height(GRID_CELL_HEIGHT)
                     .min_width_0()
                     .min_height_0()
-                    .gap(GRID_GAP)
                     .build(),
             )
             .build(tree, parent)?;
@@ -1944,7 +2047,14 @@ impl GridSink {
                 self.build_cell(tree, frame, index)?;
             } else {
                 NodeBuilder::boxed()
-                    .style(StyleBuilder::new().flex_1().min_width_0().build())
+                    .style(
+                        StyleBuilder::new()
+                            .width(GRID_CELL_WIDTH)
+                            .height(GRID_CELL_HEIGHT)
+                            .flex_none()
+                            .min_width_0()
+                            .build(),
+                    )
                     .build(tree, frame)?;
             }
         }
@@ -1978,7 +2088,11 @@ impl GridSink {
             .id("TEST_INDICES_GRID_CELL")
             .style(
                 StyleBuilder::new()
-                    .flex_1()
+                    .width(GRID_CELL_WIDTH)
+                    .height(GRID_CELL_HEIGHT)
+                    .flex_none()
+                    .relative()
+                    .overflow_hidden()
                     .min_width_0()
                     .flex_col()
                     .gap(4.0)
@@ -2189,15 +2303,13 @@ impl GridSink {
             .id("TEST_INDICES_GRID_FLASH")
             .style(
                 StyleBuilder::new()
-                    .width_full()
+                    .absolute()
+                    .top(-1.0)
+                    .left(-1.0)
+                    .right(-1.0)
                     .height(GRID_FLASH_HEIGHT)
-                    .flex_none()
                     .build(),
             )
-            .paint(PaintSpec {
-                corner_radius: [GRID_FLASH_HEIGHT / 2.0; 4],
-                ..PaintSpec::default()
-            })
             .bind_style(move |read| {
                 let flashes = read.read(&flash);
                 let rows = read.read(&rows);
@@ -2229,7 +2341,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::{LocalizedFinancialIndexName, MAX_NAME_CHARS, MAX_SELECTED_INDICES},
+        model::{
+            FinancialIndexCatalog, LocalizedFinancialIndexName, MAX_NAME_CHARS,
+            MAX_SELECTED_INDICES, prepare_catalog,
+        },
         service::FinancialIndexStreamError,
         test_support::{self, ACCOUNT, FakeSource, event, selected, topic},
     };
@@ -2280,7 +2395,10 @@ mod tests {
         proto_types::FinancialIndices {
             categories: vec![proto_types::FinancialIndexCategory {
                 code: "test".to_owned(),
-                name: None,
+                name: Some(proto_types::FinancialIndexLocalizedName {
+                    en: "Test indices".to_owned(),
+                    zh: "测试指数".to_owned(),
+                }),
             }],
             indices: selection
                 .iter()
@@ -2305,6 +2423,8 @@ mod tests {
         parent: NodeId,
         /// The signal scope the pane was mounted with: the kit keys it mints carry it.
         scope: SignalScope,
+        /// How many times the pane asked the framework to persist its config.
+        publishes: Rc<Cell<usize>>,
     }
 
     /// Runs `body` with a context over the pane's own scope, the way the framework drives it.
@@ -2325,6 +2445,20 @@ mod tests {
     /// The height a test body is laid out with.
     const BODY_HEIGHT: f32 = 480.0;
 
+    /// A config report that counts the writes the pane publishes, and the counter it feeds.
+    ///
+    /// A pane writes its config back only when it changed the selection: a test that asserts
+    /// the counter did not move is asserting the pane did not "settle" a selection nobody
+    /// asked it to.
+    fn change_tracker() -> (WidgetConfigChange, Rc<Cell<usize>>) {
+        let publishes: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&publishes);
+        (
+            WidgetConfigChange::new(move |_| counter.set(counter.get() + 1)),
+            publishes,
+        )
+    }
+
     /// A second pane of the same host, mounted with its own signal scope.
     ///
     /// The framework mints one scope per widget mount, and a kit component key carries it;
@@ -2340,13 +2474,14 @@ mod tests {
         let status = WidgetStatus::new(harness.app_mut(), scope);
         let services = std::rc::Rc::clone(harness.services_rc());
         let window = harness.window();
+        let (config_change, publishes) = change_tracker();
         let widget = {
             let mut cx = WidgetCx::new(harness.app_mut(), window, &services, scope);
             FinancialIndexWidget::with_source(
                 config,
                 source,
                 status,
-                WidgetConfigChange::default(),
+                config_change,
                 WidgetAction::new("common.retry", |_| {}),
                 &mut cx,
             )
@@ -2356,6 +2491,7 @@ mod tests {
             status,
             parent,
             scope,
+            publishes,
         }
     }
 
@@ -2383,12 +2519,13 @@ mod tests {
                 .build(cx.tree_mut(), root)
                 .expect("the body parent builds")
         });
+        let (config_change, publishes) = change_tracker();
         let widget = harness.with_cx(|cx| {
             FinancialIndexWidget::with_source(
                 config,
                 source,
                 status,
-                WidgetConfigChange::default(),
+                config_change,
                 WidgetAction::new("common.retry", |_| {}),
                 cx,
             )
@@ -2398,6 +2535,7 @@ mod tests {
             status,
             parent,
             scope,
+            publishes,
         }
     }
 
@@ -2474,6 +2612,19 @@ mod tests {
     }
 
     fn report_quotes(harness: &mut WidgetTestApp, pane: &mut Pane, quotes: &[(&str, u32)]) {
+        if let Some(binding) = pane.widget.stream.as_mut() {
+            binding.cancel();
+        }
+        report_quotes_keeping_the_bridge(harness, pane, quotes);
+    }
+
+    /// Reports quotes without stopping the stream's bridge, for a test whose pane still has to
+    /// command the service behind it.
+    fn report_quotes_keeping_the_bridge(
+        harness: &mut WidgetTestApp,
+        pane: &mut Pane,
+        quotes: &[(&str, u32)],
+    ) {
         let scope = pane
             .widget
             .current_scope()
@@ -2484,9 +2635,6 @@ mod tests {
                 .iter()
                 .map(|(code, latest)| (topic(code), quote(code, *latest))),
         );
-        if let Some(binding) = pane.widget.stream.as_mut() {
-            binding.cancel();
-        }
         drive(harness, pane, |widget, cx| {
             widget.apply_latest(
                 scope,
@@ -2561,6 +2709,22 @@ mod tests {
         harness.text_of(node)
     }
 
+    /// Every node under `root` whose debug id is exactly `id`, in document order.
+    fn nodes_with_id(harness: &WidgetTestApp, root: NodeId, id: &str) -> Vec<NodeId> {
+        let tree = harness.tree();
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if tree.debug_id(node).is_some_and(|debug| debug == id) {
+                found.push(node);
+            }
+            if let Ok(target) = tree.get(node) {
+                stack.extend(target.children().iter().rev().copied());
+            }
+        }
+        found
+    }
+
     /// The first node under `parent` whose debug prefix is `prefix`.
     fn find(harness: &WidgetTestApp, parent: NodeId, prefix: &str) -> Option<NodeId> {
         harness.find_by_debug_prefix(parent, prefix)
@@ -2581,6 +2745,62 @@ mod tests {
             stack.extend(target.children().iter().copied());
         }
         texts
+    }
+
+    /// The laid-out box of a node: `(x, y, width, height)`, which is what a cell's geometry is
+    /// asserted by.
+    fn place(harness: &WidgetTestApp, node: NodeId) -> (f32, f32, f32, f32) {
+        let bounds = harness
+            .tree()
+            .get(node)
+            .expect("the node is in the tree")
+            .layout()
+            .bounds;
+        (
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        )
+    }
+
+    /// The catalogue an answer carries for exactly `selection`.
+    fn catalog_carrying(selection: &[SelectedFinancialIndex]) -> FinancialIndexCatalog {
+        prepare_catalog(manifest_carrying(selection)).expect("the fixture catalogue is valid")
+    }
+
+    /// An accepted catalogue read that carries `selection`.
+    fn manifest_answer(
+        selection: &[SelectedFinancialIndex],
+    ) -> WidgetRpcResult<FinancialIndexProtocol> {
+        Ok(FinancialIndexResponse::Manifest {
+            catalog: catalog_carrying(selection),
+            limit: None,
+        })
+    }
+
+    /// Delivers one answer to the manifest bridge, the way `sync` takes it from the inbox.
+    fn deliver_manifest(
+        harness: &mut WidgetTestApp,
+        pane: &mut Pane,
+        request_id: RequestId,
+        result: WidgetRpcResult<FinancialIndexProtocol>,
+    ) {
+        drive(harness, pane, |widget, cx| {
+            widget.apply_manifest(Inbound::Rpc { request_id, result }, cx)
+        });
+    }
+
+    /// Delivers one answer to the stream bridge, the way `sync` takes it from the inbox.
+    fn deliver_stream(
+        harness: &mut WidgetTestApp,
+        pane: &mut Pane,
+        request_id: RequestId,
+        result: WidgetRpcResult<FinancialIndexProtocol>,
+    ) {
+        drive(harness, pane, |widget, cx| {
+            widget.apply_stream_rpc(request_id, result, cx)
+        });
     }
 
     fn header_parent(harness: &mut WidgetTestApp, id: &'static str) -> NodeId {
@@ -2732,11 +2952,16 @@ mod tests {
     // ------------------------------------------------------------------- grid
 
     #[test]
-    fn a_grid_layout_should_use_every_column_the_width_fits() {
-        let layout = grid_layout(640.0, 12);
+    fn a_grid_layout_should_use_every_column_the_whole_width_fits() {
+        // The count is the old one: 640 px is four 160 px cells and 800 px is five (the list's
+        // scroll bar is an overlay, so it takes no width away).
+        let narrow = grid_layout(640.0, 12);
+        assert_eq!(narrow.columns, 4, "640 px fits four 160 px cells");
+        assert_eq!(narrow.lines, 3);
 
-        assert_eq!(layout.columns, 3, "640 px fits three 160 px cells");
-        assert_eq!(layout.lines, 4);
+        let wide = grid_layout(800.0, 12);
+        assert_eq!(wide.columns, 5, "800 px fits five 160 px cells");
+        assert_eq!(wide.lines, 3);
     }
 
     #[test]
@@ -2749,11 +2974,13 @@ mod tests {
 
     #[test]
     fn a_grid_layout_should_floor_the_width_without_resizing_cells() {
-        // 640 px minus the scroll bar's 8 px fits three cells and 472 px of a fourth.
         let layout = grid_layout(648.0, 12);
 
-        assert_eq!(layout.columns, 4, "the scroll bar is not usable width");
-        assert_eq!(layout.cell_height, GRID_MIN_CELL_HEIGHT);
+        assert_eq!(
+            layout.columns, 4,
+            "the 8 px a fourth cell would need are not a column"
+        );
+        assert_eq!(layout.cell_height, GRID_CELL_HEIGHT);
     }
 
     #[test]
@@ -3007,6 +3234,8 @@ mod tests {
         report_quotes(&mut harness, &mut pane, &[("HSI", 101)]);
         build_body(&mut harness, &mut pane);
 
+        // The catalogue carries the index the user picks next, so the pane settles on it.
+        source.set_manifest(manifest_carrying(&[selected("SPX")]));
         let _next = source.subscribe();
         drive(&mut harness, &mut pane, |widget, cx| {
             widget.select_indices(vec![selected("SPX")], cx)
@@ -3119,6 +3348,46 @@ mod tests {
         assert_eq!(source.subscribed().len(), 2);
     }
 
+    /// A recovery re-reads the scope instead of starting over: the quotes the reader was
+    /// looking at stay on screen while the stream is reopened. Only an explicit load clears
+    /// them.
+    #[test]
+    fn the_recovery_should_keep_the_quotes_the_reader_was_reading() {
+        let source = FakeSource::with_session(4);
+        let mut harness = test_support::harness();
+        let mut pane = pane(&mut harness, source.clone(), config(&[selected("HSI")]));
+        follow(&mut harness, &mut pane, &source);
+        report_quotes_keeping_the_bridge(&mut harness, &mut pane, &[("HSI", 101)]);
+        report_status(&mut harness, &mut pane, FinancialIndexStatus::Ready);
+        report_failure(&mut harness, &mut pane);
+        assert!(pane.status.is_failed(harness.app()));
+
+        let _next = source.subscribe();
+        drive(&mut harness, &mut pane, |widget, cx| widget.load(cx));
+        settle(
+            &mut harness,
+            &mut pane,
+            "the recovery should reopen the scope's stream",
+            |_, _| source.subscribed().len() == 2,
+        );
+
+        assert_eq!(
+            latest_of(&pane),
+            vec![Some(101)],
+            "a recovery keeps the quotes the reader was reading"
+        );
+        assert!(pane.widget.quotes.is_some());
+        assert_eq!(
+            pane.widget.accepted,
+            pane.widget.current_scope(),
+            "the kept quotes still belong to the scope the pane follows"
+        );
+        assert!(
+            pane.widget.has_content(),
+            "a recovery does not blank the pane while it reconnects"
+        );
+    }
+
     // ------------------------------------------------------------------ flash
 
     #[test]
@@ -3194,7 +3463,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flash_should_draw_the_bar_of_the_cell_that_moved() {
+    fn a_flash_should_cover_the_top_of_its_cell() {
         let source = FakeSource::with_session(4);
         let mut harness = test_support::harness();
         let mut pane = pane(&mut harness, source.clone(), config(&[selected("HSI")]));
@@ -3210,11 +3479,13 @@ mod tests {
         );
         build_body(&mut harness, &mut pane);
         settle_frames(&mut harness, &mut pane);
+        harness.drain();
 
         let grid_node =
             find(&harness, pane.parent, "TEST_INDICES_GRID").expect("the grid is drawn");
-        let bar = find(&harness, grid_node, "TEST_INDICES_GRID_FLASH")
-            .expect("the moving cell draws its bar");
+        let cell = find(&harness, grid_node, "TEST_INDICES_GRID_CELL").expect("a cell is drawn");
+        let bar =
+            find(&harness, cell, "TEST_INDICES_GRID_FLASH").expect("the moving cell draws its bar");
         let tree = harness.tree();
         let opacity = tree
             .get(bar)
@@ -3224,6 +3495,22 @@ mod tests {
             .expect("the bar binds its opacity");
 
         assert!(opacity > 0.0, "a visible flash is drawn");
+        let (cell_x, cell_y, cell_width, cell_height) = place(&harness, cell);
+        let (bar_x, bar_y, bar_width, bar_height) = place(&harness, bar);
+        assert_eq!(cell_width, GRID_CELL_WIDTH);
+        assert_eq!(cell_height, GRID_CELL_HEIGHT);
+        assert_eq!(bar_height, GRID_FLASH_HEIGHT);
+        assert!(
+            (bar_y - cell_y).abs() <= 1.5,
+            "the bar is drawn over the top of its cell, not under its text: bar {bar_y}, \
+             cell {cell_y}"
+        );
+        assert!(
+            bar_x <= cell_x + 0.5 && bar_width >= cell_width - 1.0,
+            "the bar spans the cell: bar {bar_x}..{}, cell {cell_x}..{}",
+            bar_x + bar_width,
+            cell_x + cell_width
+        );
     }
 
     #[test]
@@ -3235,20 +3522,34 @@ mod tests {
         report_quotes(&mut harness, &mut pane, &[("HSI", 101)]);
         report_quotes(&mut harness, &mut pane, &[("HSI", 102)]);
         build_body(&mut harness, &mut pane);
-        assert!(
-            pane.widget.flash_timer.is_some(),
-            "a visible flash is timed"
-        );
+        let first = pane.widget.flash_timer.expect("a visible flash is timed");
 
-        // The timer wakes one frame per tick (E10). The pane's flash runs on the clock the
-        // frame is drawn with, so a test moves the flash's own start rather than waiting:
-        // the wakeup it leaves behind is what this asserts.
+        // The engine's timer is one-shot: this round dispatches it, and the sync after it has to
+        // arm the following tick. A re-armed tick is a new identity — the old one is gone from
+        // the engine's table.
         harness.advance(FLASH_TICK);
         sync(&mut harness, &mut pane);
-        assert!(
-            pane.widget.flash_timer.is_some(),
-            "a flash still visible keeps asking for frames"
+        let next = pane
+            .widget
+            .flash_timer
+            .expect("a flash still visible keeps asking for frames");
+        assert_ne!(
+            next, first,
+            "the pane armed the next tick instead of leaving the dispatched one behind"
         );
+
+        // The next tick is dispatched too, and the one after it is armed again.
+        harness.advance(FLASH_TICK);
+        sync(&mut harness, &mut pane);
+        let third = pane
+            .widget
+            .flash_timer
+            .expect("every visible tick is followed by the next one");
+        assert_ne!(
+            third, next,
+            "a flash that is still moving keeps the pane timed"
+        );
+
         pane.widget.flashes.insert(
             topic("HSI"),
             QuoteFlash {
@@ -3262,6 +3563,32 @@ mod tests {
         assert!(
             pane.widget.flash_timer.is_none(),
             "a pane with nothing moving leaves no wakeup behind (I3)"
+        );
+    }
+
+    /// A released pane leaves no timer behind: the timer holds no widget, but it would keep
+    /// asking for frames for a pane that is gone.
+    #[test]
+    fn releasing_a_flashing_pane_should_cancel_its_timer() {
+        let source = FakeSource::with_session(4);
+        let mut harness = test_support::harness();
+        let mut pane = pane(&mut harness, source.clone(), config(&[selected("HSI")]));
+        follow(&mut harness, &mut pane, &source);
+        report_quotes(&mut harness, &mut pane, &[("HSI", 101)]);
+        report_quotes(&mut harness, &mut pane, &[("HSI", 102)]);
+        build_body(&mut harness, &mut pane);
+        let timer = pane
+            .widget
+            .flash_timer
+            .expect("the pane is timed while the flash is visible");
+
+        drive(&mut harness, &mut pane, |widget, cx| widget.release(cx));
+
+        let cancelled = harness.app_mut().cancel_timer(&timer);
+        assert!(pane.widget.flash_timer.is_none());
+        assert!(
+            !cancelled,
+            "the released pane cancelled the timer it had armed"
         );
     }
 
@@ -3286,6 +3613,56 @@ mod tests {
         assert_eq!(cell_text(&harness, &pane, 0, 1), "1.01");
         assert_eq!(cell_text(&harness, &pane, 0, 2), "+0.01");
         assert_eq!(cell_text(&harness, &pane, 0, 3), "+1.00%");
+    }
+
+    /// A mounted table is told the row count the model holds: without that, a selection the
+    /// user grows keeps drawing the rows it was built with and the new index is invisible.
+    #[test]
+    fn the_table_should_grow_and_shrink_with_the_selection() {
+        let source = FakeSource::with_session(8);
+        let mut harness = test_support::harness();
+        let two = [selected("HSI"), selected("SPX")];
+        let mut pane = pane(&mut harness, source.clone(), table_config(&two));
+        follow(&mut harness, &mut pane, &source);
+        report_quotes(&mut harness, &mut pane, &[("HSI", 101), ("SPX", 202)]);
+        report_status(&mut harness, &mut pane, FinancialIndexStatus::Ready);
+        build_body(&mut harness, &mut pane);
+        assert_eq!(table(&pane).rows(), 2);
+
+        let three = [selected("HSI"), selected("SPX"), selected("IX3")];
+        source.set_manifest(manifest_carrying(&three));
+        let _next_row = source.subscribe();
+        drive(&mut harness, &mut pane, |widget, cx| {
+            widget.select_indices(three.to_vec(), cx)
+        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the table should grow a row",
+            |_harness, pane| pane.widget.rows.len() == 3 && table(pane).rows() == 3,
+        );
+        assert_eq!(
+            table(&pane).rows(),
+            3,
+            "a newly selected index is a row of the table"
+        );
+
+        source.set_manifest(manifest_carrying(&two));
+        let _next_row = source.subscribe();
+        drive(&mut harness, &mut pane, |widget, cx| {
+            widget.select_indices(two.to_vec(), cx)
+        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the table should drop the row",
+            |_harness, pane| pane.widget.rows.len() == 2 && table(pane).rows() == 2,
+        );
+        assert_eq!(
+            table(&pane).rows(),
+            2,
+            "the row of a dropped index is not left behind"
+        );
     }
 
     #[test]
@@ -3409,6 +3786,117 @@ mod tests {
         assert!(texts.iter().any(|text| text == "1.01"), "{texts:?}");
         assert!(texts.iter().any(|text| text == "2.02"), "{texts:?}");
         assert!(find(&harness, grid_node, "TEST_INDICES_GRID_CELL").is_some());
+    }
+
+    /// The old grid placed each cell at exactly 160 px and centred the block of columns the
+    /// width did not fill; the migrated grid is the same shape, not an equal-share stretch.
+    #[test]
+    fn the_grid_should_draw_fixed_width_cells_in_a_centered_block() {
+        let source = FakeSource::with_session(4);
+        let mut harness = test_support::harness();
+        let mut pane = pane(
+            &mut harness,
+            source.clone(),
+            config(&[selected("HSI"), selected("SPX")]),
+        );
+        follow(&mut harness, &mut pane, &source);
+        report_quotes(&mut harness, &mut pane, &[("HSI", 101), ("SPX", 202)]);
+        report_status(&mut harness, &mut pane, FinancialIndexStatus::Ready);
+        build_body(&mut harness, &mut pane);
+        harness.drain();
+
+        let grid_node =
+            find(&harness, pane.parent, "TEST_INDICES_GRID").expect("the grid is drawn");
+        let (grid_x, _, grid_width, _) = place(&harness, grid_node);
+        assert_eq!(grid_width, BODY_WIDTH, "the grid is as wide as its body");
+        let line = grid(&pane)
+            .mounted_rows(harness.app())
+            .first()
+            .map(|(_, node)| *node)
+            .expect("a line is mounted");
+        let cells = nodes_with_id(&harness, line, "TEST_INDICES_GRID_CELL");
+        assert_eq!(cells.len(), 2, "the line holds one cell per selected index");
+
+        let (first_x, _, first_width, first_height) = place(&harness, cells[0]);
+        let (second_x, _, second_width, _) = place(&harness, cells[1]);
+        assert_eq!(
+            (first_width, first_height),
+            (GRID_CELL_WIDTH, GRID_CELL_HEIGHT),
+            "a cell keeps the old 160x88 size"
+        );
+        assert_eq!(second_width, GRID_CELL_WIDTH);
+        assert!(
+            (first_x - (grid_x + 160.0)).abs() <= 0.5,
+            "two 160 px cells in a 640 px line are centred: first cell at {first_x}"
+        );
+        assert!(
+            (second_x - (first_x + GRID_CELL_WIDTH)).abs() <= 0.5,
+            "cells sit against each other, as the old grid placed them"
+        );
+    }
+
+    /// The list is told how many lines the rows need when the selection changes size: a
+    /// mounted grid whose count was never updated keeps drawing the old number of rows.
+    #[test]
+    fn the_grid_should_wrap_new_lines_when_the_selection_grows() {
+        let source = FakeSource::with_session(8);
+        let mut harness = test_support::harness();
+        let four = [
+            selected("HSI"),
+            selected("SPX"),
+            selected("IX3"),
+            selected("IX4"),
+        ];
+        let mut pane = pane(&mut harness, source.clone(), config(&four));
+        follow(&mut harness, &mut pane, &source);
+        build_body(&mut harness, &mut pane);
+        assert_eq!(pane.widget.rows.len(), 4);
+        assert_eq!(
+            grid(&pane).count(harness.app()),
+            1,
+            "four cells fit on the 640 px line"
+        );
+
+        let five = [
+            selected("HSI"),
+            selected("SPX"),
+            selected("IX3"),
+            selected("IX4"),
+            selected("IX5"),
+        ];
+        source.set_manifest(manifest_carrying(&five));
+        let _next_line = source.subscribe();
+        drive(&mut harness, &mut pane, |widget, cx| {
+            widget.select_indices(five.to_vec(), cx)
+        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the fifth cell should wrap to a second line",
+            |harness, pane| pane.widget.rows.len() == 5 && grid(pane).count(harness.app()) == 2,
+        );
+        assert_eq!(
+            grid(&pane).count(harness.app()),
+            2,
+            "a fifth cell is a second line, not an invisible row"
+        );
+
+        source.set_manifest(manifest_carrying(&four));
+        let _next_line = source.subscribe();
+        drive(&mut harness, &mut pane, |widget, cx| {
+            widget.select_indices(four.to_vec(), cx)
+        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the dropped cell should leave the second line empty",
+            |harness, pane| pane.widget.rows.len() == 4 && grid(pane).count(harness.app()) == 1,
+        );
+        assert_eq!(
+            grid(&pane).count(harness.app()),
+            1,
+            "the line the dropped index left behind is gone"
+        );
     }
 
     #[test]
@@ -3622,6 +4110,125 @@ mod tests {
         );
     }
 
+    /// A catalogue read the pane replaced can still be answered: its identity is no longer in
+    /// the in-flight table, so the answer is dropped. Attributed by "a read is pending" instead,
+    /// the old answer settles the *new* selection against the old catalogue — every index looks
+    /// dropped and the empty selection is written back.
+    #[test]
+    fn a_late_catalogue_answer_should_not_settle_the_new_selection() {
+        let source = FakeSource::with_session(4);
+        let mut harness = test_support::harness();
+        let mut pane = pane(&mut harness, source, config(&[selected("HSI")]));
+        // The load's read (identity 1) is in flight; the user changes the selection before it
+        // answers, so a read for the new selection (identity 2) replaces it.
+        drive(&mut harness, &mut pane, |widget, cx| {
+            widget.select_indices(vec![selected("SPX")], cx)
+        });
+        assert_eq!(
+            pane.publishes.get(),
+            1,
+            "the new selection was written once"
+        );
+
+        // The replaced read answers with the catalogue it was asked about (HSI only).
+        deliver_manifest(
+            &mut harness,
+            &mut pane,
+            RequestId::new(1),
+            manifest_answer(&[selected("HSI")]),
+        );
+
+        assert_eq!(
+            pane.widget.config.selection,
+            vec![selected("SPX")],
+            "an answer to the replaced read is not the new selection's to settle"
+        );
+        assert_eq!(
+            pane.publishes.get(),
+            1,
+            "the late answer persisted a selection the user did not make"
+        );
+        assert_eq!(
+            pane.widget.manifest_pending.dropped(),
+            1,
+            "the late answer was dropped and counted"
+        );
+
+        // The read that is actually in flight still answers, and it is not counted as dropped.
+        deliver_manifest(
+            &mut harness,
+            &mut pane,
+            RequestId::new(2),
+            manifest_answer(&[selected("SPX")]),
+        );
+        assert_eq!(pane.widget.config.selection, vec![selected("SPX")]);
+        assert_eq!(
+            pane.widget.manifest_pending.dropped(),
+            1,
+            "an answer to the command in flight is applied, not dropped"
+        );
+    }
+
+    /// The stream bridge replaces the call before it too: a refusal queued for the command that
+    /// was replaced may not paint the pane as failed.
+    #[test]
+    fn a_replaced_commands_failure_should_not_fail_the_pane() {
+        let source = FakeSource::with_session(4);
+        let mut harness = test_support::harness();
+        let mut pane = pane(&mut harness, source, config(&[selected("HSI")]));
+        // The load's catalogue read answers, which starts the stream's load (identity 1).
+        deliver_manifest(
+            &mut harness,
+            &mut pane,
+            RequestId::new(1),
+            manifest_answer(&[selected("HSI")]),
+        );
+        // The user picks another index: its read (identity 2) answers and the stream's load for
+        // the new scope (identity 2) replaces the first one.
+        drive(&mut harness, &mut pane, |widget, cx| {
+            widget.select_indices(vec![selected("SPX")], cx)
+        });
+        deliver_manifest(
+            &mut harness,
+            &mut pane,
+            RequestId::new(2),
+            manifest_answer(&[selected("SPX")]),
+        );
+
+        deliver_stream(
+            &mut harness,
+            &mut pane,
+            RequestId::new(1),
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(1),
+            }),
+        );
+
+        assert!(
+            !pane.status.is_failed(harness.app()),
+            "a replaced command's refusal is not the current command's"
+        );
+        assert_eq!(
+            pane.widget.stream_pending.dropped(),
+            1,
+            "the late refusal was dropped and counted"
+        );
+
+        deliver_stream(
+            &mut harness,
+            &mut pane,
+            RequestId::new(2),
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(2),
+            }),
+        );
+
+        assert!(
+            pane.status.is_failed(harness.app()),
+            "the command in flight reports its own failure"
+        );
+    }
+
     // ----------------------------------------------------------------- header
 
     #[test]
@@ -3663,6 +4270,48 @@ mod tests {
         );
     }
 
+    /// A disabled control only paints its state; its handler still runs when the action is
+    /// dispatched. The entry has to refuse the request, not trust the disabled bit.
+    #[test]
+    fn a_signed_out_pane_should_not_open_the_selector_from_its_header() {
+        let mut harness = test_support::harness();
+        let mut pane = signed_out_pane(&mut harness, FakeSource::default());
+        settle_frames(&mut harness, &mut pane);
+        build_body(&mut harness, &mut pane);
+        build_header(&mut harness, &mut pane);
+        let (node, action) = {
+            let control = pane
+                .widget
+                .header_left
+                .as_ref()
+                .expect("the left group is built");
+            (
+                control.choose.node().expect("the control is a node"),
+                control
+                    .choose
+                    .action_identity()
+                    .expect("the control registers an action"),
+            )
+        };
+
+        let window = harness.window();
+        harness.app_mut().dispatch_action(
+            window,
+            node,
+            action,
+            ui_core::event::ActionSource::Click {
+                click_count: 1,
+                button: ui_core::event::PointerButton::Primary,
+            },
+        );
+        settle_frames(&mut harness, &mut pane);
+
+        assert!(
+            pane.widget.selector.is_none(),
+            "a pane with no account has nothing to choose from, so the request is refused"
+        );
+    }
+
     #[test]
     fn choosing_should_open_the_selector() {
         let source = FakeSource::with_session(4);
@@ -3693,6 +4342,8 @@ mod tests {
         let mut harness = test_support::harness();
         let mut pane = pane(&mut harness, source.clone(), config(&[selected("HSI")]));
         follow(&mut harness, &mut pane, &source);
+        // The catalogue carries the confirmed index, so the pane settles on it.
+        source.set_manifest(manifest_carrying(&[selected("SPX")]));
         let _next = source.subscribe();
 
         let confirmed = pane.widget.confirmed;
@@ -3834,6 +4485,20 @@ mod tests {
         build_body(&mut harness, &mut pane);
         build_header(&mut harness, &mut pane);
         let live_before = harness.node_count();
+        let choose_action = pane
+            .widget
+            .header_left
+            .as_ref()
+            .and_then(|control| control.choose.action_identity())
+            .expect("the choose control registers an action");
+        let mode_action = pane
+            .widget
+            .header_right
+            .as_ref()
+            .and_then(|right| right.table.button.action_identity())
+            .expect("the table half registers an action");
+        assert!(harness.app().has_action_handler(&choose_action));
+        assert!(harness.app().has_action_handler(&mode_action));
 
         drive(&mut harness, &mut pane, |widget, cx| widget.release(cx));
 
@@ -3846,8 +4511,28 @@ mod tests {
         assert!(pane.widget.header_left.is_none());
         assert!(pane.widget.header_right.is_none());
         assert!(pane.widget.flash_timer.is_none());
-        assert!(harness.node_count() <= live_before);
-        assert_eq!(harness.frame_requests(), harness.frame_requests());
+        assert!(pane.widget.selector.is_none());
+        assert!(
+            !harness.app().has_action_handler(&choose_action),
+            "the released pane left its header handler behind"
+        );
+        assert!(!harness.app().has_action_handler(&mode_action));
+        assert!(harness.layer().is_empty(harness.window()));
+        assert!(
+            harness.node_count() < live_before,
+            "the content the pane built is removed"
+        );
+
+        // The release's own frame first: what follows is only a lingering wakeup, and a pane
+        // that is gone may not ask for one.
+        harness.drain();
+        let requests = harness.frame_requests();
+        harness.drain();
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "a released pane asks for no further frame"
+        );
     }
 
     #[test]

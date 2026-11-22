@@ -16,7 +16,6 @@ network = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 # Workspace members

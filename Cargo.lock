@@ -3031,7 +3031,6 @@ dependencies = [
  "serde_json",
  "smol_str",
  "thiserror 2.0.21",
- "time",
  "tokio",
  "ui_core",
  "widget",
