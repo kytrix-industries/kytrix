@@ -27,9 +27,17 @@
 
 use std::{ops::Range, sync::OnceLock};
 
-use gpui_kit::{FillOptions, FillRule, PathBuilder, PathStyle, point, px};
+use lyon::{
+    math::point,
+    path::Path,
+    tessellation::{
+        BuffersBuilder, FillOptions, FillRule, FillTessellator, FillVertex, VertexBuffers,
+    },
+};
 
-use crate::model::{self, CellSpan, GRID_COLS, GRID_ROWS, LAND_TIERS};
+#[cfg(test)]
+use crate::model::CellSpan;
+use crate::model::{self, GRID_COLS, GRID_ROWS, LAND_TIERS};
 
 /// The packaged base map: KHL2, four land tiers and two line sections.
 ///
@@ -159,9 +167,9 @@ pub(super) enum SceneError {
     NonFiniteCoordinate,
     /// lyon rejected the geometry.
     ///
-    /// Its error is an untyped `anyhow::Error`, and the rings have already been
-    /// validated by the time it runs, so this is a fail-safe rather than a
-    /// diagnosis.
+    /// Its error enumerates three unrelated failures — an unsupported option, a geometry
+    /// builder's rejection, or an internal one — and the rings have already been validated
+    /// by the time it runs, so this is a fail-safe rather than a diagnosis.
     #[error("map asset could not be tessellated")]
     Tessellation,
 }
@@ -290,6 +298,11 @@ impl LandLayer {
     /// `cells` is the viewport's cells grown by one, which is what covers the triangles
     /// bucketed by centroid; [`Self::wide`] is tested against the viewport itself. Each
     /// triangle is yielded at most once, so the caller can draw the path directly.
+    ///
+    /// Test-only: a frame selects the same triangles by index range
+    /// ([`crate::paint::visible_land_ranges`]) because the registered mesh cannot skip
+    /// vertices, and the scene's own tests are what pin the culling rule.
+    #[cfg(test)]
     pub(super) fn visible(
         &self,
         cells: CellSpan,
@@ -320,7 +333,7 @@ impl LandLayer {
         let options = FillOptions::default()
             .with_fill_rule(FillRule::EvenOdd)
             .with_tolerance(TESSELLATION_TOLERANCE);
-        let mut builder = PathBuilder::fill().with_style(PathStyle::Fill(options));
+        let mut builder = Path::builder();
         let point_count = section.points.len() / POINT_LEN;
 
         for piece in section.pieces.as_chunks::<PIECE_LEN>().0 {
@@ -339,9 +352,9 @@ impl LandLayer {
                 if !x.is_finite() || !y.is_finite() {
                     return Err(SceneError::NonFiniteCoordinate);
                 }
-                let at = point(px(x), px(y));
+                let at = point(x, y);
                 if index == start {
-                    builder.move_to(at);
+                    builder.begin(at);
                 } else {
                     builder.line_to(at);
                 }
@@ -349,17 +362,23 @@ impl LandLayer {
             builder.close();
         }
 
-        let path = builder.build().map_err(|_| SceneError::Tessellation)?;
-        let mut triangles = Vec::with_capacity(path.vertices.len() / 3);
-        for vertices in path.vertices.as_chunks::<3>().0 {
-            triangles.push([
-                f32::from(vertices[0].xy_position.x),
-                f32::from(vertices[0].xy_position.y),
-                f32::from(vertices[1].xy_position.x),
-                f32::from(vertices[1].xy_position.y),
-                f32::from(vertices[2].xy_position.x),
-                f32::from(vertices[2].xy_position.y),
-            ]);
+        let path: Path = builder.build();
+        let mut geometry: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+        let mut tessellator = FillTessellator::new();
+        tessellator
+            .tessellate_path(
+                &path,
+                &options,
+                &mut BuffersBuilder::new(&mut geometry, |vertex: FillVertex<'_>| {
+                    vertex.position().to_array()
+                }),
+            )
+            .map_err(|_| SceneError::Tessellation)?;
+
+        let mut triangles = Vec::with_capacity(geometry.indices.len() / 3);
+        for indices in geometry.indices.as_chunks::<3>().0 {
+            let [first, second, third] = indices.map(|index| geometry.vertices[index as usize]);
+            triangles.push([first[0], first[1], second[0], second[1], third[0], third[1]]);
         }
         if triangles.is_empty() {
             return Err(SceneError::Empty);

@@ -122,6 +122,10 @@ libc = "0.2.191"
 llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
+# W6：`global_shipping_chokepoint` 的海岸线资产要在装载期三角化（偶奇填充、带洞）。
+# lyon 已在 `Cargo.lock`（gpui-kit 的传递依赖 1.0.19），这里只把它提为直接依赖，
+# 不引入新 crate；引擎与 base_ui 都不做 tessellation（设计 §5.5）。
+lyon = "1.0.19"
 # P13 图片色彩管理（D-8）：image 0.25.10 的**非可选**依赖（`Cargo.lock` 已在 0.8.1），
 # 这里只是把它提到直接依赖；不引入新的编译单元。
 moxcms = "0.8.1"

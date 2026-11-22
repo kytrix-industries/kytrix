@@ -27,7 +27,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use gpui_kit::{App, SharedString};
+use i18n::{t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
     engine::{ErrorCode, KytrixAccountSession, KytrixServiceError},
@@ -38,7 +38,7 @@ use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::time::Instant;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     runtime::{ServiceContext, WidgetService},
     stream::StreamPublisher,
@@ -92,16 +92,19 @@ pub(super) enum AisStreamError {
     Transport(#[from] TransportError),
 }
 
-impl LocalizedError for AisStreamError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for AisStreamError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
             // An account without AIS access is a refusal about the subscription, not a
             // connection failure that asking again would fix, so it is named as itself.
             Self::Service(KytrixServiceError::Server(ErrorCode::EntitlementRequired)) => {
-                i18n::t!(cx, "widget.global_shipping_chokepoint.entitlement_required")
+                t_smol!(
+                    translate,
+                    "widget.global_shipping_chokepoint.entitlement_required"
+                )
             }
-            Self::Service(error) => error.localized_message(cx),
-            Self::Transport(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Transport(error) => error.translated_message(translate),
         }
     }
 }

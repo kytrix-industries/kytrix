@@ -20,8 +20,10 @@
 //! paper land and the pale sea, and the dark values are light enough to read on the night
 //! basemap. Every type has one colour in each appearance and no two types share one.
 
-use base_ui::style::palette::Appearance;
-use gpui_kit::{Hsla, hsla};
+use std::sync::OnceLock;
+
+use base_ui::theme::appearance::Appearance;
+use ui_core::paint::color::Color;
 
 /// Every ship type the map distinguishes, in the order the legend lists them.
 pub(super) const SHIP_TYPES: [ShipType; 20] = [
@@ -256,68 +258,102 @@ const LABEL_KEYS: [&str; SHIP_TYPE_COUNT] = [
     "widget.global_shipping_chokepoint.ship_type.unknown",
 ];
 
-/// One authored colour, with the hue in degrees.
-const fn colour(hue: f32, saturation: f32, lightness: f32) -> Hsla {
-    hsla(hue / 360.0, saturation, lightness, 1.0)
+/// Converts one authored colour into the engine's sRGB.
+///
+/// The formula is the standard CSS `hsl()` one. The hue picks one of six sixty-degree
+/// sectors: `chroma` is how far that sector's full channel sits from the grey of equal
+/// lightness, `second` is the part of it that bleeds into the sector's other channel, and
+/// `base` is the grey itself. The hue is an angle, so it is reduced modulo a full turn before
+/// it picks a sector; saturation and lightness are `0..=1` and the result is opaque.
+fn colour(hue_degrees: f32, saturation: f32, lightness: f32) -> Color {
+    let hue = hue_degrees.rem_euclid(360.0) / 60.0;
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let second = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+    let (red, green, blue) = match hue as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = lightness - chroma / 2.0;
+    Color::srgb(red + base, green + base, blue + base, 1.0)
 }
 
-/// The colours the light appearance draws each type in, in [`SHIP_TYPES`] order.
+/// Resolves the authored triples of one appearance into the colours the canvas draws with.
+///
+/// The triples stay authored numbers because turning them into sRGB is `f32` arithmetic, which
+/// a `const` cannot run; a palette is resolved once and then read for the life of the process.
+fn palette(hsl: &[(f32, f32, f32); SHIP_TYPE_COUNT]) -> [Color; SHIP_TYPE_COUNT] {
+    hsl.map(|(hue, saturation, lightness)| colour(hue, saturation, lightness))
+}
+
+/// The hue, saturation and lightness the light appearance draws each type in, in
+/// [`SHIP_TYPES`] order.
 ///
 /// The values are dark enough to stay legible on both the paper land and the pale sea.
-static LIGHT: [Hsla; SHIP_TYPE_COUNT] = [
-    colour(30.0, 0.82, 0.40),  // Tanker: amber
-    colour(215.0, 0.70, 0.40), // Cargo: blue
-    colour(275.0, 0.62, 0.42), // Passenger: violet
-    colour(140.0, 0.68, 0.36), // Fishing: green
-    colour(0.0, 0.72, 0.40),   // Towing: red
-    colour(50.0, 0.78, 0.32),  // Dredging: yellow
-    colour(350.0, 0.55, 0.32), // Military: dark red
-    colour(190.0, 0.68, 0.38), // Sailing: cyan
-    colour(320.0, 0.72, 0.40), // Pleasure: magenta
-    colour(85.0, 0.78, 0.34),  // High-speed: yellow-green
-    colour(240.0, 0.65, 0.42), // Pilot: blue-violet
-    colour(15.0, 0.78, 0.40),  // Search and rescue: red-orange
-    colour(170.0, 0.55, 0.36), // Port tender: teal
-    colour(100.0, 0.58, 0.38), // Anti-pollution: green-yellow
-    colour(225.0, 0.60, 0.32), // Law enforcement: dark blue
-    colour(335.0, 0.55, 0.44), // Medical: pink
-    colour(260.0, 0.35, 0.40), // Noncombatant: muted purple
-    colour(120.0, 0.48, 0.42), // Wing in ground: light green
-    colour(30.0, 0.18, 0.36),  // Other: brown-grey
-    colour(0.0, 0.00, 0.44),   // Unknown: mid grey
+const LIGHT_HSL: [(f32, f32, f32); SHIP_TYPE_COUNT] = [
+    (30.0, 0.82, 0.40),  // Tanker: amber
+    (215.0, 0.70, 0.40), // Cargo: blue
+    (275.0, 0.62, 0.42), // Passenger: violet
+    (140.0, 0.68, 0.36), // Fishing: green
+    (0.0, 0.72, 0.40),   // Towing: red
+    (50.0, 0.78, 0.32),  // Dredging: yellow
+    (350.0, 0.55, 0.32), // Military: dark red
+    (190.0, 0.68, 0.38), // Sailing: cyan
+    (320.0, 0.72, 0.40), // Pleasure: magenta
+    (85.0, 0.78, 0.34),  // High-speed: yellow-green
+    (240.0, 0.65, 0.42), // Pilot: blue-violet
+    (15.0, 0.78, 0.40),  // Search and rescue: red-orange
+    (170.0, 0.55, 0.36), // Port tender: teal
+    (100.0, 0.58, 0.38), // Anti-pollution: green-yellow
+    (225.0, 0.60, 0.32), // Law enforcement: dark blue
+    (335.0, 0.55, 0.44), // Medical: pink
+    (260.0, 0.35, 0.40), // Noncombatant: muted purple
+    (120.0, 0.48, 0.42), // Wing in ground: light green
+    (30.0, 0.18, 0.36),  // Other: brown-grey
+    (0.0, 0.00, 0.44),   // Unknown: mid grey
 ];
 
-/// The colours the dark appearance draws each type in, in [`SHIP_TYPES`] order.
+/// [`LIGHT_HSL`] resolved to engine colours, on first use.
+static LIGHT: OnceLock<[Color; SHIP_TYPE_COUNT]> = OnceLock::new();
+
+/// The hue, saturation and lightness the dark appearance draws each type in, in
+/// [`SHIP_TYPES`] order.
 ///
 /// The values are light enough to stay legible on the near-black sea and the dark land.
-static DARK: [Hsla; SHIP_TYPE_COUNT] = [
-    colour(30.0, 0.78, 0.76),
-    colour(215.0, 0.66, 0.70),
-    colour(275.0, 0.58, 0.78),
-    colour(140.0, 0.64, 0.66),
-    colour(0.0, 0.68, 0.74),
-    colour(50.0, 0.74, 0.78),
-    colour(350.0, 0.52, 0.62),
-    colour(190.0, 0.64, 0.70),
-    colour(320.0, 0.68, 0.76),
-    colour(85.0, 0.74, 0.72),
-    colour(240.0, 0.61, 0.78),
-    colour(15.0, 0.74, 0.76),
-    colour(170.0, 0.52, 0.68),
-    colour(100.0, 0.54, 0.70),
-    colour(225.0, 0.56, 0.62),
-    colour(335.0, 0.51, 0.80),
-    colour(260.0, 0.32, 0.74),
-    colour(120.0, 0.44, 0.76),
-    colour(30.0, 0.15, 0.66),
-    colour(0.0, 0.00, 0.82),
+const DARK_HSL: [(f32, f32, f32); SHIP_TYPE_COUNT] = [
+    (30.0, 0.78, 0.76),
+    (215.0, 0.66, 0.70),
+    (275.0, 0.58, 0.78),
+    (140.0, 0.64, 0.66),
+    (0.0, 0.68, 0.74),
+    (50.0, 0.74, 0.78),
+    (350.0, 0.52, 0.62),
+    (190.0, 0.64, 0.70),
+    (320.0, 0.68, 0.76),
+    (85.0, 0.74, 0.72),
+    (240.0, 0.61, 0.78),
+    (15.0, 0.74, 0.76),
+    (170.0, 0.52, 0.68),
+    (100.0, 0.54, 0.70),
+    (225.0, 0.56, 0.62),
+    (335.0, 0.51, 0.80),
+    (260.0, 0.32, 0.74),
+    (120.0, 0.44, 0.76),
+    (30.0, 0.15, 0.66),
+    (0.0, 0.00, 0.82),
 ];
 
+/// [`DARK_HSL`] resolved to engine colours, on first use.
+static DARK: OnceLock<[Color; SHIP_TYPE_COUNT]> = OnceLock::new();
+
 /// The palette one appearance draws the ship types with.
-pub(super) fn colours(appearance: Appearance) -> &'static [Hsla; SHIP_TYPE_COUNT] {
+pub(super) fn colours(appearance: Appearance) -> &'static [Color; SHIP_TYPE_COUNT] {
     match appearance {
-        Appearance::Light => &LIGHT,
-        Appearance::Dark => &DARK,
+        Appearance::Light => LIGHT.get_or_init(|| palette(&LIGHT_HSL)),
+        Appearance::Dark => DARK.get_or_init(|| palette(&DARK_HSL)),
     }
 }
 
@@ -379,7 +415,7 @@ mod tests {
 
     #[test]
     fn every_type_should_have_a_colour_of_its_own_in_each_appearance() {
-        for palette in [&LIGHT, &DARK] {
+        for palette in [colours(Appearance::Light), colours(Appearance::Dark)] {
             for (first, first_colour) in palette.iter().enumerate() {
                 for (second, second_colour) in palette.iter().enumerate().skip(first + 1) {
                     assert_ne!(
@@ -393,7 +429,9 @@ mod tests {
 
     #[test]
     fn the_two_appearances_should_draw_different_colours() {
-        for (index, (light, dark)) in LIGHT.iter().zip(&DARK).enumerate() {
+        let light_palette = colours(Appearance::Light);
+        let dark_palette = colours(Appearance::Dark);
+        for (index, (light, dark)) in light_palette.iter().zip(dark_palette).enumerate() {
             assert_ne!(
                 light, dark,
                 "type {index} draws one colour in both appearances"
