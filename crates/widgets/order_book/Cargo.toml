@@ -5,7 +5,6 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
-ahash = { workspace = true }
 app_config = { workspace = true }
 base_ui = { workspace = true }
 futures = { workspace = true }

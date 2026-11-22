@@ -45,8 +45,12 @@ use market_participants_model::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    event::Action,
-    node::{builder::NodeBuilder, id::NodeId},
+    event::{Action, ActionSource},
+    node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
+    paint::{
+        canvas::Canvas,
+        primitive::{ClipOp, Primitive, Quad, QuadPaint},
+    },
 };
 use widget::{
     category::WidgetCategory,
@@ -564,6 +568,92 @@ fn leaf(harness: &mut WidgetTestApp, id: &'static str, size: (f32, f32)) -> Node
     })
 }
 
+// ------------------------------------------------------------------- canvas reads
+
+/// The canvas node one `TEST_*` selector draws into.
+///
+/// The lookups elsewhere use the debug-id *prefix*, which is not enough here: the
+/// imbalance row's own id (`TEST_ORDER_BOOK_IMBALANCE_ROW`) is a prefix match for
+/// the canvas inside it. The debug id has to be exact.
+fn canvas_node(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> NodeId {
+    let tree = harness.tree();
+    let mut stack = vec![parent];
+    let mut seen = Vec::new();
+    while let Some(current) = stack.pop() {
+        if let Some(id) = tree.debug_id(current) {
+            if id == selector {
+                return current;
+            }
+            seen.push(id.to_owned());
+        }
+        stack.extend(
+            tree.get(current)
+                .expect("the node is alive")
+                .children()
+                .iter()
+                .rev()
+                .copied(),
+        );
+    }
+    panic!("`{selector}` is not drawn; debug ids: {seen:?}");
+}
+
+/// One canvas node's content, as `set_canvas` last wrote it.
+fn canvas_of(harness: &WidgetTestApp, node: NodeId) -> &Canvas {
+    match harness
+        .tree()
+        .get(node)
+        .expect("the canvas node is alive")
+        .kind()
+    {
+        NodeKind::Canvas(canvas) => canvas,
+        _ => panic!("`{node:?}` is not a canvas node"),
+    }
+}
+
+/// One canvas node's shared frame; every `set_canvas` replaces it with a new one.
+fn canvas_arc(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Arc<Canvas> {
+    let node = canvas_node(harness, parent, selector);
+    match harness
+        .tree()
+        .get(node)
+        .expect("the canvas node is alive")
+        .kind()
+    {
+        NodeKind::Canvas(canvas) => Arc::clone(canvas),
+        _ => panic!("`{selector}` is not a canvas node"),
+    }
+}
+
+/// The solid quads one canvas draws, in paint order.
+fn canvas_quads(canvas: &Canvas) -> Vec<Quad> {
+    canvas
+        .primitives()
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::Quad(quad) => Some(quad.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The width of every depth bar drawn on one canvas.
+fn canvas_bar_widths(harness: &WidgetTestApp, parent: NodeId, selector: &str) -> Vec<f32> {
+    canvas_quads(canvas_of(harness, canvas_node(harness, parent, selector)))
+        .into_iter()
+        .map(|quad| quad.bounds.size.width)
+        .collect()
+}
+
+/// Whether the pane's depth-easing timer chain still has a tick to run.
+fn depth_is_ticking(fixture: &Fixture) -> bool {
+    fixture
+        .widget
+        .depth_ticker
+        .as_ref()
+        .is_some_and(|state| state.ticking.get())
+}
+
 #[test]
 fn a_widget_without_a_book_should_report_connecting_and_have_no_content() {
     let fixture = pane(true);
@@ -581,9 +671,22 @@ fn a_widget_without_a_book_should_report_connecting_and_have_no_content() {
 fn an_unloaded_market_should_leave_the_pane_waiting() {
     let fixture = pane(false);
 
+    assert_eq!(
+        fixture.status(),
+        WidgetState::waiting(Notice::MarketNotLoaded {
+            venues: vec![route().venue],
+            supported: market_venues(),
+        }),
+        "the notice names the market the book is waiting for and every market it can read"
+    );
     assert!(
-        matches!(fixture.status(), WidgetState::Waiting(_)),
-        "a market that was never loaded is a wait, not a failure"
+        !fixture.status().is_failed(),
+        "an unloaded market is a wait, not a failure"
+    );
+    assert_eq!(
+        fixture.widget.config.selection,
+        Some(selection("BTC")),
+        "the choice the user stored is left alone while the pane waits"
     );
     assert!(!fixture.widget.has_content());
 }
@@ -614,6 +717,10 @@ fn a_widget_without_a_selection_should_ask_for_one() {
         WidgetState::waiting(Notice::message(
             "widget.order_book.select_instrument_prompt"
         ))
+    );
+    assert!(
+        fixture.widget.current_key().is_none(),
+        "a book that follows nothing has nothing to stream"
     );
     assert!(!fixture.widget.has_content());
 }
@@ -810,11 +917,35 @@ fn a_book_the_stream_has_overtaken_should_not_roll_the_ladder_back() {
 fn a_ready_status_that_overtakes_its_book_should_wait_for_it() {
     let mut fixture = pane(true);
     fixture.apply_reliable(OrderBookStatus::Ready {
-        revision: MarketSequence::Numeric(5),
+        revision: MarketSequence::Numeric(3),
     });
 
     assert_eq!(fixture.status(), WidgetState::Loading);
     assert!(!fixture.widget.has_content());
+
+    // A book older than the revision the status named is not the book that was
+    // promised: the pane is still working, and only the content moves.
+    fixture.apply_latest(snapshot(2, &[("101", "1")], &[("100", "1")]));
+    assert_eq!(
+        fixture.status(),
+        WidgetState::Loading,
+        "a book older than the status named is not the book that was promised"
+    );
+    assert_eq!(
+        fixture
+            .widget
+            .snapshot
+            .as_ref()
+            .map(|book| book.sequence.clone()),
+        Some(MarketSequence::Numeric(2))
+    );
+
+    fixture.apply_latest(snapshot(3, &[("102", "1")], &[("99", "1")]));
+    assert_eq!(
+        fixture.status(),
+        WidgetState::Ready,
+        "the book that reaches the ready revision is the one that was promised"
+    );
 }
 
 #[test]
@@ -909,7 +1040,15 @@ fn a_retry_after_a_failure_should_keep_the_ladder() {
 #[test]
 fn a_directory_generation_change_should_reload_the_book() {
     let mut fixture = pane(true);
+    let reduce_motion = fixture.harness.services().reduce_motion;
+    fixture.harness.app_mut().write(&reduce_motion, true);
     fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
+    fixture.draw();
+    let sequence = fixture
+        .widget
+        .snapshot
+        .as_ref()
+        .map(|book| book.sequence.clone());
     let generation = fixture.harness.services().catalog_generation;
     let next = *fixture.app().read(&generation) + 1;
     assert!(fixture.harness.app_mut().write(&generation, next));
@@ -919,7 +1058,25 @@ fn a_directory_generation_change_should_reload_the_book() {
     assert_eq!(
         fixture.status(),
         WidgetState::Connecting,
-        "the changed generation starts the book over"
+        "the changed generation replaces the subscription the book was reading through"
+    );
+    assert!(
+        fixture.widget.has_content(),
+        "a directory refresh keeps the ladder the user is reading (AGENTS §8.3)"
+    );
+    assert_eq!(
+        fixture
+            .widget
+            .snapshot
+            .as_ref()
+            .map(|book| book.sequence.clone()),
+        sequence,
+        "the book on screen is only replaced by the generation that supersedes it"
+    );
+    assert_eq!(
+        fixture.row_text(RowSide::Ask, 0, 0),
+        "101",
+        "the rows stay drawn while the new stream opens"
     );
     assert_eq!(fixture.widget.seen_generation, next);
     assert_eq!(fixture.widget.config.price_multiplier, 1);
@@ -1351,45 +1508,96 @@ fn an_imperceptible_movement_should_not_start_an_animation() {
 }
 
 #[test]
-fn the_depth_animation_should_advance_on_a_tick_and_stop_when_it_arrives() {
+fn the_depth_animation_should_ease_the_bars_on_the_canvas_tick_by_tick() {
     let mut fixture = pane(true);
-    fixture.body();
-    fixture.drain();
-    fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
-    fixture.accept(snapshot(2, &[("101", "4")], &[("100", "4")]));
-    let ticking = || {
-        fixture
-            .widget
-            .depth_ticker
-            .as_ref()
-            .is_some_and(|state| state.ticking.get())
-    };
-    assert!(ticking(), "the movement started a timer");
-    let start = *fixture.harness.app().read(&fixture.widget.depth_progress);
-    assert_eq!(start, 0.0);
+    let reduce_motion = fixture.harness.services().reduce_motion;
+    // The first book arrives settled, so the movement this test watches is the second.
+    fixture.harness.app_mut().write(&reduce_motion, true);
+    fixture.accept(snapshot(1, &[("101", "1"), ("102", "3")], &[("100", "2")]));
+    fixture.draw();
+    let settled = canvas_bar_widths(&fixture.harness, fixture.page, ASK_BARS_SELECTOR);
+    assert_eq!(settled.len(), 2, "one bar per visible ask level");
+    let row_width = settled[1];
+    assert!(
+        (settled[0] / row_width - 0.25).abs() < 0.01,
+        "the best ask carries a quarter of the visible depth: {settled:?}"
+    );
+    fixture.harness.app_mut().write(&reduce_motion, false);
 
-    let mut ticks = 0;
-    while ticking() && ticks < 200 {
+    // The second book moves the best ask from a quarter to three quarters of the
+    // visible depth. The chain restarts from the frame already painted.
+    fixture.accept(snapshot(2, &[("101", "3"), ("102", "1")], &[("100", "2")]));
+    fixture.sync();
+    // The sync that publishes the new book asked for a frame; let it commit so the
+    // wait below measures the tick chain only.
+    fixture.drain();
+    assert!(depth_is_ticking(&fixture), "the movement started a timer");
+    let progress = fixture.widget.depth_progress;
+    assert_eq!(*fixture.harness.app().read(&progress), 0.0);
+    assert_eq!(
+        canvas_bar_widths(&fixture.harness, fixture.page, ASK_BARS_SELECTOR),
+        settled,
+        "the bars start from where the frame before painted them"
+    );
+
+    // One tick is 16 ms of engine time: nothing moves before it is due ...
+    fixture.harness.advance(Duration::from_millis(15));
+    assert_eq!(
+        *fixture.harness.app().read(&progress),
+        0.0,
+        "a partial tick moves the easing by nothing"
+    );
+    assert_eq!(
+        canvas_bar_widths(&fixture.harness, fixture.page, ASK_BARS_SELECTOR),
+        settled,
+        "a partial tick writes no canvas"
+    );
+    // ... and the due tick asks for the frame that draws the eased bars.
+    let before = fixture.harness.frame_requests();
+    fixture.harness.advance(Duration::from_millis(1));
+    assert!(
+        fixture.harness.frame_requests() > before,
+        "the due tick requests the frame that draws the bars at the new progress"
+    );
+    let eased = *fixture.harness.app().read(&progress);
+    assert!(
+        eased > 0.0 && eased < 1.0,
+        "one 16 ms tick is one step of the easing: {eased}"
+    );
+    fixture.sync();
+    fixture.drain();
+    let moved = canvas_bar_widths(&fixture.harness, fixture.page, ASK_BARS_SELECTOR);
+    assert!(
+        moved[0] > settled[0] && moved[0] < 0.75 * row_width,
+        "the canvas follows the eased progress: {moved:?}"
+    );
+
+    // The chain runs to the ratio the new book asks for and stops there.
+    let mut ticks = 1;
+    while depth_is_ticking(&fixture) && ticks < 200 {
         fixture.harness.advance(DEPTH_ANIMATION_TICK);
         ticks += 1;
     }
-
+    fixture.sync();
+    fixture.drain();
     assert!(
-        ticks > 0 && ticks < 200,
+        ticks > 1 && ticks < 200,
         "the chain settled after {ticks} ticks"
     );
-    assert_eq!(
-        *fixture.harness.app().read(&fixture.widget.depth_progress),
-        1.0
+    assert_eq!(*fixture.harness.app().read(&progress), 1.0);
+    let arrived = canvas_bar_widths(&fixture.harness, fixture.page, ASK_BARS_SELECTOR);
+    assert!(
+        (arrived[0] / row_width - 0.75).abs() < 0.01,
+        "the bars arrive where the new book puts them: {arrived:?}"
     );
     assert!(
         !depth_is_active(1.0, *fixture.harness.app().read(&fixture.widget.depth_span)),
         "a settled movement asks for no more frames"
     );
 
-    let settled = fixture.harness.frame_requests();
+    let settled_requests = fixture.harness.frame_requests();
     fixture.harness.advance(Duration::from_millis(100));
-    assert_eq!(fixture.harness.frame_requests(), settled);
+    assert_eq!(fixture.harness.frame_requests(), settled_requests);
 }
 
 #[test]
@@ -1418,8 +1626,8 @@ fn the_mid_price_should_take_the_direction_it_moved_in() {
 
 // ------------------------------------------------------------------------ body
 
-/// A book that has not moved draws no frame: the rows, the bars and the lists all
-/// write only what changed (I3).
+/// A book that has not moved draws no frame and writes no canvas: the rows, the
+/// bars and the lists all write only what changed (I3).
 #[test]
 fn a_steady_book_should_not_ask_for_a_frame() {
     let mut fixture = pane(true);
@@ -1428,6 +1636,12 @@ fn a_steady_book_should_not_ask_for_a_frame() {
     fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
     fixture.draw();
     let requests = fixture.harness.frame_requests();
+    let selectors = [
+        ASK_BARS_SELECTOR,
+        BID_BARS_SELECTOR,
+        crate::paint::IMBALANCE_SELECTOR,
+    ];
+    let canvases = selectors.map(|selector| canvas_arc(&fixture.harness, fixture.page, selector));
 
     fixture.frame();
     fixture.frame();
@@ -1437,6 +1651,13 @@ fn a_steady_book_should_not_ask_for_a_frame() {
         requests,
         "a steady ladder writes nothing and schedules no frame"
     );
+    for (selector, before) in selectors.into_iter().zip(&canvases) {
+        let after = canvas_arc(&fixture.harness, fixture.page, selector);
+        assert!(
+            Arc::ptr_eq(before, &after),
+            "a steady frame writes no canvas: `{selector}` keeps the frame it drew"
+        );
+    }
 }
 
 #[test]
@@ -1474,6 +1695,117 @@ fn the_body_should_draw_the_ladder_it_was_given() {
     }
     assert!(fixture.widget.ask_list.is_some());
     assert!(fixture.widget.bid_list.is_some());
+}
+
+/// The bars are what the pane draws itself, so the frame content has to be
+/// asserted on the canvases: one solid quad per visible level, at the level's
+/// share of the side's depth, anchored to the row's right edge, in the themed
+/// side colour — and the imbalance split in the same two colours.
+#[test]
+fn the_depth_bars_should_be_drawn_on_the_canvases_it_owns() {
+    let mut fixture = pane(true);
+    let reduce_motion = fixture.harness.services().reduce_motion;
+    fixture.harness.app_mut().write(&reduce_motion, true);
+    fixture.accept(snapshot(1, &[("101", "1"), ("102", "3")], &[("100", "2")]));
+    fixture.draw();
+
+    let theme = fixture.widget.theme.clone();
+    let appearance = theme.current(fixture.harness.app());
+    let resolved = theme.theme_for(appearance);
+    let ask_color = resolved.role(RowSide::Ask.depth_role());
+    let bid_color = resolved.role(RowSide::Bid.depth_role());
+
+    // The ask side: the clip it installs, then one solid quad per visible level.
+    let ask_node = canvas_node(&fixture.harness, fixture.page, ASK_BARS_SELECTOR);
+    let ask_canvas = canvas_of(&fixture.harness, ask_node);
+    assert!(
+        matches!(
+            ask_canvas.primitives().first(),
+            Some(Primitive::Clip(ClipOp::Push(_)))
+        ),
+        "the bars are clipped to the ladder area"
+    );
+    assert!(matches!(
+        ask_canvas.primitives().last(),
+        Some(Primitive::Clip(ClipOp::Pop))
+    ));
+    let ask_bounds = ask_canvas.bounds();
+    let ask_right = ask_bounds.origin.x + ask_bounds.size.width;
+    let ask_quads = canvas_quads(ask_canvas);
+    assert_eq!(ask_quads.len(), 2, "one quad per visible ask level");
+    for (index, quad) in ask_quads.iter().enumerate() {
+        assert_eq!(
+            quad.paint,
+            QuadPaint::Solid {
+                fill: ask_color,
+                border: None
+            },
+            "ask bar {index} is painted in the ask depth colour"
+        );
+        assert_eq!(quad.corner_radius, [0.0; 4]);
+        assert!(
+            (quad.bounds.origin.x + quad.bounds.size.width - ask_right).abs() < 0.01,
+            "ask bar {index} hangs off the row's right edge"
+        );
+    }
+    let ask_ratios = ask_quads
+        .iter()
+        .map(|quad| quad.bounds.size.width / ask_bounds.size.width)
+        .collect::<Vec<_>>();
+    assert!(
+        (ask_ratios[0] - 0.25).abs() < 0.01 && (ask_ratios[1] - 1.0).abs() < 0.01,
+        "each bar is its level's share of the visible ask depth: {ask_ratios:?}"
+    );
+
+    // The bid side is the same drawing in the other role colour.
+    let bid_node = canvas_node(&fixture.harness, fixture.page, BID_BARS_SELECTOR);
+    let bid_canvas = canvas_of(&fixture.harness, bid_node);
+    let bid_quads = canvas_quads(bid_canvas);
+    assert_eq!(bid_quads.len(), 1, "one quad per visible bid level");
+    assert_eq!(
+        bid_quads[0].paint,
+        QuadPaint::Solid {
+            fill: bid_color,
+            border: None
+        }
+    );
+    assert!((bid_quads[0].bounds.size.width / bid_canvas.bounds().size.width - 1.0).abs() < 0.01);
+
+    // The imbalance bar: the ask share from the left, the bid share from the right.
+    let imbalance_node = canvas_node(
+        &fixture.harness,
+        fixture.page,
+        crate::paint::IMBALANCE_SELECTOR,
+    );
+    let imbalance_canvas = canvas_of(&fixture.harness, imbalance_node);
+    let imbalance_quads = canvas_quads(imbalance_canvas);
+    assert_eq!(imbalance_quads.len(), 2);
+    assert_eq!(
+        imbalance_quads[0].paint,
+        QuadPaint::Solid {
+            fill: ask_color,
+            border: None
+        }
+    );
+    assert_eq!(
+        imbalance_quads[1].paint,
+        QuadPaint::Solid {
+            fill: bid_color,
+            border: None
+        }
+    );
+    let imbalance_width = imbalance_canvas.bounds().size.width;
+    assert!(
+        (imbalance_quads[0].bounds.size.width / imbalance_width - 2.0 / 3.0).abs() < 0.01,
+        "the ask share of four asks and two bids is two thirds"
+    );
+    assert!(
+        (imbalance_quads[0].bounds.size.width + imbalance_quads[1].bounds.size.width
+            - imbalance_width)
+            .abs()
+            < 0.01,
+        "the two shares fill the bar"
+    );
 }
 
 #[test]
@@ -1613,13 +1945,240 @@ fn the_header_should_offer_the_instrument_control_and_the_drawing_controls() {
 }
 
 #[test]
+fn a_drawing_choice_should_reach_the_next_sync() {
+    let mut fixture = pane(true);
+    fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
+    fixture.headers();
+    fixture.frame();
+
+    let multiplier = PRICE_MULTIPLIERS[2];
+    let rows = window_sizes(Some(FIXTURE_DEPTH))
+        .iter()
+        .copied()
+        .find(|rows| *rows != fixture.widget.config.window_size)
+        .expect("the ladder offers more than one row limit");
+    let price_step = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are built")
+        .price_step
+        .clone();
+
+    // The picker's own change path: choosing an item notifies the callback the
+    // widget wired, which parses the id and hands the choice to the next sync.
+    price_step.set_chosen(
+        fixture.harness.app_mut(),
+        [format_smolstr!("{multiplier}").as_str()],
+        true,
+    );
+    assert_eq!(
+        *fixture.harness.app().read(&fixture.widget.header_requests),
+        Some(HeaderRequest::PriceStep(multiplier)),
+        "the picker hands its choice over through the same signal the control path uses"
+    );
+    fixture.sync();
+    assert_eq!(
+        fixture.widget.config.price_multiplier, multiplier,
+        "the next sync applies the choice"
+    );
+    assert_eq!(fixture.publishes.get(), 1, "the choice is written back");
+    assert_eq!(
+        fixture
+            .widget
+            .header_right
+            .as_ref()
+            .expect("the pickers are rebuilt")
+            .price_step
+            .chosen(fixture.harness.app()),
+        vec![format_smolstr!("{multiplier}")],
+        "the rebuilt picker shows the choice"
+    );
+
+    let window_size = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are rebuilt")
+        .window_size
+        .clone();
+    window_size.set_chosen(
+        fixture.harness.app_mut(),
+        [format_smolstr!("{rows}").as_str()],
+        true,
+    );
+    assert_eq!(
+        *fixture.harness.app().read(&fixture.widget.header_requests),
+        Some(HeaderRequest::WindowSize(rows))
+    );
+    fixture.sync();
+    assert_eq!(fixture.widget.config.window_size, rows);
+    assert_eq!(fixture.publishes.get(), 2);
+}
+
+#[test]
+fn the_drawing_pickers_should_be_disabled_until_a_book_is_shown() {
+    let mut fixture = pane(true);
+    fixture.headers();
+    let window = fixture.harness.window();
+    assert!(
+        fixture
+            .widget
+            .header_right
+            .as_ref()
+            .expect("the pickers are built")
+            .built
+            .disabled,
+        "a pane without a book has nothing to regroup"
+    );
+    let header = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are built");
+    let action = Action::Custom(format_smolstr!("{}.trigger", header.price_step.key()));
+    let trigger = header
+        .price_step
+        .trigger_node()
+        .expect("the picker trigger is built");
+    assert!(fixture.harness.app_mut().dispatch_action(
+        window,
+        trigger,
+        action.clone(),
+        ActionSource::Programmatic
+    ));
+    assert!(
+        !fixture
+            .widget
+            .header_right
+            .as_ref()
+            .expect("the pickers are built")
+            .price_step
+            .is_open(fixture.harness.app()),
+        "a disabled picker does not open its panel"
+    );
+
+    // A book makes the choices mean something: the picker is rebuilt enabled and
+    // the same trigger action opens it.
+    fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
+    fixture.frame();
+    let header = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are rebuilt");
+    assert!(!header.built.disabled);
+    let trigger = header
+        .price_step
+        .trigger_node()
+        .expect("the rebuilt trigger is built");
+    assert!(fixture.harness.app_mut().dispatch_action(
+        window,
+        trigger,
+        action,
+        ActionSource::Programmatic
+    ));
+    assert!(
+        fixture
+            .widget
+            .header_right
+            .as_ref()
+            .expect("the pickers are rebuilt")
+            .price_step
+            .is_open(fixture.harness.app()),
+        "an enabled picker opens its panel"
+    );
+}
+
+#[test]
+fn the_drawing_pickers_should_be_rebuilt_in_the_language_showing_now() {
+    let mut fixture = pane(true);
+    fixture.accept(snapshot(1, &[("101", "1")], &[("100", "1")]));
+    fixture.headers();
+    fixture.frame();
+    let price_key = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are built")
+        .price_step
+        .key()
+        .to_owned();
+    let english_rows = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are built")
+        .window_size
+        .items()[0]
+        .label
+        .clone();
+
+    fixture.harness.switch_language(LanguageCode::ZhCn);
+    fixture.frame();
+
+    let rebuilt = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the pickers are rebuilt");
+    assert_eq!(
+        rebuilt.price_step.key(),
+        price_key,
+        "the same suffix in the same instance mints the same key after a rebuild"
+    );
+    assert_ne!(
+        rebuilt.window_size.items()[0].label,
+        english_rows,
+        "the picker's copy follows the language showing now"
+    );
+    assert!(
+        fixture
+            .harness
+            .app()
+            .has_action_handler(&Action::Custom(format_smolstr!("{price_key}.trigger"))),
+        "the rebuilt picker registers its handler again"
+    );
+}
+
+#[test]
 fn two_panes_should_not_share_a_single_component_key() {
     let mut fixture = pane(true);
     fixture.headers();
-    let first_key = fixture
-        .harness
-        .with_cx(|cx| cx.unique_key(INSTRUMENT_KEY_SUFFIX));
-    let first_action = Action::Custom(format_smolstr!("{first_key}.click"));
+    let peer_right = leaf(
+        &mut fixture.harness,
+        "TEST_ORDER_BOOK_PEER_HEADER_RIGHT",
+        (320.0, 32.0),
+    );
+    let first_keys = fixture.harness.with_cx(|cx| {
+        [
+            cx.unique_key(INSTRUMENT_KEY_SUFFIX),
+            cx.unique_key(PRICE_STEP_KEY_SUFFIX),
+            cx.unique_key(WINDOW_SIZE_KEY_SUFFIX),
+        ]
+    });
+    let first_actions = [
+        Action::Custom(format_smolstr!("{}.click", first_keys[0])),
+        Action::Custom(format_smolstr!("{}.trigger", first_keys[1])),
+        Action::Custom(format_smolstr!("{}.trigger", first_keys[2])),
+    ];
+    for action in &first_actions {
+        assert!(
+            fixture.harness.app().has_action_handler(action),
+            "the first pane registers every header control: {action:?}"
+        );
+    }
+    let header_right = fixture
+        .widget
+        .header_right
+        .as_ref()
+        .expect("the first pane built its pickers");
+    assert_eq!(
+        header_right.price_step.key(),
+        first_keys[1].as_str(),
+        "the picker records the key the pane's own suffix mints"
+    );
+    assert_eq!(header_right.window_size.key(), first_keys[2].as_str());
     let first_node = fixture
         .widget
         .header_left
@@ -1627,19 +2186,22 @@ fn two_panes_should_not_share_a_single_component_key() {
         .expect("the first pane built its picker")
         .control
         .node();
-    assert!(fixture.harness.app().has_action_handler(&first_action));
 
     // The second pane: one more pane of the same widget over the same directory, with
     // its own signal scope — what `AnyWidget::mount` mints for each pane.
     let right = fixture.right;
-    let (peer, peer_key) = {
+    let (peer, peer_keys) = {
         let services = Rc::clone(fixture.harness.services_rc());
         let window = fixture.harness.window();
         let scope = fixture.harness.app_mut().signal_scope();
         let directory: Rc<dyn MarketDirectory> = Rc::new(fixture.directory.clone());
         let status = WidgetStatus::new(fixture.harness.app_mut(), scope);
         let mut cx = WidgetCx::new(fixture.harness.app_mut(), window, &services, scope);
-        let key = cx.unique_key(INSTRUMENT_KEY_SUFFIX);
+        let keys = [
+            cx.unique_key(INSTRUMENT_KEY_SUFFIX),
+            cx.unique_key(PRICE_STEP_KEY_SUFFIX),
+            cx.unique_key(WINDOW_SIZE_KEY_SUFFIX),
+        ];
         let mut peer = OrderBookWidget::with_source(
             config(Some("ETH")),
             PendingSource,
@@ -1651,9 +2213,15 @@ fn two_panes_should_not_share_a_single_component_key() {
         );
         peer.header(HeaderGroup::Left, right, &mut cx)
             .expect("the second pane's picker builds");
-        (peer, key)
+        peer.header(HeaderGroup::Right, peer_right, &mut cx)
+            .expect("the second pane's pickers build");
+        (peer, keys)
     };
-    let peer_action = Action::Custom(format_smolstr!("{peer_key}.click"));
+    let peer_actions = [
+        Action::Custom(format_smolstr!("{}.click", peer_keys[0])),
+        Action::Custom(format_smolstr!("{}.trigger", peer_keys[1])),
+        Action::Custom(format_smolstr!("{}.trigger", peer_keys[2])),
+    ];
     let peer_node = peer
         .header_left
         .as_ref()
@@ -1661,31 +2229,62 @@ fn two_panes_should_not_share_a_single_component_key() {
         .control
         .node();
 
+    for (suffix, (first, peer)) in [
+        INSTRUMENT_KEY_SUFFIX,
+        PRICE_STEP_KEY_SUFFIX,
+        WINDOW_SIZE_KEY_SUFFIX,
+    ]
+    .into_iter()
+    .zip(first_keys.into_iter().zip(peer_keys))
+    {
+        assert_ne!(
+            first, peer,
+            "each pane mints its own identity for `{suffix}`"
+        );
+    }
+    let peer_header = peer
+        .header_right
+        .as_ref()
+        .expect("the second pane built its pickers");
     assert_ne!(
-        first_key, peer_key,
-        "each pane mints its own component identity"
+        peer_header.price_step.trigger_node(),
+        fixture
+            .widget
+            .header_right
+            .as_ref()
+            .expect("the first pane built its pickers")
+            .price_step
+            .trigger_node(),
+        "each pane builds its own trigger"
     );
     assert_ne!(first_node, peer_node, "and builds its own control");
-    assert!(
-        fixture.harness.app().has_action_handler(&peer_action),
-        "the second pane's control is live beside the first"
-    );
+    for action in &peer_actions {
+        assert!(
+            fixture.harness.app().has_action_handler(action),
+            "the second pane's control is live beside the first: {action:?}"
+        );
+    }
 
-    // Releasing the first pane takes down only its own control: the second pane's
-    // handler and node stay standing.
+    // Releasing the first pane takes down only its own controls: the second pane's
+    // handlers and nodes stay standing.
     fixture.with_cx(|widget, cx| widget.release(cx));
-    assert!(
-        !fixture.harness.app().has_action_handler(&first_action),
-        "the released pane takes its own component down"
-    );
-    assert!(
-        fixture.harness.app().has_action_handler(&peer_action),
-        "and leaves the other pane's component alone"
-    );
+    for action in &first_actions {
+        assert!(
+            !fixture.harness.app().has_action_handler(action),
+            "the released pane takes its own component down: {action:?}"
+        );
+    }
+    for action in &peer_actions {
+        assert!(
+            fixture.harness.app().has_action_handler(action),
+            "and leaves the other pane's component alone: {action:?}"
+        );
+    }
     assert!(
         fixture.harness.tree().get(peer_node).is_ok(),
         "the other pane's node is untouched"
     );
+    let _ = peer;
 }
 
 #[test]
@@ -1697,7 +2296,7 @@ fn a_rebuilt_header_control_should_not_leak_its_component_scope() {
     let before = fixture.harness.signal_slot_stats().live;
 
     // Two language switches rebuild both groups in place; each rebuild releases the
-    // component it replaces.
+    // component it replaces — the selectors' own scope included (P2-10).
     for language in [LanguageCode::ZhCn, LanguageCode::En] {
         fixture.harness.switch_language(language);
         fixture.frame();
@@ -1705,23 +2304,42 @@ fn a_rebuilt_header_control_should_not_leak_its_component_scope() {
     }
 
     let after = fixture.harness.signal_slot_stats().live;
-    assert!(
-        after <= before + SELECT_RELEASE_GAP,
-        "a rebuilt header keeps its signal slots bounded: {before} -> {after}"
+    assert_eq!(
+        after, before,
+        "a rebuilt header hands every value slot back: {before} -> {after}"
     );
 }
 
-/// The value slots two language switches leave behind, which is the kit's own known
-/// gap rather than this widget's.
-///
-/// `kit::select` mints a signal scope of its own (three values per picker) and its
-/// `release` does not hand that scope back yet: two switches rebuild two pickers
-/// each, so twelve values stay. `InstrumentButton`'s component scope is released
-/// with its handle. Registered with the kit batch (`test-ledger/w4-order-book.md`
-/// §10), and the assertion above pins the count so a widget-side leak still fails.
-const SELECT_RELEASE_GAP: usize = 3 * 2 * 2;
-
 // ---------------------------------------------------------------------- release
+
+#[test]
+fn mounting_and_releasing_the_pane_should_reuse_its_value_slots() {
+    let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+    let baseline = harness.signal_slot_stats();
+    let mut after_first = baseline;
+    for round in 0..8 {
+        let pane = harness.mount::<OrderBookWidget>(config(None));
+        let mounted = harness.signal_slot_stats();
+        pane.release(harness.app_mut());
+        let released = harness.signal_slot_stats();
+        assert!(
+            mounted.live > baseline.live,
+            "round {round}: the mounted pane minted its own values"
+        );
+        assert_eq!(
+            released.live, baseline.live,
+            "round {round}: the released pane handed every value slot back"
+        );
+        if round == 0 {
+            after_first = released;
+        } else {
+            assert_eq!(
+                released.slots, after_first.slots,
+                "round {round}: a later pane reuses the slots the first one allocated"
+            );
+        }
+    }
+}
 
 #[test]
 fn releasing_the_pane_should_reclaim_its_value_slots_and_canvases() {

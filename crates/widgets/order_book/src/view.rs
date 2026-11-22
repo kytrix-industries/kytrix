@@ -163,11 +163,13 @@ use super::{
 /// this answers with what it has.
 const SNAPSHOT_DEPTH: u16 = 5_000;
 
-/// How far one depth-animation tick advances the bars.
+/// What one depth-animation tick advances the bars by.
 ///
-/// The movement is measured from elapsed engine time at the frame tick the engine
-/// runs at, so a bar keeps its speed when a frame is late rather than jumping a
-/// fixed step (E10: the timer chain is the only frame source this pane owns).
+/// The chain is an E10 one-shot timer that re-arms itself, and each callback moves
+/// the easing by exactly this step: the movement is **not** measured from elapsed
+/// engine time (the engine exposes no clock read surface), so a dropped frame
+/// lengthens the animation by the ticks it lost instead of being skipped over.
+/// The settle predicate reads the same step, which is what stops the chain.
 const DEPTH_ANIMATION_TICK: Duration = Duration::from_millis(16);
 
 /// The widget-local names of the header controls' kit keys.
@@ -701,9 +703,13 @@ impl WidgetView for OrderBookWidget {
         // back has to reopen that stream.
         let market_reloaded = mem::take(&mut self.market_reloaded);
         let retry = self.status.is_failed(cx.app());
-        if !retry {
+        if !retry && !market_reloaded {
             // An explicit load starts over, because the widget cannot vouch for
-            // what it was showing. A retry keeps the book the user is reading.
+            // what it was showing. A retry keeps the book the user is reading, and
+            // so does a directory-generation reload: that one re-resolves the rules
+            // and units behind a book the user is still looking at (AGENTS §8.3),
+            // so it only replaces the subscription and keeps the ladder up until
+            // the new generation publishes the book it holds.
             self.clear_book(cx);
         }
         self.start(retry, market_reloaded, cx);
@@ -2140,8 +2146,10 @@ impl OrderBookWidget {
                 );
             });
         select.set_chosen(cx.app_mut(), [spec.chosen.as_str()], false);
-        let _ = select.set_disabled(cx.app_mut(), disabled);
         select.build(cx.app_mut(), window, parent)?;
+        // Disable after the build: `Interactive::build` initialises its state from the
+        // builder flags, so a `set_disabled` written before it would be overwritten.
+        let _ = select.set_disabled(cx.app_mut(), disabled);
         Ok(select)
     }
 
