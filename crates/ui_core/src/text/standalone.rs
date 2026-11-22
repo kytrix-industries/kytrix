@@ -4,7 +4,9 @@
 //! 节点路径的内容宽来自 taffy 布局；canvas 内文本没有节点，宽度由应用显式给出
 //! （`max_width = None` ⇒ 单行、按 max-content 宽断行）。两条路径共用同一份形状缓存
 //! （`text::cache::ShapeKey`）、同一条光栅/装箱路径（`ShapedText::rasterize`）与同一个字形
-//! 图集，因此同一文本 + 同一 shaping 输入重复 shape 命中缓存、不重复塑形。
+//! 图集，因此同一文本 + 同一 shaping 输入重复 shape 命中缓存、不重复塑形。颜色不进缓存键
+//! （R12-11）：同文本换色同样命中布局、**不重复 shape**，但光栅按本次 `style.color` 重写基础
+//! run（E24 / W6b F22）—— Canvas 文本没有节点绘制期的重上色通道。
 //!
 //! # 图集租约（D-5 的等价面）
 //!
@@ -90,7 +92,8 @@ pub(crate) fn shape(
     let content =
         TextContent::new(text, style.clone()).with_inline_boxes(inline_boxes.iter().copied());
     // 形状缓存（`ShapeKey`：文本 + shaping 输入的样式 + 行内盒 + font_stack_version）；
-    // 命中路径不重建 parley Layout，只按新的内容宽断行 + 光栅。
+    // 命中路径不重建 parley Layout，只按新的内容宽断行 + 光栅（颜色不在键里，由
+    // `ShapedText::rasterize` 按本次 `style.color` 重写基础画刷；E24）。
     let (shaped, _hit) = text_context.shape_cached(&content);
     let width = max_width.unwrap_or_else(|| shaped.max_content_size().width);
     let ellipsis = text_context.ellipsis_for(style);
@@ -171,7 +174,7 @@ mod tests {
         event::Event,
         math::{Point, Rect, Scale, Size},
         node::builder::NodeBuilder,
-        paint::{canvas::Canvas, primitive::Primitive},
+        paint::{canvas::Canvas, color::Color, primitive::Primitive},
         text::{FontStack, InlineAlign, ShapedLine, TextOverflow, TextStyle},
         window::WindowOptions,
     };
@@ -503,8 +506,14 @@ mod tests {
     fn repeated_shape_reuses_the_cached_snapshot() {
         let (_runtime, mut app) = new_app();
         let style = TextStyle::new(16.0);
+        let shaped_before = app.shape_count_for_test();
         let first = app.shape_text("Cache me", &style, None, &[]).expect("塑形");
         let second = app.shape_text("Cache me", &style, None, &[]).expect("塑形");
+        assert_eq!(
+            app.shape_count_for_test() - shaped_before,
+            1,
+            "同色重复调用必须命中形状缓存（不重复 shape）"
+        );
         assert_eq!(
             first.line(),
             second.line(),
@@ -512,6 +521,84 @@ mod tests {
         );
         assert!(!first.is_stale());
         assert!(!second.is_stale());
+    }
+
+    /// E24（W6b 审查 F22）：Canvas 文本换色必须真的换色。
+    ///
+    /// `ShapeKey` 不含 `color`（R12-11：颜色不是 shaping 输入）：同文本第二次以不同颜色 shape
+    /// 时命中同一份布局快照、**不重复塑形**；但光栅必须按本次 `style.color` 重写基础 run ——
+    /// Canvas 文本没有节点绘制期的 `foreground` 重上色，旧实现里 halo 副本永远画首次的颜色
+    /// （chokepoint 的 halo 8 副本环视觉不存在的根因）。
+    #[test]
+    fn canvas_text_recolors_on_a_shaping_cache_hit() {
+        let red = Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let blue = Color::Srgb {
+            r: 0.0,
+            g: 0.2,
+            b: 1.0,
+            alpha: 1.0,
+        };
+        let (_runtime, mut app) = new_app();
+        let text = "Halo";
+        let shaped_before = app.shape_count_for_test();
+        let red_handle = app
+            .shape_text(text, &TextStyle::new(16.0).with_color(red), None, &[])
+            .expect("塑形");
+        let blue_handle = app
+            .shape_text(text, &TextStyle::new(16.0).with_color(blue), None, &[])
+            .expect("塑形");
+        assert_eq!(
+            app.shape_count_for_test() - shaped_before,
+            1,
+            "同文本换色必须命中形状缓存（颜色不是 shaping 输入），只准塑形一次"
+        );
+
+        let colors = |handle: &ShapedTextHandle| -> Vec<Color> {
+            handle.line().glyph_runs().map(|run| run.color).collect()
+        };
+        let red_colors = colors(&red_handle);
+        assert!(!red_colors.is_empty(), "「Halo」必须有可见字形 run");
+        assert!(red_colors.iter().all(|color| *color == red));
+        let blue_colors = colors(&blue_handle);
+        assert_eq!(
+            blue_colors.len(),
+            red_colors.len(),
+            "同一份布局快照的 run 数不变"
+        );
+        assert!(
+            blue_colors.iter().all(|color| *color == blue),
+            "缓存命中后 run 的颜色必须来自本次 style.color：{blue_colors:?}"
+        );
+
+        // 布局缓存复用：字形落点逐位相同（只换颜色）。
+        let positions = |handle: &ShapedTextHandle| -> Vec<(f32, f32)> {
+            handle
+                .line()
+                .glyph_runs()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| (glyph.position.x, glyph.position.y))
+                .collect()
+        };
+        assert_eq!(positions(&red_handle), positions(&blue_handle));
+        assert_eq!(red_handle.size(), blue_handle.size());
+
+        // Canvas 图元（编码期的最终颜色）：Canvas 文本没有绘制期重上色，必须直接是本次颜色。
+        let mut canvas = canvas();
+        assert!(canvas.push_shaped_text(&blue_handle, Point::ZERO));
+        let mut pushed = 0usize;
+        for primitive in canvas.primitives() {
+            let Primitive::GlyphRun(run) = primitive else {
+                panic!("push_shaped_text 只能产生 GlyphRun 图元，实际 {primitive:?}");
+            };
+            pushed += 1;
+            assert_eq!(run.color, blue, "Canvas 文本必须用本次 shape 的颜色");
+        }
+        assert!(pushed > 0, "「Halo」必须至少推一条字形 run");
     }
 
     // ── E1b：App 级默认 scale（hidpi 用户裁决）────────────────────────────────

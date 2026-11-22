@@ -1,6 +1,6 @@
 //! Indicator series computed from the loaded candles.
 //!
-//! Pure functions with no GPUI dependency: the chart painter builds the
+//! Pure functions with no application context: the chart painter builds the
 //! [`IndicatorInput`] columns from a snapshot and asks for every enabled
 //! indicator's lines in one pass (design §7.1). Values are indexed by the
 //! absolute candle index of the whole snapshot, never by a visible-window slot;
@@ -11,8 +11,8 @@
 //! [`IndicatorLine`]'s display threshold feeds the history prefetch, so the two
 //! cannot disagree.
 
-use gpui_kit::Hsla;
 use smol_str::{SmolStr, format_smolstr};
+use ui_core::paint::color::Color;
 
 use super::{
     CandlestickIndicatorConfig, IndicatorEntry, IndicatorId, IndicatorLineConfig,
@@ -59,7 +59,7 @@ pub(crate) struct IndicatorLine {
     /// completeness: its bars are painted in the market's bullish/bearish colours
     /// and the sub-plot legend does not list it, so its stored colour is never
     /// drawn.
-    pub color: Hsla,
+    pub color: Color,
     /// One entry per candle; `None` means the value is not defined there.
     pub values: Vec<Option<f64>>,
     /// The first absolute index whose value is trustworthy.
@@ -212,7 +212,7 @@ fn lines_series(
         let label = format_smolstr!("{}{}", series.legend, row.period);
         series.lines.push(IndicatorLine {
             label,
-            color: Hsla::from(row.color),
+            color: Color::from(row.color),
             values: formula(inputs, row.period),
             readable_from: line_depth(id, row.period),
             shape: LineShape::Line,
@@ -253,7 +253,7 @@ fn macd_series(
     if draw_dif {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("DIF"),
-            color: Hsla::from(dif_color),
+            color: Color::from(dif_color),
             values: dif.into_iter().map(Some).collect(),
             readable_from,
             shape: LineShape::Line,
@@ -262,7 +262,7 @@ fn macd_series(
     if draw_dea {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("DEA"),
-            color: Hsla::from(dea_color),
+            color: Color::from(dea_color),
             values: dea.into_iter().map(Some).collect(),
             readable_from,
             shape: LineShape::Line,
@@ -270,7 +270,7 @@ fn macd_series(
     }
     lines.push(IndicatorLine {
         label: SmolStr::new_static("MACD"),
-        color: Hsla::from(default_line_color(2)),
+        color: Color::from(default_line_color(2)),
         values: histogram,
         readable_from,
         shape: LineShape::Histogram,
@@ -303,7 +303,7 @@ fn kdj_series(
     if draw_k {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("K"),
-            color: Hsla::from(k_color),
+            color: Color::from(k_color),
             values: k,
             readable_from,
             shape: LineShape::Line,
@@ -312,7 +312,7 @@ fn kdj_series(
     if draw_d {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("D"),
-            color: Hsla::from(d_color),
+            color: Color::from(d_color),
             values: d,
             readable_from,
             shape: LineShape::Line,
@@ -321,7 +321,7 @@ fn kdj_series(
     if draw_j {
         lines.push(IndicatorLine {
             label: SmolStr::new_static("J"),
-            color: Hsla::from(j_color),
+            color: Color::from(j_color),
             values: j,
             readable_from,
             shape: LineShape::Line,

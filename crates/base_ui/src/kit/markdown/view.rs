@@ -359,6 +359,9 @@ impl MarkdownView {
 /// 失效链路：根节点绑一个只读主题依赖的空补丁（组件不产出挂载期颜色之外的静态色），外观
 /// 信号写入 → 根节点标脏 → 出现一帧 → 组合根的帧钩子（样式 pass **之前**）调用 `sync` 重建，
 /// 同帧完成新颜色的塑形与绘制。没有读主题的节点（其它静态子树）不受影响。
+///
+/// 生命周期：[`MarkdownNode::release`] 卸载挂载时建出的根子树（P2-11）——富文本块是纯静态
+/// 子树（没有 `bind_*` / 作用域 / handler），根上的外观依赖边随节点卸载由引擎交还。
 pub struct MarkdownNode {
     root: NodeId,
     document: Arc<MarkdownDocument>,
@@ -478,6 +481,29 @@ impl MarkdownNode {
     #[must_use]
     pub fn handles(&self) -> &MarkdownHandles {
         &self.handles
+    }
+
+    /// 卸载组件：摘掉 `mount` 建出的整棵子树（幂等；P2-11，W8a/W8b 缺口）。
+    ///
+    /// 生命周期契约：`MarkdownNode` = **一棵节点子树 + 根上的外观依赖边**，没有自有
+    /// `SignalScope`、也没有 Action handler；因此释放面就是卸载根子树 —— [`App::remove_node`]
+    /// 同时交还根上的依赖边并清理 scoped 绑定，widget 不必再自己 `remove_node(root)` 并记住
+    /// 根句柄（W8 的 `remove_markdown` 绕行）。返回 `true` = 本次真的卸载了根；根已被父级
+    /// 卸载（父树先删）或重复调用返回 `false`。
+    ///
+    /// 释放后组件不可再用（`sync` 变成 no-op，`handles()` 清空）；需要内容请重新 [`mount`]。
+    /// 只卸载**自己**的根：挂在同一个父节点下的其它节点属于调用方。
+    ///
+    /// [`mount`]: MarkdownNode::mount
+    pub fn release(&mut self, app: &mut App) -> bool {
+        let Some(window) = self.root.window() else {
+            return false;
+        };
+        let removed = app.remove_node(window, self.root).is_ok();
+        if removed {
+            self.handles.text_blocks.clear();
+        }
+        removed
     }
 }
 
@@ -1442,6 +1468,57 @@ mod tests {
             resolved(Theme::of(Appearance::Dark).role(Role::FgDefault)),
             "两套外观的正文色必须不同（否则上面的断言无意义）"
         );
+    }
+
+    /// P2-11（W8a/W8b 缺口）：`MarkdownNode::release` 卸载挂载时建出的根子树（幂等）；释放后
+    /// `sync` 是 no-op、不再持有文本块句柄，外观写入也不会为已卸载的根留下可求值的依赖边。
+    #[test]
+    fn releasing_the_markdown_unloads_its_root_and_stops_syncing() {
+        let mut app = TestApp::new();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let mut node = MarkdownNode::mount(
+            app.app_mut(),
+            window,
+            root,
+            theme.clone(),
+            document(vec![paragraph(vec![text("段落")])]),
+        )
+        .expect("the markdown mounts");
+        let _ = app.drain().expect("首帧");
+        let markdown_root = node.root();
+        assert!(
+            app.app()
+                .window(window)
+                .expect("窗口")
+                .tree()
+                .get(markdown_root)
+                .is_ok(),
+            "挂载后有根子树"
+        );
+
+        assert!(node.release(app.app_mut()), "第一次释放卸载根");
+        assert!(
+            app.app()
+                .window(window)
+                .expect("窗口")
+                .tree()
+                .get(markdown_root)
+                .is_err(),
+            "根子树已卸载"
+        );
+        assert!(
+            node.handles().text_blocks.is_empty(),
+            "释放后不再持有文本块句柄"
+        );
+        assert!(!node.release(app.app_mut()), "重复释放幂等");
+        assert!(!node.sync(app.app_mut()), "释放后 sync 是 no-op");
+
+        // 外观写入不再为已卸载的根留下可求值依赖：帧不 panic、sync 仍 no-op。
+        assert!(theme.set_appearance(app.app_mut(), Appearance::Dark));
+        let _ = app.drain().expect("外观帧");
+        assert!(!node.sync(app.app_mut()));
     }
 
     /// F8（契约测试）：重建**原地保留根节点身份**（外部 probe / 布局锚点不失效），且页面滚动

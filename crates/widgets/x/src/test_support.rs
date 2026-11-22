@@ -16,7 +16,6 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::{App, TestAppContext};
 use kytrix_service_provider::service::{
     engine::{
         KytrixServiceError, XProfileEvent, XSubscriptionEvent, XTweetBatch, XTweetEvent,
@@ -39,26 +38,6 @@ use crate::{
 /// The account every fixture belongs to.
 pub(super) const ACCOUNT: &str = "test-account";
 
-/// Waits until the condition holds, which is what a test driving two executors at once needs.
-///
-/// Two executors are involved: a widget sends its commands from GPUI's own, and the service
-/// answers on the application runtime. So both are given a turn — the pane first, because a
-/// command that has not been sent is a service with nothing to answer.
-pub(super) fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&App) -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        cx.run_until_parked();
-        let handle =
-            cx.update(|cx: &mut App| widget_tokio_runtime::global::handle(cx).handle().clone());
-        handle.block_on(async { tokio::task::yield_now().await });
-        if cx.update(|cx| ready(cx)) {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what} should happen");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
 /// One tweet at one time, with nothing on it.
 pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> XTweetEvent {
     XTweetEvent {
@@ -66,7 +45,7 @@ pub(super) fn tweet(tweet_id: &str, timestamp: i64) -> XTweetEvent {
         timestamp,
         x_user_id: SmolStr::new_static("42"),
         text_segments: vec![XTweetTextSegment {
-            text: SmolStr::new(format!("tweet {tweet_id}")),
+            text: format_smolstr!("tweet {tweet_id}"),
             url: None,
         }],
         reference: None,
@@ -90,8 +69,8 @@ pub(super) fn profile(x_user_id: &str, username: &str) -> XProfileEvent {
     XProfileEvent {
         x_user_id: x_user_id.into(),
         username: username.into(),
-        display_name: SmolStr::new(format!("{username} display")),
-        avatar_url: SmolStr::new(format!("https://pbs.twimg.com/{username}.jpg")),
+        display_name: format_smolstr!("{username} display"),
+        avatar_url: format_smolstr!("https://pbs.twimg.com/{username}.jpg"),
         verified: true,
         revision: 1,
     }
@@ -113,9 +92,9 @@ pub(super) fn search_profile(x_user_id: &str, username: &str) -> XProfile {
     XProfile {
         x_user_id: x_user_id.into(),
         username: username.into(),
-        display_name: SmolStr::new(format!("{username} display")),
-        avatar_url: SmolStr::new(format!("https://pbs.twimg.com/{username}.jpg")),
-        description: SmolStr::new(format!("about {username}")),
+        display_name: format_smolstr!("{username} display"),
+        avatar_url: format_smolstr!("https://pbs.twimg.com/{username}.jpg"),
+        description: format_smolstr!("about {username}"),
         followers_count: 1_250,
         following_count: 12,
         protected: false,

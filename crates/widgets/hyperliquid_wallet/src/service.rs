@@ -51,8 +51,7 @@ use std::{collections::VecDeque, convert::Infallible, future::Future, sync::Arc,
 
 use ahash::AHashSet;
 use futures::future::try_join_all;
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_connector::{
     account::{
         domain::{
@@ -84,7 +83,7 @@ use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::time::Instant;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     runtime::{ServiceContext, WidgetService},
     stream::{StreamPublishError, StreamPublisher},
@@ -145,39 +144,39 @@ pub(super) enum WalletStreamError {
     StreamClosed,
 }
 
-impl LocalizedError for WalletStreamError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for WalletStreamError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         // The venue this widget reads is named by the catalogue rather than spelled
         // into each message, so a sentence about it follows a rename of it.
-        let market = VenueId::Hyperliquid.display_string(cx);
+        let market = VenueId::Hyperliquid.display_string(translate);
         match self {
-            Self::Account(error) => error.localized_message(cx),
-            Self::Model(error) => error.localized_message(cx),
-            Self::Data(error) => error.localized_message(cx),
+            Self::Account(error) => error.translated_message(translate),
+            Self::Model(error) => error.translated_message(translate),
+            Self::Data(error) => error.translated_message(translate),
             Self::SubscriptionBufferFull {
                 operation,
                 capacity,
-            } => t!(
-                cx,
+            } => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_subscription_buffer_full",
                 market = market,
                 operation = operation,
                 capacity = capacity
             ),
-            Self::DexRead { route, source } => t!(
-                cx,
+            Self::DexRead { route, source } => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_dex_read",
                 market = market,
-                dex = route_display_string(route, cx),
-                cause = source.localized_message(cx)
+                dex = route_display_string(route, translate),
+                cause = source.translated_message(translate)
             ),
-            Self::SubscriptionClosed => t!(
-                cx,
+            Self::SubscriptionClosed => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_subscription_closed",
                 market = market
             ),
-            Self::StreamClosed => t!(
-                cx,
+            Self::StreamClosed => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_stream_closed",
                 market = market
             ),
@@ -1951,7 +1950,6 @@ fn time_error() -> WalletStreamError {
 mod tests {
     use std::time::Duration;
 
-    use gpui_kit::TestAppContext;
     use market_participants_connector::account::domain::HyperliquidWalletUpdate;
     use market_participants_model::{
         identifier::{VenueId, VenueScopeId, WalletAddress},
@@ -1961,9 +1959,9 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        SubscriptionKind, TestSource, address, context, deposit, fill, latest_reading, open_order,
-        overview_key, pair_listing, perp_entry, perpetual_route, perpetual_state, position,
-        runtime, spot_entry, spot_pair, spot_state, test_routes, timeline_key, until,
+        SubscriptionKind, TestSource, address, context, deposit, detail_key, fill, latest_reading,
+        open_order, overview_key, pair_listing, perp_entry, perpetual_route, perpetual_state,
+        position, runtime, spot_entry, spot_pair, spot_state, test_routes, timeline_key, until,
         wait_for_status, wallet_balance,
     };
 
@@ -2049,46 +2047,6 @@ mod tests {
             routes,
             vec![perpetual_route()],
             "only this venue's wallet route, published with a catalog, is read"
-        );
-    }
-
-    /// The routes a reading covers come from the loaded venues, and those are the venue's own
-    /// answer: every Hyperliquid scope that monitors wallets and publishes a catalog is one of
-    /// them, and a scope that carries neither — the discovery scope the venue used to publish —
-    /// is not.
-    #[gpui_kit::test]
-    fn client_wallet_routes_should_name_every_hyperliquid_wallet_route(cx: &mut TestAppContext) {
-        crate::test_support::install_metadata(cx);
-        cx.update(|cx| {
-            crate::test_support::install_connector(cx, &crate::test_support::test_routes());
-        });
-        let source =
-            cx.update(|cx| ClientWalletSource::new(cx.global::<MarketParticipantsConnector>()));
-
-        let routes = source.wallet_routes();
-
-        assert!(!routes.is_empty(), "the venue publishes wallet routes");
-        assert!(
-            routes
-                .iter()
-                .all(|route| route.venue.as_str() == crate::test_support::VENUE),
-            "the capability is Hyperliquid's: {routes:?}"
-        );
-        assert!(
-            routes
-                .iter()
-                .any(|route| route.scope.as_str() == crate::test_support::SPOT_SCOPE)
-        );
-        assert!(
-            routes
-                .iter()
-                .any(|route| route.scope.as_str() == crate::test_support::PERPETUAL_SCOPE)
-        );
-        assert!(
-            !routes
-                .iter()
-                .any(|route| route.scope.as_str() == "discovery"),
-            "a scope's route reads no wallet: {routes:?}"
         );
     }
 

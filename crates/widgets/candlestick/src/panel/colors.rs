@@ -1,35 +1,47 @@
-//! The keyed table of colour pickers the panel's colour settings edit.
+//! The colour wells the panel's colours are chosen from.
 //!
-//! One picker per configurable colour: every line of a line list, and one for
-//! each switch row that controls a line whose colour the user may choose. Every
-//! picker is built by the panel's first sync — including fields whose indicator is
-//! folded, because the field is still part of the configuration — and reused
-//! afterwards; a picker rebuilt on every frame would lose the tab the user left it
-//! on. A picker is dropped with the field it edits, so a line added later does not
-//! come back with a colour nobody stored.
+//! One picker per configurable colour: every line of a line list, and one for each switch row that
+//! controls a line whose colour the user may choose. The list is read from the configuration, so
+//! it is the configuration that decides which colours exist; a line added later gets its picker
+//! when the rows are rebuilt, and a line that was removed takes its picker with it.
+//!
+//! The kit picker reports a colour once per interaction — when the user confirms it in the
+//! panel — and that report is the edit the panel hands to the widget. The picker's own state (the
+//! tab it is on, the caret in its hex field) belongs to the user and is never overwritten from the
+//! configuration while the rows stay built: the stored colour only changes the picker when the
+//! configuration moved under it, which rebuilds the rows.
 
 use base_ui::{
-    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerLabels},
-    size::UnifiedSize,
+    kit::{
+        color_picker::{ColorPicker, ColorPickerLabels},
+        size::UnifiedSize,
+    },
+    theme::handle::ThemeHandle,
 };
-use gpui_kit::{App, AppContext, Context, Entity, Hsla, Subscription, Window};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
+use ui_core::{
+    error::EngineError,
+    event::Event,
+    node::{id::NodeId, signal::Signal},
+    paint::color::Color,
+    window::WindowId,
+};
+use widget::cx::WidgetCx;
 
-use super::view::IndicatorPanel;
+use super::view::PanelEdit;
 use crate::indicator::{
     CandlestickIndicatorConfig, IndicatorId, LineColor, SettingControl, SettingKey, definition_of,
 };
 
-/// How many colour fields the default configuration has, so that listing them
-/// every frame does not grow a vector.
+/// How many colour fields the default configuration has, so that listing them on every rebuild
+/// does not grow a vector.
 ///
-/// MA's three lines, EMA's one, RSI's three, MACD's two and KDJ's three are
-/// twelve. A configuration with more lines is not bounded, so this is a starting
-/// capacity rather than a cap.
+/// MA's three lines, EMA's one, RSI's three, MACD's two and KDJ's three are twelve. A
+/// configuration with more lines is not bounded, so this is a starting capacity rather than a cap.
 const COLOR_FIELD_CAPACITY: usize = 12;
 
-/// One configurable colour: which indicator and line it belongs to, and the
-/// exact colour the configuration holds for it.
+/// One configurable colour: which indicator and line it belongs to, and the exact colour the
+/// configuration holds for it.
 pub(super) struct ColorField {
     pub id: IndicatorId,
     /// The line of a line list; `None` for a switch row's colour.
@@ -39,7 +51,7 @@ pub(super) struct ColorField {
 }
 
 impl ColorField {
-    /// The identity this field's picker is keyed by.
+    /// The identity this field's picker and its edit are keyed by.
     pub(super) fn key(&self) -> ColorKey {
         ColorKey {
             id: self.id,
@@ -51,9 +63,9 @@ impl ColorField {
 
 /// Which colour field a picker, a change or a commit belongs to.
 ///
-/// It is the same shape as [`super::inputs::InputKey`] and serves the same
-/// purpose: the panel is redrawn every frame, so what pairs a control with the
-/// value it edits has to be an identity, not a position in a vector.
+/// The same shape as [`super::inputs::InputKey`] and for the same reason: the rows are rebuilt
+/// when the configuration moves, so a control is paired with the value it edits by identity, not
+/// by its position in the built tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ColorKey {
     pub id: IndicatorId,
@@ -63,11 +75,9 @@ pub(super) struct ColorKey {
 
 /// Every colour the panel offers a picker for, in the order they are drawn.
 ///
-/// Read from the configuration rather than stored: the configuration is the one
-/// owner of what the pickers show. A switch row contributes its colour through
-/// [`SettingKey`], and a line list contributes one field per line; periods have
-/// no colour, and a value whose shape does not match its catalogue row
-/// contributes nothing.
+/// A switch row contributes its colour through [`SettingKey`], and a line list contributes one
+/// field per line; periods have no colour, and a value whose shape does not match its catalogue
+/// row contributes nothing.
 pub(super) fn color_fields(config: &CandlestickIndicatorConfig) -> Vec<ColorField> {
     let mut fields = Vec::with_capacity(COLOR_FIELD_CAPACITY);
     for entry in &config.entries {
@@ -108,80 +118,95 @@ pub(super) fn color_fields(config: &CandlestickIndicatorConfig) -> Vec<ColorFiel
     fields
 }
 
-/// The panel's text, in the language of the frame being drawn.
+/// The colour field `key` names, if the configuration still holds it.
 ///
-/// Built every sync so a language switch localizes the popup too: the picker is
-/// a `base_ui` view and cannot translate for itself. `set_labels` is a no-op when
-/// the labels are equal, so handing the same ones over each frame costs nothing.
-pub(super) fn color_labels(cx: &App) -> ColorPickerLabels {
+/// The row builder asks for the colour it has to draw rather than reading the settings value
+/// itself: which colours are configurable is stated once in [`color_fields`].
+pub(super) fn field_of(config: &CandlestickIndicatorConfig, key: ColorKey) -> Option<ColorField> {
+    color_fields(config)
+        .into_iter()
+        .find(|field| field.key() == key)
+}
+
+/// The picker's text, in the language of the frame that builds the rows.
+///
+/// The kit picker cannot translate for itself, and its copy is build-time (AGENTS §15.1): a
+/// language switch rebuilds the rows, which hands the picker the new labels.
+pub(super) fn color_labels(translate: &Translate) -> ColorPickerLabels {
     ColorPickerLabels {
-        palette: t!(cx, "common.color.palette"),
-        hsla: t!(cx, "common.color.hsla"),
-        hue: t!(cx, "common.color.hue"),
-        saturation: t!(cx, "common.color.saturation"),
-        lightness: t!(cx, "common.color.lightness"),
-        alpha: t!(cx, "common.color.alpha"),
-        confirm: t!(cx, "common.confirm"),
+        panel: t_smol!(translate, "widget.candlestick.indicator.line_color"),
+        palette: t_smol!(translate, "common.color.palette"),
+        hsla: t_smol!(translate, "common.color.hsla"),
+        hue: t_smol!(translate, "common.color.hue"),
+        saturation: t_smol!(translate, "common.color.saturation"),
+        lightness: t_smol!(translate, "common.color.lightness"),
+        alpha: t_smol!(translate, "common.color.alpha"),
+        confirm: t_smol!(translate, "common.confirm"),
     }
 }
 
-/// One field's picker, and the connection that makes a user's choice reach the
-/// configuration.
-pub(super) struct LinePicker {
-    key: ColorKey,
-    /// The number that tells this picker's tooltip apart from its siblings'.
-    ///
-    /// Handed out by the panel and never reused, so a picker drawn again after
-    /// its line was deleted is a different element.
-    slot: u64,
-    entity: Entity<ColorPicker>,
-    /// Held because the subscription is what stores the colour: dropping it would
-    /// leave a picker that changes what is drawn and never what is saved.
-    _events: Subscription,
+/// One colour field's kit picker.
+pub(super) struct FieldPicker {
+    picker: ColorPicker,
 }
 
-impl LinePicker {
-    /// The colour field this picker edits.
-    pub(super) fn key(&self) -> ColorKey {
-        self.key
-    }
-
-    /// The number that distinguishes this picker from its siblings.
-    pub(super) fn slot(&self) -> u64 {
-        self.slot
-    }
-
-    /// The picker view, which the row draws.
-    pub(super) fn entity(&self) -> &Entity<ColorPicker> {
-        &self.entity
-    }
-
-    /// Builds `field`'s picker and connects it to `panel`.
+impl FieldPicker {
+    /// Builds `field`'s picker under `parent` and connects it to the panel's edits.
     ///
-    /// The picker reports a colour once per interaction — when the user presses the confirm
-    /// button in its panel — and that is exactly the colour to store, so the report is handed
-    /// over as a commit. Nothing is previewed before it: the panel's own footer and trigger show
-    /// the colour the user is choosing, and a panel dismissed without confirming stores nothing.
-    pub(super) fn connect(
+    /// `suffix` is the panel-local control position; the key the picker derives its actions from
+    /// is minted from it, so two panes never collide and a rebuilt row reclaims its own key.
+    pub(super) fn build(
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
         field: &ColorField,
-        slot: u64,
         labels: &ColorPickerLabels,
-        window: &mut Window,
-        cx: &mut Context<IndicatorPanel>,
-    ) -> Self {
-        let entity =
-            cx.new(|cx| ColorPicker::new(Hsla::from(field.color), UnifiedSize::Small, window, cx));
-        entity.update(cx, |picker, cx| picker.set_labels(labels.clone(), cx));
-        let key = field.key();
-        let events = cx.subscribe(&entity, move |panel, _, event: &ColorPickerEvent, cx| {
-            let ColorPickerEvent::ColorChanged(color) = event;
-            panel.commit_color(key, *color, cx);
-        });
-        Self {
+        edits: Signal<Option<PanelEdit>>,
+        suffix: &str,
+    ) -> Result<Self, EngineError> {
+        let theme: ThemeHandle = cx.theme().clone();
+        let layer = cx.layer().clone();
+        let router = cx.animation().clone();
+        let key = cx.unique_key(suffix);
+        let color = Color::from(field.color);
+        let picker = ColorPicker::new(
+            cx.app_mut(),
+            theme,
+            layer,
+            router,
             key,
-            slot,
-            entity,
-            _events: events,
-        }
+            color,
+            UnifiedSize::Small,
+        );
+        picker.set_labels(cx.app_mut(), labels.clone());
+        let color_key = field.key();
+        let window: WindowId = cx.window();
+        picker.on_change(move |app, color| {
+            app.write(
+                &edits,
+                Some(PanelEdit::SetColor {
+                    key: color_key,
+                    color,
+                }),
+            );
+            let _ = app.request_repaint(window);
+        });
+        picker.build(cx.app_mut(), window, parent)?;
+        Ok(Self { picker })
+    }
+
+    /// Frame-driven sync: overlay state, trigger hover, the panel's own inputs.
+    pub(super) fn sync(&self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        self.picker.sync(cx.app_mut())?;
+        Ok(())
+    }
+
+    /// Routes one platform event to the picker (its hex field owns it while the panel is open).
+    pub(super) fn dispatch(&self, cx: &mut WidgetCx<'_>, event: &Event) -> bool {
+        self.picker.dispatch(cx.app_mut(), event)
+    }
+
+    /// Releases the picker's action handlers, overlay and signal scope.
+    pub(super) fn release(self, cx: &mut WidgetCx<'_>) {
+        let _ = self.picker.release(cx.app_mut());
     }
 }

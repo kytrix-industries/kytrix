@@ -15,8 +15,7 @@
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use futures::StreamExt;
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_connector::market::{
     domain::DisconnectReason,
     error::MarketError,
@@ -33,10 +32,11 @@ use market_participants_model::{
     },
     market::book::ListingCandlestick,
 };
+use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     runtime::{ServiceContext, WidgetService},
     stream::StreamPublisher,
@@ -179,12 +179,12 @@ pub(super) enum CandlestickServiceError {
     StreamBusy,
 }
 
-impl LocalizedError for CandlestickServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for CandlestickServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::NoActiveStream => t!(cx, "error.candlestick.no_active_stream"),
-            Self::StreamClosed => t!(cx, "error.candlestick.stream_closed"),
-            Self::StreamBusy => t!(cx, "error.candlestick.stream_busy"),
+            Self::NoActiveStream => t_smol!(translate, "error.candlestick.no_active_stream"),
+            Self::StreamClosed => t_smol!(translate, "error.candlestick.stream_closed"),
+            Self::StreamBusy => t_smol!(translate, "error.candlestick.stream_busy"),
         }
     }
 }

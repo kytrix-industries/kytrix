@@ -34,6 +34,7 @@
 use std::{collections::VecDeque, future::Future, path::PathBuf, sync::Arc};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use i18n::translate::Translate;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
     engine::{KytrixAccountSession, KytrixServiceError, XSubscriptionEvent, XTweetBatch},
@@ -52,7 +53,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     runtime::{ServiceContext, WidgetService},
     stream::{StreamPublishError, StreamPublisher},
@@ -170,12 +171,12 @@ pub(super) enum TweetStreamError {
     Transport(TransportError),
 }
 
-impl LocalizedError for TweetStreamError {
-    fn localized_message(&self, cx: &gpui_kit::App) -> gpui_kit::SharedString {
+impl TranslatedError for TweetStreamError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::Api(error) => error.localized_message(cx),
-            Self::Transport(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Api(error) => error.translated_message(translate),
+            Self::Transport(error) => error.translated_message(translate),
         }
     }
 }
