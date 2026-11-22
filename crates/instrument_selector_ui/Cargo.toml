@@ -6,28 +6,26 @@ edition.workspace = true
 
 [dependencies]
 ahash = { workspace = true }
-gpui-kit = { workspace = true }
+app_config = { workspace = true }
+base_ui = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
 nucleo = { workspace = true }
 smol_str = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
-
-# Workspace members
-app_config = { workspace = true }
-app_config_provider = { workspace = true }
-base_ui = { workspace = true }
-market_participants_connector = { workspace = true }
-market_participants_model = { workspace = true }
+ui_core = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
 # The connection seam a widget test connects a venue through: the crate's own
 # `test-support` feature, which is never enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
+# The headless engine host (`ui_core::test_support::TestApp`) plus its layout probe and
+# frame record. Only the test build opens the feature.
+ui_core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
