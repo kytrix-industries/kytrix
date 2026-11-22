@@ -795,3 +795,11 @@ P3-1h 冻结 `cx.unique_key` 后，**已迁移**代码里两类写法要在各�
 `off_action`、不能 `Button::release`（组件信号作用域泄漏；W2a 实测 `live 18→28→38`）。selector 批需让 `build` 交还可释放
 句柄（或等价的 `release(&mut App)`）；本批只把契约写成「优先保留组件句柄，`release` 同时摘 handler 与释放 scope」。
 
+### 15.6 `kit::tooltip` 内容没有宽度上限（kit 后续批）
+
+旧 `base_ui::tooltip` 的内容是调用方自己给的容器（W3a 的旧实现是 `div().max_w(px(320.0)).text_xs()`），所以长句在窄 pane 里按
+320 px 换行。`kit::tooltip` 的 `TooltipContent` 只带文本，面板样式没有宽度选项（`kit/tooltip.rs` 的面板只有 padding / 背景 /
+圆角），长句按 pane 宽度换行，换行位置与旧实现不同。**登记 kit 后续批**：`TooltipOptions` 增 `max_width`（或让
+`TooltipContent` 带布局选项）；在此之前 W 批只登记偏差，不自己给浮层再包一层容器（W3a 的 `info_history` / `info_yearly`
+两处 note 即此情形）。
+

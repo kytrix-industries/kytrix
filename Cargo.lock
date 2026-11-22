@@ -1737,18 +1737,18 @@ name = "coin_market_cap_fear_and_greed_index"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
+ "bytes",
  "i18n",
  "kytrix_proto",
  "kytrix_service_provider",
+ "log",
  "serde",
  "smol_str",
  "thiserror 2.0.21",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
