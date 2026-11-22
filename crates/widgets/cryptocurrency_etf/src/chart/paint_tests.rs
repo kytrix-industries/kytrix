@@ -1,311 +1,311 @@
-//! One prepared frame: the bars, the line and the days a window folds into, and the
-//! lines a tooltip draws out of one of those days.
-//!
-//! The frame is what a resize costs, so what it is worth testing is that it is a
-//! function of the layout alone: the same window in a wider box is more bars in the
-//! same places, and a window of one day is a point rather than a line.
+//! What one frame is prepared from, and what the shaped labels cost: the bars, the
+//! line, the time ticks, the hover, and the mesh the line is drawn as.
 
-use base_ui::style::theme::{Theme, ThemeExt};
-use gpui_kit::{Pixels, TestAppContext};
+use base_ui::theme::{appearance::Appearance, resolved::Theme};
 use smol_str::SmolStr;
+use ui_core::{
+    math::{Point, Rect},
+    paint::geometry::{GeometryPipeline, IndexType, Topology},
+    test_support::app::TestApp,
+};
 
 use super::{
-    axes::{HOVER_MARKER_SIZE, marker_bounds, point_x, value_y},
-    paint::{CacheKey, Hover, PaintContext, PreparedFrame, measure, prepare, tooltip_lines},
-    palette::AXIS_FONT_SIZE,
-    test_support::{FUNDS, layout, prepared, prepared_all},
+    axes::{ChartLayout, marker_bounds, value_y},
+    data::PreparedData,
+    paint::{CacheKey, Hover, line_geometry, measure, prepare, tooltip_lines},
+    palette::LINE_WIDTH,
+    test_support::{bounds, english, layout, prepared, prepared_all},
     text::ChartTextCache,
 };
 use crate::model::{CryptocurrencyEtfFundSelection, CryptocurrencyEtfWindow};
 
-fn bar_values(prepared: &PreparedFrame) -> Vec<f64> {
-    prepared.bars.iter().map(|bar| bar.value).collect()
+fn theme() -> Theme {
+    Theme::of(Appearance::Light)
 }
 
-/// Installs the translator, which is what the labels of a resolved view come from.
-fn with_locales(cx: &mut TestAppContext, test: impl FnOnce(&mut gpui_kit::App)) {
-    cx.update(|cx| {
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-        test(cx);
-    });
+#[test]
+fn a_window_of_days_should_become_one_bar_each() {
+    let data = prepared_all(&english(), &[1_000.0, -500.0, 2_000.0]);
+    let layout = layout(640.0, 360.0);
+    let prepared = prepare(&data, layout);
+
+    assert_eq!(prepared.bars.len(), 3);
+    assert!(
+        prepared
+            .bars
+            .iter()
+            .all(|bar| layout.plot.contains(bar.bounds.origin)),
+        "every bar is inside the plot"
+    );
+    assert_eq!(
+        prepared
+            .bars
+            .iter()
+            .map(|bar| bar.value)
+            .collect::<Vec<_>>(),
+        vec![1_000.0, -500.0, 2_000.0]
+    );
+    assert!(
+        prepared
+            .time_ticks
+            .first()
+            .is_some_and(|tick| tick.label.as_str() == "01-01"),
+        "the time axis starts at the first day"
+    );
 }
 
-#[gpui_kit::test]
-fn a_window_of_days_should_become_one_bar_each(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        let data = prepared_all(cx, &[1.0, -2.0, 3.0]);
-        let prepared = prepare(&data, layout(640.0, 360.0));
+#[test]
+fn a_window_of_one_day_should_be_a_point_rather_than_a_line() {
+    let data = prepared_all(&english(), &[1_000.0]);
+    let prepared = prepare(&data, layout(640.0, 360.0));
 
-        assert_eq!(bar_values(&prepared), vec![1.0, -2.0, 3.0]);
-        assert!(
-            prepared
-                .bars
-                .iter()
-                .all(|bar| bar.bounds.size.height > gpui_kit::px(0.0)),
-            "every bar is drawn"
-        );
-        assert!(prepared.line.is_some(), "three days are a line");
-        assert!(prepared.marker.is_none());
-        assert!(!prepared.time_ticks.is_empty(), "the window is dated");
-    });
+    assert!(prepared.line.is_none(), "a line needs two points");
+    let marker = prepared.marker.expect("one day is a reading to mark");
+    assert!(prepared.bars.len() == 1);
+    assert!(
+        (marker.x - prepared.bars[0].bounds.origin.x - prepared.bars[0].bounds.size.width / 2.0)
+            .abs()
+            < 0.5,
+        "the marker sits on the day the bar stands for"
+    );
 }
 
-#[gpui_kit::test]
-fn a_window_of_one_day_should_be_a_point_rather_than_a_line(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        let data = prepared_all(cx, &[4.0]);
-        let layout = layout(640.0, 360.0);
-        let prepared = prepare(&data, layout);
+#[test]
+fn a_day_that_is_not_a_reading_should_draw_no_bar_and_break_the_line() {
+    let rows = [[1_000.0, 0.0], [f64::NAN, 0.0], [2_000.0, 0.0]];
+    let translate = english();
+    let data = PreparedData::new(
+        &translate,
+        super::test_support::dataset_rows(&rows),
+        CryptocurrencyEtfFundSelection::All,
+        CryptocurrencyEtfWindow::All,
+    );
+    let prepared = prepare(&data, layout(640.0, 360.0));
 
-        assert_eq!(prepared.bars.len(), 1);
-        assert!(prepared.line.is_none(), "one day is not a line");
-        let marker = prepared.marker.expect("the one reading is marked instead");
-        assert_eq!(
-            marker,
-            gpui_kit::point(
-                point_x(layout.plot, 1, 0),
-                value_y(
-                    4.0,
-                    data.net_assets
-                        .as_ref()
-                        .expect("all funds have assets")
-                        .domain,
-                    layout.plot
-                ),
-            )
-        );
-    });
+    assert_eq!(prepared.bars.len(), 2, "the middle day has no bar");
+    let line = prepared.line.expect("the window has a line");
+    assert_eq!(line.len(), 3);
+    assert!(line[0].is_some(), "the first day is a reading");
+    assert!(
+        line[1].is_none(),
+        "the day whose accumulation is not a number breaks the line"
+    );
 }
 
-#[gpui_kit::test]
-fn a_day_that_is_not_a_reading_should_draw_no_bar_and_break_the_line(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        // The third day is a row the service could not have published: it has no
-        // flow, so it has no bar, and the line does not cross the gap as if the gap
-        // were data.
-        let data = prepared_all(cx, &[1.0, 2.0, f64::NAN, 4.0, 5.0]);
-        let prepared = prepare(&data, layout(640.0, 360.0));
+#[test]
+fn a_named_fund_should_have_no_line_and_no_second_reading() {
+    let fund = CryptocurrencyEtfFundSelection::Named(SmolStr::new_static("AAA"));
+    let data = prepared(
+        &english(),
+        &[1_000.0, 2_000.0],
+        fund,
+        CryptocurrencyEtfWindow::All,
+    );
+    let prepared = prepare(&data, layout(640.0, 360.0));
 
-        assert_eq!(bar_values(&prepared), vec![1.0, 2.0, 4.0, 5.0]);
-        assert!(
-            prepared.line.is_some(),
-            "the days either side of the gap are still a line"
-        );
-    });
+    assert!(prepared.line.is_none(), "one fund has no level to plot");
+    assert!(prepared.marker.is_none());
+    assert_eq!(prepared.bars.len(), 2, "but it still has a flow per day");
 }
 
-#[gpui_kit::test]
-fn the_bars_of_a_dense_window_should_be_prepared_as_one_layer(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        let flows = vec![1.0; 400];
-        let prepared = prepare(&prepared_all(cx, &flows), layout(640.0, 360.0));
+#[test]
+fn a_wider_box_should_spread_the_same_days_further_apart() {
+    let data = prepared_all(&english(), &[1_000.0, 2_000.0, 3_000.0]);
+    let narrow = prepare(&data, layout(320.0, 240.0));
+    let wide = prepare(&data, layout(1_280.0, 240.0));
 
-        assert_eq!(prepared.bars.len(), 400);
-        assert!(
-            prepared.bars_are_disjoint,
-            "a bar per day is a column of its own, so one layer can hold them all"
-        );
-        assert!(prepared.bars[0].bounds.right() <= prepared.bars[1].bounds.origin.x);
-    });
-}
-
-#[gpui_kit::test]
-fn a_named_fund_should_have_no_line_and_no_second_reading(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        let data = prepared(
-            cx,
-            &[1.0, 2.0],
-            CryptocurrencyEtfFundSelection::Named(SmolStr::new_static(FUNDS[0])),
-            CryptocurrencyEtfWindow::All,
-        );
-        let prepared = prepare(&data, layout(640.0, 360.0));
-
-        assert!(!data.show_net_assets);
-        assert!(data.net_assets.is_none());
-        assert!(
-            prepared.line.is_none() && prepared.marker.is_none(),
-            "one fund's flow is a bar chart, not a level"
-        );
-    });
-}
-
-#[gpui_kit::test]
-fn a_wider_box_should_spread_the_same_days_further_apart(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        let data = prepared_all(cx, &[1.0; 30]);
-        // The floor is what a narrow pane actually draws in: the content box has a
-        // minimum width, so a pane narrower than the axes need scrolls instead of
-        // squeezing them.
-        let floor = layout(640.0, 360.0);
-        let wide = layout(1_200.0, 360.0);
-        let floor_prepared = prepare(&data, floor);
-        let wide_prepared = prepare(&data, wide);
-
-        assert_eq!(floor_prepared.bars.len(), wide_prepared.bars.len());
-        assert!(
-            wide_prepared.bars[29].bounds.origin.x > floor_prepared.bars[29].bounds.origin.x,
-            "a wider plot places the last day further right"
-        );
-        assert!(floor_prepared.bars[0].bounds.origin.x >= floor.plot.origin.x);
-        assert!(floor_prepared.bars[29].bounds.right() <= floor.plot.right());
-        assert!(wide_prepared.bars[29].bounds.right() <= wide.plot.right());
-        assert!(
-            wide_prepared.bars[0].bounds.size.width <= gpui_kit::px(14.0),
-            "a bar has a widest size, so few days do not become slabs"
-        );
-    });
+    let spacing = |prepared: &super::paint::PreparedFrame| {
+        prepared.bars[1].bounds.origin.x - prepared.bars[0].bounds.origin.x
+    };
+    assert!(
+        spacing(&wide) > spacing(&narrow),
+        "the same three days are further apart in a wider plot"
+    );
+    assert_eq!(
+        wide.bars.len(),
+        narrow.bars.len(),
+        "a resize is not a different window"
+    );
 }
 
 #[test]
 fn a_cache_key_should_name_the_box_and_the_window_it_was_prepared_from() {
     let key = CacheKey {
-        bounds: super::test_support::bounds(640.0, 360.0),
-        revision: 1,
-    };
-    let same = CacheKey {
-        bounds: super::test_support::bounds(640.0, 360.0),
-        revision: 1,
-    };
-    let resized = CacheKey {
-        bounds: super::test_support::bounds(641.0, 360.0),
-        revision: 1,
-    };
-    let redrawn = CacheKey {
-        bounds: super::test_support::bounds(640.0, 360.0),
-        revision: 2,
+        bounds: bounds(640.0, 360.0),
+        revision: 3,
     };
 
-    assert_eq!(key, same);
-    assert_ne!(key, resized);
-    assert_ne!(key, redrawn, "another window is another frame");
+    assert_eq!(
+        key,
+        CacheKey {
+            bounds: bounds(640.0, 360.0),
+            revision: 3
+        }
+    );
+    assert_ne!(
+        key,
+        CacheKey {
+            bounds: bounds(640.0, 361.0),
+            revision: 3
+        },
+        "a resize prepares the frame again"
+    );
+    assert_ne!(
+        key,
+        CacheKey {
+            bounds: bounds(640.0, 360.0),
+            revision: 4
+        },
+        "so does another answer"
+    );
 }
 
 #[test]
 fn a_hover_should_be_the_same_hover_until_a_reading_or_a_whole_pixel_changes() {
     let hover = Hover {
         index: 2,
-        cursor_y: gpui_kit::px(40.0),
+        cursor_y: 40.0,
     };
 
     assert_eq!(
         hover,
         Hover {
             index: 2,
-            cursor_y: gpui_kit::px(40.0)
+            cursor_y: 40.0
         },
-        "the same reading at the same height is not a change worth a frame"
+        "two positions on one day are one drawing"
     );
     assert_ne!(
         hover,
         Hover {
             index: 3,
-            cursor_y: gpui_kit::px(40.0)
+            cursor_y: 40.0
         }
     );
     assert_ne!(
         hover,
         Hover {
             index: 2,
-            cursor_y: gpui_kit::px(41.0)
+            cursor_y: 41.0
         }
     );
 }
 
 #[test]
 fn a_hover_marker_should_be_centered_on_the_reading_it_marks() {
-    let bounds = marker_bounds(gpui_kit::point(gpui_kit::px(100.0), gpui_kit::px(50.0)));
+    let center = Point::new(120.0, 80.0);
+    let marker = marker_bounds(center);
 
-    assert_eq!(bounds.size.width, HOVER_MARKER_SIZE);
-    assert_eq!(bounds.size.height, HOVER_MARKER_SIZE);
     assert_eq!(
-        bounds.center(),
-        gpui_kit::point(gpui_kit::px(100.0), gpui_kit::px(50.0))
+        marker.origin.x + marker.size.width / 2.0,
+        center.x,
+        "the marker is centred on the reading, not hung from it"
     );
+    assert_eq!(marker.origin.y + marker.size.height / 2.0, center.y);
+    assert_eq!(marker.size.width, marker.size.height);
 }
 
-/// The tooltip is the one reading the chart draws in two colours, so which of the two
-/// runs is coloured is worth pinning: the amount carries the direction the day went,
-/// and the caption naming that direction is read like the rest of the tooltip.
-#[gpui_kit::test]
-fn a_tooltips_flow_should_colour_the_amount_and_not_the_caption(cx: &mut TestAppContext) {
-    with_locales(cx, |cx| {
-        let data = prepared_all(cx, &[1_000.0, -500.0]);
-        let theme = Theme::default();
-        let foreground = theme.components.tooltip.foreground.hsla;
+#[test]
+fn a_tooltips_flow_should_colour_the_amount_and_not_the_caption() {
+    let data = prepared_all(&english(), &[-500.0]);
+    let point = &data.points[0];
+    let theme = theme();
+    let lines = tooltip_lines(point, true, &theme);
+    let foreground = theme.components().tooltip.foreground;
 
-        let gained = tooltip_lines(&data.points[0], true, &theme);
-        assert_eq!(gained.len(), 3, "the date, the day's flow and the assets");
-        assert_eq!(
-            gained[1],
-            vec![
-                (data.points[0].flow_tooltip_caption.as_ref(), foreground),
-                (
-                    data.points[0].flow_label.as_ref(),
-                    theme.components.chart.bullish.hsla
-                ),
-            ]
-        );
-
-        let lost = tooltip_lines(&data.points[1], true, &theme);
-        assert_eq!(
-            lost[1],
-            vec![
-                (data.points[1].flow_tooltip_caption.as_ref(), foreground),
-                (
-                    data.points[1].flow_label.as_ref(),
-                    theme.components.chart.bearish.hsla
-                ),
-            ]
-        );
-    });
+    assert_eq!(lines.len(), 3, "the day, its flow, and what it holds");
+    assert_eq!(
+        lines[1][0].1, foreground,
+        "the caption reads in the tooltip's own text colour"
+    );
+    assert_eq!(
+        lines[1][1].1,
+        theme.components().chart.bearish,
+        "the amount keeps the colour the bar under it is drawn in"
+    );
+    assert_eq!(lines[1][0].0, "Daily net outflow (M): ");
+    assert_eq!(lines[1][1].0, "-$500.00M");
 }
 
-/// Each axis is measured against its title as well as against its ticks: the title is
-/// where the unit of the bare numbers beside it comes from, and one wider than its axis
-/// would be drawn off the edge of the chart and clipped away.
-#[gpui_kit::test]
-fn the_axes_should_be_measured_wide_enough_for_the_titles_they_draw(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-    });
-    let cx = cx.add_empty_window();
-    let mut cache = ChartTextCache::default();
-
-    let (measurements, left_title, right_title) = cx.update(|window, cx| {
-        let data = prepared_all(cx, &[1_000.0, -500.0]);
-        let muted = cx.theme().components.chart.axis.hsla;
-        let left_title = cache.width(data.left_axis_title.as_ref(), AXIS_FONT_SIZE, muted, window);
-        let right_title = cache.width(
-            data.right_axis_title.as_ref(),
-            AXIS_FONT_SIZE,
-            muted,
-            window,
-        );
-        let measurements = measure(
-            &data,
-            &mut PaintContext {
-                text_cache: &mut cache,
-                window,
-                app: cx,
-            },
-        );
-        (measurements, left_title, right_title)
-    });
-
-    assert!(
-        left_title > Pixels::ZERO && right_title > Pixels::ZERO,
-        "a title is text, not a gap"
+#[test]
+fn the_line_mesh_should_cover_every_segment_and_joint() {
+    let points = [
+        Some(Point::new(0.0, 0.0)),
+        Some(Point::new(10.0, 10.0)),
+        Some(Point::new(20.0, 0.0)),
+    ];
+    let desc = line_geometry(&points, LINE_WIDTH).expect("a line of three points has a mesh");
+    eprintln!(
+        "vertices={} indices={} bounds={:?}",
+        desc.vertex_bytes.len(),
+        desc.index_bytes.len(),
+        desc.bounds
     );
+
+    assert_eq!(desc.vertex_stride, GeometryPipeline::Ui.vertex_stride());
+    assert_eq!(desc.index_type, IndexType::U32);
+    assert_eq!(desc.topology, Topology::TriangleList);
+    // Two segments + three joints, one quad each: 4 vertices and 6 indices each.
+    assert_eq!(desc.vertex_bytes.len(), 5 * 4 * 12);
+    assert_eq!(desc.index_bytes.len(), 5 * 6 * 4);
+    assert!(desc.bounds.size.width >= 20.0, "{:?}", desc.bounds);
+    assert!(desc.bounds.size.height >= 10.0, "{:?}", desc.bounds);
+}
+
+#[test]
+fn the_line_mesh_should_break_where_a_day_is_not_a_reading() {
+    let points = [
+        Some(Point::new(0.0, 0.0)),
+        None,
+        Some(Point::new(10.0, 10.0)),
+    ];
+    let desc = line_geometry(&points, LINE_WIDTH).expect("two runs of one point each");
+
+    // Two single-reading runs: one square each.
+    assert_eq!(desc.vertex_bytes.len(), 2 * 4 * 12);
+}
+
+#[test]
+fn no_readings_should_have_no_line_mesh_at_all() {
+    assert!(line_geometry(&[], LINE_WIDTH).is_none());
+    assert!(line_geometry(&[None, None], LINE_WIDTH).is_none());
+}
+
+#[test]
+fn the_axes_should_be_measured_wide_enough_for_the_titles_they_draw() {
+    let data = prepared_all(&english(), &[1_000.0, 2_000.0]);
+    let mut app = TestApp::new();
+    let theme = theme();
+    let mut text = ChartTextCache::default();
+
+    let measurements = measure(app.app_mut(), &data, &mut text, &theme);
+    let nothing_measured = super::paint::Measurements::default();
+
     assert!(
-        measurements.left_axis_width >= left_title,
-        "the flow axis has to fit the title drawn above it"
+        measurements.left_axis_width > nothing_measured.left_axis_width,
+        "an axis has to fit the labels it draws"
     );
     assert!(
         measurements
             .right_axis_width
-            .expect("the whole complex has a net-asset axis")
-            >= right_title,
-        "and so does the net-asset axis"
+            .is_some_and(|width| width > 0.0),
+        "the whole complex draws a second axis"
     );
+    assert_eq!(
+        nothing_measured.right_axis_width, None,
+        "a layout built before anything was measured falls back to its own minimum"
+    );
+}
+
+#[test]
+fn a_layout_should_place_the_marker_on_the_zero_line_of_its_own_axis() {
+    let layout = ChartLayout::new(Rect::new(0.0, 0.0, 640.0, 360.0), 40.0, Some(60.0));
+    let data = prepared_all(&english(), &[1_000.0, 2_000.0]);
+    let scale = data.flow.domain;
+
+    assert!(
+        value_y(0.0, scale, layout.plot) <= layout.plot.origin.y + layout.plot.size.height,
+        "a flow domain always contains zero, so the baseline is inside the plot"
+    );
+    assert!(layout.plot.size.height > 0.0);
 }

@@ -8,19 +8,37 @@
 //! - **labels are formatted once**, when a snapshot arrives, and stored as text on
 //!   the scale or the point that owns them. A frame that repainted the same chart
 //!   formats nothing;
-//! - **shaped lines are cached** for the last [`TEXT_CACHE_CAPACITY`]
-//!   `(text, size, colour)` triples, so a tooltip that moved one day re-shapes one
-//!   line rather than four.
+//! - **shaped text is cached** for the last [`TEXT_CACHE_CAPACITY`]
+//!   `(text, size, colour, align)` tuples, so a tooltip that moved one day re-shapes
+//!   one line rather than four.
 //!
-//! The cache is keyed on the window's text style as well as on its own inputs: a
-//! style or font change invalidates shaped text even when no number moved.
+//! A shaped handle carries an atlas lease: the glyphs it points at can be evicted
+//! (an atlas generation change, or a per-tile LRU sweep), and a handle whose lease is
+//! gone is re-shaped here rather than drawn from stale texture coordinates. Two things
+//! keep a dead lease from quietly taking a label off the screen, and they are the two
+//! halves of the same promise:
+//!
+//! - the cache checks [`ShapedTextHandle::is_stale`] on every hit, and it answers
+//!   [`ChartTextCache::has_stale`] so the chart's whole-frame short-circuit cannot
+//!   decide "nothing changed" over a cache of dead handles. A lease that moved between
+//!   frames is therefore a frame the chart rebuilds — labels included — instead of
+//!   keeping a canvas the engine will no longer encode;
+//! - a line the engine refuses while the canvas is being built
+//!   (`Canvas::push_shaped_text` answers `false`) makes that canvas incomplete, and the
+//!   frame does not count as what the chart draws: the next one shapes and pushes again
+//!   rather than leaving the missing run missing.
 
 use std::sync::Arc;
 
-use gpui_kit::{Hsla, Pixels, ShapedLine, SharedString, TextRun, TextStyle, Window};
 use smol_str::{SmolStr, format_smolstr};
 use time::Date;
+use ui_core::{
+    app::App,
+    paint::color::Color,
+    text::{ShapedTextHandle, TextAlign, TextStyle},
+};
 
+/// How many shaped labels one chart keeps.
 pub(crate) const TEXT_CACHE_CAPACITY: usize = 128;
 
 /// What a day the service did not report is shown as.
@@ -30,88 +48,86 @@ pub(crate) const TEXT_CACHE_CAPACITY: usize = 128;
 /// ever published.
 pub(crate) const NOT_A_READING: SmolStr = SmolStr::new_static("--");
 
-/// A line of text shaped once and kept.
-struct CachedTextLine {
-    text: SharedString,
-    font_size: Pixels,
-    color: Hsla,
-    line: Arc<ShapedLine>,
+/// One shaped line, kept until its lease is gone or it falls out of the cache.
+struct CachedText {
+    text: SmolStr,
+    style: TextStyle,
+    handle: Arc<ShapedTextHandle>,
 }
 
-/// Shaped labels, keyed by text, size and colour.
+/// Shaped labels, keyed by text and the style they were shaped in.
 pub(crate) struct ChartTextCache {
-    text_style: Option<TextStyle>,
-    entries: Vec<CachedTextLine>,
+    entries: Vec<CachedText>,
 }
 
 impl Default for ChartTextCache {
     fn default() -> Self {
         Self {
-            text_style: None,
             entries: Vec::with_capacity(TEXT_CACHE_CAPACITY),
         }
     }
 }
 
 impl ChartTextCache {
-    /// Shapes `text` in `color`, or returns the line that was shaped before.
+    /// Shapes `text` in `style`, or returns the line that was shaped before.
+    ///
+    /// A handle whose atlas lease is gone is dropped and shaped again: the glyphs it
+    /// named have been reused, so drawing it would be drawing another line's pixels.
     pub(crate) fn line(
         &mut self,
-        text: SharedString,
-        font_size: Pixels,
-        color: Hsla,
-        window: &Window,
-    ) -> Arc<ShapedLine> {
-        let text_style = window.text_style();
-        if self.text_style.as_ref() != Some(&text_style) {
-            self.text_style = Some(text_style.clone());
-            self.entries.clear();
-        }
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.text == text && entry.color == color && entry.font_size == font_size
-        }) {
+        app: &mut App,
+        text: &str,
+        style: &TextStyle,
+    ) -> Arc<ShapedTextHandle> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.text == text && entry.style == *style)
+        {
             // Refreshing recency by moving the entry to the back is what makes the
             // capacity below evict the least recently used label.
             let entry = self.entries.remove(index);
-            let line = entry.line.clone();
-            self.entries.push(entry);
-            return line;
+            if !entry.handle.is_stale() {
+                let handle = Arc::clone(&entry.handle);
+                self.entries.push(entry);
+                return handle;
+            }
         }
-
-        let text_len = text.len();
-        let line = Arc::new(window.text_system().shape_line(
-            text.clone(),
-            font_size,
-            &[TextRun {
-                len: text_len,
-                font: text_style.font(),
-                color,
-                ..Default::default()
-            }],
-            None,
-        ));
+        let handle = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
+            // Text that cannot be shaped at all is drawn as nothing rather
+            // than failing the frame: an axis label is not worth a dropped
+            // frame, and the next frame tries again.
+            app.shape_text("", style, None, &[])
+                .expect("an empty line always shapes")
+        }));
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
         }
-        self.entries.push(CachedTextLine {
-            text,
-            font_size,
-            color,
-            line: line.clone(),
+        self.entries.push(CachedText {
+            text: SmolStr::new(text),
+            style: style.clone(),
+            handle: Arc::clone(&handle),
         });
-        line
+        handle
     }
 
-    /// The width `text` occupies, shaped in `color`.
-    pub(crate) fn width(
-        &mut self,
-        text: &str,
-        font_size: Pixels,
-        color: Hsla,
-        window: &Window,
-    ) -> Pixels {
-        self.line(SharedString::new(text), font_size, color, window)
-            .width()
+    /// The width `text` occupies, shaped in `style`.
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+        self.line(app, text, style).size().width
+    }
+
+    /// Whether any line this cache holds can no longer be drawn from the atlas.
+    ///
+    /// This is what the chart asks before it decides a frame changed nothing: a canvas
+    /// is a value and the chart keeps the one it built, but the *glyphs* a canvas names
+    /// are leased from a shared atlas, and an atlas generation change (a font stack
+    /// change, a reset) or a per-tile eviction leaves every handle the canvas was built
+    /// from pointing at reused texture. The engine drops such runs at encode time
+    /// (`Canvas::without_stale_glyph_runs`), so a chart that did not rebuild would lose
+    /// its axis, date and tooltip labels permanently. Nothing is stale in the steady
+    /// state, so the scan of a few dozen handles is the whole cost of the guard.
+    pub(crate) fn has_stale(&self) -> bool {
+        self.entries.iter().any(|entry| entry.handle.is_stale())
     }
 }
 
@@ -192,4 +208,17 @@ pub(crate) fn format_header_date(date: Date) -> SmolStr {
         date.month() as u8,
         date.day()
     )
+}
+
+/// The style one chart label is shaped in.
+///
+/// Alignment is *not* part of it: this chart places every label itself, from the
+/// measured width the shaped line reports, so that a label sits where its own axis
+/// says it does rather than where a wrapping rule would put it.
+pub(crate) fn label_style(font_size: f32, line_height: f32, color: Color) -> TextStyle {
+    let mut style = TextStyle::new(font_size);
+    style.color = color;
+    style.line_height = Some(line_height / font_size);
+    style.alignment = TextAlign::Left;
+    style
 }
