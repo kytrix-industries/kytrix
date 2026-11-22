@@ -10634,12 +10634,10 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
  "bytes",
  "cargo-packager-updater",
  "download_provider",
- "gpui-kit",
  "http",
  "hyper",
  "hyper-util",
@@ -10651,12 +10649,14 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",
  "tokio-util",
+ "ui_core",
  "url",
- "widget_tokio_runtime",
+ "widget",
 ]
 
 [[package]]

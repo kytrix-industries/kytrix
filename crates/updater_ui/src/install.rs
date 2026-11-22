@@ -17,8 +17,7 @@ use cargo_packager_updater::{
     Config, Update, UpdateFormat, WindowsConfig, WindowsUpdateInstallMode,
 };
 use i18n::language::codes::LanguageCode;
-use tokio::task::JoinHandle;
-use widget_tokio_runtime::runtime::Runtime;
+use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{
     error::InstallError,
@@ -53,14 +52,16 @@ pub(crate) fn supported() -> bool {
 /// nothing reports an outcome. On macOS and Linux it resolves once the files are in
 /// place, and the application is what leaves afterwards.
 pub(crate) fn install(
-    runtime: &Runtime,
+    runtime: &Handle,
     release: &ReleaseInfo,
     bytes: Bytes,
     language: LanguageCode,
 ) -> JoinHandle<Result<(), InstallError>> {
     let release = release.clone();
 
-    runtime.blocking(move || {
+    // `Handle::spawn_blocking` carries the runtime itself, so the work runs on the
+    // application runtime's blocking pool whatever thread the caller is on.
+    runtime.spawn_blocking(move || {
         let update = update_value(&release, language)?;
         update
             .install(bytes.to_vec())
