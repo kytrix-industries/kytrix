@@ -510,7 +510,7 @@ impl Tree {
         // 选中与扁平集合位置来自列表行基线。层级用 `level`（0-based depth）表达 —— 行是虚拟列表
         // 的兄弟行，物理树里没有嵌套，引擎的父子推导因此给出「全部挂在 Tree 下」。
         let flat_a11y = flat.clone();
-        list.set_row_a11y(move |index| {
+        list.set_row_a11y(move |_cx, index| {
             let flat = flat_a11y.borrow();
             let Some(row) = flat.get(index) else {
                 return A11yPatch::default();

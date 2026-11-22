@@ -512,7 +512,7 @@ impl Table {
         );
         // 行级 a11y（E9）：表格行用 `Row`（不是默认的 `ListBoxOption`）。行号 / 行总数由引擎
         // 从集合结构推导：0 = 表头行、数据行 = 行窗口基址 + 条目逻辑下标、总数含未挂载条目。
-        list.set_row_a11y(|_| A11yPatch {
+        list.set_row_a11y(|_cx, _| A11yPatch {
             role: Some(A11yRole::Row),
             ..A11yPatch::default()
         });

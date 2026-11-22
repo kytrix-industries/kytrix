@@ -72,6 +72,15 @@
 //! dialog.open(app, window)?;
 //! ```
 //!
+//! # 动态标题（P2-11）
+//!
+//! 标题不是构建期常量：`Dialog` 自持一条 `Signal<SmolStr>`，标题文本节点 `bind_text` 读它，
+//! [`Dialog::set_title`] 写它 —— 语言切换 / 状态驱动的标题不需要整只重建对话框（W8a/W8b/W9
+//! 登记的 §15.2 缺口在 dialog 上的收口）。可访问名同步更新：打开中的浮层包装节点走
+//! `App::set_a11y_patch`（下一个 a11y 帧交付），下一次打开走 `OverlayA11y`。标题文本节点只在
+//! `header(true)` 且打开时标题非空时建出（与旧语义的布局一致）；空标题对话框的 `set_title`
+//! 只更新可访问名与下一次打开，不凭空长出一行标题。
+//!
 //! # 生命周期
 //!
 //! 信号 / 瞬时值归自有 `SignalScope`（[`Dialog::release`] 释放）；面板节点归引擎（引擎浮层卸载
@@ -88,6 +97,7 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 use taffy::style::{LengthPercentageAuto, Position};
 use ui_core::{
+    a11y::A11yPatch,
     app::App,
     error::EngineError,
     interaction::ActionCtx,
@@ -238,10 +248,12 @@ impl DialogConfig {
         }
     }
 
-    fn a11y(&self) -> OverlayA11y {
+    /// 浮层包装节点的 a11y 声明：角色按 dialog / alert 二分，可访问名取**当前**标题
+    /// （[`Dialog::set_title`] 之后重开用的是新标题）。
+    fn a11y(&self, title: &str) -> OverlayA11y {
         match self.role {
-            DialogRole::Dialog => OverlayA11y::dialog(self.title.clone()),
-            DialogRole::AlertDialog => OverlayA11y::alert_dialog(self.title.clone()),
+            DialogRole::Dialog => OverlayA11y::dialog(title),
+            DialogRole::AlertDialog => OverlayA11y::alert_dialog(title),
         }
     }
 }
@@ -272,6 +284,9 @@ struct DialogInner {
     scope: SignalScope,
     /// 对话框状态（`true` 从打开到退场结束；`is_open` 读它）。
     open: Signal<bool>,
+    /// 当前标题（P2-11）：标题文本节点 `bind_text` 读它、a11y 可访问名取它；
+    /// [`Dialog::set_title`] 写它 —— 语言切换不需要整只重建对话框。
+    title: Signal<SmolStr>,
     /// 是否已经开始程序化关闭（淡出中；Esc / 点外部是引擎立即卸载，不置位）。
     closing: Cell<bool>,
     /// 本次关闭的原因（开始关闭时写入；引擎侧关闭不写 ⇒ 默认 `Dismissed`）。
@@ -446,6 +461,7 @@ impl DialogBuilder {
         let key = key.into();
         let scope = app.signal_scope();
         let open = app.signal_scoped(scope, false);
+        let title = app.signal_scoped(scope, self.config.title.clone());
         let overlay = Overlay::new(
             app,
             theme.clone(),
@@ -466,7 +482,7 @@ impl DialogBuilder {
                 slot: crate::kit::layer::LayerSlot::Exclusive,
                 surface: OverlaySurface::dialog(),
                 scrim: Some(Scrim::default()),
-                a11y: self.config.a11y(),
+                a11y: self.config.a11y(self.config.title.as_str()),
                 fade: self.config.fade,
             },
         );
@@ -477,6 +493,7 @@ impl DialogBuilder {
                 theme,
                 scope,
                 open,
+                title,
                 closing: Cell::new(false),
                 reason: Cell::new(None),
                 on_close: RefCell::new(self.on_close),
@@ -523,6 +540,11 @@ impl Dialog {
             .window(window)
             .ok_or(EngineError::UnknownWindow { window })?
             .size();
+        // 每次打开按**当前**标题写浮层的 a11y 声明（`set_title` 可能在上一次打开之后改过它）。
+        let title = app.read(&self.inner.title).clone();
+        self.inner
+            .overlay
+            .set_a11y(self.inner.config.a11y(title.as_str()));
         let anchor = Anchor::point(Point::new(viewport.width * 0.5, viewport.height * 0.5));
         let opened = self.inner.overlay.open(
             app,
@@ -624,10 +646,40 @@ impl Dialog {
         self.inner.closing.get()
     }
 
-    /// 标题（也是包装节点的 a11y 可访问名）。
+    /// 当前标题（也是浮层包装节点的 a11y 可访问名；`set_title` 之后读到新值）。
     #[must_use]
-    pub fn title(&self) -> &str {
-        &self.inner.config.title
+    pub fn title(&self, app: &App) -> SmolStr {
+        app.read(&self.inner.title).clone()
+    }
+
+    /// 改写标题（语言切换 / 动态标题页不需要整只重建对话框；P2-11 绑定面）。
+    ///
+    /// 写入对话框自己的标题信号：打开中的标题文本节点 `bind_text` 读它，下一次文本 pass 即更新；
+    /// 同时把浮层包装节点的 a11y 可访问名改成新标题（`App::set_a11y_patch`），并更新下一次打开
+    /// 用的 `OverlayA11y`。返回是否真的改了值（同值写入 `false`，不请求帧）。
+    ///
+    /// 空标题对话框（打开时标题为空）不建标题文本节点（与旧语义的布局一致），此时本方法只更新
+    /// a11y 名与下一次打开的标题，不会凭空长出一行标题。
+    pub fn set_title(&self, app: &mut App, title: impl Into<SmolStr>) -> bool {
+        let title = title.into();
+        if !app.write(&self.inner.title, title.clone()) {
+            return false;
+        }
+        self.inner
+            .overlay
+            .set_a11y(self.inner.config.a11y(title.as_str()));
+        let window = self.inner.state.borrow().window;
+        if let (Some(window), Some(wrapper)) = (window, self.inner.overlay.overlay_node()) {
+            let _ = app.set_a11y_patch(
+                window,
+                wrapper,
+                A11yPatch {
+                    label: Some(title),
+                    ..A11yPatch::default()
+                },
+            );
+        }
+        true
     }
 
     /// 浮层键（调试 id 前缀）。
@@ -726,13 +778,16 @@ impl Dialog {
             .build(tree_mut(app, window)?, panel)?;
         if self.inner.config.header && !self.inner.config.title.is_empty() {
             let title_theme = self.inner.theme.clone();
+            let title = self.inner.title;
             NodeBuilder::text(self.inner.config.title.clone(), {
                 let mut style = TextStyle::new(TITLE_SIZE);
                 style.weight = 700;
                 style.alignment = TextAlign::Center;
                 style
             })
+            .id(format_smolstr!("{key}:title"))
             .style(StyleBuilder::new().width_full().build())
+            .bind_text(move |cx| cx.read(&title).clone())
             .bind_style(move |cx| StylePatch {
                 foreground: Some(title_theme.role(cx, Role::FgDefault)),
                 ..StylePatch::default()
@@ -993,7 +1048,7 @@ mod tests {
 
     use std::{cell::Cell, rc::Rc, time::Duration};
 
-    use smol_str::format_smolstr;
+    use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::A11yRole,
         app::App,
@@ -1127,6 +1182,30 @@ mod tests {
                 .tree()
                 .get(node)
                 .is_ok()
+        }
+
+        /// 按调试 id 找节点（当前窗口整棵树）。
+        fn find(&self, debug_id: &str) -> Option<NodeId> {
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            let mut stack = vec![tree.root()];
+            while let Some(node) = stack.pop() {
+                if tree.debug_id(node) == Some(debug_id) {
+                    return Some(node);
+                }
+                if let Ok(target) = tree.get(node) {
+                    stack.extend(target.children().iter().rev().copied());
+                }
+            }
+            None
+        }
+
+        /// 文本节点的当前文本。
+        fn text_of(&self, node: NodeId) -> Option<SmolStr> {
+            let tree = self.app.app().window(self.window).expect("窗口").tree();
+            match tree.get(node).expect("文本节点").kind() {
+                ui_core::node::tree::NodeKind::Text(content) => Some(content.text.clone()),
+                other => panic!("期望文本节点，实际 {other:?}"),
+            }
         }
 
         fn background_with_actions(&mut self) -> (NodeId, Signal<u32>) {
@@ -1290,7 +1369,7 @@ mod tests {
                 .cancel("Cancel", |_| {}),
             "layout",
         );
-        assert_eq!(dialog.title(), "Save changes");
+        assert_eq!(dialog.title(harness.app.app()), "Save changes");
         let panel = harness.bounds(dialog.panel_node().expect("面板"));
         let body = harness.bounds(dialog.body_node().expect("内容列"));
         let ok = harness.bounds(
@@ -1663,6 +1742,94 @@ mod tests {
             .find(|record| record.role == A11yRole::Group)
             .expect("遮罩在 a11y 树里");
         assert!(scrim.hidden, "遮罩必须 hidden（纯装饰）");
+    }
+
+    /// P2-11（W8a/W8b/W9 的 §15.2 缺口）：`set_title` 改写打开中的标题文本与浮层 a11y 名，
+    /// **不重建**标题节点；重开之后仍是新标题（`OverlayA11y` 跟着当前标题）。
+    #[test]
+    fn setting_the_title_rewrites_the_title_node_and_the_a11y_name() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let dialog = harness.dialog(DialogBuilder::new("Save changes").fade(false), "titled");
+        let title_node = harness.find("titled:title").expect("标题节点");
+        assert_eq!(
+            harness.text_of(title_node),
+            Some(SmolStr::new_static("Save changes"))
+        );
+        let wrapper = dialog.overlay_node().expect("包装节点");
+        {
+            let snapshot = full_a11y(&mut harness.app);
+            assert_eq!(
+                a11y_of(&snapshot, wrapper).label_text(),
+                Some("Save changes")
+            );
+        }
+
+        assert_eq!(dialog.title(harness.app.app()), "Save changes");
+        assert!(dialog.set_title(harness.app.app_mut(), "保存更改"));
+        assert_eq!(dialog.title(harness.app.app()), "保存更改");
+        assert!(
+            !dialog.set_title(harness.app.app_mut(), "保存更改"),
+            "同值写入是 no-op"
+        );
+        harness.settle(&dialog);
+        assert_eq!(
+            harness.find("titled:title"),
+            Some(title_node),
+            "标题节点不重建"
+        );
+        assert_eq!(
+            harness.text_of(title_node),
+            Some(SmolStr::new_static("保存更改"))
+        );
+        let snapshot = full_a11y(&mut harness.app);
+        assert_eq!(
+            a11y_of(&snapshot, wrapper).label_text(),
+            Some("保存更改"),
+            "a11y 名跟随标题"
+        );
+
+        // 重开：标题节点按新标题重建，`OverlayA11y` 也用新标题。
+        assert!(dialog.close_now(harness.app.app_mut()));
+        assert!(
+            dialog
+                .open(harness.app.app_mut(), harness.window)
+                .expect("重开")
+        );
+        harness.settle(&dialog);
+        let reopened = harness.find("titled:title").expect("重开后的标题节点");
+        assert_eq!(
+            harness.text_of(reopened),
+            Some(SmolStr::new_static("保存更改"))
+        );
+        let snapshot = full_a11y(&mut harness.app);
+        assert_eq!(
+            a11y_of(&snapshot, dialog.overlay_node().expect("包装节点")).label_text(),
+            Some("保存更改")
+        );
+    }
+
+    /// alert 形状没有标题行节点（内容自己的标题归 alert），`set_title` 更新的是浮层可访问名
+    /// （旧 alert 的标题语义）与下一次打开的声明。
+    #[test]
+    fn setting_the_title_of_an_alert_updates_its_a11y_name() {
+        let mut harness = Harness::new();
+        harness.app.enable_a11y_capture();
+        let dialog = harness.dialog(
+            DialogBuilder::alert("Rename", |_dialog, _theme| {
+                AlertBuilder::new().ok_cancel("Rename", "Enter a name.")
+            })
+            .fade(false),
+            "alert-title",
+        );
+        let wrapper = dialog.overlay_node().expect("包装节点");
+        assert!(
+            harness.find("alert-title:title").is_none(),
+            "alert 形状没有标题行节点"
+        );
+        assert!(dialog.set_title(harness.app.app_mut(), "重命名"));
+        let snapshot = full_a11y(&mut harness.app);
+        assert_eq!(a11y_of(&snapshot, wrapper).label_text(), Some("重命名"));
     }
 
     #[test]
