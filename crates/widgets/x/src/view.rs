@@ -70,7 +70,12 @@
 //! (`crates/widgets/AGENTS.md` §6). Only "no account" — nobody to read a timeline for —
 //! is a neutral [`Notice`].
 
-use std::{cell::RefCell, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
 
 use ahash::AHashMap as HashMap;
 use app_config::{
@@ -87,7 +92,7 @@ use base_ui::{
         size::{UnifiedSizable, UnifiedSize},
     },
     style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
+    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -102,7 +107,7 @@ use time::OffsetDateTime;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch},
     error::EngineError,
-    event::{Event, InputEvent, PointerButton},
+    event::{Action, Event, InputEvent, PointerButton},
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -112,7 +117,7 @@ use ui_core::{
         tree::NodeTree,
     },
     paint::{color::Color, style::StylePatch},
-    text::{TextAlign, TextOverflow, TextStyle},
+    text::{TextAlign, TextOverflow, TextRun, TextStyle},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding},
@@ -392,12 +397,22 @@ struct RowContext {
     language: Signal<LanguageCode>,
     config: Signal<SettingsConfig>,
     theme: ThemeHandle,
+    /// The appearance the visible rows were built against.
+    ///
+    /// A text run's colour is a static load the engine does not re-read (there is no
+    /// dynamic channel inside a run), so a link's colour is the brand role of the
+    /// appearance the row was built for: the pane updates this cell and rebuilds the
+    /// visible window when the appearance moves.
+    appearance: Rc<Cell<Appearance>>,
     translate: Translate,
     images: RowImages,
     /// The picture states the rows draw, mirrored from the feed's media map.
     media: Rc<RefCell<MediaStates>>,
     icons: RowIcons,
     hits: RowHits,
+    /// The action a failed picture's tile declares: Enter / Space on the focused tile
+    /// (and an assistive technology's activation) ask for the picture again.
+    retry: Action,
 }
 
 impl RowContext {
@@ -441,8 +456,17 @@ pub struct XWidget {
     /// The picture state the rows were last built against, so a media change rebuilds
     /// the visible window.
     built_media: Option<MediaStates>,
+    /// The appearance the visible rows were built against (a link's colour is a static
+    /// run colour, see [`RowContext::appearance`]).
+    appearance: Rc<Cell<Appearance>>,
     /// The image resources registered for the pictures on screen.
     images: RowImages,
+    /// The action a failed picture's tile declares, registered on the app for the
+    /// keyboard / assistive-technology activation of that tile.
+    media_retry_action: Option<Action>,
+    /// The URL a failed picture's tile asked to fetch again, written by the tile's own
+    /// handler or by a pointer landing on it and taken by the next `sync`.
+    media_retry: Signal<Option<SmolStr>>,
     /// The icon resources the rows draw, registered once in `body`.
     icons: Option<RowIcons>,
     /// What a pointer lands on inside the feed.
@@ -595,6 +619,12 @@ impl WidgetView for XWidget {
             self.open_dialog(cx)?;
         }
         self.sync_dialog(cx)?;
+        self.sync_media_retry(cx);
+
+        // A link's colour is a static run colour, so the rows are built for an
+        // appearance: a theme that moved rebuilds the visible window, as a media change
+        // does.
+        self.sync_appearance(cx)?;
 
         if let Some(list) = &self.list {
             list.sync(cx.app_mut())?;
@@ -673,7 +703,11 @@ impl WidgetView for XWidget {
             found
         };
         if let Some(url) = failed_url {
-            self.retry_media(url, cx);
+            // The tile's own action is what the engine dispatches for a pointer landing on
+            // it (and for Enter / Space on it); a headless caller reaching this hook
+            // directly asks for the same picture through the same request.
+            let _ = cx.write(&self.media_retry, Some(url));
+            let _ = cx.request_frame();
             return true;
         }
 
@@ -706,6 +740,9 @@ impl WidgetView for XWidget {
         // The header's nodes belong to the pane, which removes its row: only the
         // component's signal scope and action handler are this widget's to release.
         let _ = self.release_manage_button(cx, false);
+        if let Some(action) = self.media_retry_action.take() {
+            let _ = cx.app_mut().off_action(&action);
+        }
         if let Some(mut dialog) = self.dialog.take() {
             dialog.release(cx);
         }
@@ -744,6 +781,27 @@ impl XWidget {
         let plan_signal = cx.signal(Arc::clone(&plans.borrow()));
         let open_dialog_requests = cx.signal(0_u64);
         let account_id = cx.account();
+        let appearance = Rc::new(Cell::new(cx.theme().current(cx.app())));
+
+        // A failed picture's tile declares this action: the keyboard (Enter / Space on the
+        // focused tile) and an assistive technology both activate the target node, and the
+        // handler reads the URL that node stands for out of the hit table — a row builder
+        // has no `App` to register a handler of its own.
+        let hits = RowHits::default();
+        let media_retry = cx.signal(None::<SmolStr>);
+        let media_retry_action = Action::Custom(cx.unique_key("x.feed.retry_media"));
+        let retry_hits = hits.clone();
+        let retry_request = media_retry;
+        let window = cx.window();
+        cx.app_mut()
+            .on_action(media_retry_action.clone(), move |ctx| {
+                let url = retry_hits.failed.borrow().get(&ctx.node()).cloned();
+                let Some(url) = url else {
+                    return;
+                };
+                ctx.write(&retry_request, Some(url));
+                let _ = ctx.app_mut().request_repaint(window);
+            });
 
         Self {
             binding,
@@ -760,9 +818,12 @@ impl XWidget {
             plans,
             plan_signal,
             built_media: None,
+            appearance,
             images: Rc::new(RefCell::new(HashMap::new())),
+            media_retry_action: Some(media_retry_action),
+            media_retry,
             icons: None,
-            hits: RowHits::default(),
+            hits,
             list: None,
             body_root: None,
             empty: None,
@@ -852,6 +913,7 @@ impl XWidget {
         self.media = Arc::new(HashMap::new());
         *self.media_mirror.borrow_mut() = Arc::clone(&self.media);
         self.built_media = None;
+        let _ = cx.write(&self.media_retry, None);
         self.revision = 0;
         self.ready = false;
         self.replace_plans(Arc::from([]), cx);
@@ -871,14 +933,15 @@ impl XWidget {
     }
 
     /// Reports the notice that stands in while the pane has nothing to show.
+    ///
+    /// A pane with no body has no account, and no account is the only neutral notice this
+    /// pane has: a live stream with nothing in it is an empty timeline, which is content
+    /// (`common.no_data`), not a waiting state (AGENTS §6).
     fn report_no_content_notice(&self, cx: &mut WidgetCx<'_>) {
-        let notice = if self.current_scope().is_none() {
-            Notice::message("widget.x.logged_out")
-        } else {
-            Notice::message("widget.x.waiting")
-        };
-        self.status
-            .report(cx.app_mut(), WidgetState::waiting(notice));
+        self.status.report(
+            cx.app_mut(),
+            WidgetState::waiting(Notice::message("widget.x.logged_out")),
+        );
     }
 
     /// Reports the state of a pane whose stream is live.
@@ -908,6 +971,13 @@ impl XWidget {
         result: widget::binding::WidgetRpcResult<TweetProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        // A failure is terminal: only the user's recovery leaves it, and no answer that was
+        // already out can steer a pane that has given up. This is the second of the two
+        // doors every entry checks (AGENTS §4.4 / design §13.12), and it comes before the
+        // identity is attributed so a late answer is not even taken off the table.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
         match self.pending.take(request_id) {
             Some(PendingCommand::Start) => self.apply_load_result(result, cx),
             Some(PendingCommand::FetchSelections) => self.apply_selections_result(result, cx),
@@ -1043,10 +1113,13 @@ impl XWidget {
             self.feed.as_ref().map_or(&[], TweetSnapshot::items),
             update.feed().items(),
         );
-        let media_changed = match self.built_media.as_ref() {
-            Some(built) => !Arc::ptr_eq(built, update.media()),
-            None => true,
-        };
+        // The service publishes a fresh map with every event, so the question is whether
+        // the picture states changed, not whether this event's map is another allocation:
+        // a pointer comparison would rebuild the window on every update (media or not).
+        let media_changed = self
+            .built_media
+            .as_ref()
+            .is_none_or(|built| built != update.media());
         self.feed = Some(update.feed().clone());
         self.media = update.media().clone();
         *self.media_mirror.borrow_mut() = Arc::clone(&self.media);
@@ -1130,6 +1203,43 @@ impl XWidget {
         }
     }
 
+    /// Takes the request a failed picture's tile made, and asks the service for that
+    /// picture again.
+    ///
+    /// The tile's own action writes the same signal a pointer landing on it does, so the
+    /// keyboard path, an assistive technology and a click are one request.
+    fn sync_media_retry(&mut self, cx: &mut WidgetCx<'_>) {
+        let request = cx.read(&self.media_retry).clone();
+        let Some(url) = request else {
+            return;
+        };
+        cx.write(&self.media_retry, None);
+        self.retry_media(url, cx);
+    }
+
+    /// Rebuilds the visible window when the appearance moved.
+    ///
+    /// A link's colour is a static run colour (`TextContent::runs`), which the engine does
+    /// not re-read on a theme change: the rows are built for the appearance showing when
+    /// they are built, so a moved appearance is another window of rows (AGENTS §7 does not
+    /// allow a colour baked at mount time to outlive the appearance it was read from).
+    fn sync_appearance(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let appearance = cx.theme().current(cx.app());
+        if appearance == self.appearance.get() {
+            return Ok(());
+        }
+        self.appearance.set(appearance);
+        if let Some(list) = &self.list {
+            let count = list.count(cx.app());
+            if count > 0 {
+                list.set_count(cx.app_mut(), count)?;
+            }
+        }
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
     /// Builds the list the body draws its feed with.
     fn make_list(&mut self, cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<List, EngineError> {
         let context = RowContext {
@@ -1138,6 +1248,7 @@ impl XWidget {
             language: cx.language(),
             config: cx.services().config,
             theme: cx.theme().clone(),
+            appearance: Rc::clone(&self.appearance),
             translate: cx.translate().clone(),
             images: Rc::clone(&self.images),
             media: Rc::clone(&self.media_mirror),
@@ -1146,9 +1257,13 @@ impl XWidget {
                 .clone()
                 .expect("the row icons are registered before the list is built"),
             hits: self.hits.clone(),
+            retry: self
+                .media_retry_action
+                .clone()
+                .expect("the retry action is registered before the list is built"),
         };
         let count = self.feed.as_ref().map_or(0, |feed| feed.items().len());
-        let key = format_smolstr!("XList:{}", parent.to_bits());
+        let key = cx.unique_key("x.feed.list");
         let theme = cx.theme().clone();
         let window = cx.window();
         let list = List::new(
@@ -1216,7 +1331,8 @@ impl XWidget {
             )
             .build(cx.tree_mut(), root)?;
         let text = t_smol!(cx.translate(), "common.no_data");
-        EmptyState::new(cx.theme().clone(), "XTweetEmpty")
+        let key = cx.unique_key("x.empty");
+        EmptyState::new(cx.theme().clone(), key)
             .text(text)
             .build(cx.tree_mut(), overlay)?;
         self.empty = Some(overlay);
@@ -1953,8 +2069,8 @@ fn build_row(
         .build(tree, parent)?;
     context.hits.rows.borrow_mut().insert(row, plan.url.clone());
 
-    if let Some(reposted_by) = plan.reposted_by.clone() {
-        build_repost_line(tree, row, reposted_by, context)?;
+    if plan.reposted_by.is_some() {
+        build_repost_line(tree, row, &plan, context)?;
     }
     build_tweet(tree, row, &plan, context)?;
 
@@ -1996,7 +2112,7 @@ fn row_a11y(
 fn build_repost_line(
     tree: &mut NodeTree,
     parent: NodeId,
-    reposted_by: SmolStr,
+    plan: &RowPlan,
     context: &RowContext,
 ) -> Result<(), EngineError> {
     let line = NodeBuilder::boxed()
@@ -2018,8 +2134,29 @@ fn build_repost_line(
         context.theme.clone(),
         Role::FgMuted,
     )?;
-    NodeBuilder::text(reposted_by, TextStyle::new(META_SIZE.text_size()))
+    let repost = t_smol!(
+        context.translate,
+        "widget.x.reposted",
+        name = plan.reposted_by.clone().unwrap_or_default()
+    );
+    NodeBuilder::text(repost, TextStyle::new(META_SIZE.text_size()))
         .style(StyleBuilder::new().min_width_0().build())
+        .bind_text({
+            let plan_signal = context.plan_signal;
+            let language = context.language;
+            let translate = context.translate.clone();
+            let row_id = plan.row_id.clone();
+            let tweet_id = plan.tweet_id.clone();
+            move |read| {
+                let _language = read.read(&language);
+                let plans = read.read(&plan_signal);
+                plan_in(&plans, &row_id, &tweet_id, false)
+                    .and_then(|plan| plan.reposted_by.clone())
+                    .map_or_else(SmolStr::default, |name| {
+                        t_smol!(translate, "widget.x.reposted", name = name)
+                    })
+            }
+        })
         .bind_style(themed_foreground(context.theme.clone(), Role::FgMuted))
         .build(tree, line)?;
 
@@ -2243,10 +2380,12 @@ fn build_tweet_header(
 
 /// One tweet's text, with the runs that are links styled and clickable.
 ///
-/// Link colours have no dynamic channel inside a run (the engine's runs are static
-/// styles), so the text is drawn in one colour and the links are hit-tested by byte
-/// range: the pane's `dispatch` turns a click over a link range into that link's URL.
-/// The links are underlined so they are still visible as links.
+/// A link's colour is a **static run colour** (`TextContent::runs`): the engine has no
+/// dynamic channel inside a run, so the rows are built for the appearance showing at build
+/// time and the pane rebuilds the visible window when the appearance moves (see
+/// [`RowContext::appearance`]). The run ranges are the plan's link byte ranges, which is
+/// also what `dispatch` hit-tests a click over a link against — one source for what is
+/// coloured and what is clickable.
 fn build_text(
     tree: &mut NodeTree,
     parent: NodeId,
@@ -2259,9 +2398,21 @@ fn build_text(
         BODY_SIZE.text_size()
     });
     style.overflow = TextOverflow::Clip;
-    let decoration = StylePatch::default();
+    let link_color = context
+        .theme
+        .theme_for(context.appearance.get())
+        .role(Role::BrandBase);
+    let mut run_style = style.clone();
+    run_style.color = link_color;
+    let runs: Vec<TextRun> = plan
+        .links
+        .iter()
+        .map(|(range, _)| TextRun::new(range.clone(), run_style.clone()))
+        .collect();
     let links = Rc::clone(&plan.links);
     let node = NodeBuilder::text(plan.text.clone(), style)
+        .id(format_smolstr!("TEST_TWEET_TEXT:{}", plan.tweet_id))
+        .runs(runs)
         .style(StyleBuilder::new().min_width_0().build())
         .bind_text({
             let plan_signal = context.plan_signal;
@@ -2278,7 +2429,7 @@ fn build_text(
             let theme = context.theme.clone();
             move |read| StylePatch {
                 foreground: Some(theme.role(read, Role::FgDefault)),
-                ..decoration.clone()
+                ..StylePatch::default()
             }
         })
         .bind_a11y({
@@ -2371,7 +2522,7 @@ fn build_media_tile(
         .height(height)
         .flex_none()
         .build();
-    let tile = NodeBuilder::boxed()
+    let mut tile = NodeBuilder::boxed()
         .id(format_smolstr!(
             "TEST_TWEET_MEDIA:{}:{index}",
             plan.tweet_id
@@ -2381,14 +2532,46 @@ fn build_media_tile(
             context.theme.clone(),
             Role::SurfaceRaised,
         ))
-        .a11y(A11yOverride {
-            // A still frame standing in for an animation says what it is; every other
-            // picture is decoration the row's label already names.
-            label: item.poster_only.then(|| SmolStr::new_static("GIF")),
-            hidden: !item.poster_only,
-            ..A11yOverride::default()
-        })
-        .build(tree, parent)?;
+        .bind_a11y({
+            let media = Rc::clone(&context.media);
+            let language = context.language;
+            let translate = context.translate.clone();
+            let url = item.url.clone();
+            let poster_only = item.poster_only;
+            move |read| {
+                let _language = read.read(&language);
+                let state = media.borrow().get(&url).cloned();
+                match state {
+                    // A picture that could not be fetched is a way to ask for it again:
+                    // it is in the a11y tree with that name, and its activation is the
+                    // retry (see the tile action below).
+                    Some(MediaState::Failed) => A11yPatch {
+                        label: Some(t_smol!(translate, "common.retry")),
+                        description: Some(t_smol!(translate, "widget.x.media_load_failed")),
+                        hidden: Some(false),
+                        ..A11yPatch::default()
+                    },
+                    // A still frame standing in for an animation says what it is; every
+                    // other picture is decoration the row's label already names.
+                    Some(MediaState::Ready(_)) if poster_only => A11yPatch {
+                        label: Some(SmolStr::new_static("GIF")),
+                        hidden: Some(false),
+                        ..A11yPatch::default()
+                    },
+                    _ => A11yPatch {
+                        hidden: Some(true),
+                        ..A11yPatch::default()
+                    },
+                }
+            }
+        });
+    if matches!(state, Some(MediaState::Failed)) {
+        // A row builder has no `App` to register a handler, so the tile declares the
+        // pane's retry action: the pointer, Enter / Space on the focused tile and an
+        // assistive technology's activation all reach that one handler.
+        tile = tile.on_action(context.retry.clone());
+    }
+    let tile = tile.build(tree, parent)?;
 
     match state {
         Some(MediaState::Ready(_)) => {

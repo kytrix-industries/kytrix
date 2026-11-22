@@ -1040,15 +1040,12 @@ widget:
     protected: Protected
     refresh: Refresh monitored accounts
     reposted: '%{name} reposted'
-    scroll_tweets: Scroll tweets
     search_placeholder: username
     search_users: Search X accounts
     searching_users: Searching X accounts
     stream_unavailable: The X timeline stream is not connected
     success_title: Success
-    timeline_end: There are currently no more tweets.
     tweet: 'Tweet by %{author} at %{time}'
-    waiting: <p align="center">Waiting for tweets</p>
   volume_heatmap:
     choose_venue: Choose a market participant
     refresh_now: Refresh the volume heat map now

@@ -1040,15 +1040,12 @@ widget:
     protected: 受保护
     refresh: 刷新监控账号
     reposted: '%{name} 已转贴'
-    scroll_tweets: 滚动推文
     search_placeholder: 用户名
     search_users: 搜索 X 账号
     searching_users: 正在搜索 X 账号
     stream_unavailable: X 推文流尚未连接
     success_title: 成功
-    timeline_end: 当前没有更多推文
     tweet: '%{author} 的推文，时间 %{time}'
-    waiting: <p align="center">等待推文</p>
   volume_heatmap:
     choose_venue: 请选择市场参与者
     refresh_now: 立即刷新成交量热力图
