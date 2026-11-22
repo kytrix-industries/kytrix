@@ -105,12 +105,13 @@ use ui_core::{
     window::WindowId,
 };
 use widget::{
-    binding::{Inbound, WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
     error::market_is_catalog_not_loaded,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     view::{HeaderGroup, ReloadHandle, WidgetView},
 };
@@ -162,6 +163,19 @@ impl WidgetConfig for MarketTradeConfig {
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
 }
 
+/// One command this pane sent and has not seen the answer to.
+///
+/// A tape reads through one binding and issues one kind of command, so the tag names
+/// the read: it is the identity the binding returned that decides whose answer arrived.
+/// A reply whose identity is not tracked answers a call the pane already replaced (a new
+/// selection, or signing out of a route) and is dropped and counted rather than failing
+/// the scope that replaced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// The read: `Load` or `Retry`.
+    Start,
+}
+
 pub struct MarketTradeWidget {
     /// The options this widget persists.
     config: MarketTradeConfig,
@@ -170,6 +184,8 @@ pub struct MarketTradeWidget {
     /// A headless host without a connector has nothing to start: the pane waits for the
     /// directory instead of spawning a service it could never ask a question.
     binding: Option<WidgetBinding<MarketTradeProtocol>>,
+    /// The command in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     /// The table, once the body has been built (the framework builds a body only once
     /// the pane has content).
     table: Option<Table>,
@@ -524,6 +540,7 @@ impl MarketTradeWidget {
         Self {
             config,
             binding,
+            pending: Pending::new(),
             table: None,
             table_slot: None,
             table_built: None,
@@ -762,7 +779,8 @@ impl MarketTradeWidget {
             MarketTradeRequest::Load { listing }
         };
         if let Some(binding) = self.binding.as_mut() {
-            binding.call(cx, request);
+            let request_id = binding.call(cx, request);
+            self.pending.track(request_id, PendingCommand::Start);
         }
     }
 
@@ -829,7 +847,28 @@ impl MarketTradeWidget {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
             Inbound::Latest { key, message } => self.apply_latest(key, &message, cx),
-            Inbound::Rpc { result, .. } => self.apply_rpc_result(result, cx),
+            Inbound::Rpc { request_id, result } => {
+                self.apply_rpc(request_id, result, cx);
+            }
+        }
+    }
+
+    /// Applies one RPC reply, once its identity says it answers the command in flight.
+    ///
+    /// The binding replaces its command slot on every read, but a reply can already be
+    /// queued when that happens: only the identity [`WidgetBinding::call`] returned may
+    /// reach the pane, and a reply this table does not know is dropped and counted.
+    fn apply_rpc(
+        &mut self,
+        request_id: RequestId,
+        result: WidgetRpcResult<MarketTradeProtocol>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Start) => self.apply_rpc_result(result, cx),
+            // Late or unknown: the reply answers a read this pane replaced, and the
+            // table has counted it.
+            None => {}
         }
     }
 

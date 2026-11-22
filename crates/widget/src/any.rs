@@ -627,6 +627,8 @@ fn reload_handle<W: WidgetView>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use smol_str::SmolStr;
     use ui_core::{error::EngineError, node::id::NodeId};
 
@@ -635,8 +637,8 @@ mod tests {
         config::WidgetConfigChange,
         cx::WidgetCx,
         identity::{WidgetId, WidgetInstanceId},
-        status::{WidgetAction, WidgetStatus},
-        test_support::{WaitingWidget, WidgetTestApp},
+        status::{Notice, WidgetAction, WidgetState, WidgetStatus},
+        test_support::{FixtureFailure, WaitingWidget, WidgetTestApp},
         view::{HeaderGroup, ReloadHandle, WidgetView},
     };
 
@@ -725,6 +727,92 @@ mod tests {
             harness.app_mut().release_scope(scope),
             0,
             "the refused mount released the scope it minted"
+        );
+    }
+
+    /// A widget whose first load fails and offers the framework's recovery, and whose
+    /// recovery's load settles into a waiting state: the state it reports is how the
+    /// test sees which code path ran.
+    struct RecoveringWidget {
+        status: WidgetStatus,
+        recovery: WidgetAction,
+        failed: bool,
+    }
+
+    impl WidgetView for RecoveringWidget {
+        type Config = ();
+
+        const ID: WidgetId = WidgetId::new_static("test.recovering");
+        const DISPLAY_NAME: &'static str = "test.recovering";
+        const CATEGORY: WidgetCategory = WidgetCategory::Market;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            _config: Self::Config,
+            status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self {
+                status,
+                recovery,
+                failed: false,
+            })
+        }
+
+        fn load(&mut self, cx: &mut WidgetCx<'_>) {
+            if self.failed {
+                self.status.report(
+                    cx.app_mut(),
+                    WidgetState::waiting(Notice::message("test.waiting")),
+                );
+                return;
+            }
+            self.failed = true;
+            self.status.report(
+                cx.app_mut(),
+                WidgetState::failed(Arc::new(FixtureFailure), self.recovery.clone()),
+            );
+        }
+
+        fn has_content(&self) -> bool {
+            false
+        }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    /// The framework's recovery control is the reload path, end to end: the widget's
+    /// own failure carries the action `mount` built, a click goes through the engine's
+    /// real action dispatch, and the action runs the widget's `load` again — not a
+    /// handler the widget (or the test) wired itself.
+    #[test]
+    fn the_recovery_control_runs_the_widget_load_again() {
+        let mut harness = WidgetTestApp::new();
+        let widget = harness.mount::<RecoveringWidget>(());
+        assert!(widget.status().is_failed(harness.app()));
+        harness.drain();
+
+        let placeholder = harness
+            .find_by_debug_prefix(widget.surface(), "WIDGET_PLACEHOLDER")
+            .expect("the failure stands in for the missing content");
+        harness.click_recovery(placeholder);
+
+        assert_eq!(
+            widget.status().state(harness.app()),
+            WidgetState::waiting(Notice::message("test.waiting")),
+            "the click ran the widget's load again, and what it reported is the state"
+        );
+        harness.drain();
+        assert!(
+            harness
+                .text_of(widget.surface())
+                .contains("Waiting for orders"),
+            "the frame after the recovery draws what the second load reported"
         );
     }
 
