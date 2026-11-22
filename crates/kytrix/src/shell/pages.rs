@@ -171,7 +171,8 @@ impl Pages {
         let host = settings_ui::host::SettingsHost::new(
             std::rc::Rc::clone(composition.services()),
             composition.settings_store.clone(),
-        );
+        )
+        .with_downloads(std::rc::Rc::clone(composition.translation_downloads()));
         let page = SettingsPage::mount(host, "kytrix.settings", app, self.window, self.root)?;
         self.settings = Some(page);
         self.page = Page::Settings;

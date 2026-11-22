@@ -25,7 +25,8 @@
 //! animation router) are the ones the indicator and the dialog build through — plus the
 //! two collaborators the toolkit used to supply: the application's transport, and a
 //! [`DownloadService`](crate::download::DownloadService) over the process-wide download
-//! manager (a seam, because that manager is still a toolkit entity until P5).
+//! manager (a seam, so a test can answer the payload request itself and the manager stays
+//! the application's one).
 //!
 //! The updater owns one frame route on the injected router. It drains the messages its
 //! asynchronous work delivered, applies them to [`state::UpdaterState`], writes the

@@ -42,20 +42,18 @@
 //! # Why two collaborators are optional
 //!
 //! Both [`WidgetServices::market_participants`] and
-//! [`WidgetServices::kytrix_service`] are application-shell objects:
-//! `MarketParticipantsConnector` takes a `widget_tokio_runtime` runtime, and
-//! `KytrixServiceConnector::install` takes the toolkit application context plus a
-//! `ConfigNotification`; both crates still depend on the old toolkit. The contract
-//! layer cannot construct either in a headless test, so both are `Option`:
+//! [`WidgetServices::kytrix_service`] are application-shell objects: the directory
+//! connector takes a `widget_tokio_runtime` runtime, and the service connector owns
+//! the process's OAuth session and its transport. Both are constructed by the
+//! composition root (the connector through its toolkit-free
+//! `KytrixServiceConnector::spawn`, P4-5). The contract layer cannot construct either
+//! in a headless test, so both are `Option` (§13.9 R-1):
 //!
 //! - the application root always supplies them;
 //! - a headless test that does not read the directory or the service leaves them
 //!   absent, and a widget that needs one maps `None` to its own business
 //!   notice/failure (there is no shared `WidgetError` type for it — a widget states
 //!   its own).
-//!
-//! P4 adds a toolkit-free construction seam and both become required fields; the
-//! `Option` is a transition forced by the old toolkit, not the frozen shape.
 //!
 //! # The application seams a widget cannot read itself
 //!

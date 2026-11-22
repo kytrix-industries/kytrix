@@ -2,8 +2,8 @@
 //!
 //! The window is frameless on Windows (E6): the platform draws no title bar, and this strip
 //! is what the user sees instead. It carries the sidebar toggle, the market participants
-//! menu, and — everywhere but macOS, where the system draws its traffic lights — the
-//! window's minimize / maximize / close buttons.
+//! menu, the update indicator, the account control, and — everywhere but macOS, where the
+//! system draws its traffic lights — the window's minimize / maximize / close buttons.
 //!
 //! # Dragging the window
 //!
@@ -18,7 +18,14 @@
 //! The bar is built once. Its maximize button is rebuilt when the window's maximized state
 //! changes (the icon is the state), and its toggle is rebuilt when the language changes
 //! (the label is catalogue copy). The market participants menu synchronizes itself and
-//! follows the language on its own.
+//! follows the language on its own; the account control and the updater synchronize
+//! themselves once per frame.
+//!
+//! # Release order
+//!
+//! The update indicator reads the updater's view signal, and that signal is minted in the
+//! updater's own scope: the indicator is released first, then the updater. The account
+//! control owns its own signal scope and components and is released independently.
 
 use base_ui::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
@@ -27,6 +34,7 @@ use base_ui::{
 };
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_ui::{host::MarketParticipantsHost, menu::MarketParticipants};
+use profile_ui::profile::ProfileMenu;
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
@@ -36,6 +44,7 @@ use ui_core::{
     node::id::NodeId,
     window::{WindowId, WindowState},
 };
+use updater_ui::{indicator::UpdateIndicator, updater::Updater};
 
 use super::{
     intent::Intent,
@@ -80,6 +89,12 @@ pub(crate) struct TitleBar {
     /// The market participants menu the bar draws, when the build has a connector.
     market: Option<MarketParticipants>,
     market_host: Option<MarketParticipantsHost>,
+    /// The account control (who is signed in, and the flows that change it).
+    profile: Option<ProfileMenu>,
+    /// The updater this launch installed, and the indicator it draws while a release is on
+    /// offer. Released indicator first, then updater (see the module documentation).
+    updater: Option<Updater>,
+    indicator: Option<UpdateIndicator>,
     /// Whether the window was maximized when the bar last synchronized.
     maximized: bool,
     /// The strip between the controls, published as the window's drag region.
@@ -172,11 +187,16 @@ impl TitleBar {
             system_buttons: Vec::new(),
             market: None,
             market_host: None,
+            profile: None,
+            updater: None,
+            indicator: None,
             maximized,
             drag_regions: Vec::new(),
         };
         bar.build_toggle(app)?;
         bar.build_market_menu(app, composition)?;
+        bar.build_updater(app, composition)?;
+        bar.build_profile(app, composition)?;
         if metrics::draws_system_buttons() {
             for which in [
                 SystemButton::Minimize,
@@ -254,6 +274,48 @@ impl TitleBar {
         Ok(())
     }
 
+    /// Installs the updater and mounts its indicator into the right cluster.
+    ///
+    /// The indicator is created even while nothing is on offer: its route is what watches
+    /// the updater's view signal, and it builds the button only once an update appears.
+    fn build_updater(
+        &mut self,
+        app: &mut App,
+        composition: &Composition,
+    ) -> Result<(), EngineError> {
+        let updater = Updater::install(
+            app,
+            self.window,
+            std::rc::Rc::clone(composition.services()),
+            composition.updater_deps(),
+        );
+        let indicator = UpdateIndicator::mount(
+            app,
+            self.window,
+            self.right,
+            std::rc::Rc::clone(composition.services()),
+            updater.clone(),
+            "kytrix.updater",
+        );
+        self.updater = Some(updater);
+        self.indicator = Some(indicator);
+
+        Ok(())
+    }
+
+    /// Builds the account control into the right cluster.
+    fn build_profile(
+        &mut self,
+        app: &mut App,
+        composition: &Composition,
+    ) -> Result<(), EngineError> {
+        let mut menu = ProfileMenu::new(composition.profile_host());
+        menu.build(app, self.window, self.right)?;
+        self.profile = Some(menu);
+
+        Ok(())
+    }
+
     /// Builds one system button into the right cluster.
     fn build_system_button(
         &mut self,
@@ -312,7 +374,8 @@ impl TitleBar {
         Ok(button)
     }
 
-    /// Runs one frame of the bar: the market menu, the window's state and the drag region.
+    /// Runs one frame of the bar: the market menu, the account control, the window's state
+    /// and the drag region.
     pub(crate) fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if app.window(self.window).is_none() {
             return Ok(());
@@ -322,6 +385,11 @@ impl TitleBar {
             && let Err(error) = market.sync(app)
         {
             log::error!("the market participants menu could not be synchronized: {error}");
+        }
+        if let Some(profile) = &mut self.profile
+            && let Err(error) = profile.sync(app)
+        {
+            log::error!("the account control could not be synchronized: {error}");
         }
 
         self.sync_window_state(app)?;
@@ -417,13 +485,31 @@ impl TitleBar {
         if let Some(toggle) = &self.toggle {
             let _ = toggle.dispatch(app, event);
         }
+        if let Some(profile) = &mut self.profile {
+            profile.dispatch(app, event);
+        }
         for (_, button) in &self.system_buttons {
             let _ = button.dispatch(app, event);
         }
     }
 
     /// Releases every component and node the bar owns.
+    ///
+    /// The indicator goes before the updater: it reads the updater's view signal, which the
+    /// updater's release takes back.
     pub(crate) fn release(&mut self, app: &mut App) {
+        if let Some(profile) = &mut self.profile {
+            if let Some(node) = profile.trigger_node() {
+                let _ = app.remove_node(self.window, node);
+            }
+            profile.release(app);
+        }
+        if let Some(indicator) = self.indicator.take() {
+            indicator.release(app);
+        }
+        if let Some(updater) = self.updater.take() {
+            updater.release(app);
+        }
         if let Some(mut market) = self.market.take() {
             market.release(app);
         }
@@ -436,6 +522,24 @@ impl TitleBar {
             }
         }
         let _ = app.remove_node(self.window, self.node);
+    }
+
+    /// The update indicator (the shell's tests assert it was mounted and released).
+    #[cfg(test)]
+    pub(crate) fn indicator(&self) -> Option<&UpdateIndicator> {
+        self.indicator.as_ref()
+    }
+
+    /// The updater (the shell's tests assert it was installed and released).
+    #[cfg(test)]
+    pub(crate) fn updater(&self) -> Option<&Updater> {
+        self.updater.as_ref()
+    }
+
+    /// The account control (the shell's tests assert the trigger was built).
+    #[cfg(test)]
+    pub(crate) fn profile(&self) -> Option<&ProfileMenu> {
+        self.profile.as_ref()
     }
 }
 

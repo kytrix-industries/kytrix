@@ -652,12 +652,59 @@ impl KytrixServiceConnector {
         ))
     }
 
-    /// Installs the connector over the signed-out in-memory test session.
+    /// Connects the application to the Kytrix service without a toolkit context.
+    ///
+    /// This is the production entry point for an engine application: it creates the auth
+    /// session (D1), and the caller owns the configuration notification. Publishing the
+    /// network projection after each settings commit is the composition root's job
+    /// ([`ConfigNotification::publish`]); there is no toolkit configuration-event bridge.
+    ///
+    /// # Errors
+    ///
+    /// The auth session (its actor thread) could not be started.
+    pub fn spawn(
+        runtime: Runtime,
+        config: ConfigNotification<Config>,
+        transport: Arc<TransportHub>,
+    ) -> Result<Self, AuthError> {
+        let auth = AuthSession::spawn(config.clone(), Arc::clone(&transport), runtime.clone())?;
+        Ok(Self::spawn_with_config(
+            &runtime,
+            KYTRIX_SERVICE_WS_URL.clone(),
+            config,
+            auth.session_changes(),
+            transport,
+            auth,
+        ))
+    }
+
+    /// Connects the application over the signed-out in-memory test session.
     ///
     /// `AuthSession::for_test_signed_out` builds a session whose credential store is empty
-    /// and in memory and whose authority is a fake, so installing it touches no keyring
+    /// and in memory and whose authority is a fake, so spawning it touches no keyring
     /// entry, performs no startup refresh, and sends no account request. The connector
     /// then serves the signed-out status a UI test reads.
+    #[cfg(feature = "test-support")]
+    pub fn spawn_signed_out(
+        runtime: Runtime,
+        config: ConfigNotification<Config>,
+        transport: Arc<TransportHub>,
+    ) -> Result<Self, AuthError> {
+        let auth = AuthSession::for_test_signed_out()?;
+        Ok(Self::spawn_with_config(
+            &runtime,
+            KYTRIX_SERVICE_WS_URL.clone(),
+            config,
+            auth.session_changes(),
+            transport,
+            auth,
+        ))
+    }
+
+    /// Installs the connector over the signed-out in-memory test session.
+    ///
+    /// The toolkit test harness's installation path; the engine application uses
+    /// [`Self::spawn`] and the headless host [`Self::spawn_signed_out`].
     #[cfg(feature = "test-support")]
     pub fn install_for_test(
         cx: &mut App,

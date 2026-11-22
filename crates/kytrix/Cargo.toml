@@ -13,6 +13,7 @@ production = ["kytrix_service_provider/production"]
 
 [dependencies]
 bytes = { workspace = true }
+env_logger = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
 smol_str = { workspace = true }
@@ -24,13 +25,16 @@ widget_tokio_runtime = { workspace = true }
 app_config = { workspace = true }
 app_config_provider = { workspace = true }
 base_ui = { workspace = true }
+download_provider = { workspace = true }
 instrument_selector_ui = { workspace = true }
 kytrix_service_provider = { workspace = true }
 market_participants_connector = { workspace = true }
 market_participants_ui = { workspace = true }
 network = { workspace = true }
+profile_ui = { workspace = true }
 settings_ui = { workspace = true }
 ui_core = { workspace = true }
+updater_ui = { workspace = true }
 widget = { workspace = true }
 widget_gallery_ui = { workspace = true }
 widget_registry = { workspace = true }
@@ -47,6 +51,12 @@ embed-resource = { workspace = true }
 # The engine test host and the widget test host (the shell's tests open both).
 ui_core = { workspace = true, features = ["test-support"] }
 widget = { workspace = true, features = ["test-support"] }
+# The headless host installs the connector over the signed-out in-memory session, so a
+# test never touches the keyring or the account service. Cargo unifies the feature into
+# test builds only; the shipped binary's dependency stays feature-free.
+kytrix_service_provider = { workspace = true, features = ["test-support"] }
+# The shell's download wiring test builds the same typed request the settings page does.
+url = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,8 +4,9 @@
 //!
 //! The binary is the composition root and nothing else: it builds the one tokio runtime,
 //! the one [`Composition`] (settings, translation, theme, the three application-level
-//! registries, the widget catalogue and the services aggregate), opens the main window,
-//! mounts the [`shell::Shell`] into it and runs the engine's event loop.
+//! registries, the widget catalogue, the services aggregate, the account connection and the
+//! download manager), opens the main window, mounts the [`shell::Shell`] into it and runs
+//! the engine's event loop.
 //!
 //! # Startup order
 //!
@@ -15,6 +16,12 @@
 //! them, and the window is created last — a composition that failed has no window to
 //! close. Nothing here installs a process global: the aggregate is handed down.
 //!
+//! # Logging
+//!
+//! The log sink is installed before the runtime is built: everything below this point —
+//! including a start that fails — reports through `log` to the one implementation. The
+//! filter is `RUST_LOG`, defaulting to `info`.
+//!
 //! # Frame ownership
 //!
 //! `App::on_frame` is a single slot. [`FrameRouter`] owns it (created exactly once, by
@@ -23,7 +30,9 @@
 //! `App::on_animation_complete` is registered only by the composition root's
 //! [`AnimationRouter`].
 
+mod account;
 mod composition;
+mod downloads;
 mod language;
 mod shell;
 #[cfg(test)]
@@ -38,6 +47,8 @@ use ui_core::app::{App, Application};
 use crate::composition::Composition;
 
 fn main() {
+    install_logging();
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -89,9 +100,7 @@ pub(crate) enum InitializationError {
     #[error(transparent)]
     Engine(#[from] ui_core::error::EngineError),
     #[error(transparent)]
-    MarketParticipants(
-        #[from] market_participants_connector::connector::MarketParticipantsConnectorError,
-    ),
+    Auth(#[from] kytrix_service_provider::auth::model::AuthError),
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     #[error(transparent)]
     AiTranslation(#[from] ai_translator::error::TranslationError),
@@ -108,6 +117,18 @@ pub(crate) fn open_config_store() -> (
     Option<app_config_provider::store::ConfigRecovery>,
 ) {
     ConfigStore::load_default()
+}
+
+/// Installs the application's one log sink.
+///
+/// Everything below this call reports through `log`; without an implementation those
+/// records go nowhere (the shell migrated off the toolkit, which used to install one). The
+/// filter is `RUST_LOG`, defaulting to `info`; the stream is stderr, which is what the
+/// terminal and the platform's crash reports capture.
+fn install_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
 }
 
 #[cfg(test)]
