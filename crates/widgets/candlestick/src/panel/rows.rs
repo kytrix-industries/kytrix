@@ -974,7 +974,7 @@ fn section_key(pane: IndicatorPane) -> &'static str {
 }
 
 /// The short name indicators are written under in test selectors and kit keys.
-fn indicator_name(id: IndicatorId) -> &'static str {
+pub(super) fn indicator_name(id: IndicatorId) -> &'static str {
     match id {
         IndicatorId::Ma => "MA",
         IndicatorId::Ema => "EMA",
@@ -986,7 +986,7 @@ fn indicator_name(id: IndicatorId) -> &'static str {
 }
 
 /// The name one setting is written under in a test selector or a kit key.
-fn setting_name(key: SettingKey) -> &'static str {
+pub(super) fn setting_name(key: SettingKey) -> &'static str {
     match key {
         SettingKey::Period => "PERIOD",
         SettingKey::ShortPeriod => "SHORT",

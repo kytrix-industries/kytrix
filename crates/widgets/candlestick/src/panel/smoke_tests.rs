@@ -1,28 +1,40 @@
-//! The panel's smoke tests.
+//! The panel's behaviour tests.
 //!
-//! They cover what the old toolkit panel's tests could not survive the migration with — the panel's
-//! life (build / sync / rebuild / release), the steady frame, the scroll range, the row geometry
-//! and the two interaction paths that turn a control into a configuration request — rather than the
-//! full behaviour table, which the later test stage rewrites against the engine.
+//! What they cover is the panel's life (build / sync / rebuild / release), the steady frame, the
+//! scroll range, the row geometry, the control paths that turn a click or a keystroke into a
+//! configuration request (toggle, caret, add line, period commit and refusal, delete line), one
+//! picker per configurable colour showing the colour the configuration holds, and the drawing rule
+//! a folded card's hover follows. The colour fields themselves are checked against the
+//! configuration in [`super::colors_tests`].
+//!
+//! What they do not cover, and where it is registered (`.docs/gui-migration/test-ledger/
+//! w7-candlestick.md` §7.4): the pointer → card hover chain (`G-HOVER`: the engine writes `hovered`
+//! in its own input dispatch, which a widget crate cannot reach), and the picker's own commit
+//! plumbing (`G-PICKER-COMMIT`: the kit component owns its confirm semantics and handle).
 
 use std::time::Instant;
 
-use base_ui::{kit::size::UnifiedSize, style_builder::StyleBuilder, theme::appearance::Appearance};
+use base_ui::{
+    kit::size::UnifiedSize,
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, resolved::Theme, role::Role},
+};
 use i18n::language::codes::LanguageCode;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     event::{Action, ActionSource, Event, InputEvent},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::color::Color,
     test_support::diagnostics::SignalSlotStats,
 };
 use widget::test_support::WidgetTestApp;
 
 use super::{
     PANEL_WIDTH,
-    rows::PERIOD_FIELD_WIDTH,
+    rows::{self, PERIOD_FIELD_WIDTH},
     view::{IndicatorPanel, PanelRequest},
 };
-use crate::indicator::{CandlestickIndicatorConfig, IndicatorId};
+use crate::indicator::{CandlestickIndicatorConfig, IndicatorId, LineColor};
 
 fn harness() -> (
     WidgetTestApp,
@@ -483,4 +495,216 @@ fn the_panel_controls_turn_into_requests_and_rebuilds() {
     );
     harness.with_cx(|cx| panel.release(cx));
     harness.drain();
+}
+
+/// A line row's delete button removes that line, and the panel asks the widget for the
+/// configuration without it. The removed line takes its field and its picker with it.
+#[test]
+fn a_line_row_should_delete_the_line_it_belongs_to() {
+    let (mut harness, mut panel, _parent, requests, _baseline) = harness();
+    let config = CandlestickIndicatorConfig::default();
+    let root = panel.root().expect("the shell was built");
+    harness.with_cx(|cx| panel.sync(cx, &config).expect("first sync"));
+    harness.drain();
+    harness.with_cx(|cx| panel.sync(cx, &config).expect("measure sync"));
+    harness.drain();
+
+    let index = harness.with_cx(|cx| cx.scope().index());
+    let delete = harness
+        .find_by_debug_prefix(root, "TEST_PANEL_DELETE_LINE_MA_1")
+        .expect("MA's second line can be removed");
+    assert!(
+        click(
+            &mut harness,
+            delete,
+            click_action(index, "line.MA.1.delete")
+        ),
+        "the delete button ran its handler"
+    );
+    harness.drain();
+    assert!(
+        harness.with_cx(|cx| panel.sync(cx, &config).expect("edit sync")),
+        "the delete is an edit the sync drained"
+    );
+    let request = harness.with_cx(|cx| cx.app().read_with(&requests, |value| value.clone()));
+    let Some(PanelRequest::SetIndicator(next)) = request else {
+        panic!("the delete button asked the widget to store the configuration");
+    };
+    let before = config
+        .entry(IndicatorId::Ma)
+        .and_then(|entry| entry.settings.lines())
+        .expect("MA holds a line list");
+    let remaining = next
+        .entry(IndicatorId::Ma)
+        .and_then(|entry| entry.settings.lines())
+        .expect("MA still holds a line list");
+    assert_eq!(
+        remaining.rows.len(),
+        before.rows.len() - 1,
+        "the request drops the line it names"
+    );
+    assert_eq!(
+        remaining.rows[0], before.rows[0],
+        "the line above it is untouched"
+    );
+    assert_eq!(
+        remaining.rows[1], before.rows[2],
+        "the line below it moved up"
+    );
+
+    // The widget applies what was asked for: the row and its picker are rebuilt away.
+    harness.with_cx(|cx| cx.write(&requests, None));
+    assert!(harness.with_cx(|cx| panel.sync(cx, &next).expect("apply sync")));
+    harness.drain();
+    assert!(
+        harness
+            .find_by_debug_prefix(root, "TEST_PANEL_LINE_ROW_MA_2")
+            .is_none(),
+        "the removed line's row is gone"
+    );
+    assert!(
+        harness
+            .find_by_debug_prefix(root, &format_smolstr!("panel.color.MA.2@{index}:trigger"),)
+            .is_none(),
+        "and so is its picker"
+    );
+    harness.with_cx(|cx| panel.release(cx));
+}
+
+/// A line list never drops below the minimum its catalogue row declares, so the last line
+/// draws no delete button at all rather than one that can never act.
+#[test]
+fn the_last_line_of_a_line_list_should_not_offer_a_delete() {
+    let (mut harness, mut panel, _parent, _requests, _baseline) = harness();
+    let mut config = CandlestickIndicatorConfig::default();
+    while config
+        .entry(IndicatorId::Ma)
+        .and_then(|entry| entry.settings.lines())
+        .expect("MA holds a line list")
+        .rows
+        .len()
+        > 1
+    {
+        assert!(
+            config.remove_line(IndicatorId::Ma, 0),
+            "the fixture trims MA down to one line"
+        );
+    }
+    let root = panel.root().expect("the shell was built");
+    harness.with_cx(|cx| panel.sync(cx, &config).expect("first sync"));
+    harness.drain();
+    harness.with_cx(|cx| panel.sync(cx, &config).expect("measure sync"));
+    harness.drain();
+
+    assert!(
+        harness
+            .find_by_debug_prefix(root, "TEST_PANEL_LINE_ROW_MA_0")
+            .is_some(),
+        "the last line is drawn"
+    );
+    assert!(
+        harness
+            .find_by_debug_prefix(root, "TEST_PANEL_DELETE_LINE_MA_0")
+            .is_none(),
+        "but it offers no delete"
+    );
+    harness.with_cx(|cx| panel.release(cx));
+}
+
+/// One picker per configurable colour, and each one is handed the colour the configuration
+/// holds: the trigger's well is painted in it.
+#[test]
+fn every_colour_setting_should_have_one_picker_showing_its_colour() {
+    let (mut harness, mut panel, _parent, _requests, _baseline) = harness();
+    let mut config = CandlestickIndicatorConfig::default();
+    // A colour no default line holds, so the well can only paint the stored one.
+    let stored = LineColor {
+        h: 0.33,
+        s: 0.8,
+        l: 0.4,
+        a: 1.0,
+    };
+    assert!(
+        config.set_line_color(IndicatorId::Ma, 0, stored),
+        "MA's first line takes a colour"
+    );
+    let root = panel.root().expect("the shell was built");
+    let index = harness.with_cx(|cx| cx.scope().index());
+    harness.with_cx(|cx| panel.sync(cx, &config).expect("first sync"));
+    harness.drain();
+    harness.with_cx(|cx| panel.sync(cx, &config).expect("picker sync"));
+    harness.drain();
+
+    let fields = super::colors::color_fields(&config);
+    assert_eq!(
+        fields.len(),
+        12,
+        "the default configuration offers twelve colours"
+    );
+    for field in &fields {
+        let name = rows::indicator_name(field.id);
+        let (holder, suffix) = match field.row {
+            Some(row) => (
+                format_smolstr!("TEST_PANEL_COLOR_{name}_{row}"),
+                format_smolstr!("panel.color.{name}.{row}"),
+            ),
+            None => (
+                format_smolstr!("TEST_PANEL_COLOR_{name}_{}", rows::setting_name(field.key)),
+                format_smolstr!("panel.color.{name}.{}", rows::setting_name(field.key)),
+            ),
+        };
+        assert!(
+            harness.find_by_debug_prefix(root, &holder).is_some(),
+            "the colour setting `{holder}` has a field"
+        );
+        assert!(
+            harness
+                .find_by_debug_prefix(root, &format_smolstr!("{suffix}@{index}:trigger"))
+                .is_some(),
+            "and exactly that field holds the picker `{suffix}`"
+        );
+    }
+
+    let well = harness
+        .find_by_debug_prefix(
+            root,
+            &format_smolstr!("panel.color.MA.0@{index}:trigger.well"),
+        )
+        .expect("MA's first line has a picker well");
+    let primitives = harness.canvas_primitives(well);
+    assert!(
+        primitives
+            .iter()
+            .any(|primitive| primitive.color == Some(Color::from(stored))),
+        "the well paints the colour the configuration holds: {primitives:?}"
+    );
+    harness.with_cx(|cx| panel.release(cx));
+}
+
+/// A folded card lights up under the pointer and an open one never does: an open card's
+/// children are controls of their own, and a box that lit up around them would say the whole
+/// box is one control.
+///
+/// The pointer-to-card half (`sync_hover`, which reads the engine's hover chain) is not
+/// reachable from the headless host: hover is set by `App`'s input dispatch, and neither
+/// `App::dispatch` nor `TestApp::move_pointer` is reachable from a widget crate. This pins the
+/// drawing rule the chain writes into.
+#[test]
+fn a_folded_card_should_light_up_and_an_open_one_should_not() {
+    let theme = Theme::of(Appearance::Light);
+    let (rest_background, rest_border) = rows::card_colors(&theme, true, false);
+    let (hovered_background, hovered_border) = rows::card_colors(&theme, true, true);
+
+    assert_ne!(
+        rest_background, hovered_background,
+        "a hovered folded card draws a lighter surface"
+    );
+    assert_ne!(rest_border, hovered_border, "and a stronger border");
+    assert_eq!(hovered_background, theme.role(Role::SurfaceControl));
+    assert_eq!(hovered_border, theme.role(Role::LineStrong));
+    assert_eq!(
+        rows::card_colors(&theme, false, true),
+        rows::card_colors(&theme, false, false),
+        "an open card draws no hover"
+    );
 }

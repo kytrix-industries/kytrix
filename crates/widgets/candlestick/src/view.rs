@@ -110,8 +110,6 @@ use instrument_selector_ui::{
     },
 };
 use market_participants_connector::{
-    catalog::error::CatalogError,
-    connector::MarketParticipantsConnector,
     error::MarketParticipantError,
     market::{
         error::MarketError,
@@ -151,6 +149,7 @@ use super::{
         geometry::{CandleGeometry, ChartViewport, visible_range},
         paint::{ChartCanvas, ChartFrame, latest_price_indicator_is_visible},
     },
+    directory::{ConnectorDirectory, ListingAnswer, MarketDirectory, market_venues},
     indicator::{CandlestickIndicatorConfig, normalize_indicator},
     model::{CandlestickSeriesSnapshot, NewestCandle},
     panel::{IndicatorPanel, PANEL_WIDTH, PanelRequest},
@@ -272,21 +271,6 @@ const fn adjustment_key(adjustment: Adjustment) -> &'static str {
         Adjustment::None => "widget.candlestick.adjust_none",
         Adjustment::Forward => "widget.candlestick.adjust_forward",
     }
-}
-
-/// The venues the waiting notice lists: every venue whose loader can answer with candles.
-fn listed_venues() -> Vec<VenueId> {
-    market_participants_connector::venue::definition::venues_supporting(CapabilityId::Candlesticks)
-}
-
-/// Whether the directory proved that the listing is not chartable.
-fn is_definitely_unsupported(error: &CatalogError) -> bool {
-    matches!(
-        error,
-        CatalogError::RouteNotRegistered { .. }
-            | CatalogError::ListingNotFound { .. }
-            | CatalogError::ListingRouteMismatch { .. }
-    )
 }
 
 /// The countdown under the latest price.
@@ -432,6 +416,9 @@ impl Service {
 pub struct CandlestickWidget {
     config: CandlestickConfig,
     binding: Option<WidgetBinding<CandlestickProtocol>>,
+    /// The loaded market directory, when the host has one: a headless host without a
+    /// connector has nothing to ask, so the pane waits for a market it can never see.
+    directory: Option<Rc<dyn MarketDirectory>>,
     status: WidgetStatus,
     /// The recovery the framework offers for every failure this widget reports.
     recovery: WidgetAction,
@@ -537,7 +524,7 @@ impl WidgetView for CandlestickWidget {
         // here, and the check is first on purpose: a route the user never loaded, or one
         // a shrinking commit has since taken away, leaves the pane waiting for it instead
         // of reaching the branches below, which settle the selection the user stored.
-        if !self.market_ready(cx) {
+        if !self.market_ready() {
             self.wait_for_market(cx);
             return;
         }
@@ -640,10 +627,10 @@ impl WidgetView for CandlestickWidget {
             if self.status.is_failed(cx.app()) {
                 // A failure is terminal: the directory moving does not revive the pane.
             } else if self.awaiting_market {
-                if self.market_ready(cx) {
+                if self.market_ready() {
                     self.load(cx);
                 }
-            } else if !self.market_ready(cx) {
+            } else if !self.market_ready() {
                 self.wait_for_market(cx);
             } else if self.config.selection.is_some() {
                 self.market_reloaded = true;
@@ -735,6 +722,20 @@ impl WidgetView for CandlestickWidget {
             }
             return true;
         }
+        // A press that started on the chart is released wherever the pointer is: the
+        // settings panel shares this surface and is offered the event first, so the up
+        // of a drag that left the canvas never reaches the position gate below. Ending
+        // it here (capture semantics) is what keeps the chart from dragging for good,
+        // and from jumping when the pointer comes back over the plot.
+        if self.dragging
+            && let InputEvent::PointerUp { .. } = input
+        {
+            let inside = pointer_position(input).filter(|position| self.chart_contains(*position));
+            if self.end_drag(inside) {
+                let _ = cx.request_frame();
+            }
+            return true;
+        }
         let position = pointer_position(input);
         if !position.is_some_and(|position| self.chart_contains(position)) {
             return false;
@@ -814,7 +815,18 @@ impl CandlestickWidget {
         let service = connector.as_ref().map_or_else(Service::none, |connector| {
             Self::follow_source(connector.market(), cx)
         });
-        Self::assemble_with(config, service, status, config_change, recovery, cx)
+        let directory: Option<Rc<dyn MarketDirectory>> = connector.map(|connector| {
+            Rc::new(ConnectorDirectory::new(connector)) as Rc<dyn MarketDirectory>
+        });
+        Self::assemble_with(
+            config,
+            service,
+            directory,
+            status,
+            config_change,
+            recovery,
+            cx,
+        )
     }
 
     /// Starts the service for one source and keeps the questions only it can answer.
@@ -848,6 +860,7 @@ impl CandlestickWidget {
     fn assemble_with(
         config: CandlestickConfig,
         service: Service,
+        directory: Option<Rc<dyn MarketDirectory>>,
         status: WidgetStatus,
         config_change: WidgetConfigChange,
         recovery: WidgetAction,
@@ -869,6 +882,7 @@ impl CandlestickWidget {
         Self {
             config,
             binding,
+            directory,
             status,
             recovery,
             config_change,
@@ -915,11 +929,6 @@ impl CandlestickWidget {
         }
     }
 
-    /// The directory root the pane reads its market through, if the host has one.
-    fn connector<'a>(&self, cx: &'a WidgetCx<'_>) -> Option<&'a MarketParticipantsConnector> {
-        cx.services().market_participants.as_ref()
-    }
-
     /// Builds a pane over a test's own candle source.
     ///
     /// A headless host has no live market connection for the pane to read, so an interface
@@ -933,21 +942,43 @@ impl CandlestickWidget {
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Self {
+        Self::with_source_and_directory(config, source, None, status, config_change, recovery, cx)
+    }
+
+    /// Builds a pane over a test's own candle source and its own market directory.
+    ///
+    /// This is the seam a view test drives the directory's branches through: the host's
+    /// headless connector can be injected but not loaded, so a fixture answers the
+    /// questions a loaded venue would.
+    #[cfg(test)]
+    fn with_source_and_directory<S: CandlestickSource>(
+        config: CandlestickConfig,
+        source: S,
+        directory: Option<Rc<dyn MarketDirectory>>,
+        status: WidgetStatus,
+        config_change: WidgetConfigChange,
+        recovery: WidgetAction,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
         let service = Self::follow_source(source, cx);
-        Self::assemble_with(config, service, status, config_change, recovery, cx)
+        Self::assemble_with(
+            config,
+            service,
+            directory,
+            status,
+            config_change,
+            recovery,
+            cx,
+        )
     }
 
     /// Whether what this chart needs is in memory: at least one market that answers with
     /// candles, and the route of the stored selection among them.
-    fn market_ready(&self, cx: &WidgetCx<'_>) -> bool {
-        let Some(connector) = self.connector(cx) else {
+    fn market_ready(&self) -> bool {
+        let Some(directory) = self.directory.as_deref() else {
             return false;
         };
-        let venues = connector.venues();
-        if !listed_venues()
-            .iter()
-            .any(|venue| venues.loaded(venue).is_some())
-        {
+        if !directory.any_market_loaded() {
             return false;
         }
         let Some(route) = self
@@ -958,7 +989,7 @@ impl CandlestickWidget {
         else {
             return true;
         };
-        venues.scope(route).is_some()
+        directory.is_loaded(route)
     }
 
     /// Reports the neutral notice for the market this chart follows, and drops the chart
@@ -983,10 +1014,10 @@ impl CandlestickWidget {
                 .selection
                 .as_ref()
                 .map(|selection| vec![selection.listing.route.venue])
-                .unwrap_or_else(listed_venues);
+                .unwrap_or_else(market_venues);
             Notice::MarketNotLoaded {
                 venues,
-                supported: listed_venues(),
+                supported: market_venues(),
             }
         } else {
             Notice::message("widget.candlestick.select_instrument_prompt")
@@ -1173,35 +1204,30 @@ impl CandlestickWidget {
         // instead of being charted and failing. A lookup that failed proves nothing and is
         // only logged: the request below resolves the listing inside one catalogue
         // generation and its rejection comes back as the failure it is.
-        if let Some(connector) = self.connector(cx) {
-            let catalog = connector.catalog_arc();
-            match catalog.contains(&selection.listing) {
-                Ok(true) => {
-                    // A listing that is settled or delisted is one no market call reads,
-                    // so it is reset here the way a missing one is.
-                    let unreadable = catalog
-                        .cached_listing(&selection.listing)
-                        .is_some_and(|entry| entry.snapshot.status.is_terminal());
-                    if unreadable {
-                        self.clear_selection("the listing no longer trades", cx);
-                        return;
-                    }
+        if let Some(directory) = self.directory.clone() {
+            match directory.listing(&selection.listing) {
+                // A listing that is settled or delisted is one no market call reads, so it
+                // is reset here the way a missing one is.
+                ListingAnswer::Terminal => {
+                    self.clear_selection("the listing no longer trades", cx);
+                    return;
                 }
-                Ok(false) => {
+                ListingAnswer::Missing => {
                     self.clear_selection("the route does not publish it", cx);
                     return;
                 }
-                Err(error) if is_definitely_unsupported(&error) => {
+                ListingAnswer::Unserved => {
                     self.clear_selection("the directory does not serve it", cx);
                     return;
                 }
-                Err(error) => {
+                ListingAnswer::Unknown(error) => {
                     log::warn!(
                         "asking whether `{:?}` is published failed; the chart asks for the \
                          stream anyway: {error}",
                         selection.listing
                     );
                 }
+                ListingAnswer::Listed => {}
             }
         }
         let request = if retry || market_reloaded {
@@ -1239,7 +1265,7 @@ impl CandlestickWidget {
             HeaderRequest::Timeframe(timeframe) => self.select_timeframe(timeframe, cx),
             HeaderRequest::Adjustment(adjustment) => self.select_adjustment(adjustment, cx),
             HeaderRequest::ToggleSettings => {
-                if self.indicator_settings_available(cx) {
+                if self.indicator_settings_available() {
                     self.toggle_indicator_panel(cx);
                 }
             }
@@ -1258,16 +1284,8 @@ impl CandlestickWidget {
         // A scope this chart may follow is a scope the loaded venues answer with, and that
         // one answer is the whole of what the selector offered: a scope it could not draw
         // is refused rather than carried into a stream nothing will publish.
-        if let Some(connector) = self.connector(cx)
-            && !connector
-                .venues()
-                .scope(&selection.listing.route)
-                .is_some_and(|scope| {
-                    scope
-                        .capabilities
-                        .iter()
-                        .any(|support| support.capability == CapabilityId::Candlesticks)
-                })
+        if let Some(directory) = self.directory.as_deref()
+            && !directory.offers_candlesticks(&selection.listing.route)
         {
             return;
         }
@@ -1313,8 +1331,8 @@ impl CandlestickWidget {
     }
 
     /// Whether the indicator settings are something the user can open.
-    fn indicator_settings_available(&self, cx: &WidgetCx<'_>) -> bool {
-        self.market_ready(cx) && self.config.selection.is_some()
+    fn indicator_settings_available(&self) -> bool {
+        self.market_ready() && self.config.selection.is_some()
     }
 
     /// Opens the settings panel, or closes and drops it.
@@ -1584,7 +1602,10 @@ impl CandlestickWidget {
             panel_open: self.panel_open,
             data_time_zone: cx.data_time_zone(),
         };
-        if self.chart.sync(cx, &frame)? {
+        // The readout's units are written from the display generation the directory has
+        // published, which is the same read that names the generation in the canvas key.
+        let display = self.directory.as_ref().map(|directory| directory.display());
+        if self.chart.sync(cx, &frame, display.as_ref())? {
             let _ = cx.request_frame();
         }
         Ok(())
@@ -1960,7 +1981,12 @@ impl CandlestickWidget {
     ///
     /// The candle under the cursor is found *before* the width changes and anchored after
     /// it, so the chart grows away from the pointer instead of sliding out from under it.
+    /// A wheel with no vertical component (a horizontal scroll, a trackpad's sideways
+    /// swipe) is not a zoom step in either direction.
     fn zoom_at(&mut self, position: Point, delta_y: f32) -> bool {
+        if delta_y == 0.0 {
+            return false;
+        }
         let Some(layout) = self.chart.layout() else {
             return false;
         };
@@ -2015,7 +2041,7 @@ impl CandlestickWidget {
             status_filter: InstrumentStatusFilter::Any,
             required_capability: CapabilityId::Candlesticks,
             entry_predicate: None,
-            routes: self.loaded_scopes(cx),
+            routes: self.loaded_scopes(),
         };
         let requests = self.selection_requests;
         let button = InstrumentButton::new(
@@ -2039,10 +2065,10 @@ impl CandlestickWidget {
     }
 
     /// The scopes a picker may offer, as the loaded venues answer them now.
-    fn loaded_scopes(&self, cx: &WidgetCx<'_>) -> Arc<[LoadedScope]> {
-        self.connector(cx).map_or_else(Arc::default, |connector| {
-            LoadedScope::all(connector.venues())
-        })
+    fn loaded_scopes(&self) -> Arc<[LoadedScope]> {
+        self.directory
+            .as_ref()
+            .map_or_else(Arc::default, |directory| directory.loaded_scopes())
     }
 
     /// Builds the settings button and the two pickers into the header's right group.
@@ -2059,7 +2085,7 @@ impl CandlestickWidget {
         let translate = cx.translate().clone();
         let theme = cx.theme().clone();
         let requests = self.requests;
-        let available = self.indicator_settings_available(cx);
+        let available = self.indicator_settings_available();
         let label = t_smol!(translate, "widget.candlestick.indicator.settings");
         let key = cx.unique_key(SETTINGS_KEY_SUFFIX);
         let window = cx.window();
@@ -2286,7 +2312,7 @@ impl CandlestickWidget {
         controls
             .settings
             .set_selected(cx.app_mut(), self.panel_open);
-        let available = self.indicator_settings_available(cx);
+        let available = self.indicator_settings_available();
         controls.settings.set_disabled(cx.app_mut(), !available);
         if let Some(adjustment) = controls.adjustment.as_ref() {
             adjustment.set_chosen(cx.app_mut(), [self.config.adjustment.label()], false);

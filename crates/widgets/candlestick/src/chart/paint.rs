@@ -384,10 +384,15 @@ impl ChartCanvas {
     }
 
     /// Rebuilds the canvas the chart is drawn on, reporting whether it changed.
+    ///
+    /// `display` is the published display generation the readout's units are written from,
+    /// as the widget's directory answered it; it is part of the key through the generation
+    /// it names.
     pub(crate) fn sync(
         &mut self,
         cx: &mut WidgetCx<'_>,
         frame: &ChartFrame<'_>,
+        display: Option<&DisplaySnapshot>,
     ) -> Result<bool, EngineError> {
         let Some(node) = self.node else {
             return Ok(false);
@@ -404,16 +409,12 @@ impl ChartCanvas {
 
         // Everything the canvas is a function of, read from the host: the colours of
         // the appearance showing now (never baked at build time), the language, the
-        // raster scale, and the catalogue generation the readout's unit comes from.
+        // raster scale, and the printed generation the readout's unit comes from.
         let appearance = cx.theme().current(cx.app());
         let colors = ChartPalette::resolve(cx.theme().theme_for(appearance));
         let language = *cx.read(&cx.language());
         let text_scale = cx.app().text_scale();
         let translate = cx.translate().clone();
-        let display = cx
-            .services()
-            .market_participants()
-            .map(|connector| connector.catalog().cached_display());
         let key = PaintedKey {
             bounds,
             candle_width: frame.viewport.candle_width,
@@ -438,14 +439,8 @@ impl ChartCanvas {
             return Ok(false);
         }
 
-        let (canvas, geometry) = self.paint(
-            cx.app_mut(),
-            &translate,
-            display.as_ref(),
-            frame,
-            bounds,
-            colors,
-        )?;
+        let (canvas, geometry) =
+            self.paint(cx.app_mut(), &translate, display, frame, bounds, colors)?;
         let changed = cx.set_canvas(node, canvas)?;
         if changed {
             for id in std::mem::take(&mut self.geometry) {
@@ -2956,8 +2951,17 @@ mod tests {
 
         /// Syncs one frame and reports whether a new canvas was written.
         fn sync(&mut self, frame: &ChartFrame<'_>) -> bool {
+            self.sync_with_display(frame, None)
+        }
+
+        /// The same, over an explicit display generation.
+        fn sync_with_display(
+            &mut self,
+            frame: &ChartFrame<'_>,
+            display: Option<&DisplaySnapshot>,
+        ) -> bool {
             self.harness
-                .with_cx(|cx| self.chart.sync(cx, frame))
+                .with_cx(|cx| self.chart.sync(cx, frame, display))
                 .expect("the chart syncs")
         }
 
@@ -3155,9 +3159,12 @@ mod tests {
     }
 
     /// The atlas lease is part of the decision: a shaped line whose tiles were reused
-    /// cannot be drawn, and the frame that follows has to rebuild the canvas. Moving the
-    /// raster scale is the reachable way to invalidate the lease from a headless test
-    /// (the engine re-rasterises at the new ppem and the old handles go stale).
+    /// cannot be drawn, and the frame that follows has to rebuild the canvas.
+    ///
+    /// Replacing the font stack is a real lease death: the engine clears the glyph atlas
+    /// (its generation moves) and every handle the canvas kept names reused tiles. Moving
+    /// the raster scale is *not* one — the engine does not touch the lease for it — which
+    /// is what [`changing_the_text_scale_should_reshape_the_text`] covers.
     #[test]
     fn a_chart_whose_atlas_lease_died_should_repaint() {
         let mut harness = Harness::new();
@@ -3172,11 +3179,12 @@ mod tests {
             .canvas_handle(node)
             .expect("the node holds a canvas");
 
-        harness
-            .harness
-            .app_mut()
-            .set_text_scale(2.0)
-            .expect("2.0 is a valid raster scale");
+        let stack = harness.harness.app().font_stack().clone();
+        harness.harness.app_mut().set_font_stack(stack);
+        assert!(
+            harness.chart.text.has_stale(),
+            "the cleared atlas leaves the shaped labels on a dead lease"
+        );
 
         assert!(
             harness.sync(&frame),
@@ -3186,7 +3194,7 @@ mod tests {
         let after = harness
             .harness
             .canvas_handle(node)
-            .expect("the node holds a canvas");
+            .expect("the node still holds a canvas");
         assert!(
             !Arc::ptr_eq(&before, &after),
             "the canvas was rebuilt with re-shaped text"
@@ -3194,6 +3202,87 @@ mod tests {
         assert!(
             kinds(&harness.primitives(), PrimitiveKind::GlyphRun) > 0,
             "the labels are re-shaped rather than lost"
+        );
+        assert!(
+            !harness.chart.text.has_stale(),
+            "the rebuilt frame re-shaped every line it draws"
+        );
+    }
+
+    /// A new raster scale re-shapes the text instead of reusing the old bitmaps.
+    ///
+    /// The engine never re-rasterises a handle it handed out (design §11.1: the
+    /// application has to shape again), so the text cache has to treat the scale as part
+    /// of its key. Both text paths are asserted: the axis labels and the readout line.
+    #[test]
+    fn changing_the_text_scale_should_reshape_the_text() {
+        let mut harness = Harness::new();
+        let snapshot = snapshot_with_spacing(HARNESS_CANDLES, 60);
+        let config = CandlestickIndicatorConfig::default();
+        let countdown = SmolStr::new_static("00:30");
+        let viewport = ChartViewport::default();
+        let frame = frame_of(&snapshot, viewport, &config, &countdown);
+        harness.paint(&frame);
+
+        // Hover a candle so the readout cache holds a line too.
+        let layout = harness.layout();
+        let plot = layout.price_plot;
+        let range = visible_range(snapshot.candles(), viewport, plot.size.width);
+        let geometry = CandleGeometry::new(plot, range.len(), viewport.candle_width);
+        let cursor = Point::new(geometry.center_x(10), plot.origin.y + 20.0);
+        let hovered = frame_of(
+            &snapshot,
+            ChartViewport {
+                cursor: Some(cursor),
+                ..viewport
+            },
+            &config,
+            &countdown,
+        );
+        assert!(harness.sync(&hovered));
+        assert!(
+            !harness.chart.text.shaped_scales().is_empty(),
+            "the frame shapes its axis labels"
+        );
+        assert!(
+            !harness.chart.readout.shaped_scales().is_empty(),
+            "the hovered frame shapes a readout"
+        );
+        assert!(
+            harness
+                .chart
+                .text
+                .shaped_scales()
+                .iter()
+                .chain(harness.chart.readout.shaped_scales().iter())
+                .all(|scale| *scale == 1.0),
+            "the harness shapes at the default raster scale"
+        );
+
+        harness
+            .harness
+            .app_mut()
+            .set_text_scale(2.0)
+            .expect("2.0 is a valid raster scale");
+        assert!(
+            harness.sync(&hovered),
+            "a new raster scale is a different picture"
+        );
+        harness.harness.drain();
+
+        let labels = harness.chart.text.shaped_scales();
+        assert!(
+            !labels.is_empty() && labels.iter().all(|scale| *scale == 2.0),
+            "every label is re-shaped at the new ppem: {labels:?}"
+        );
+        let readout = harness.chart.readout.shaped_scales();
+        assert!(
+            !readout.is_empty() && readout.iter().all(|scale| *scale == 2.0),
+            "the readout is re-shaped at the new ppem: {readout:?}"
+        );
+        assert!(
+            kinds(&harness.primitives(), PrimitiveKind::GlyphRun) > 0,
+            "the text is re-shaped rather than lost"
         );
     }
 
@@ -3243,6 +3332,142 @@ mod tests {
                 .iter()
                 .any(|primitive| primitive.color == Some(light.chart.grid)),
             "no light-theme colour survives the switch"
+        );
+    }
+
+    /// The axis is laid out once, from the widest label the widest plot can produce, so
+    /// the labels the final (narrower) plot draws fit the axis it settled on.
+    ///
+    /// This is the regression signal for replacing the old three-pass fixed-point loop
+    /// with one measurement: measuring on the final plot instead — or using half the
+    /// measurement, which is what a second widening pass used to correct — leaves labels
+    /// wider than their own axis.
+    #[test]
+    fn the_axis_should_hold_every_label_the_frame_draws() {
+        use crate::chart::geometry::AXIS_LABEL_HORIZONTAL_PADDING;
+
+        let countdown = SmolStr::new_static("00:30");
+        let config = CandlestickIndicatorConfig::default();
+        let sub_plot_ids = enabled_sub_plot_ids(&config);
+        // The large prices are the point: with short labels the minimum axis width hides
+        // a measurement that is too small.
+        for (size, base_price) in [
+            ((640.0_f32, 400.0_f32), 100_u64),
+            ((640.0, 400.0), 1_234_567_u64),
+            ((420.0, 320.0), 123_456_u64),
+        ] {
+            let mut harness = Harness::of_size(size);
+            let snapshot = snapshot_of((0..HARNESS_CANDLES).map(|index| {
+                let open = base_price + index as u64;
+                candle_with_prices(index as i64 + 1, open, open + 10, open - 10, open)
+            }));
+            let frame = frame_of(&snapshot, ChartViewport::default(), &config, &countdown);
+            harness.paint(&frame);
+
+            let layout = harness.layout();
+            let plot = layout.price_plot;
+            let axis_width = layout.price_axis.size.width;
+            let range = visible_range(
+                snapshot.candles(),
+                ChartViewport::default(),
+                plot.size.width,
+            );
+            let latest = latest_candle_for_indicator(&snapshot, range.end)
+                .map(|candle| CandlePrices::of(candle).close());
+            let series = Arc::clone(
+                &harness
+                    .chart
+                    .indicators
+                    .as_ref()
+                    .expect("the painted frame computed its series")
+                    .series,
+            );
+            let style = style_of(AXIS_FONT_SIZE, Color::WHITE);
+            let widest = axis_label_candidates(
+                snapshot.candles(),
+                range,
+                latest,
+                snapshot.price_tick(),
+                plot.size.height,
+                &series,
+                &sub_plot_ids,
+            )
+            .into_iter()
+            .map(|label| {
+                harness
+                    .chart
+                    .text
+                    .width(harness.harness.app_mut(), &label, &style)
+            })
+            .fold(0.0_f32, f32::max);
+
+            assert!(
+                axis_width + 0.01 >= widest + AXIS_LABEL_HORIZONTAL_PADDING,
+                "the {size:?} chart's axis is {axis_width} wide but the widest label it draws is {widest} wide"
+            );
+        }
+    }
+
+    /// The readout names the traded size in the unit the published catalogue decided on: a
+    /// token's size reads as the token once a generation has named it, and the same chart at a
+    /// host with no display generation does not invent a name for it.
+    #[test]
+    fn the_readout_should_name_the_traded_size_in_the_published_code() {
+        let mut harness = Harness::new();
+        let asset = test_support::token(test_support::VENUE, "BTC");
+        let snapshot = snapshot_of((0..HARNESS_CANDLES).map(|index| {
+            let mut candle = candle_with_prices(index as i64 * 60 + 1, 100, 110, 90, 100);
+            candle.traded_quantity = Some(MarketQuantity {
+                value: Quantity::from(3_u64),
+                unit: QuantityUnit::AssetUnits {
+                    asset: asset.clone(),
+                },
+            });
+            candle
+        }));
+        let config = CandlestickIndicatorConfig::default();
+        let countdown = SmolStr::new_static("00:30");
+        let frame = frame_of(&snapshot, ChartViewport::default(), &config, &countdown);
+
+        // No published display generation: the readout cannot name the asset.
+        assert!(harness.sync(&frame));
+        let unnamed = harness
+            .chart
+            .readout
+            .described_text()
+            .expect("the frame describes a candle");
+        assert!(
+            !unnamed.contains("BTC"),
+            "no catalogue has named the token yet: {unnamed}"
+        );
+
+        // A published generation names it, and the readout follows the generation.
+        let entry = test_support::entry(
+            &test_support::spot_route(),
+            test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
+            "BTCUSDT",
+        );
+        let fixture = test_support::Fixture::new(vec![entry.clone()]);
+        test_support::publish_fixture_route(
+            fixture.catalog(),
+            &test_support::spot_route(),
+            vec![entry],
+        )
+        .expect("the fixture route publishes its listing");
+        let display = fixture.catalog().cached_display();
+        assert!(
+            harness.sync_with_display(&frame, Some(&display)),
+            "the display generation is part of what the canvas draws"
+        );
+
+        let named = harness
+            .chart
+            .readout
+            .described_text()
+            .expect("the frame describes a candle");
+        assert!(
+            named.contains("BTC"),
+            "the readout reads the token's own code: {named}"
         );
     }
 

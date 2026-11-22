@@ -8,4 +8,6 @@ mod view;
 pub(crate) use view::{IndicatorPanel, PANEL_WIDTH, PanelRequest};
 
 #[cfg(test)]
+mod colors_tests;
+#[cfg(test)]
 mod smoke_tests;

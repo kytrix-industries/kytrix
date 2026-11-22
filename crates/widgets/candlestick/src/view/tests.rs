@@ -20,14 +20,23 @@
 //! routes — is therefore asserted on the branch the pane takes with no directory, and the
 //! gaps are named in the delivery report rather than papered over.
 
-use std::{cell::Cell, rc::Rc, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use app_config::{time_zone::DataTimeZone, widget::VersionedWidgetConfig};
 use base_ui::style_builder::StyleBuilder;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::{
     catalog::{
+        batch::CatalogEntry,
+        display::catalog::DisplaySnapshot,
         error::{CatalogError, SourceError},
+        store::Catalog,
         test_support,
     },
     error::MarketParticipantError,
@@ -36,6 +45,7 @@ use market_participants_connector::{
 use market_participants_model::{
     decimal::{Price, Quantity, Tick},
     listing::{
+        listing_impl::ListingStatus,
         route::{VenueListingKey, VenueRoute},
         rules::ListingPrecision,
         venue::PriceBasis,
@@ -67,6 +77,7 @@ use widget::{
 
 use super::*;
 use crate::{
+    directory::{listing_answer, proves_absent},
     indicator::IndicatorId,
     model::CandlestickSeries,
     service::{CandlestickEventSubscription, CandlestickPageQuery},
@@ -583,6 +594,168 @@ fn drawn_pane(harness: &mut WidgetTestApp, snapshot: CandlestickSeriesSnapshot) 
     pane
 }
 
+// ------------------------------------------------------------------ the directory seam
+
+/// A market directory a test loads and unloads venues on.
+///
+/// The headless host can be handed a `MarketParticipantsConnector`, but nothing in this
+/// crate can *load* one (loading needs a live transport, and the loaded-venue table's write
+/// entry is crate-private to the connector). This fixture answers the same questions a loaded
+/// venue would, so the directory's branches are reachable from a view test.
+struct FixtureDirectory {
+    catalog: Arc<Catalog>,
+    /// The routes this directory answers as loaded, and the capabilities each one carries.
+    loaded: RefCell<Vec<(VenueRoute, Vec<CapabilityId>)>>,
+}
+
+impl FixtureDirectory {
+    /// A directory over `catalog` with nothing loaded: what a host whose directory load never
+    /// committed looks like.
+    fn new(catalog: Arc<Catalog>) -> Rc<Self> {
+        Rc::new(Self {
+            catalog,
+            loaded: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// The same directory with the fixture spot route loaded for candlesticks.
+    fn with_spot_loaded(catalog: Arc<Catalog>) -> Rc<Self> {
+        let directory = Self::new(catalog);
+        directory.load(route(), vec![CapabilityId::Candlesticks]);
+        directory
+    }
+
+    fn directory(self: &Rc<Self>) -> Rc<dyn MarketDirectory> {
+        Rc::clone(self) as Rc<dyn MarketDirectory>
+    }
+
+    /// Publishes `route` as loaded, with `capabilities`.
+    fn load(&self, route: VenueRoute, capabilities: Vec<CapabilityId>) {
+        let mut loaded = self.loaded.borrow_mut();
+        loaded.retain(|(held, _)| held != &route);
+        loaded.push((route, capabilities));
+    }
+
+    /// Takes `route` back out of the loaded venues, as a shrinking commit does.
+    fn unload(&self, route: &VenueRoute) {
+        self.loaded.borrow_mut().retain(|(held, _)| held != route);
+    }
+}
+
+impl MarketDirectory for FixtureDirectory {
+    fn loaded_scopes(&self) -> Arc<[LoadedScope]> {
+        self.loaded
+            .borrow()
+            .iter()
+            .map(|(route, capabilities)| LoadedScope {
+                route: route.clone(),
+                capabilities: capabilities.clone(),
+                provides_catalog: true,
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    fn any_market_loaded(&self) -> bool {
+        self.loaded
+            .borrow()
+            .iter()
+            .any(|(route, _)| market_venues().contains(&route.venue))
+    }
+
+    fn is_loaded(&self, route: &VenueRoute) -> bool {
+        self.loaded.borrow().iter().any(|(held, _)| held == route)
+    }
+
+    fn offers_candlesticks(&self, route: &VenueRoute) -> bool {
+        self.loaded.borrow().iter().any(|(held, capabilities)| {
+            held == route && capabilities.contains(&CapabilityId::Candlesticks)
+        })
+    }
+
+    fn listing(&self, listing: &VenueListingKey) -> ListingAnswer {
+        listing_answer(&self.catalog, listing)
+    }
+
+    fn display(&self) -> DisplaySnapshot {
+        self.catalog.cached_display()
+    }
+}
+
+/// A published fixture catalogue listing `symbols` on the fixture spot route.
+fn fixture_catalog(symbols: &[&str]) -> Arc<Catalog> {
+    let entries = fixture_entries(symbols);
+    let fixture = test_support::Fixture::new(entries.clone());
+    test_support::publish_fixture_route(fixture.catalog(), &route(), entries)
+        .expect("the fixture route publishes its listings");
+    Arc::clone(fixture.catalog_arc())
+}
+
+/// The same catalogue registered but never published: a read of it is answered with
+/// [`CatalogError::CatalogNotLoaded`], the directory's "not loaded yet" state.
+fn fixture_catalog_unpublished(symbols: &[&str]) -> Arc<Catalog> {
+    let fixture = test_support::Fixture::new(fixture_entries(symbols));
+    Arc::clone(fixture.catalog_arc())
+}
+
+/// The catalogue entries a fixture route lists `symbols` under.
+fn fixture_entries(symbols: &[&str]) -> Vec<CatalogEntry> {
+    symbols
+        .iter()
+        .map(|symbol| {
+            test_support::entry(
+                &route(),
+                test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
+                symbol,
+            )
+        })
+        .collect()
+}
+
+/// A pane over `directory`, with its own scope and header groups, and no work started.
+fn pane_with_directory(
+    harness: &mut WidgetTestApp,
+    config: CandlestickConfig,
+    source: FixtureSource,
+    size: (f32, f32),
+    directory: Rc<dyn MarketDirectory>,
+) -> Pane {
+    let scope = harness.app_mut().signal_scope();
+    let status = WidgetStatus::new(harness.app_mut(), scope);
+    let chart_page = page(harness, "TEST_CANDLESTICK_PAGE", size);
+    let left = header_group(harness, chart_page, "TEST_CANDLESTICK_HEADER_LEFT");
+    let right = header_group(harness, chart_page, "TEST_CANDLESTICK_HEADER_RIGHT");
+    let publishes = Rc::new(Cell::new(0));
+    let counted = Rc::clone(&publishes);
+    let change = WidgetConfigChange::new(move |_| counted.set(counted.get() + 1));
+    let widget = with_scope(harness, scope, |cx| {
+        CandlestickWidget::with_source_and_directory(
+            config,
+            source,
+            Some(directory),
+            status,
+            change,
+            recovery(),
+            cx,
+        )
+    });
+    Pane {
+        widget,
+        status,
+        scope,
+        chart_page,
+        left,
+        right,
+        publishes,
+    }
+}
+
+/// Moves the directory generation the host publishes, which is what wakes a waiting pane.
+fn publish_generation(harness: &mut WidgetTestApp, generation: u64) {
+    let signal = harness.services().catalog_generation;
+    harness.app_mut().write(&signal, generation);
+}
+
 /// One frame of the surface the framework draws around the body, over the pane's own status.
 fn synced_surface(harness: &mut WidgetTestApp, pane: &Pane, has_content: bool) -> WidgetSurface {
     let mut surface = with_scope(harness, pane.scope, |cx| {
@@ -630,15 +803,25 @@ fn pointer_up(position: Point) -> Event {
     })
 }
 
-fn scroll(position: Point, steps: f32) -> Event {
+fn scroll(position: Point, delta: Point) -> Event {
     Event::Input(InputEvent::Scroll {
         position,
-        delta: ui_core::math::Point::new(0.0, steps),
+        delta,
         unit: ui_core::event::ScrollUnit::Line,
         phase: ui_core::event::ScrollPhase::Discrete,
         modifiers: Modifiers::default(),
         timestamp: std::time::Instant::now(),
     })
+}
+
+/// The point the settings panel occupies: the chart's surface is the whole pane, and the
+/// panel is offered the events over its own column first, so a chart never sees them.
+fn over_the_panel(pane: &Pane) -> Point {
+    let bounds = pane.widget.chart.bounds().expect("the chart has a box");
+    Point::new(
+        bounds.max().x + 8.0,
+        bounds.origin.y + bounds.size.height / 2.0,
+    )
 }
 
 // --------------------------------------------------------------- config & reading
@@ -766,10 +949,10 @@ fn only_a_directory_answer_should_count_as_unsupported() {
         reason: SmolStr::new_static("the fixture catalog is unreachable"),
     }));
 
-    assert!(is_definitely_unsupported(&missing));
-    assert!(is_definitely_unsupported(&revoked));
+    assert!(proves_absent(&missing));
+    assert!(proves_absent(&revoked));
     assert!(
-        !is_definitely_unsupported(&failed),
+        !proves_absent(&failed),
         "a fetch that failed proves nothing about the listing"
     );
 }
@@ -857,7 +1040,7 @@ fn a_widget_without_a_snapshot_should_report_connecting_and_have_no_content() {
         pane.status(&harness),
         WidgetState::Waiting(Notice::MarketNotLoaded {
             venues: vec![route().venue],
-            supported: listed_venues(),
+            supported: market_venues(),
         }),
         "load reports the notice for the market the chart follows"
     );
@@ -885,7 +1068,7 @@ fn an_unloaded_market_should_leave_the_pane_waiting() {
             assert_eq!(venues, vec![route().venue], "the pane names its own venue");
             assert_eq!(
                 supported,
-                listed_venues(),
+                market_venues(),
                 "the sentence lists every market this widget can read"
             );
         }
@@ -1728,7 +1911,7 @@ fn scrolling_should_zoom_around_the_pointer() {
     let width = pane.widget.viewport.candle_width;
 
     assert!(
-        pane.dispatch(&mut harness, scroll(center, 1.0)),
+        pane.dispatch(&mut harness, scroll(center, Point::new(0.0, 1.0))),
         "the plot consumes the wheel rather than letting the page scroll"
     );
 
@@ -1743,6 +1926,125 @@ fn scrolling_should_zoom_around_the_pointer() {
         Some(center),
         "the candle under the pointer is anchored"
     );
+}
+
+/// A wheel with no vertical component is not a zoom step: a trackpad's sideways swipe
+/// arrives as `delta.y == 0`, and reading that as "zoom out" shrinks the chart on every
+/// horizontal event.
+#[test]
+fn a_wheel_without_a_vertical_delta_should_not_zoom() {
+    let mut harness = harness();
+    let mut pane = drawn_pane(&mut harness, live_edge_snapshot(60, 60));
+    let center = pane.data_center();
+    let width = pane.widget.viewport.candle_width;
+
+    assert!(
+        pane.dispatch(&mut harness, scroll(center, Point::new(0.0, 0.0))),
+        "the chart still consumes the wheel over its plot"
+    );
+
+    assert_eq!(
+        pane.widget.viewport.candle_width, width,
+        "a wheel with no steps leaves the zoom alone"
+    );
+    assert_eq!(
+        pane.widget.viewport.cursor, None,
+        "and it anchors no crosshair"
+    );
+}
+
+/// The same for a horizontal scroll, which is what a trackpad sends while it pans
+/// sideways: no vertical delta means no zoom, in either direction.
+#[test]
+fn a_horizontal_wheel_should_not_zoom_the_chart() {
+    let mut harness = harness();
+    let mut pane = drawn_pane(&mut harness, live_edge_snapshot(60, 60));
+    let center = pane.data_center();
+    let width = pane.widget.viewport.candle_width;
+    let anchored = pane.widget.viewport.right_timestamp;
+
+    assert!(
+        pane.dispatch(&mut harness, scroll(center, Point::new(24.0, 0.0))),
+        "the chart consumes both axes of a two-finger pan over its plot"
+    );
+
+    assert_eq!(
+        pane.widget.viewport.candle_width, width,
+        "a sideways wheel does not zoom"
+    );
+    assert_eq!(
+        pane.widget.viewport.right_timestamp, anchored,
+        "and it does not re-anchor the viewport"
+    );
+    assert_eq!(pane.widget.viewport.cursor, None);
+}
+
+/// A press that started on the chart is released wherever the pointer is. The settings
+/// panel is offered the up over its own column first, so the chart has to end the drag
+/// without the position gate: otherwise it is left dragging for good.
+#[test]
+fn a_release_outside_the_canvas_should_end_the_drag() {
+    let mut harness = harness();
+    let mut pane = drawn_pane(&mut harness, live_edge_snapshot(120, 120));
+    let center = pane.data_center();
+
+    assert!(pane.dispatch(&mut harness, pointer_down(center)));
+    assert!(pane.widget.dragging, "the press started a drag");
+    assert!(
+        pane.dispatch(
+            &mut harness,
+            pointer_move(Point::new(center.x + 120.0, center.y))
+        ),
+        "the drag pans"
+    );
+
+    let outside = over_the_panel(&pane);
+    assert!(
+        pane.dispatch(&mut harness, pointer_up(outside)),
+        "the release belongs to the widget whose press started the drag"
+    );
+    assert!(
+        !pane.widget.dragging,
+        "a release over the panel ends the drag"
+    );
+    assert_eq!(
+        pane.widget.viewport.cursor, None,
+        "no crosshair is placed off the canvas"
+    );
+}
+
+/// Coming back over the plot after a release over the panel moves the crosshair; it must
+/// not pan from the stale drag position the canvas never got to end.
+#[test]
+fn a_pointer_that_comes_back_to_the_plot_should_not_jump() {
+    let mut harness = harness();
+    let mut pane = drawn_pane(&mut harness, live_edge_snapshot(120, 120));
+    let center = pane.data_center();
+
+    assert!(pane.dispatch(&mut harness, pointer_down(center)));
+    let outside = over_the_panel(&pane);
+    assert!(
+        !pane.dispatch(&mut harness, pointer_move(outside)),
+        "a move over the panel is not the chart's to consume"
+    );
+    assert!(pane.dispatch(&mut harness, pointer_up(outside)));
+    let anchored = pane.widget.viewport.right_timestamp;
+
+    let back = Point::new(center.x + 40.0, center.y);
+    assert!(
+        pane.dispatch(&mut harness, pointer_move(back)),
+        "the chart takes the pointer again"
+    );
+    assert_eq!(
+        pane.widget.viewport.cursor,
+        Some(back),
+        "the pointer came back to hover, not to drag"
+    );
+    assert_eq!(
+        pane.widget.viewport.right_timestamp, anchored,
+        "a hovering move pans nothing"
+    );
+    assert!(!pane.widget.dragging);
 }
 
 #[test]
@@ -2524,4 +2826,367 @@ fn releasing_the_pane_should_remove_its_own_nodes_and_stop_its_timer() {
         requests,
         "a released pane asks for no frame"
     );
+}
+
+// --------------------------------------------------------------------- the directory
+
+/// A waiting pane recovers from a loaded venue by itself: the published generation moves,
+/// the pane re-runs its load, and the market it was waiting for starts it.
+#[test]
+fn loading_the_venue_should_let_the_waiting_pane_start() {
+    let mut harness = harness();
+    let catalog = fixture_catalog(&[SYMBOL]);
+    let directory = FixtureDirectory::new(Arc::clone(&catalog));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+
+    pane.load(&mut harness);
+    assert!(pane.widget.awaiting_market, "the pane waits for its market");
+    assert_eq!(pane.widget.generation, 0, "and starts no stream");
+    assert!(matches!(
+        pane.status(&harness),
+        WidgetState::Waiting(Notice::MarketNotLoaded { .. })
+    ));
+
+    // The directory load commits: the venue is loaded and its catalogue is published.
+    directory.load(route(), vec![CapabilityId::Candlesticks]);
+    publish_generation(&mut harness, 1);
+    pane.frame(&mut harness);
+
+    assert!(
+        !pane.widget.awaiting_market,
+        "the pane left the notice without being reopened"
+    );
+    assert_eq!(
+        pane.widget.generation, 1,
+        "and it started the stream it was waiting for"
+    );
+    assert_eq!(pane.status(&harness), WidgetState::Connecting);
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "the choice it was holding is still the one it reads"
+    );
+}
+
+/// A listing the published catalogue provably does not list is a scope that cannot be
+/// charted: the pane goes back to having nothing chosen and writes the reset back.
+#[test]
+fn a_selection_missing_from_the_directory_should_be_cleared_and_reported() {
+    let mut harness = harness();
+    let catalog = fixture_catalog(&["ETHUSDT"]);
+    let directory = FixtureDirectory::with_spot_loaded(catalog);
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+
+    pane.load(&mut harness);
+
+    assert_eq!(pane.widget.config.selection, None, "the selection is reset");
+    assert!(
+        pane.publishes.get() >= 1,
+        "the reset has to be written back, or the next start resets it again"
+    );
+    assert_eq!(
+        pane.status(&harness),
+        WidgetState::Waiting(Notice::message(
+            "widget.candlestick.select_instrument_prompt"
+        )),
+        "a chart with nothing chosen asks for one"
+    );
+}
+
+/// A listing the catalogue publishes but has settled is one no market call reads: the pane
+/// resets it the way it resets a missing one.
+#[test]
+fn a_selection_for_a_terminal_listing_should_be_cleared_and_reported() {
+    let mut harness = harness();
+    let settled = test_support::with_status(
+        test_support::entry(
+            &route(),
+            test_support::spot_token(test_support::VENUE, "BTC", "USDT"),
+            SYMBOL,
+        ),
+        ListingStatus::Settled,
+    );
+    let fixture = test_support::Fixture::new(vec![settled.clone()]);
+    test_support::publish_fixture_route(fixture.catalog(), &route(), vec![settled])
+        .expect("the fixture route publishes its settled listing");
+    let directory = FixtureDirectory::with_spot_loaded(Arc::clone(fixture.catalog_arc()));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+
+    pane.load(&mut harness);
+
+    assert_eq!(
+        pane.widget.config.selection, None,
+        "a settled listing is no longer chartable"
+    );
+    assert!(pane.publishes.get() >= 1, "and the reset is written back");
+    assert!(!pane.status(&harness).is_failed(), "it is not a failure");
+    assert_eq!(
+        pane.status(&harness),
+        WidgetState::Waiting(Notice::message(
+            "widget.candlestick.select_instrument_prompt"
+        )),
+        "a chart whose listing stopped trading asks for another one"
+    );
+    assert!(
+        pane.widget.snapshot.is_none(),
+        "nothing is drawn for a listing no market call reads"
+    );
+}
+
+/// A lookup that failed proves nothing: the stored selection stays and the stream is asked
+/// for anyway, so a directory that could not answer does not throw the user's choice away.
+#[test]
+fn a_selection_should_survive_a_lookup_that_proves_nothing() {
+    let mut harness = harness();
+    // The venue is loaded, but its catalogue is registered and never published: the lookup
+    // is answered with "not loaded yet", which proves nothing about the listing.
+    let catalog = fixture_catalog_unpublished(&[SYMBOL]);
+    let directory = FixtureDirectory::with_spot_loaded(catalog);
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+
+    pane.load(&mut harness);
+
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "a lookup that proved nothing keeps the selection"
+    );
+    assert_eq!(
+        pane.widget.generation, 1,
+        "and the chart asks for the stream anyway"
+    );
+    assert_eq!(pane.publishes.get(), 0, "nothing is written back");
+}
+
+/// A route the loaded venues answer with but the catalogue does not list is a market the
+/// chart waits for, not a scope that stopped serving candles: the selection the user made is
+/// not the pane's to throw away.
+#[test]
+fn a_revoked_route_should_leave_the_selection_alone_and_be_reported() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::with_spot_loaded(fixture_catalog(&[SYMBOL]));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+    pane.load(&mut harness);
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "a listed scope starts the chart"
+    );
+    let publishes = pane.publishes.get();
+
+    // A shrinking commit takes the market away, but the user's choice is theirs.
+    directory.unload(&route());
+    publish_generation(&mut harness, 1);
+    pane.frame(&mut harness);
+
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "a market that went away does not unmake the user's choice"
+    );
+    assert_eq!(
+        pane.publishes.get(),
+        publishes,
+        "nothing about the choice changed, so nothing is written back"
+    );
+    assert!(pane.widget.awaiting_market);
+    assert!(!pane.status(&harness).is_failed(), "waiting is not working");
+    assert!(matches!(
+        pane.status(&harness),
+        WidgetState::Waiting(Notice::MarketNotLoaded { .. })
+    ));
+}
+
+/// A market whose directory load never committed is a market the pane waits for: the
+/// directory is empty, and the selection it was given is kept untouched.
+#[test]
+fn a_directory_failure_should_preserve_the_selection() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(fixture_catalog(&[SYMBOL]));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+
+    pane.load(&mut harness);
+
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "a market that is not in memory must not change the persisted config"
+    );
+    assert_eq!(pane.publishes.get(), 0, "nothing is written back");
+    assert_eq!(
+        pane.status(&harness),
+        WidgetState::Waiting(Notice::MarketNotLoaded {
+            venues: vec![route().venue],
+            supported: market_venues(),
+        }),
+        "the pane waits for its market rather than reading nothing"
+    );
+}
+
+/// The lookup is advisory and the loaded venue is the prerequisite: a chart whose market was
+/// never loaded starts no stream at all rather than subscribing to a route nobody has loaded.
+#[test]
+fn a_market_that_is_not_in_memory_should_not_start_a_stream() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(fixture_catalog(&[SYMBOL]));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+
+    pane.load(&mut harness);
+
+    assert_eq!(
+        pane.widget.generation, 0,
+        "an unloaded market starts no stream"
+    );
+    assert_eq!(
+        pane.widget.pending.dropped(),
+        0,
+        "and nothing was asked for it either"
+    );
+    assert!(pane.widget.snapshot.is_none());
+    assert!(pane.widget.awaiting_market);
+}
+
+/// A committed refresh of the chart's own venue reopens its stream: the catalogue generation
+/// the live stream resolved its rules against was replaced, so the same scope is asked for
+/// again — and the selection the user made is not what changed.
+#[test]
+fn a_refresh_of_the_charts_own_venue_should_reopen_its_stream() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::with_spot_loaded(fixture_catalog(&[SYMBOL]));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+    pane.load(&mut harness);
+    pane.accept(&mut harness, live_edge_snapshot(10, 10));
+    assert_eq!(pane.widget.generation, 1, "the chart started one stream");
+    let publishes = pane.publishes.get();
+
+    // The venue is loaded and refreshed: its catalogue publishes a new generation.
+    publish_generation(&mut harness, 1);
+    pane.frame(&mut harness);
+
+    assert!(
+        !pane.widget.awaiting_market,
+        "a market that is still loaded is not a wait"
+    );
+    assert_eq!(
+        pane.widget.generation, 2,
+        "the chart reopened the stream it was reading"
+    );
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "the user's choice is not what the refresh changed"
+    );
+    assert_eq!(
+        pane.publishes.get(),
+        publishes,
+        "and nothing about it is written back"
+    );
+    assert_eq!(pane.status(&harness), WidgetState::Connecting);
+}
+
+/// A market taken away while the chart was reading goes back to waiting on the generation
+/// change, and the stream it was reading is dropped with it.
+#[test]
+fn a_market_taken_away_after_a_generation_change_should_leave_the_pane_waiting() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::with_spot_loaded(fixture_catalog(&[SYMBOL]));
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+    pane.load(&mut harness);
+    pane.accept(&mut harness, live_edge_snapshot(10, 10));
+    assert!(pane.widget.snapshot.is_some(), "the chart is reading");
+
+    directory.unload(&route());
+    publish_generation(&mut harness, 2);
+    pane.frame(&mut harness);
+
+    assert!(pane.widget.awaiting_market, "the pane waits again");
+    assert!(pane.widget.snapshot.is_none(), "the chart it drew is gone");
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "and the choice it was reading stays"
+    );
+}
+
+/// A route whose loaded scope does not offer candlesticks is a scope this chart cannot
+/// follow: the selection the selector offered is refused rather than carried into a stream
+/// nothing will publish.
+#[test]
+fn a_scope_without_candlesticks_should_be_refused() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(fixture_catalog(&["ETHUSDT"]));
+    directory.load(route(), vec![CapabilityId::MarketCatalog]);
+    let mut pane = pane_with_directory(
+        &mut harness,
+        config(),
+        FixtureSource::publishing_all_intervals(),
+        PAGE,
+        directory.directory(),
+    );
+    let offered = selection("ETHUSDT");
+    let signal = pane.widget.selection_requests;
+    harness.app_mut().write(&signal, Some(offered));
+
+    pane.frame(&mut harness);
+
+    assert_eq!(
+        pane.widget.config.selection,
+        config().selection,
+        "a scope that does not serve candles is not followed"
+    );
+    assert_eq!(pane.publishes.get(), 0, "and nothing is written back");
 }

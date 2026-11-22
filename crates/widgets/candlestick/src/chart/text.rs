@@ -13,7 +13,10 @@
 //!
 //! Both caches are keyed on the whole [`TextStyle`], which carries the colour and
 //! the size as well as the font: a colour or font change invalidates shaped text
-//! even when the numbers did not change.
+//! even when the numbers did not change. The raster scale the engine shaped at is a
+//! key part as well: the atlas does not re-rasterise an existing handle when
+//! [`App::text_scale`] moves, so text shaped at another scale would keep the old
+//! ppem bitmaps for good (design §11.1).
 //!
 //! # The atlas lease
 //!
@@ -85,30 +88,41 @@ struct CachedTextLine {
 /// Shaped axis labels, keyed by text and style.
 pub(crate) struct ChartTextCache {
     entries: Vec<CachedTextLine>,
+    /// The raster scale every entry was shaped at, or `None` before the first line.
+    ///
+    /// The engine never re-rasterises a handle it handed out, so a scale change is a
+    /// different cache: the labels would otherwise keep the previous DPI's bitmaps.
+    scale: Option<f32>,
 }
 
 impl ChartTextCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: Vec::with_capacity(TEXT_CACHE_CAPACITY),
+            scale: None,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.scale = None;
     }
 
     /// Shapes `text` in `style`, or returns the line that was shaped before.
     ///
     /// A handle whose atlas lease is gone is dropped and shaped again: the glyphs
     /// it named have been reused, so drawing it would be drawing another line's
-    /// pixels.
+    /// pixels. The same happens when the raster scale moved, because the atlas does
+    /// not re-rasterise a handle.
     pub(crate) fn line(
         &mut self,
         app: &mut App,
         text: &str,
         style: &TextStyle,
     ) -> Arc<ShapedTextHandle> {
+        if self.scale != Some(app.text_scale()) {
+            self.clear();
+        }
         if let Some(index) = self
             .entries
             .iter()
@@ -124,6 +138,7 @@ impl ChartTextCache {
             }
         }
 
+        let scale = app.text_scale();
         let handle = Arc::new(shape_line(app, text, style));
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
@@ -133,6 +148,7 @@ impl ChartTextCache {
             style: style.clone(),
             handle: Arc::clone(&handle),
         });
+        self.scale = Some(scale);
         handle
     }
 
@@ -165,6 +181,18 @@ impl ChartTextCache {
         self.entries
             .iter()
             .map(|entry| entry.text.clone())
+            .collect()
+    }
+
+    /// The raster scale every line this cache holds was shaped at (test read point).
+    ///
+    /// Reads the fact off the handles rather than the cache's own bookkeeping: the
+    /// engine stamps the scale it actually rasterised at onto each handle.
+    #[cfg(test)]
+    pub(crate) fn shaped_scales(&self) -> Vec<f32> {
+        self.entries
+            .iter()
+            .map(|entry| entry.handle.scale())
             .collect()
     }
 }
@@ -338,6 +366,22 @@ impl ReadoutCache {
     #[cfg(test)]
     pub(crate) fn described_time_label(&self) -> Option<SmolStr> {
         Some(self.entry.as_ref()?.presentation.time_label.clone())
+    }
+
+    /// The raster scale every run of the cached line was shaped at (test read point).
+    #[cfg(test)]
+    pub(crate) fn shaped_scales(&self) -> Vec<f32> {
+        self.entry
+            .as_ref()
+            .map(|entry| {
+                entry
+                    .presentation
+                    .runs
+                    .iter()
+                    .map(|run| run.handle.scale())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Shapes the readout for `candle`, reading its traded size in
