@@ -1,21 +1,28 @@
 //! Signing in: the desktop half of the account service's OAuth authorization.
 //!
-//! The application never sees the user's credentials. It opens the account service in
-//! the system browser, which authorizes the request and sends the browser back to a
-//! loopback address this process is listening on. Three properties make that safe, and
-//! all three are decided here:
+//! The application never sees the user's credentials. It opens the account service in the
+//! system browser, which authorizes the request and sends the browser back to a loopback
+//! address this process is listening on. Three properties make that safe, and all three are
+//! decided here:
 //!
-//! * the listener binds an **ephemeral loopback port**, so nothing outside this
-//!   machine can reach the callback and the redirect URI is known only to the browser
-//!   that was just opened;
-//! * the request carries a **single-use `state`** and a **PKCE challenge**, so a
-//!   callback that was not produced for this attempt is rejected instead of exchanged;
-//! * the exchange happens **on this machine, over the loopback**, with a key that never
-//!   leaves the process — the browser only ever carries an authorization code.
+//! * the listener binds an **ephemeral loopback port**, so nothing outside this machine can
+//!   reach the callback and the redirect URI is known only to the browser that was just opened;
+//! * the request carries a **single-use `state`** and a **PKCE challenge**, so a callback that
+//!   was not produced for this attempt is rejected instead of exchanged;
+//! * the exchange happens **on this machine, over the loopback**, with a key that never leaves
+//!   the process — the browser only ever carries an authorization code.
 //!
-//! An attempt is not open forever: it lives for [`ATTEMPT_TTL`], after which the
-//! listener is dropped and the port is released. Nothing about a failed or expired
-//! attempt is retried; the user asks again.
+//! An attempt is not open forever: it lives for [`ATTEMPT_TTL`], after which the listener is
+//! dropped and the port is released. Nothing about a failed or expired attempt is retried; the
+//! user asks again.
+//!
+//! # Copy
+//!
+//! Everything the user can read is a [`TranslatedError`]: the attempt's own failures map to the
+//! `error.account.*` keys, and a failure the account service reported is rendered through
+//! [`AccountFailure`], which is also what the control uses when a tier query or a dashboard
+//! handoff fails. The `Display` text of [`LoginError`] is a developer diagnostic and is never
+//! drawn.
 
 use std::{
     io,
@@ -26,8 +33,7 @@ use std::{
 use app_config::settings::AccountConfig;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Bytes, BytesMut};
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use kytrix_service_provider::{
     auth::{
         constants::{ACCOUNT_ORIGIN, API_RESOURCE, CLIENT_ID, SCOPE},
@@ -38,6 +44,7 @@ use kytrix_service_provider::{
 };
 use rand::TryRng as _;
 use sha2::{Digest as _, Sha256};
+use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -45,6 +52,7 @@ use tokio::{
     time::timeout,
 };
 use url::Url;
+use widget::error::TranslatedError;
 use zeroize::Zeroizing;
 
 use crate::account::account_from_identity;
@@ -56,8 +64,8 @@ const RANDOM_TOKEN_BYTES: usize = 32;
 
 /// How long an attempt stays open.
 ///
-/// It is a session in a browser, not a request: the user may have to sign in, create
-/// an account, or approve a wallet before the callback arrives.
+/// It is a session in a browser, not a request: the user may have to sign in, create an
+/// account, or approve a wallet before the callback arrives.
 pub(crate) const ATTEMPT_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// How long one callback connection may take to send its request line and headers.
@@ -74,8 +82,8 @@ const FAILURE_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><meta name="r
 
 /// A prepared but not yet authorized sign-in.
 ///
-/// It owns the callback listener, so dropping it — a cancelled attempt, an expired
-/// one — gives the loopback port back.
+/// It owns the callback listener, so dropping it — a cancelled attempt, an expired one — gives
+/// the loopback port back.
 pub(crate) struct LoginAttempt {
     listener: StdTcpListener,
     state: String,
@@ -115,54 +123,81 @@ pub(crate) enum LoginError {
     Expired,
 }
 
-impl LoginError {
-    /// The failure as the menu reports it.
-    ///
-    /// The message is produced where the failure happens, so a failure that is still
-    /// on screen when the language changes keeps the words it was reported in.
-    pub(crate) fn message(&self, cx: &App) -> SharedString {
+impl TranslatedError for LoginError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
             Self::CallbackListener(_) | Self::ConfigureCallback(_) => {
-                t!(cx, "error.account.login_listener")
+                t_smol!(translate, "error.account.login_listener")
             }
-            Self::SecureRandom(_) => t!(cx, "error.account.secure_random"),
-            Self::AuthorizationUrl(_) => t!(cx, "error.account.route"),
-            Self::Auth(error) => service_failure(error, cx),
+            Self::SecureRandom(_) => t_smol!(translate, "error.account.secure_random"),
+            Self::AuthorizationUrl(_) => t_smol!(translate, "error.account.route"),
+            Self::Auth(error) => AccountFailure::Service(error).translated_message(translate),
             Self::AcceptCallback(_) | Self::ReadCallback(_) | Self::InvalidCallback => {
-                t!(cx, "error.account.login_callback")
+                t_smol!(translate, "error.account.login_callback")
             }
-            Self::Expired => t!(cx, "error.account.login_expired"),
+            Self::Expired => t_smol!(translate, "error.account.login_expired"),
         }
     }
 }
 
-/// The account service could not do what was asked of it.
+/// A failure this feature reports to the user.
 ///
-/// Every variant is named, including the ones that only mean "the answer was lost": an
-/// outcome that is unknown must not be reported as a plain failure, because the only
-/// honest thing to do about it is to ask again rather than to assume.
-pub(crate) fn service_failure(error: &AuthError, cx: &App) -> SharedString {
-    match error {
-        AuthError::CredentialStore => t!(cx, "error.account.credential_store"),
-        AuthError::MissingCredential => t!(cx, "error.account.missing_credential"),
-        AuthError::InvalidCredential => t!(cx, "error.account.invalid_credential"),
-        AuthError::HttpClient | AuthError::Request => t!(cx, "error.account.request"),
-        AuthError::Route => t!(cx, "error.account.route"),
-        AuthError::RefreshOutcomeUnknown => t!(cx, "error.account.refresh_unknown"),
-        AuthError::Status(status) => t!(cx, "error.account.status", status = status.as_u16()),
-        AuthError::InvalidResponse => t!(cx, "error.account.response"),
-        AuthError::InvalidGrant => t!(cx, "error.account.invalid_grant"),
-        AuthError::SystemTime => t!(cx, "error.account.system_time"),
-        AuthError::SecureRandom => t!(cx, "error.account.secure_random"),
-        AuthError::SessionClosed => t!(cx, "error.account.session_closed"),
-        AuthError::SequenceExhausted => t!(cx, "error.account.sequence_exhausted"),
+/// It exists as a type of this crate because [`TranslatedError`] and the account service's
+/// [`AuthError`] are both foreign: the sentence a failure is stated with is this feature's
+/// business, so the mapping lives here and every failure the service reports is rendered through
+/// it — a sign-in, a tier query, a dashboard handoff, a session read.
+#[derive(Debug)]
+pub(crate) enum AccountFailure<'a> {
+    /// The account service could not do what was asked of it.
+    Service(&'a AuthError),
+}
+
+impl TranslatedError for AccountFailure<'_> {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::Service(error) => {
+                // Every variant is named, including the ones that only mean "the answer was
+                // lost": an outcome that is unknown must not be reported as a plain failure,
+                // because the only honest thing to do about it is to ask again rather than to
+                // assume.
+                match error {
+                    AuthError::CredentialStore => {
+                        t_smol!(translate, "error.account.credential_store")
+                    }
+                    AuthError::MissingCredential => {
+                        t_smol!(translate, "error.account.missing_credential")
+                    }
+                    AuthError::InvalidCredential => {
+                        t_smol!(translate, "error.account.invalid_credential")
+                    }
+                    AuthError::HttpClient | AuthError::Request => {
+                        t_smol!(translate, "error.account.request")
+                    }
+                    AuthError::Route => t_smol!(translate, "error.account.route"),
+                    AuthError::RefreshOutcomeUnknown => {
+                        t_smol!(translate, "error.account.refresh_unknown")
+                    }
+                    AuthError::Status(status) => {
+                        t_smol!(translate, "error.account.status", status = status.as_u16())
+                    }
+                    AuthError::InvalidResponse => t_smol!(translate, "error.account.response"),
+                    AuthError::InvalidGrant => t_smol!(translate, "error.account.invalid_grant"),
+                    AuthError::SystemTime => t_smol!(translate, "error.account.system_time"),
+                    AuthError::SecureRandom => t_smol!(translate, "error.account.secure_random"),
+                    AuthError::SessionClosed => t_smol!(translate, "error.account.session_closed"),
+                    AuthError::SequenceExhausted => {
+                        t_smol!(translate, "error.account.sequence_exhausted")
+                    }
+                }
+            }
+        }
     }
 }
 
 /// Prepares a sign-in and binds its callback listener.
 ///
-/// The returned attempt is inert until its URL is opened: nothing is listening for
-/// anything but the one callback it was built for.
+/// The returned attempt is inert until its URL is opened: nothing is listening for anything but
+/// the one callback it was built for.
 pub(crate) fn prepare_login(dpop_key: DpopKey) -> Result<LoginAttempt, LoginError> {
     let listener =
         StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(LoginError::CallbackListener)?;
@@ -204,9 +239,9 @@ pub(crate) fn prepare_login(dpop_key: DpopKey) -> Result<LoginAttempt, LoginErro
 
 /// Serves the callback listener until the attempt is authorized or expires.
 ///
-/// The exchange is a parameter rather than a call so the flow can be driven without an
-/// account service: everything decided here — which callbacks are accepted, what the
-/// browser is told, when the attempt ends — is the same either way.
+/// The exchange is a parameter rather than a call so the flow can be driven without an account
+/// service: everything decided here — which callbacks are accepted, what the browser is told,
+/// when the attempt ends — is the same either way.
 pub(crate) async fn run_login<F, Fut>(
     attempt: LoginAttempt,
     exchange: F,
@@ -257,11 +292,11 @@ where
         .and_then(|value| value.strip_suffix(CALLBACK_PATH))
         .ok_or(LoginError::InvalidCallback)?;
 
-    // Everything that is not this attempt's callback — a port scan, a stale tab, a
-    // forged `state` — is answered with a failure page and the listener keeps waiting.
-    // Only a callback carrying this attempt's `state` and a well-formed code ends the
-    // loop, because that code is about to be exchanged for an account; the connection
-    // is held until the exchange says what the browser should be told.
+    // Everything that is not this attempt's callback — a port scan, a stale tab, a forged
+    // `state` — is answered with a failure page and the listener keeps waiting. Only a callback
+    // carrying this attempt's `state` and a well-formed code ends the loop, because that code is
+    // about to be exchanged for an account; the connection is held until the exchange says what
+    // the browser should be told.
     let (code, mut stream) = loop {
         let (mut stream, _) = listener
             .accept()
@@ -330,9 +365,9 @@ async fn read_callback_request(stream: &mut TcpStream) -> Result<Bytes, LoginErr
 
 /// Reads the authorization code out of one callback request.
 ///
-/// The request must be exactly a `GET` for [`CALLBACK_PATH`] addressed to the host this
-/// attempt bound, and its query must be exactly `code` and `state`: a request that
-/// carries anything else is not the callback that was asked for.
+/// The request must be exactly a `GET` for [`CALLBACK_PATH`] addressed to the host this attempt
+/// bound, and its query must be exactly `code` and `state`: a request that carries anything else
+/// is not the callback that was asked for.
 fn parse_callback_request(
     request: &[u8],
     expected_state: &str,
