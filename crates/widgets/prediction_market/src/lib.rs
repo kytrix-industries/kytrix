@@ -1,5 +1,6 @@
 mod book;
 mod chart;
+mod directory;
 mod model;
 mod service;
 #[cfg(test)]

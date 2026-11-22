@@ -50,7 +50,7 @@ use network::transport::{
 use smol_str::SmolStr;
 use tokio::{sync::watch, time::Instant};
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     runtime::{ServiceContext, WidgetService},
     stream::{StreamPublishError, StreamPublisher},
@@ -139,11 +139,11 @@ pub(super) enum SolanaWalletStreamError {
     Transport(TransportError),
 }
 
-impl LocalizedError for SolanaWalletStreamError {
-    fn localized_message(&self, cx: &gpui_kit::App) -> gpui_kit::SharedString {
+impl TranslatedError for SolanaWalletStreamError {
+    fn translated_message(&self, translate: &i18n::translate::Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::Transport(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Transport(error) => error.translated_message(translate),
         }
     }
 }

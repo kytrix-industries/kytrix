@@ -2843,19 +2843,18 @@ name = "ethereum_wallet"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
  "i18n",
  "kytrix_service_provider",
+ "log",
  "network",
  "serde",
  "smol_str",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -3523,19 +3522,20 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
+ "bytes",
  "i18n",
  "kytrix_service_provider",
+ "log",
+ "lyon",
  "network",
  "serde",
  "smol_str",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -7897,10 +7897,8 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
  "futures",
- "gpui-kit",
  "i18n",
  "instrument_selector_ui",
  "log",
@@ -7909,11 +7907,12 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
+ "taffy",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -9637,19 +9636,18 @@ name = "solana_wallet"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
  "i18n",
  "kytrix_service_provider",
+ "log",
  "network",
  "serde",
  "smol_str",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

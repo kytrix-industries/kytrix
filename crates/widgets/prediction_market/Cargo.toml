@@ -6,35 +6,38 @@ edition.workspace = true
 
 [dependencies]
 ahash = { workspace = true }
+app_config = { workspace = true }
+base_ui = { workspace = true }
 futures = { workspace = true }
-gpui-kit = { workspace = true }
 i18n = { workspace = true }
+instrument_selector_ui = { workspace = true }
 log = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
+# The book region's percent height and its minimum are taffy lengths the engine has
+# no setter for (the same way the kit's own components express them).
+taffy = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-
-# Workspace members
-app_config = { workspace = true }
-app_config_provider = { workspace = true }
-base_ui = { workspace = true }
-instrument_selector_ui = { workspace = true }
-market_participants_connector = { workspace = true }
-market_participants_model = { workspace = true }
+ui_core = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
 # A pane only reads a venue that is in the loaded-venues view, so a view test has to
 # commit one; the fixture seam is how it does that without a venue answering. Never
 # enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
 # The persisted config is JSON, so the round-trip test encodes and decodes one.
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# The engine's node/canvas inspection the chart and book tests read, and the
+# framework's headless host (`WidgetTestApp`), which is what every interface test
+# drives the widget through. Only the test build opens either feature.
+ui_core = { workspace = true, features = ["test-support"] }
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

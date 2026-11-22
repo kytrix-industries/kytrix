@@ -1,36 +1,63 @@
 //! Painting one prepared prediction chart.
 //!
-//! One frame turns the prepared boxes, paths and ticks into quads and strokes. This
-//! module holds no state: the y labels travel with the prepared chart, and the series
-//! palette is a six-colour stack array read from the theme, so neither the y-label
-//! strings nor the palette is rebuilt per frame. The only text a frame formats is the
-//! hover's own — a label per series and the time under the pointer — because those are
-//! the only strings that depend on where the pointer is, and the only buffer a frame
-//! builds is the small label column those strings sit in.
+//! One frame turns the prepared boxes, lines and ticks into quads, registered meshes
+//! and shaped text. This module holds no state beyond the shaped-line cache it is
+//! handed: the y labels travel with the prepared chart, and the series palette is read
+//! from the theme into a small copy, so neither the y-label strings nor the palette is
+//! rebuilt per frame. The only text a frame formats is the hover's own — a label per
+//! series and the time under the pointer — because those are the only strings that
+//! depend on where the pointer is, and the only buffer a frame builds is the small
+//! label column those strings sit in.
 //!
-//! Everything that follows the pointer is drawn here and only here: the crosshair,
-//! the right-side fade of every line, the hover dots, the label column and the time
-//! label. The prepared chart underneath them is shared with every pointer position,
-//! which is what keeps a mouse crossing the plot from rebuilding geometry.
+//! Everything that follows the pointer is drawn here and only here: the crosshair, the
+//! right-side fade of every line, the hover dots, the label column and the time label.
+//! The prepared chart underneath them is shared with every pointer position, which is
+//! what keeps a mouse crossing the plot from rebuilding geometry.
+//!
+//! # Lines are registered meshes
+//!
+//! The engine has no path builder: a line is a registered mesh ([`GeometryDesc`]) drawn
+//! with [`GeometryDraw`]. [`line_geometry`] builds that mesh — a ribbon through the
+//! step-line's points, one quad per segment and a square at every joint — and the chart
+//! registers it once per prepared frame, releasing the previous frame's meshes. The
+//! ribbon carries no anti-aliasing distance (every vertex is marked as interior), so the
+//! line is drawn with a hard edge rather than the feather the old path painter gave it;
+//! that is the registered difference from the toolkit's old chart.
+//!
+//! # Text
+//!
+//! Labels are shaped through [`super::text::ChartTextCache`] and pushed as glyph runs,
+//! so the only cost a hover pays is the two strings whose values changed. Every run a
+//! frame pushes is reported back to the chart: they are the atlas leases a steady frame
+//! has to check before it decides it may keep the canvas on screen.
 
-use base_ui::style::theme::ThemeExt;
-use gpui_kit::{
-    App, Bounds, ContentMask, Hsla, Pixels, Point, SharedString, TextAlign, Window, fill, point,
-    px, size,
-};
-use i18n::translator::types::I18n;
+use std::sync::Arc;
+
+use base_ui::theme::{resolved::Theme, role::Role};
+use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::App,
+    math::{Point, Rect, Size, Transform},
+    paint::{
+        canvas::Canvas,
+        color::Color,
+        geometry::{GeometryDesc, GeometryPipeline, IndexType, Topology},
+        primitive::{Border, ClipRect, GeometryDraw, Quad, QuadPaint},
+    },
+    text::{ShapedTextHandle, TextStyle},
+};
 
 use super::{
-    canvas::{ChartCanvasOptions, ChartPaintCaches, PreparedChart},
-    geometry::{ScreenPoint, y_for_percent, y_for_series},
+    canvas::{PreparedChart, SeriesMeshes},
+    geometry::{RectExt, ScreenPoint, y_for_percent, y_for_series},
     hover::{
         HoveredSample, LABEL_COLLISION_GAP, LABEL_GAP, LABEL_HEIGHT, dot_bounds, hover_point,
         label_side, label_tops, label_x, value_at,
     },
     text::{
-        AXIS_FONT_SIZE, ChartFont, ChartTextCache, LABEL_FONT_SIZE, STRONG_WEIGHT,
-        TIME_LABEL_FONT_SIZE, format_hover_time, format_percent_one_decimal,
+        AXIS_FONT_SIZE, ChartTextCache, LABEL_FONT_SIZE, REGULAR_WEIGHT, STRONG_WEIGHT,
+        TIME_LABEL_FONT_SIZE, format_hover_time, format_percent_one_decimal, label_style,
     },
 };
 
@@ -114,61 +141,57 @@ const ENDPOINT_MASK_VERTICAL: f32 = PULSE_MAX_RADIUS;
 const TIME_LABEL_TOP_INSET: f32 = 1.0;
 const TIME_LABEL_LINE_HEIGHT: f32 = 16.0;
 
-/// The two things a paint pass needs that only a frame can hand over.
+/// The colours one frame is drawn with, resolved from the theme.
 ///
-/// Text is shaped through the cache rather than through the window, and the window
-/// cannot be borrowed while a shaped line is being told about its own accessibility,
-/// so both travel together.
-struct PaintContext<'a> {
-    text_cache: &'a mut ChartTextCache,
-    window: &'a mut Window,
-    app: &'a mut App,
+/// The canvas bakes them in, which is why an appearance switch is one of the painted
+/// key's inputs: a canvas built for the light appearance is the wrong value for the
+/// dark one.
+///
+/// The palette is the theme's six series roles. The old chart read an eight-colour
+/// array out of the theme; six roles is one fewer pair of hues, so a series whose index
+/// is six or more wraps — a chart of more than six lines reuses colours, which the old
+/// one only did past eight (registered difference).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ChartColors {
+    palette: [Color; 6],
+    grid: Color,
+    axis: Color,
+    crosshair: Color,
+    halo: Color,
+    foreground: Color,
+    muted: Color,
+    label_background: Color,
+    label_border: Color,
 }
 
-impl PaintContext<'_> {
-    /// Shapes and draws one line of text, through the cache.
-    fn text(
-        &mut self,
-        text: &str,
-        origin: Point<Pixels>,
-        font: ChartFont,
-        align: TextAlign,
-        width: Pixels,
-        line_height: Pixels,
-    ) {
-        paint_text(
-            self.text_cache,
-            self.window,
-            self.app,
-            text,
-            origin,
-            font,
-            align,
-            width,
-            line_height,
-        );
+impl ChartColors {
+    /// The colours the theme resolves, for one appearance.
+    pub(crate) fn resolve(theme: &Theme) -> Self {
+        Self {
+            palette: [
+                theme.role(Role::ChartSeries0),
+                theme.role(Role::ChartSeries1),
+                theme.role(Role::ChartSeries2),
+                theme.role(Role::ChartSeries3),
+                theme.role(Role::ChartSeries4),
+                theme.role(Role::ChartSeries5),
+            ],
+            grid: theme.role(Role::ChartGrid),
+            axis: theme.role(Role::ChartAxis),
+            crosshair: theme.role(Role::ChartCrosshair),
+            // The halo is the pane body behind the canvas: it only separates crossing
+            // lines, so fading it would not change what a reader sees.
+            halo: theme.role(Role::SurfaceSunken),
+            foreground: theme.role(Role::FgDefault),
+            muted: theme.role(Role::FgMuted),
+            label_background: theme.role(Role::SurfaceOverlay),
+            label_border: theme.role(Role::LineBorder),
+        }
     }
 
-    /// The width `text` takes in `font`, shaped through the cache.
-    fn width(&mut self, text: &str, font: ChartFont) -> Pixels {
-        let window = &*self.window;
-        self.text_cache.width(text, font, window)
-    }
-
-    /// Runs `draw` clipped to `mask`.
-    fn with_mask<R>(
-        &mut self,
-        mask: Bounds<Pixels>,
-        draw: impl FnOnce(&mut ChartTextCache, &mut Window, &mut App) -> R,
-    ) -> R {
-        let Self {
-            text_cache,
-            window,
-            app,
-        } = self;
-        window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-            draw(text_cache, window, app)
-        })
+    /// The colour of one series, by the index the model gave it.
+    fn series(self, index: usize) -> Color {
+        self.palette[index % self.palette.len()]
     }
 }
 
@@ -177,36 +200,83 @@ impl PaintContext<'_> {
 /// The layers go down in the design's order: grid, axis labels, series, then
 /// everything the pointer adds, and the endpoint pulse last. The pulse is above the
 /// crosshair and the labels.
+///
+/// The second half of the answer says whether every line of text reached the canvas. A
+/// line whose atlas lease died while the canvas was being built is refused by the
+/// engine rather than encoded from reused texture, so that frame is missing a run and
+/// is not one the chart can keep. The handles are the lines the canvas was built from —
+/// the leases a steady frame has to check before it keeps this canvas.
 pub(crate) fn paint(
-    prepared: &PreparedChart,
-    options: &ChartCanvasOptions,
-    caches: &ChartPaintCaches,
-    window: &mut Window,
     app: &mut App,
-) {
+    text: &mut ChartTextCache,
+    translate: &Translate,
+    prepared: &PreparedChart,
+    meshes: &[SeriesMeshes],
+    colors: &ChartColors,
+    hovered: Option<HoveredSample>,
+    pulse_phase: Option<f32>,
+) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
     let layout = prepared.layout;
-    if prepared.domain.is_none()
-        || layout.plot.size.width <= Pixels::ZERO
-        || layout.plot.size.height <= Pixels::ZERO
+    if prepared.domain.is_none() || layout.plot.size.width <= 0.0 || layout.plot.size.height <= 0.0
     {
-        return;
+        return (Canvas::new(layout.bounds), true, Vec::new());
     }
-    let hovered = options
-        .pointer
-        .and_then(|pointer| prepared.hover_at(pointer));
-    let mut text_cache = caches.text_cache().borrow_mut();
-    let context = &mut PaintContext {
-        text_cache: &mut text_cache,
-        window,
+    let mut context = PaintContext {
         app,
+        translate,
+        text,
+        colors,
+        used: Vec::new(),
+        whole: true,
     };
-    paint_grid(prepared, context);
-    paint_axis_labels(prepared, context);
-    paint_series(prepared, hovered.as_ref(), context);
-    if let Some(hovered) = hovered.as_ref() {
-        paint_hover(prepared, hovered, context);
+    let mut canvas = Canvas::new(layout.bounds);
+    paint_grid(&mut canvas, prepared, colors);
+    paint_axis_labels(&mut canvas, prepared, &mut context);
+    paint_series(&mut canvas, prepared, meshes, hovered, &mut context);
+    if let Some(hovered) = hovered {
+        paint_hover(&mut canvas, prepared, hovered, &mut context);
     }
-    paint_endpoints(prepared, hovered.as_ref(), options.pulse_phase, context);
+    paint_endpoints(&mut canvas, prepared, hovered, pulse_phase, &mut context);
+    let whole = context.whole;
+    (canvas, whole, context.used)
+}
+
+/// The shaped text and theme one paint pass needs.
+struct PaintContext<'a> {
+    app: &'a mut App,
+    translate: &'a Translate,
+    text: &'a mut ChartTextCache,
+    colors: &'a ChartColors,
+    /// The lines this frame pushed, which are the canvas' text.
+    used: Vec<Arc<ShapedTextHandle>>,
+    /// Whether every line this pass placed reached the canvas.
+    whole: bool,
+}
+
+impl PaintContext<'_> {
+    /// Pushes one line of text with its top-left corner at (`x`, `y`).
+    ///
+    /// A refused line is one whose atlas lease died between being shaped and being
+    /// pushed: its glyphs have been reused, so the run is left out rather than drawn
+    /// from stale texture, and the pass is not a whole frame any more.
+    fn text(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle) {
+        if text.is_empty() {
+            return;
+        }
+        let line = self.text.line(self.app, text, style);
+        if canvas.push_shaped_text(&line, Point::new(x, y)) {
+            #[cfg(test)]
+            record_text(text, x, y, style.size, line.size().width);
+            self.used.push(line);
+        } else {
+            self.whole = false;
+        }
+    }
+
+    /// The width one line of `text` occupies in `style`.
+    fn width(&mut self, text: &str, style: &TextStyle) -> f32 {
+        self.text.width(self.app, text, style)
+    }
 }
 
 /// Draws the dotted grid.
@@ -214,63 +284,55 @@ pub(crate) fn paint(
 /// A horizontal row of dots spans the plot; a vertical one runs from the plot's top
 /// through the band under it, which is what the reference chart measures, and stops
 /// before the strip above the plot that holds the hovered time. The rows are disjoint
-/// and so are the columns, so each direction is one layer the scene builder can batch
-/// instead of one insertion per dot.
-fn paint_grid(prepared: &PreparedChart, context: &mut PaintContext<'_>) {
+/// and so are the columns, so each direction is one run of quads under one clip.
+fn paint_grid(canvas: &mut Canvas, prepared: &PreparedChart, colors: &ChartColors) {
     let layout = prepared.layout;
-    let color = context.app.theme().roles.chart.grid.hsla;
-    context.window.paint_layer(layout.plot, |window| {
-        for tick in &prepared.axis.ticks {
-            let y = y_for_percent(*tick, &prepared.axis, layout.plot);
-            let mut x = layout.plot.origin.x;
-            while x < layout.plot.right() {
-                let width = px(GRID_DOT).min(layout.plot.right() - x);
-                window.paint_quad(fill(
-                    Bounds::new(point(x, y), size(width, px(GRID_DOT))),
-                    color,
-                ));
-                x += px(GRID_PERIOD);
-            }
+    push_clip(canvas, layout.plot);
+    for tick in &prepared.axis.ticks {
+        let y = y_for_percent(*tick, &prepared.axis, layout.plot);
+        let mut x = layout.plot.origin.x;
+        while x < layout.plot.right() {
+            let width = GRID_DOT.min(layout.plot.right() - x);
+            push_quad(canvas, Rect::new(x, y, width, GRID_DOT), colors.grid);
+            x += GRID_PERIOD;
         }
-    });
-    context.window.paint_layer(layout.bounds, |window| {
-        for tick in prepared.time_ticks.iter() {
-            let mut y = layout.plot.origin.y;
-            while y < layout.bounds.bottom() {
-                let height = px(GRID_DOT).min(layout.bounds.bottom() - y);
-                window.paint_quad(fill(
-                    Bounds::new(point(tick.x, y), size(px(GRID_DOT), height)),
-                    color,
-                ));
-                y += px(GRID_PERIOD);
-            }
+    }
+    pop_clip(canvas);
+    push_clip(canvas, layout.bounds);
+    for tick in prepared.time_ticks.iter() {
+        let mut y = layout.plot.origin.y;
+        while y < layout.bounds.bottom() {
+            let height = GRID_DOT.min(layout.bounds.bottom() - y);
+            push_quad(canvas, Rect::new(tick.x, y, GRID_DOT, height), colors.grid);
+            y += GRID_PERIOD;
         }
-    });
+    }
+    pop_clip(canvas);
 }
 
 /// Draws the y values right of the plot and the x times under it.
 ///
 /// The y labels were formatted when the chart was prepared; the x labels come with
 /// their ticks.
-fn paint_axis_labels(prepared: &PreparedChart, context: &mut PaintContext<'_>) {
+fn paint_axis_labels(
+    canvas: &mut Canvas,
+    prepared: &PreparedChart,
+    context: &mut PaintContext<'_>,
+) {
     let layout = prepared.layout;
-    let color = context.app.theme().roles.chart.axis.hsla;
-    let font = ChartFont::new(AXIS_FONT_SIZE, gpui_kit::FontWeight::NORMAL, color);
-    let x_origin = layout.plot.right() + px(Y_LABEL_GAP);
-    let y_width = (layout.bounds.right() - x_origin).max(Pixels::ZERO);
+    let style = label_style(
+        AXIS_FONT_SIZE,
+        AXIS_LINE_HEIGHT,
+        context.colors.axis,
+        REGULAR_WEIGHT,
+    );
+    let x_origin = layout.plot.right() + Y_LABEL_GAP;
     for (tick, label) in prepared.axis.ticks.iter().zip(prepared.axis_labels.iter()) {
-        let y = y_for_percent(*tick, &prepared.axis, layout.plot) - px(AXIS_LINE_HEIGHT / 2.0);
-        context.text(
-            label.as_str(),
-            point(x_origin, y),
-            font,
-            TextAlign::Left,
-            y_width,
-            px(AXIS_LINE_HEIGHT),
-        );
+        let y = y_for_percent(*tick, &prepared.axis, layout.plot) - AXIS_LINE_HEIGHT / 2.0;
+        context.text(canvas, label.as_str(), x_origin, y, &style);
     }
 
-    let y_origin = layout.bottom_band().origin.y + px(X_LABEL_GAP);
+    let y_origin = layout.bottom_band().origin.y + X_LABEL_GAP;
     let left = layout.bounds.origin.x;
     let right = layout.bounds.right();
     for tick in prepared.time_ticks.iter() {
@@ -278,99 +340,78 @@ fn paint_axis_labels(prepared: &PreparedChart, context: &mut PaintContext<'_>) {
             // A repeated clock label keeps its gridline but draws no text.
             continue;
         }
-        let width = context.width(tick.label.as_str(), font);
+        let width = context.width(tick.label.as_str(), &style);
         let x = (tick.x - width / 2.0).clamp(left, (right - width).max(left));
-        context.text(
-            tick.label.as_str(),
-            point(x, y_origin),
-            font,
-            TextAlign::Left,
-            width,
-            px(AXIS_LINE_HEIGHT),
-        );
+        context.text(canvas, tick.label.as_str(), x, y_origin, &style);
     }
 }
 
-/// Draws every series: its halo first, then its step path.
+/// Draws every series: its halo first, then its step line.
 ///
-/// Which side of the crosshair a stroke is on is decided by a content mask, not by
-/// splitting the points: the prepared path is built once and both halves paint the
-/// same vertices, so the two sides join exactly at the indicator. The faded side is
-/// painted first, which is what puts the full-colour side and the dots above it.
+/// Which side of the crosshair a line is on is decided by a clip, not by splitting the
+/// points: the prepared mesh is built once and both halves draw the same vertices, so
+/// the two sides join exactly at the indicator. The faded side is painted first, which
+/// is what puts the full-colour side and the dots above it.
 fn paint_series(
+    canvas: &mut Canvas,
     prepared: &PreparedChart,
-    hovered: Option<&HoveredSample>,
+    meshes: &[SeriesMeshes],
+    hovered: Option<HoveredSample>,
     context: &mut PaintContext<'_>,
 ) {
     let layout = prepared.layout;
-    let palette = series_palette(context);
-    let halo_color = context.app.theme().roles.surface.sunken.hsla;
-    let plot_mask = ContentMask {
-        bounds: layout.plot,
-    };
-    for series in prepared.series.iter() {
+    push_clip(canvas, layout.plot);
+    for (index, series) in prepared.series.iter().enumerate() {
+        let Some(mesh) = meshes.get(index) else {
+            continue;
+        };
         if series.screen.len() < 2 {
             // A line of one point has no segment; its endpoint dot is all it draws.
             continue;
         }
-        let color = palette[series.color % palette.len()];
-        context.window.with_content_mask(Some(plot_mask), |window| {
-            if let Some(halo) = series.halo.as_ref() {
-                // The halo is the background's own colour: it only separates
-                // crossing lines, so fading it would not change what a reader sees.
-                window.paint_path(halo.clone(), halo_color);
-                #[cfg(test)]
-                record_stroke(halo_color, SERIES_HALO_WIDTH, layout.plot);
+        let color = context.colors.series(series.color);
+        if let Some(halo) = mesh.halo {
+            canvas.push_geometry(GeometryDraw::full(
+                halo,
+                Transform::IDENTITY,
+                context.colors.halo,
+            ));
+        }
+        let Some(line) = mesh.line else {
+            continue;
+        };
+        match hovered {
+            Some(hovered) => {
+                let (left, right) = fade_masks(layout.plot, hovered.x);
+                push_clip(canvas, right);
+                canvas.push_geometry(GeometryDraw::full(
+                    line,
+                    Transform::IDENTITY,
+                    color.with_opacity(SERIES_FADE_ALPHA),
+                ));
+                pop_clip(canvas);
+                push_clip(canvas, left);
+                canvas.push_geometry(GeometryDraw::full(line, Transform::IDENTITY, color));
+                pop_clip(canvas);
             }
-            let Some(path) = series.path.as_ref() else {
-                return;
-            };
-            match hovered {
-                Some(hovered) => {
-                    let (left, right) = fade_masks(layout.plot, hovered.x);
-                    let faded = Hsla {
-                        a: SERIES_FADE_ALPHA,
-                        ..color
-                    };
-                    window.with_content_mask(Some(ContentMask { bounds: right }), |window| {
-                        window.paint_path(path.clone(), faded);
-                        #[cfg(test)]
-                        record_stroke(faded, SERIES_STROKE_WIDTH, right);
-                    });
-                    window.with_content_mask(Some(ContentMask { bounds: left }), |window| {
-                        window.paint_path(path.clone(), color);
-                        #[cfg(test)]
-                        record_stroke(color, SERIES_STROKE_WIDTH, left);
-                    });
-                }
-                None => {
-                    window.paint_path(path.clone(), color);
-                    #[cfg(test)]
-                    record_stroke(color, SERIES_STROKE_WIDTH, layout.plot);
-                }
+            None => {
+                canvas.push_geometry(GeometryDraw::full(line, Transform::IDENTITY, color));
             }
-        });
+        }
     }
-}
-
-/// The theme colour of every series, in palette order.
-///
-/// The palette is the theme's fixed six, so a frame reads it into a stack array and
-/// indexes it with the series' own colour; a normal frame allocates nothing for it.
-fn series_palette(context: &PaintContext<'_>) -> [Hsla; 6] {
-    context.app.theme().roles.chart.series.map(|role| role.hsla)
+    pop_clip(canvas);
 }
 
 /// The two masks a hovering frame splits every line into.
-fn fade_masks(plot: Bounds<Pixels>, crosshair_x: Pixels) -> (Bounds<Pixels>, Bounds<Pixels>) {
+fn fade_masks(plot: Rect, crosshair_x: f32) -> (Rect, Rect) {
     let x = crosshair_x.clamp(plot.origin.x, plot.right());
-    let left = Bounds::new(
+    let left = Rect::from_origin_size(
         plot.origin,
-        size((x - plot.origin.x).max(Pixels::ZERO), plot.size.height),
+        Size::new((x - plot.origin.x).max(0.0), plot.size.height),
     );
-    let right = Bounds::new(
-        point(x, plot.origin.y),
-        size((plot.right() - x).max(Pixels::ZERO), plot.size.height),
+    let right = Rect::from_origin_size(
+        Point::new(x, plot.origin.y),
+        Size::new((plot.right() - x).max(0.0), plot.size.height),
     );
     (left, right)
 }
@@ -380,15 +421,15 @@ fn fade_masks(plot: Bounds<Pixels>, crosshair_x: Pixels) -> (Bounds<Pixels>, Bou
 /// A hover dot's centre can sit on either vertical edge of the plot, so both edges get
 /// the wash's radius. The right overhang stays inside [`Y_LABEL_GAP`], and the x labels
 /// start one pixel past the bottom overhang.
-fn dot_mask(plot: Bounds<Pixels>) -> Bounds<Pixels> {
-    Bounds::new(
-        point(
-            plot.origin.x - px(DOT_MASK_LEFT),
-            plot.origin.y - px(DOT_MASK_VERTICAL),
+fn dot_mask(plot: Rect) -> Rect {
+    Rect::from_origin_size(
+        Point::new(
+            plot.origin.x - DOT_MASK_LEFT,
+            plot.origin.y - DOT_MASK_VERTICAL,
         ),
-        size(
-            plot.size.width + px(DOT_MASK_LEFT + DOT_MASK_RIGHT),
-            plot.size.height + px(DOT_MASK_VERTICAL * 2.0),
+        Size::new(
+            plot.size.width + (DOT_MASK_LEFT + DOT_MASK_RIGHT),
+            plot.size.height + DOT_MASK_VERTICAL * 2.0,
         ),
     )
 }
@@ -399,15 +440,15 @@ fn dot_mask(plot: Bounds<Pixels>) -> Bounds<Pixels> {
 /// endpoint gets a mask with the pulse's full vertical reach. The left overhang is the
 /// hover wash's, for a one-point chart whose padded window puts its only sample in
 /// the middle of the plot rather than on an edge.
-fn endpoint_mask(plot: Bounds<Pixels>) -> Bounds<Pixels> {
-    Bounds::new(
-        point(
-            plot.origin.x - px(DOT_MASK_LEFT),
-            plot.origin.y - px(ENDPOINT_MASK_VERTICAL),
+fn endpoint_mask(plot: Rect) -> Rect {
+    Rect::from_origin_size(
+        Point::new(
+            plot.origin.x - DOT_MASK_LEFT,
+            plot.origin.y - ENDPOINT_MASK_VERTICAL,
         ),
-        size(
-            plot.size.width + px(DOT_MASK_LEFT + DOT_MASK_RIGHT),
-            plot.size.height + px(ENDPOINT_MASK_VERTICAL * 2.0),
+        Size::new(
+            plot.size.width + (DOT_MASK_LEFT + DOT_MASK_RIGHT),
+            plot.size.height + ENDPOINT_MASK_VERTICAL * 2.0,
         ),
     )
 }
@@ -419,41 +460,33 @@ fn endpoint_mask(plot: Bounds<Pixels>) -> Bounds<Pixels> {
 /// endpoint mask rather than the plot's own, because its centre is the plot's right
 /// edge and the pulse reaches past it at the top, bottom and right.
 fn paint_endpoints(
+    canvas: &mut Canvas,
     prepared: &PreparedChart,
-    hovered: Option<&HoveredSample>,
+    hovered: Option<HoveredSample>,
     pulse_phase: Option<f32>,
     context: &mut PaintContext<'_>,
 ) {
     let layout = prepared.layout;
-    let palette = series_palette(context);
     let pulse = pulse_phase.and_then(pulse_ring);
     let scale = pulse_phase.map_or(1.0, dot_scale);
-    context.window.with_content_mask(
-        Some(ContentMask {
-            bounds: endpoint_mask(layout.plot),
-        }),
-        |window| {
-            for series in prepared.series.iter() {
-                let Some(last) = series.last else {
-                    continue;
-                };
-                let color = palette[series.color % palette.len()];
-                if let Some((radius, alpha)) = pulse {
-                    paint_circle(window, last, px(radius), Hsla { a: alpha, ..color });
-                }
-                let dimmed = hovered.is_some_and(|hovered| last.x > hovered.x);
-                let dot = if dimmed {
-                    Hsla {
-                        a: SERIES_FADE_ALPHA,
-                        ..color
-                    }
-                } else {
-                    color
-                };
-                paint_circle(window, last, px(ENDPOINT_RADIUS * scale), dot);
-            }
-        },
-    );
+    push_clip(canvas, endpoint_mask(layout.plot));
+    for series in prepared.series.iter() {
+        let Some(last) = series.last else {
+            continue;
+        };
+        let color = context.colors.series(series.color);
+        if let Some((radius, alpha)) = pulse {
+            paint_circle(canvas, last, radius, color.with_opacity(alpha));
+        }
+        let dimmed = hovered.is_some_and(|hovered| last.x > hovered.x);
+        let dot = if dimmed {
+            color.with_opacity(SERIES_FADE_ALPHA)
+        } else {
+            color
+        };
+        paint_circle(canvas, last, ENDPOINT_RADIUS * scale, dot);
+    }
+    pop_clip(canvas);
 }
 
 /// The expanding ring's radius and alpha for a pulse phase, if the phase is running.
@@ -481,49 +514,44 @@ fn dot_scale(phase: f32) -> f32 {
 /// it meets each series, so the dot has to sit on top rather than have the line cut
 /// through it. It ends on the 0% line instead of running through the x-label band.
 /// The labels come after both, because they name what the dots mark.
-fn paint_hover(prepared: &PreparedChart, hovered: &HoveredSample, context: &mut PaintContext<'_>) {
+fn paint_hover(
+    canvas: &mut Canvas,
+    prepared: &PreparedChart,
+    hovered: HoveredSample,
+    context: &mut PaintContext<'_>,
+) {
     let layout = prepared.layout;
-    let palette = series_palette(context);
-    let crosshair_color = context.app.theme().roles.chart.crosshair.hsla;
-    context.with_mask(layout.bounds, |_, window, _| {
-        let x = hovered.x - px(CROSSHAIR_WIDTH / 2.0);
-        let top = layout.plot.origin.y - px(CROSSHAIR_OVERHANG_TOP);
-        let height = layout.plot.size.height + px(CROSSHAIR_OVERHANG_TOP);
-        window.paint_quad(fill(
-            Bounds::new(point(x, top), size(px(CROSSHAIR_WIDTH), height)),
-            crosshair_color,
-        ));
-    });
-    context.window.with_content_mask(
-        Some(ContentMask {
-            bounds: dot_mask(layout.plot),
-        }),
-        |window| {
-            for series in prepared.series.iter() {
-                if !series.covers(hovered.timestamp) {
-                    continue;
-                }
-                let Some(center) =
-                    hover_point(&series.samples, &prepared.axis, layout.plot, *hovered)
-                else {
-                    continue;
-                };
-                let color = palette[series.color % palette.len()];
-                paint_circle(
-                    window,
-                    center,
-                    px(HOVER_DOT_OUTER / 2.0),
-                    Hsla {
-                        a: HOVER_DOT_OUTER_ALPHA,
-                        ..color
-                    },
-                );
-                paint_circle(window, center, px(HOVER_DOT_INNER / 2.0), color);
-            }
-        },
+    push_clip(canvas, layout.bounds);
+    let x = hovered.x - CROSSHAIR_WIDTH / 2.0;
+    let top = layout.plot.origin.y - CROSSHAIR_OVERHANG_TOP;
+    let height = layout.plot.size.height + CROSSHAIR_OVERHANG_TOP;
+    push_quad(
+        canvas,
+        Rect::new(x, top, CROSSHAIR_WIDTH, height),
+        context.colors.crosshair,
     );
-    paint_label_column(prepared, hovered, &palette, context);
-    paint_hover_time(prepared, hovered, context);
+    pop_clip(canvas);
+    push_clip(canvas, dot_mask(layout.plot));
+    for series in prepared.series.iter() {
+        if !series.covers(hovered.timestamp) {
+            continue;
+        }
+        let Some(center) = hover_point(&series.samples, &prepared.axis, layout.plot, hovered)
+        else {
+            continue;
+        };
+        let color = context.colors.series(series.color);
+        paint_circle(
+            canvas,
+            center,
+            HOVER_DOT_OUTER / 2.0,
+            color.with_opacity(HOVER_DOT_OUTER_ALPHA),
+        );
+        paint_circle(canvas, center, HOVER_DOT_INNER / 2.0, color);
+    }
+    pop_clip(canvas);
+    paint_label_column(canvas, prepared, hovered, context);
+    paint_hover_time(canvas, prepared, hovered, context);
 }
 
 /// Draws the label boxes of every series that has a value at the hovered sample.
@@ -534,16 +562,19 @@ fn paint_hover(prepared: &PreparedChart, hovered: &HoveredSample, context: &mut 
 /// the one buffer a hover frame builds, because its text and widths depend on the
 /// sample under the pointer.
 fn paint_label_column(
+    canvas: &mut Canvas,
     prepared: &PreparedChart,
-    hovered: &HoveredSample,
-    palette: &[Hsla; 6],
+    hovered: HoveredSample,
     context: &mut PaintContext<'_>,
 ) {
     let layout = prepared.layout;
-    let text_color = context.app.theme().roles.fg.default.hsla;
-    let font = ChartFont::new(LABEL_FONT_SIZE, STRONG_WEIGHT, text_color);
-    let mut labels: Vec<(usize, SmolStr, Pixels, Pixels)> =
-        Vec::with_capacity(prepared.series.len());
+    let font = label_style(
+        LABEL_FONT_SIZE,
+        LABEL_LINE_HEIGHT,
+        context.colors.foreground,
+        STRONG_WEIGHT,
+    );
+    let mut labels: Vec<(usize, SmolStr, f32, f32)> = Vec::with_capacity(prepared.series.len());
     for series in prepared.series.iter() {
         if !series.covers(hovered.timestamp) {
             continue;
@@ -552,7 +583,7 @@ fn paint_label_column(
             continue;
         };
         let text = format_smolstr!("{} {}", series.label, format_percent_one_decimal(percent));
-        let width = context.width(text.as_str(), font) + px(LABEL_BOX_CHROME);
+        let width = context.width(text.as_str(), &font) + LABEL_BOX_CHROME;
         let anchor = y_for_series(percent, &prepared.axis, layout.plot);
         labels.push((series.color, text, width, anchor));
     }
@@ -562,53 +593,52 @@ fn paint_label_column(
     let widest = labels
         .iter()
         .map(|(_, _, width, _)| *width)
-        .fold(Pixels::ZERO, Pixels::max);
+        .fold(0.0, f32::max);
     let side = label_side(hovered.x, widest, layout.plot);
-    let anchors: Vec<Pixels> = labels.iter().map(|(_, _, _, anchor)| *anchor).collect();
-    let tops = label_tops(
-        &anchors,
-        px(LABEL_HEIGHT),
-        px(LABEL_COLLISION_GAP),
-        layout.plot,
-    );
-    let background = context.app.theme().roles.surface.overlay.hsla;
-    let border = context.app.theme().roles.line.border.hsla;
-    context.with_mask(layout.bounds, |text_cache, window, app| {
-        for (label, top) in labels.iter().zip(tops.iter()) {
-            let (color, text, width, _) = label;
-            let bounds = Bounds::new(
-                point(label_x(hovered.x, *width, side, layout.plot), *top),
-                size(*width, px(LABEL_HEIGHT)),
-            );
-            window.paint_quad(
-                fill(bounds, background)
-                    .border_widths(px(LABEL_BOX_BORDER))
-                    .border_color(border)
-                    .corner_radii(px(LABEL_BOX_RADIUS)),
-            );
-            let bar = Bounds::new(
-                point(
-                    bounds.origin.x + px(LABEL_PADDING_LEFT),
-                    bounds.origin.y + px((LABEL_HEIGHT - LABEL_BAR_HEIGHT) / 2.0),
-                ),
-                size(px(LABEL_BAR_WIDTH), px(LABEL_BAR_HEIGHT)),
-            );
-            window.paint_quad(
-                fill(bar, palette[*color % palette.len()]).corner_radii(px(LABEL_BAR_RADIUS)),
-            );
-            paint_text(
-                text_cache,
-                window,
-                app,
-                text.as_str(),
-                point(bounds.origin.x + px(LABEL_TEXT_INSET), bounds.origin.y),
-                font,
-                TextAlign::Left,
-                (*width - px(LABEL_TEXT_INSET)).max(Pixels::ZERO),
-                px(LABEL_LINE_HEIGHT),
-            );
-        }
-    });
+    let anchors: Vec<f32> = labels.iter().map(|(_, _, _, anchor)| *anchor).collect();
+    let tops = label_tops(&anchors, LABEL_HEIGHT, LABEL_COLLISION_GAP, layout.plot);
+    push_clip(canvas, layout.bounds);
+    for ((color, text, width, _), top) in labels.iter().zip(tops.iter()) {
+        let bounds = Rect::new(
+            label_x(hovered.x, *width, side, layout.plot),
+            *top,
+            *width,
+            LABEL_HEIGHT,
+        );
+        canvas.push_quad(Quad {
+            bounds,
+            corner_radius: [LABEL_BOX_RADIUS; 4],
+            paint: QuadPaint::Solid {
+                fill: context.colors.label_background,
+                border: Some(Border {
+                    width: LABEL_BOX_BORDER,
+                    color: context.colors.label_border,
+                }),
+            },
+        });
+        let bar = Rect::new(
+            bounds.origin.x + LABEL_PADDING_LEFT,
+            bounds.origin.y + (LABEL_HEIGHT - LABEL_BAR_HEIGHT) / 2.0,
+            LABEL_BAR_WIDTH,
+            LABEL_BAR_HEIGHT,
+        );
+        canvas.push_quad(Quad {
+            bounds: bar,
+            corner_radius: [LABEL_BAR_RADIUS; 4],
+            paint: QuadPaint::Solid {
+                fill: context.colors.series(*color),
+                border: None,
+            },
+        });
+        context.text(
+            canvas,
+            text.as_str(),
+            bounds.origin.x + LABEL_TEXT_INSET,
+            bounds.origin.y,
+            &font,
+        );
+    }
+    pop_clip(canvas);
 }
 
 /// Draws the hovered sample's time in the strip above the plot.
@@ -617,146 +647,211 @@ fn paint_label_column(
 /// left of the indicator instead, and it is clamped into the element either way so a
 /// label at the very edge is never clipped away.
 fn paint_hover_time(
+    canvas: &mut Canvas,
     prepared: &PreparedChart,
-    hovered: &HoveredSample,
+    hovered: HoveredSample,
     context: &mut PaintContext<'_>,
 ) {
     let layout = prepared.layout;
-    let color = context.app.theme().roles.fg.muted.hsla;
-    let font = ChartFont::new(TIME_LABEL_FONT_SIZE, STRONG_WEIGHT, color);
-    let text = {
-        let i18n = context.app.global::<I18n>();
-        format_hover_time(
-            hovered.timestamp,
-            prepared.time_zone,
-            i18n,
-            prepared.language,
-        )
-    };
-    let width = context.width(text.as_str(), font);
-    let right_of = hovered.x + px(LABEL_GAP);
+    let font = label_style(
+        TIME_LABEL_FONT_SIZE,
+        TIME_LABEL_LINE_HEIGHT,
+        context.colors.muted,
+        STRONG_WEIGHT,
+    );
+    let text = format_hover_time(hovered.timestamp, prepared.time_zone, context.translate);
+    let width = context.width(text.as_str(), &font);
+    let right_of = hovered.x + LABEL_GAP;
     let x = if right_of + width <= layout.plot.right() {
         right_of
     } else {
-        hovered.x - px(LABEL_GAP) - width
+        hovered.x - LABEL_GAP - width
     };
     let left = layout.bounds.origin.x;
     let x = x.clamp(left, (layout.bounds.right() - width).max(left));
-    let y = layout.top_strip().origin.y + px(TIME_LABEL_TOP_INSET);
-    context.text(
-        text.as_str(),
-        point(x, y),
-        font,
-        TextAlign::Left,
-        width,
-        px(TIME_LABEL_LINE_HEIGHT),
-    );
+    let y = layout.top_strip().origin.y + TIME_LABEL_TOP_INSET;
+    context.text(canvas, text.as_str(), x, y, &font);
+}
+
+/// The mesh of one series line: a ribbon of `width` through the step line's points.
+///
+/// A step line runs horizontally at each sample's value up to the next sample's x and
+/// then jumps vertically, so the ribbon's points are the screen points with the
+/// vertical run inserted between every pair. Every segment becomes one quad and every
+/// point a square joint, which is what keeps the ribbon continuous around a corner. Two
+/// consecutive points that are the same are folded first: a flat stretch would
+/// otherwise contribute zero-length segments and a duplicate joint per sample.
+///
+/// Every vertex is marked as interior (a negative distance, which the engine's coverage
+/// shader reads as full coverage), because this mesh is not anti-aliased: the engine's
+/// `Ui` pipeline is a coverage-distance pipeline and a filled ribbon is its degenerate
+/// case.
+pub(crate) fn line_geometry(screen: &[ScreenPoint], width: f32) -> Option<GeometryDesc> {
+    let mut points: Vec<Point> = Vec::with_capacity(screen.len() * 2);
+    let first = screen.first()?;
+    points.push(Point::new(first.x, first.y));
+    for pair in screen.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let horizontal = Point::new(to.x, from.y);
+        if points.last().is_none_or(|last| *last != horizontal) {
+            points.push(horizontal);
+        }
+        let next = Point::new(to.x, to.y);
+        if points.last().is_none_or(|last| *last != next) {
+            points.push(next);
+        }
+    }
+    if points.len() < 2 {
+        return None;
+    }
+
+    let half = (width / 2.0).max(0.5);
+    let mut vertices = Vec::<[f32; 3]>::with_capacity(points.len() * 8);
+    let mut indices = Vec::<u32>::with_capacity(points.len() * 12);
+    // The mesh's AABB is accumulated from the corners themselves rather than from
+    // rectangles: a zero-size rect is "empty" to the geometry helpers, and a union of
+    // empty rects is the last one of them.
+    let mut min = Point::new(f32::INFINITY, f32::INFINITY);
+    let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut push_quad = |corners: [Point; 4]| {
+        let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+        for corner in corners {
+            vertices.push([corner.x, corner.y, -1.0]);
+            min = Point::new(min.x.min(corner.x), min.y.min(corner.y));
+            max = Point::new(max.x.max(corner.x), max.y.max(corner.y));
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    let square = |center: Point| {
+        [
+            Point::new(center.x - half, center.y - half),
+            Point::new(center.x + half, center.y - half),
+            Point::new(center.x + half, center.y + half),
+            Point::new(center.x - half, center.y + half),
+        ]
+    };
+
+    for window in points.windows(2) {
+        let (from, to) = (window[0], window[1]);
+        let delta = Point::new(to.x - from.x, to.y - from.y);
+        let length = delta.x.hypot(delta.y);
+        if !length.is_finite() || length <= f32::EPSILON {
+            continue;
+        }
+        let normal = Point::new(-delta.y / length * half, delta.x / length * half);
+        push_quad([
+            Point::new(from.x + normal.x, from.y + normal.y),
+            Point::new(to.x + normal.x, to.y + normal.y),
+            Point::new(to.x - normal.x, to.y - normal.y),
+            Point::new(from.x - normal.x, from.y - normal.y),
+        ]);
+    }
+    for point in &points {
+        push_quad(square(*point));
+    }
+    let bounds = Rect::new(min.x, min.y, max.x - min.x, max.y - min.y).outset(half / 2.0);
+    if vertices.is_empty() || indices.is_empty() || !bounds.is_finite() {
+        return None;
+    }
+
+    let vertex_bytes = vertices
+        .iter()
+        .flat_map(|vertex| vertex.iter().flat_map(|value| value.to_le_bytes()))
+        .collect::<Vec<u8>>();
+    let index_bytes = indices
+        .iter()
+        .flat_map(|index| index.to_le_bytes())
+        .collect::<Vec<u8>>();
+    Some(GeometryDesc {
+        vertex_bytes: vertex_bytes.into(),
+        index_bytes: index_bytes.into(),
+        vertex_stride: GeometryPipeline::Ui.vertex_stride(),
+        index_type: IndexType::U32,
+        topology: Topology::TriangleList,
+        bounds,
+        pipeline: GeometryPipeline::Ui,
+    })
 }
 
 /// Draws a filled circle as a rounded quad.
-fn paint_circle(window: &mut Window, center: ScreenPoint, radius: Pixels, color: Hsla) {
-    if radius <= Pixels::ZERO {
+fn paint_circle(canvas: &mut Canvas, center: ScreenPoint, radius: f32, color: Color) {
+    if radius <= 0.0 {
         return;
     }
-    window.paint_quad(fill(dot_bounds(center, radius * 2.0), color).corner_radii(radius));
+    canvas.push_quad(Quad {
+        bounds: dot_bounds(center, radius * 2.0),
+        corner_radius: [radius; 4],
+        paint: QuadPaint::Solid {
+            fill: color,
+            border: None,
+        },
+    });
 }
 
-/// Shapes, records and draws one line of text.
-fn paint_text(
-    text_cache: &mut ChartTextCache,
-    window: &mut Window,
-    app: &mut App,
-    text: &str,
-    origin: Point<Pixels>,
-    font: ChartFont,
-    align: TextAlign,
-    width: Pixels,
-    line_height: Pixels,
-) {
-    if width <= Pixels::ZERO {
-        return;
-    }
-    let line = text_cache.line(SharedString::new(text), font, &*window);
-    let _ = line.paint(origin, line_height, align, Some(width), window, app);
-    #[cfg(test)]
-    record_text(text, origin, font, width, line.width());
+/// Pushes one solid quad.
+fn push_quad(canvas: &mut Canvas, bounds: Rect, fill: Color) {
+    canvas.push_quad(Quad {
+        bounds,
+        corner_radius: [0.0; 4],
+        paint: QuadPaint::Solid { fill, border: None },
+    });
 }
 
-/// What one painted stroke reported drawing.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct StrokeRecord {
-    pub color: Hsla,
-    pub width: f32,
-    pub mask: Bounds<Pixels>,
+/// Pushes one axis-aligned clip.
+fn push_clip(canvas: &mut Canvas, rect: Rect) {
+    let _ = canvas.push_clip(ClipRect {
+        rect,
+        corner_radius: [0.0; 4],
+    });
+}
+
+/// Pops the clip pushed last.
+fn pop_clip(canvas: &mut Canvas) {
+    let _ = canvas.pop_clip();
 }
 
 /// What one painted line of text reported drawing.
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct TextRecord {
-    pub text: SharedString,
-    pub origin: Point<Pixels>,
-    pub font_size: Pixels,
-    /// The room the line was given, not what it used.
-    pub width: Pixels,
-    /// What the shaped line measured, which is what the room has to hold.
-    pub shaped_width: Pixels,
+    pub text: SmolStr,
+    pub origin: Point,
+    pub font_size: f32,
+    /// What the shaped line measured, which is the width its box has to hold.
+    pub shaped_width: f32,
 }
 
-/// The paint pass's record of the last frame, for tests.
-///
-/// Glyphs and stroked paths are not readable from a painted frame — they live in a
-/// private scene — so the production paint pass reports what it drew here, boxed
-/// behind `#[cfg(test)]`. Quads are asserted through the window's own
-/// `painted_quads`; this log covers the two things that leaves out.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct PaintLog {
-    pub strokes: Vec<StrokeRecord>,
-    pub texts: Vec<TextRecord>,
-}
-
+// The paint pass's record of the last frame, for tests.
+//
+// Glyph runs are checked from the painted frame's primitives (a run's placed glyphs
+// are readable), but what the run *says* is not in the scene: a shaped handle is
+// opaque once pushed. The production pass therefore reports the lines it drew here,
+// boxed behind `#[cfg(test)]`, and the tests assert the labels' text and placement
+// against it alongside the quads they read from `WidgetTestApp::canvas_primitives`.
 #[cfg(test)]
 std::thread_local! {
-    static PAINT_LOG: std::cell::RefCell<PaintLog> = std::cell::RefCell::new(PaintLog::default());
+    static TEXT_LOG: std::cell::RefCell<Vec<TextRecord>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The log of the last frame, taken so the next one starts empty.
+/// The lines the last paint pass drew, taken so the next one starts empty.
 #[cfg(test)]
-pub(crate) fn take_log() -> PaintLog {
-    PAINT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+pub(crate) fn take_text_log() -> Vec<TextRecord> {
+    TEXT_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
-/// Forgets everything the previous frame reported.
+/// Forgets everything the previous paint pass reported.
 #[cfg(test)]
-pub(crate) fn reset_log() {
-    PAINT_LOG.with(|log| *log.borrow_mut() = PaintLog::default());
-}
-
-#[cfg(test)]
-fn record_stroke(color: Hsla, width: f32, mask: Bounds<Pixels>) {
-    PAINT_LOG.with(|log| {
-        log.borrow_mut()
-            .strokes
-            .push(StrokeRecord { color, width, mask });
-    });
+pub(crate) fn reset_text_log() {
+    TEXT_LOG.with(|log| log.borrow_mut().clear());
 }
 
 #[cfg(test)]
-fn record_text(
-    text: &str,
-    origin: Point<Pixels>,
-    font: ChartFont,
-    width: Pixels,
-    shaped_width: Pixels,
-) {
-    PAINT_LOG.with(|log| {
-        log.borrow_mut().texts.push(TextRecord {
-            text: SharedString::new(text),
-            origin,
-            font_size: font.size,
-            width,
+fn record_text(text: &str, x: f32, y: f32, font_size: f32, shaped_width: f32) {
+    TEXT_LOG.with(|log| {
+        log.borrow_mut().push(TextRecord {
+            text: SmolStr::new(text),
+            origin: Point::new(x, y),
+            font_size,
             shaped_width,
         });
     });
