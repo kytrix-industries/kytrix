@@ -49,14 +49,6 @@ const PAGE: (f32, f32) = (640.0, 360.0);
 /// one that has already run out.
 const COUNTDOWN: i64 = 600_000;
 
-/// The value slots one `kit::select` keeps after it is released.
-///
-/// `kit::select` mints a signal scope of its own and its `release` does not hand that
-/// scope back yet: three values per picker. It is registered with the kit batch
-/// (`test-ledger/w3-etf.md` §10-5); this pane has one picker, and the release test below
-/// pins the count so the widget's own release surface stays asserted.
-const PICKER_SCOPE_GAP: usize = 3;
-
 /// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -866,6 +858,53 @@ fn unloading_the_venue_on_screen_should_move_the_pane_to_the_loaded_one() {
     );
 }
 
+/// A commit that takes every market this pane reads away resets the venue it persists —
+/// and reports the reset: a field that moved without being published comes back on the
+/// next start, so the user would see a market the pane no longer reads.
+#[test]
+fn a_commit_that_takes_the_market_away_should_report_the_reset() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(&[binance()]);
+    let mut pane = pane(&mut harness, &directory);
+    let published = Rc::new(Cell::new(0usize));
+    let counter = Rc::clone(&published);
+    pane.widget.config_change = WidgetConfigChange::new(move |_| counter.set(counter.get() + 1));
+    load(&mut harness, &mut pane);
+    build_header(&mut harness, &mut pane);
+    a_whole_map(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+    assert_eq!(pane.widget.config.venue, Some(binance()));
+    let stated = published.get();
+    assert!(stated > 0, "the venue the pane chose was published");
+
+    directory.unload(binance());
+    publish_generation(&mut harness);
+    frame(&mut harness, &mut pane);
+
+    assert_eq!(
+        pane.widget.config.venue, None,
+        "a market that is not loaded is not a venue the pane can persist"
+    );
+    assert!(
+        published.get() > stated,
+        "the reset is reported, not only held in memory"
+    );
+    assert!(
+        reported(&harness, &pane).notice().is_some(),
+        "nothing on screen is backed by a market any more"
+    );
+    assert!(
+        pane.widget
+            .venue_control
+            .as_ref()
+            .expect("the header is still built")
+            .select
+            .chosen(harness.app())
+            .is_empty(),
+        "the picker states no choice either"
+    );
+}
+
 /// A commit that leaves the pane's market as it was — the venue it reads loading
 /// again with the same scopes — is a publication behind a market the pane already
 /// has: it re-checks its precondition and keeps the round it is running rather
@@ -1192,6 +1231,7 @@ fn the_countdown_should_only_run_while_the_pane_is_ready() {
     build_header(&mut harness, &mut pane);
 
     a_whole_map(&mut harness, &mut pane);
+    build_body(&mut harness, &mut pane);
     report_status(&mut harness, &mut pane, binance(), ready(1));
     frame(&mut harness, &mut pane);
     assert_eq!(
@@ -1240,6 +1280,46 @@ fn the_countdown_should_only_run_while_the_pane_is_ready() {
         "and with the map in hand the countdown starts on the new deadline"
     );
     assert!(!pane.widget.refresh_is_disabled(harness.app()));
+}
+
+/// Releasing the pane takes the tick it is waiting for with it: a one-shot timer that
+/// outlived the pane would write a label nobody draws and keep waking the engine (I3).
+#[test]
+fn releasing_the_pane_should_cancel_its_countdown() {
+    let mut harness = harness();
+    let clock = TestClock::new(0);
+    let directory = FixtureDirectory::new(&[binance()]);
+    let mut pane = pane_over(
+        &mut harness,
+        FakeSource::pending(),
+        Rc::clone(&directory),
+        VolumeHeatMapConfig::default(),
+        &clock,
+    );
+    load(&mut harness, &mut pane);
+    build_header(&mut harness, &mut pane);
+    a_whole_map(&mut harness, &mut pane);
+    report_status(&mut harness, &mut pane, binance(), ready(1));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+    assert_eq!(
+        countdown_label(&harness, &pane),
+        Some(SmolStr::new_static("10:00")),
+        "the countdown is running on the deadline the map carried"
+    );
+
+    // The pane goes away, and the clock moves past the tick that was armed.
+    harness.with_cx(|cx| pane.widget.release(cx));
+    let left_by_release = countdown_label(&harness, &pane);
+    assert_eq!(left_by_release, None, "release takes the countdown down");
+    clock.set(60_000);
+    harness.advance(COUNTDOWN_TICK);
+
+    assert_eq!(
+        countdown_label(&harness, &pane),
+        left_by_release,
+        "the released pane's tick never ran: the label release left behind is the last one"
+    );
 }
 
 /// A failure is the framework's to recover from, not the header's.
@@ -1544,6 +1624,152 @@ fn a_language_change_should_rebuild_the_header_and_the_empty_state() {
     );
 }
 
+/// A map that gains tiles takes its stand-in down: the pane says "nothing to draw" only
+/// while that is true, and a published map with tiles on it must not keep the sentence
+/// over them.
+#[test]
+fn a_map_that_gains_tiles_should_remove_the_empty_state() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(&[binance()]);
+    let mut pane = pane(&mut harness, &directory);
+    load(&mut harness, &mut pane);
+    report_map(&mut harness, &mut pane, binance(), 1, Arc::from([]));
+    build_body(&mut harness, &mut pane);
+    frame(&mut harness, &mut pane);
+    assert!(
+        harness
+            .find_by_debug_prefix(pane.page, "TEST_VOLUME_HEATMAP_EMPTY")
+            .is_some(),
+        "the empty map says it holds nothing"
+    );
+
+    report_map(&mut harness, &mut pane, binance(), 2, entries());
+    frame(&mut harness, &mut pane);
+
+    assert!(
+        harness
+            .find_by_debug_prefix(pane.page, "TEST_VOLUME_HEATMAP_EMPTY")
+            .is_none(),
+        "the stand-in is gone once the map holds something"
+    );
+    assert!(
+        pane.widget.has_content() && !pane.widget.chart.is_empty(),
+        "the map on screen is the one with tiles"
+    );
+}
+
+/// The picker's accessible name and placeholder are build-time copy (AGENTS §15.1), so a
+/// language switch rebuilds the picker rather than only re-stating its items — the same
+/// rule the refresh button follows.
+#[test]
+fn a_language_change_should_rebuild_the_venue_picker() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(&[]);
+    let mut pane = pane(&mut harness, &directory);
+    load(&mut harness, &mut pane);
+    build_header(&mut harness, &mut pane);
+
+    // Nothing is loaded, so the picker shows the placeholder it was built with.
+    let trigger = pane
+        .widget
+        .venue_control
+        .as_ref()
+        .expect("the picker is built")
+        .select
+        .trigger_node()
+        .expect("the picker is mounted");
+    assert_eq!(
+        harness.text_of(trigger),
+        "Choose a market participant",
+        "with no venue chosen the trigger states the placeholder"
+    );
+    let nodes = harness.node_count();
+
+    harness.switch_language(LanguageCode::ZhCn);
+    frame(&mut harness, &mut pane);
+
+    let rebuilt = pane
+        .widget
+        .venue_control
+        .as_ref()
+        .expect("the picker is rebuilt in place")
+        .select
+        .trigger_node()
+        .expect("the rebuilt picker is mounted");
+    assert_ne!(rebuilt, trigger, "the copy is rebuilt rather than re-bound");
+    assert!(
+        harness.tree().get(trigger).is_err(),
+        "the old trigger went with the row this widget removed"
+    );
+    assert_eq!(
+        harness.text_of(rebuilt),
+        "请选择市场参与者",
+        "the placeholder is in the language showing now"
+    );
+    assert_eq!(
+        harness.node_count(),
+        nodes,
+        "the rebuilt picker replaces the old one instead of adding to it"
+    );
+
+    // The accessible name is built from the same options as the placeholder; both are
+    // resolved in the language passed when the picker is built.
+    let english = pane
+        .widget
+        .venue_select_options(&product_translate(LanguageCode::En));
+    assert_eq!(
+        english.label.as_deref(),
+        Some("Market participant"),
+        "the picker's accessible name is the catalogue's word for the market"
+    );
+    assert_eq!(english.placeholder.as_str(), "Choose a market participant");
+    let chinese = pane
+        .widget
+        .venue_select_options(&product_translate(LanguageCode::ZhCn));
+    assert_eq!(chinese.label.as_deref(), Some("市场参与者"));
+    assert_eq!(chinese.placeholder.as_str(), "请选择市场参与者");
+}
+
+/// The pane rebuilds its header row, and the controls this widget built into the old one
+/// are gone with it: the next `sync` releases them instead of touching stale nodes, and a
+/// `StaleNode` from here would fail the synchronization and leave the pane without its
+/// controls for good.
+#[test]
+fn a_header_row_that_is_gone_should_release_its_controls() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::new(&[binance()]);
+    let mut pane = pane(&mut harness, &directory);
+    load(&mut harness, &mut pane);
+    build_header(&mut harness, &mut pane);
+    assert!(
+        pane.widget.venue_control.is_some() && pane.widget.refresh_control.is_some(),
+        "the pane built both controls"
+    );
+
+    // The pane rebuilds its row: the groups, and the nodes this widget built into them,
+    // are removed before it asks for the controls again.
+    harness.with_cx(|cx| {
+        let window = cx.window();
+        cx.app_mut()
+            .remove_node(window, pane.header_left)
+            .expect("the left row is removed");
+        cx.app_mut()
+            .remove_node(window, pane.header_right)
+            .expect("the right row is removed");
+    });
+    harness.switch_language(LanguageCode::ZhCn);
+    frame(&mut harness, &mut pane);
+
+    assert!(
+        pane.widget.venue_control.is_none(),
+        "the picker's component was released instead of rebuilt into a stale row"
+    );
+    assert!(
+        pane.widget.refresh_control.is_none(),
+        "the refresh button was released instead of rebuilt into a stale row"
+    );
+}
+
 /// The map's labels are tickers and amounts, so a display time zone that moved is not a
 /// repaint: the pane reads the same numbers in every zone, and drawing them again would be
 /// a frame nobody can see.
@@ -1680,9 +1906,7 @@ fn preparing_and_releasing_should_leave_the_geometry_store_alone() {
 
 // ── release and two panes ─────────────────────────────────────────────────────────
 
-/// A released pane hands its own state back: what stays behind is the kit's registered
-/// picker gap rather than this widget's, and the assertion goes red the day the kit closes
-/// that gap.
+/// A released pane hands every value slot back, header controls included.
 #[test]
 fn releasing_the_pane_should_reclaim_its_signal_scope() {
     let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
@@ -1715,12 +1939,9 @@ fn releasing_the_pane_should_reclaim_its_signal_scope() {
         }
     }
 
-    // The header's controls are kit components. They are released with the pane, and what
-    // stays behind is the kit's registered gap rather than this widget's: `Select` mints a
-    // signal scope its `release` does not hand back yet (three values per picker, one picker
-    // — registered with the kit batch). Pinning the count is what makes a release that
-    // reclaimed less than this fail here, and it is also the assertion that goes red the day
-    // the kit closes the gap.
+    // The header's controls are kit components. P2-10 made `Select::release` hand back the
+    // signal scope it minted, so releasing the pane takes the picker's three values with it:
+    // what is left behind is nothing at all.
     let pane = harness.mount::<VolumeHeatMapWidget>(VolumeHeatMapConfig::default());
     let group = page(&mut harness);
     pane.header(harness.app_mut(), HeaderGroup::Left, group)
@@ -1728,12 +1949,15 @@ fn releasing_the_pane_should_reclaim_its_signal_scope() {
     let group = page(&mut harness);
     pane.header(harness.app_mut(), HeaderGroup::Right, group)
         .expect("the refresh control builds");
-    let mounted = harness.signal_slot_stats().live;
+    assert!(
+        harness.signal_slot_stats().live > baseline.live,
+        "the mounted header mints its controls' values"
+    );
     pane.release(harness.app_mut());
     assert_eq!(
         harness.signal_slot_stats().live,
-        baseline.live + PICKER_SCOPE_GAP,
-        "the pane releases its components; what remains is the kit's picker scope ({mounted} while mounted)"
+        baseline.live,
+        "the pane releases its components, the picker's own scope included"
     );
 }
 

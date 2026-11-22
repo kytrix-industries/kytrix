@@ -49,10 +49,12 @@
 //! map: what it states is the market participant the tiles below it are made of. Every
 //! control's key comes from [`WidgetCx::unique_key`], so two panes of this widget never
 //! share one handler (AGENTS §1 rule 11). A picker's and a button's copy is chosen when it
-//! is built, so a language switch rebuilds the button and re-states the picker's items;
-//! what the picker *offers* is its item list (`set_items`), which a commit moves without a
-//! rebuild. The choice a control reports is written into a request signal and applied by
-//! the next `sync`, because a control's handler owns no widget context (AGENTS §4.2).
+//! is built, so a language switch rebuilds both: the button in its slot, and the picker in
+//! the group the pane gave it (its accessible name and placeholder are build-time copy,
+//! AGENTS §15.1). What the picker *offers* is its item list (`set_items`), which a commit
+//! moves without a rebuild. The choice a control reports is written into a request signal
+//! and applied by the next `sync`, because a control's handler owns no widget context
+//! (AGENTS §4.2).
 //!
 //! # Why a reply is matched by request identity
 //!
@@ -405,10 +407,20 @@ enum HeaderRequest {
 /// re-arms the timer. Every deadline change goes through `update`, which cancels the
 /// pending tick before it writes the label and arms the next chain — a deadline that
 /// flickers cannot leave two chains ticking (I3: the pane is woken once per tick, not
-/// twice), and `release` cancels through the same path.
+/// twice), and `release` cancels through the same path. The tick itself is scoped to the
+/// body root (AGENTS §11: `App::after_scoped`), so a pane torn down by the framework
+/// cannot leave one behind either.
 struct Countdown {
     /// The window the timer belongs to.
     window: WindowId,
+    /// The body root, once the body exists: the node whose teardown ends the chain.
+    ///
+    /// The countdown is a header label, but what it counts belongs to the map, and the
+    /// body root is the pane's stable node for it. It is not there when the pane is built
+    /// (the framework builds the body on the first frame with content), so the scope is
+    /// handed over by [`VolumeHeatMapWidget::body`] and a deadline written before that
+    /// is armed then.
+    scope: Cell<Option<NodeId>>,
     /// The wall-clock millisecond the next read is due at, or nothing worth counting
     /// to (a read in flight, a failure, a schedule that stopped).
     deadline: Cell<Option<i64>>,
@@ -426,11 +438,27 @@ impl Countdown {
     fn new(cx: &mut WidgetCx<'_>, now: Rc<dyn Fn() -> i64>) -> Self {
         Self {
             window: cx.window(),
+            scope: Cell::new(None),
             deadline: Cell::new(None),
             label: cx.signal(None),
             now,
             timer: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Points the countdown at the node whose teardown ends it, arming a deadline that
+    /// was written before the body existed.
+    fn set_scope(self: &Rc<Self>, app: &mut App, scope: NodeId) {
+        self.scope.set(Some(scope));
+        if self.deadline.get().is_some() && self.timer.borrow().is_none() {
+            self.arm(app);
+        }
+    }
+
+    /// Forgets the node: the tick is cancelled by the same release, and a scope that
+    /// describes no body any more would only keep the arm from doing nothing.
+    fn clear_scope(&self) {
+        self.scope.set(None);
     }
 
     /// The deadline the label is counting to.
@@ -468,12 +496,22 @@ impl Countdown {
     }
 
     /// Arms the one-shot tick for the next interval, if there is anything to count to.
+    ///
+    /// The timer is scoped to the body root, so the framework's own subtree teardown
+    /// cancels a tick that is still pending when the pane goes (E8/E10); `release` also
+    /// cancels it, because the body outlives this hook. A deadline written before the
+    /// body was built is armed as soon as the root is handed over ([`Self::set_scope`]).
     fn arm(self: &Rc<Self>, app: &mut App) {
         if self.deadline.get().is_none() {
             return;
         }
+        let Some(scope) = self.scope.get() else {
+            return;
+        };
         let this = Rc::clone(self);
-        match app.after(self.window, COUNTDOWN_TICK, move |app| this.tick(app)) {
+        match app.after_scoped(self.window, scope, COUNTDOWN_TICK, move |app| {
+            this.tick(app)
+        }) {
             Ok(id) => *self.timer.borrow_mut() = Some(id),
             Err(error) => {
                 log::error!("the volume heat map countdown could not arm its next tick: {error}");
@@ -494,11 +532,13 @@ impl Countdown {
 
 /// The venue picker this pane built, and the copy it was built with.
 ///
-/// A kit picker's item labels are chosen when the items are handed to it (a language
-/// switch re-states them, AGENTS §15.1); its *selection* is not — a picker's trigger text
-/// is a `bind_text` over the picker's own signals, so a commit that offers another venue
-/// is `set_items`.
+/// A kit picker's accessible name, placeholder and item labels are chosen when it is
+/// built (a language switch rebuilds it, AGENTS §15.1); its *selection* is not — a
+/// picker's trigger text is a `bind_text` over the picker's own signals, so a commit
+/// that offers another venue is `set_items`.
 struct VenueControl {
+    /// The header group the pane built this control into, which a rebuild replaces it in.
+    parent: NodeId,
     /// The widget's own row inside the group the pane made, which the widget removes
     /// itself.
     root: NodeId,
@@ -745,6 +785,9 @@ impl WidgetView for VolumeHeatMapWidget {
             .build(cx.tree_mut(), parent)?;
         self.chart.build(cx, root)?;
         self.body_root = Some(root);
+        // The countdown's tick is scoped to the body: hand the node over, which also arms
+        // a deadline the map brought before this frame could build the body.
+        self.countdown.set_scope(cx.app_mut(), root);
         self.sync_empty_overlay(cx)?;
         // The canvas node has no box until the frame that lays this body out, so the map
         // cannot be painted on the frame that builds it: ask for the one that can.
@@ -859,9 +902,11 @@ impl WidgetView for VolumeHeatMapWidget {
         // The chart's canvas node lives in the body, which the framework removes after
         // this hook; the node and its cache are the chart's own, so they go here.
         self.chart.release(cx);
-        // The countdown tick is this widget's: the framework's subtree teardown does not
-        // own it, so release is where it is cancelled.
+        // The countdown tick is this widget's: the framework's subtree teardown would
+        // cancel a timer scoped to the body, but release is what takes the last one down
+        // before that happens, so the chain never outlives the pane.
         Countdown::update(&self.countdown, cx.app_mut(), None);
+        self.countdown.clear_scope();
         self.empty = None;
         self.empty_language = None;
         self.body_root = None;
@@ -980,9 +1025,13 @@ impl VolumeHeatMapWidget {
         let venues = directory.readable_venues();
         if venues.is_empty() {
             // Nothing this pane reads is loaded any more, so nothing on screen is
-            // backed by a market: the venue it was showing goes with it.
+            // backed by a market: the venue it was showing goes with it — and a field
+            // this pane persists that moved is reported, the same reset `load` reports
+            // (AGENTS §4.3: a change that is not published lives only in memory).
             self.venues = venues;
-            self.config.venue = None;
+            if self.config.venue.take().is_some() {
+                self.config_change.publish(cx.app_mut());
+            }
             self.reading = None;
             self.wait_for_market(cx);
             return;
@@ -1366,6 +1415,7 @@ impl VolumeHeatMapWidget {
             .build(cx.tree_mut(), parent)?;
         let select = self.build_venue_select(cx, row)?;
         Ok(VenueControl {
+            parent,
             root: row,
             select,
             language,
@@ -1382,16 +1432,7 @@ impl VolumeHeatMapWidget {
     ) -> Result<Select, EngineError> {
         let requests = self.requests;
         let translate = cx.translate().clone();
-        let label = t_smol!(translate, "common.market_participants");
-        let placeholder = if self.config.venue.is_some() {
-            SmolStr::default()
-        } else {
-            t_smol!(translate, "widget.volume_heatmap.choose_venue")
-        };
-        let options = SelectOptions::default()
-            .size(UnifiedSize::Small)
-            .label(label)
-            .placeholder(placeholder);
+        let options = self.venue_select_options(&translate);
         let window = cx.window();
         let key = cx.unique_key(VENUE_KEY_SUFFIX);
         let theme = cx.theme().clone();
@@ -1423,6 +1464,25 @@ impl VolumeHeatMapWidget {
         let _ = select.set_disabled(cx.app_mut(), self.venue_picker_is_disabled());
         select.build(cx.app_mut(), window, parent)?;
         Ok(select)
+    }
+
+    /// The picker's own copy: its accessible name and, with nothing chosen, its
+    /// placeholder.
+    ///
+    /// Both are chosen when the picker is built (the kit select has no binding face for
+    /// them, AGENTS §15.1), so this is also what a language switch rebuilds along with
+    /// the item labels.
+    fn venue_select_options(&self, translate: &Translate) -> SelectOptions {
+        let label = t_smol!(translate, "common.market_participants");
+        let placeholder = if self.config.venue.is_some() {
+            SmolStr::default()
+        } else {
+            t_smol!(translate, "widget.volume_heatmap.choose_venue")
+        };
+        SelectOptions::default()
+            .size(UnifiedSize::Small)
+            .label(label)
+            .placeholder(placeholder)
     }
 
     /// The picker's items: the loaded venues this map can read, in the order the
@@ -1543,17 +1603,22 @@ impl VolumeHeatMapWidget {
         Ok(())
     }
 
-    /// Keeps the picker's items, choice and availability current.
+    /// Keeps the picker's copy, items, choice and availability current.
     ///
-    /// The picker's item labels are resolved text, so a language switch re-states them; a
-    /// commit that changed the readable venues does the same. What the picker *states* is
-    /// its `chosen` signal, which a venue switch moves without a rebuild.
+    /// The picker's accessible name, placeholder and item labels are resolved text chosen
+    /// when it is built (AGENTS §15.1), so a language switch rebuilds it in the group the
+    /// pane gave it; a commit that changed the readable venues only re-states the items.
+    /// What the picker *states* is its `chosen` signal, which a venue switch moves without
+    /// a rebuild.
     fn sync_venue_control(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        let Some((root, language, venues)) = self
-            .venue_control
-            .as_ref()
-            .map(|control| (control.root, control.language, control.venues.clone()))
-        else {
+        let Some((root, parent, language, venues)) = self.venue_control.as_ref().map(|control| {
+            (
+                control.root,
+                control.parent,
+                control.language,
+                control.venues.clone(),
+            )
+        }) else {
             return Ok(());
         };
         // The pane rebuilds the row it calls `header` for, so the row this widget built
@@ -1565,8 +1630,13 @@ impl VolumeHeatMapWidget {
             return Ok(());
         }
         let language_now = *cx.read(&cx.language());
-        let items_moved = language != language_now || venues != self.venues;
-        if items_moved {
+        if language != language_now {
+            // The accessible name and the placeholder are build-time copy: the picker is
+            // rebuilt in place rather than re-bound, the same rule the button follows.
+            self.release_venue_control(cx, true);
+            let control = self.build_venue_control(cx, parent)?;
+            self.venue_control = Some(control);
+        } else if venues != self.venues {
             let translate = cx.translate().clone();
             let items = self.venue_items(&translate);
             if let Some(control) = self.venue_control.as_mut() {
@@ -1578,20 +1648,29 @@ impl VolumeHeatMapWidget {
                             "the volume heat map picker could not replace its venues: {error}"
                         );
                     });
-                control.language = language_now;
                 control.venues = self.venues.clone();
             }
         }
         let Some(control) = self.venue_control.as_ref() else {
             return Ok(());
         };
-        if let Some(venue) = self.config.venue {
-            let stated = control.select.chosen(cx.app());
-            if stated.len() != 1 || stated.first().map(SmolStr::as_str) != Some(venue.as_str()) {
-                control
-                    .select
-                    .set_chosen(cx.app_mut(), [venue.as_str()], false);
+        match self.config.venue {
+            Some(venue) => {
+                let stated = control.select.chosen(cx.app());
+                if stated.len() != 1 || stated.first().map(SmolStr::as_str) != Some(venue.as_str())
+                {
+                    control
+                        .select
+                        .set_chosen(cx.app_mut(), [venue.as_str()], false);
+                }
             }
+            // A venue that went away leaves nothing chosen: the picker must not keep
+            // stating a choice the pane no longer reads. The config change that reset the
+            // field is reported by `reload_market`; this is the control catching up.
+            None if !control.select.chosen(cx.app()).is_empty() => {
+                control.select.set_chosen(cx.app_mut(), [], false);
+            }
+            None => {}
         }
         let _ = control
             .select

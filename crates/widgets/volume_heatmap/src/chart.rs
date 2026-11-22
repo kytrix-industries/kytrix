@@ -175,6 +175,10 @@ struct CachedText {
 /// a map of twenty tiles twice over, and it is what makes a hover free: the tiles
 /// all keep the same labels, so a frame that only moves the highlight finds every
 /// line it needs.
+///
+/// The cache keeps lines a later map no longer draws until they are evicted, so it is
+/// not what a steady frame asks about its atlas leases: only the lines the canvas on
+/// screen was built from matter, and the chart records those ([`VolumeHeatMapChart::painted_text`]).
 struct ChartTextCache {
     entries: Vec<CachedText>,
 }
@@ -221,19 +225,6 @@ impl ChartTextCache {
             handle: Arc::clone(&handle),
         });
         handle
-    }
-
-    /// Whether any line this cache holds can no longer be drawn from the atlas.
-    ///
-    /// This is what the chart asks before it decides a frame changed nothing: a canvas
-    /// is a value and the chart keeps the one it built, but the *glyphs* a canvas names
-    /// are leased from a shared atlas, and an atlas generation change or a per-tile
-    /// eviction leaves every handle the canvas was built from pointing at reused
-    /// texture. The engine drops such runs at encode time, so a chart that did not
-    /// rebuild would lose its labels permanently. Nothing is stale in the steady state,
-    /// so the scan of a few dozen handles is the whole cost of the guard.
-    fn has_stale(&self) -> bool {
-        self.entries.iter().any(|entry| entry.handle.is_stale())
     }
 }
 
@@ -329,6 +320,16 @@ pub(crate) struct VolumeHeatMapChart {
     layout: Option<Layout>,
     /// What the canvas on screen was built from.
     painted: Option<PaintedKey>,
+    /// The shaped lines the canvas on screen was built from.
+    ///
+    /// A canvas is a value and the chart keeps the one it built, but the *glyphs* a
+    /// canvas names are leased from a shared atlas: an atlas generation change or a
+    /// per-tile eviction leaves the handles it was built from pointing at reused
+    /// texture, and the engine drops such runs at encode time. The lines recorded here
+    /// are the ones whose lease a steady frame has to check — a line the cache still
+    /// holds from a map that is no longer drawn is not on the canvas, so it cannot
+    /// keep a steady chart rebuilding.
+    painted_text: Vec<Arc<ShapedTextHandle>>,
     text: ChartTextCache,
     /// The tile the pointer is over.
     hover: Option<usize>,
@@ -343,6 +344,7 @@ impl VolumeHeatMapChart {
             revision: 0,
             layout: None,
             painted: None,
+            painted_text: Vec::new(),
             text: ChartTextCache::new(),
             hover: None,
         }
@@ -464,7 +466,7 @@ impl VolumeHeatMapChart {
             colors,
             text_scale,
         };
-        if self.painted == Some(key) && !self.text.has_stale() {
+        if self.painted == Some(key) && !self.painted_text.iter().any(|handle| handle.is_stale()) {
             return Ok(false);
         }
 
@@ -478,13 +480,14 @@ impl VolumeHeatMapChart {
         let Some(layout) = layout.as_ref() else {
             return Ok(false);
         };
-        let (canvas, whole) = paint(cx.app_mut(), data, layout, *hover, colors, text);
+        let (canvas, whole, painted_text) = paint(cx.app_mut(), data, layout, *hover, colors, text);
         let changed = cx.set_canvas(node, canvas)?;
         // An incomplete canvas is not what the chart draws: leaving the key unrecorded is
         // what makes the next frame build it again (I3 holds — a whole frame is still a
         // short circuit).
         if whole {
             self.painted = Some(key);
+            self.painted_text = painted_text;
         }
         Ok(changed)
     }
@@ -555,6 +558,7 @@ impl VolumeHeatMapChart {
         }
         self.layout = None;
         self.painted = None;
+        self.painted_text.clear();
         self.hover = None;
     }
 
@@ -601,8 +605,8 @@ impl VolumeHeatMapChart {
 /// The returned flag says whether every label reached the canvas. A line whose atlas
 /// lease died between being shaped and being pushed is refused by the engine rather
 /// than encoded from reused texture, so the frame that ran into it is missing that run:
-/// it is not a frame the chart can keep (see [`ChartTextCache::has_stale`] for the other
-/// half of the same guard).
+/// it is not a frame the chart can keep. The returned handles are the lines the canvas
+/// was built from — the only ones whose lease the next steady frame has to check.
 fn paint(
     app: &mut App,
     data: &PreparedHeatMap,
@@ -610,7 +614,7 @@ fn paint(
     hover: Option<usize>,
     colors: ChartColors,
     text: &mut ChartTextCache,
-) -> (Canvas, bool) {
+) -> (Canvas, bool, Vec<Arc<ShapedTextHandle>>) {
     let mut canvas = Canvas::new(layout.bounds);
     // The masked drawing the reference did: the frame is clipped to the box the node
     // ended up with, so a rounding error cannot paint over a sibling.
@@ -649,6 +653,7 @@ fn paint(
     let mut context = TextContext {
         app,
         text,
+        used: Vec::with_capacity(data.tiles.len() * 2),
         whole: true,
     };
     for (tile, bounds) in data.tiles.iter().zip(layout.tiles.iter()) {
@@ -680,14 +685,17 @@ fn paint(
         let _ = canvas.pop_clip();
     }
     let whole = context.whole;
+    let painted_text = context.used;
     let _ = canvas.pop_clip();
-    (canvas, whole)
+    (canvas, whole, painted_text)
 }
 
 /// The shaped text one frame pushes, and whether every line reached the canvas.
 struct TextContext<'a> {
     app: &'a mut App,
     text: &'a mut ChartTextCache,
+    /// The lines this frame pushed, which are the canvas' text.
+    used: Vec<Arc<ShapedTextHandle>>,
     whole: bool,
 }
 
@@ -702,7 +710,9 @@ impl TextContext<'_> {
             return;
         }
         let line = self.text.line(self.app, text, style);
-        if !canvas.push_shaped_text(&line, origin) {
+        if canvas.push_shaped_text(&line, origin) {
+            self.used.push(line);
+        } else {
             self.whole = false;
         }
     }
@@ -1078,6 +1088,20 @@ mod tests {
     /// The canvas node's rendered primitives.
     fn primitives(harness: &ChartHarness) -> Vec<&Primitive> {
         harness.canvas().primitives().iter().collect()
+    }
+
+    /// The canvas value the chart's node holds, which says whether a frame rebuilt it.
+    fn canvas_arc(harness: &ChartHarness) -> Arc<Canvas> {
+        match harness
+            .app
+            .tree()
+            .get(harness.chart.node().expect("the chart built"))
+            .expect("the canvas node exists")
+            .kind()
+        {
+            NodeKind::Canvas(canvas) => Arc::clone(canvas),
+            other => panic!("the chart node is a canvas, not {other:?}"),
+        }
     }
 
     fn quads(harness: &ChartHarness) -> Vec<&Quad> {
@@ -1480,32 +1504,11 @@ mod tests {
     #[test]
     fn a_steady_canvas_should_be_kept() {
         let mut harness = harness();
-        let drawn = Arc::clone(
-            match harness
-                .app
-                .tree()
-                .get(harness.chart.node().expect("the chart built"))
-                .expect("the canvas node exists")
-                .kind()
-            {
-                NodeKind::Canvas(canvas) => canvas,
-                other => panic!("the chart node is a canvas, not {other:?}"),
-            },
-        );
+        let drawn = canvas_arc(&harness);
         assert!(!harness.sync(), "a steady frame paints nothing");
         assert!(!harness.sync(), "and keeps on painting nothing");
-        let kept = match harness
-            .app
-            .tree()
-            .get(harness.chart.node().expect("the chart built"))
-            .expect("the canvas node exists")
-            .kind()
-        {
-            NodeKind::Canvas(canvas) => canvas,
-            other => panic!("the chart node is a canvas, not {other:?}"),
-        };
         assert!(
-            Arc::ptr_eq(&drawn, kept),
+            Arc::ptr_eq(&drawn, &canvas_arc(&harness)),
             "a steady frame keeps the canvas it is drawn from"
         );
     }
@@ -1513,16 +1516,7 @@ mod tests {
     #[test]
     fn a_dark_appearance_should_repaint_the_map() {
         let mut harness = harness();
-        let light = match harness
-            .app
-            .tree()
-            .get(harness.chart.node().expect("the chart built"))
-            .expect("the canvas node exists")
-            .kind()
-        {
-            NodeKind::Canvas(canvas) => Arc::clone(canvas),
-            other => panic!("the chart node is a canvas, not {other:?}"),
-        };
+        let light = canvas_arc(&harness);
         assert_eq!(
             quads(&harness)[0].paint,
             QuadPaint::Solid {
@@ -1540,16 +1534,7 @@ mod tests {
             harness.sync(),
             "another appearance is a change the pane has to draw"
         );
-        let dark = match harness
-            .app
-            .tree()
-            .get(harness.chart.node().expect("the chart built"))
-            .expect("the canvas node exists")
-            .kind()
-        {
-            NodeKind::Canvas(canvas) => Arc::clone(canvas),
-            other => panic!("the chart node is a canvas, not {other:?}"),
-        };
+        let dark = canvas_arc(&harness);
         assert!(
             !Arc::ptr_eq(&light, &dark),
             "the redraw prepared a canvas of its own"
@@ -1683,6 +1668,59 @@ mod tests {
         assert!(
             !harness.sync(),
             "with fresh leases the frame is steady again (I3)"
+        );
+    }
+
+    /// The labels of a map that replaced a bigger one stay in the text cache until they
+    /// are evicted. An atlas reset makes those lines stale, but they are not on the
+    /// canvas any more: only the lines the canvas was built from may keep a frame from
+    /// being steady, or the chart would rebuild its canvas on every frame after such a
+    /// reset.
+    #[test]
+    fn a_map_that_left_its_labels_behind_should_still_be_steady() {
+        let big_map: Arc<[HeatMapEntry]> = Arc::from(
+            (0..TILE_LIMIT)
+                .map(|index| entry(&format!("ASSET{index}"), 1, &format!("{index}")))
+                .collect::<Vec<_>>(),
+        );
+        let mut harness = harness_in(WIDTH, HEIGHT, big_map);
+        assert_eq!(
+            harness.chart.text.entries.len(),
+            TEXT_CACHE_CAPACITY,
+            "the first map fills the cache with lines of its own"
+        );
+
+        harness.chart.set_entries(entries(&["BTC"]));
+        assert!(harness.sync(), "the smaller map is a frame");
+        assert_eq!(
+            harness.chart.painted_text.len(),
+            2,
+            "the canvas on screen is drawn from the two lines of the map that is there"
+        );
+
+        // An atlas reset under the same font stack: every line shaped so far is leased
+        // from an atlas that no longer exists.
+        let stack = harness.app.app().font_stack().clone();
+        harness.app.app_mut().set_font_stack(stack);
+        assert!(harness.sync(), "the lines on the canvas are shaped again");
+        assert!(
+            harness
+                .chart
+                .text
+                .entries
+                .iter()
+                .any(|cached| cached.handle.is_stale()),
+            "the cache still holds lines the canvas does not draw"
+        );
+
+        let kept = canvas_arc(&harness);
+        assert!(
+            !harness.sync(),
+            "a stale line the canvas does not draw is not a frame the chart owes"
+        );
+        assert!(
+            Arc::ptr_eq(&kept, &canvas_arc(&harness)),
+            "so the steady frame keeps the canvas it is drawn from"
         );
     }
 
