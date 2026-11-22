@@ -686,16 +686,23 @@ impl WidgetView for WatchListWidget {
             self.publish_rows(cx)?;
             cx.request_frame()?;
         }
-        if rows_changed || self.controls_dirty || self.catalog_moved {
+        // The tables recycle their mounted row window as the list scrolls or the pane
+        // resizes, and a row's controls are built into the slot its row factory built.
+        // No dirty flag of this widget moves for that — the rows themselves are the same
+        // — so the pairing is rebuilt whenever the tables say the window they draw moved
+        // (they fill the contents of newly mounted rows in `sync`, which is also when
+        // the slot a control belongs in exists for the first time).
+        let mut window_moved = false;
+        if let Some(pane) = self.continuous.as_ref() {
+            window_moved |= pane.table.sync(cx.app_mut())?;
+        }
+        if let Some(pane) = self.session.as_ref() {
+            window_moved |= pane.table.sync(cx.app_mut())?;
+        }
+        if rows_changed || self.controls_dirty || self.catalog_moved || window_moved {
             self.sync_row_controls(cx)?;
             self.controls_dirty = false;
             self.catalog_moved = false;
-        }
-        if let Some(pane) = self.continuous.as_ref() {
-            pane.table.sync(cx.app_mut())?;
-        }
-        if let Some(pane) = self.session.as_ref() {
-            pane.table.sync(cx.app_mut())?;
         }
         Ok(())
     }
