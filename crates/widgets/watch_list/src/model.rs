@@ -57,7 +57,6 @@ use std::{
 };
 
 use ahash::HashMap;
-use gpui_kit::SharedString;
 use market_participants_connector::{market::error::MarketError, routing::LONGBRIDGE_US_SCOPE};
 use market_participants_model::{
     asset::AssetId,
@@ -395,10 +394,10 @@ impl WatchListRowState {
 /// The values one row draws, each still carrying its own unit.
 #[derive(Debug)]
 pub(super) struct WatchListRowDisplay {
-    pub price: SharedString,
+    pub price: SmolStr,
     pub quote_asset: AssetId,
-    pub change: SharedString,
-    pub change_percent: SharedString,
+    pub change: SmolStr,
+    pub change_percent: SmolStr,
     /// The traded quantity of the session, in the unit the listing publishes it in.
     pub traded_quantity: Option<MarketQuantity>,
     /// The traded notional of the session, in the asset the venue states it in.
@@ -411,13 +410,10 @@ impl WatchListRowDisplay {
         let (change, change_percent) = format_change(ticker, precision.price_tick);
 
         Self {
-            price: SharedString::new(
-                ticker
-                    .close
-                    .value
-                    .format_and_round_tick(precision.price_tick)
-                    .as_str(),
-            ),
+            price: ticker
+                .close
+                .value
+                .format_and_round_tick(precision.price_tick),
             quote_asset: ticker.close.quote_asset.clone(),
             change,
             change_percent,
@@ -456,10 +452,7 @@ impl PriceDirection {
 /// difference that lost its sign. It is written at the listing's price tick, like
 /// the price it is measured from. The percentage is hidden when the open price is
 /// zero, because there is no denominator to measure against.
-pub(super) fn format_change(
-    ticker: &ListingTicker,
-    price_tick: Tick,
-) -> (SharedString, SharedString) {
+pub(super) fn format_change(ticker: &ListingTicker, price_tick: Tick) -> (SmolStr, SmolStr) {
     let current = ticker.close.value;
     let open = ticker.open.value;
     let (magnitude, is_negative) = if current >= open {
@@ -469,13 +462,13 @@ pub(super) fn format_change(
     };
     let magnitude_text = magnitude.format_and_round_tick(price_tick);
     let change = if is_negative {
-        SharedString::new(format_smolstr!("-{magnitude_text}").as_str())
+        format_smolstr!("-{magnitude_text}")
     } else {
-        SharedString::new(magnitude_text.as_str())
+        magnitude_text
     };
 
     let change_percent = if open == Price::ZERO {
-        SharedString::new_static("--")
+        SmolStr::new_static("--")
     } else {
         let magnitude_percent = magnitude.inner() as f64 / open.inner() as f64 * 100.0;
         let percent = if is_negative {
@@ -483,7 +476,7 @@ pub(super) fn format_change(
         } else {
             magnitude_percent
         };
-        SharedString::new(format_smolstr!("{percent:.2}%").as_str())
+        format_smolstr!("{percent:.2}%")
     };
 
     (change, change_percent)
