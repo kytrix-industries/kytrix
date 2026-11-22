@@ -9,8 +9,10 @@
 //! - **A** a steady `sync` writes no canvas and asks for no frame (the same `Arc` is
 //!   still in the node);
 //! - **B** an appearance switch repaints in the appearance's own roles;
-//! - **C** a canvas node that was never written paints no primitives (deleting
-//!   `set_canvas` turns that test red, and the node is still one opaque canvas);
+//! - **C** a canvas node that was never written paints no primitives, though the node
+//!   is still one opaque canvas — a node that stopped being a canvas is what this
+//!   turns red. Deleting the chart's `set_canvas` is caught by the tests that assert
+//!   the primitives it wrote (A, B and D), not by C;
 //! - **D** releasing the chart hands its registered geometry back.
 
 use std::{rc::Rc, sync::Arc};
@@ -138,6 +140,18 @@ impl ChartHarness {
             ..
         } = self;
         app.with_cx(|cx| chart.sync(cx, snapshot, None, None))
+            .expect("the chart syncs")
+    }
+
+    /// Syncs one frame with the pointer over `pointer`.
+    fn sync_at(&mut self, pointer: Point) -> bool {
+        let Self {
+            app,
+            chart,
+            snapshot,
+            ..
+        } = self;
+        app.with_cx(|cx| chart.sync(cx, snapshot, Some(pointer), None))
             .expect("the chart syncs")
     }
 
@@ -380,8 +394,9 @@ fn another_appearance_should_repaint_the_chart_in_the_dark_roles() {
 }
 
 /// **Rule C.** A canvas node that was never written paints no primitives; the node
-/// itself is still one opaque canvas in the frame's paint. Deleting the chart's
-/// `set_canvas` is what this test turns red.
+/// itself is still one opaque canvas in the frame's paint. What turns this red is a
+/// build that stops making the node a canvas — the frame the chart's `set_canvas`
+/// feeds is guarded by the tests that assert the primitives it wrote (A, B and D).
 #[test]
 fn a_canvas_node_that_was_never_written_paints_no_primitives() {
     let harness = ChartHarness::new(snapshot());
@@ -542,6 +557,43 @@ fn a_stale_atlas_lease_should_force_a_repaint() {
     assert!(
         !harness.sync(),
         "with fresh leases the frame is steady again (I3)"
+    );
+}
+
+/// The stale-lease guard looks at the handles the canvas on screen was built from, not
+/// at every handle the shaping cache still holds. A label an earlier pointer sample
+/// left behind is in the cache but not on the canvas, and a chart that redrew for it
+/// would never settle again (I3).
+#[test]
+fn a_stale_label_off_the_canvas_should_not_keep_the_chart_repainting() {
+    let mut harness = ChartHarness::new(snapshot());
+    assert!(harness.sync(), "the first frame paints");
+    let plot = ChartLayout::new(harness.box_of()).plot;
+    let sample = |fraction: f32| {
+        Point::new(
+            plot.origin.x + plot.size.width * fraction,
+            plot.origin.y + plot.size.height / 2.0,
+        )
+    };
+    let first = sample(0.25);
+    let second = sample(0.75);
+    assert!(
+        harness.sync_at(first),
+        "the first hovered sample is a drawing"
+    );
+    assert!(harness.sync_at(second), "another sample is another drawing");
+
+    // An atlas reset invalidates every lease, including the labels of the sample the
+    // pointer has left: those stay in the shaping cache but are not on the canvas.
+    let stack = harness.app.app().font_stack().clone();
+    harness.app.app_mut().set_font_stack(stack);
+    assert!(
+        harness.sync_at(second),
+        "the labels on screen are shaped for the atlas that exists now"
+    );
+    assert!(
+        !harness.sync_at(second),
+        "a stale label the canvas does not draw must not keep the chart repainting (I3)"
     );
 }
 

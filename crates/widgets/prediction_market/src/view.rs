@@ -742,7 +742,7 @@ impl WidgetView for PredictionMarketWidget {
         self.split_area = Some(split_area);
 
         let chart_wrap = NodeBuilder::boxed()
-            .id("TEST_PREDICTION_MARKET_CHART")
+            .id("TEST_PREDICTION_MARKET_CHART_FRAME")
             .style(
                 StyleBuilder::new()
                     .flex_1()
@@ -1693,7 +1693,7 @@ impl PredictionMarketWidget {
         area_style.inner.size.height = LengthPercentageAuto::percent(ratio).into();
         area_style.inner.min_size.height = LengthPercentageAuto::length(MIN_BOOK_HEIGHT);
         let area = NodeBuilder::boxed()
-            .id("TEST_PREDICTION_MARKET_BOOK")
+            .id("TEST_PREDICTION_MARKET_BOOK_AREA")
             .style(area_style)
             .build(cx.tree_mut(), area_parent)?;
 

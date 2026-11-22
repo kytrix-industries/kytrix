@@ -48,6 +48,16 @@
 //!   still brought into view by item and centred, which is the old
 //!   `scroll_to_item_strict(asks.len(), Center)`.
 //!
+//! **W5b-G1 — accepted as a visible deviation.** The kit list has `offset()` and
+//! `scroll_to_item()` but no `scroll_by` / `set_offset`, so the pixel nudge above
+//! cannot be written from here, and a widget does not implement its own scrolling
+//! container (AGENTS §15.3). The reader-visible effect is bounded and registered: a
+//! live ask that inserts or removes a level shifts every row by one row height
+//! (`ROW_HEIGHT`, 22 px per level) — the spread row keeps the item it is anchored on,
+//! not its pixel place — while a first book, a side switch and a grouping switch are
+//! still anchored exactly. The kit batch that adds `List::scroll_by` restores the nudge;
+//! W5b ships with this deviation recorded in the ledger and accepted by the Lead.
+//!
 //! The kit list also paints its scrollbar over the right edge of the rows and
 //! draws a hover veil; the old panel reserved a 10 px inset on the header and the
 //! rows instead and drew nothing on hover. Both are kit-owned drawing decisions,
@@ -989,6 +999,23 @@ impl PredictionBookPanel {
     #[cfg(test)]
     pub(crate) fn scroll_offset(&self, app: &App) -> Option<f32> {
         self.built.as_ref().and_then(|built| built.list.offset(app))
+    }
+
+    /// Moves the ladder's scroll position, for a test that reads what the bars draw.
+    ///
+    /// The kit list has no pixel offset setter (W5b-G1), so a programmatic item jump is
+    /// the only way a test can scroll the ladder without a new book.
+    #[cfg(test)]
+    pub(crate) fn scroll_to_item_for_test(
+        &self,
+        app: &mut App,
+        index: usize,
+        align: ItemAlign,
+    ) -> Result<(), EngineError> {
+        match self.built.as_ref() {
+            Some(built) => built.list.scroll_to_item(app, index, align),
+            None => Ok(()),
+        }
     }
 
     /// Whether the depth timer is waiting for its next tick.

@@ -17,7 +17,7 @@ use std::{
 
 use app_config::widget::WidgetConfig;
 use i18n::{language::codes::LanguageCode, translate::Translate};
-use market_participants_connector::market::error::MarketError;
+use market_participants_connector::{catalog::error::CatalogError, market::error::MarketError};
 use market_participants_model::{
     identifier::{IdentifierValue, VenueId, VenueScopeId},
     listing::route::VenueRoute,
@@ -27,7 +27,7 @@ use market_participants_model::{
     },
 };
 use ui_core::{
-    event::{Event, InputEvent, Modifiers, PointerButton},
+    event::{ActionSource, Event, InputEvent, Modifiers, PointerButton},
     math::Point,
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope},
 };
@@ -741,6 +741,65 @@ fn a_terminal_chart_failure_should_release_the_book_lease() {
     assert!(pane.widget.book_pending.is_empty() || true);
 }
 
+/// The venue answers the chart's read with "that catalog is not loaded": the market
+/// the pane follows is not in memory any more, so the reading and the book read for it
+/// are both dropped, and the pane goes back to waiting for its directory.
+#[test]
+fn a_chart_whose_market_is_not_loaded_should_clear_the_book() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::loaded(&[VenueId::Polymarket]);
+    let mut pane = ready_pane(&mut harness, &directory);
+    report_book(
+        &mut harness,
+        &mut pane,
+        vec![("0.4", "10")],
+        vec![("0.6", "10")],
+    );
+    sync(&mut harness, &mut pane);
+    assert!(
+        pane.widget.book_snapshot.is_some(),
+        "the ladder is on screen before the venue refuses"
+    );
+    assert!(pane.widget.book_panel.grouped.is_some());
+
+    report_market_status(
+        &mut harness,
+        &mut pane,
+        PredictionMarketStatus::Failed {
+            error: PredictionMarketFetchError::Market(MarketError::Catalog(Box::new(
+                CatalogError::CatalogNotLoaded {
+                    route: event_ref().route,
+                },
+            ))),
+        },
+    );
+
+    assert!(
+        pane.widget.awaiting_market,
+        "the chart waits for its market"
+    );
+    assert!(pane.widget.snapshot.is_none(), "the reading is dropped");
+    assert!(
+        pane.widget.book_key.is_none(),
+        "the book's stream is retired"
+    );
+    assert!(
+        pane.widget.book_snapshot.is_none(),
+        "the book of a market not in memory is dropped"
+    );
+    assert!(
+        pane.widget.book_panel.grouped.is_none(),
+        "the panel forgets the ladder it can no longer vouch for"
+    );
+    assert_eq!(
+        state(&harness, &pane),
+        WidgetState::waiting(Notice::MarketNotLoaded {
+            venues: vec![VenueId::Polymarket],
+            supported: event_venues(),
+        })
+    );
+}
+
 #[test]
 fn a_message_from_another_range_or_an_older_revision_should_be_refused() {
     let mut harness = harness();
@@ -1207,6 +1266,76 @@ fn a_book_failure_should_be_shown_in_the_panel_and_recoverable() {
     );
 }
 
+/// A book that fails before any ladder is a failure of the whole region: the way back
+/// is a button of its own, its label is resolved when it is built, and a language
+/// switch rebuilds it (the kit has no text binding on a button, AGENTS §15.1).
+#[test]
+fn a_book_failure_without_a_ladder_should_offer_a_retry() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::loaded(&[VenueId::Polymarket]);
+    let mut pane = ready_pane(&mut harness, &directory);
+    assert!(pane.widget.book_snapshot.is_none());
+    report_book_status(
+        &mut harness,
+        &mut pane,
+        PredictionOrderBookStatus::Failed {
+            error: PredictionOrderBookError::Timeout(Duration::from_secs(5)),
+        },
+    );
+    sync(&mut harness, &mut pane);
+    harness.drain();
+
+    let window = harness.window();
+    let chrome = pane.widget.book_chrome.as_ref().expect("chrome");
+    let node = chrome.status_retry_node;
+    let retry = chrome
+        .status_retry
+        .action_identity()
+        .expect("the retry acts");
+    let label = chrome
+        .status_retry
+        .label_text()
+        .expect("the way back is labelled")
+        .to_owned();
+    assert!(
+        harness.visible(chrome.status_retry_parent),
+        "a failed region shows the way back"
+    );
+    assert!(!label.is_empty());
+    let old_key = pane.widget.book_key.clone().expect("a book");
+
+    assert!(
+        harness
+            .app_mut()
+            .dispatch_action(window, node, retry, ActionSource::Programmatic)
+    );
+    sync(&mut harness, &mut pane);
+
+    assert!(
+        pane.widget.book_error.is_none(),
+        "a retry stops being the answer"
+    );
+    assert_ne!(
+        pane.widget.book_key.as_ref().expect("a book"),
+        &old_key,
+        "a retry is a new generation of the same book"
+    );
+
+    harness.switch_language(LanguageCode::ZhCn);
+    sync(&mut harness, &mut pane);
+    let rebuilt = pane.widget.book_chrome.as_ref().expect("chrome");
+    assert_eq!(rebuilt.retry_language, LanguageCode::ZhCn);
+    assert_eq!(
+        rebuilt
+            .status_retry
+            .label_text()
+            .expect("the way back is labelled"),
+        "\u{91cd}\u{8bd5}",
+        "the retry is rebuilt in the language showing now"
+    );
+    assert!(harness.tree().get(node).is_err(), "the old button is gone");
+}
+
 #[test]
 fn the_toggle_should_hide_the_book_panel_and_report_the_change() {
     let mut harness = harness();
@@ -1467,6 +1596,67 @@ fn a_splitter_gesture_interrupted_by_hiding_should_not_report_its_notch() {
         pane.publishes.get(),
         publishes,
         "the interrupted gesture chose nothing"
+    );
+    assert!(pane.widget.split_drag.is_none());
+}
+
+/// A drag that ends where it began moved nothing: the notch is reported only when the
+/// gesture left it somewhere else than the ratio it was built with.
+#[test]
+fn a_splitter_drag_back_to_its_start_should_not_report() {
+    let mut harness = harness();
+    let directory = FixtureDirectory::loaded(&[VenueId::Polymarket]);
+    let mut pane = ready_pane(&mut harness, &directory);
+    let splitter = pane.widget.book_chrome.as_ref().expect("chrome").splitter;
+    let bounds = harness
+        .tree()
+        .get(splitter)
+        .expect("the splitter")
+        .layout()
+        .bounds;
+    let start = Point::new(bounds.origin.x + 10.0, bounds.origin.y + 2.0);
+    let publishes = pane.publishes.get();
+    let down = Event::Input(InputEvent::PointerDown {
+        position: start,
+        button: PointerButton::Primary,
+        modifiers: Modifiers::empty(),
+        timestamp: Instant::now(),
+    });
+    harness.with_cx(|cx| pane.widget.dispatch(&down, cx));
+
+    let away = Event::Input(InputEvent::PointerMove {
+        position: Point::new(start.x, start.y - 40.0),
+        modifiers: Modifiers::empty(),
+        timestamp: Instant::now(),
+    });
+    harness.with_cx(|cx| pane.widget.dispatch(&away, cx));
+    assert!(
+        pane.widget.config.order_book_ratio > 0.5,
+        "the gesture moved the notch"
+    );
+    let back = Event::Input(InputEvent::PointerMove {
+        position: start,
+        modifiers: Modifiers::empty(),
+        timestamp: Instant::now(),
+    });
+    harness.with_cx(|cx| pane.widget.dispatch(&back, cx));
+    assert_eq!(
+        pane.widget.config.order_book_ratio, 0.5,
+        "and moved it back to where it started"
+    );
+
+    let up = Event::Input(InputEvent::PointerUp {
+        position: start,
+        button: PointerButton::Primary,
+        modifiers: Modifiers::empty(),
+        timestamp: Instant::now(),
+    });
+    harness.with_cx(|cx| pane.widget.dispatch(&up, cx));
+
+    assert_eq!(
+        pane.publishes.get(),
+        publishes,
+        "a gesture that ended where it started reports nothing"
     );
     assert!(pane.widget.split_drag.is_none());
 }

@@ -18,6 +18,7 @@ use market_participants_model::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
+    interaction::ItemAlign,
     node::{builder::NodeBuilder, id::NodeId},
     test_support::record::PrimitiveKind,
 };
@@ -820,6 +821,34 @@ fn the_depth_bars_should_follow_the_lists_scroll_offset() {
         quads.len() + 1 >= visible_rows.min(121 - first),
         "the canvas carries the bars of the visible window, not of the whole ladder: {}",
         quads.len()
+    );
+
+    // The offset is part of what the canvas was drawn from: the list moving without a
+    // new book is still a frame the depth bars owe, and the bars on screen have to be
+    // laid out from the offset the list is at now.
+    fixture
+        .panel
+        .scroll_to_item_for_test(fixture.harness.app_mut(), 20, ItemAlign::Start)
+        .expect("the list is scrolled to the twentieth row");
+    let scrolled = fixture
+        .panel
+        .scroll_offset(fixture.harness.app())
+        .expect("the list is attached");
+    assert!(
+        (scrolled - offset).abs() > 1.0,
+        "the programmatic jump moved the ladder: {scrolled} vs {offset}"
+    );
+    assert!(
+        fixture.draw(),
+        "a scrolled ladder is a drawing for the bars, not a steady frame"
+    );
+    let first = (scrolled / ROW_HEIGHT).floor() as usize;
+    let expected_top = bounds.origin.y + first as f32 * ROW_HEIGHT - scrolled;
+    let first_quad = fixture.quads()[0].bounds.expect("a quad has bounds");
+    assert!(
+        (first_quad.origin.y - expected_top).abs() < 0.01,
+        "the bars follow the offset the list is scrolled to: {} vs {expected_top}",
+        first_quad.origin.y
     );
 }
 
