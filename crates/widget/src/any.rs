@@ -57,7 +57,7 @@ use super::{
     config::WidgetConfigChange,
     cx::WidgetCx,
     descriptor::WidgetDescriptor,
-    frame::{FrameRouter, RouteId},
+    frame::RouteId,
     identity::{WidgetId, WidgetInstanceId},
     instrument_link::InstrumentLink,
     services::WidgetServices,
@@ -201,7 +201,6 @@ struct WidgetSlot {
     services: Rc<WidgetServices>,
     window: WindowId,
     scope: SignalScope,
-    router: FrameRouter,
     route: Option<RouteId>,
     body_built: bool,
     released: bool,
@@ -221,19 +220,18 @@ impl WidgetSlot {
             services,
             window,
             scope,
-            router,
             body_built,
             ..
         } = self;
 
         let has_content = (vtable.has_content)(body);
         if has_content && !*body_built {
-            let mut cx = WidgetCx::new(app, *window, services, *scope, router.clone());
+            let mut cx = WidgetCx::new(app, *window, services, *scope);
             (vtable.body)(body, surface.content_slot(), &mut cx)?;
             *body_built = true;
         }
 
-        let mut cx = WidgetCx::new(app, *window, services, *scope, router.clone());
+        let mut cx = WidgetCx::new(app, *window, services, *scope);
         (vtable.sync)(body, &mut cx)?;
         surface.sync(&mut cx, has_content)?;
 
@@ -246,13 +244,7 @@ impl WidgetSlot {
             return Ok(());
         }
 
-        let mut cx = WidgetCx::new(
-            app,
-            self.window,
-            &self.services,
-            self.scope,
-            self.router.clone(),
-        );
+        let mut cx = WidgetCx::new(app, self.window, &self.services, self.scope);
         (self.vtable.header)(&self.body, group, parent, &mut cx)
     }
 
@@ -264,13 +256,7 @@ impl WidgetSlot {
 
         let surface = self.surface.dispatch(app, event);
         let view = {
-            let mut cx = WidgetCx::new(
-                app,
-                self.window,
-                &self.services,
-                self.scope,
-                self.router.clone(),
-            );
+            let mut cx = WidgetCx::new(app, self.window, &self.services, self.scope);
             (self.vtable.dispatch)(&self.body, event, &mut cx)
         };
 
@@ -285,17 +271,11 @@ impl WidgetSlot {
         self.released = true;
 
         if let Some(route) = self.route.take() {
-            self.router.unregister(route);
+            self.services.frame_router.unregister(route);
         }
 
         {
-            let mut cx = WidgetCx::new(
-                app,
-                self.window,
-                &self.services,
-                self.scope,
-                self.router.clone(),
-            );
+            let mut cx = WidgetCx::new(app, self.window, &self.services, self.scope);
             (self.vtable.release)(&self.body, &mut cx);
         }
 
@@ -315,7 +295,7 @@ impl WidgetSlot {
 impl Drop for WidgetSlot {
     fn drop(&mut self) {
         if let Some(route) = self.route.take() {
-            self.router.unregister(route);
+            self.services.frame_router.unregister(route);
         }
     }
 }
@@ -325,8 +305,9 @@ impl Drop for WidgetSlot {
 /// This is a structural and lifecycle container: it holds the parts a pane needs
 /// without knowing which widget it is hosting. A pane embeds
 /// [`AnyWidget::surface`]'s node, calls [`AnyWidget::sync`] from the
-/// [`FrameRouter`] (mount registers that route itself), forwards events to
-/// [`AnyWidget::dispatch`], and calls [`AnyWidget::release`] when the pane closes.
+/// [`FrameRouter`](crate::frame::FrameRouter) (mount registers that route itself),
+/// forwards events to [`AnyWidget::dispatch`], and calls [`AnyWidget::release`] when the
+/// pane closes.
 #[derive(Clone)]
 pub struct AnyWidget {
     slot: Rc<RefCell<WidgetSlot>>,
@@ -338,14 +319,15 @@ impl AnyWidget {
     /// The order is the contract: the state cell and the surface exist before
     /// [`WidgetView::new`], the widget is stored before [`WidgetView::load`] runs,
     /// and the frame route is registered last — so a load that schedules a frame
-    /// always finds a complete widget.
+    /// always finds a complete widget. The route is registered with the router the
+    /// services carry ([`WidgetServices::frame_router`]), which is the composition
+    /// root's one router.
     #[allow(clippy::too_many_arguments)]
     pub fn mount<W: WidgetView>(
         app: &mut App,
         window: WindowId,
         parent: NodeId,
         services: &Rc<WidgetServices>,
-        router: &FrameRouter,
         instance_id: WidgetInstanceId,
         config: W::Config,
         config_change: WidgetConfigChange,
@@ -356,7 +338,6 @@ impl AnyWidget {
             window,
             parent,
             services,
-            router,
             instance_id,
             config,
             config_change,
@@ -375,7 +356,6 @@ impl AnyWidget {
         window: WindowId,
         parent: NodeId,
         services: &Rc<WidgetServices>,
-        router: &FrameRouter,
         instance_id: WidgetInstanceId,
         config: W::Config,
         config_change: WidgetConfigChange,
@@ -384,7 +364,7 @@ impl AnyWidget {
         let status = WidgetStatus::new(app, scope);
 
         let surface = {
-            let mut cx = WidgetCx::new(app, window, services, scope, router.clone());
+            let mut cx = WidgetCx::new(app, window, services, scope);
             match WidgetSurface::build(&mut cx, parent, status) {
                 Ok(surface) => surface,
                 Err(error) => {
@@ -398,14 +378,14 @@ impl AnyWidget {
         };
 
         let body: ErasedBody = Rc::new(RefCell::new(None));
-        let reload = reload_handle::<W>(Rc::downgrade(&body), window, services, router, scope);
+        let reload = reload_handle::<W>(Rc::downgrade(&body), window, services, scope);
         let recovery = WidgetAction::new(RECOVERY_KEY, {
             let reload = reload.clone();
             move |app| reload.reload(app)
         });
 
         let constructed = {
-            let mut cx = WidgetCx::new(app, window, services, scope, router.clone());
+            let mut cx = WidgetCx::new(app, window, services, scope);
             W::new(
                 instance_id,
                 config,
@@ -436,7 +416,7 @@ impl AnyWidget {
         *body.borrow_mut() = Some(Box::new(widget));
 
         {
-            let mut cx = WidgetCx::new(app, window, services, scope, router.clone());
+            let mut cx = WidgetCx::new(app, window, services, scope);
             let mut borrow = body.borrow_mut();
             let view = borrow
                 .as_mut()
@@ -456,7 +436,6 @@ impl AnyWidget {
             services: Rc::clone(services),
             window,
             scope,
-            router: router.clone(),
             route: None,
             body_built: false,
             released: false,
@@ -464,7 +443,7 @@ impl AnyWidget {
 
         let route = {
             let slot: Weak<RefCell<WidgetSlot>> = Rc::downgrade(&slot);
-            router.register(move |app| {
+            services.frame_router.register(move |app| {
                 let Some(slot) = slot.upgrade() else {
                     return Ok(());
                 };
@@ -626,11 +605,9 @@ fn reload_handle<W: WidgetView>(
     body: Weak<RefCell<Option<Box<dyn Any>>>>,
     window: WindowId,
     services: &Rc<WidgetServices>,
-    router: &FrameRouter,
     scope: SignalScope,
 ) -> ReloadHandle {
     let services = Rc::clone(services);
-    let router = router.clone();
 
     ReloadHandle::new(move |app| {
         let Some(cell) = body.upgrade() else {
@@ -643,7 +620,7 @@ fn reload_handle<W: WidgetView>(
         else {
             return;
         };
-        let mut cx = WidgetCx::new(app, window, &services, scope, router.clone());
+        let mut cx = WidgetCx::new(app, window, &services, scope);
         view.load(&mut cx);
     })
 }

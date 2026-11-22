@@ -4,10 +4,10 @@
 //! The previous contract's tests drove its own application context and asserted through
 //! its element tree. This host is the engine's equivalent and the migration carrier for
 //! the twenty widget crates: it builds the same [`WidgetServices`] the composition
-//! root builds (minus the market-participants directory, which still needs a toolkit
-//! context to construct — see [`WidgetServices`]), installs the [`FrameRouter`] the
-//! composition root installs, and drains frames through
-//! [`ui_core::test_support::app::TestApp`].
+//! root builds through [`WidgetServices::builder`] (minus the market-participants
+//! directory, which still needs a toolkit context to construct — see
+//! [`WidgetServices`]), creates and injects the three composition-root singletons, and
+//! drains frames through [`ui_core::test_support::app::TestApp`].
 //!
 //! # What the headless host does that the platform pump does
 //!
@@ -17,6 +17,18 @@
 //! first and only then drains — the same order the production pump uses. A test that
 //! wants one synchronized frame calls `drain`; a test that wants to inspect the
 //! sync in isolation calls [`WidgetTestApp::tick`].
+//!
+//! # The composition-root singletons
+//!
+//! The host is the composition root of a test: it creates the one
+//! [`Layer`](base_ui::kit::layer::Layer), the one [`FrameRouter`] and the one
+//! [`AnimationRouter`](base_ui::kit::overlay::AnimationRouter), keeps its own handles
+//! ([`WidgetTestApp::layer`], [`WidgetTestApp::router`],
+//! [`WidgetTestApp::animation`]) and injects the same instances through
+//! [`WidgetServices::builder`]. A test therefore asserts against the application-level
+//! instances, not against a copy a widget might have built: an overlay opened through
+//! the widget context shows up in [`WidgetTestApp::layer`], and the first overlay
+//! installs [`WidgetTestApp::animation`] as the engine's completion dispatcher.
 //!
 //! # Driving the widget's async work
 //!
@@ -66,8 +78,10 @@
 
 use std::rc::Rc;
 
-use app_config::settings::Config;
-use base_ui::theme::handle::ThemeHandle;
+use base_ui::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
+};
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, translate::Translate, translator::types::I18n};
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
@@ -177,8 +191,14 @@ pub struct WidgetTestApp {
     /// can drive a widget's async work ([`WidgetTestApp::drain_runtime`]); it is a
     /// current-thread runtime, so nothing runs between drains.
     runtime: tokio::runtime::Runtime,
+    /// The composition root's one layer stack, mirrored into `services`.
+    layer: Rc<Layer>,
+    /// The composition root's one frame router, mirrored into `services`.
+    router: Rc<FrameRouter>,
+    /// The composition root's one animation-completion router, mirrored into
+    /// `services`.
+    animation: Rc<AnimationRouter>,
     services: Rc<WidgetServices>,
-    router: FrameRouter,
     scope: SignalScope,
     status: WidgetStatus,
 }
@@ -206,11 +226,6 @@ impl WidgetTestApp {
     pub fn with_translate(translate: Translate) -> Self {
         let mut app = TestApp::new();
         let window = app.window_id();
-        let scope = app.app_mut().signal_scope();
-        let language = app.app_mut().signal_scoped(scope, LanguageCode::En);
-        let config = app.app_mut().signal_scoped(scope, Config::default());
-        let catalog_generation = app.app_mut().signal_scoped(scope, 0_u64);
-        let reduce_motion = app.app_mut().signal_scoped(scope, false);
         let theme = ThemeHandle::new(app.app_mut(), base_ui::theme::appearance::Appearance::Light);
         // The services' runtime is one the host owns (a current-thread runtime, so a
         // test drives its work explicitly) rather than the engine's: the engine's
@@ -219,29 +234,35 @@ impl WidgetTestApp {
             .enable_all()
             .build()
             .expect("the host's runtime builds");
-        let sound: Rc<dyn Fn(&'static str) -> Option<Bytes>> = Rc::new(|_| None);
-        let services = Rc::new(WidgetServices {
-            translate,
-            language,
-            config,
-            theme,
-            market_participants: None,
-            catalog_generation,
-            kytrix_service: None,
-            open_url: Rc::new(|_| {}),
-            sound,
-            reduce_motion,
-            runtime: runtime.handle().clone(),
-        });
-        let router = FrameRouter::new(app.app_mut()).expect("the host owns the frame hook slot");
+        // The composition root's three singletons: the host keeps its own handles and
+        // injects the same instances, exactly as the application root does.
+        let layer = Rc::new(Layer::new());
+        let animation = Rc::new(AnimationRouter::new());
+        let router =
+            Rc::new(FrameRouter::new(app.app_mut()).expect("the host owns the frame hook slot"));
+        let services = Rc::new(
+            WidgetServices::builder(
+                app.app_mut(),
+                runtime.handle().clone(),
+                translate,
+                theme,
+                Rc::clone(&layer),
+                Rc::clone(&router),
+                Rc::clone(&animation),
+            )
+            .build(),
+        );
+        let scope = app.app_mut().signal_scope();
         let status = WidgetStatus::new(app.app_mut(), scope);
 
         Self {
             app,
             window,
             runtime,
-            services,
+            layer,
             router,
+            animation,
+            services,
             scope,
             status,
         }
@@ -318,10 +339,30 @@ impl WidgetTestApp {
         &self.services
     }
 
+    /// The composition root's one layer stack the services carry.
+    ///
+    /// A test asserts an overlay opened through the widget context against this
+    /// instance: it is the same one the services hand out, and a widget that built its
+    /// own stack could not register there.
+    #[must_use]
+    pub fn layer(&self) -> &Layer {
+        &self.layer
+    }
+
     /// The installed frame router.
     #[must_use]
     pub fn router(&self) -> &FrameRouter {
         &self.router
+    }
+
+    /// The composition root's one animation-completion router the services carry.
+    ///
+    /// The engine's single completion slot stays with this instance: the first kit
+    /// component built through the widget context installs it
+    /// ([`AnimationRouter::installed`]).
+    #[must_use]
+    pub fn animation(&self) -> &AnimationRouter {
+        &self.animation
     }
 
     /// The window every widget of this host lives in.
@@ -345,13 +386,7 @@ impl WidgetTestApp {
     /// Runs `body` with a [`WidgetCx`] over this host.
     pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R {
         let services = Rc::clone(&self.services);
-        let mut cx = WidgetCx::new(
-            self.app.app_mut(),
-            self.window,
-            &services,
-            self.scope,
-            self.router.clone(),
-        );
+        let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, self.scope);
         body(&mut cx)
     }
 
@@ -454,20 +489,18 @@ impl WidgetTestApp {
     pub fn build_surface(&mut self) -> WidgetSurface {
         let status = self.status;
         let services = Rc::clone(&self.services);
-        let router = self.router.clone();
         let scope = self.scope;
         let root = self.root();
-        let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, scope, router);
+        let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, scope);
         WidgetSurface::build(&mut cx, root, status).expect("the surface builds")
     }
 
     /// Runs the surface's sync for one frame and then drains it.
     pub fn sync_surface(&mut self, surface: &mut WidgetSurface, has_content: bool) {
         let services = Rc::clone(&self.services);
-        let router = self.router.clone();
         let scope = self.scope;
         {
-            let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, scope, router);
+            let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, scope);
             surface
                 .sync(&mut cx, has_content)
                 .expect("the surface syncs");
@@ -508,14 +541,12 @@ impl WidgetTestApp {
         config: W::Config,
     ) -> Result<AnyWidget, EngineError> {
         let services = Rc::clone(&self.services);
-        let router = self.router.clone();
         let parent = self.root();
         AnyWidget::mount::<W>(
             self.app.app_mut(),
             self.window,
             parent,
             &services,
-            &router,
             WidgetInstanceId::new(),
             config,
             crate::config::WidgetConfigChange::default(),
@@ -535,13 +566,11 @@ impl WidgetTestApp {
         config: W::Config,
     ) -> Result<AnyWidget, EngineError> {
         let services = Rc::clone(&self.services);
-        let router = self.router.clone();
         AnyWidget::mount_in_scope::<W>(
             self.app.app_mut(),
             self.window,
             parent,
             &services,
-            &router,
             WidgetInstanceId::new(),
             config,
             crate::config::WidgetConfigChange::default(),

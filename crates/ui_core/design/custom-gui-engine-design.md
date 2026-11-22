@@ -1,8 +1,19 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.7（2026-11-22）
+> **版本**：v2.8（2026-11-22）
 >
+> **v2.8 变更摘要（2026-11-22）**：**P3-1e（P3-0b 审查 F2：组合根资源槽批）完成**。§13 把三个**应用级组合根单例**放进
+> 冻结契约：① `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` /
+> `animation_router: Rc<AnimationRouter>`（`base_ui::kit::{layer::Layer, overlay::AnimationRouter}` + `widget::frame::FrameRouter`），
+> `WidgetCx` 提供 `layer()` / `frame_router()` / `animation()` 访问器并**删除**独立的 `router` 形参（`WidgetCx::new` 与
+> `AnyWidget::mount` 不再另收 `FrameRouter`——单例只从服务取，杜绝两份真相）；② `WidgetServices::builder(app, runtime,
+> translate, theme, layer, frame_router, animation_router)` 是装配缝（四信号铸在 builder 的一个 scope 里，可选槽用 setter）；
+> ③ `WidgetTestApp` 自建三单例、经 builder 注入并用 `layer()` / `router()` / `animation()` 暴露（测试断言落在组合根实例上，
+> 而不是 widget 可能自建的副本）；④ `base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与
+> `FrameRouter::installed` 同型，让「完成回调装了哪一个路由」可断言）。裁决依据：`instrument_selector_ui` 的 `SelectorHost`
+> 需要 `Rc<WidgetServices>` + `Layer` + `FrameRouter` + `AnimationRouter`，此前 6 个 selector widget 无合法 host 来源（P3-0b
+> §F2）。测试 156 → **160**。逐条登记 `.docs/gui-migration/design-changes.md` §16。
 > **v2.7 变更摘要（2026-11-22）**：**P3-1d（W1 迁移暴露的契约补缝批）完成**。§13 补齐六处 W1 实测缺口：①
 > `Notice::is_markdown` 改为**按解析后的目录值判定**（`fn is_markdown(&self, translate: &Translate) -> bool`）——任意文案来源
 > （`Message` 也可以是 `<p align="center">` 段落）含 HTML/markdown 标记即走 `kit::markdown`，纯文本仍 `empty_state`
@@ -3722,14 +3733,14 @@ impl App {
 | 模块 | 职责 | 关键类型 |
 |---|---|---|
 | `view.rs` | 契约本体：widget 实现什么、框架何时调用 | `WidgetView` / `ReloadHandle` / `HeaderGroup` |
-| `cx.rs` | 唯一应用层上下文：服务、窗口、节点树、信号、帧请求 | `WidgetCx<'a>` |
+| `cx.rs` | 唯一应用层上下文：服务、窗口、节点树、信号、帧请求、组合根三单例访问器 | `WidgetCx<'a>` |
 | `any.rs` | 类型擦除句柄：`NodeId` 即擦除后的句柄 + 单态化 vtable | `AnyWidget` / `WidgetVTable`（私有） |
 | `status.rs` | 状态机：5 状态和、去重写入、notice/failure/action | `WidgetState` / `Notice` / `Failure` / `WidgetAction` / `WidgetStatus` |
 | `surface.rs` | 展示规则唯一实现：banner / 正文槽 / 占位（§13.6） | `WidgetSurface` |
 | `ui/placeholder.rs` | 三种占位的 kit 组合（spinner / empty_state / button / 富文本 notice 的 markdown） | `Placeholder` |
 | `frame.rs` | `App::on_frame` 单槽唯一注册者 + 扇出（I3） | `FrameRouter` / `RouteId` / `WeakRouter` |
 | `binding.rs` | 执行器桥：tokio 侧消息 → 收件箱 → `sync` 消费 | `WidgetBinding` / `WidgetInbox` / `Inbound` |
-| `services.rs` | 组合根注入的协作者（**唯一**获取途径，无全局） | `WidgetServices` |
+| `services.rs` | 组合根注入的协作者（**唯一**获取途径，无全局）；三个组合根单例（`Layer` / `FrameRouter` / `AnimationRouter`）的注入点 | `WidgetServices` / `WidgetServicesBuilder` |
 | `error.rs` | 强类型错误 + 29 个 `TranslatedError` 映射（文本只在画的那一帧解析） | `TranslatedError` |
 | `time_zone.rs` | 数据时区接缝：读设置快照 | `data_time_zone(&Config)` |
 | `test_support.rs` | 框架测试宿主（`cfg(test)` 或 `test-support` feature） | `WidgetTestApp` / `WaitingWidget` / `FixtureFailure` |
@@ -3794,14 +3805,13 @@ pub trait WidgetView: Sized + 'static {
 }
 
 // ── cx.rs ──────────────────────────────────────────────────────────────────
-pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a WidgetServices, SignalScope, FrameRouter */ }
+pub struct WidgetCx<'a> { /* &'a mut App, WindowId, &'a WidgetServices, SignalScope */ }
 impl<'a> WidgetCx<'a> {
     pub fn new(
         app: &'a mut App,
         window: WindowId,
         services: &'a WidgetServices,
         scope: SignalScope,
-        router: FrameRouter,
     ) -> Self;
 
     pub fn app(&self) -> &App;
@@ -3818,7 +3828,11 @@ impl<'a> WidgetCx<'a> {
     pub fn account(&self) -> Option<SmolStr>;                          // config_ref 派生
     pub fn data_time_zone(&self) -> time::UtcOffset;
     pub fn scope(&self) -> SignalScope;
-    pub fn router(&self) -> &FrameRouter;
+
+    // 组合根三单例（应用级唯一；widget 不得自建，见 §13.9 R-10）
+    pub fn layer(&self) -> &base_ui::kit::layer::Layer;
+    pub fn frame_router(&self) -> &FrameRouter;
+    pub fn animation(&self) -> &base_ui::kit::overlay::AnimationRouter;
 
     pub fn window_mut(&mut self) -> &mut ui_core::window::Window;      // 自绘族直通
     pub fn set_canvas(&mut self, node: NodeId, canvas: Canvas) -> Result<bool, EngineError>;
@@ -3894,7 +3908,6 @@ impl AnyWidget {
         window: WindowId,
         parent: NodeId,
         services: &Rc<WidgetServices>,
-        router: &FrameRouter,
         instance_id: WidgetInstanceId,
         config: W::Config,
         config_change: WidgetConfigChange,
@@ -3991,11 +4004,38 @@ pub struct WidgetServices {
     pub open_url: Rc<dyn Fn(&str)>,                                  // 应用层 Command
     pub sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>,            // 应用层音效字节
     pub reduce_motion: Signal<bool>,                                 // 应用层无障碍设置镜像
+    pub layer: Rc<base_ui::kit::layer::Layer>,                       // 组合根唯一：浮层层序
+    pub frame_router: Rc<FrameRouter>,                               // 组合根唯一：App::on_frame 单槽
+    pub animation_router: Rc<base_ui::kit::overlay::AnimationRouter>, // 组合根唯一：完成回调单槽
     pub runtime: tokio::runtime::Handle,
 }
 impl WidgetServices {
     pub fn market_participants(&self) -> Option<&MarketParticipantsConnector>;
     pub fn kytrix_service(&self) -> Option<&KytrixServiceConnector>;
+
+    /// 装配缝：三单例是构造参数（不能忘），四信号由 build 在一个 scope 里铸出（默认 En /
+    /// `Config::default()` / 0 / false），可选槽与初值用 builder 方法覆盖。
+    pub fn builder(
+        app: &mut App,
+        runtime: tokio::runtime::Handle,
+        translate: Translate,
+        theme: ThemeHandle,
+        layer: Rc<base_ui::kit::layer::Layer>,
+        frame_router: Rc<FrameRouter>,
+        animation_router: Rc<base_ui::kit::overlay::AnimationRouter>,
+    ) -> WidgetServicesBuilder<'_>;
+}
+pub struct WidgetServicesBuilder<'a>;   // 私有字段；每个 setter 消费并返回 self
+impl WidgetServicesBuilder<'_> {
+    pub fn language(self, LanguageCode) -> Self;
+    pub fn config(self, Config) -> Self;
+    pub fn catalog_generation(self, u64) -> Self;
+    pub fn reduce_motion(self, bool) -> Self;
+    pub fn market_participants(self, Option<MarketParticipantsConnector>) -> Self;
+    pub fn kytrix_service(self, Option<KytrixServiceConnector>) -> Self;
+    pub fn open_url(self, impl Fn(&str) + 'static) -> Self;
+    pub fn sound(self, impl Fn(&'static str) -> Option<Bytes> + 'static) -> Self;
+    pub fn build(self) -> WidgetServices;
 }
 
 // ── error.rs / time_zone.rs ────────────────────────────────────────────────
@@ -4015,7 +4055,9 @@ impl WidgetTestApp {
     pub fn with_sound(self, impl Fn(&'static str) -> Option<Bytes> + 'static) -> Self;   // 注入音频字节源
     pub fn app(&self) -> &App;  pub fn app_mut(&mut self) -> &mut App;
     pub fn services(&self) -> &WidgetServices;
-    pub fn router(&self) -> &FrameRouter;
+    pub fn router(&self) -> &FrameRouter;                     // 组合根那一个，经 builder 注入
+    pub fn layer(&self) -> &base_ui::kit::layer::Layer;       // 同上（测试断言落在宿主实例上）
+    pub fn animation(&self) -> &base_ui::kit::overlay::AnimationRouter;  // 同上
     pub fn window(&self) -> WindowId;  pub fn root(&self) -> NodeId;
     pub fn status(&self) -> WidgetStatus;  pub fn scope(&self) -> SignalScope;
     pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R;
@@ -4069,7 +4111,8 @@ kit 组件的「`new` → `build` → `mount`/`attach` → `sync` → `dispatch`
 | `release(app)` | `WidgetView::release` | `AnyWidget::release` | 释放 kit 组件 / 解绑 / 取消定时器 |
 
 **`AnyWidget::mount` 的不可交换顺序**（`any.rs`）：建 scope → 铸 `WidgetStatus` → 建 surface → 建 body 单元与
-`ReloadHandle`（`Weak` 自引用）→ `Widget::new` → 存入 body → 调 `load` → 注册 `FrameRouter` 路由。
+`ReloadHandle`（`Weak` 自引用）→ `Widget::new` → 存入 body → 调 `load` → 向 `services.frame_router`（组合根那一个）
+注册路由。
 **失败回滚**：surface 建到一半失败时先删已建的根子树，再 `App::release_scope(scope)`（N4：scope 里已有状态单元与
 presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 `surface.release`，再
 `App::remove_node_with_scope(window, surface.root(), scope)`（节点先删、scope 后释放，与 release 同一顺序），
@@ -4127,8 +4170,9 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 
 ### 13.7 FrameRouter 与 I3
 
-- `App::on_frame` 是单槽；`FrameRouter` 是**唯一**注册者。组合根 `FrameRouter::new(&mut app)` 一次，widget 的
-  `AnyWidget::mount` 向它注册自己的 `sync` 路由；`release` 摘除。**单槽可观测**：引擎新增
+- `App::on_frame` 是单槽；`FrameRouter` 是**唯一**注册者。组合根 `FrameRouter::new(&mut app)` 一次，把 `Rc<FrameRouter>`
+  放进 `WidgetServices`（§13.2）；widget 的 `AnyWidget::mount` 向 `services.frame_router` 注册自己的 `sync` 路由；
+  `release` 摘除。widget 不再各自接收 / 新建 router——单例只有服务这一个来源（P3-1e）。**单槽可观测**：引擎新增
   `App::frame_hook_installed()`，另一个安装者占用时 `FrameRouter::new`/`install` 返回
   `EngineError::FrameHookInstalled`（同一 router 的重复 `install` 仍幂等），不会再出现两个 router 都报 `installed()` 而
   第一个静默不跑。
@@ -4146,7 +4190,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1d 实测 **156 passed**；逐项给测试名，不再按模块笼统声明）：
+- **契约层单测覆盖**（P3-1e 实测 **160 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
     **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
@@ -4167,6 +4211,11 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
     （`a_headless_market_participants_directory_can_be_injected`）；`drain_runtime` 推进 services runtime
     （`drain_runtime_advances_the_services_runtime`）；`run_until_idle` 驱动服务链并呈现服务请求的帧
     （`run_until_idle_drives_a_chain_of_service_work` / `run_until_idle_presents_the_frame_a_service_asked_for`）。
+  - **组合根资源槽**（P3-1e）：services 装配带三槽、且与组合根实例同一（`services::services_compose_without_a_gui_context`）；
+    builder 全槽（`the_builder_composes_every_frozen_slot`）；经 widget 上下文开的浮层注册进宿主的层栈
+    （`an_overlay_opened_through_the_widget_context_registers_in_the_layer_stack`）；首个浮层装上宿主那一个完成路由
+    （`the_animation_router_handed_to_a_widget_owns_the_completion_slot`）；层查询 + `layer`/`frame_router`/`animation`
+    三访问器返回宿主实例（`the_widget_context_queries_the_layer_stack_it_was_handed`）。
   - **路由**：扇出 / 注销 / 弱句柄自注销 / 空路由不出帧；**单槽占用报错**
     （`a_second_router_cannot_install_itself`、`a_second_router_constructor_reports_the_occupied_slot`）。
   - **擦除与生命周期**：`a_minimal_widget_runs_the_whole_lifecycle`（mount → waiting → loading → ready → waiting(zh) →
@@ -4190,6 +4239,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-7 | P3-1b 对 P3-1 冻结面的增量 | 相对 `2e4d3d6` 的必须变更（W1 开工前收口）：`WidgetCx::config` → `config_ref`（不克隆；`Arc<Config>` 出口删除）、新增 `account`/`window_mut`/`set_canvas`；`WidgetServices` 6 → 10 字段；`Notice::is_markdown`；`FrameRouter::new/install` → `Result`；引擎新增 `App::frame_hook_installed` 与 `EngineError::FrameHookInstalled`；`WidgetTestApp` 新增 `with_translate`/`try_mount`/`tree`/`a11y_hidden` 等并删除假 `recovery_action`。P3-1b 之前没有下游代码（W 批未开工），故不构成迁移负担，登记于 design-changes §13 |
 | R-8 | P3-1c 对 P3-1b 冻结面的增量 | `WidgetServices` 新增 `catalog_generation: Signal<u64>`（目录已发布世代：组合根写、`WidgetSurface` 根读；widget 在 `sync` 比较后重跑 `load`，等待目录、无正文的 widget 也会被唤醒——「目录变更 → 重跑 `load`」的唯一通法）；`MarkdownNode::mount` → `Result<Self, EngineError>`（N5：富文本占位的失败面统一）；mount 的 surface 失败释放 scope（N4）；`WidgetTestApp::try_mount_in_scope`（失败路径观测缝）。W 批仍未开工，故不构成迁移负担，登记于 design-changes §14 |
 | R-9 | P3-1d 对 P3-1c 冻结面的增量 | `Notice::is_markdown` 由 `const fn(&self)` 改为 `fn(&self, &Translate)`（判定基于解析后的目录值；契约只增语义、不删变体）；`WidgetTestApp` 新增注入构造器 `with_market_participants`/`with_kytrix_service`/`with_open_url`/`with_sound` 与 `drain_runtime`/`run_until_idle`，宿主改为拥有 `WidgetServices.runtime` 的 current-thread runtime（App 引擎 runtime 不变）；`WidgetSurface` 根新增 `services.config` 依赖锚点；`crates/widget` 增两个 test-only dev-dependency（`app_config_provider`/`widget_tokio_runtime`，供 headless 目录连接器注入测试）。W 批未开工，不构成迁移负担，登记于 design-changes §15 |
+| R-10 | P3-1e 对 P3-1d 冻结面的增量（P3-0b §F2 裁决） | `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` / `animation_router: Rc<AnimationRouter>`——三个组合根单例的**唯一**注入点，`SelectorHost` 因此可从 `&WidgetServices` + `cx` 访问器组装（此前 6 个 selector widget 无合法 host 来源）；`WidgetServices::builder(app, runtime, translate, theme, layer, frame_router, animation_router)` 为装配缝（四信号铸在一个 scope，可选槽用 setter）；`WidgetCx` 新增 `layer()`/`frame_router()`/`animation()` 并**删除** `router()` 与独立 router 字段（`WidgetCx::new` 5→4 参数，`AnyWidget::mount`/`mount_in_scope` 去掉 `&FrameRouter` 形参：单例只从服务取，杜绝两份真相）；`WidgetTestApp` 自建三单例、经 builder 注入并增 `layer()`/`animation()` 访问器（`router()` 保留，返回宿主实例）；`base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与 `FrameRouter::installed` 同型）。测试 156 → 160。W 批未开工，不构成迁移负担，登记于 design-changes §16 |
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 
