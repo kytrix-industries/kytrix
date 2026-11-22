@@ -8,8 +8,11 @@
 use app_config::network::ConfigError;
 use cargo_packager_updater as updater;
 use download_provider::error::DownloadFailure;
+use i18n::{t_smol, translate::Translate};
 use network::transport::error::TransportError;
+use smol_str::SmolStr;
 use thiserror::Error;
+use widget::error::TranslatedError;
 
 /// Everything the update path can fail with.
 #[derive(Debug, Error)]
@@ -53,6 +56,17 @@ impl UpdaterError {
             Self::UnsupportedPlatform => "error.updater.unsupported_platform",
             Self::Install(_) => "error.updater.install",
         }
+    }
+}
+
+/// The sentence the dialog draws a failure with.
+///
+/// The arm that names the key is [`UpdaterError::message_key`]; this is the one place
+/// that resolves it, so the dialog never formats a diagnostic and a language switch
+/// re-resolves the same key.
+impl TranslatedError for UpdaterError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        t_smol!(translate, self.message_key())
     }
 }
 
@@ -136,7 +150,13 @@ pub enum InstallError {
 
 #[cfg(test)]
 mod tests {
-    use i18n::global::embedded;
+    use std::rc::Rc;
+
+    use download_provider::error::DownloadFailure;
+    use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+    use url::Url;
+
+    use super::*;
 
     /// The catalogue keys this file's arms name, read out of the arms themselves so
     /// that an arm naming a new key is covered by the arm that names it.
@@ -194,6 +214,46 @@ mod tests {
                     "{key} is named by a failure but renders empty in {language}"
                 );
             }
+        }
+    }
+
+    /// The dialog draws what a failure says through the catalogue, in the language the
+    /// interface is in — not through `Display`, whose text is the developer's.
+    #[test]
+    fn every_failure_should_be_stated_in_the_language_it_is_drawn_in() {
+        let en = Translate::new(
+            Rc::new(embedded::load().expect("the embedded locales load")),
+            LanguageCode::En,
+        );
+        let zh = Translate::new(
+            Rc::new(embedded::load().expect("the embedded locales load")),
+            LanguageCode::ZhCn,
+        );
+        let failures = [
+            UpdaterError::Transport(UpdateRequestError::Cancelled),
+            UpdaterError::Download(DownloadFailure::Cancelled),
+            UpdaterError::Metadata(MetadataError::Endpoint(
+                Url::parse("not a url").expect_err("the literal is not a URL"),
+            )),
+            UpdaterError::UnsupportedPlatform,
+            UpdaterError::Install(InstallError::ExtractPath),
+        ];
+
+        for failure in &failures {
+            let english = failure.translated_message(&en);
+            let chinese = failure.translated_message(&zh);
+            assert!(
+                !english.is_empty() && !chinese.is_empty(),
+                "{failure:?} states nothing in one language"
+            );
+            assert_ne!(
+                english, chinese,
+                "{failure:?} is the same sentence in both languages"
+            );
+            assert!(
+                !english.contains("error.updater."),
+                "{failure:?} draws its catalogue key rather than the sentence"
+            );
         }
     }
 }

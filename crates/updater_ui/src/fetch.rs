@@ -7,9 +7,12 @@
 //! are therefore followed here, one at a time, and the budget for them is the
 //! operation class's own.
 
-use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceTarget};
+use app_config::network::{
+    Config, ConfigError, KytrixServiceCapability, ProxyRoute, ResolvedProxy, RouteTarget,
+    ServiceTarget,
+};
 use network::{
-    proxy::resolve_async_cancellable,
+    proxy::resolve,
     transport::{
         http::{HttpClientClass, read_response_body},
         hub::{TransportHub, TransportPermit},
@@ -17,9 +20,9 @@ use network::{
 };
 use reqwest::{Response, StatusCode, header::LOCATION};
 use semver::Version;
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
     error::{MetadataError, RedirectRefusal, UpdateRequestError, UpdaterError},
@@ -39,7 +42,7 @@ use crate::{
 pub async fn fetch_release(
     transport: &TransportHub,
     config: &Config,
-    runtime: &Runtime,
+    runtime: &Handle,
     endpoint: &Url,
     cancellation: &CancellationToken,
 ) -> Result<Option<ReleaseInfo>, UpdaterError> {
@@ -121,7 +124,51 @@ pub(crate) fn redirect_decision(
     RedirectDecision::Follow(next)
 }
 
-/// Sends one request, following its redirects, and keeps the transport operation open.
+/// Resolves one hop's outbound route, off the runtime's workers when it needs the
+/// operating system's proxy.
+///
+/// The two branches are the ones `network::proxy::resolve_route_async_cancellable`
+/// takes: `Direct` / `Named` are pure configuration reads and resolve inline, while
+/// `System` evaluates the OS proxy (including PAC/WPAD, a blocking download and a
+/// JavaScript run) and must not run on a worker that is driving a future. That
+/// facade's signature still names the old toolkit runtime, which this crate no longer
+/// depends on (P4-4; the crate itself goes away in P5-1), so the blocking hop is made
+/// here against the application runtime handle, with the same cancellation contract:
+/// a cancelled operation reports the route failure that says its system proxy could
+/// not be resolved.
+async fn resolve_route(
+    config: &Config,
+    target: &RouteTarget,
+    destination: &Url,
+    runtime: &Handle,
+    cancellation: &CancellationToken,
+) -> Result<ResolvedProxy, ConfigError> {
+    let system = match target {
+        RouteTarget::Service(ServiceTarget::KytrixService { capability }) => matches!(
+            config.service_proxy_route_for(&ServiceTarget::KytrixService {
+                capability: *capability
+            }),
+            ProxyRoute::System
+        ),
+        _ => false,
+    };
+    if !system {
+        return resolve(config, target, destination);
+    }
+
+    let config = config.clone();
+    let task_target = target.clone();
+    let destination = destination.clone();
+    let resolving = runtime.spawn_blocking(move || resolve(&config, &task_target, &destination));
+    let refused = || ConfigError::InvalidSystemProxy {
+        target: target.clone(),
+    };
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(refused()),
+        result = resolving => result.unwrap_or_else(|_| Err(refused())),
+    }
+}
 ///
 /// The returned permit is the caller's to hold for as long as it is still reading
 /// the response: it is what keeps a shutdown from closing the transport under a
@@ -130,7 +177,7 @@ pub(crate) fn redirect_decision(
 async fn exchange(
     transport: &TransportHub,
     config: &Config,
-    runtime: &Runtime,
+    runtime: &Handle,
     capability: KytrixServiceCapability,
     class: HttpClientClass,
     mut url: Url,
@@ -148,10 +195,9 @@ async fn exchange(
         // Every hop is resolved again: the destination changed, and a route may be
         // destination-dependent, so reusing the first hop's route would send the
         // rest of the chain down a line the user did not choose for it.
-        let route =
-            resolve_async_cancellable(config, &target, &url, cancellation.child_token(), runtime)
-                .await
-                .map_err(UpdaterError::Route)?;
+        let route = resolve_route(config, &target, &url, runtime, cancellation)
+            .await
+            .map_err(UpdaterError::Route)?;
         let client = transport
             .http()
             .client(&route, class)

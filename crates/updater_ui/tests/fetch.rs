@@ -29,7 +29,6 @@ use updater_ui::{
     release::{PlatformKey, ReleaseFormat},
 };
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 /// The response body the release server answers with: its whole entity in one frame.
 struct TestBody(Option<Bytes>);
@@ -146,24 +145,37 @@ fn endpoint(address: SocketAddr) -> Url {
     Url::parse(&format!("http://{address}/latest.json")).expect("the endpoint is a URL")
 }
 
-#[tokio::test]
-async fn a_release_should_be_read_through_its_redirect_chain() {
-    let address = spawn_release_server().await;
-    let hub = transport();
-    let runtime = Runtime::for_test();
-    let config = Config::default();
-    let cancellation = hub.cancellation().child_token();
+/// The metadata request end to end, against a server that answers the way GitHub
+/// does: the endpoint behind a redirect, and the release behind another one.
+///
+/// The test owns the runtime the request is driven on (the workspace denies reaching
+/// for the ambient one), and hands its handle to the updater the way the composition
+/// root does.
+#[test]
+fn a_release_should_be_read_through_its_redirect_chain() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the test runtime builds");
+    let handle = runtime.handle().clone();
+    runtime.block_on(async {
+        let address = spawn_release_server().await;
+        let hub = transport();
+        let config = Config::default();
+        let cancellation = hub.cancellation().child_token();
 
-    let release = fetch::fetch_release(&hub, &config, &runtime, &endpoint(address), &cancellation)
-        .await
-        .expect("the metadata is read through its redirect")
-        .expect("a newer release is offered");
+        let release =
+            fetch::fetch_release(&hub, &config, &handle, &endpoint(address), &cancellation)
+                .await
+                .expect("the metadata is read through its redirect")
+                .expect("a newer release is offered");
 
-    assert_eq!(release.version, semver::Version::new(9, 9, 9));
-    assert_eq!(release.asset.format, ReleaseFormat::Nsis);
-    assert_eq!(
-        release.asset.url.as_str(),
-        format!("http://{address}/payload"),
-        "the payload is what the metadata named, not what was asked for"
-    );
+        assert_eq!(release.version, semver::Version::new(9, 9, 9));
+        assert_eq!(release.asset.format, ReleaseFormat::Nsis);
+        assert_eq!(
+            release.asset.url.as_str(),
+            format!("http://{address}/payload"),
+            "the payload is what the metadata named, not what was asked for"
+        );
+    });
 }
