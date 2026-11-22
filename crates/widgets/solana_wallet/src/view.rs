@@ -250,7 +250,6 @@ enum SelectionRead {
 
 /// One pane: the transfers it holds, and the addresses it manages.
 pub struct SolanaWalletWidget {
-    config: SolanaWalletConfig,
     /// The executor bridge, absent on a host that installed no Kytrix service.
     binding: Option<WidgetBinding<SolanaWalletProtocol>>,
     /// The commands in flight, keyed by the identity the binding returned.
@@ -309,7 +308,7 @@ impl WidgetView for SolanaWalletWidget {
 
     fn new(
         _instance_id: WidgetInstanceId,
-        config: Self::Config,
+        _config: Self::Config,
         status: WidgetStatus,
         _reload: ReloadHandle,
         _config_change: WidgetConfigChange,
@@ -317,7 +316,7 @@ impl WidgetView for SolanaWalletWidget {
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
         let source = cx.services().kytrix_service().cloned();
-        Ok(Self::assemble(config, source, status, recovery, cx))
+        Ok(Self::assemble(source, status, recovery, cx))
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
@@ -337,11 +336,6 @@ impl WidgetView for SolanaWalletWidget {
     /// content, which leaves the slot to the framework's placeholder and its own sentence.
     fn has_content(&self) -> bool {
         self.account_has_addresses() && self.snapshot.is_some()
-    }
-
-    /// The one option this pane owns: the schema version of an otherwise empty config.
-    fn config(&self) -> Option<&Self::Config> {
-        Some(&self.config)
     }
 
     fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -435,8 +429,10 @@ impl WidgetView for SolanaWalletWidget {
 
         // The body is built by the framework from the answer `has_content` gives, and it
         // asks that question before this hook runs: content that first appeared here is
-        // one frame away, so ask for that frame.
-        if self.snapshot.is_some() && self.body_root.is_none() {
+        // one frame away, so ask for that frame. A pane that has no content asks for
+        // nothing — an account with no addresses never builds a body, so asking again
+        // would keep the pane repainting itself every frame it waits for one (I3).
+        if self.has_content() && self.body_root.is_none() {
             cx.request_frame()?;
         }
 
@@ -488,7 +484,6 @@ impl SolanaWalletWidget {
     /// argument: the production constructor answers it with the injected Kytrix service
     /// connection, and a test with a fake session.
     fn assemble<S: SolanaWalletSource>(
-        config: SolanaWalletConfig,
         source: Option<S>,
         status: WidgetStatus,
         recovery: WidgetAction,
@@ -502,7 +497,6 @@ impl SolanaWalletWidget {
         let account_id = cx.account();
 
         Self {
-            config,
             binding,
             pending: Pending::new(),
             status,
@@ -531,13 +525,12 @@ impl SolanaWalletWidget {
     /// A pane over a source the caller answers, for the crate's own tests.
     #[cfg(test)]
     fn new_with_source<S: SolanaWalletSource>(
-        config: SolanaWalletConfig,
         source: S,
         status: WidgetStatus,
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Self {
-        Self::assemble(config, Some(source), status, recovery, cx)
+        Self::assemble(Some(source), status, recovery, cx)
     }
 
     /// The scope this pane follows, which is the account it reads as.
@@ -1423,12 +1416,12 @@ fn build_transfer_row(
     let a11y_language = context.language;
     let a11y_config = context.config;
     let a11y_translate = context.translate.clone();
+    // The kit list's own row container is the list option this content is drawn in, so the
+    // content root declares no role of its own: `A11yRole::Row` belongs to real tables and
+    // grids only (ui_core `a11y.rs`). The summary travels on the content root because a kit
+    // list row has no a11y-patch seam yet (W8a ledger §6.8).
     let row = NodeBuilder::boxed()
         .id(format_smolstr!("TEST_SOLANA_WALLET_TRANSFER_ROW:{index}"))
-        .a11y(A11yOverride {
-            role: Some(A11yRole::Row),
-            ..A11yOverride::default()
-        })
         .style(
             StyleBuilder::new()
                 .flex_col()
@@ -1715,7 +1708,6 @@ mod tests {
         let parent = harness.placeholder_parent();
         let widget = harness.with_cx(|cx| {
             SolanaWalletWidget::new_with_source(
-                SolanaWalletConfig,
                 source,
                 status,
                 WidgetAction::new("common.retry", |_| {}),
@@ -2025,6 +2017,20 @@ mod tests {
         assert_eq!(
             decode_or_default::<SolanaWalletConfig>(None),
             SolanaWalletConfig
+        );
+    }
+
+    /// What a pane follows is the account's own list of addresses, so the pane has nothing of
+    /// its own to persist: a config it returned would make every save write an empty envelope
+    /// into the layout (AGENTS §4.3).
+    #[test]
+    fn a_pane_should_persist_no_config() {
+        let mut harness = harness();
+        let pane = pane(&mut harness, FakeSource::default());
+
+        assert!(
+            pane.widget.config().is_none(),
+            "a pane with no options writes no envelope"
         );
     }
 
@@ -3017,7 +3023,6 @@ mod tests {
         let mut second = {
             let mut cx = WidgetCx::new(harness.app_mut(), window, &services, scope);
             SolanaWalletWidget::new_with_source(
-                SolanaWalletConfig,
                 FakeSource::default(),
                 status,
                 WidgetAction::new("common.retry", |_| {}),
@@ -3103,6 +3108,90 @@ mod tests {
         );
     }
 
+    /// The framework drops a pane by releasing the scope it was mounted in; everything the
+    /// pane built has to be gone by then, or the scope's values leak and the next mount
+    /// mints fresh slots (AGENTS §11). A pane with a feed, a header control and an open
+    /// dialog is the widest state it builds.
+    #[test]
+    fn releasing_the_pane_should_reclaim_what_it_built() {
+        let mut harness = harness();
+        let baseline = harness.signal_slot_stats();
+        let mut mounted_slots = None;
+        sign_in(&mut harness, ACCOUNT);
+
+        for _ in 0..3 {
+            let scope = harness.app_mut().signal_scope();
+            let services = Rc::clone(harness.services_rc());
+            let window = harness.window();
+            let parent = harness.placeholder_parent();
+            let status = WidgetStatus::new(harness.app_mut(), scope);
+            let source = FakeSource::default();
+            let session = source.session(ACCOUNT);
+            let _control = session.subscribe();
+            let mut pane = {
+                let mut cx = WidgetCx::new(harness.app_mut(), window, &services, scope);
+                let widget = SolanaWalletWidget::new_with_source(
+                    source,
+                    status,
+                    WidgetAction::new("common.retry", |_| {}),
+                    &mut cx,
+                );
+                Pane {
+                    widget,
+                    status,
+                    parent,
+                }
+            };
+
+            // Everything the pane can own: a feed to draw, a header control and the dialog.
+            pane.widget.selections =
+                Some(SelectionData::new(selections(vec![selection(FIRST)], 3)));
+            pane.widget.selection_read = SelectionRead::Known;
+            pane.widget.ready = true;
+            report_feed(&mut harness, &mut pane, FakeFeed::new().push("one", 1));
+            build_body(&mut harness, &mut pane);
+            build_header(&mut harness, &mut pane);
+            harness
+                .with_cx(|cx| pane.widget.open_dialog(cx))
+                .expect("the dialog opens");
+            harness.drain();
+            assert!(
+                harness.signal_slot_stats().live > baseline.live,
+                "the pane mints its own values"
+            );
+            let body = pane.widget.body_root.expect("the body was built");
+            assert!(pane.widget.list.is_some());
+            assert!(pane.widget.dialog.is_some());
+
+            harness.with_cx(|cx| pane.widget.release(cx));
+            assert!(
+                harness.tree().get(body).is_err(),
+                "the pane takes its own body subtree down"
+            );
+            assert!(pane.widget.list.is_none(), "the list is released");
+            assert!(pane.widget.dialog.is_none(), "the dialog is released");
+            assert!(
+                pane.widget.manage_button.is_none(),
+                "the header control is released"
+            );
+            drop(pane);
+            // The framework releases the pane's scope after dropping it.
+            harness.app_mut().release_scope(scope);
+
+            assert_eq!(
+                harness.signal_slot_stats().live,
+                baseline.live,
+                "releasing the pane returns every live value slot"
+            );
+            let used = harness.signal_slot_stats().slots;
+            assert_eq!(
+                *mounted_slots.get_or_insert(used),
+                used,
+                "a mount reuses the slots it was given rather than minting afresh"
+            );
+        }
+    }
+
     /// A host that installed no Kytrix service is a pane that cannot follow its account:
     /// it reports a typed failure with its own recovery instead of panicking.
     #[test]
@@ -3166,6 +3255,38 @@ mod tests {
             "a steady pane asks for no frame"
         );
         assert!(!harness.rendered(), "a steady pane paints nothing");
+    }
+
+    /// An account nobody has added an address to is a pane with nothing to follow, so the
+    /// feed it is published is not content and the pane must not keep asking for the body
+    /// frame it can never use (I3). The service publishes an empty snapshot for such an
+    /// account, which is the state this pins.
+    #[test]
+    fn a_pane_waiting_for_its_first_address_should_not_keep_asking_for_frames() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, FakeSource::default());
+        pane.widget.selections = Some(SelectionData::new(selections(Vec::new(), 3)));
+        pane.widget.selection_read = SelectionRead::Known;
+        pane.widget.ready = true;
+        report_feed(&mut harness, &mut pane, FakeFeed::new().snapshot());
+        harness.drain();
+        let requests = harness.frame_requests();
+
+        sync(&mut harness, &mut pane);
+        harness.drain();
+        sync(&mut harness, &mut pane);
+        harness.drain();
+
+        assert!(!pane.widget.has_content(), "there is nothing to follow");
+        assert!(
+            pane.widget.body_root.is_none(),
+            "so the framework built no body"
+        );
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "a pane with nothing to follow asks for no frame"
+        );
     }
 
     /// The pane is content for an account with addresses as soon as the feed arrives; the

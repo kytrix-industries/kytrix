@@ -76,10 +76,9 @@ use kytrix_service_provider::service::solana_wallet::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    a11y::{A11yOverride, A11yRole},
     app::App,
     error::EngineError,
-    event::{Event, InputEvent},
+    event::{Action, Event, InputEvent},
     interaction::ActionCtx,
     node::{
         builder::NodeBuilder,
@@ -306,6 +305,9 @@ struct DialogState {
     dialog: Option<Dialog>,
     list: Option<List>,
     input: Option<InputNode>,
+    /// The action Enter in the address field dispatches: the field's submit identity, which
+    /// the dialog registers an action handler for and releases with its other components.
+    input_submit: Option<Action>,
     spinner: Option<Spinner>,
     spinner_parent: Option<NodeId>,
     refresh: Option<Button>,
@@ -379,6 +381,8 @@ struct MarkdownMessage {
 struct DialogComponents {
     dialog: Option<Dialog>,
     input: Option<InputNode>,
+    /// The field's submit action handler, which is the dialog's own registration.
+    input_submit: Option<Action>,
     list: Option<List>,
     spinner: Option<Spinner>,
     refresh: Option<Button>,
@@ -429,6 +433,7 @@ impl DialogState {
             dialog: None,
             list: None,
             input: None,
+            input_submit: None,
             spinner: None,
             spinner_parent: None,
             refresh: None,
@@ -568,6 +573,11 @@ impl DialogState {
         if let Some(input) = self.input.as_ref() {
             input.update_placeholder(cx.app_mut(), placeholder);
         }
+        // A spinner's accessible name is chosen when it is built as well: a language switch
+        // while the addresses are being read rebuilds it in the language showing now.
+        if let Some(spinner) = self.spinner.take() {
+            spinner.release(cx.app_mut());
+        }
         let window = cx.window();
         let app = cx.app_mut();
         for (parent, kind) in [
@@ -664,7 +674,7 @@ impl DialogState {
                     .a11y_label(label.clone())
                     .tooltip_text(label)
                     .on_click(move |ctx| {
-                        let address = addable_from(
+                        offer_typed_address(
                             ctx,
                             &input_state,
                             &addresses,
@@ -672,12 +682,8 @@ impl DialogState {
                             &ready,
                             &known,
                             &operation,
+                            &add_request,
                         );
-                        if let Some(address) = address {
-                            ctx.write(&add_request, Some(address));
-                            let window = ctx.window();
-                            let _ = ctx.app_mut().request_repaint(window);
-                        }
                     });
                 button.build(app, window, parent)?;
                 self.add = Some(button);
@@ -871,7 +877,10 @@ impl DialogState {
                 spinner.sync(cx.app_mut())?;
             } else if let Some(parent) = self.spinner_parent {
                 let key = format_smolstr!("{}:spinner", self.keys.dialog);
-                let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key);
+                // A spinner with no name is a decorative shape to assistive technology
+                // (`kit/spinner.rs`): the name is what makes the loading window audible.
+                let label = t_smol!(self.translate, "widget.solana_wallet.loading_addresses");
+                let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key).with_label(label);
                 let window = cx.window();
                 spinner.build(cx.app_mut(), window, parent)?;
                 self.spinner = Some(spinner);
@@ -1094,6 +1103,30 @@ impl DialogState {
                 .style(StyleBuilder::new().flex_1().min_width_0().build())
                 .build(tree, toolbar)
         })?;
+        // Enter in the field is the add control's keyboard path: the kit input dispatches the
+        // action it is given, and the action re-checks at entry what the control checks,
+        // because a disabled control is drawn disabled rather than enforced (AGENTS §4.2).
+        let submit = Action::Custom(format_smolstr!("{}.submit", self.keys.input));
+        let submit_input_state = self.input_state;
+        let submit_addresses = self.addresses;
+        let submit_limit = self.limit;
+        let submit_ready = self.ready;
+        let submit_known = self.known;
+        let submit_operation = self.operation;
+        let submit_add_request = self.add_request;
+        app.on_action(submit.clone(), move |ctx| {
+            offer_typed_address(
+                ctx,
+                &submit_input_state,
+                &submit_addresses,
+                &submit_limit,
+                &submit_ready,
+                &submit_known,
+                &submit_operation,
+                &submit_add_request,
+            );
+        });
+        self.input_submit = Some(submit.clone());
         let spec = Arc::new(InputSpec {
             name: self.keys.input.clone(),
             placeholder: SmolStr::default(),
@@ -1103,7 +1136,7 @@ impl DialogState {
             disabled: false,
             max_length: None,
             size: ControlSize::Medium,
-            submit: None,
+            submit: Some(submit),
         });
         let input = {
             let tree = app
@@ -1500,6 +1533,7 @@ impl DialogState {
         DialogComponents {
             dialog: self.dialog.take(),
             input: self.input.take(),
+            input_submit: self.input_submit.take(),
             list: self.list.take(),
             spinner: self.spinner.take(),
             refresh: self.refresh.take(),
@@ -1546,6 +1580,30 @@ fn addable_from(
     Some(typed)
 }
 
+/// Offers the address the field holds to the pane, when the pane may monitor it now.
+///
+/// The add control and Enter in the field both come through here: what the control is drawn
+/// with (`addable_now`) is a hint, and the judgement that keeps a request from leaving is the
+/// action-entry check (`addable_from`, AGENTS §4.2).
+fn offer_typed_address(
+    ctx: &mut ActionCtx<'_>,
+    input_state: &Signal<InputState>,
+    addresses: &Signal<Arc<[SolanaWalletSelection]>>,
+    limit: &Signal<Option<usize>>,
+    ready: &Signal<bool>,
+    known: &Signal<bool>,
+    operation: &Signal<Option<SelectionOperation>>,
+    add_request: &Signal<Option<SmolStr>>,
+) {
+    let Some(address) = addable_from(ctx, input_state, addresses, limit, ready, known, operation)
+    else {
+        return;
+    };
+    ctx.write(add_request, Some(address));
+    let window = ctx.window();
+    let _ = ctx.app_mut().request_repaint(window);
+}
+
 /// One address row of the list: the address, and the slot its delete control goes in.
 fn build_address_row(
     tree: &mut NodeTree,
@@ -1557,12 +1615,11 @@ fn build_address_row(
     theme: &ThemeHandle,
 ) -> Result<(), EngineError> {
     let row_theme = theme.clone();
+    // The kit list's own row container is the list option this content is drawn in, so the
+    // content root declares no role of its own: `A11yRole::Row` belongs to real tables and
+    // grids only (ui_core `a11y.rs`), and the old address row declared none (W8a ledger §6.8).
     let row = NodeBuilder::boxed()
         .id(format_smolstr!("{key}:row:{index}"))
-        .a11y(A11yOverride {
-            role: Some(A11yRole::Row),
-            ..A11yOverride::default()
-        })
         .style(
             StyleBuilder::new()
                 .flex_row()
@@ -1696,6 +1753,9 @@ fn release_components(app: &mut App, components: DialogComponents) {
     if let Some(input) = components.input {
         input.release(app);
     }
+    if let Some(action) = components.input_submit {
+        app.off_action(&action);
+    }
     if let Some(list) = components.list {
         list.release(app);
     }
@@ -1768,7 +1828,7 @@ mod tests {
     use kytrix_service_provider::service::solana_wallet::{
         SolanaWalletSelection, SolanaWalletSelectionsResponse,
     };
-    use ui_core::event::ActionSource;
+    use ui_core::event::{ActionSource, KeyCode, KeyState, Modifiers};
     use widget::{protocol::RequestId, rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
@@ -1915,6 +1975,33 @@ mod tests {
         );
     }
 
+    /// Puts exactly `text` in the address field, replacing whatever it held.
+    fn set_address(harness: &mut WidgetTestApp, dialog: &SolanaWalletDialog, text: &str) {
+        let state = dialog.inner.borrow().input_state;
+        harness.with_cx(|cx| {
+            cx.write(&state, InputState::new(text));
+        });
+    }
+
+    /// Presses Enter in the address field, the way the engine routes a key to the focused
+    /// input: the field dispatches the submit action its spec carries.
+    fn press_enter(harness: &mut WidgetTestApp, dialog: &SolanaWalletDialog) {
+        let input = dialog.test_input().expect("the address field is built");
+        let window = harness.window();
+        let _ = harness.app_mut().set_focus(window, Some(input.root));
+        let event = Event::Input(InputEvent::Key {
+            code: KeyCode::Enter,
+            state: KeyState::Down,
+            repeat: false,
+            modifiers: Modifiers::empty(),
+            timestamp: Instant::now(),
+        });
+        assert!(
+            input.dispatch(harness.app_mut(), &event),
+            "the focused field takes the Enter key"
+        );
+    }
+
     /// A Solana address is base58: its case is part of it and is not folded away; the
     /// whitespace a paste can bring along is not part of one.
     #[test]
@@ -1990,6 +2077,39 @@ mod tests {
         );
     }
 
+    /// Enter in the field is the add control's keyboard path: it offers the address the field
+    /// holds to the pane, and the action re-checks at entry so an address the account may not
+    /// monitor is not offered even though the key reaches the handler.
+    #[test]
+    fn pressing_enter_in_the_address_field_should_offer_the_typed_address() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        type_address(&mut harness, &dialog, SECOND);
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(
+            requests(&mut harness, &mut dialog).is_empty(),
+            "typing alone offers nothing"
+        );
+        press_enter(&mut harness, &dialog);
+        assert_eq!(
+            requests(&mut harness, &mut dialog),
+            vec![DialogRequest::Add(SmolStr::new_static(SECOND))],
+            "Enter offers the address the field holds, exactly as the add control does"
+        );
+
+        // The action entry check refuses what the pane may not monitor: an address that is
+        // already on the list is not offered twice.
+        set_address(&mut harness, &dialog, FIRST);
+        press_enter(&mut harness, &dialog);
+        assert!(
+            requests(&mut harness, &mut dialog).is_empty(),
+            "an address the account already monitors is not offered"
+        );
+    }
+
     #[test]
     fn a_full_quota_should_refuse_another_address() {
         let mut harness = harness();
@@ -2036,6 +2156,88 @@ mod tests {
             requests(&mut harness, &mut dialog),
             vec![DialogRequest::Delete(SmolStr::new_static(FIRST))],
             "the address of the row that was clicked is the one that was asked to leave"
+        );
+    }
+
+    /// A row that leaves the visible window takes its delete control with it: the slot is
+    /// released and the control's values go back, rather than the pairing being left behind
+    /// for the next row (the leak the W8a review's M6 mutation found).
+    #[test]
+    fn a_shrunk_address_list_should_release_the_row_controls_it_no_longer_shows() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let two = view(
+            true,
+            true,
+            Some(data(vec![address(FIRST), address(SECOND)], 3)),
+        );
+        settle_frames(&mut harness, &mut dialog, &two);
+        assert!(
+            dialog.test_delete_button(1).is_some(),
+            "each row carries the control that stops monitoring its address"
+        );
+        let both = harness.signal_slot_stats();
+
+        let one = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &one);
+
+        assert!(
+            dialog.test_delete_button(1).is_none(),
+            "the control of the row that went is released"
+        );
+        assert!(
+            dialog.test_delete_button(0).is_some(),
+            "the row that is still shown keeps a control"
+        );
+        assert!(
+            harness.signal_slot_stats().live < both.live,
+            "the released control's values went with it"
+        );
+    }
+
+    /// The delete control's accessible name is chosen when it is built: a language switch
+    /// rebuilds the row controls, not only the dialog's buttons (the W8a review's M7
+    /// mutation found the pairing was never rebuilt).
+    #[test]
+    fn the_row_control_should_follow_the_language() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+        let english = dialog
+            .test_delete_button(0)
+            .expect("the row carries its control")
+            .a11y_label_text()
+            .map(str::to_owned);
+        assert_eq!(
+            english.as_deref(),
+            Some(
+                t_smol!(
+                    translate(LanguageCode::En),
+                    "widget.solana_wallet.delete_address"
+                )
+                .as_str()
+            )
+        );
+
+        harness.switch_language(LanguageCode::ZhCn);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let chinese = dialog
+            .test_delete_button(0)
+            .expect("the row is rebuilt")
+            .a11y_label_text()
+            .map(str::to_owned);
+        assert_eq!(
+            chinese.as_deref(),
+            Some(
+                t_smol!(
+                    translate(LanguageCode::ZhCn),
+                    "widget.solana_wallet.delete_address"
+                )
+                .as_str()
+            ),
+            "the control is rebuilt in the language showing now"
         );
     }
 
@@ -2122,6 +2324,56 @@ mod tests {
             .expect("the unavailable block draws the pane's recovery control");
         click(&mut harness, &recover);
         assert!(ran.get(), "the pane's recovery runs");
+    }
+
+    /// The loading window's spinner carries the sentence that says what is being read: a kit
+    /// spinner with no name is a decorative shape and the engine hides it from assistive
+    /// technology (`kit/spinner.rs`), so the name is what makes the window audible. A language
+    /// switch while it spins rebuilds it, because its name is chosen when it is built.
+    #[test]
+    fn a_loading_dialog_should_announce_what_it_is_reading() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let mut view = view(true, true, None);
+        view.operation = Some(SelectionOperation::Loading);
+        settle_frames(&mut harness, &mut dialog, &view);
+        let spinning = {
+            let state = dialog.inner.borrow();
+            state
+                .spinner
+                .as_ref()
+                .expect("the loading window spins")
+                .node()
+                .expect("the spinner is built")
+        };
+
+        harness.enable_a11y_capture();
+        harness.drain();
+        assert!(
+            !harness.a11y_hidden(spinning),
+            "a named spinner is announced rather than hidden as decoration"
+        );
+
+        harness.switch_language(LanguageCode::ZhCn);
+        sync(&mut harness, &mut dialog, &view);
+        harness.drain();
+        let rebuilt = {
+            let state = dialog.inner.borrow();
+            state
+                .spinner
+                .as_ref()
+                .expect("the loading window still spins")
+                .node()
+                .expect("the spinner is built again")
+        };
+        assert_ne!(
+            rebuilt, spinning,
+            "the language rebuilds the spinner's name"
+        );
+        assert!(
+            !harness.a11y_hidden(rebuilt),
+            "the rebuilt spinner is announced as well"
+        );
     }
 
     #[test]
