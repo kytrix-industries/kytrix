@@ -46,6 +46,10 @@ header 声音按钮、`perpetual_statistics` 的一 crate 多 widget 布局）�
 9. **应用设置只经注入的服务读**：语言 / 外观 / 数据时区 / 账户 / 目录 / 服务连接全部在 `WidgetServices` 里，不读进程全局、不
    自造 watch / 轮询。
 10. **动画由 widget 自己请求帧、收敛即停，并尊重 `reduce_motion`**（见 §8）。
+11. **kit 组件的 `key` / action 名必须经 `cx.unique_key(后缀)` 生成，禁止常量 key**：kit 的 key 是**应用级** Action 身份
+    （`"<key>.click"`，`App::on_action` 同 Action 后写覆盖）与调试 id 前缀。两个 pane 用同一常量 key 时，后建的覆盖先建的，
+    先 release / 先重建的一方再把对方的 handler 摘掉（点击派发到错的 pane 或没有 handler；W2a 审查 F1 实测）。后缀在
+    widget 内唯一标识控件位置；多行重复控件把行身份拼进后缀；同一控件跨帧重建必须用同一后缀。写法与释放配对见 §9。
 
 ---
 
@@ -212,6 +216,7 @@ cx.services_rc()                    // Rc<WidgetServices>：自建 selector host
 cx.config_ref(|config| ...)          // 不克隆地读设置快照（read 不登记依赖）
 cx.account() / cx.data_time_zone()   // 由设置快照派生
 cx.scope() / cx.layer() / cx.frame_router() / cx.animation()
+cx.unique_key("header.sound")       // kit 组件 key：`<后缀>@<本实例 scope>`，跨 pane 唯一（§9）
 cx.signal(v) / cx.transient(v)       // 铸进 widget scope
 cx.read(&s) / cx.write(&s, v) / cx.update(&s, f)
 cx.request_frame() / cx.request_node_repaint(node) / cx.set_a11y_patch(node, patch)
@@ -392,6 +397,34 @@ if generation != self.seen {
   - `sync`：结构 / 画布 / 实测回写（列表行内容、canvas、行高）。
 - **kit 组件也走五段式**：`new(app, …)` → `build(tree, parent)`（或 `build(app, window, parent)`）→ `mount`/`attach`（如列表）→
   `sync(app)` → `dispatch(app, &event)` → `release(app)`。控件的 `on_click` 回调是 `Rc` 闭包，捕获 widget 需要的信号与动作。
+- **kit 组件的 `key` 只从 `cx.unique_key(后缀)` 取，禁止常量**（硬约束 11）。kit 的 key 是**应用级**动作身份
+  （`Button::on_click` 由 key 派生 `Action::Custom("<key>.click")`，`App::on_action` 同 Action 后写覆盖）与调试 id 前缀。
+  两个 pane 都建同一个 header 控件时，常量 key 让后建的覆盖先建的，先 release / 先重建的一方再把对方 handler 摘掉
+  （点击派发到错 pane 或没有 handler；W2a 审查 F1 实测）。后缀是 **widget 内的控件位置名**：一个控件一个后缀；行内重复
+  控件把行身份拼进后缀（`format_smolstr!("row.{index}.sound")`）。同一控件跨帧 / 语言切换重建必须用**同一后缀**
+  （返回同一 key），重建与释放才配得上对。
+
+  ```rust
+  // body / header：key 由本实例身份派生（`<后缀>@<scope>`），两个 pane 不会撞。
+  let key = cx.unique_key("market_trade.header.instrument");
+  let theme = cx.theme().clone();
+  let window = cx.window();
+  let button = Button::new(cx.app_mut(), theme, key.clone())
+      .label(label)
+      .on_click(move |action_ctx| { /* 只写自己 pane 的模型 / 信号 */ });
+  button.build(cx.app_mut(), window, parent)?;
+  // 记住 key / action / 组件句柄（跨帧存活）；下面的重建与 release 用同一份。
+  let action = button.action_identity().expect("on_click 注册了 <key>.click");
+  self.header = Some(HeaderControl { button, key, action });
+
+  // release / 重建前（存活守卫通过后）：先摘自己建的节点，再释放组件。
+  if let Some(control) = self.header.take() {
+      control.button.release(cx.app_mut()); // off_action(<key>.click) + release_scope
+  }
+  ```
+
+  **只 `off_action` 不 `Button::release` 会漏组件作用域**（W2a 审查 F2：header 每次重建 +10 live 信号槽）；kit 组件的
+  `release` 两件事都做，所以优先在字段里保留组件句柄。需要「只摘 handler、不交还组件」的接缝属于 selector 批（§15.5）。
 - **需要组合根单例的 kit 组件用 `cx` 的访问器装配**：`Overlay` / `Tooltip` / 对话框 / selector host 的构造要
   `theme.clone()` + `layer.clone()` + `animation.clone()`（`cx.theme()` / `cx.layer()` / `cx.animation()`），`sync` 由
   `cx.frame_router()` 上的路由驱动（widget 自己的 `sync` 里调 `component.sync(cx.app_mut())` 即可，不要再注册第二个
@@ -492,6 +525,10 @@ if generation != self.seen {
   （workspace 单写者统一登记）。
 - 覆盖建议：状态上报（含去重）、有 / 无内容两种失败出口、迟到消息与 `RequestId` 挡迟到、恢复动作、取消与替换、
   空快照的「暂无数据」、容器的能力裁剪、配置写回与规则 2 回默认、语言切换后的重绘、a11y hidden。
+- **多 pane / 多实例**：kit key 与 `App` 级 action 是全局的，涉及它们的行为必须用**同一 `WidgetTestApp` 的两个 widget 实例**
+  测：两个实例的 `cx.unique_key(同后缀)` 不同、两边的 handler 都在、release 一个之后另一个的 handler / 节点 / 帧路由仍在
+  （P3-1h 的契约测试是 `cx::tests::releasing_one_pane_leaves_the_other_pane_s_action_handler` 与
+  `test_support::tests::two_widget_instances_live_side_by_side`，widget crate 照此写自己的版本）。
 - **会踩的坑**：
   1. 断言「写 → 出帧」用 `harness.frame_requests()`（`App::write` 只在有节点读过该信号时才请求帧）；
   2. `sync` 里才变「有内容」的正文晚一帧出现——断言前 `drain()` 或让 widget `request_frame`；
@@ -515,7 +552,8 @@ if generation != self.seen {
 8. 正文：`flex_1` + `min_*_0`，无自绘底色 / 圆角 / 裁剪；空快照画 `EmptyState` + `common.no_data`。
 9. 语言文本在 `bind_text` 里读语言；颜色在 `bind_style` 里读主题；不把颜色 / 句子烤进挂载期常量。
 10. `name-key` / 文案不自己拼；错误实现 `TranslatedError`。
-11. release 释放自己建的 kit 组件与自定义作用域；不删 surface 节点。
+11. release 释放自己建的 kit 组件与自定义作用域；不删 surface 节点；kit 组件的 key 全部经 `cx.unique_key(后缀)`（§9），
+    release / 重建用与 build 相同的那个 key 或组件句柄。
 12. 删掉重构后不再使用的代码、字段、i18n key 与依赖；生产代码不允许 `#[allow(dead_code)]` / `#[expect(...)]`。
 
 **明确不做**：自动重连 / 退避；框架级 Ready 水位；widget 级缓存构件；共享恢复按钮包装；进程全局查服务；
@@ -673,4 +711,24 @@ W1a2 的当前写法：`UnifiedSize::Medium.text_size()`（14，标题 / 内容�
 即**借用控件尺寸档**，不是正文档；时间回到旧 12 px，标题 / 内容比旧正文档大一档。**登记 theme 后续批**：`theme` 增
 正文 / 次要文本 / 标题的排版令牌（body / secondary / caption 三级）；在此之前 W 批统一走 kit 尺寸档（或具名常量）并
 登记与旧实现的偏差，**不写裸 px**。
+
+### 15.5 已迁移 widget 的 kit key 唯一化（W 批跟进）
+
+P3-1h 冻结 `cx.unique_key` 后，**已迁移**代码里两类写法要在各自 W 批改（本批不改 `crates/widgets/**`）：
+
+- **常量 key**（W2a 审查 F1，必修）：`market_trade` 的 `HEADER_KEY = "MarketTradeInstrument"` 与表格 key
+  `"MarketTradeTable"` 是同一个 App 内多个 pane 共用的动作身份。改为 `cx.unique_key("market_trade.header.instrument")` /
+  `cx.unique_key("market_trade.table")`，并把生成出的 `Action` 存进 `HeaderControl` / 表格字段供 release 用；两个 pane
+  的回归测试按 §11「多 pane」写。
+- **按 owner 节点手拼的 key**：`news` 的 `format_smolstr!("news.sound.{}", parent.to_bits())`（`view.rs:884`）在同一实例的
+  header 行重建后会换身份（parent 变了）；它今天正确只因 widget 把 `Button` 句柄存进字段、release 用的是组件自己的 key。
+  改用 `cx.unique_key("news.sound")`（同一实例同后缀恒同 key，与 parent 无关），测试的 `find_by_debug_prefix(.., "news.sound")`
+  前缀仍然成立。`force_order` / 其它已迁移 crate 里的 kit key 同样改。
+
+**验收口径**：已迁移 widget 里不再出现字面量 kit key / 字面量 `Action::Custom`（测试里直接构造的组件除外）；kit key 只从
+`cx.unique_key` 来。
+
+**selector 批的释放面（W2a 审查 F2）**：`InstrumentButton::build` 消费掉 `Button` 只返回 `NodeId`，widget 只能
+`off_action`、不能 `Button::release`（组件信号作用域泄漏；W2a 实测 `live 18→28→38`）。selector 批需让 `build` 交还可释放
+句柄（或等价的 `release(&mut App)`）；本批只把契约写成「优先保留组件句柄，`release` 同时摘 handler 与释放 scope」。
 
