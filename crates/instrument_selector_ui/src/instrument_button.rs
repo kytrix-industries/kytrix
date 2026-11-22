@@ -150,7 +150,7 @@ impl InstrumentButton {
         }
     }
 
-    /// Builds the control under `parent`.
+    /// Builds the control under `parent`, handing back the handle the caller releases it with.
     ///
     /// The click opens the selector through [`InstrumentSelector::show_with_filters`], which
     /// returns `false` when the filters offer no route: the caller keeps its state and no dialog
@@ -164,7 +164,7 @@ impl InstrumentButton {
         app: &mut App,
         window: WindowId,
         parent: NodeId,
-    ) -> Result<NodeId, EngineError> {
+    ) -> Result<InstrumentButtonHandle, EngineError> {
         let text = self.label(host);
         let disabled = self.is_disabled();
         let button = Button::new(app, host.theme().clone(), self.key)
@@ -194,7 +194,40 @@ impl InstrumentButton {
             })
         };
 
-        button.build(app, window, parent)
+        button
+            .build(app, window, parent)
+            .map(|node| InstrumentButtonHandle { button, node })
+    }
+}
+
+/// The built control: the kit button it stands on and the node it built.
+///
+/// A kit component is not reclaimed by dropping it: the button owns a signal scope and, when
+/// it is live, the click handler its `on_click` registered. The caller keeps this handle for
+/// as long as the control stands in its header row and calls [`Self::release`] before it
+/// rebuilds the control or closes the pane — `Button::release` unregisters exactly the handler
+/// the control registered and hands the component's scope back. A caller that leaks the handle
+/// leaks one component scope per rebuild (W2a review F2: a header rebuilt on every language
+/// switch grew `live` slots by ten a time).
+pub struct InstrumentButtonHandle {
+    button: Button,
+    node: NodeId,
+}
+
+impl InstrumentButtonHandle {
+    /// The node the control built.
+    #[must_use]
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Releases the component's click handler and its signal scope.
+    ///
+    /// The node itself is the caller's to remove first: the engine's teardown order is "remove
+    /// the subtree, then release the scope", and the control's node lives in the caller's header
+    /// row. Idempotent, like [`Button::release`].
+    pub fn release(&self, app: &mut App) -> usize {
+        self.button.release(app)
     }
 }
 

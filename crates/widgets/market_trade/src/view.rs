@@ -31,10 +31,10 @@
 //!
 //! The pane never loads the directory and never polls the catalogue: it re-reads the
 //! answers its [`MarketDirectory`] gives on every load, and re-runs that load when the
-//! injected [`catalog_generation`](WidgetServices::catalog_generation) signal moves
-//! (AGENTS §8.3). A listing the route provably dropped — it left the catalogue, or its
-//! venue settled or delisted it — is reset to "nothing chosen"; a lookup that failed
-//! proves nothing and leaves the stored value alone.
+//! injected [`catalog_generation`](widget::services::WidgetServices::catalog_generation)
+//! signal moves (AGENTS §8.3). A listing the route provably dropped — it left the
+//! catalogue, or its venue settled or delisted it — is reset to "nothing chosen"; a
+//! lookup that failed proves nothing and leaves the stored value alone.
 //!
 //! # A generation is one number for the whole directory
 //!
@@ -63,8 +63,10 @@
 //!
 //! The control is built **once per pane header row** by [`WidgetView::header`] and
 //! rebuilt in place by [`WidgetView::sync`] when its copy changed; the header row
-//! itself belongs to the pane, which is why only the component's action handler is the
-//! widget's to release.
+//! itself belongs to the pane. What the widget keeps is the handle the control hands
+//! back, and releasing that handle is what takes the component's click handler and its
+//! signal scope down — a header rebuilt on every language switch would otherwise leak
+//! one component scope per rebuild (W2a review F2).
 //!
 //! # Confirmation is a signal, not a re-entry
 //!
@@ -84,7 +86,7 @@ use base_ui::{kit::table::Table, style_builder::StyleBuilder, theme::handle::The
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use instrument_selector_ui::{
     host::SelectorHost,
-    instrument_button::InstrumentButton,
+    instrument_button::{InstrumentButton, InstrumentButtonHandle},
     instrument_selector::{
         InstrumentFilters, InstrumentKindFilter, InstrumentStatusFilter, LoadedScope, offers_route,
     },
@@ -94,12 +96,11 @@ use market_participants_model::{
     listing::route::VenueListingKey, market::selection::InstrumentSelection, routing::CapabilityId,
 };
 use serde::{Deserialize, Serialize};
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::SmolStr;
 use ui_core::{
     a11y::A11yPatch,
     app::App,
     error::EngineError,
-    event::Action,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     window::WindowId,
 };
@@ -110,7 +111,6 @@ use widget::{
     cx::WidgetCx,
     error::market_is_catalog_not_loaded,
     identity::{WidgetId, WidgetInstanceId},
-    services::WidgetServices,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     view::{HeaderGroup, ReloadHandle, WidgetView},
 };
@@ -132,12 +132,22 @@ use super::{
 /// How many trades the opening page asks for.
 const HISTORY_LIMIT: u16 = 200;
 
-/// The kit button key of the header control.
+/// The widget-local name of the header control's kit key.
 ///
-/// The pane owns the key so the control keeps its identity across the frames the header
-/// row is rebuilt in; it is also the prefix of the click action the control registers
-/// (`<key>.click`, the kit button's documented convention).
-const HEADER_KEY: &str = "MarketTradeInstrument";
+/// A kit key is **application-level** — the button derives its click action from it
+/// (`"<key>.click"`, the kit button's documented convention) and two panes that build the
+/// same constant key share one handler — so the pane does not spell it out:
+/// [`WidgetCx::unique_key`] stamps this suffix with the pane's instance scope. The same
+/// suffix in the same instance always mints the same key, which is what lets a control
+/// rebuilt on a later frame reclaim the identity it registered.
+const HEADER_KEY_SUFFIX: &str = "market_trade.header.instrument";
+
+/// The widget-local name of the table's kit key (its sort action is `"<key>.sort"`).
+///
+/// Unique per instance for the same reason as [`HEADER_KEY_SUFFIX`]: two panes that build a
+/// table under one constant key would register one sort handler and the first release would
+/// take it away from the second.
+const TABLE_KEY_SUFFIX: &str = "market_trade.table";
 
 /// The listing a tape follows, persisted with the widget.
 ///
@@ -236,9 +246,14 @@ struct TableCopy {
 }
 
 /// The header control and the copy it was built with.
-#[derive(Clone, Debug)]
+///
+/// The control is kept as the selector crate's handle rather than as a bare node: a kit
+/// component owns a signal scope and (when it is live) the click handler its `on_click`
+/// registered, so only the component can hand both back (`InstrumentButtonHandle::release`).
+/// Holding the node alone would leave the widget able to unregister the handler but not to
+/// reclaim the scope.
 struct HeaderControl {
-    node: NodeId,
+    control: InstrumentButtonHandle,
     parent: NodeId,
     built: HeaderState,
 }
@@ -463,8 +478,7 @@ impl WidgetView for MarketTradeWidget {
             return Ok(());
         }
         // The pane is building its row; the control this widget built into the previous
-        // one went with it. Only the component's action handler is the widget's to take
-        // down.
+        // one went with it. Only the component is the widget's to take down.
         self.release_header(cx, true);
         self.build_header(parent, cx)
     }
@@ -472,7 +486,7 @@ impl WidgetView for MarketTradeWidget {
     fn release(&mut self, cx: &mut WidgetCx<'_>) {
         // The table's nodes are removed by the framework after this hook, so the
         // component is released here while its nodes are still alive. The control in the
-        // header row belongs to the pane; only its action handler is released.
+        // header row belongs to the pane; the component it stands on is the widget's.
         self.release_header(cx, false);
         if let Some(table) = self.table.take() {
             let _ = table.release(cx.app_mut());
@@ -489,7 +503,6 @@ impl WidgetView for MarketTradeWidget {
 
 impl MarketTradeWidget {
     /// Builds a widget over the collaborators a caller hands it.
-    #[allow(clippy::too_many_arguments)]
     fn assemble(
         config: MarketTradeConfig,
         binding: Option<WidgetBinding<MarketTradeProtocol>>,
@@ -779,7 +792,15 @@ impl MarketTradeWidget {
         self.config_change.publish(cx.app_mut());
         // The trades on screen belong to the scope the user just left.
         self.clear_trades();
-        self.start(false, cx);
+        // A pane that is waiting for its market is a pane whose gate `start` would not run:
+        // `start` reads the loaded scopes of a directory that has none and withdraws the
+        // choice the user just made, writing the default back on top of it. `load` is the
+        // path that runs the gate, and it keeps the choice while it waits (AGENTS §4.2).
+        if self.awaiting_market {
+            self.load(cx);
+        } else {
+            self.start(false, cx);
+        }
         true
     }
 
@@ -788,6 +809,12 @@ impl MarketTradeWidget {
         result: WidgetRpcResult<MarketTradeProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        // An answer that arrives after the pane failed, or while it waits for its market, is
+        // about a call that no longer belongs to what the pane is showing: the failure is
+        // terminal until the user recovers, and a late error must not replace it (AGENTS §4.4).
+        if self.status.is_failed(cx.app()) || self.awaiting_market {
+            return;
+        }
         match result {
             Ok(MarketTradeResponse::StreamStarted) => {}
             Err(error) => {
@@ -933,10 +960,11 @@ impl MarketTradeWidget {
                 font_size,
             );
         };
+        let key = cx.unique_key(TABLE_KEY_SUFFIX);
         let table = Table::new(
             cx.app_mut(),
             theme,
-            "MarketTradeTable",
+            key,
             columns(copy.headers),
             table_options(row_height),
             cells,
@@ -990,13 +1018,11 @@ impl MarketTradeWidget {
     /// The selector host the header control opens its dialog through.
     ///
     /// The host is the one thing in this widget that owns the services rather than
-    /// borrowing them, and a widget is handed them by reference. P3-1f adds
-    /// `WidgetCx::services_rc()`; until it lands, [`services_rc`] re-wraps the same
-    /// handles — every collaborator is `Rc`-shared or `Copy`, so the host reads the same
-    /// translator, theme, signals and composition-root singletons the widget does (the
-    /// batch registers this as the one place to delete when P3-1f merges).
+    /// borrowing them, so it takes the shared handle the composition root handed over
+    /// ([`WidgetCx::services_rc`]) — the same aggregate the widget works over, not a
+    /// second one assembled from its fields.
     fn selector_host(&self, cx: &WidgetCx<'_>) -> SelectorHost {
-        let host = SelectorHost::new(services_rc(cx.services()));
+        let host = SelectorHost::new(Rc::clone(cx.services_rc()));
         match &self.directory {
             // The host derives its catalogue from the injected directory root; the pane's
             // own directory is the same root in production, and the only source in a
@@ -1021,19 +1047,18 @@ impl MarketTradeWidget {
         let selection = self.config.selection.clone();
         let requests = self.selection_requests;
         let button = InstrumentButton::new(
-            HEADER_KEY,
+            cx.unique_key(HEADER_KEY_SUFFIX),
             selection,
             filters,
             "widget.market_trade.select_instrument",
             move |selection: InstrumentSelection, app: &mut App, window: WindowId| {
-                app.write(&requests, Some(selection));
-                let _ = app.request_repaint(window);
+                hand_over_selection(requests, selection, app, window);
             },
         );
         let window = cx.window();
-        let node = button.build(&host, cx.app_mut(), window, parent)?;
+        let control = button.build(&host, cx.app_mut(), window, parent)?;
         self.header = Some(HeaderControl {
-            node,
+            control,
             parent,
             built: self.header_state(cx),
         });
@@ -1060,7 +1085,7 @@ impl MarketTradeWidget {
         let parent = header.parent;
         if cx.tree().get(parent).is_err() {
             // The pane took its row down; the control went with it, and only the
-            // component's action handler is left to release.
+            // component (its click handler and signal scope) is left to release.
             self.release_header(cx, false);
             return Ok(());
         }
@@ -1072,56 +1097,37 @@ impl MarketTradeWidget {
     ///
     /// `remove_node` is true when the pane's row is still there and the widget is
     /// replacing its own control in it; a row the pane already took down needs no node
-    /// removal (`StaleNode`). The node itself belongs to the pane's header row, so
-    /// teardown passes `false` — but the **action handler** is this widget's in every
-    /// case. It is registered under the kit button's documented identity
-    /// (`<key>.click`), which is why this can take it down without holding the component:
-    /// the selector crate's control does not hand its button back (registered as a batch
-    /// gap).
+    /// removal (`StaleNode`). The node itself belongs to the pane's header row, but the
+    /// **component** — its click handler and its signal scope — is this widget's in every
+    /// case, which is why the handle the selector's control hands back is released here.
     fn release_header(&mut self, cx: &mut WidgetCx<'_>, remove_node: bool) {
         let Some(header) = self.header.take() else {
             return;
         };
-        if remove_node && cx.tree().get(header.node).is_ok() {
+        let node = header.control.node();
+        if remove_node && cx.tree().get(node).is_ok() {
             let window = cx.window();
-            let _ = cx.app_mut().remove_node(window, header.node);
+            let _ = cx.app_mut().remove_node(window, node);
         }
-        let _ = cx.app_mut().off_action(&header_action());
+        let _ = header.control.release(cx.app_mut());
     }
 }
 
-/// The action the header control registers for its click.
-fn header_action() -> Action {
-    Action::Custom(format_smolstr!("{HEADER_KEY}.click"))
-}
-
-/// Re-wraps the injected services as the shared handle a selector host takes.
+/// Hands a confirmed selection over to the next `sync`.
 ///
-/// A host that owns the aggregate (the selector host) needs the `Rc` the composition
-/// root built; [`WidgetCx`] hands the aggregate by reference. Every field here is an
-/// `Rc` handle, a `Copy` signal or a cloneable runtime handle, so the host works over
-/// exactly the same collaborator set as the widget — the translator and theme are
-/// shared, the signals are the same slots, and the three composition-root singletons are
-/// the host's own instances. This is a stopgap for the frozen contract's missing
-/// accessor; P3-1f adds `WidgetCx::services_rc()` and this function is then
-/// `Rc::clone(cx.services_rc())`.
-fn services_rc(services: &WidgetServices) -> Rc<WidgetServices> {
-    Rc::new(WidgetServices {
-        translate: services.translate.clone(),
-        language: services.language,
-        config: services.config,
-        theme: services.theme.clone(),
-        market_participants: services.market_participants.clone(),
-        catalog_generation: services.catalog_generation,
-        kytrix_service: services.kytrix_service.clone(),
-        open_url: Rc::clone(&services.open_url),
-        sound: Rc::clone(&services.sound),
-        reduce_motion: services.reduce_motion,
-        layer: Rc::clone(&services.layer),
-        frame_router: Rc::clone(&services.frame_router),
-        animation_router: Rc::clone(&services.animation_router),
-        runtime: services.runtime.clone(),
-    })
+/// The control's confirm handler runs with an application context and no widget context, so
+/// it cannot call into the pane: it writes the request signal and asks for a frame, and
+/// [`WidgetView::sync`] applies the choice and publishes the configuration change. A
+/// confirmation that wrote nothing would leave the pane following the listing it was already
+/// on, however far the user browsed.
+fn hand_over_selection(
+    requests: Signal<Option<InstrumentSelection>>,
+    selection: InstrumentSelection,
+    app: &mut App,
+    window: WindowId,
+) {
+    app.write(&requests, Some(selection));
+    let _ = app.request_repaint(window);
 }
 
 #[cfg(test)]

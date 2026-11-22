@@ -42,8 +42,17 @@ use market_participants_model::{
     },
     routing::CapabilityId,
 };
-use ui_core::{node::tree::NodeKind, paint::color::Color};
-use widget::{error::TranslatedError, test_support::WidgetTestApp, view::WidgetView};
+use smol_str::format_smolstr;
+use ui_core::{
+    event::{Action, ActionSource},
+    node::tree::NodeKind,
+    paint::color::Color,
+    test_support::diagnostics::signal_slot_stats,
+};
+use widget::{
+    cx::WidgetCx, error::TranslatedError, protocol::RequestId, rpc::RpcCallError,
+    test_support::WidgetTestApp, view::WidgetView,
+};
 
 use super::*;
 use crate::{
@@ -195,6 +204,19 @@ fn both_sides_snapshot() -> MarketTradeSnapshot {
     let mut newer = trade(2, 2, 101);
     newer.side = Side::Sell;
     state.merge([newer]);
+    state.snapshot()
+}
+
+/// Two prints whose newest one is counted in contracts rather than in the base asset, which is
+/// a tape whose headers have to be rebuilt when it arrives.
+fn contract_snapshot() -> MarketTradeSnapshot {
+    let mut state = MarketTradeState::new(2, precision());
+    let mut newer = trade(2, 2, 101);
+    newer.quantity = MarketQuantity {
+        value: Quantity::from(3_u64),
+        unit: QuantityUnit::Contracts,
+    };
+    state.merge([trade(1, 1, 100), newer]);
     state.snapshot()
 }
 
@@ -592,7 +614,25 @@ impl Fixture {
 
     fn header_node(&self) -> Option<NodeId> {
         self.harness
-            .find_by_debug_prefix(self.harness.root(), HEADER_KEY)
+            .find_by_debug_prefix(self.harness.root(), HEADER_KEY_SUFFIX)
+    }
+
+    /// The kit key this pane's instance scope mints for `suffix`.
+    ///
+    /// The widget must not spell a kit key: the key is what the kit component's action is
+    /// registered under, and it is application-level (W2a review F1).
+    fn kit_key(&mut self, suffix: &str) -> SmolStr {
+        self.with_cx(|_, cx| cx.unique_key(suffix))
+    }
+
+    /// The action the header control registers for its click.
+    fn header_action(&mut self) -> Action {
+        Action::Custom(format_smolstr!("{}.click", self.kit_key(HEADER_KEY_SUFFIX)))
+    }
+
+    /// The action the table registers for a header click.
+    fn table_sort_action(&mut self) -> Action {
+        Action::Custom(format_smolstr!("{}.sort", self.kit_key(TABLE_KEY_SUFFIX)))
     }
 
     fn table(&self) -> &Table {
@@ -624,7 +664,6 @@ impl Fixture {
             if let Some(node) = node {
                 return self.harness.text_of(node);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("row {row} column {column} should be mounted");
     }
@@ -894,6 +933,59 @@ fn a_late_stream_message_after_a_failure_should_not_change_the_status() {
 
     assert_eq!(fixture.status(), failed);
     assert_eq!(fixture.snapshot_len(), None);
+}
+
+/// A result that arrives after the pane failed belongs to a call the pane no longer shows: the
+/// failure is terminal until the user recovers, so the late answer must not replace it
+/// (AGENTS §4.4 — every message entry guards).
+#[test]
+fn a_late_rpc_result_should_not_replace_a_terminal_failure() {
+    let mut fixture = Fixture::over_listing(PendingSource, true);
+    fixture.report_failure();
+    let failed = fixture.status();
+
+    fixture.with_cx(|widget, cx| {
+        widget.apply_rpc_result(
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(1),
+            }),
+            cx,
+        );
+    });
+
+    assert_eq!(
+        fixture.status(),
+        failed,
+        "the failed pane keeps its failure"
+    );
+}
+
+/// The same guard for a pane waiting for its market: the answer describes a call that does not
+/// belong to what the pane is showing, and the wait is not a failure.
+#[test]
+fn an_rpc_result_while_waiting_for_the_market_should_not_replace_the_wait() {
+    let mut fixture = Fixture::over_listing(PendingSource, false);
+    assert!(
+        fixture.widget.awaiting_market,
+        "the fixture waits for its market"
+    );
+    let waiting = fixture.status();
+
+    fixture.with_cx(|widget, cx| {
+        widget.apply_rpc_result(
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(1),
+            }),
+            cx,
+        );
+    });
+
+    assert_eq!(
+        fixture.status(),
+        waiting,
+        "the pane keeps waiting for its market"
+    );
+    assert!(!fixture.status().is_failed());
 }
 
 /// Both streams are keyed by the listing they were opened for, and a message from a
@@ -1225,17 +1317,70 @@ fn a_language_change_should_not_leak_the_old_table() {
     );
 }
 
+/// A snapshot whose newest trade changes the unit the headers count in rebuilds the table: the
+/// headers name the units of the newest retained trade, and the kit table takes them as
+/// resolved text rather than a binding (AGENTS §15).
+#[test]
+fn a_snapshot_that_changes_the_units_should_rebuild_the_table() {
+    let mut fixture = Fixture::over_listing(PendingSource, true);
+    fixture.accept_snapshot(snapshot(1));
+    fixture.build_body();
+    assert_eq!(
+        fixture.header_text(1),
+        "Amount (BTC)",
+        "the base asset is the unit of the trade the tape holds"
+    );
+
+    // The tape starts printing contracts: the unit every header names moved with it.
+    fixture.accept_snapshot(contract_snapshot());
+
+    assert_eq!(
+        fixture.header_text(1),
+        "Amount (Contracts)",
+        "the rebuilt table names the unit the newest trade carries"
+    );
+    assert_eq!(
+        fixture.header_text(0),
+        "Price (USDT)",
+        "the quote unit did not move"
+    );
+    assert_eq!(
+        fixture.table_rows(),
+        2,
+        "the rebuilt table keeps the rows it was given"
+    );
+
+    // And back: the newest print is measured in base units again.
+    fixture.accept_snapshot(snapshot(3));
+
+    assert_eq!(
+        fixture.header_text(1),
+        "Amount (BTC)",
+        "a unit that moves back rebuilds the table back"
+    );
+}
+
 /// `release` hands the table and the header control back to their components: the
 /// handlers they registered are removed with them, which is what keeps the application
 /// from holding a closed pane's widgets.
+///
+/// Both components are keyed from the pane's instance scope, so the keys this test derives
+/// are the ones the pane really registered (a constant would pass here and collide in the
+/// second pane; see `two_panes_should_not_share_their_control_identities`).
 #[test]
 fn releasing_the_widget_should_release_the_table() {
     let mut fixture = Fixture::over_listing(PendingSource, true);
     fixture.accept_snapshot(snapshot(1));
     fixture.build_body();
     fixture.build_header();
-    let sort = Action::Custom(SmolStr::new_static("MarketTradeTable.sort"));
-    let click = header_action();
+    let table_key = fixture.table().key().to_owned();
+    let expected_table_key = fixture.kit_key(TABLE_KEY_SUFFIX);
+    assert_eq!(
+        table_key, expected_table_key,
+        "the table's kit key is minted from the pane's instance scope, not a constant"
+    );
+    let sort = fixture.table_sort_action();
+    let click = fixture.header_action();
     assert!(
         fixture.harness.app().has_action_handler(&sort),
         "the mounted table registers its sort handler"
@@ -1496,6 +1641,110 @@ fn a_selection_from_the_header_control_should_start_following_it() {
     });
 }
 
+/// The control's click and the confirmation behind it are both real: the click the pane
+/// registered opens the selector it hosts, and the confirmation the dialog runs hands the
+/// choice over through the request signal.
+///
+/// The confirm handler owns no widget context, so it cannot call into the pane: it writes
+/// [`MarketTradeWidget::selection_requests`] and asks for the frame whose `sync` applies the
+/// choice. A confirmation that wrote nothing would leave the pane following the listing it
+/// was already on, however far the user browsed — which is why this drives the hand-over
+/// itself rather than only the request the test writes by hand.
+#[test]
+fn a_confirmation_should_hand_the_choice_to_the_next_sync() {
+    let mut fixture = Fixture::new(
+        MarketTradeConfig::default(),
+        PendingSource,
+        true,
+        vec![default_entry()],
+    );
+    fixture.build_header();
+    let node = fixture.header_node().expect("the control is in the header");
+    let click = fixture.header_action();
+    let window = fixture.harness.window();
+
+    assert!(
+        fixture
+            .harness
+            .app_mut()
+            .dispatch_action(window, node, click, ActionSource::Programmatic),
+        "the live control handles its own click"
+    );
+    fixture.drain();
+    assert!(
+        !fixture.harness.app().overlays(window).is_empty(),
+        "the control opened the selector it hosts"
+    );
+
+    let requests = fixture.widget.selection_requests;
+    let before = fixture.harness.app().frame_requests();
+    hand_over_selection(
+        requests,
+        selection(listing()),
+        fixture.harness.app_mut(),
+        window,
+    );
+
+    assert_eq!(
+        &*fixture.harness.app().read(&requests),
+        &Some(selection(listing())),
+        "the confirmation writes the selection the next sync applies"
+    );
+    assert!(
+        fixture.harness.app().frame_requests() > before,
+        "the confirmation asks for the frame that applies it"
+    );
+
+    fixture.sync();
+
+    assert_eq!(
+        fixture.selected(),
+        Some(selection(listing())),
+        "the next sync follows the confirmed listing"
+    );
+    assert_eq!(
+        &*fixture.harness.app().read(&requests),
+        &None,
+        "the request is consumed once"
+    );
+}
+
+/// A confirmation made while the pane waits for its market is a choice its gate keeps, not one
+/// `start` withdraws: the pane stores it, re-runs the gate, and keeps waiting for the market the
+/// choice names (AGENTS §4.2 — a late confirmation is refused at the entry that acts on it).
+#[test]
+fn a_confirmation_made_while_the_market_is_loading_should_keep_the_choice() {
+    let mut fixture = Fixture::over_listing(PendingSource, false);
+    assert!(
+        fixture.widget.awaiting_market,
+        "the fixture waits for its market"
+    );
+
+    fixture.request_selection(selection(other_listing()));
+    fixture.sync();
+
+    assert_eq!(
+        fixture.selected(),
+        Some(selection(other_listing())),
+        "a choice made while the market is away is not withdrawn by a settle it never saw"
+    );
+    assert_eq!(
+        fixture.publishes.get(),
+        1,
+        "the choice is written back once"
+    );
+    assert!(
+        fixture.widget.awaiting_market,
+        "the pane keeps waiting for the market"
+    );
+    let status = fixture.status();
+    assert!(
+        status.notice().is_some(),
+        "the pane says which market it waits for"
+    );
+    assert!(status.failure().is_none(), "waiting is not working");
+}
+
 /// The header control states the offer while nothing is followed and the listing (with
 /// its route) once one is.
 #[test]
@@ -1530,6 +1779,32 @@ fn the_header_should_build_the_instrument_control() {
     );
 }
 
+/// A pane with no market loaded has nothing its picker could offer, so the control is built
+/// disabled and carries no click: the kit's `disabled` only paints the state, and a click that
+/// opened nothing would read as broken (AGENTS §4.2 — the entry refuses, not the paint).
+#[test]
+fn a_control_with_no_market_loaded_should_carry_no_click() {
+    let mut fixture = Fixture::new(
+        MarketTradeConfig::default(),
+        PendingSource,
+        false,
+        Vec::new(),
+    );
+    fixture.build_header();
+    let click = fixture.header_action();
+
+    let node = fixture.header_node().expect("the control is in the header");
+    assert_eq!(
+        fixture.harness.text_of(node),
+        "Select instrument",
+        "a control that follows nothing states the offer"
+    );
+    assert!(
+        !fixture.harness.app().has_action_handler(&click),
+        "a control with no market to offer must not answer a click with a selector"
+    );
+}
+
 /// The control's copy is chosen when it is built, so a language switch rebuilds it.
 #[test]
 fn a_language_change_should_rebuild_the_header_control() {
@@ -1555,6 +1830,162 @@ fn a_language_change_should_rebuild_the_header_control() {
         fixture.harness.text_of(node),
         "选择标的",
         "the rebuilt control states the offer in the language showing now"
+    );
+}
+
+/// A header control rebuilt for a language switch hands its component back: ten rebuilds leave
+/// the value store exactly where the first build left it.
+///
+/// The kit button (and the selector control standing on it) owns a signal scope and a click
+/// handler, and neither is reclaimed by dropping it. The W2a review measured the leak on this
+/// pane: `live` slots grew `18 → 28 → 38` over two language switches, because the widget could
+/// only unregister the handler and never return the scope.
+#[test]
+fn rebuilding_the_header_control_should_not_leak_signal_slots() {
+    let mut fixture = Fixture::new(
+        MarketTradeConfig::default(),
+        PendingSource,
+        true,
+        vec![default_entry()],
+    );
+    fixture.build_header();
+    fixture.drain();
+    let baseline = signal_slot_stats(fixture.harness.app()).live;
+
+    for cycle in 0..10 {
+        let language = if cycle % 2 == 0 {
+            LanguageCode::ZhCn
+        } else {
+            LanguageCode::En
+        };
+        fixture.harness.switch_language(language);
+        fixture.sync();
+
+        assert!(
+            fixture.header_node().is_some(),
+            "cycle {cycle}: the control is still in the header"
+        );
+        assert_eq!(
+            signal_slot_stats(fixture.harness.app()).live,
+            baseline,
+            "cycle {cycle}: the control rebuilt for the language switch released the one it replaced"
+        );
+    }
+}
+
+/// A directory generation that may have widened the picker rebuilds the header control: the
+/// filters the control opens its selector with are read when it is built, so a venue loaded on
+/// a later commit is only offered by a control built after it.
+#[test]
+fn a_directory_generation_should_rebuild_the_header_control() {
+    let source = RecordingSource::default();
+    let mut fixture = Fixture::over_listing(source.clone(), true);
+    fixture.settle_until("the tape to follow its listing", |_| {
+        !source.subscribed().is_empty()
+    });
+    fixture.accept_snapshot(snapshot(1));
+    fixture.build_header();
+    let previous = fixture.header_node().expect("the control is in the header");
+
+    fixture.directory.load(okx_route());
+    fixture.bump_generation();
+
+    assert!(
+        fixture.harness.tree().get(previous).is_err(),
+        "the control built against the retired generation was removed"
+    );
+    let rebuilt = fixture
+        .header_node()
+        .expect("a control stands in the header again");
+    assert_ne!(
+        rebuilt, previous,
+        "a new control was built for the generation that may have widened the picker"
+    );
+}
+
+/// **The W2a review's High finding.** Two panes of this widget live in one application, and
+/// each header control registers its own click: releasing one pane takes down only its own
+/// control and leaves the other pane's handler and node standing.
+///
+/// A constant kit key is one application-level action, so the second pane's control overwrote
+/// the first's handler and closing either pane unregistered the other's — a click then
+/// dispatched into no pane (or into the wrong one).
+#[test]
+fn two_panes_should_not_share_their_control_identities() {
+    let mut fixture = Fixture::new(
+        MarketTradeConfig::default(),
+        PendingSource,
+        true,
+        vec![default_entry()],
+    );
+    let root = fixture.harness.root();
+    fixture.build_header();
+    let first_click = fixture.header_action();
+    let first_node = fixture
+        .header_node()
+        .expect("the first pane's control is in its row");
+
+    // The second pane: one more mount of the same widget over the same directory, with its own
+    // signal scope — what `AnyWidget::mount` mints for each pane.
+    let directory: Rc<dyn MarketDirectory> = Rc::new(fixture.directory.clone());
+    let status = fixture.harness.status();
+    let (peer, peer_click) = {
+        let services = Rc::clone(fixture.harness.services_rc());
+        let window = fixture.harness.window();
+        let scope = fixture.harness.app_mut().signal_scope();
+        let mut cx = WidgetCx::new(fixture.harness.app_mut(), window, &services, scope);
+        let key = cx.unique_key(HEADER_KEY_SUFFIX);
+        let mut peer = MarketTradeWidget::with_source(
+            MarketTradeConfig::default(),
+            PendingSource,
+            directory,
+            status,
+            WidgetConfigChange::new(|_| {}),
+            WidgetAction::new("common.retry", |_| {}),
+            &mut cx,
+        );
+        peer.header(HeaderGroup::Left, root, &mut cx)
+            .expect("the second pane's header control builds");
+        (peer, Action::Custom(format_smolstr!("{key}.click")))
+    };
+    let peer_node = peer
+        .header
+        .as_ref()
+        .expect("the second pane built its control")
+        .control
+        .node();
+
+    assert_ne!(
+        first_click, peer_click,
+        "each pane's control registered its own action identity"
+    );
+    assert!(
+        fixture.harness.app().has_action_handler(&first_click),
+        "the first pane's control is live"
+    );
+    assert!(
+        fixture.harness.app().has_action_handler(&peer_click),
+        "the second pane's control is live"
+    );
+
+    // Closing the first pane releases its own component, and only its own.
+    fixture.with_cx(|widget, cx| widget.release(cx));
+
+    assert!(
+        !fixture.harness.app().has_action_handler(&first_click),
+        "the closed pane released the control it built"
+    );
+    assert!(
+        fixture.harness.app().has_action_handler(&peer_click),
+        "releasing one pane removed another pane's header handler"
+    );
+    assert!(
+        fixture.harness.tree().get(peer_node).is_ok(),
+        "the other pane's control node is still mounted"
+    );
+    assert!(
+        fixture.harness.tree().get(first_node).is_ok(),
+        "the closed pane's header row belongs to the pane, not the widget"
     );
 }
 
