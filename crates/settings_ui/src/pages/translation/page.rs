@@ -2,50 +2,666 @@
 //! downloaded.
 //!
 //! The page is a view of its own rather than a page of fields: its model list is a table of its
-//! own, its directory is a label that only the system folder picker changes, and its download
-//! state belongs to the process-wide [`crate::translation_downloads::TranslationDownloads`]
-//! rather than to the settings page. The chosen directory and model are written into the settings
-//! as they are chosen, and the controls read them back from there, so what the page draws is what
-//! is stored.
+//! own, its directory is a text field that is committed when the user leaves it, and its download
+//! state belongs to the process-wide [`TranslationDownloads`] rather than to the settings page.
+//! The chosen directory and model are written into the settings as they are chosen, and the
+//! controls read them back from there, so what the page draws is what is stored.
 //!
-//! One repair is made the first time the page is really drawn, and only then — see
-//! [`TranslationPage::repair_on_open`]: a selection that the stored directory does not hold is
-//! cleared. It is written once, so a page opened without being entered writes nothing.
+//! One repair is made when the page is really drawn: a selection that the stored directory does not
+//! hold is cleared. The page is only built when it is shown, so a page that is never opened writes
+//! nothing.
 //!
 //! Downloading starts from the site the settings hold: the site is a select in the card of model
 //! settings, and both a first download and a retry of a failed one use the chosen site.
+//!
+//! # Frames
+//!
+//! The page holds its kit components (two selects and the directory field) and syncs them from the
+//! settings each frame; the model table syncs from the download manager. Everything is written
+//! through the injected host, so a change made anywhere else is drawn on the frame that follows.
 
-use std::path::PathBuf;
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+};
 
 use app_config::translation::{DownloadSite, TranslationModel};
 use base_ui::{
-    button::Button, interactive::InteractiveVariantExt, style::theme::ThemeExt, tooltip::Tooltip,
+    kit::{
+        input::{self, InputNode, InputSpec, InputState},
+        select::{Select, SelectItem, SelectOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, role::Role},
 };
-use gpui_kit::{
-    App, AppContext as _, Context, ElementId, Entity, InteractiveElement as _, IntoElement,
-    ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _,
-    Styled, Subscription, Window, div,
+use i18n::{t_smol, translate::Translate};
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    event::{Action, Event},
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::style::PaintSpec,
+    window::WindowId,
 };
-use i18n::t;
 
-use super::table::{TranslationRequest, TranslationTable};
+use super::table::TranslationTable;
 use crate::{
+    host::SettingsHost,
     layout,
+    pages::page::{PageBuild, PageView},
     search::{PageSearch, words},
-    session::{SettingsChange, SettingsSession},
+    session::SettingsChange,
     translation_downloads::TranslationDownloads,
 };
 
+/// The id of this page's settings.
+const PAGE: &str = "ai.translation";
+
+/// The translation page.
+pub(crate) struct TranslationPage {
+    host: SettingsHost,
+    key: SmolStr,
+    window: Option<WindowId>,
+    /// The process-wide downloads, when the composition host attached them.
+    downloads: Option<Rc<TranslationDownloads>>,
+    /// The model directory field, and the state it edits.
+    directory: Option<InputNode>,
+    directory_state: Option<Signal<InputState>>,
+    /// Set when a committed directory could not be stored, so the field shows the stored one again.
+    directory_rejected: Rc<Cell<bool>>,
+    /// The select the download site is chosen from.
+    site: Option<Select>,
+    /// The select the model in use is chosen from.
+    model: Option<Select>,
+    /// The node the model select is mounted under, for the frames that replace it.
+    model_parent: Option<NodeId>,
+    /// The model ids the model select was last given.
+    model_items: Vec<SmolStr>,
+    /// Whether the model select was built over a stored directory, which its placeholder names.
+    model_has_directory: Option<bool>,
+    /// The models table.
+    table: Option<TranslationTable>,
+    /// The action the directory field dispatches when it is committed.
+    commit: Option<Action>,
+}
+
+impl TranslationPage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
+    pub(crate) fn new(host: SettingsHost, key: &str) -> Self {
+        Self {
+            host,
+            key: SmolStr::new(key),
+            window: None,
+            downloads: None,
+            directory: None,
+            directory_state: None,
+            directory_rejected: Rc::new(Cell::new(false)),
+            site: None,
+            model: None,
+            model_parent: None,
+            model_items: Vec::new(),
+            model_has_directory: None,
+            table: None,
+            commit: None,
+        }
+    }
+
+    /// Clears a selection the stored directory does not hold.
+    ///
+    /// A model is available when its file is in that directory at its published size and its row
+    /// is not being removed: a file that is still there while the engine unloads is not one the
+    /// page can load. Nothing is written when there is nothing to repair.
+    fn repair(&self, app: &mut App, window: WindowId) {
+        let Some(downloads) = self.downloads.as_deref() else {
+            return;
+        };
+        let (directory, selected) = self.host.config(app, |config| {
+            (
+                config.translation.model_directory.clone(),
+                config.translation.selected_model,
+            )
+        });
+        let Some(selected) = selected else {
+            return;
+        };
+        let available = directory
+            .as_deref()
+            .is_some_and(|directory| downloads.is_available(selected, directory));
+        if available {
+            return;
+        }
+
+        let _ = self.host.write(
+            app,
+            window,
+            SettingsChange::TranslationModelSelected { model: None },
+        );
+    }
+
+    /// Creates the model select over the models the stored directory can load.
+    fn create_model_select(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        directory: Option<&std::path::Path>,
+        available: &[TranslationModel],
+        selected: Option<TranslationModel>,
+    ) -> Result<Select, EngineError> {
+        let translate = self.host.translate().clone();
+        let label = t_smol!(translate, "settings_ui.ai.model_in_use");
+        let placeholder = if directory.is_some() {
+            t_smol!(translate, "settings_ui.ai.no_downloaded_models")
+        } else {
+            t_smol!(translate, "settings_ui.ai.no_model_directory")
+        };
+        let items = available
+            .iter()
+            .map(|model| {
+                SelectItem::new(
+                    SmolStr::new(model.display_name()),
+                    SmolStr::new(model.display_name()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let chosen = selected
+            .filter(|model| available.contains(model))
+            .map(|model| SmolStr::new(model.display_name()));
+        let key = format_smolstr!("{}.{PAGE}.model", self.key);
+        let select = Select::new(
+            app,
+            self.host.theme_handle(),
+            self.host.layer(),
+            self.host.animation(),
+            key,
+            SelectOptions::default()
+                .width(layout::CONTROL_WIDTH)
+                .label(label)
+                .placeholder(placeholder),
+        );
+        select.set_items(app, items)?;
+        match chosen {
+            Some(chosen) => select.set_chosen(app, [chosen.as_str()], false),
+            None => select.set_chosen(app, std::iter::empty::<&str>(), false),
+        }
+        select.set_disabled(app, directory.is_none() || available.is_empty());
+
+        let host = self.host.clone();
+        let downloads = self.downloads.clone();
+        Ok(select.on_change(move |app, chosen| {
+            let Some(model) = chosen
+                .first()
+                .and_then(|id| TranslationModel::from_name(id.as_str()))
+            else {
+                return;
+            };
+            select_model(app, &host, window, downloads.as_deref(), model);
+        }))
+    }
+
+    /// Replaces the model select when its placeholder has to name a different reason.
+    fn rebuild_model(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        directory: Option<&std::path::Path>,
+        available: &[TranslationModel],
+        selected: Option<TranslationModel>,
+    ) -> Result<(), EngineError> {
+        let Some(parent) = self.model_parent else {
+            return Ok(());
+        };
+        if let Some(select) = self.model.take() {
+            select.release(app);
+        }
+        for child in child_nodes(app, window, parent) {
+            if let Err(error) = app.remove_node(window, child) {
+                log::warn!("removing the rebuilt model select failed: {error}");
+            }
+        }
+        let select = self.create_model_select(app, window, directory, available, selected)?;
+        let _ = select.mount(app, window, parent)?;
+        self.model = Some(select);
+        self.model_has_directory = Some(directory.is_some());
+        self.model_items = available
+            .iter()
+            .map(|model| SmolStr::new(model.display_name()))
+            .collect();
+
+        Ok(())
+    }
+}
+
+impl PageView for TranslationPage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
+
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        self.window = Some(window);
+        self.downloads = self.host.downloads().cloned();
+        self.repair(app, window);
+
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let (directory, site, selected) = self.host.config(app, |config| {
+            (
+                config.translation.model_directory.clone(),
+                config.translation.download_site,
+                config.translation.selected_model,
+            )
+        });
+        let available = match (self.downloads.as_deref(), directory.as_deref()) {
+            (Some(downloads), Some(directory)) => downloads.available_models(directory),
+            _ => Vec::new(),
+        };
+
+        let root = layout::themed_box(
+            app,
+            window,
+            parent,
+            SmolStr::new_static("SETTINGS_AI_PAGE"),
+            StyleBuilder::new()
+                .flex_col()
+                .size_full()
+                .min_width_0()
+                .min_height_0()
+                .gap(16.0)
+                .padding_y(4.0)
+                .build(),
+            PaintSpec::default(),
+            &theme,
+            None,
+            None,
+        )?;
+
+        // The directory field is committed when the user leaves it, and re-shows the stored value
+        // when what they committed could not be stored.
+        let directory_state = app.signal(InputState::new(
+            directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+        let placeholder = app.signal(t_smol!(translate, "settings_ui.ai.model_directory"));
+        self.directory_state = Some(directory_state);
+        let commit = Action::Custom(format_smolstr!("{}.{PAGE}.directory.commit", self.key));
+        let spec = Arc::new(InputSpec {
+            name: format_smolstr!("{}.{PAGE}.directory", self.key),
+            placeholder: t_smol!(translate, "settings_ui.ai.model_directory"),
+            masked: false,
+            multiline: false,
+            readonly: false,
+            disabled: false,
+            max_length: None,
+            size: ControlSize::Medium,
+            submit: Some(commit.clone()),
+        });
+        {
+            let rejected = Rc::clone(&self.directory_rejected);
+            let host = self.host.clone();
+            let downloads = self.downloads.clone();
+            let state = directory_state;
+            app.on_action(commit.clone(), move |ctx| {
+                let text = {
+                    let state = ctx.read(&state);
+                    state.text().to_owned()
+                };
+                if text.is_empty() {
+                    return;
+                }
+                let accepted = choose_directory(
+                    ctx.app_mut(),
+                    &host,
+                    window,
+                    downloads.as_deref(),
+                    PathBuf::from(text),
+                );
+                rejected.set(!accepted);
+            });
+        }
+        self.commit = Some(commit);
+
+        let mut rows = Vec::with_capacity(3);
+        let directory_theme = theme.clone();
+        let directory_row_theme = theme.clone();
+        let directory_translate = translate.clone();
+        let directory_slot = Rc::new(RefCell::new(None::<InputNode>));
+        let directory_sink = Rc::clone(&directory_slot);
+        let directory_spec = Arc::clone(&spec);
+        rows.push(layout::row(
+            &directory_row_theme,
+            "ai.directory",
+            t_smol!(directory_translate, "settings_ui.ai.model_directory"),
+            t_smol!(
+                directory_translate,
+                "settings_ui.ai.model_directory_description"
+            ),
+            move |app, window, parent| {
+                let wrapper = layout::build_node(app, window, parent, |tree, parent| {
+                    NodeBuilder::boxed()
+                        .id(SmolStr::new_static("SETTINGS_AI_DIRECTORY_INPUT"))
+                        .style(StyleBuilder::new().width_full().min_width_0().build())
+                        .build(tree, parent)
+                })?;
+                let input = {
+                    let tree = app
+                        .window_mut(window)
+                        .ok_or(EngineError::UnknownWindow { window })?
+                        .tree_mut();
+                    input::build(
+                        tree,
+                        wrapper,
+                        Arc::clone(&directory_spec),
+                        &directory_theme,
+                        &directory_state,
+                        &placeholder,
+                    )
+                };
+                input.install(app);
+                input.set_submit_on_blur(true);
+                let _ = input.sync(app);
+                *directory_sink.borrow_mut() = Some(input);
+                Ok(())
+            },
+        ));
+
+        let site_row_label = t_smol!(translate, "settings_ui.ai.download_site");
+        let site_choices = DownloadSite::ALL
+            .into_iter()
+            .map(|choice| {
+                (
+                    SmolStr::new_static(site_id(choice)),
+                    site_label(choice, &translate),
+                )
+            })
+            .collect::<Vec<_>>();
+        let site_host = self.host.clone();
+        let site_select = layout::choice_select(
+            app,
+            &self.host,
+            cx.unique_key("site"),
+            site_id(site),
+            site_choices,
+            site_row_label.clone(),
+            move |app, value| {
+                let Some(chosen) = site_of(value) else {
+                    return;
+                };
+                let _ = site_host.write(
+                    app,
+                    window,
+                    SettingsChange::TranslationDownloadSite { site: chosen },
+                );
+            },
+        );
+        let site_for_row = site_select.clone();
+        let site_theme = theme.clone();
+        let site_translate = translate.clone();
+        rows.push(layout::row(
+            &site_theme,
+            "ai.download-site",
+            site_row_label,
+            t_smol!(site_translate, "settings_ui.ai.download_site_description"),
+            move |app, window, parent| {
+                let wrapper = layout::build_node(app, window, parent, |tree, parent| {
+                    NodeBuilder::boxed()
+                        .id(SmolStr::new_static("SETTINGS_AI_SITE_SELECT"))
+                        .style(StyleBuilder::new().width_full().min_width_0().build())
+                        .build(tree, parent)
+                })?;
+                let _ = site_for_row.mount(app, window, wrapper)?;
+                Ok(())
+            },
+        ));
+        self.site = Some(site_select);
+
+        let model_parent = Rc::new(Cell::new(None::<NodeId>));
+        let model_parent_for_row = Rc::clone(&model_parent);
+        let model_select =
+            self.create_model_select(app, window, directory.as_deref(), &available, selected)?;
+        self.model_has_directory = Some(directory.is_some());
+        self.model_items = available
+            .iter()
+            .map(|model| SmolStr::new(model.display_name()))
+            .collect();
+        let model_for_row = model_select.clone();
+        let model_theme = theme.clone();
+        let model_translate = translate.clone();
+        rows.push(layout::row(
+            &model_theme,
+            "ai.model",
+            t_smol!(model_translate, "settings_ui.ai.model_in_use"),
+            t_smol!(model_translate, "settings_ui.ai.model_in_use_description"),
+            move |app, window, parent| {
+                let wrapper = layout::build_node(app, window, parent, |tree, parent| {
+                    NodeBuilder::boxed()
+                        .id(SmolStr::new_static("SETTINGS_AI_MODEL_SELECT"))
+                        .style(StyleBuilder::new().width_full().min_width_0().build())
+                        .build(tree, parent)
+                })?;
+                let _ = model_for_row.mount(app, window, wrapper)?;
+                model_parent_for_row.set(Some(wrapper));
+                Ok(())
+            },
+        ));
+        self.model = Some(model_select);
+        self.model_parent = model_parent.get();
+
+        layout::section(app, window, root, &theme, "ai.translation", None, rows)?;
+        self.directory = directory_slot.borrow_mut().take();
+
+        if cx.filter.admits_field(PAGE, "models") {
+            let models = layout::build_node(app, window, root, |tree, parent| {
+                NodeBuilder::boxed()
+                    .id(SmolStr::new_static("SETTINGS_AI_MODELS"))
+                    .style(
+                        StyleBuilder::new()
+                            .flex_col()
+                            .flex_1()
+                            .width_full()
+                            .min_width_0()
+                            .min_height_0()
+                            .gap(6.0)
+                            .build(),
+                    )
+                    .build(tree, parent)
+            })?;
+            layout::themed_text(
+                app,
+                window,
+                models,
+                Some(SmolStr::new_static("SETTINGS_AI_MODELS_TITLE")),
+                t_smol!(translate, "settings_ui.ai.models"),
+                13.0,
+                600,
+                Role::FgDefault,
+                &theme,
+            )?;
+            let mut table = TranslationTable::new(cx.unique_key("model"), self.downloads.clone());
+            table.build(
+                app,
+                window,
+                models,
+                &theme,
+                &translate,
+                directory.as_deref(),
+                site,
+            )?;
+            self.table = Some(table);
+        }
+
+        Ok(())
+    }
+
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        let Some(window) = self.window else {
+            return Ok(());
+        };
+        if app.window(window).is_none() {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        if let Some(downloads) = &self.downloads {
+            changed |= downloads.sync(app);
+        }
+
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let (directory, site, selected) = self.host.config(app, |config| {
+            (
+                config.translation.model_directory.clone(),
+                config.translation.download_site,
+                config.translation.selected_model,
+            )
+        });
+
+        // The directory field shows what is stored, except while it is being typed into: what the
+        // user typed is theirs until it is committed or abandoned.
+        let stored = directory
+            .as_ref()
+            .map(|path| SmolStr::new(path.to_string_lossy()))
+            .unwrap_or_default();
+        if let Some(input) = &self.directory {
+            let rejected = self.directory_rejected.replace(false);
+            let state = match self.directory_state {
+                Some(state) => {
+                    let state = app.read(&state);
+                    (SmolStr::new(state.text()), state.is_focused())
+                }
+                None => (SmolStr::new(""), false),
+            };
+            if rejected || (state.0 != stored && !state.1) {
+                changed |= input.update_value(app, stored.as_str());
+            }
+            changed |= input.sync(app);
+        }
+
+        if let Some(select) = &self.site {
+            let chosen = select.chosen(app);
+            if chosen.as_slice() != [SmolStr::new_static(site_id(site))] {
+                select.set_chosen(app, [site_id(site)], false);
+                changed = true;
+            }
+        }
+
+        let available = match (self.downloads.as_deref(), directory.as_deref()) {
+            (Some(downloads), Some(directory)) => downloads.available_models(directory),
+            _ => Vec::new(),
+        };
+        let items = available
+            .iter()
+            .map(|model| SmolStr::new(model.display_name()))
+            .collect::<Vec<_>>();
+        if self.model_has_directory != Some(directory.is_some()) {
+            self.rebuild_model(app, window, directory.as_deref(), &available, selected)?;
+            changed = true;
+        } else if let Some(select) = &self.model {
+            if items != self.model_items {
+                select.set_items(
+                    app,
+                    items
+                        .iter()
+                        .map(|id| SelectItem::new(id.clone(), id.clone())),
+                )?;
+                self.model_items = items;
+                changed = true;
+            }
+            let wanted = selected
+                .filter(|model| available.contains(model))
+                .map(|model| SmolStr::new(model.display_name()));
+            let chosen = select.chosen(app);
+            let matches = match (&wanted, chosen.as_slice()) {
+                (Some(wanted), [chosen]) => wanted == chosen,
+                (None, []) => true,
+                _ => false,
+            };
+            if !matches {
+                match &wanted {
+                    Some(wanted) => select.set_chosen(app, [wanted.as_str()], false),
+                    None => select.set_chosen(app, std::iter::empty::<&str>(), false),
+                }
+                changed = true;
+            }
+            changed |= select.set_disabled(app, directory.is_none() || available.is_empty());
+        }
+        if let Some(select) = &self.site {
+            changed |= select.sync(app)?;
+        }
+        if let Some(select) = &self.model {
+            changed |= select.sync(app)?;
+        }
+
+        if let Some(table) = &mut self.table {
+            changed |= table.sync(app, window, &theme, &translate, directory.as_deref(), site)?;
+        }
+
+        if changed {
+            let _ = app.request_repaint(window);
+        }
+
+        Ok(())
+    }
+
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        if let Some(input) = &self.directory {
+            consumed |= input.dispatch(app, event);
+        }
+        if let Some(select) = &self.site {
+            consumed |= select.dispatch(app, event);
+        }
+        if let Some(select) = &self.model {
+            consumed |= select.dispatch(app, event);
+        }
+        consumed
+    }
+
+    fn release(&mut self, app: &mut App) {
+        if let Some(input) = self.directory.take() {
+            input.release(app);
+        }
+        if let Some(select) = self.site.take() {
+            select.release(app);
+        }
+        if let Some(select) = self.model.take() {
+            select.release(app);
+        }
+        if let Some(mut table) = self.table.take() {
+            table.release(app);
+        }
+        if let Some(action) = self.commit.take() {
+            app.off_action(&action);
+        }
+        self.model_items.clear();
+        self.model_has_directory = None;
+        self.model_parent = None;
+    }
+
+    fn scrolls(&self) -> bool {
+        false
+    }
+}
+
 /// What one site is called in the interface.
-fn site_label(site: DownloadSite, cx: &App) -> SharedString {
+fn site_label(site: DownloadSite, translate: &Translate) -> SmolStr {
     match site {
-        DownloadSite::HuggingFace => t!(cx, "settings_ui.ai.download_site_huggingface"),
-        DownloadSite::ModelScope => t!(cx, "settings_ui.ai.download_site_modelscope"),
+        DownloadSite::HuggingFace => t_smol!(translate, "settings_ui.ai.download_site_huggingface"),
+        DownloadSite::ModelScope => t_smol!(translate, "settings_ui.ai.download_site_modelscope"),
     }
 }
 
 /// The stored id of one site, which is what its choice writes.
-const fn site_id(site: DownloadSite) -> &'static str {
+fn site_id(site: DownloadSite) -> &'static str {
     match site {
         DownloadSite::HuggingFace => "hugging_face",
         DownloadSite::ModelScope => "model_scope",
@@ -53,24 +669,107 @@ const fn site_id(site: DownloadSite) -> &'static str {
 }
 
 /// The site a choice names.
-fn site_from_id(id: &str) -> Option<DownloadSite> {
+fn site_of(id: &str) -> Option<DownloadSite> {
     DownloadSite::ALL
         .into_iter()
         .find(|site| site_id(*site) == id)
 }
 
-/// The text the translation page is searched by.
+/// Writes `model` as the model the local translation is loaded from, or clears the selection when
+/// the stored directory cannot load it.
 ///
-/// The page has no setting rows of its own to filter: its directory, its site and its model are
-/// delivered by the page as a whole, and the model table is a view over the directory. What the
-/// search reaches it by is therefore the page's own words, including the names of the settings it
-/// holds.
-pub(crate) fn search(cx: &App) -> PageSearch {
-    let title = t!(cx, "settings_ui.ai.translation.title");
-    let directory = t!(cx, "settings_ui.ai.model_directory");
-    let site = t!(cx, "settings_ui.ai.download_site");
-    let model = t!(cx, "settings_ui.ai.model_in_use");
-    let models = t!(cx, "settings_ui.ai.models");
+/// The menu only offers what the directory holds and is not being removed, so what this refuses is
+/// a model that stopped being usable between the frame the menu was drawn in and the choice — a
+/// delete that started while the menu was open. Clearing rather than writing it is what keeps the
+/// settings from naming a file that is on its way out.
+fn select_model(
+    app: &mut App,
+    host: &SettingsHost,
+    window: WindowId,
+    downloads: Option<&TranslationDownloads>,
+    model: TranslationModel,
+) {
+    let available = host.config(app, |config| {
+        config
+            .translation
+            .model_directory
+            .as_deref()
+            .is_some_and(|directory| {
+                downloads.is_some_and(|downloads| {
+                    !downloads.row_state(model, directory).is_removing()
+                        && downloads.is_downloaded(model, directory)
+                })
+            })
+    });
+
+    let selected = available.then_some(model);
+    let _ = host.write(
+        app,
+        window,
+        SettingsChange::TranslationModelSelected { model: selected },
+    );
+}
+
+/// Writes `directory` as the model directory, selecting the first model it holds when the stored
+/// selection cannot be loaded from it.
+///
+/// Returns whether the settings accepted the change, so the field knows whether to keep the path it
+/// was committed with.
+fn choose_directory(
+    app: &mut App,
+    host: &SettingsHost,
+    window: WindowId,
+    downloads: Option<&TranslationDownloads>,
+    directory: PathBuf,
+) -> bool {
+    let (unchanged, selected) = host.config(app, |config| {
+        (
+            config.translation.model_directory.as_deref() == Some(directory.as_path()),
+            config.translation.selected_model,
+        )
+    });
+    if unchanged {
+        return true;
+    }
+
+    let next = {
+        let mut available = downloads
+            .map(|downloads| downloads.available_models(&directory))
+            .unwrap_or_default();
+        available.sort_by_key(|model| model.display_name());
+
+        match selected {
+            Some(model) if available.contains(&model) => Some(model),
+            _ => available.first().copied(),
+        }
+    };
+
+    let mut changes = Vec::with_capacity(2);
+    changes.push(SettingsChange::TranslationModelDirectory { directory });
+    if next != selected {
+        changes.push(SettingsChange::TranslationModelSelected { model: next });
+    }
+    host.write_all(app, window, changes).is_ok()
+}
+
+/// The child nodes of `parent`, which is what a rebuilt control replaces.
+fn child_nodes(app: &App, window: WindowId, parent: NodeId) -> Vec<NodeId> {
+    app.window(window)
+        .and_then(|target| target.tree().get(parent).ok())
+        .map(|entry| entry.children().to_vec())
+        .unwrap_or_default()
+}
+
+/// The text this page and its settings are searched by.
+pub(crate) fn search(translate: &Translate) -> PageSearch {
+    let title = t_smol!(translate, "settings_ui.ai.translation.title");
+    let directory = t_smol!(translate, "settings_ui.ai.model_directory");
+    let site = t_smol!(translate, "settings_ui.ai.download_site");
+    let model = t_smol!(translate, "settings_ui.ai.model_in_use");
+    let models = t_smol!(translate, "settings_ui.ai.models");
+    // The directory is typed into the field now that there is no folder picker to browse with;
+    // the word this catalogue gives it still reaches the page through the search.
+    let browse = t_smol!(translate, "settings_ui.ai.browse");
 
     PageSearch {
         label: words(&[
@@ -79,6 +778,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
             site.as_ref(),
             model.as_ref(),
             models.as_ref(),
+            browse.as_ref(),
             "translation",
             "translate",
             "翻译",
@@ -90,8 +790,6 @@ pub(crate) fn search(cx: &App) -> PageSearch {
             "使用的模型",
             "model directory",
             "model in use",
-            "browse",
-            "浏览",
             "huggingface",
             "modelscope",
             "魔搭",
@@ -106,715 +804,5 @@ pub(crate) fn search(cx: &App) -> PageSearch {
             "hy mt2",
         ]),
         fields: Vec::new(),
-    }
-}
-
-/// The translation page.
-pub(crate) struct TranslationPage {
-    session: Entity<SettingsSession>,
-    /// The process-wide downloads, when the composition root installed them.
-    downloads: Option<Entity<TranslationDownloads>>,
-    /// The supported models and what each of them is doing.
-    table: Entity<TranslationTable>,
-    /// Whether the repair of [`Self::repair_on_open`] has been scheduled, so it happens once.
-    repair_started: bool,
-    /// Held because a write of the settings can land here rather than through this page — the
-    /// repair the page schedules is written through the session — and the directory label, the
-    /// site radios and the model select all draw what the settings hold.
-    _session: Subscription,
-    /// Held because every change the download manager publishes repaints this page through it:
-    /// it selects a finished download and clears the selection of a model it starts removing
-    /// through the settings, and notifies on each of those changes.
-    _observe: Option<Subscription>,
-}
-
-impl TranslationPage {
-    pub(crate) fn new(
-        session: Entity<SettingsSession>,
-        downloads: Option<Entity<TranslationDownloads>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let table = cx.new(|cx| TranslationTable::new(session.clone(), downloads.clone(), cx));
-        let session_changes = cx.observe(&session, |_, _, cx| cx.notify());
-        let observe = downloads
-            .as_ref()
-            .map(|downloads| cx.observe(downloads, |_, _, cx| cx.notify()));
-
-        Self {
-            session,
-            downloads,
-            table,
-            repair_started: false,
-            _session: session_changes,
-            _observe: observe,
-        }
-    }
-
-    /// Schedules the repair the page makes, once, when it is first opened.
-    ///
-    /// A settings page that is opened but never shows this page must not write the translation
-    /// settings, so nothing is written when the page is built: the repair is scheduled here,
-    /// when the page is moved to, and runs at the end of the effect cycle that moved there.
-    pub(crate) fn repair_on_open(&mut self, cx: &mut Context<Self>) {
-        if self.repair_started {
-            return;
-        }
-        self.repair_started = true;
-
-        let session = self.session.clone();
-        let downloads = self.downloads.clone();
-        cx.defer(move |cx| Self::repair(session, downloads, cx));
-    }
-
-    /// Clears a selection the stored directory does not hold.
-    ///
-    /// A model is available when its file is in that directory at its published size and its row
-    /// is not being removed: a file that is still there while the engine unloads is not one the
-    /// page can load.
-    fn repair(
-        session: Entity<SettingsSession>,
-        downloads: Option<Entity<TranslationDownloads>>,
-        cx: &mut App,
-    ) {
-        let Some(downloads) = downloads else {
-            return;
-        };
-
-        let config = session.read(cx).config(cx);
-        let directory = config.translation.model_directory.clone();
-        let selected = config.translation.selected_model;
-        drop(config);
-
-        let Some(selected) = selected else {
-            return;
-        };
-        let available = directory
-            .as_deref()
-            .is_some_and(|directory| downloads.read(cx).is_available(selected, directory));
-        if available {
-            return;
-        }
-
-        session.update(cx, |session, cx| {
-            let change = SettingsChange::TranslationModelSelected { model: None };
-            let _ = session.write(change, cx);
-        });
-    }
-
-    /// Asks the system for a directory and records the one chosen.
-    fn browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = t!(cx, "settings_ui.ai.browse");
-        let answer = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some(prompt),
-        });
-
-        cx.spawn_in(window, async move |page, cx| {
-            let Ok(Ok(Some(paths))) = answer.await else {
-                return;
-            };
-            let Some(directory) = paths.into_iter().next() else {
-                return;
-            };
-            let _ = page.update_in(cx, |page, _window, cx| page.choose(directory, cx));
-        })
-        .detach();
-    }
-
-    /// Writes `directory` as the model directory and shows it in the label.
-    ///
-    /// The selection follows the directory in the same write: a selection the new directory
-    /// cannot load would name a file that is not there, so the first model the directory holds —
-    /// in the order their names sort — is selected instead, and the selection is cleared when the
-    /// directory holds none. A selection the new directory does hold is left as it is. The label
-    /// shows the directory only once it is stored — a write that failed leaves the old one on
-    /// screen, and the settings page reports why.
-    fn choose(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
-        let (unchanged, selected) = {
-            let config = self.session.read(cx).config(cx);
-            let unchanged =
-                config.translation.model_directory.as_deref() == Some(directory.as_path());
-            let selected = config.translation.selected_model;
-
-            (unchanged, selected)
-        };
-        if unchanged {
-            return;
-        }
-
-        let next = {
-            let mut available = self
-                .downloads
-                .as_ref()
-                .map(|downloads| downloads.read(cx).available_models(&directory))
-                .unwrap_or_default();
-            available.sort_by_key(|model| model.display_name());
-
-            match selected {
-                Some(model) if available.contains(&model) => Some(model),
-                _ => available.first().copied(),
-            }
-        };
-
-        let mut changes = Vec::with_capacity(2);
-        changes.push(SettingsChange::TranslationModelDirectory { directory });
-        if next != selected {
-            changes.push(SettingsChange::TranslationModelSelected { model: next });
-        }
-
-        let stored = self
-            .session
-            .update(cx, |session, cx| session.write_all(changes, cx));
-        if stored.is_err() {
-            return;
-        }
-
-        cx.notify();
-    }
-
-    /// Writes `model` as the model the local translation is loaded from, or clears the selection
-    /// when the stored directory cannot load it.
-    ///
-    /// The menu only offers what the directory holds and is not being removed, so what this
-    /// refuses is a model that stopped being usable between the frame the menu was drawn in and
-    /// the choice — a delete that started while the menu was open. Clearing rather than writing
-    /// it is what keeps the settings from naming a file that is on its way out.
-    fn select_model(&mut self, model: TranslationModel, cx: &mut Context<Self>) {
-        let available = {
-            let config = self.session.read(cx).config(cx);
-            config
-                .translation
-                .model_directory
-                .as_deref()
-                .is_some_and(|directory| {
-                    self.downloads.as_ref().is_some_and(|downloads| {
-                        let downloads = downloads.read(cx);
-                        !downloads.row_state(model, directory).is_removing()
-                            && downloads.is_downloaded(model, directory)
-                    })
-                })
-        };
-
-        let selected = available.then_some(model);
-        self.session.update(cx, |session, cx| {
-            let change = SettingsChange::TranslationModelSelected { model: selected };
-            let _ = session.write(change, cx);
-        });
-        cx.notify();
-    }
-
-    /// Takes the action a row asked for and answers it, before the page draws that action's
-    /// result.
-    ///
-    /// Stopping and deleting a model are the download manager's own: it clears a selection that
-    /// names the model it starts removing, so the page does not do that a second time.
-    fn handle_request(&mut self, cx: &mut Context<Self>) {
-        let Some(request) = self.table.update(cx, |table, _| table.take_request()) else {
-            return;
-        };
-        let config = self.session.read(cx).config(cx);
-        let directory = config.translation.model_directory.clone();
-        let site = config.translation.download_site;
-        drop(config);
-
-        match request {
-            TranslationRequest::Download { model } => {
-                self.start_model_download(model, site, false, cx);
-            }
-            TranslationRequest::Retry { model } => {
-                self.start_model_download(model, site, true, cx);
-            }
-            TranslationRequest::Resume { model } => {
-                let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
-                    return;
-                };
-                downloads.update(cx, |downloads, cx| {
-                    downloads.resume(model, directory, cx);
-                });
-            }
-            TranslationRequest::Terminate { model } => {
-                let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
-                    return;
-                };
-                downloads.update(cx, |downloads, cx| {
-                    downloads.terminate(model, directory, cx);
-                });
-            }
-            TranslationRequest::Delete { model } => {
-                let (Some(directory), Some(downloads)) = (directory, self.downloads.clone()) else {
-                    return;
-                };
-                downloads.update(cx, |downloads, cx| {
-                    downloads.delete(model, directory, cx);
-                });
-            }
-        }
-    }
-
-    /// Starts the download of `model` from `site`.
-    fn start_model_download(
-        &mut self,
-        model: TranslationModel,
-        site: DownloadSite,
-        retry: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let directory = self
-            .session
-            .read(cx)
-            .config(cx)
-            .translation
-            .model_directory
-            .clone();
-        let Some(directory) = directory else {
-            return;
-        };
-        let Some(downloads) = self.downloads.clone() else {
-            return;
-        };
-
-        downloads.update(cx, |downloads, cx| {
-            if retry {
-                downloads.retry(model, directory, site, cx);
-            } else {
-                downloads.download(model, directory, site, cx);
-            }
-        });
-    }
-
-    /// The directory the page shows, for the page's tests.
-    #[cfg(test)]
-    pub(crate) fn shown_directory(&self, cx: &gpui_kit::App) -> Option<SharedString> {
-        let config = self.session.read(cx).config(cx);
-
-        config
-            .translation
-            .model_directory
-            .as_ref()
-            .map(|path| SharedString::from(path.to_string_lossy().into_owned()))
-    }
-
-    /// Chooses a model the way the open menu does, for the settings page's tests.
-    #[cfg(test)]
-    pub(crate) fn select_model_for_test(
-        &mut self,
-        model: TranslationModel,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_model(model, cx);
-    }
-}
-
-impl Render for TranslationPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.handle_request(cx);
-
-        let config = self.session.read(cx).config(cx);
-        let directory = config.translation.model_directory.clone();
-        // What the menu offers is what the directory holds, minus what is being removed: a model
-        // whose files are on their way out is not one the page can load, so it is not one the
-        // user can pick.
-        let downloaded = self
-            .downloads
-            .as_ref()
-            .zip(directory.as_deref())
-            .map(|(downloads, directory)| downloads.read(cx).available_models(directory))
-            .unwrap_or_default();
-        let selected = config
-            .translation
-            .selected_model
-            .filter(|model| downloaded.contains(model));
-        let disabled = directory.is_none() || downloaded.is_empty();
-        let placeholder = if directory.is_some() {
-            t!(cx, "settings_ui.ai.no_downloaded_models")
-        } else {
-            t!(cx, "settings_ui.ai.no_model_directory")
-        };
-
-        let model_page = cx.entity().downgrade();
-        let model_label = t!(cx, "settings_ui.ai.model_in_use");
-        let model_choices = downloaded.iter().map(|model| {
-            (
-                SharedString::from(model.display_name()),
-                SharedString::from(model.display_name()),
-            )
-        });
-        let model_select = layout::choice_select(
-            ElementId::Name(SharedString::new_static("settings-ai-model-select")),
-            selected.map(|model| SharedString::from(model.display_name())),
-            model_choices,
-            model_label.clone(),
-            Some(placeholder.into_any_element()),
-            disabled,
-            move |item_id, _, cx| {
-                let Some(model) = item_id
-                    .as_ref()
-                    .and_then(|id| TranslationModel::from_name(id.as_str()))
-                else {
-                    return;
-                };
-                if let Some(page) = model_page.upgrade() {
-                    page.update(cx, |page, cx| page.select_model(model, cx));
-                }
-            },
-        );
-
-        let download_site = config.translation.download_site;
-        let site_page = cx.entity().downgrade();
-        let site_label_text = t!(cx, "settings_ui.ai.download_site");
-        let site_choices = DownloadSite::ALL.into_iter().map(|site| {
-            (
-                SharedString::new_static(site_id(site)),
-                site_label(site, cx),
-            )
-        });
-        let site_select = layout::choice_select(
-            ElementId::Name(SharedString::new_static("settings-ai-site-select")),
-            Some(SharedString::new_static(site_id(download_site))),
-            site_choices,
-            site_label_text,
-            None,
-            false,
-            move |item_id, _, cx| {
-                let Some(site) = item_id.as_ref().and_then(|id| site_from_id(id.as_str())) else {
-                    return;
-                };
-                let Some(page) = site_page.upgrade() else {
-                    return;
-                };
-                page.update(cx, |page, cx| {
-                    let change = SettingsChange::TranslationDownloadSite { site };
-                    page.session.update(cx, |session, cx| {
-                        let _ = session.write(change, cx);
-                    });
-                    cx.notify();
-                });
-            },
-        );
-
-        let directory_text = directory
-            .as_ref()
-            .map_or_else(SharedString::default, |path| {
-                SharedString::from(path.to_string_lossy().into_owned())
-            });
-        let directory_label = div()
-            .debug_selector(|| "SETTINGS_AI_DIRECTORY_LABEL".into())
-            .min_w_0()
-            .truncate()
-            .text_sm()
-            .text_color(cx.theme().roles.fg.muted.hsla)
-            .child(directory_text.clone());
-        let mut directory_hint = Tooltip::new(
-            ElementId::Name(SharedString::new_static("settings-ai-directory-tooltip")),
-            directory_label,
-        )
-        .min_w_0();
-        if !directory_text.is_empty() {
-            directory_hint = directory_hint.content(directory_text);
-        }
-
-        let directory_control = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .pr_2()
-                    .flex()
-                    .items_center()
-                    .child(directory_hint),
-            )
-            .child(
-                Button::new("settings-ai-browse")
-                    .tonal()
-                    .flex_none()
-                    .debug_selector(|| "SETTINGS_AI_BROWSE".into())
-                    .aria_label(t!(cx, "settings_ui.ai.browse"))
-                    .child(t!(cx, "settings_ui.ai.browse"))
-                    .on_click(cx.listener(|page, _, window, cx| {
-                        page.browse(window, cx);
-                    })),
-            )
-            .into_any_element();
-
-        let directory_row = div()
-            .debug_selector(|| "SETTINGS_AI_DIRECTORY".into())
-            .child(layout::row(
-                "ai.directory",
-                t!(cx, "settings_ui.ai.model_directory"),
-                t!(cx, "settings_ui.ai.model_directory_description"),
-                directory_control,
-                layout::CONTROL_WIDTH,
-                cx,
-            ))
-            .into_any_element();
-        let site_row = div()
-            .debug_selector(|| "SETTINGS_AI_DOWNLOAD_SITE".into())
-            .child(layout::row(
-                "ai.download-site",
-                t!(cx, "settings_ui.ai.download_site"),
-                t!(cx, "settings_ui.ai.download_site_description"),
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .debug_selector(|| "SETTINGS_AI_SITE_SELECT".into())
-                    .child(site_select)
-                    .into_any_element(),
-                layout::CONTROL_WIDTH,
-                cx,
-            ))
-            .into_any_element();
-        let model_row = div()
-            .debug_selector(|| "SETTINGS_AI_MODEL_SELECT_SECTION".into())
-            .child(layout::row(
-                "ai.model",
-                model_label,
-                t!(cx, "settings_ui.ai.model_in_use_description"),
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .debug_selector(|| "SETTINGS_AI_MODEL_SELECT".into())
-                    .child(model_select)
-                    .into_any_element(),
-                layout::CONTROL_WIDTH,
-                cx,
-            ))
-            .into_any_element();
-
-        div()
-            .debug_selector(|| "SETTINGS_AI_PAGE".into())
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .py_1()
-            .child(layout::section(
-                None,
-                "ai.translation",
-                vec![directory_row, site_row, model_row],
-                cx,
-            ))
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_AI_MODELS".into())
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(layout::section_title(t!(cx, "settings_ui.ai.models"), cx))
-                    .child(self.table.clone()),
-            )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use app_config::{settings::Config, translation::TranslationModel};
-    use app_config_provider::manager::ConfigManager;
-    use gpui_kit::{AppContext as _, Entity, TestAppContext};
-    use network::transport::hub::{TransportHub, TransportPolicy};
-    use tempfile::TempDir;
-    use widget_tokio_runtime::runtime::Runtime;
-
-    use super::TranslationPage;
-    use crate::{
-        session::SettingsSession,
-        translation_downloads::{DownloadState, TranslationDownloads, TranslationDownloadsDeps},
-    };
-
-    fn downloads(cx: &mut TestAppContext) -> Entity<TranslationDownloads> {
-        cx.update(|cx| {
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
-            let provider = download_provider::global::install(
-                cx,
-                download_provider::global::DownloadProviderDeps {
-                    transport: Arc::new(TransportHub::new(TransportPolicy::default())),
-                    runtime: Runtime::for_test(),
-                },
-            );
-            cx.new(|cx| {
-                TranslationDownloads::new(
-                    TranslationDownloadsDeps {
-                        provider,
-                        runtime: Runtime::for_test(),
-                        unload: Arc::new(|_: &std::path::Path| Ok(())),
-                    },
-                    cx,
-                )
-            })
-        })
-    }
-
-    /// Opens a session over the settings a manager holds, as the settings page does.
-    fn session_over(cx: &mut TestAppContext, config: Config) -> Entity<SettingsSession> {
-        cx.update(|cx| {
-            let manager = ConfigManager::in_memory(config, cx);
-            cx.set_global(manager);
-            cx.new(|_| SettingsSession::new())
-        })
-    }
-
-    /// The settings as they are stored now.
-    fn stored(cx: &TestAppContext) -> Config {
-        cx.read(|cx| cx.global::<ConfigManager>().read().as_ref().clone())
-    }
-
-    /// Opens the page the way moving to it does, and lets its deferred repair run.
-    fn open(page: &Entity<TranslationPage>, cx: &mut TestAppContext) {
-        cx.update(|cx| page.update(cx, |page, cx| page.repair_on_open(cx)));
-        cx.run_until_parked();
-    }
-
-    /// The table offers a download only when both the process-wide manager and a directory
-    /// exist: without either there is nothing a download could start.
-    #[gpui_kit::test]
-    fn the_table_should_offer_no_download_without_a_manager_or_a_directory(
-        cx: &mut TestAppContext,
-    ) {
-        let directory = TempDir::new().expect("the test directory builds");
-        let downloads = downloads(cx);
-        let session = session_over(cx, Config::default());
-
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, None, cx)));
-
-        assert!(
-            !cx.read(|cx| page.read(cx).table.read(cx).downloads_enabled()),
-            "a page without the process-wide manager cannot download"
-        );
-
-        let mut config = Config::default();
-        config.translation.model_directory = None;
-        let session = session_over(cx, config);
-        let page =
-            cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads.clone()), cx)));
-
-        assert!(
-            !cx.read(|cx| page.read(cx).table.read(cx).downloads_enabled()),
-            "a session with no directory cannot download"
-        );
-
-        let mut config = Config::default();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let session = session_over(cx, config);
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads), cx)));
-
-        assert!(
-            cx.read(|cx| page.read(cx).table.read(cx).downloads_enabled()),
-            "the manager and a directory are what the download action needs"
-        );
-    }
-
-    /// A selection the stored directory does not hold is cleared when the page is opened.
-    #[gpui_kit::test]
-    fn a_page_should_clear_a_selection_the_directory_does_not_hold(cx: &mut TestAppContext) {
-        let directory = TempDir::new().expect("the test directory builds");
-        let downloads = downloads(cx);
-        let mut config = Config::default();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        config.translation.selected_model = Some(TranslationModel::HyMt218BQ4Km);
-        let session = session_over(cx, config);
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads), cx)));
-
-        open(&page, cx);
-
-        let config = stored(cx);
-        assert_eq!(
-            config.translation.selected_model, None,
-            "a model the directory does not hold must not stay selected"
-        );
-        assert_eq!(
-            config.translation.model_directory,
-            Some(directory.path().to_path_buf()),
-            "the directory itself is already stored and is not replaced"
-        );
-    }
-
-    /// A selection whose files are on their way out is cleared even though the file is still
-    /// there when the page opens.
-    #[gpui_kit::test]
-    fn a_page_should_clear_a_selection_that_is_being_removed(cx: &mut TestAppContext) {
-        let directory = TempDir::new().expect("the test directory builds");
-        let model = TranslationModel::HyMt27BQ8;
-        let downloads = downloads(cx);
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(model, directory.path().to_path_buf(), cx);
-            downloads.set_state_for_test(
-                model,
-                directory.path().to_path_buf(),
-                DownloadState::Deleting,
-                cx,
-            );
-        });
-        let mut config = Config::default();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        config.translation.selected_model = Some(model);
-        let session = session_over(cx, config);
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads), cx)));
-
-        open(&page, cx);
-
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "a model being removed must not stay selected"
-        );
-    }
-
-    /// A model can only be selected while the directory holds it and its row is not being
-    /// removed; a choice that stopped being available clears the selection instead of writing
-    /// a model the page cannot load.
-    #[gpui_kit::test]
-    fn a_model_should_only_be_selected_while_the_directory_can_load_it(cx: &mut TestAppContext) {
-        let directory = TempDir::new().expect("the test directory builds");
-        let downloaded = TranslationModel::HyMt218BQ4Km;
-        let missing = TranslationModel::HyMt27BQ8;
-        let removing = TranslationModel::HyMt218BQ6K;
-        let downloads = downloads(cx);
-        downloads.update(cx, |downloads, cx| {
-            downloads.force_downloaded_for_test(downloaded, directory.path().to_path_buf(), cx);
-            downloads.force_downloaded_for_test(removing, directory.path().to_path_buf(), cx);
-            downloads.set_state_for_test(
-                removing,
-                directory.path().to_path_buf(),
-                DownloadState::Deleting,
-                cx,
-            );
-        });
-        let mut config = Config::default();
-        config.translation.model_directory = Some(directory.path().to_path_buf());
-        let session = session_over(cx, config);
-        let page = cx.update(|cx| cx.new(|cx| TranslationPage::new(session, Some(downloads), cx)));
-
-        cx.update(|cx| page.update(cx, |page, cx| page.select_model(downloaded, cx)));
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            Some(downloaded),
-            "a downloaded model the directory holds is selected"
-        );
-
-        cx.update(|cx| page.update(cx, |page, cx| page.select_model(missing, cx)));
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "a model the directory does not hold clears the selection"
-        );
-
-        cx.update(|cx| page.update(cx, |page, cx| page.select_model(removing, cx)));
-        assert_eq!(
-            stored(cx).translation.selected_model,
-            None,
-            "a model whose files are being removed clears the selection"
-        );
     }
 }

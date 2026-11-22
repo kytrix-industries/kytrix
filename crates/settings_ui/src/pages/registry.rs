@@ -1,18 +1,20 @@
 //! Every page the settings offer, and the search index over them.
 //!
 //! This is navigation metadata, not a description of a page's UI: a page is named, placed in the
-//! sidebar and given the words a search reaches it by, and its module draws the page itself. A
-//! new setting is added in the page module that holds it; only a new page is added here.
+//! sidebar and given the words a search reaches it by, and its module draws the page itself. A new
+//! setting is added in the page module that holds it; only a new page is added here.
 
-use gpui_kit::{AnyElement, App, SharedString};
-use i18n::t;
+use i18n::translate::Translate;
 use market_participants_connector::venue::definition::supported_venues;
 use market_participants_model::identifier::VenueId;
+use smol_str::{SmolStr, format_smolstr};
 use widget::venue::VenueDisplay;
 
 use crate::{
-    layout::PageArgs,
-    pages::{about, appearance, configure, data_format, venues},
+    host::SettingsHost,
+    pages::{
+        about, appearance, configure, data_format, page::PageView, proxy, translation, venues,
+    },
     search::{PageSearch, SearchFilter, SearchNode, words},
 };
 
@@ -33,41 +35,41 @@ pub(crate) enum PageId {
 
 impl PageId {
     /// The id a selection and a search both name this page by.
-    pub(crate) fn id(self) -> SharedString {
+    pub(crate) fn id(self) -> SmolStr {
         match self {
-            Self::Appearance => SharedString::new_static("appearance"),
-            Self::DataFormat => SharedString::new_static("data-format"),
-            Self::Translation => SharedString::new_static("ai.translation"),
-            Self::ServerManagement => SharedString::new_static("server-management"),
-            Self::Configure => SharedString::new_static("configure"),
-            Self::Venue(venue) => {
-                SharedString::from(format!("market_participants.{}", venue.as_str()))
-            }
-            Self::About => SharedString::new_static("about"),
+            Self::Appearance => SmolStr::new_static("appearance"),
+            Self::DataFormat => SmolStr::new_static("data-format"),
+            Self::Translation => SmolStr::new_static("ai.translation"),
+            Self::ServerManagement => SmolStr::new_static("server-management"),
+            Self::Configure => SmolStr::new_static("configure"),
+            Self::Venue(venue) => format_smolstr!("market_participants.{}", venue.as_str()),
+            Self::About => SmolStr::new_static("about"),
         }
     }
 
     /// The name this page is drawn with.
-    pub(crate) fn title(self, cx: &App) -> SharedString {
+    pub(crate) fn title(self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Appearance => t!(cx, "settings_ui.appearance.title"),
-            Self::DataFormat => t!(cx, "settings_ui.data_format.title"),
-            Self::Translation => t!(cx, "settings_ui.ai.translation.title"),
-            Self::ServerManagement => t!(cx, "settings_ui.proxies.server_management"),
-            Self::Configure => t!(cx, "settings_ui.proxies.configure"),
-            Self::Venue(venue) => t!(cx, venue.name_key()),
-            Self::About => t!(cx, "settings_ui.about.title"),
+            Self::Appearance => i18n::t_smol!(translate, "settings_ui.appearance.title"),
+            Self::DataFormat => i18n::t_smol!(translate, "settings_ui.data_format.title"),
+            Self::Translation => i18n::t_smol!(translate, "settings_ui.ai.translation.title"),
+            Self::ServerManagement => {
+                i18n::t_smol!(translate, "settings_ui.proxies.server_management")
+            }
+            Self::Configure => i18n::t_smol!(translate, "settings_ui.proxies.configure"),
+            Self::Venue(venue) => i18n::t_smol!(translate, venue.name_key()),
+            Self::About => i18n::t_smol!(translate, "settings_ui.about.title"),
         }
     }
 
     /// The text this page and its settings are searched by.
-    pub(crate) fn search(self, cx: &App) -> PageSearch {
+    pub(crate) fn search(self, translate: &Translate) -> PageSearch {
         match self {
-            Self::Appearance => appearance::search(cx),
-            Self::DataFormat => data_format::search(cx),
-            Self::Translation => crate::pages::translation::page::search(cx),
+            Self::Appearance => appearance::search(translate),
+            Self::DataFormat => data_format::search(translate),
+            Self::Translation => translation::page::search(translate),
             Self::ServerManagement => {
-                let title = t!(cx, "settings_ui.proxies.server_management");
+                let title = i18n::t_smol!(translate, "settings_ui.proxies.server_management");
 
                 PageSearch {
                     label: words(&[
@@ -83,15 +85,10 @@ impl PageId {
                     fields: Vec::new(),
                 }
             }
-            Self::Configure => configure::search(cx),
-            Self::Venue(venue) => venues::dispatcher::search(venue, cx),
-            Self::About => about::search(cx),
+            Self::Configure => configure::search(translate),
+            Self::Venue(venue) => venues::dispatcher::search(venue, translate),
+            Self::About => about::search(translate),
         }
-    }
-
-    /// Whether this page is the translation view.
-    pub(crate) fn is_translation(self) -> bool {
-        matches!(self, Self::Translation)
     }
 }
 
@@ -176,71 +173,78 @@ pub(crate) fn page(id: &str) -> Option<PageId> {
 /// A page is reached by its own label and keywords, or through any setting it holds: a query that
 /// names a setting on a page is a query that can open that page, and the page draws only the
 /// settings that matched.
-pub(crate) fn page_is_reachable(page: PageId, filter: &SearchFilter, cx: &App) -> bool {
+pub(crate) fn page_is_reachable(
+    page: PageId,
+    filter: &SearchFilter,
+    translate: &Translate,
+) -> bool {
     let id = page.id();
     filter.admits_page(id.as_ref())
         || page
-            .search(cx)
+            .search(translate)
             .fields
             .iter()
             .any(|field| filter.admits_field(id.as_ref(), field.id.as_ref()))
 }
 
 /// The first page a filter leaves reachable, in the order the sidebar draws them.
-pub(crate) fn first_admitted_page(filter: &SearchFilter, cx: &App) -> Option<PageId> {
+pub(crate) fn first_admitted_page(filter: &SearchFilter, translate: &Translate) -> Option<PageId> {
     pages()
         .into_iter()
-        .find(|page| page_is_reachable(*page, filter, cx))
+        .find(|page| page_is_reachable(*page, filter, translate))
 }
 
 /// The search index the sidebar and the pages are filtered by.
-pub(crate) fn search_nodes(cx: &App) -> Vec<SearchNode> {
+pub(crate) fn search_nodes(translate: &Translate) -> Vec<SearchNode> {
     let mut nodes = Vec::new();
 
     for group in groups() {
-        let label = t!(cx, group.label_key);
+        let label = i18n::t_smol!(translate, group.label_key);
         let mut parts = Vec::with_capacity(group.keywords.len() + 1);
         parts.push(label.as_ref());
         parts.extend(group.keywords.iter().copied());
 
         nodes.push(SearchNode {
-            id: SharedString::new_static(group.id),
+            id: SmolStr::new_static(group.id),
             page: None,
             keywords: vec![words(&parts)],
             children: group
                 .pages
                 .iter()
-                .map(|page| page_node(*page, cx))
+                .map(|page| page_node(*page, translate))
                 .collect(),
         });
     }
-    nodes.extend(root_pages().into_iter().map(|page| page_node(page, cx)));
+    nodes.extend(
+        root_pages()
+            .into_iter()
+            .map(|page| page_node(page, translate)),
+    );
 
     nodes
 }
 
-fn page_node(page: PageId, cx: &App) -> SearchNode {
+fn page_node(page: PageId, translate: &Translate) -> SearchNode {
     SearchNode {
         id: page.id(),
-        page: Some(page.search(cx)),
+        page: Some(page.search(translate)),
         keywords: Vec::new(),
         children: Vec::new(),
     }
 }
 
-/// Draws one page that is a list of native setting rows.
+/// Opens the page one id names, the way a page switch opens it.
 ///
-/// The two views that own their layout — the translation page and the proxy catalog — are drawn
-/// by the settings page itself and never reach this function.
-pub(crate) fn render_page(page: PageId, args: &mut PageArgs<'_, '_>) -> AnyElement {
+/// The two views that own their layout — the translation page and the proxy catalog — are values of
+/// their own; the pages that are a list of setting rows are built by their module.
+pub(crate) fn page_view(page: PageId, host: &SettingsHost, key: &str) -> Box<dyn PageView> {
     match page {
-        PageId::Appearance => appearance::render(args),
-        PageId::DataFormat => data_format::render(args),
-        PageId::About => about::render(args),
-        PageId::Configure => configure::render(args),
-        PageId::Venue(venue) => venues::dispatcher::render(venue, args),
-        PageId::Translation | PageId::ServerManagement => {
-            unreachable!("the translation and proxy pages are drawn by their own views")
-        }
+        PageId::Appearance => Box::new(appearance::AppearancePage::new(host.clone(), key)),
+        PageId::DataFormat => Box::new(data_format::DataFormatPage::new(host.clone(), key)),
+        PageId::About => Box::new(about::AboutPage::new(host.clone(), key)),
+        PageId::Configure => Box::new(configure::ConfigurePage::new(host.clone(), key)),
+        PageId::Venue(venue) => venues::dispatcher::page_view(venue, host, key),
+        PageId::Translation => Box::new(translation::page::TranslationPage::new(host.clone(), key)),
+        PageId::ServerManagement => Box::new(proxy::table::ProxyTablePage::new(host.clone(), key)),
     }
 }

@@ -1,19 +1,37 @@
 //! OKX's page: the service region the account belongs to, and the credentials it authenticates with.
 
-use app_config::market_participants::{origins::OkxRegion, settings::VenueSettings};
-use gpui_kit::{AnyElement, App, IntoElement, SharedString};
-use i18n::t;
+use app_config::{
+    market_participants::{origins::OkxRegion, settings::VenueSettings},
+    settings::Config,
+};
+use i18n::translate::Translate;
 use market_participants_model::identifier::VenueId;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
 
 use crate::{
-    layout::{self, PageArgs},
-    pages::venues::{
-        credentials::{self, CredentialsKind},
-        shared,
+    host::SettingsHost,
+    layout::{self, RowFn},
+    pages::{
+        page::{PageBuild, PageView},
+        venues::{
+            credentials::{CredentialsArea, CredentialsKind},
+            shared::{self, VenueSelect},
+        },
     },
     search::FieldSearch,
 };
 
+/// The id of this page's settings.
+const PAGE: &str = "market_participants.okx";
+
+/// The region row, as the search filter and the tests name it.
+const REGION_FIELD: &str = "market_participants.okx.region";
+
+/// The id of the card this page's rows are drawn in.
+const SECTION_ID: &str = "market_participants.okx_0";
+
+/// The region choices, in the order the control offers them.
 const REGION_OPTIONS: [(OkxRegion, &str); 3] = [
     (
         OkxRegion::Global,
@@ -29,90 +47,138 @@ const REGION_OPTIONS: [(OkxRegion, &str); 3] = [
     ),
 ];
 
-pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
-    let venue = VenueId::Okx;
-    let page_id = shared::page_id(&venue);
-    let mut rows = Vec::new();
-
-    let region_id = format!("{page_id}.region");
-    if args.filter.admits_field(page_id.as_ref(), &region_id) {
-        let label = t!(args.cx, "settings_ui.market_participants.service_region");
-        let description = t!(
-            args.cx,
-            "settings_ui.market_participants.service_region_description"
-        );
-        let current = match args.config.venue(&venue) {
-            Some(VenueSettings::Okx(settings)) => settings.region,
-            _ => OkxRegion::default(),
-        };
-        let choices = REGION_OPTIONS.into_iter().map(|(region, label_key)| {
-            (
-                SharedString::new_static(region.as_str()),
-                t!(args.cx, label_key),
-            )
-        });
-        let select = layout::choice_select(
-            layout::element_id("settings-select", &region_id),
-            Some(SharedString::new_static(current.as_str())),
-            choices,
-            label.clone(),
-            None,
-            false,
-            layout::on_select(args.handle, move |config, value| {
-                let Some(region) = OkxRegion::ALL
-                    .iter()
-                    .find(|region| region.as_str() == value)
-                else {
-                    return;
-                };
-                config.set_okx_region(&venue, *region);
-            }),
-        );
-
-        rows.push(layout::row(
-            &region_id,
-            label,
-            description,
-            select.into_any_element(),
-            layout::CONTROL_WIDTH,
-            args.cx,
-        ));
-    }
-
-    let credentials = CredentialsKind::Okx;
-    if args
-        .filter
-        .admits_field(page_id.as_ref(), credentials.row_id())
-    {
-        rows.push(credentials::credentials_row(args, credentials));
-    }
-
-    if rows.is_empty() {
-        return layout::page(Vec::new());
-    }
-
-    layout::page(vec![layout::section(
-        None,
-        "market_participants.okx_0",
-        rows,
-        args.cx,
-    )])
+/// The OKX page.
+pub(crate) struct VenuePage {
+    host: SettingsHost,
+    selects: Vec<VenueSelect>,
+    credentials: CredentialsArea,
 }
 
-pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
+impl VenuePage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs
+    /// to.
+    pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
+        Self {
+            host,
+            selects: Vec::new(),
+            credentials: CredentialsArea::new(),
+        }
+    }
+}
+
+impl PageView for VenuePage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
+
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let venue = VenueId::Okx;
+        let mut rows: Vec<RowFn> = Vec::with_capacity(2);
+
+        if cx.filter.admits_field(PAGE, REGION_FIELD) {
+            let label = i18n::t_smol!(translate, "settings_ui.market_participants.service_region");
+            let description = i18n::t_smol!(
+                translate,
+                "settings_ui.market_participants.service_region_description"
+            );
+            let choices = REGION_OPTIONS
+                .into_iter()
+                .map(|(region, label_key)| {
+                    (
+                        SmolStr::new_static(region.as_str()),
+                        i18n::t_smol!(translate, label_key),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current = move |config: &Config| {
+                let region = match config.venue(&venue) {
+                    Some(VenueSettings::Okx(settings)) => settings.region,
+                    _ => OkxRegion::default(),
+                };
+                SmolStr::new_static(region.as_str())
+            };
+            let select = VenueSelect::new(
+                app,
+                &self.host,
+                window,
+                shared::control_key(cx, REGION_FIELD),
+                current,
+                choices,
+                label.clone(),
+                move |config, value| {
+                    let Some(region) = OkxRegion::ALL
+                        .iter()
+                        .find(|region| region.as_str() == value)
+                    else {
+                        return;
+                    };
+                    config.set_okx_region(&venue, *region);
+                },
+            );
+            rows.push(select.row(&theme, REGION_FIELD, label, description));
+            self.selects.push(select);
+        }
+
+        let kind = CredentialsKind::Okx;
+        if cx.filter.admits_field(PAGE, kind.row_id()) {
+            let base_key = shared::control_key(cx, kind.row_id());
+            rows.push(
+                self.credentials
+                    .row(app, window, &self.host, base_key, kind, &theme)?,
+            );
+        }
+
+        layout::section(app, window, parent, &theme, SECTION_ID, None, rows)
+    }
+
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        for select in &self.selects {
+            select.sync(app)?;
+        }
+        self.credentials.sync(app)
+    }
+
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        for select in &self.selects {
+            consumed |= select.dispatch(app, event);
+        }
+        consumed |= self.credentials.dispatch(app, event);
+
+        consumed
+    }
+
+    fn release(&mut self, app: &mut App) {
+        for select in self.selects.drain(..) {
+            select.release(app);
+        }
+        self.credentials.release(app);
+    }
+}
+
+/// The search rows of the settings this page draws.
+pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     let venue = VenueId::Okx;
     let page_id = shared::page_id(&venue);
-    let label = t!(cx, "settings_ui.market_participants.service_region");
-    let description = t!(
-        cx,
+    let label = i18n::t_smol!(translate, "settings_ui.market_participants.service_region");
+    let description = i18n::t_smol!(
+        translate,
         "settings_ui.market_participants.service_region_description"
     );
 
     vec![
         shared::origin_search_field(
-            format!("{page_id}.region"),
-            label.as_ref(),
-            description.as_ref(),
+            format_smolstr!("{page_id}.region"),
+            label,
+            description,
             &[
                 "market_participants",
                 "okx",
@@ -122,6 +188,6 @@ pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
                 "市场参与者",
             ],
         ),
-        CredentialsKind::Okx.search_field(cx),
+        CredentialsKind::Okx.search_field(translate),
     ]
 }

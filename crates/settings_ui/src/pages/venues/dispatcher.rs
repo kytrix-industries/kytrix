@@ -4,35 +4,39 @@
 //! fact of the venue rather than of a declaration, so adding a venue adds a page beside the venues
 //! already served, and the compiler is what says one is missing.
 
-use gpui_kit::{AnyElement, App};
-use i18n::t;
+use i18n::translate::Translate;
 use market_participants_model::identifier::VenueId;
 use widget::venue::VenueDisplay;
 
 use crate::{
-    layout::PageArgs,
-    pages::venues::{binance, hyperliquid, longbridge, okx, polymarket},
+    host::SettingsHost,
+    pages::{
+        page::PageView,
+        venues::{binance, hyperliquid, longbridge, okx, polymarket},
+    },
     search::{PageSearch, words},
 };
 
-pub(crate) fn render(venue: VenueId, args: &mut PageArgs<'_, '_>) -> AnyElement {
+/// Opens the page of one venue.
+pub(crate) fn page_view(venue: VenueId, host: &SettingsHost, key: &str) -> Box<dyn PageView> {
     match venue {
-        VenueId::Binance => binance::render(args),
-        VenueId::Okx => okx::render(args),
-        VenueId::Hyperliquid => hyperliquid::render(args),
-        VenueId::Longbridge => longbridge::render(args),
-        VenueId::Polymarket => polymarket::render(args),
+        VenueId::Binance => Box::new(binance::VenuePage::new(host.clone(), key)),
+        VenueId::Okx => Box::new(okx::VenuePage::new(host.clone(), key)),
+        VenueId::Hyperliquid => Box::new(hyperliquid::VenuePage::new(host.clone(), key)),
+        VenueId::Longbridge => Box::new(longbridge::VenuePage::new(host.clone(), key)),
+        VenueId::Polymarket => Box::new(polymarket::VenuePage::new(host.clone(), key)),
     }
 }
 
-pub(crate) fn search(venue: VenueId, cx: &App) -> PageSearch {
-    let title = t!(cx, venue.name_key());
+/// The text one venue's page and its settings are searched by.
+pub(crate) fn search(venue: VenueId, translate: &Translate) -> PageSearch {
+    let title = i18n::t_smol!(translate, venue.name_key());
     let fields = match venue {
-        VenueId::Binance => binance::search_fields(cx),
-        VenueId::Okx => okx::search_fields(cx),
-        VenueId::Hyperliquid => hyperliquid::search_fields(cx),
-        VenueId::Longbridge => longbridge::search_fields(cx),
-        VenueId::Polymarket => polymarket::search_fields(cx),
+        VenueId::Binance => binance::search_fields(translate),
+        VenueId::Okx => okx::search_fields(translate),
+        VenueId::Hyperliquid => hyperliquid::search_fields(translate),
+        VenueId::Longbridge => longbridge::search_fields(translate),
+        VenueId::Polymarket => polymarket::search_fields(translate),
     };
 
     PageSearch {

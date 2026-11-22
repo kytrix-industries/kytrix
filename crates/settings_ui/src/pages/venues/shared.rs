@@ -5,6 +5,8 @@
 //! updated, how a published address is offered as a choice, and how a row is described to the
 //! search. The layout of a page stays in the page that draws it.
 
+use std::rc::Rc;
+
 use app_config::{
     market_participants::{
         origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
@@ -12,13 +14,17 @@ use app_config::{
     },
     settings::Config,
 };
-use base_ui::select::Select;
-use gpui_kit::SharedString;
+use base_ui::{kit::select::Select, theme::handle::ThemeHandle};
 use market_participants_model::identifier::VenueId;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{app::App, error::EngineError, event::Event, window::WindowId};
 
 use crate::{
-    layout::{self, PageArgs},
+    host::SettingsHost,
+    layout::{self, RowFn},
+    pages::page::PageBuild,
     search::{FieldSearch, words},
+    session::SettingsChange,
 };
 
 /// Which of one scope's two addresses a row writes.
@@ -100,54 +106,149 @@ pub(crate) fn write_binance_origin(
     config.set_binance_market_origins(venue, market, &origins);
 }
 
-/// A select over the published addresses of one origin row.
-pub(crate) fn address_select(
-    args: &mut PageArgs<'_, '_>,
-    field_id: &str,
-    selected: &str,
-    choices: impl IntoIterator<Item = &'static str>,
-    label: SharedString,
-    apply: impl Fn(&mut Config, &str) + 'static,
-) -> Select {
-    let choices = choices.into_iter().map(|address| {
-        (
-            SharedString::new_static(address),
-            SharedString::new_static(address),
-        )
-    });
-
-    layout::choice_select(
-        layout::element_id("settings-origin", field_id),
-        Some(SharedString::from(selected)),
-        choices,
-        label,
-        None,
-        false,
-        layout::on_select(args.handle, apply),
-    )
-}
-
 /// The search row of one origin.
 pub(crate) fn origin_search_field(
-    id: impl Into<SharedString>,
-    label: &str,
-    description: &str,
+    id: SmolStr,
+    label: SmolStr,
+    description: SmolStr,
     keywords: &[&str],
 ) -> FieldSearch {
-    let id = id.into();
     let mut parts = Vec::with_capacity(keywords.len() + 3);
     parts.push(id.as_ref());
-    parts.push(label);
-    parts.push(description);
+    parts.push(label.as_ref());
+    parts.push(description.as_ref());
     parts.extend_from_slice(keywords);
+    let text = words(&parts);
 
-    FieldSearch {
-        text: words(&parts),
-        id,
-    }
+    FieldSearch { id, text }
 }
 
 /// The page id one venue's settings are drawn under.
-pub(crate) fn page_id(venue: &VenueId) -> SharedString {
-    SharedString::from(format!("market_participants.{}", venue.as_str()))
+pub(crate) fn page_id(venue: &VenueId) -> SmolStr {
+    format_smolstr!("market_participants.{}", venue.as_str())
+}
+
+/// The application-level key one control of a venue page is named by.
+///
+/// It is the settings page instance's key followed by the row's field id, which already names the
+/// page: two panes showing the same page are two settings page instances, so their controls are
+/// two identities and one pane's control never dispatches the other pane's handler.
+pub(crate) fn control_key(cx: &PageBuild<'_>, field_id: &str) -> SmolStr {
+    format_smolstr!("{}.{field_id}", cx.key)
+}
+
+/// A select over the published addresses of one origin row.
+///
+/// The choices are the addresses themselves: a published address is its own id and its own label,
+/// and a value no table publishes writes nothing (see [`write_binance_origin`]).
+pub(crate) fn address_select(
+    app: &mut App,
+    host: &SettingsHost,
+    window: WindowId,
+    key: SmolStr,
+    choices: impl IntoIterator<Item = &'static str>,
+    label: SmolStr,
+    current: impl Fn(&Config) -> SmolStr + 'static,
+    apply: impl Fn(&mut Config, &str) + 'static,
+) -> VenueSelect {
+    let choices = choices.into_iter().map(|address| {
+        let address = SmolStr::new_static(address);
+        (address.clone(), address)
+    });
+
+    VenueSelect::new(app, host, window, key, current, choices, label, apply)
+}
+
+/// One setting of a venue page as the page draws it: the value the settings hold and the selector
+/// that writes it.
+///
+/// The selector is a value the page keeps: it is what `sync` writes the settings of the frame into
+/// and what `release` gives back. A value the settings hold that no choice names is still handed to
+/// the selector — the row shows what the settings hold, not what the table offers — and the address
+/// writers ignore a value they do not publish, so such a row writes nothing until it is changed.
+pub(crate) struct VenueSelect {
+    host: SettingsHost,
+    select: Select,
+    /// The value the settings hold for this row, read for the frame's `sync`.
+    current: Box<dyn Fn(&Config) -> SmolStr>,
+}
+
+impl VenueSelect {
+    /// The selector over `choices`, writing what the user chose through `apply`.
+    ///
+    /// `current` reads the value the row draws from the settings; it is read once here for the
+    /// first frame and on every `sync` afterwards.
+    pub(crate) fn new(
+        app: &mut App,
+        host: &SettingsHost,
+        window: WindowId,
+        key: SmolStr,
+        current: impl Fn(&Config) -> SmolStr + 'static,
+        choices: impl IntoIterator<Item = (SmolStr, SmolStr)>,
+        label: SmolStr,
+        apply: impl Fn(&mut Config, &str) + 'static,
+    ) -> Self {
+        let selected = host.config(app, |config| current(config));
+        let write_host = host.clone();
+        let apply = Rc::new(apply);
+        let select = layout::choice_select(
+            app,
+            host,
+            key,
+            selected.as_str(),
+            choices,
+            label,
+            move |app, value| {
+                let value = SmolStr::new(value);
+                let apply = Rc::clone(&apply);
+                let _ = write_host.write(
+                    app,
+                    window,
+                    SettingsChange::edit(move |config| apply(config, value.as_str())),
+                );
+            },
+        );
+
+        Self {
+            host: host.clone(),
+            select,
+            current: Box::new(current),
+        }
+    }
+
+    /// The row this selector is drawn in.
+    pub(crate) fn row(
+        &self,
+        theme: &ThemeHandle,
+        id: &'static str,
+        label: SmolStr,
+        description: SmolStr,
+    ) -> RowFn {
+        let select = self.select.clone();
+        layout::row(theme, id, label, description, move |app, window, parent| {
+            select.mount(app, window, parent)?;
+            Ok(())
+        })
+    }
+
+    /// Makes the selector show the value the settings hold for this frame.
+    ///
+    /// # Errors
+    /// The selector refused a write (`StaleNode`, or a selector whose nodes were removed).
+    pub(crate) fn sync(&self, app: &mut App) -> Result<(), EngineError> {
+        let value = self.host.config(app, |config| (self.current)(config));
+        self.select.set_chosen(app, [value.as_str()], false);
+        self.select.sync(app)?;
+        Ok(())
+    }
+
+    /// Offers one platform event to the selector.
+    pub(crate) fn dispatch(&self, app: &mut App, event: &Event) -> bool {
+        self.select.dispatch(app, event)
+    }
+
+    /// Releases the selector.
+    pub(crate) fn release(&self, app: &mut App) {
+        self.select.release(app);
+    }
 }

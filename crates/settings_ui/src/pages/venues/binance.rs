@@ -1,156 +1,237 @@
 //! Binance's page: the two markets the venue publishes, each with its origins and credentials.
 
-use app_config::market_participants::origins::{
-    BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin,
+use app_config::{
+    market_participants::origins::{BinanceHttpOrigin, BinanceMarket, BinanceWebsocketOrigin},
+    settings::Config,
 };
-use gpui_kit::{AnyElement, App, IntoElement, SharedString};
-use i18n::t;
+use i18n::translate::Translate;
 use market_participants_model::identifier::VenueId;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
 
 use crate::{
-    layout::{self, PageArgs},
-    pages::venues::{
-        credentials::{self, CredentialsKind},
-        shared::{self, OriginKind},
+    host::SettingsHost,
+    layout::{self, RowFn},
+    pages::{
+        page::{PageBuild, PageView},
+        venues::{
+            credentials::{self, CredentialsArea, CredentialsKind},
+            shared::{self, OriginKind, VenueSelect},
+        },
     },
     search::FieldSearch,
 };
 
-pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
-    let venue = VenueId::Binance;
-    let page_id = shared::page_id(&venue);
-    let mut groups = Vec::new();
+/// The id of this page's settings.
+const PAGE: &str = "market_participants.binance";
 
-    for (index, market) in BinanceMarket::ALL.into_iter().enumerate() {
-        let scope = market.scope();
-        let mut rows = Vec::new();
-        let origins = shared::binance_origins(args.config, &venue, market);
+/// The Binance page.
+pub(crate) struct VenuePage {
+    host: SettingsHost,
+    selects: Vec<VenueSelect>,
+    credentials: CredentialsArea,
+}
 
-        let http_id = format!("{page_id}.{scope}.http");
-        if args.filter.admits_field(page_id.as_ref(), &http_id) {
-            let label = t!(args.cx, OriginKind::Http.label_key());
-            let description = t!(args.cx, OriginKind::Http.description_key());
-            let selected = origins
-                .as_ref()
-                .map_or_else(|| market.http(), |origins| origins.http);
-
-            let select = shared::address_select(
-                args,
-                &http_id,
-                selected.as_str(),
-                BinanceHttpOrigin::for_market(market)
-                    .iter()
-                    .map(BinanceHttpOrigin::as_str),
-                label.clone(),
-                move |config, value| {
-                    shared::write_binance_origin(config, &venue, market, OriginKind::Http, value)
-                },
-            );
-
-            rows.push(layout::row(
-                &http_id,
-                label,
-                description,
-                select.into_any_element(),
-                layout::CONTROL_WIDTH,
-                args.cx,
-            ));
+impl VenuePage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs
+    /// to.
+    pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
+        Self {
+            host,
+            selects: Vec::new(),
+            credentials: CredentialsArea::new(),
         }
+    }
+}
 
-        let websocket_id = format!("{page_id}.{scope}.websocket");
-        if args.filter.admits_field(page_id.as_ref(), &websocket_id) {
-            let label = t!(args.cx, OriginKind::Websocket.label_key());
-            let description = t!(args.cx, OriginKind::Websocket.description_key());
-            let selected = origins
-                .as_ref()
-                .map_or_else(|| market.websocket(), |origins| origins.websocket);
+impl PageView for VenuePage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
 
-            let select = shared::address_select(
-                args,
-                &websocket_id,
-                selected.as_str(),
-                BinanceWebsocketOrigin::for_market(market)
-                    .iter()
-                    .map(BinanceWebsocketOrigin::as_str),
-                label.clone(),
-                move |config, value| {
-                    shared::write_binance_origin(
-                        config,
-                        &venue,
-                        market,
-                        OriginKind::Websocket,
-                        value,
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let venue = VenueId::Binance;
+
+        for market in BinanceMarket::ALL {
+            let mut rows: Vec<RowFn> = Vec::with_capacity(3);
+
+            let http_field = http_id(market);
+            if cx.filter.admits_field(PAGE, http_field) {
+                let label = i18n::t_smol!(translate, OriginKind::Http.label_key());
+                let description = i18n::t_smol!(translate, OriginKind::Http.description_key());
+                let current = move |config: &Config| {
+                    shared::binance_origins(config, &venue, market).map_or_else(
+                        || SmolStr::new_static(market.http().as_str()),
+                        |origins| SmolStr::new_static(origins.http.as_str()),
                     )
-                },
-            );
+                };
+                let select = shared::address_select(
+                    app,
+                    &self.host,
+                    window,
+                    shared::control_key(cx, http_field),
+                    BinanceHttpOrigin::for_market(market)
+                        .iter()
+                        .map(BinanceHttpOrigin::as_str),
+                    label.clone(),
+                    current,
+                    move |config, value| {
+                        shared::write_binance_origin(
+                            config,
+                            &venue,
+                            market,
+                            OriginKind::Http,
+                            value,
+                        );
+                    },
+                );
+                rows.push(select.row(&theme, http_field, label, description));
+                self.selects.push(select);
+            }
 
-            rows.push(layout::row(
-                &websocket_id,
-                label,
-                description,
-                select.into_any_element(),
-                layout::CONTROL_WIDTH,
-                args.cx,
-            ));
+            let websocket_field = websocket_id(market);
+            if cx.filter.admits_field(PAGE, websocket_field) {
+                let label = i18n::t_smol!(translate, OriginKind::Websocket.label_key());
+                let description = i18n::t_smol!(translate, OriginKind::Websocket.description_key());
+                let current = move |config: &Config| {
+                    shared::binance_origins(config, &venue, market).map_or_else(
+                        || SmolStr::new_static(market.websocket().as_str()),
+                        |origins| SmolStr::new_static(origins.websocket.as_str()),
+                    )
+                };
+                let select = shared::address_select(
+                    app,
+                    &self.host,
+                    window,
+                    shared::control_key(cx, websocket_field),
+                    BinanceWebsocketOrigin::for_market(market)
+                        .iter()
+                        .map(BinanceWebsocketOrigin::as_str),
+                    label.clone(),
+                    current,
+                    move |config, value| {
+                        shared::write_binance_origin(
+                            config,
+                            &venue,
+                            market,
+                            OriginKind::Websocket,
+                            value,
+                        );
+                    },
+                );
+                rows.push(select.row(&theme, websocket_field, label, description));
+                self.selects.push(select);
+            }
+
+            let kind = CredentialsKind::for_market(market);
+            if cx.filter.admits_field(PAGE, kind.row_id()) {
+                let base_key = shared::control_key(cx, kind.row_id());
+                rows.push(
+                    self.credentials
+                        .row(app, window, &self.host, base_key, kind, &theme)?,
+                );
+            }
+
+            let title = i18n::t_smol!(translate, credentials::market_title_key(market));
+            layout::section(
+                app,
+                window,
+                parent,
+                &theme,
+                section_id(market),
+                Some(title),
+                rows,
+            )?;
         }
 
-        let credentials = CredentialsKind::for_market(market);
-        if args
-            .filter
-            .admits_field(page_id.as_ref(), credentials.row_id())
-        {
-            rows.push(credentials::credentials_row(args, credentials));
-        }
-
-        if rows.is_empty() {
-            continue;
-        }
-
-        groups.push(layout::section(
-            Some(market_title(market, args.cx)),
-            &format!("market_participants.binance_{index}"),
-            rows,
-            args.cx,
-        ));
+        Ok(())
     }
 
-    layout::page(groups)
-}
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        for select in &self.selects {
+            select.sync(app)?;
+        }
+        self.credentials.sync(app)
+    }
 
-/// The name one Binance market is drawn under.
-fn market_title(market: BinanceMarket, cx: &App) -> SharedString {
-    match market {
-        BinanceMarket::Spot => t!(cx, "settings_ui.market_participants.binance_spot"),
-        BinanceMarket::UsdMPerp => t!(cx, "settings_ui.market_participants.binance_usd_m_perp"),
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        for select in &self.selects {
+            consumed |= select.dispatch(app, event);
+        }
+        consumed |= self.credentials.dispatch(app, event);
+
+        consumed
+    }
+
+    fn release(&mut self, app: &mut App) {
+        for select in self.selects.drain(..) {
+            select.release(app);
+        }
+        self.credentials.release(app);
     }
 }
 
-pub(crate) fn search_fields(cx: &App) -> Vec<FieldSearch> {
+/// The search rows of the settings this page draws.
+pub(crate) fn search_fields(translate: &Translate) -> Vec<FieldSearch> {
     let venue = VenueId::Binance;
     let page_id = shared::page_id(&venue);
     let mut fields = Vec::with_capacity(BinanceMarket::ALL.len() * 3);
 
     for market in BinanceMarket::ALL {
         let scope = market.scope();
-        let http_label = t!(cx, OriginKind::Http.label_key());
-        let http_description = t!(cx, OriginKind::Http.description_key());
-        let websocket_label = t!(cx, OriginKind::Websocket.label_key());
-        let websocket_description = t!(cx, OriginKind::Websocket.description_key());
+        let http_label = i18n::t_smol!(translate, OriginKind::Http.label_key());
+        let http_description = i18n::t_smol!(translate, OriginKind::Http.description_key());
+        let websocket_label = i18n::t_smol!(translate, OriginKind::Websocket.label_key());
+        let websocket_description =
+            i18n::t_smol!(translate, OriginKind::Websocket.description_key());
 
         fields.push(shared::origin_search_field(
-            format!("{page_id}.{scope}.http"),
-            http_label.as_ref(),
-            http_description.as_ref(),
+            format_smolstr!("{page_id}.{scope}.http"),
+            http_label,
+            http_description,
             &[venue.as_str(), scope, "http", "origin", "地址"],
         ));
         fields.push(shared::origin_search_field(
-            format!("{page_id}.{scope}.websocket"),
-            websocket_label.as_ref(),
-            websocket_description.as_ref(),
+            format_smolstr!("{page_id}.{scope}.websocket"),
+            websocket_label,
+            websocket_description,
             &[venue.as_str(), scope, "websocket", "origin", "地址"],
         ));
-        fields.push(CredentialsKind::for_market(market).search_field(cx));
+        fields.push(CredentialsKind::for_market(market).search_field(translate));
     }
 
     fields
+}
+
+/// The id one market's choice of its HTTP address is drawn and searched under.
+const fn http_id(market: BinanceMarket) -> &'static str {
+    match market {
+        BinanceMarket::Spot => "market_participants.binance.spot.http",
+        BinanceMarket::UsdMPerp => "market_participants.binance.usd-m-perp.http",
+    }
+}
+
+/// The id one market's choice of its WebSocket address is drawn and searched under.
+const fn websocket_id(market: BinanceMarket) -> &'static str {
+    match market {
+        BinanceMarket::Spot => "market_participants.binance.spot.websocket",
+        BinanceMarket::UsdMPerp => "market_participants.binance.usd-m-perp.websocket",
+    }
+}
+
+/// The id of the card one market's rows are drawn in.
+const fn section_id(market: BinanceMarket) -> &'static str {
+    match market {
+        BinanceMarket::Spot => "market_participants.binance_0",
+        BinanceMarket::UsdMPerp => "market_participants.binance_1",
+    }
 }

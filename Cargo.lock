@@ -9374,9 +9374,6 @@ dependencies = [
  "app_config_provider",
  "base_ui",
  "download_provider",
- "gpui-kit",
- "hyper",
- "hyper-util",
  "i18n",
  "log",
  "market_participants_connector",
@@ -9385,9 +9382,9 @@ dependencies = [
  "smol_str",
  "tempfile",
  "tokio",
+ "ui_core",
  "url",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

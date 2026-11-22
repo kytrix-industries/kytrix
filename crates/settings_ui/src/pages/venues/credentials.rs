@@ -21,6 +21,12 @@
 //! and how it is read, written and cleared. Every venue page is written with the same helpers
 //! rather than with a copy of this dialog.
 
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
+
 use ahash::AHashMap;
 use app_config::{
     market_participants::{
@@ -33,44 +39,51 @@ use app_config::{
     settings::Config,
 };
 use base_ui::{
-    button::Button,
-    input::{Input, InputState, InputStateBuilder, InputStateEvent},
-    interactive::InteractiveVariantExt,
-    layer::LayerExt,
-    separator::Separator,
-    size::{UnifiedSizable, UnifiedSize},
-    style::theme::ThemeExt,
+    kit::{
+        alert::AlertBuilder,
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        input::{self, InputNode, InputSpec, InputState},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, DismissEvent, ElementId, Entity, EventEmitter,
-    InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
-};
-use i18n::t;
+use i18n::translate::Translate;
 use market_participants_model::identifier::VenueId;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    event::Event,
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+    },
+    paint::style::{PaintSpec, StylePatch},
+    text::TextStyle,
+    window::WindowId,
+};
 use widget::venue::VenueDisplay;
 
 use crate::{
-    layout::{self, PageArgs},
+    host::SettingsHost,
+    layout::{self, RowFn},
     search::{FieldSearch, words},
-    session::{SettingsChange, SettingsSession},
+    session::SettingsChange,
 };
 
 /// How wide the dialog is.
-pub(crate) const WIDTH: f32 = 480.0;
+const WIDTH: f32 = 480.0;
 
-/// What the dialog is drawn under, which is what a test finds it by.
+/// What the dialog's content is drawn under, which is what a test finds it by.
 pub(crate) const DIALOG_SELECTOR: &str = "SETTINGS_CREDENTIALS_DIALOG";
-
-/// What the dialog's title is drawn under.
-pub(crate) const TITLE_SELECTOR: &str = "SETTINGS_CREDENTIALS_TITLE";
 
 /// What the row the dialog ends in is drawn under: the line across it and the two buttons under
 /// that line, which is where the dialog says what it does rather than what it holds.
 pub(crate) const FOOTER_SELECTOR: &str = "SETTINGS_CREDENTIALS_FOOTER";
 
-/// What the button that writes the set is drawn under, which is what a test clicks it by.
+/// What the button that writes the set is drawn under.
 pub(crate) const CONFIRM_SELECTOR: &str = "SETTINGS_CREDENTIALS_CONFIRM";
 
 /// What the button that leaves the set alone is drawn under.
@@ -262,9 +275,9 @@ impl CredentialsKind {
     ///
     /// The title and the message are read together from here rather than spelled out at the call
     /// site, so the alert the row opens is the sentence this set's own part of the page asks for.
-    pub(crate) fn clear_title(self, cx: &App) -> SharedString {
-        t!(
-            cx,
+    pub(crate) fn clear_title(self, translate: &Translate) -> SmolStr {
+        i18n::t_smol!(
+            translate,
             "settings_ui.market_participants.clear_credentials_title"
         )
     }
@@ -273,11 +286,11 @@ impl CredentialsKind {
     ///
     /// The title of the set is written into it, so a user confirming a removal is told which set
     /// goes; it is the same name the dialog that edits the set is titled with.
-    pub(crate) fn clear_message(self, cx: &App) -> SharedString {
-        let title = t!(cx, self.title_key());
+    pub(crate) fn clear_message(self, translate: &Translate) -> SmolStr {
+        let title = i18n::t_smol!(translate, self.title_key());
 
-        t!(
-            cx,
+        i18n::t_smol!(
+            translate,
             "settings_ui.market_participants.clear_credentials_message",
             title = title.as_str()
         )
@@ -294,36 +307,35 @@ impl CredentialsKind {
     }
 
     /// The id one value of this set is drawn and keyed under.
-    pub(crate) fn field_id(self, field: &CredentialField) -> SharedString {
-        SharedString::from(format!("{}.{}", self.field_prefix(), field.id))
+    pub(crate) fn field_id(self, field: &CredentialField) -> SmolStr {
+        format_smolstr!("{}.{}", self.field_prefix(), field.id)
     }
 
     /// What the row's edit button is drawn under.
-    pub(crate) fn edit_selector(self) -> String {
-        format!("SETTINGS_EDIT_CREDENTIALS_{}", self.row_id())
+    pub(crate) fn edit_selector(self) -> SmolStr {
+        format_smolstr!("SETTINGS_EDIT_CREDENTIALS_{}", self.row_id())
     }
 
     /// What the row's clear button is drawn under.
-    pub(crate) fn clear_selector(self) -> String {
-        format!("SETTINGS_CLEAR_CREDENTIALS_{}", self.row_id())
+    pub(crate) fn clear_selector(self) -> SmolStr {
+        format_smolstr!("SETTINGS_CLEAR_CREDENTIALS_{}", self.row_id())
     }
 
     /// What one field's line of the dialog is drawn under.
-    pub(crate) fn field_selector(self, field: &CredentialField) -> String {
-        format!("SETTINGS_CREDENTIALS_FIELD_{}", self.field_id(field))
+    pub(crate) fn field_selector(self, field: &CredentialField) -> SmolStr {
+        format_smolstr!("SETTINGS_CREDENTIALS_FIELD_{}", self.field_id(field))
     }
 
     /// What one field's error is drawn under, when the field has one.
-    pub(crate) fn error_selector(self, field: &CredentialField) -> String {
-        format!("SETTINGS_CREDENTIALS_ERROR_{}", self.field_id(field))
+    pub(crate) fn error_selector(self, field: &CredentialField) -> SmolStr {
+        format_smolstr!("SETTINGS_CREDENTIALS_ERROR_{}", self.field_id(field))
     }
 
     /// Whether the settings hold a set for this kind.
     ///
-    /// The row clears what is stored, so the question is whether a set is there at all —
-    /// `is_some` — rather than whether every value of it is filled in: a set a hand-edited
-    /// file left incomplete is still a set the user can clear, and completing it is what
-    /// the dialog is for.
+    /// The row clears what is stored, so the question is whether a set is there at all — `is_some`
+    /// — rather than whether every value of it is filled in: a set a hand-edited file left
+    /// incomplete is still a set the user can clear, and completing it is what the dialog is for.
     pub(crate) fn has_stored_set(self, config: &Config) -> bool {
         match self {
             Self::BinanceSpot | Self::BinanceUsdMPerp => {
@@ -483,16 +495,19 @@ impl CredentialsKind {
     /// What is searched is the row and what it is for, never the name of a field it holds: the
     /// fields are values of the row, and a user looking for a credential looks for the credentials
     /// rather than for the spelling one venue gives one of them.
-    pub(crate) fn search_field(self, cx: &App) -> FieldSearch {
-        let label = t!(cx, "settings_ui.market_participants.credentials");
-        let description = t!(
-            cx,
+    pub(crate) fn search_field(self, translate: &Translate) -> FieldSearch {
+        let label = i18n::t_smol!(translate, "settings_ui.market_participants.credentials");
+        let description = i18n::t_smol!(
+            translate,
             "settings_ui.market_participants.credentials_description"
         );
         // The venue is searched by the name it is drawn with as well as by the identity it is
         // stored under: the identity is `binance` in every language, and a user looking for the
         // venue's credentials in Chinese types the name the page shows them.
-        let venue_name = t!(cx, self.venue().name_key());
+        let venue_name = i18n::t_smol!(translate, self.venue().name_key());
+        let market_title = self
+            .market()
+            .map(|market| (market, i18n::t_smol!(translate, market_title_key(market))));
         let mut parts = Vec::with_capacity(10);
         parts.push(self.row_id());
         parts.push(label.as_ref());
@@ -502,23 +517,21 @@ impl CredentialsKind {
         parts.push("凭据");
         parts.push(self.venue().as_str());
         parts.push(venue_name.as_ref());
-        let market_title = self
-            .market()
-            .map(|market| (market, t!(cx, market_title_key(market))));
         if let Some((market, title)) = &market_title {
             parts.push(market.scope());
             parts.push(title.as_ref());
         }
+        let text = words(&parts);
 
         FieldSearch {
-            id: SharedString::from(self.row_id()),
-            text: words(&parts),
+            id: SmolStr::new_static(self.row_id()),
+            text,
         }
     }
 }
 
 /// The name one Binance market is drawn under, which the set's search row repeats.
-const fn market_title_key(market: BinanceMarket) -> &'static str {
+pub(crate) const fn market_title_key(market: BinanceMarket) -> &'static str {
     match market {
         BinanceMarket::Spot => "settings_ui.market_participants.binance_spot",
         BinanceMarket::UsdMPerp => "settings_ui.market_participants.binance_usd_m_perp",
@@ -533,7 +546,7 @@ pub(crate) struct CredentialsDraft {
 
 impl CredentialsDraft {
     /// The form a set nothing is stored for opens on.
-    fn empty(kind: CredentialsKind) -> Self {
+    pub(crate) fn empty(kind: CredentialsKind) -> Self {
         let fields = kind.fields();
         let mut values = AHashMap::with_capacity(fields.len());
         for field in fields {
@@ -554,453 +567,822 @@ impl CredentialsDraft {
     }
 }
 
-/// The row one credential set is drawn as.
+/// The credential rows one venue page draws.
 ///
-/// The row says what is configured rather than showing it: the edit button is always there, and a
-/// set the settings hold has a clear button beside it. Clearing is asked about before it is
-/// written, because it is the one thing a row can do that takes something away.
-pub(crate) fn credentials_row(args: &mut PageArgs<'_, '_>, kind: CredentialsKind) -> AnyElement {
-    let label = t!(args.cx, "settings_ui.market_participants.credentials");
-    let description = t!(
-        args.cx,
-        "settings_ui.market_participants.credentials_description"
-    );
-    let edit_label = t!(args.cx, "settings_ui.market_participants.edit_credentials");
-    // The button says what it edits as well as what it does: Binance's two markets are two rows
-    // of the same page, so a label that named only the action would tell them apart by nothing a
-    // reader of the accessibility tree can hear.
-    let title = t!(args.cx, kind.title_key());
-    let edit_aria = t!(
-        args.cx,
-        "settings_ui.market_participants.edit_credentials_for",
-        title = title.as_str()
-    );
-    let session = args.settings.session_entity();
-    let mut controls = div().flex().items_center().justify_end().gap_2();
+/// A venue draws one row per set it configures (Binance draws one per market), and every row owns
+/// the dialog that edits it and the alert that clears it.
+pub(crate) struct CredentialsArea {
+    rows: Vec<CredentialsRow>,
+}
 
-    controls = controls.child(
-        Button::new(layout::element_id(
-            "settings-credentials-edit",
-            kind.row_id(),
-        ))
-        .medium()
-        .tonal()
-        .debug_selector({
-            let selector = kind.edit_selector();
-            move || selector
-        })
-        .aria_label(edit_aria)
-        .child(edit_label)
-        .on_click(move |_, window, cx| {
-            CredentialsEditor::show(kind, session.clone(), window, cx);
-        }),
-    );
+impl CredentialsArea {
+    /// The area of a page that draws no rows yet.
+    pub(crate) fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
 
-    if kind.has_stored_set(args.config) {
-        let clear_label = t!(args.cx, "settings_ui.market_participants.clear_credentials");
-        let clear_aria = t!(
-            args.cx,
+    /// Builds the row of one set and takes ownership of what it draws with.
+    ///
+    /// # Errors
+    /// Engine node-building errors from the row's controls.
+    pub(crate) fn row(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        host: &SettingsHost,
+        base_key: SmolStr,
+        kind: CredentialsKind,
+        theme: &ThemeHandle,
+    ) -> Result<RowFn, EngineError> {
+        let (row, row_fn) = CredentialsRow::build(app, window, host, base_key, kind, theme)?;
+        self.rows.push(row);
+
+        Ok(row_fn)
+    }
+
+    /// Makes every row show what the settings hold for this frame.
+    ///
+    /// # Errors
+    /// A kit component refused a write.
+    pub(crate) fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        for row in &mut self.rows {
+            row.sync(app)?;
+        }
+
+        Ok(())
+    }
+
+    /// Offers one platform event to the rows (their dialogs type into their own fields).
+    pub(crate) fn dispatch(&self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        for row in &self.rows {
+            consumed |= row.dispatch(app, event);
+        }
+
+        consumed
+    }
+
+    /// Releases every component the rows own.
+    pub(crate) fn release(&mut self, app: &mut App) {
+        for row in self.rows.drain(..) {
+            row.release(app);
+        }
+    }
+}
+
+/// One credential row and the dialog that edits it.
+struct CredentialsRow {
+    kind: CredentialsKind,
+    host: SettingsHost,
+    window: WindowId,
+    theme: ThemeHandle,
+    /// The control column the buttons are drawn in, and the clear button when a set is stored.
+    state: Rc<RefCell<RowState>>,
+    edit: Button,
+    editor: Rc<CredentialsEditor>,
+    alert: Dialog,
+    /// The key the clear button is named by when it is drawn.
+    clear_key: SmolStr,
+    /// What the clear button is labelled and named for, resolved in the language of the build.
+    clear_label: SmolStr,
+    clear_aria: SmolStr,
+}
+
+/// What one row currently draws below its control column.
+#[derive(Default)]
+struct RowState {
+    /// The column the buttons are drawn in; filled when the row is built.
+    controls: Option<NodeId>,
+    /// The wrapper and button of the clear control, when a set is stored.
+    clear: Option<(NodeId, Button)>,
+}
+
+impl CredentialsRow {
+    /// Builds one row and returns it with the row builder the page puts in its card.
+    fn build(
+        app: &mut App,
+        window: WindowId,
+        host: &SettingsHost,
+        base_key: SmolStr,
+        kind: CredentialsKind,
+        theme: &ThemeHandle,
+    ) -> Result<(Self, RowFn), EngineError> {
+        let translate = host.translate();
+        let label = i18n::t_smol!(translate, "settings_ui.market_participants.credentials");
+        let description = i18n::t_smol!(
+            translate,
+            "settings_ui.market_participants.credentials_description"
+        );
+        let edit_label = i18n::t_smol!(
+            translate,
+            "settings_ui.market_participants.edit_credentials"
+        );
+        // The button says what it edits as well as what it does: Binance's two markets are two rows
+        // of the same page, so a label that named only the action would tell them apart by nothing
+        // a reader of the accessibility tree can hear.
+        let clear_label = i18n::t_smol!(
+            translate,
+            "settings_ui.market_participants.clear_credentials"
+        );
+        let title = i18n::t_smol!(translate, kind.title_key());
+        let edit_aria = i18n::t_smol!(
+            translate,
+            "settings_ui.market_participants.edit_credentials_for",
+            title = title.as_str()
+        );
+        let clear_aria = i18n::t_smol!(
+            translate,
             "settings_ui.market_participants.clear_credentials_for",
             title = title.as_str()
         );
-        let session = args.settings.session_entity();
+        let edit_key = format_smolstr!("{base_key}.edit");
+        let clear_key = format_smolstr!("{base_key}.clear");
+        let alert_key = format_smolstr!("{base_key}.clear-alert");
+        let stored = host.config(app, |config| kind.has_stored_set(config));
 
-        controls = controls.child(
-            Button::new(layout::element_id(
-                "settings-credentials-clear",
-                kind.row_id(),
-            ))
-            .medium()
-            .tonal()
-            .debug_selector({
-                let selector = kind.clear_selector();
-                move || selector
-            })
-            .aria_label(clear_aria)
-            .child(clear_label)
-            .on_click(move |_, window, cx| {
-                // Both the alert and its action are `'static`, so every sentence is resolved
-                // here, where the application is still known to be in the language it is
-                // drawn in.
-                let title = kind.clear_title(cx);
-                let message = kind.clear_message(cx);
-                let confirm = t!(cx, "common.confirm");
-                let cancel = t!(cx, "common.cancel");
-                let session = session.clone();
+        let editor = CredentialsEditor::new(app, host, window, kind, base_key.as_str());
+        let alert = Self::build_clear_alert(app, host, window, kind, alert_key);
+        let weak = Rc::downgrade(&editor);
+        let edit = Button::new(app, theme.clone(), edit_key)
+            .secondary()
+            .label(edit_label)
+            .a11y_label(edit_aria)
+            .on_click(move |ctx| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.open(ctx.app_mut());
+                }
+            });
 
-                window.alert(cx, move |alert, _, _| {
-                    alert
-                        .ok_cancel(title, message)
-                        .ok_text(confirm)
-                        .cancel_text(cancel)
-                        .ok_action(move |_, _, cx| {
-                            session.update(cx, |session, cx| {
-                                let change = SettingsChange::edit(move |config| kind.clear(config));
-                                let _ = session.write(change, cx);
-                            });
-                        })
-                });
-            }),
+        let state: Rc<RefCell<RowState>> = Rc::new(RefCell::new(RowState::default()));
+        let state_for_row = Rc::clone(&state);
+        let edit_for_row = edit.clone();
+        let row_theme = theme.clone();
+        let row_clear_key = clear_key.clone();
+        let row_clear_label = clear_label.clone();
+        let row_clear_aria = clear_aria.clone();
+        let alert_for_row = alert.clone();
+        let row_fn = layout::row(
+            theme,
+            kind.row_id(),
+            label,
+            description,
+            move |app, window, parent| {
+                let controls = layout::container(
+                    app,
+                    window,
+                    parent,
+                    StyleBuilder::new()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .gap(8.0)
+                        .width_full()
+                        .build(),
+                )?;
+                let edit_wrapper =
+                    Self::button_wrapper(app, window, controls, kind.edit_selector())?;
+                edit_for_row.build(app, window, edit_wrapper)?;
+                if stored {
+                    let clear_wrapper =
+                        Self::button_wrapper(app, window, controls, kind.clear_selector())?;
+                    let clear = Button::new(app, row_theme, row_clear_key)
+                        .secondary()
+                        .label(row_clear_label)
+                        .a11y_label(row_clear_aria)
+                        .on_click(move |ctx| {
+                            let window = ctx.window();
+                            let _ = alert_for_row.open(ctx.app_mut(), window);
+                        });
+                    clear.build(app, window, clear_wrapper)?;
+                    state_for_row.borrow_mut().clear = Some((clear_wrapper, clear));
+                }
+                state_for_row.borrow_mut().controls = Some(controls);
+
+                Ok(())
+            },
         );
+
+        let row = Self {
+            kind,
+            host: host.clone(),
+            window,
+            theme: theme.clone(),
+            state,
+            edit,
+            editor,
+            alert,
+            clear_key,
+            clear_label,
+            clear_aria,
+        };
+
+        Ok((row, row_fn))
     }
 
-    layout::row(
-        kind.row_id(),
-        label,
-        description,
-        controls.into_any_element(),
-        layout::CONTROL_WIDTH,
-        args.cx,
-    )
+    /// Builds the alert that puts clearing one set to the user.
+    fn build_clear_alert(
+        app: &mut App,
+        host: &SettingsHost,
+        window: WindowId,
+        kind: CredentialsKind,
+        key: SmolStr,
+    ) -> Dialog {
+        let translate = host.translate();
+        let title = kind.clear_title(translate);
+        let message = kind.clear_message(translate);
+        let confirm = i18n::t_smol!(translate, "common.confirm");
+        let cancel = i18n::t_smol!(translate, "common.cancel");
+        let write_host = host.clone();
+
+        DialogBuilder::alert(title.clone(), move |dialog, _theme| {
+            let ok_dialog = dialog.clone();
+            let cancel_dialog = dialog.clone();
+            let write_host = write_host.clone();
+            AlertBuilder::new()
+                .ok_cancel(title.clone(), message.clone())
+                .ok_text(confirm.clone())
+                .cancel_text(cancel.clone())
+                .ok_action(move |_value, app| {
+                    let _ = write_host.write(
+                        app,
+                        window,
+                        SettingsChange::edit(move |config| kind.clear(config)),
+                    );
+                    ok_dialog.close(app);
+                })
+                .cancel_action(move |app| {
+                    cancel_dialog.close(app);
+                })
+        })
+        .build(
+            app,
+            host.theme_handle(),
+            host.layer(),
+            host.animation(),
+            key,
+        )
+    }
+
+    /// Builds one wrapper node what a row button is drawn in, which is the id a test clicks it by.
+    fn button_wrapper(
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        id: SmolStr,
+    ) -> Result<NodeId, EngineError> {
+        layout::build_node(app, window, parent, move |tree, parent| {
+            NodeBuilder::boxed()
+                .id(id)
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .build(),
+                )
+                .build(tree, parent)
+        })
+    }
+
+    /// Makes the row show what the settings hold for this frame, including whether a set is stored
+    /// at all (which is what the clear button is drawn for).
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        let stored = self
+            .host
+            .config(app, |config| self.kind.has_stored_set(config));
+        if stored != self.state.borrow().clear.is_some() {
+            self.rebuild_clear(app, stored)?;
+        }
+
+        self.edit.sync(app)?;
+        if let Some((_, clear)) = self.state.borrow().clear.as_ref() {
+            clear.sync(app)?;
+        }
+        self.editor.sync(app)?;
+        let _ = self.alert.sync(app);
+
+        Ok(())
+    }
+
+    /// Draws or takes away the clear button, which is drawn only while a set is stored.
+    fn rebuild_clear(&mut self, app: &mut App, stored: bool) -> Result<(), EngineError> {
+        if let Some((node, button)) = self.state.borrow_mut().clear.take() {
+            button.release(app);
+            if let Err(error) = app.remove_node(self.window, node) {
+                log::warn!("removing the clear-credentials button failed: {error}");
+            }
+        }
+        if !stored {
+            return Ok(());
+        }
+
+        let Some(controls) = self.state.borrow().controls else {
+            return Ok(());
+        };
+        let wrapper = Self::button_wrapper(app, self.window, controls, self.kind.clear_selector())?;
+        let alert = self.alert.clone();
+        let clear = Button::new(app, self.theme.clone(), self.clear_key.clone())
+            .secondary()
+            .label(self.clear_label.clone())
+            .a11y_label(self.clear_aria.clone())
+            .on_click(move |ctx| {
+                let window = ctx.window();
+                let _ = alert.open(ctx.app_mut(), window);
+            });
+        clear.build(app, self.window, wrapper)?;
+        self.state.borrow_mut().clear = Some((wrapper, clear));
+
+        Ok(())
+    }
+
+    /// Offers one platform event to the row's dialog.
+    fn dispatch(&self, app: &mut App, event: &Event) -> bool {
+        self.editor.dispatch(app, event)
+    }
+
+    /// Releases every component the row owns.
+    fn release(self, app: &mut App) {
+        self.edit.release(app);
+        if let Some((node, clear)) = self.state.borrow_mut().clear.take() {
+            clear.release(app);
+            if let Err(error) = app.remove_node(self.window, node) {
+                log::warn!("removing the clear-credentials button failed: {error}");
+            }
+        }
+        self.editor.release(app);
+        self.alert.release(app);
+    }
 }
 
 /// The dialog that edits one credential set.
-pub(crate) struct CredentialsEditor {
-    kind: CredentialsKind,
-    draft: CredentialsDraft,
-    /// The settings session the set is written through.
-    session: Entity<SettingsSession>,
-    /// The reason each rejected field was rejected, if the current submission was rejected.
-    errors: AHashMap<&'static str, &'static str>,
-    /// The state of every value of the dialog, keyed by the field it belongs to.
-    inputs: AHashMap<&'static str, Entity<InputState>>,
-    /// Held because a field reports what it holds when the caret leaves it, and the dialog has to
-    /// hear that to know what was submitted.
-    _events: Vec<Subscription>,
+///
+/// The dialog is built once, when the page is, and opened from the row it belongs to. Its content
+/// is built per open, over the draft the settings of that moment hold; nothing is written until
+/// the content's own confirm button writes the set — the submission validates first, and a set
+/// that cannot be stored leaves the dialog open with what the user typed.
+struct CredentialsEditor {
+    inner: Rc<RefCell<EditorInner>>,
 }
 
-impl EventEmitter<DismissEvent> for CredentialsEditor {}
+/// The one state the dialog's content and the row that opens it share.
+struct EditorInner {
+    kind: CredentialsKind,
+    host: SettingsHost,
+    window: WindowId,
+    /// The dialog, once it is built; the content closure reaches the editor through a weak handle
+    /// because the dialog owns that closure.
+    dialog: Option<Dialog>,
+    /// The key every component of the dialog is named by.
+    key: SmolStr,
+    /// The draft the content of the next open is built from.
+    draft: CredentialsDraft,
+    /// The content of the open, when there is one.
+    form: Option<CredentialsForm>,
+    theme: ThemeHandle,
+    translate: Translate,
+}
+
+/// What one open of the dialog holds.
+struct CredentialsForm {
+    /// The scope every signal of the form belongs to, released with the form.
+    scope: SignalScope,
+    fields: Vec<FormField>,
+    buttons: Vec<Button>,
+}
+
+/// One value of the form: its declaration, the input that edits it, and what was already reported
+/// about it (which the value changing is what takes away).
+struct FormField {
+    field: &'static CredentialField,
+    input: InputNode,
+    error: Signal<Option<SmolStr>>,
+    /// The text the input held when its error was last observed, so only a value that changed
+    /// takes the report away.
+    previous: RefCell<SmolStr>,
+}
 
 impl CredentialsEditor {
-    /// Opens the dialog over what the settings hold for this set.
-    pub(crate) fn show(
+    /// Builds the (closed) dialog and returns the editor that opens it.
+    fn new(
+        app: &mut App,
+        host: &SettingsHost,
+        window: WindowId,
         kind: CredentialsKind,
-        session: Entity<SettingsSession>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let draft = {
-            let config = session.read(cx).config(cx);
-            kind.draft(config.as_ref())
-        };
-        let fields = kind.fields();
-        let mut inputs = AHashMap::with_capacity(fields.len());
-        for field in fields {
-            let input = input(kind, field, draft.value(field.id), window, cx);
-            inputs.insert(field.id, input);
-        }
-        let editor = cx.new(|cx| {
-            // Every field reports the value it holds when the caret leaves it — and when Enter is
-            // pressed — which is the moment the draft takes it; the confirm button reads the
-            // fields back as well, because clicking it does not take the caret away from what was
-            // typed last.
-            let events = fields
-                .iter()
-                .map(|field| {
-                    let id = field.id;
-                    cx.subscribe(
-                        &inputs[id],
-                        move |editor: &mut Self, _, event: &InputStateEvent, cx| {
-                            if let InputStateEvent::Blur(value)
-                            | InputStateEvent::PressEnter(value) = event
-                            {
-                                editor.write(id, value.clone(), cx);
-                            }
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            Self {
+        base_key: &str,
+    ) -> Rc<Self> {
+        let key = format_smolstr!("{base_key}.dialog");
+        let title = i18n::t_smol!(host.translate(), kind.title_key());
+        let editor = Rc::new(Self {
+            inner: Rc::new(RefCell::new(EditorInner {
                 kind,
-                draft,
-                session,
-                errors: AHashMap::with_capacity(fields.len()),
-                inputs,
-                _events: events,
-            }
+                host: host.clone(),
+                window,
+                dialog: None,
+                key: key.clone(),
+                draft: CredentialsDraft::empty(kind),
+                form: None,
+                theme: host.theme_handle(),
+                translate: host.translate().clone(),
+            })),
         });
+        let weak = Rc::downgrade(&editor);
+        let dialog = DialogBuilder::new(title)
+            .close_button(false)
+            .width(WIDTH)
+            .content(move |app, window, body| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.build_form(app, window, body)?;
+                }
 
-        window.dialog(cx, editor.clone());
-        editor.update(cx, |_, cx| cx.notify());
+                Ok(())
+            })
+            .build(
+                app,
+                host.theme_handle(),
+                host.layer(),
+                host.animation(),
+                key,
+            );
+        editor.inner.borrow_mut().dialog = Some(dialog);
+
+        editor
     }
 
-    /// Takes one field's value into the draft, which is what a field reports when it is left.
-    fn write(&mut self, id: &'static str, value: SharedString, cx: &mut Context<Self>) {
-        let changed = self.draft.value(id) != value.as_str();
-        self.draft.set(id, SmolStr::new(value.as_str()));
-        // Only the field whose value actually changed stops being reported: leaving a field
-        // without changing what it holds must not take away the report of what it is still
-        // missing, and the other fields' reports stay until they are filled in as well.
-        if changed {
-            self.errors.remove(id);
-        }
-        cx.notify();
-    }
-
-    /// Takes what every field currently holds into the draft.
-    ///
-    /// A field reports itself when the caret leaves it, and clicking the confirm button does not
-    /// take the caret away from it: without this, the last thing typed before the button was
-    /// pressed would be the one thing the dialog did not carry.
-    fn commit_inputs(&mut self, cx: &mut Context<Self>) {
-        // The fields are read while the draft is written, and the draft is written through
-        // `self`, so what to write is collected before anything is written.
-        let pending = self
-            .kind
-            .fields()
-            .iter()
-            .map(|field| (field.id, self.inputs[field.id].read(cx).value(cx)))
-            .collect::<Vec<_>>();
-
-        for (id, value) in pending {
-            self.write(id, value, cx);
-        }
-    }
-
-    /// Every required value the submission left empty.
-    fn validate(&self) -> AHashMap<&'static str, &'static str> {
-        let mut errors = AHashMap::with_capacity(self.kind.fields().len());
-        for field in self.kind.fields() {
-            let Some(error) = field.error_key else {
-                continue;
-            };
-            if self.draft.value(field.id).trim().is_empty() {
-                errors.insert(field.id, error);
-            }
-        }
-
-        errors
-    }
-
-    /// Writes the set into the settings, or reports every problem with the form.
-    ///
-    /// A set that has been stored takes the dialog off the layer. One that could not be stored
-    /// leaves it open with what the user typed: the settings page reports the reason, and the
-    /// dialog is where the set is submitted again from.
-    fn confirm(&mut self, cx: &mut Context<Self>) {
-        self.commit_inputs(cx);
-        let errors = self.validate();
-        if !errors.is_empty() {
-            self.errors = errors;
-            cx.notify();
+    /// Opens the dialog over the set the settings hold now.
+    fn open(&self, app: &mut App) {
+        let (dialog, window, draft) = {
+            let inner = self.inner.borrow();
+            let draft = inner.kind.draft(&inner.host.config(app, Config::clone));
+            (inner.dialog.clone(), inner.window, draft)
+        };
+        let Some(dialog) = dialog else {
+            return;
+        };
+        if dialog.is_open(app) {
             return;
         }
 
-        let kind = self.kind;
-        let draft = self.draft.clone();
-        let stored = self.session.update(cx, |session, cx| {
-            session.write(
-                SettingsChange::edit(move |config| kind.save(config, &draft)),
-                cx,
-            )
-        });
+        self.release_form(app);
+        self.inner.borrow_mut().draft = draft;
+        let _ = dialog.open(app, window);
+    }
 
-        match stored {
-            Ok(()) => cx.emit(DismissEvent),
-            // The reason is the settings page's to report, and the dialog stays where the user can
-            // submit it again.
-            Err(_) => cx.notify(),
+    /// Closes the dialog the way its cancel button does.
+    fn close(&self, app: &mut App) {
+        let dialog = self.inner.borrow().dialog.clone();
+        if let Some(dialog) = dialog {
+            dialog.close(app);
         }
     }
 
-    /// One field of the dialog, with its label and whatever is wrong with it.
+    /// Builds the content of one open: the values on top, the foot below.
     ///
-    /// The error line is drawn whether or not there is anything wrong with the field, so a form
-    /// that is rejected does not move everything below the field it complains about. What the
-    /// message is drawn under is only there when there is one: a test reading a selector that a
-    /// filled-in field also answered with would not be reading the rejection.
-    fn field(&self, field: &'static CredentialField, cx: &Context<Self>) -> impl IntoElement {
-        let label = t!(cx, field.label_key);
-        let error = self.errors.get(field.id).copied();
-        let selector = self.kind.field_selector(field);
-        let error_line = match error {
-            Some(error) => {
-                let selector = self.kind.error_selector(field);
+    /// The content is built over `inner.draft`, which is the set the settings held when the dialog
+    /// was opened, and every value is a field of its own with the line its rejection is drawn in.
+    fn build_form(
+        self: &Rc<Self>,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+    ) -> Result<(), EngineError> {
+        let (kind, key, theme, translate, draft) = {
+            let inner = self.inner.borrow();
+            (
+                inner.kind,
+                inner.key.clone(),
+                inner.theme.clone(),
+                inner.translate.clone(),
+                inner.draft.clone(),
+            )
+        };
+        let scope = app.signal_scope();
+        let fields = kind.fields();
+        let mut form_fields = Vec::with_capacity(fields.len());
+        let mut buttons = Vec::with_capacity(2);
 
-                div()
-                    .debug_selector(move || selector)
-                    .child(t!(cx, error))
-                    .into_any_element()
-            }
-            // A line that holds nothing is still a line: the space it is drawn with is what keeps
-            // the height a message would have, so reporting one field does not move everything
-            // below it.
-            None => div()
-                .child(SharedString::new_static(" "))
-                .into_any_element(),
+        let root = layout::build_node(app, window, parent, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static(DIALOG_SELECTOR))
+                .style(
+                    StyleBuilder::new()
+                        .flex_col()
+                        .width_full()
+                        .min_width_0()
+                        .gap(12.0)
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+
+        for field in fields {
+            let column = layout::build_node(app, window, root, move |tree, parent| {
+                NodeBuilder::boxed()
+                    .id(kind.field_selector(field))
+                    .style(
+                        StyleBuilder::new()
+                            .flex_col()
+                            .width_full()
+                            .min_width_0()
+                            .gap(4.0)
+                            .build(),
+                    )
+                    .build(tree, parent)
+            })?;
+            let label = i18n::t_smol!(translate, field.label_key);
+            layout::themed_text(
+                app,
+                window,
+                column,
+                None,
+                label,
+                12.0,
+                500,
+                Role::FgDefault,
+                &theme,
+            )?;
+            let initial = SmolStr::new(draft.value(field.id));
+            let state = app.signal_scoped(scope, InputState::new(initial.as_str()));
+            let placeholder_text = field
+                .placeholder_key
+                .map_or_else(SmolStr::default, |key| i18n::t_smol!(translate, key));
+            let placeholder = app.signal_scoped(scope, placeholder_text.clone());
+            let spec = Arc::new(InputSpec {
+                name: kind.field_id(field),
+                placeholder: placeholder_text,
+                masked: field.password,
+                multiline: false,
+                readonly: false,
+                disabled: false,
+                max_length: None,
+                size: ControlSize::Medium,
+                submit: None,
+            });
+            let input = {
+                let tree = app
+                    .window_mut(window)
+                    .ok_or(EngineError::UnknownWindow { window })?
+                    .tree_mut();
+                input::build(tree, column, spec, &theme, &state, &placeholder)
+            };
+            input.install(app);
+            let error: Signal<Option<SmolStr>> = app.signal_scoped(scope, None);
+            let error_theme = theme.clone();
+            layout::build_node(app, window, column, move |tree, parent| {
+                NodeBuilder::text(SmolStr::default(), TextStyle::new(12.0))
+                    .id(kind.error_selector(field))
+                    .bind_text(move |cx| cx.read(&error).clone().unwrap_or_default())
+                    .bind_style(move |cx| {
+                        let shown = cx.read(&error).is_some();
+                        StylePatch {
+                            foreground: Some(error_theme.role(cx, Role::StatusDangerBase)),
+                            visible: Some(shown),
+                            ..StylePatch::default()
+                        }
+                    })
+                    .build(tree, parent)
+            })?;
+            form_fields.push(FormField {
+                field,
+                input,
+                error,
+                previous: RefCell::new(initial),
+            });
+        }
+
+        let footer = layout::build_node(app, window, root, move |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static(FOOTER_SELECTOR))
+                .style(
+                    StyleBuilder::new()
+                        .flex_col()
+                        .flex_none()
+                        .width_full()
+                        .gap(8.0)
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+        layout::themed_box(
+            app,
+            window,
+            footer,
+            format_smolstr!("{key}:divider"),
+            StyleBuilder::new()
+                .flex_none()
+                .width_full()
+                .height(1.0)
+                .build(),
+            PaintSpec::default(),
+            &theme,
+            Some(Role::LineDivider),
+            None,
+        )?;
+        let row = layout::container(
+            app,
+            window,
+            footer,
+            StyleBuilder::new()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .width_full()
+                .gap(8.0)
+                .build(),
+        )?;
+        let weak = Rc::downgrade(self);
+        let cancel_label = i18n::t_smol!(translate, "common.cancel");
+        let cancel_wrapper =
+            Self::button_wrapper(app, window, row, SmolStr::new_static(CANCEL_SELECTOR))?;
+        let cancel = Button::new(app, theme.clone(), format_smolstr!("{key}:cancel"))
+            .ghost()
+            .label(cancel_label)
+            .on_click({
+                let weak = Weak::clone(&weak);
+                move |ctx| {
+                    if let Some(editor) = weak.upgrade() {
+                        editor.close(ctx.app_mut());
+                    }
+                }
+            });
+        cancel.build(app, window, cancel_wrapper)?;
+        buttons.push(cancel);
+
+        let confirm_label = i18n::t_smol!(translate, "common.confirm");
+        let confirm_wrapper =
+            Self::button_wrapper(app, window, row, SmolStr::new_static(CONFIRM_SELECTOR))?;
+        let confirm = Button::new(app, theme.clone(), format_smolstr!("{key}:confirm"))
+            .primary()
+            .label(confirm_label)
+            .on_click(move |ctx| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.confirm(ctx.app_mut());
+                }
+            });
+        confirm.build(app, window, confirm_wrapper)?;
+        buttons.push(confirm);
+
+        self.inner.borrow_mut().form = Some(CredentialsForm {
+            scope,
+            fields: form_fields,
+            buttons,
+        });
+
+        Ok(())
+    }
+
+    /// Writes the set the form holds, or reports every value it is missing.
+    ///
+    /// The dialog stays open when anything is missing or the set cannot be stored: what the user
+    /// typed is what they submit again with.
+    fn confirm(&self, app: &mut App) {
+        let (dialog, kind, host, window, translate) = {
+            let inner = self.inner.borrow();
+            (
+                inner.dialog.clone(),
+                inner.kind,
+                inner.host.clone(),
+                inner.window,
+                inner.translate.clone(),
+            )
+        };
+        let pending = {
+            let inner = self.inner.borrow();
+            let Some(form) = inner.form.as_ref() else {
+                return;
+            };
+            form.fields
+                .iter()
+                .map(|field| (field.field, field.input.state, field.error))
+                .collect::<Vec<_>>()
         };
 
-        div()
-            .debug_selector(move || selector)
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().roles.fg.default.hsla)
-                    .child(label),
-            )
-            .child(Input::new(&self.inputs[field.id]).medium())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().roles.status.danger.base.hsla)
-                    .child(error_line),
-            )
-    }
-}
-
-/// A text field's state, built from what the draft holds.
-///
-/// The state is keyed under the field's own id, which is what keeps the box one value is typed
-/// into from being the box of another: one dialog holds every value of one set, and the sets
-/// share this code.
-fn input(
-    kind: CredentialsKind,
-    field: &CredentialField,
-    value: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> Entity<InputState> {
-    let id = kind.field_id(field);
-
-    cx.new(|cx| {
-        let mut builder = InputStateBuilder::new(ElementId::Name(id)).default_value(value);
-        if field.password {
-            builder = builder.password();
-        }
-        if let Some(placeholder) = field.placeholder_key {
-            builder = builder.placeholder(t!(cx, placeholder));
-        }
-
-        builder.build(window, cx)
-    })
-}
-
-impl Render for CredentialsEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .debug_selector(|| DIALOG_SELECTOR.into())
-            .w(px(WIDTH))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .debug_selector(|| TITLE_SELECTOR.into())
-                    .text_base()
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .child(t!(cx, self.kind.title_key())),
-            )
-            .children(self.kind.fields().iter().map(|field| self.field(field, cx)))
-            .child(
-                // The foot of the dialog is the foot the application's other dialogs end in: a
-                // line across it, and the buttons under that line.
-                div()
-                    .debug_selector(|| FOOTER_SELECTOR.into())
-                    .w_full()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Separator::horizontal())
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("settings-credentials-cancel")
-                                    .ghost()
-                                    .with_unified_size(UnifiedSize::Medium)
-                                    .debug_selector(|| CANCEL_SELECTOR.into())
-                                    .aria_label(t!(cx, "common.cancel"))
-                                    .child(t!(cx, "common.cancel"))
-                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                            )
-                            .child(
-                                Button::new("settings-credentials-confirm")
-                                    .filled()
-                                    .with_unified_size(UnifiedSize::Medium)
-                                    .debug_selector(|| CONFIRM_SELECTOR.into())
-                                    .aria_label(t!(cx, "common.confirm"))
-                                    .child(t!(cx, "common.confirm"))
-                                    .on_click(cx.listener(|editor, _, _, cx| {
-                                        editor.confirm(cx);
-                                    })),
-                            ),
-                    ),
-            )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use app_config::settings::Config;
-    use gpui_kit::{SharedString, TestAppContext};
-    use i18n::t;
-
-    use super::{CredentialsKind, input};
-    use crate::settings_tests::test_support::settings;
-
-    /// The five sets the settings edit, each with every value it holds.
-    const KINDS: [CredentialsKind; 5] = [
-        CredentialsKind::BinanceSpot,
-        CredentialsKind::BinanceUsdMPerp,
-        CredentialsKind::Okx,
-        CredentialsKind::Hyperliquid,
-        CredentialsKind::Longbridge,
-    ];
-
-    /// The state the dialog builds for one value is the state its declaration describes: a secret
-    /// is masked and an identity is not, the hint under an empty field is the sentence the field
-    /// declares — or no hint at all — and what the field starts with is what was stored for it.
-    ///
-    /// The assertions are about the built field rather than about the declaration the field was
-    /// built from: a declaration that said one thing while the builder was handed another would
-    /// pass a test of the declaration and fail this one.
-    #[gpui_kit::test]
-    fn every_field_should_be_built_the_way_its_declaration_describes_it(cx: &mut TestAppContext) {
-        let (_panel, cx) = settings(Config::default(), cx);
-        let built = cx.update(|window, cx| {
-            let mut built = Vec::new();
-            for kind in KINDS {
-                for field in kind.fields() {
-                    let input = input(kind, field, "stored-value", window, cx);
-                    built.push((kind, field, input));
+        let mut draft = CredentialsDraft::empty(kind);
+        let mut rejected = false;
+        for (field, state, error) in pending {
+            let value = SmolStr::new(app.read(&state).text());
+            match field.error_key {
+                Some(key) if value.trim().is_empty() => {
+                    app.write(&error, Some(i18n::t_smol!(translate, key)));
+                    rejected = true;
+                }
+                _ => {
+                    app.write(&error, None);
                 }
             }
-            built
-        });
-        cx.read(|cx| {
-            for (kind, field, input) in &built {
-                let input = input.read(cx);
-                assert_eq!(
-                    input.is_masked(cx),
-                    field.password,
-                    "{kind:?}'s {} should be drawn {}",
-                    field.id,
-                    if field.password { "masked" } else { "as it is" }
-                );
-                assert_eq!(
-                    input.placeholder(cx),
-                    field.placeholder_key.map(|key| t!(cx, key)),
-                    "{kind:?}'s {} should be hinted with the sentence its declaration names",
-                    field.id
-                );
-                assert_eq!(
-                    input.value(cx),
-                    SharedString::new_static("stored-value"),
-                    "{kind:?}'s {} should start from the value it was built with",
-                    field.id
-                );
+            draft.set(field.id, value);
+        }
+        if rejected {
+            return;
+        }
+
+        let stored = host.write(
+            app,
+            window,
+            SettingsChange::edit(move |config| kind.save(config, &draft)),
+        );
+        // The reason the set could not be stored is the settings page's to report, and the dialog
+        // stays where the user can submit it again.
+        if stored.is_ok()
+            && let Some(dialog) = dialog
+        {
+            dialog.close(app);
+        }
+    }
+
+    /// Makes the dialog and its form follow the frame.
+    fn sync(&self, app: &mut App) -> Result<(), EngineError> {
+        let dialog = self.inner.borrow().dialog.clone();
+        let Some(dialog) = dialog else {
+            return Ok(());
+        };
+        if !dialog.is_open(app) {
+            self.release_form(app);
+            return Ok(());
+        }
+
+        {
+            let inner = self.inner.borrow();
+            if let Some(form) = inner.form.as_ref() {
+                for field in &form.fields {
+                    field.input.sync(app);
+                    let text =
+                        app.read_with(&field.input.state, |state| SmolStr::new(state.text()));
+                    if field.previous.borrow().as_str() != text.as_str() {
+                        *field.previous.borrow_mut() = text;
+                        if app.read(&field.error).is_some() {
+                            app.write(&field.error, None);
+                        }
+                    }
+                }
+                for button in &form.buttons {
+                    button.sync(app)?;
+                }
             }
-        });
+        }
+        let _ = dialog.sync(app);
+        if !dialog.is_open(app) {
+            self.release_form(app);
+        }
+
+        Ok(())
+    }
+
+    /// Offers one platform event to the form's inputs.
+    fn dispatch(&self, app: &mut App, event: &Event) -> bool {
+        let inner = self.inner.borrow();
+        let Some(form) = inner.form.as_ref() else {
+            return false;
+        };
+        let mut consumed = false;
+        for field in &form.fields {
+            consumed |= field.input.dispatch(app, event);
+        }
+
+        consumed
+    }
+
+    /// Releases the form of the open, if there is one.
+    fn release_form(&self, app: &mut App) {
+        let form = self.inner.borrow_mut().form.take();
+        let Some(form) = form else {
+            return;
+        };
+        for field in &form.fields {
+            field.input.release(app);
+        }
+        for button in &form.buttons {
+            button.release(app);
+        }
+        app.release_scope(form.scope);
+    }
+
+    /// Builds one wrapper node a dialog button is drawn in, which is the id a test clicks it by.
+    fn button_wrapper(
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        id: SmolStr,
+    ) -> Result<NodeId, EngineError> {
+        layout::build_node(app, window, parent, move |tree, parent| {
+            NodeBuilder::boxed()
+                .id(id)
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .build(),
+                )
+                .build(tree, parent)
+        })
+    }
+
+    /// Releases the form and the dialog.
+    fn release(&self, app: &mut App) {
+        self.release_form(app);
+        let dialog = self.inner.borrow_mut().dialog.take();
+        if let Some(dialog) = dialog {
+            dialog.release(app);
+        }
     }
 }

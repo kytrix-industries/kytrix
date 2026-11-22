@@ -1,10 +1,10 @@
-//! The pages of the market participants this build serves.
+//! The venue pages: one native page per venue this build serves.
 
-mod binance;
+pub(crate) mod binance;
 pub(crate) mod credentials;
 pub(crate) mod dispatcher;
-mod hyperliquid;
-mod longbridge;
-mod okx;
-mod polymarket;
-mod shared;
+pub(crate) mod hyperliquid;
+pub(crate) mod longbridge;
+pub(crate) mod okx;
+pub(crate) mod polymarket;
+pub(crate) mod shared;

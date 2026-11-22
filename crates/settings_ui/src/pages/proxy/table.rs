@@ -1,371 +1,798 @@
-//! The proxy catalog: one row per saved endpoint, with the controls that change it.
+//! The server-management page: the proxy catalog as a table, and the form its rows open.
 //!
-//! A catalog with nothing in it has no rows to draw, so what it says then is one line across
-//! the body — see [`TableDataSet::empty`] — rather than a row whose every column says it.
+//! The catalog is one row per saved endpoint. A catalog with nothing in it draws one line across
+//! the body rather than a row whose every column says it holds nothing.
 //!
-//! The table is an entity of its own because that is what [`Table`] reads its rows from. It
-//! holds one snapshot at a time and is told to look again when the settings session changes
-//! them, which is what makes it follow a change rather than showing what the catalog was when
-//! the settings page opened.
+//! The table is the page's own: the page is drawn without the shell's scroll region
+//! ([`PageView::scrolls`]) because the table scrolls its rows itself, and the page sits at the
+//! height the settings give it — the row above the catalog and the catalog under it.
 //!
-//! Opening a form is not done here. A table cell is drawn without a window, and a dialog
-//! needs one, so a row records the form the user asked for and the settings page takes it: it
-//! opens the form on the window layer, which pushes it and draws it on the next frame. A request
-//! is opened once, in the frame the settings page takes it — see [`ProxyTable::take_request`].
+//! # Who opens the form
+//!
+//! The table's rows are built without an application context (a kit table's row factory is handed
+//! only the node tree), so a row cannot open a dialog. A row records what it asked for in a signal
+//! and the page opens the form on the frame that follows — see [`ProxyTablePage::sync`]. The same
+//! request signal is what the button above the catalog writes, so there is one path into the form
+//! rather than two.
+//!
+//! Deleting is the one row action that cannot be taken back, because removing an entry puts every
+//! route that named it back on the default line. It is put to the user as an alert over the
+//! settings, and only what the alert confirms is written.
 
-use app_config::network::{ProxyAuthorizationConfig, ProxyConfig};
+use std::borrow::Cow;
+
+use app_config::{
+    network::{ProxyAuthorizationConfig, ProxyConfig},
+    settings::Config,
+};
 use base_ui::{
-    button::Button,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    size::UnifiedSizable,
-    style::theme::ThemeExt,
-    table::{Table, TableDataSet},
-    tooltip::TooltipExt,
+    kit::{
+        alert::AlertBuilder,
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        icon::IconKind,
+        list::SelectionMode,
+        markdown::{parse::parse_document, source::MarkdownAssets},
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, Context, ElementId, Empty, Entity, InteractiveElement, IntoElement, Length,
-    ParentElement, Render, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, WeakEntity, Window, base::Align, div, relative,
+use i18n::translate::Translate;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    a11y::{A11yOverride, A11yRole},
+    app::App,
+    error::EngineError,
+    event::{Action, Event},
+    interaction::ActionCtx,
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+        tree::NodeTree,
+    },
+    paint::style::StylePatch,
+    text::{TextOverflow, TextStyle, TextWrap},
+    window::WindowId,
 };
-use i18n::t;
-use smol_str::SmolStr;
 
-use super::editor::DnsMode;
-use crate::session::SettingsSession;
+use crate::{
+    host::SettingsHost,
+    layout,
+    pages::{
+        page::{PageBuild, PageView},
+        proxy::editor::{DnsMode, ProxyEditor},
+    },
+    session::SettingsChange,
+};
 
-/// Columns: name, address, port, authentication, DNS mode, actions.
-const COLUMN_COUNT: usize = 6;
+/// The id of this page.
+const PAGE: &str = "server-management";
 
-/// Column widths in header order.
-///
-/// Every column is a share of the panel, so the widths are the whole of it: the name and the
-/// address are the widest two, because they are what a row is told apart and reached by.
-const COLUMN_WIDTHS: [Length; COLUMN_COUNT] = [
-    Length::Definite(relative(0.22)),
-    Length::Definite(relative(0.22)),
-    Length::Definite(relative(0.10)),
-    Length::Definite(relative(0.18)),
-    Length::Definite(relative(0.20)),
-    Length::Definite(relative(0.08)),
+/// The columns of the catalog, in the order they are drawn: the name, the endpoint, the
+/// authentication it asks for and the mode it resolves names in, then the row's own controls.
+const COLUMN_COUNT: usize = 8;
+
+/// The share of the table each column takes.
+const COLUMN_WEIGHTS: [f32; COLUMN_COUNT] = [0.14, 0.14, 0.06, 0.12, 0.12, 0.10, 0.10, 0.22];
+
+/// How each column aligns its text.
+const COLUMN_ALIGNS: [ColumnAlign; COLUMN_COUNT] = [
+    ColumnAlign::Start,
+    ColumnAlign::Start,
+    ColumnAlign::End,
+    ColumnAlign::Start,
+    ColumnAlign::Start,
+    ColumnAlign::Start,
+    ColumnAlign::Start,
+    ColumnAlign::Center,
 ];
 
-/// What one row asks the settings page to do.
+/// The text a password is drawn as, whatever it holds: a catalog entry's password is the one
+/// value the settings hold that the page must not draw back.
+const PASSWORD_MASK: &str = "••••••";
+
+/// The height of one row of the catalog.
+const ROW_GAP: f32 = 6.0;
+
+/// One entry of the catalog as the table draws it: the name it is stored under and what it holds.
+type Rows = Vec<(SmolStr, ProxyConfig)>;
+
+/// What one control of the page asked it to do, waiting for the frame that does it.
+///
+/// The table's rows are built without an application context, so a row records the form it wants
+/// and the page opens it: a request is opened once, on the frame the page takes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ProxyRequest {
+enum ProxyIntent {
     /// Open the form that adds a new entry.
     Add,
     /// Open the form that edits `name`, started from what it currently holds.
-    Edit { name: SmolStr },
-    /// Remove `name` and everything bound to it, which the settings page has the user confirm
-    /// before anything is written.
-    Delete { name: SmolStr },
+    Edit(SmolStr),
+    /// Ask the user to confirm removing `name`.
+    Delete(SmolStr),
 }
 
-/// The proxy catalog, drawn as a table.
-pub(crate) struct ProxyTable {
-    rows: Vec<(SmolStr, ProxyConfig)>,
-    /// The form a row asked for, which the settings page takes when it next draws.
-    request: Option<ProxyRequest>,
-    /// How many times the rows changed, so the table is drawn again rather than reusing
-    /// what it drew before.
-    revision: u64,
-    /// The table's own handle, which its rows are drawn with: a cell is given no window,
-    /// so a row cannot reach the entity it belongs to any other way.
-    owner: WeakEntity<ProxyTable>,
-    /// The session the rows are the catalog of.
-    session: Entity<SettingsSession>,
-    /// Held because the subscription is what keeps the rows of the table the rows of the
-    /// session: dropping it would leave a catalog that never notices it changed.
-    _session_changes: Subscription,
+/// The server-management page.
+pub(crate) struct ProxyTablePage {
+    host: SettingsHost,
+    window: Option<WindowId>,
+    /// The key prefix every kit component of this page and every dialog it opens is named by.
+    prefix: Option<SmolStr>,
+    /// The catalog the table's cells read, so a value that changed under a mounted row is drawn
+    /// on the next frame without rebuilding the row.
+    rows: Option<Signal<Rows>>,
+    /// What a control of the page asked for, waiting for the frame that opens it.
+    request: Option<Signal<Option<ProxyIntent>>>,
+    /// The signal scope the page's two signals belong to, released with the page.
+    scope: Option<SignalScope>,
+    table: Option<Table>,
+    add_button: Option<Button>,
+    /// The actions the catalog's rows dispatch, by the order they were registered in.
+    row_actions: Vec<Action>,
+    /// The form the page opened, until it is confirmed or walked away from.
+    editor: Option<ProxyEditor>,
+    /// The alert a delete is asked in, until it is answered.
+    alert: Option<Dialog>,
+    /// The catalog the table was last told to draw.
+    applied: Option<Rows>,
+    /// How many rows the table was last told to draw.
+    applied_rows: usize,
 }
 
-impl ProxyTable {
-    pub fn new(session: Entity<SettingsSession>, cx: &mut Context<Self>) -> Self {
-        let changes = cx.observe(&session, |table, _, cx| table.reload(cx));
-
-        let mut table = Self {
-            rows: Vec::new(),
+impl ProxyTablePage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
+    pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
+        Self {
+            host,
+            window: None,
+            prefix: None,
+            rows: None,
             request: None,
-            revision: 0,
-            owner: cx.entity().downgrade(),
-            session,
-            _session_changes: changes,
-        };
-        table.reload(cx);
-
-        table
+            scope: None,
+            table: None,
+            add_button: None,
+            row_actions: Vec::new(),
+            editor: None,
+            alert: None,
+            applied: None,
+            applied_rows: 0,
+        }
     }
 
-    /// Records the form the user asked for, which the settings page takes when it next draws and
-    /// opens on the window layer.
-    pub fn request(&mut self, request: ProxyRequest, cx: &mut Context<Self>) {
+    /// The catalog as the settings hold it, in the order the table draws it.
+    ///
+    /// The catalog is a map keyed by name, so its order is the name order: the rows do not move
+    /// because a proxy was added, and two rows never trade places.
+    fn catalog(&self, app: &App) -> Rows {
+        self.host.config(app, |config: &Config| {
+            config
+                .proxies
+                .iter()
+                .map(|(name, proxy)| (name.clone(), proxy.clone()))
+                .collect()
+        })
+    }
+
+    /// Takes what a control asked for, so it is opened once.
+    fn take_request(&self, app: &mut App) -> Option<ProxyIntent> {
+        let signal = self.request?;
+        let request = { app.read(&signal).clone() };
+        if request.is_some() {
+            app.write(&signal, None);
+        }
+        request
+    }
+
+    /// Opens what one request asked for: the form of an entry, or the alert a delete is asked in.
+    fn adopt(&mut self, app: &mut App, request: ProxyIntent) {
+        // A modal owns the page while it is up: a request that arrives while one is open is the
+        // frame behind the modal asking for another, not a user opening two forms at once.
+        if self.editor.is_some() || self.alert.is_some() {
+            return;
+        }
+        let (Some(window), Some(prefix)) = (self.window, self.prefix.clone()) else {
+            return;
+        };
+
+        match request {
+            ProxyIntent::Add => {
+                let key = format_smolstr!("{prefix}.add-form");
+                match ProxyEditor::add(app, &self.host, window, key) {
+                    Ok(editor) => self.editor = Some(editor),
+                    Err(error) => log::warn!("opening the add-proxy form failed: {error}"),
+                }
+            }
+            ProxyIntent::Edit(name) => {
+                let key = format_smolstr!("{prefix}.edit-form");
+                match ProxyEditor::edit(app, &self.host, window, key, &name) {
+                    Ok(Some(editor)) => self.editor = Some(editor),
+                    Ok(None) => {}
+                    Err(error) => log::warn!("opening the edit-proxy form failed: {error}"),
+                }
+            }
+            ProxyIntent::Delete(name) => self.open_delete(app, window, &prefix, name),
+        }
+    }
+
+    /// Opens the alert that asks whether one entry may be removed.
+    fn open_delete(&mut self, app: &mut App, window: WindowId, prefix: &SmolStr, name: SmolStr) {
+        let translate = self.host.translate().clone();
+        let title = i18n::t_smol!(translate, "settings_ui.proxies.delete_title");
+        let message = delete_message(&translate, &name);
+        let confirm = i18n::t_smol!(translate, "common.confirm");
+        let cancel = i18n::t_smol!(translate, "common.cancel");
+        let close_label = i18n::t_smol!(translate, "common.close");
+        let host = self.host.clone();
+        let dialog = DialogBuilder::alert(title.clone(), move |dialog, _theme| {
+            let dialog_for_ok = dialog.clone();
+            let dialog_for_cancel = dialog.clone();
+            let host = host.clone();
+            let name = name.clone();
+            AlertBuilder::new()
+                .ok_cancel(title.clone(), message.clone())
+                .ok_text(confirm.clone())
+                .cancel_text(cancel.clone())
+                .ok_action(move |_value: Option<SmolStr>, app: &mut App| {
+                    let change = SettingsChange::RemoveProxy { name: name.clone() };
+                    let _ = host.write(app, window, change);
+                    dialog_for_ok.close(app);
+                })
+                .cancel_action(move |app: &mut App| {
+                    dialog_for_cancel.close(app);
+                })
+        })
+        .fade(false)
+        .close_label(close_label)
+        .build(
+            app,
+            self.host.theme_handle(),
+            self.host.layer(),
+            self.host.animation(),
+            format_smolstr!("{prefix}.delete"),
+        );
+        match dialog.open(app, window) {
+            Ok(_) => self.alert = Some(dialog),
+            Err(error) => {
+                log::warn!("opening the delete-proxy alert failed: {error}");
+                dialog.release(app);
+            }
+        }
+    }
+
+    /// Registers the actions the catalog's rows dispatch, for the rows there are now.
+    ///
+    /// A row's action identity carries the row's place in the catalog rather than its name: the
+    /// handler reads the name of the row the click landed on, so a rename that moves a row keeps
+    /// every button pointing at the entry it is drawn under.
+    fn register_row_actions(&mut self, app: &mut App) {
+        for action in self.row_actions.drain(..) {
+            app.off_action(&action);
+        }
+        let (Some(rows), Some(prefix), Some(request), Some(window)) =
+            (self.rows, self.prefix.clone(), self.request, self.window)
+        else {
+            return;
+        };
+        let count = app.read_with(&rows, |rows| rows.len());
+
+        for index in 0..count {
+            let action = Action::Custom(format_smolstr!("{prefix}.row.{index}.edit"));
+            app.on_action(action.clone(), move |ctx: &mut ActionCtx<'_>| {
+                open_row(ctx, rows, request, window, index, false);
+            });
+            self.row_actions.push(action);
+
+            let action = Action::Custom(format_smolstr!("{prefix}.row.{index}.delete"));
+            app.on_action(action.clone(), move |ctx: &mut ActionCtx<'_>| {
+                open_row(ctx, rows, request, window, index, true);
+            });
+            self.row_actions.push(action);
+        }
+    }
+}
+
+/// Asks the page to open the form of one row, reading the name the row is drawn under now.
+fn open_row(
+    ctx: &mut ActionCtx<'_>,
+    rows: Signal<Rows>,
+    request: Signal<Option<ProxyIntent>>,
+    window: WindowId,
+    index: usize,
+    delete: bool,
+) {
+    let name = {
+        let rows = ctx.read(&rows);
+        rows.get(index).map(|(name, _profile)| name.clone())
+    };
+    let Some(name) = name else {
+        return;
+    };
+    let intent = if delete {
+        ProxyIntent::Delete(name)
+    } else {
+        ProxyIntent::Edit(name)
+    };
+    ctx.write(&request, Some(intent));
+    let _ = ctx.app_mut().request_repaint(window);
+}
+
+impl PageView for ProxyTablePage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
+
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        self.window = Some(window);
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let prefix = SmolStr::new(cx.unique_key("proxy"));
+        self.prefix = Some(prefix.clone());
+        let scope = app.signal_scope();
+        self.scope = Some(scope);
+        let rows = app.signal_scoped(scope, Rows::default());
+        self.rows = Some(rows);
+        let request = app.signal_scoped(scope, Option::<ProxyIntent>::None);
         self.request = Some(request);
-        cx.notify();
-    }
 
-    /// Takes the form a row asked for, so it is opened once.
-    pub fn take_request(&mut self) -> Option<ProxyRequest> {
-        self.request.take()
-    }
+        let catalog = self.catalog(app);
+        app.write(&rows, catalog.clone());
+        self.applied = Some(catalog.clone());
+        self.applied_rows = catalog.len();
 
-    /// Re-reads the catalog of the session and tells the table to draw it again when it
-    /// changed.
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let config = self.session.read(cx).config(cx);
-        let rows = config
-            .proxies
-            .iter()
-            .map(|(name, proxy)| (name.clone(), proxy.clone()))
-            .collect::<Vec<_>>();
-        drop(config);
-
-        let changed = self.rows != rows;
-        self.rows = rows;
-        if changed {
-            self.revision = self.revision.wrapping_add(1);
-            cx.notify();
-        }
-    }
-}
-
-impl TableDataSet<COLUMN_COUNT> for ProxyTable {
-    fn rows_count(&self) -> usize {
-        // A catalog with nothing in it has no rows: what it has to say then is the one line
-        // the body draws in place of them, not a row of columns that each say it.
-        self.rows.len()
-    }
-
-    fn headers(&self, cx: &App) -> [SharedString; COLUMN_COUNT] {
-        [
-            t!(cx, "settings_ui.proxies.name"),
-            t!(cx, "settings_ui.proxies.address"),
-            t!(cx, "settings_ui.proxies.port"),
-            t!(cx, "settings_ui.proxies.authorization"),
-            t!(cx, "settings_ui.proxies.dns_mode"),
-            SharedString::new_static(""),
-        ]
-    }
-
-    fn column_aligns(&self) -> [Align; COLUMN_COUNT] {
-        [
-            Align::Start,
-            Align::Start,
-            Align::End,
-            Align::End,
-            Align::End,
-            Align::Center,
-        ]
-    }
-
-    fn column_widths(&self) -> [Length; COLUMN_COUNT] {
-        COLUMN_WIDTHS
-    }
-
-    fn cell(&self, row_index: usize, column_index: usize, _cx: &App) -> impl IntoElement {
-        let Some((name, proxy)) = self.rows.get(row_index) else {
-            return Empty.into_any_element();
-        };
-
-        ProxyCell {
-            name: name.clone(),
-            proxy: proxy.clone(),
-            column: column_index,
-            owner: self.owner.clone(),
-        }
-        .into_any_element()
-    }
-
-    /// A catalog that holds nothing says so once, across the body, rather than in every column.
-    fn empty(&self, cx: &App) -> Option<AnyElement> {
-        Some(
-            div()
-                .debug_selector(|| "SETTINGS_PROXY_EMPTY".into())
-                .text_sm()
-                .text_color(cx.theme().roles.fg.muted.hsla)
-                .child(t!(cx, "settings_ui.proxies.empty"))
-                .into_any_element(),
-        )
-    }
-}
-
-/// One cell of one row, drawn when the table asks for it.
-///
-/// The text is resolved here rather than in [`ProxyTable::cell`], which is given no
-/// application context to translate with.
-#[derive(IntoElement)]
-struct ProxyCell {
-    name: SmolStr,
-    proxy: ProxyConfig,
-    column: usize,
-    owner: WeakEntity<ProxyTable>,
-}
-
-impl RenderOnce for ProxyCell {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self {
-            name,
-            proxy,
-            column,
-            owner,
-        } = self;
-
-        // The row controls ask the table for a form rather than opening one, because a cell
-        // is drawn without a window and a dialog needs one.
-        let actions = ProxyActions {
-            name: name.clone(),
-            owner,
-        };
-
-        match column {
-            0 => SharedString::from(name.as_str()).into_any_element(),
-            1 => SharedString::from(proxy.addr.as_str()).into_any_element(),
-            2 => proxy.port.to_string().into_any_element(),
-            3 => match &proxy.authorization {
-                ProxyAuthorizationConfig::None => {
-                    t!(cx, "settings_ui.proxies.no_authorization").into_any_element()
-                }
-                ProxyAuthorizationConfig::UsernameAndPassword { .. } => {
-                    t!(cx, "settings_ui.proxies.username_password").into_any_element()
-                }
-            },
-            4 => DnsMode::of(proxy.resolve_dns_at_remote)
-                .label(cx)
-                .into_any_element(),
-            5 => actions.into_any_element(),
-            _ => Empty.into_any_element(),
-        }
-    }
-}
-
-/// The controls of one row: edit and delete, both of which ask the table for a form.
-///
-/// The row is given the table's own weak handle because a cell is drawn without a window,
-/// and an entity is only reachable through one.
-#[derive(IntoElement)]
-struct ProxyActions {
-    name: SmolStr,
-    owner: WeakEntity<ProxyTable>,
-}
-
-impl RenderOnce for ProxyActions {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let table = self.owner.clone();
-        let edit_table = table.clone();
-        let delete_table = table;
-        let edit_name = self.name.clone();
-        let delete_name = self.name.clone();
-        let theme = cx.theme();
-
-        div()
-            .flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .child(
-                Button::new(ElementId::NamedChild(
-                    std::sync::Arc::new(ElementId::Name(SharedString::new_static(
-                        "settings-proxy-edit",
-                    ))),
-                    SharedString::from(self.name.as_str()),
-                ))
-                .small()
-                .ghost()
-                .aria_label(t!(cx, "settings_ui.proxies.edit"))
-                .with_tooltip(t!(cx, "settings_ui.proxies.edit"))
-                .child(Icon::new(IconKind::NotePencil).size_3())
-                .on_click(move |_, _, cx| {
-                    let Some(table) = edit_table.upgrade() else {
-                        return;
-                    };
-                    let name = edit_name.clone();
-                    table.update(cx, |table, cx| {
-                        table.request(ProxyRequest::Edit { name }, cx);
-                    });
-                }),
-            )
-            .child(
-                Button::new(ElementId::NamedChild(
-                    std::sync::Arc::new(ElementId::Name(SharedString::new_static(
-                        "settings-proxy-delete",
-                    ))),
-                    SharedString::from(self.name.as_str()),
-                ))
-                .small()
-                .ghost()
-                .aria_label(t!(cx, "settings_ui.proxies.delete"))
-                .with_tooltip(t!(cx, "settings_ui.proxies.delete"))
-                .child(
-                    Icon::new(IconKind::Trash)
-                        .size_3()
-                        .text_color(theme.roles.status.danger.base.hsla),
+        let page = layout::build_node(app, window, parent, |tree, parent| {
+            NodeBuilder::boxed()
+                .id("SETTINGS_PROXY_PAGE")
+                .style(
+                    StyleBuilder::new()
+                        .flex_col()
+                        .size_full()
+                        .min_width_0()
+                        .min_height_0()
+                        .gap(8.0)
+                        .build(),
                 )
-                .on_click(move |_, _, cx| {
-                    let Some(table) = delete_table.upgrade() else {
-                        return;
-                    };
-                    let name = delete_name.clone();
-                    table.update(cx, |table, cx| {
-                        table.request(ProxyRequest::Delete { name }, cx);
-                    });
-                }),
-            )
+                .build(tree, parent)
+        })?;
+
+        // The row above the catalog is the way to add to it and nothing else, so what it holds is
+        // the right end of it.
+        let toolbar = layout::build_node(app, window, page, |tree, parent| {
+            NodeBuilder::boxed()
+                .id("SETTINGS_PROXY_ADD_ROW")
+                .style(
+                    StyleBuilder::new()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .flex_none()
+                        .width_full()
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+        let add_holder = layout::build_node(app, window, toolbar, |tree, parent| {
+            NodeBuilder::boxed()
+                .id("SETTINGS_PROXY_ADD_BUTTON")
+                .style(StyleBuilder::new().flex_none().build())
+                .build(tree, parent)
+        })?;
+        let add_label = i18n::t_smol!(translate, "settings_ui.proxies.add");
+        let add_button = Button::new(app, theme.clone(), format_smolstr!("{prefix}.add"))
+            .primary()
+            .icon(IconKind::Plus)
+            .label(add_label)
+            .on_click(move |ctx: &mut ActionCtx<'_>| {
+                ctx.write(&request, Some(ProxyIntent::Add));
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        add_button.build(app, window, add_holder)?;
+        self.add_button = Some(add_button);
+
+        let frame = layout::themed_box(
+            app,
+            window,
+            page,
+            SmolStr::new_static("SETTINGS_PROXY_TABLE"),
+            StyleBuilder::new()
+                .flex_col()
+                .flex_1()
+                .width_full()
+                .min_width_0()
+                .min_height_0()
+                .overflow_hidden()
+                .relative()
+                .build(),
+            PaintBuilder::new().rounded(6.0).build(),
+            &theme,
+            Some(Role::SurfaceSunken),
+            Some(Role::LineDivider),
+        )?;
+
+        let labels = CellLabels::new(&translate);
+        let cell_theme = theme.clone();
+        let action_prefix = format_smolstr!("{prefix}.row");
+        let edit_label = i18n::t_smol!(translate, "settings_ui.proxies.edit");
+        let delete_label = i18n::t_smol!(translate, "settings_ui.proxies.delete");
+        let cells = move |tree: &mut NodeTree, parent: NodeId, row: usize, column: usize| {
+            let cell = CellBuild {
+                labels: &labels,
+                theme: &cell_theme,
+                action_prefix: &action_prefix,
+                edit_label: &edit_label,
+                delete_label: &delete_label,
+            };
+            build_cell(tree, parent, row, column, &cell, rows);
+        };
+        let table = Table::new(
+            app,
+            theme.clone(),
+            format_smolstr!("{prefix}.table"),
+            columns(&translate),
+            TableOptions::fixed(theme.tokens().medium.height).selection(SelectionMode::None),
+            cells,
+            "",
+        );
+        table.set_initial_rows(app, catalog.len());
+        table.mount(app, window, frame)?;
+        self.table = Some(table);
+
+        // A catalog that holds nothing says so once, across the body, rather than in every
+        // column of a row that has no entry behind it.
+        let empty = layout::build_node(app, window, frame, move |tree, parent| {
+            NodeBuilder::boxed()
+                .id("SETTINGS_PROXY_EMPTY")
+                .style(
+                    StyleBuilder::new()
+                        .absolute()
+                        .left(0.0)
+                        .right(0.0)
+                        .top(0.0)
+                        .bottom(0.0)
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .build(),
+                )
+                .bind_style(move |cx| StylePatch {
+                    visible: Some(cx.read(&rows).is_empty()),
+                    ..StylePatch::default()
+                })
+                .build(tree, parent)
+        })?;
+        let empty_label = i18n::t_smol!(translate, "settings_ui.proxies.empty");
+        layout::build_node(app, window, empty, move |tree, parent| {
+            let size = theme.tokens().medium.font_size;
+            let text_theme = theme.clone();
+            NodeBuilder::text(SmolStr::default(), TextStyle::new(size))
+                .bind_text(move |cx| {
+                    if cx.read(&rows).is_empty() {
+                        empty_label.clone()
+                    } else {
+                        SmolStr::default()
+                    }
+                })
+                .bind_style(move |cx| StylePatch {
+                    foreground: Some(text_theme.role(cx, Role::FgMuted)),
+                    ..StylePatch::default()
+                })
+                .build(tree, parent)
+        })?;
+
+        self.register_row_actions(app);
+
+        Ok(())
+    }
+
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        if let Some(request) = self.take_request(app) {
+            self.adopt(app, request);
+        }
+
+        let catalog = self.catalog(app);
+        if self.applied.as_ref() != Some(&catalog) {
+            let count = catalog.len();
+            if let Some(rows) = self.rows {
+                app.write(&rows, catalog.clone());
+            }
+            if count != self.applied_rows {
+                if let Some(table) = &self.table {
+                    table.set_rows(app, count)?;
+                }
+                self.applied_rows = count;
+                self.register_row_actions(app);
+            }
+            self.applied = Some(catalog);
+        }
+
+        let mut close_editor = false;
+        if let Some(editor) = self.editor.as_mut() {
+            editor.sync(app)?;
+            close_editor = !editor.is_open(app);
+        }
+        if close_editor && let Some(editor) = self.editor.take() {
+            editor.release(app);
+        }
+
+        if let Some(alert) = self.alert.as_ref()
+            && let Err(error) = alert.sync(app)
+        {
+            log::warn!("syncing the delete-proxy alert failed: {error}");
+        }
+        if self.alert.as_ref().is_some_and(|alert| !alert.is_open(app))
+            && let Some(alert) = self.alert.take()
+        {
+            alert.release(app);
+        }
+
+        if let Some(table) = &self.table {
+            table.sync(app)?;
+        }
+
+        Ok(())
+    }
+
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        if let Some(editor) = self.editor.as_mut() {
+            return editor.dispatch(app, event);
+        }
+        false
+    }
+
+    fn release(&mut self, app: &mut App) {
+        if let Some(editor) = self.editor.take() {
+            editor.release(app);
+        }
+        if let Some(alert) = self.alert.take() {
+            alert.release(app);
+        }
+        for action in self.row_actions.drain(..) {
+            app.off_action(&action);
+        }
+        if let Some(table) = self.table.take() {
+            table.release(app);
+        }
+        if let Some(button) = self.add_button.take() {
+            button.release(app);
+        }
+        if let Some(scope) = self.scope.take() {
+            app.release_scope(scope);
+        }
+    }
+
+    fn scrolls(&self) -> bool {
+        false
     }
 }
 
-impl Render for ProxyTable {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let table = cx.entity();
+/// The labels the catalog's cells draw: what an entry's authentication and DNS mode are called,
+/// and the text a password is drawn as.
+///
+/// They are resolved when the page is built rather than per cell, because a cell is built in a
+/// frame and the catalogue does not move under a drawn page: a language that moves on rebuilds
+/// the page, and with it every label here.
+struct CellLabels {
+    no_authorization: SmolStr,
+    username_password: SmolStr,
+    dns_local: SmolStr,
+    dns_proxy: SmolStr,
+    mask: SmolStr,
+}
 
-        div()
-            .id("settings-proxy-page")
-            .debug_selector(|| "SETTINGS_PROXY_PAGE".into())
-            .size_full()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                // The row above the catalog is the way to add to it and nothing else, so what it
-                // holds is the right end of it.
-                div().flex_none().flex().items_center().justify_end().child(
-                    Button::new("settings-proxy-add")
-                        .debug_selector(|| "SETTINGS_PROXY_ADD_BUTTON".into())
-                        .filled()
-                        .medium()
-                        .aria_label(t!(cx, "settings_ui.proxies.add"))
-                        .with_tooltip(t!(cx, "settings_ui.proxies.add"))
-                        .child(Icon::new(IconKind::Plus).size_3())
-                        .child(t!(cx, "settings_ui.proxies.add"))
-                        .on_click(cx.listener(|table, _, _, cx| {
-                            table.request(ProxyRequest::Add, cx);
-                        })),
-                ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_PROXY_TABLE".into())
-                    .w_full()
-                    // The table is what the page leaves below that row, however tall the page is.
-                    .flex_1()
-                    .min_h_0()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(theme.roles.line.divider.hsla)
-                    // §8.4: a table's rows are transparent over `surface.sunken`, and its
-                    // header is `surface.raised`. The table lives on the settings page here, so
-                    // the content face has to be laid down by the box that holds it.
-                    .bg(theme.roles.surface.sunken.hsla)
-                    .overflow_hidden()
-                    .child(Table::new(
-                        ElementId::NamedInteger(
-                            SharedString::new_static("settings-proxy-table"),
-                            self.revision,
-                        ),
-                        &table,
-                    )),
-            )
+impl CellLabels {
+    /// The labels of one built page.
+    fn new(translate: &Translate) -> Self {
+        Self {
+            no_authorization: i18n::t_smol!(translate, "settings_ui.proxies.no_authorization"),
+            username_password: i18n::t_smol!(translate, "settings_ui.proxies.username_password"),
+            dns_local: i18n::t_smol!(translate, DnsMode::Local.label_key()),
+            dns_proxy: i18n::t_smol!(translate, DnsMode::Proxy.label_key()),
+            mask: SmolStr::new_static(PASSWORD_MASK),
+        }
+    }
+}
+
+/// What one cell of the table is built from: the labels it draws, the theme it follows and the
+/// page's row-action prefix.
+struct CellBuild<'a> {
+    labels: &'a CellLabels,
+    theme: &'a ThemeHandle,
+    action_prefix: &'a SmolStr,
+    edit_label: &'a SmolStr,
+    delete_label: &'a SmolStr,
+}
+
+/// The columns the catalog declares, in header order.
+fn columns(translate: &Translate) -> Vec<Column> {
+    let headers = [
+        i18n::t_smol!(translate, "settings_ui.proxies.name"),
+        i18n::t_smol!(translate, "settings_ui.proxies.address"),
+        i18n::t_smol!(translate, "settings_ui.proxies.port"),
+        i18n::t_smol!(translate, "settings_ui.proxies.authorization"),
+        i18n::t_smol!(translate, "settings_ui.proxies.username"),
+        i18n::t_smol!(translate, "settings_ui.proxies.password"),
+        i18n::t_smol!(translate, "settings_ui.proxies.dns_mode"),
+        // The last column is the row's own controls, which carry no label: nothing is written
+        // over a column whose content is a button.
+        SmolStr::default(),
+    ];
+
+    headers
+        .into_iter()
+        .zip(COLUMN_WEIGHTS)
+        .zip(COLUMN_ALIGNS)
+        .map(|((header, weight), align)| Column::flex(header, weight).align(align))
+        .collect()
+}
+
+/// Builds one cell of one row of the table.
+///
+/// A table's row factory is handed no application context, so a cell is either a text node bound
+/// to the catalog signal or a pair of controls that dispatch the action the page registered for
+/// its row.
+fn build_cell(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    row: usize,
+    column: usize,
+    cell: &CellBuild<'_>,
+    rows: Signal<Rows>,
+) {
+    if let Err(error) = cell_node(tree, parent, row, column, cell, rows) {
+        log::warn!("building a proxy catalog cell failed: {error}");
+    }
+}
+
+/// Builds one cell, reporting what the table's node tree refused.
+fn cell_node(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    row: usize,
+    column: usize,
+    cell: &CellBuild<'_>,
+    rows: Signal<Rows>,
+) -> Result<(), EngineError> {
+    if column + 1 == COLUMN_COUNT {
+        return row_controls(tree, parent, row, cell);
+    }
+
+    let size = cell.theme.tokens().small.font_size;
+    let text_theme = cell.theme.clone();
+    let labels = CellLabels {
+        no_authorization: cell.labels.no_authorization.clone(),
+        username_password: cell.labels.username_password.clone(),
+        dns_local: cell.labels.dns_local.clone(),
+        dns_proxy: cell.labels.dns_proxy.clone(),
+        mask: cell.labels.mask.clone(),
+    };
+    NodeBuilder::text(
+        SmolStr::default(),
+        TextStyle::new(size)
+            .with_wrap(TextWrap::NoWrap)
+            .with_overflow(TextOverflow::Ellipsis, 1),
+    )
+    .bind_text(move |cx| {
+        let rows = cx.read(&rows);
+        cell_text(&rows, row, column, &labels)
+    })
+    .bind_style(move |cx| StylePatch {
+        foreground: Some(text_theme.role(cx, Role::FgDefault)),
+        ..StylePatch::default()
+    })
+    .build(tree, parent)?;
+
+    Ok(())
+}
+
+/// The text one cell of one row draws.
+fn cell_text(rows: &Rows, row: usize, column: usize, labels: &CellLabels) -> SmolStr {
+    let Some((name, proxy)) = rows.get(row) else {
+        return SmolStr::default();
+    };
+    let authenticated = matches!(
+        proxy.authorization,
+        ProxyAuthorizationConfig::UsernameAndPassword { .. }
+    );
+
+    match column {
+        0 => name.clone(),
+        1 => proxy.addr.clone(),
+        2 => format_smolstr!("{}", proxy.port),
+        3 => {
+            if authenticated {
+                labels.username_password.clone()
+            } else {
+                labels.no_authorization.clone()
+            }
+        }
+        4 => match &proxy.authorization {
+            ProxyAuthorizationConfig::None => SmolStr::default(),
+            ProxyAuthorizationConfig::UsernameAndPassword { username, .. } => username.clone(),
+        },
+        5 => match &proxy.authorization {
+            ProxyAuthorizationConfig::None => SmolStr::default(),
+            ProxyAuthorizationConfig::UsernameAndPassword { .. } => labels.mask.clone(),
+        },
+        6 => match DnsMode::of(proxy.resolve_dns_at_remote) {
+            DnsMode::Local => labels.dns_local.clone(),
+            DnsMode::Proxy => labels.dns_proxy.clone(),
+        },
+        _ => SmolStr::default(),
+    }
+}
+
+/// Builds the controls of one row: the way into its form and the way out of the catalog.
+fn row_controls(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    row: usize,
+    cell: &CellBuild<'_>,
+) -> Result<(), EngineError> {
+    let controls = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .width_full()
+                .gap(ROW_GAP)
+                .build(),
+        )
+        .build(tree, parent)?;
+
+    for (suffix, label) in [("edit", cell.edit_label), ("delete", cell.delete_label)] {
+        let action = Action::Custom(format_smolstr!("{}.{row}.{suffix}", cell.action_prefix));
+        let button = NodeBuilder::boxed()
+            .id(format_smolstr!("SETTINGS_PROXY_ROW_{row}_{suffix}"))
+            .style(StyleBuilder::new().flex_none().padding(4.0).build())
+            .tab_stop(true)
+            .on_click(action)
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Button),
+                label: Some(label.clone()),
+                ..A11yOverride::default()
+            })
+            .build(tree, controls)?;
+        layout::themed_text_in_tree(
+            tree,
+            button,
+            None,
+            label.clone(),
+            12.0,
+            500,
+            Role::FgMuted,
+            cell.theme,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// The sentence a delete is confirmed by, as the plain text the alert draws.
+///
+/// The catalogue value is rich text (it aligns its paragraph); a kit alert draws plain text, so
+/// the sentence is read as the words it says — the markup is parsed away rather than shown.
+fn delete_message(translate: &Translate, name: &SmolStr) -> SmolStr {
+    let rich = i18n::t_smol!(
+        translate,
+        "settings_ui.proxies.delete_message",
+        name = name.as_str()
+    );
+
+    parse_document(rich.as_ref(), &NoMarkdownAssets).plain_text()
+}
+
+/// No resource is read while a sentence is read as text: the delete message names no image.
+struct NoMarkdownAssets;
+
+impl MarkdownAssets for NoMarkdownAssets {
+    fn load(&self, _path: &str) -> Option<Cow<'static, [u8]>> {
+        None
     }
 }
