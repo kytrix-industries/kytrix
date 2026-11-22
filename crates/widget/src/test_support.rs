@@ -89,6 +89,26 @@
 //! and the controls the framework builds carry the instance-derived keys
 //! `widget.placeholder.action.<node>` / `widget.banner.action.<node>`.
 //!
+//! # Reading what a canvas drew (P3-1j)
+//!
+//! A self-drawn widget's canvas is **one opaque primitive** in the engine's paint, so the
+//! old assertions could only see that a canvas node exists — deleting `set_canvas`,
+//! breaking a steady-state short circuit, or dropping `request_repaint` stayed green. The
+//! host now reads the canvas contents as paint:
+//!
+//! - [`WidgetTestApp::paint_entries`] — the node's own paint (its background/border/text/…
+//!   and the opaque `Canvas` entry), for "this node was painted at all".
+//! - [`WidgetTestApp::canvas_primitives`] — the canvas' contents as [`CanvasPrimitive`]s
+//!   (quads, paths, clip brackets, text runs, geometry) with the colors/radii the widget
+//!   wrote.
+//! - [`WidgetTestApp::canvas_handle`] — the tree's canvas value, no frame needed, for
+//!   `Arc::ptr_eq` steady-state assertions (an unchanged widget must not replace it).
+//!
+//! The first two read the **last drained frame**, so an idle round has no paint (assert
+//! after a round where [`WidgetTestApp::rendered`] is true). The four test shapes the
+//! widget crates write (steady state, theme switch, "canvas never written", geometry
+//! handed back) are documented in `crates/widgets/AGENTS.md` §11 and design §13.8.
+//!
 //! # Compiling this module
 //!
 //! It is available to this crate's own tests (`cfg(test)`) and to other crates as
@@ -96,7 +116,7 @@
 //! the only thing that turns on `ui_core`'s own test support, so a release build of
 //! `widget` never links the engine's test host.
 
-use std::{rc::Rc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
@@ -112,13 +132,24 @@ use ui_core::{
     app::App,
     error::EngineError,
     event::{Action, ActionSource},
+    math::Rect,
     node::{
         builder::NodeBuilder,
         id::NodeId,
         signal::SignalScope,
         tree::{NodeKind, NodeTree},
     },
-    test_support::{app::TestApp, diagnostics::SignalSlotStats},
+    paint::{
+        canvas::Canvas,
+        color::Color,
+        geometry::GeometryId,
+        primitive::{ClipOp, GradientKind, Primitive, QuadPaint},
+    },
+    test_support::{
+        app::TestApp,
+        diagnostics::SignalSlotStats,
+        record::{PrimitiveKind, PrimitiveRecord},
+    },
     window::{FrameIndex, WindowId},
 };
 
@@ -728,6 +759,79 @@ impl WidgetTestApp {
         false
     }
 
+    /// The primitives the last drained frame painted for `node`.
+    ///
+    /// This is the node's **own** paint in paint order — its background quad, border, text run,
+    /// image, shadows and, for a self-drawn node, the single opaque
+    /// [`PrimitiveKind::Canvas`] entry. A canvas node's contents are not flattened here: read
+    /// them with [`WidgetTestApp::canvas_primitives`].
+    ///
+    /// The read is the last drained frame's paint, not the tree's inputs: a round that painted
+    /// nothing (an idle round, I3) has no paint and answers empty. Assert after a round that
+    /// committed ([`WidgetTestApp::rendered`]).
+    ///
+    /// # Panics
+    /// No round has been drained yet (there is no frame record to read).
+    #[must_use]
+    pub fn paint_entries(&self, node: NodeId) -> Vec<PrimitiveRecord> {
+        self.app
+            .rendered()
+            .map(|frame| {
+                frame
+                    .primitives
+                    .iter()
+                    .filter(|entry| entry.node == node)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The primitives a canvas node's canvas holds in the last drained frame.
+    ///
+    /// A self-drawn widget (`NodeBuilder::canvas` + [`WidgetCx::set_canvas`](crate::cx::WidgetCx::set_canvas))
+    /// is one opaque `Primitive::Canvas` in the engine's paint; what the widget drew — quads,
+    /// paths, clip brackets, text runs, geometry — is read here, in the order the widget pushed
+    /// them. Colors are the [`Color`]s the widget wrote (compare them against the theme role it
+    /// read, not against resolved linear-premultiplied values), and every text run is one
+    /// [`PrimitiveKind::GlyphRun`] entry whose `glyphs` is its positioned-glyph count.
+    ///
+    /// The read is the last drained frame's paint: a node with no canvas, a canvas that was not
+    /// painted (hidden/removed), and an idle round all answer empty. Assert after a round that
+    /// committed ([`WidgetTestApp::rendered`]).
+    ///
+    /// # Panics
+    /// No round has been drained yet (there is no frame record to read).
+    #[must_use]
+    pub fn canvas_primitives(&self, node: NodeId) -> Vec<CanvasPrimitive> {
+        self.app
+            .rendered()
+            .map(|frame| {
+                frame
+                    .canvases
+                    .iter()
+                    .filter(|entry| entry.node == node)
+                    .flat_map(|entry| entry.canvas.primitives().iter().map(canvas_primitive))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The canvas the node tree currently holds for `node` (`None` = not a canvas node).
+    ///
+    /// This is the input side and needs no frame. A widget that repaints only when something it
+    /// paints changed leaves the same [`Arc`] in place across steady-state syncs, so
+    /// `Arc::ptr_eq` of two reads is the assertion that `set_canvas` was **not** called between
+    /// them (a widget that rebuilds its canvas every frame replaces it, which is what a
+    /// steady-state mutation breaks).
+    #[must_use]
+    pub fn canvas_handle(&self, node: NodeId) -> Option<Arc<Canvas>> {
+        let NodeKind::Canvas(canvas) = self.tree().get(node).ok()?.kind() else {
+            return None;
+        };
+        Some(Arc::clone(canvas))
+    }
+
     /// Clicks the recovery control the framework built under `parent`.
     ///
     /// The click goes through the engine's real action dispatch — the control's
@@ -858,6 +962,146 @@ impl WidgetTestApp {
     }
 }
 
+/// One primitive inside a canvas, as the last drained frame painted it.
+///
+/// [`WidgetTestApp::canvas_primitives`] returns these in push order: one entry per
+/// `Canvas::push_*` call, with the fields that call wrote. `ClipPush` / `ClipPop` are the
+/// canvas' bracket instructions (a balanced pair is how a test asserts the widget closed what it
+/// opened); `glyphs` is meaningful on `GlyphRun` entries only (one entry = one text run).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CanvasPrimitive {
+    /// Which primitive this is.
+    pub kind: PrimitiveKind,
+    /// Logical-pixel bounds; `None` for instructions without geometry (`ClipPop`, `Geometry`).
+    pub bounds: Option<Rect>,
+    /// Four corner radii (logical px) for `Quad`, `Shadow` and `ClipPush`.
+    pub corner_radius: Option<[f32; 4]>,
+    /// Solid fill / path fill / text / shadow colour, or a gradient's **start** colour.
+    pub color: Option<Color>,
+    /// A quad's inner border (width, colour).
+    pub border: Option<(f32, Color)>,
+    /// A gradient quad's end colour and direction; its start colour is [`Self::color`].
+    pub gradient: Option<(Color, GradientKind)>,
+    /// Positioned-glyph count for a `GlyphRun` (0 for every other kind).
+    pub glyphs: usize,
+    /// The geometry a `Path` / `Geometry` primitive draws from.
+    pub geometry: Option<GeometryId>,
+}
+
+/// Snapshots one canvas-inner primitive, keeping the app-written colors unresolved.
+fn canvas_primitive(primitive: &Primitive) -> CanvasPrimitive {
+    match primitive {
+        Primitive::Quad(quad) => {
+            let (color, border, gradient) = match &quad.paint {
+                QuadPaint::Solid { fill, border } => (
+                    Some(*fill),
+                    border.map(|painted| (painted.width, painted.color)),
+                    None,
+                ),
+                QuadPaint::Gradient(painted) => {
+                    (Some(painted.from), None, Some((painted.to, painted.kind)))
+                }
+            };
+            CanvasPrimitive {
+                kind: PrimitiveKind::Quad,
+                bounds: Some(quad.bounds),
+                corner_radius: Some(quad.corner_radius),
+                color,
+                border,
+                gradient,
+                glyphs: 0,
+                geometry: None,
+            }
+        }
+        Primitive::GlyphRun(run) => {
+            let mut bounds = Rect::default();
+            for glyph in &run.glyphs {
+                bounds = bounds.union(Rect::from_origin_size(glyph.position, glyph.size));
+            }
+            CanvasPrimitive {
+                kind: PrimitiveKind::GlyphRun,
+                bounds: Some(bounds),
+                corner_radius: None,
+                color: Some(run.color),
+                border: None,
+                gradient: None,
+                glyphs: run.glyphs.len(),
+                geometry: None,
+            }
+        }
+        Primitive::Image(image) => CanvasPrimitive {
+            kind: PrimitiveKind::Image,
+            bounds: Some(image.bounds),
+            corner_radius: None,
+            color: None,
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: None,
+        },
+        Primitive::Path(path) => CanvasPrimitive {
+            kind: PrimitiveKind::Path,
+            bounds: Some(path.bounds),
+            corner_radius: None,
+            color: Some(path.fill),
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: Some(path.geometry),
+        },
+        Primitive::Shadow(shadow) => CanvasPrimitive {
+            kind: PrimitiveKind::Shadow,
+            bounds: Some(shadow.rect),
+            corner_radius: Some(shadow.corner_radius),
+            color: Some(shadow.color),
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: None,
+        },
+        Primitive::Clip(ClipOp::Push(clip)) => CanvasPrimitive {
+            kind: PrimitiveKind::ClipPush,
+            bounds: Some(clip.rect),
+            corner_radius: Some(clip.corner_radius),
+            color: None,
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: None,
+        },
+        Primitive::Clip(ClipOp::Pop) => CanvasPrimitive {
+            kind: PrimitiveKind::ClipPop,
+            bounds: None,
+            corner_radius: None,
+            color: None,
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: None,
+        },
+        Primitive::Geometry(draw) => CanvasPrimitive {
+            kind: PrimitiveKind::Geometry,
+            bounds: None,
+            corner_radius: None,
+            color: Some(draw.color),
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: Some(draw.id),
+        },
+        Primitive::Canvas(canvas) => CanvasPrimitive {
+            kind: PrimitiveKind::Canvas,
+            bounds: Some(canvas.bounds()),
+            corner_radius: None,
+            color: None,
+            border: None,
+            gradient: None,
+            glyphs: 0,
+            geometry: None,
+        },
+    }
+}
+
 /// A widget in the shape the framework drives, for the tests that need the whole
 /// path rather than one piece of it.
 ///
@@ -955,6 +1199,7 @@ mod tests {
     };
 
     use app_config_provider::notification::ConfigNotification;
+    use base_ui::theme::{appearance::Appearance, role::Role};
     use bytes::Bytes;
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::{
@@ -963,13 +1208,32 @@ mod tests {
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
     use smol_str::{SmolStr, format_smolstr};
-    use ui_core::{math::Rect, node::builder::NodeBuilder, text::TextStyle};
+    use ui_core::{
+        app::App,
+        error::EngineError,
+        math::{Point, Rect},
+        node::{builder::NodeBuilder, id::NodeId},
+        paint::{
+            canvas::Canvas,
+            color::Color,
+            geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
+            primitive::{ClipRect, Path, Quad, QuadPaint},
+            style::StylePatch,
+        },
+        test_support::record::PrimitiveKind,
+        text::TextStyle,
+    };
     use widget_tokio_runtime::runtime::Runtime;
 
-    use super::{FixtureFailure, WaitingWidget, WidgetTestApp};
+    use super::{CanvasPrimitive, FixtureFailure, WaitingWidget, WidgetTestApp};
     use crate::{
         any::AnyWidget,
-        status::{WidgetAction, WidgetState},
+        category::WidgetCategory,
+        config::WidgetConfigChange,
+        cx::WidgetCx,
+        identity::{WidgetId, WidgetInstanceId},
+        status::{WidgetAction, WidgetState, WidgetStatus},
+        view::{ReloadHandle, WidgetView},
     };
 
     /// The contract's minimum end-to-end example: mount a widget, let the framework
@@ -1468,5 +1732,410 @@ mod tests {
             "the callback's write is the only frame request"
         );
         assert_eq!(harness.frame_index().get(), index.get() + 1);
+    }
+
+    /// How far the canvas fixture animates before it settles.
+    const CANVAS_TICKS: u8 = 3;
+
+    /// The canvas box the fixture draws into.
+    const CANVAS_BOX: Rect = Rect::new(0.0, 0.0, 120.0, 40.0);
+
+    /// A widget whose body is one self-drawn canvas: it animates a few frames, draws a clipped
+    /// quad + a path over registered geometry + one shaped text run, reads the theme on every
+    /// repaint, and hands the geometry back on release.
+    ///
+    /// It is the subject the canvas observations are tested on (P3-1j): the same `sync → set_canvas
+    /// → frame` path the migrated deep-bar / chart widgets take, without their domain code.
+    struct CanvasWidget {
+        progress: u8,
+        painted: Option<(u8, Appearance)>,
+        node: Option<NodeId>,
+        mesh: Option<GeometryId>,
+    }
+
+    impl WidgetView for CanvasWidget {
+        type Config = ();
+
+        const ID: WidgetId = WidgetId::new_static("test.canvas");
+        const DISPLAY_NAME: &'static str = "test.canvas";
+        const CATEGORY: WidgetCategory = WidgetCategory::Market;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            _config: Self::Config,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            _recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Ok(Self {
+                progress: 0,
+                painted: None,
+                node: None,
+                mesh: None,
+            })
+        }
+
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
+
+        fn has_content(&self) -> bool {
+            true
+        }
+
+        fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            // A plate that reads a theme role registers the dependency an appearance switch
+            // invalidates, so switching the theme asks for the repaint the canvas follows.
+            let theme = cx.theme().clone();
+            NodeBuilder::boxed()
+                .id("TEST_PLATE")
+                .layout_override(Rect::new(0.0, 0.0, CANVAS_BOX.size.width, 10.0))
+                .bind_style(move |read| StylePatch {
+                    background: Some(theme.role(read, Role::MarketUp)),
+                    ..StylePatch::default()
+                })
+                .build(cx.tree_mut(), parent)?;
+            let node = NodeBuilder::canvas(Canvas::new(CANVAS_BOX))
+                .id("TEST_CANVAS")
+                .layout_override(CANVAS_BOX)
+                .build(cx.tree_mut(), parent)?;
+            self.node = Some(node);
+            self.mesh = Some(register_triangle(cx.app_mut())?);
+            Ok(())
+        }
+
+        fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            let appearance = cx.theme().current(cx.app());
+            let key = (self.progress, appearance);
+            if self.painted == Some(key) {
+                return Ok(());
+            }
+            let (Some(node), Some(mesh)) = (self.node, self.mesh) else {
+                return Ok(());
+            };
+            let theme = cx.theme().clone();
+            let fill = theme.theme_for(appearance).role(Role::MarketUp);
+            let text_color = theme.theme_for(appearance).role(Role::FgDefault);
+            let mut canvas = Canvas::new(CANVAS_BOX);
+            assert!(
+                canvas.push_clip(ClipRect {
+                    rect: CANVAS_BOX,
+                    corner_radius: [4.0; 4],
+                }),
+                "the fixture's clip is one rounded layer, under the depth limit"
+            );
+            canvas.push_quad(Quad {
+                bounds: Rect::new(0.0, 0.0, 10.0 * f32::from(self.progress + 1), 20.0),
+                corner_radius: [2.0; 4],
+                paint: QuadPaint::Solid { fill, border: None },
+            });
+            canvas.push_path(Path {
+                bounds: Rect::new(0.0, 0.0, 40.0, 20.0),
+                geometry: mesh,
+                fill,
+            });
+            let mut style = TextStyle::new(12.0);
+            style.color = text_color;
+            let line = cx.app_mut().shape_text("42", &style, None, &[])?;
+            assert!(
+                canvas.push_shaped_text(&line, Point::new(4.0, 4.0)),
+                "the fixture's shaped line is a live lease"
+            );
+            assert!(canvas.pop_clip(), "the fixture closes its clip");
+            cx.set_canvas(node, canvas)?;
+            self.painted = Some(key);
+            if self.progress < CANVAS_TICKS {
+                self.progress += 1;
+                cx.request_frame()?;
+            }
+            Ok(())
+        }
+
+        fn release(&mut self, cx: &mut WidgetCx<'_>) {
+            if let Some(mesh) = self.mesh.take() {
+                assert!(
+                    cx.app_mut().geometry_mut().release(mesh),
+                    "the fixture releases the mesh it registered"
+                );
+            }
+        }
+    }
+
+    /// Registers one `GeometryPipeline::Ui` triangle in the process-wide store.
+    fn register_triangle(app: &mut App) -> Result<GeometryId, EngineError> {
+        let mut vertex_bytes = Vec::with_capacity(36);
+        for vertex in [[0.0_f32, 0.0, -1.0], [40.0, 0.0, -1.0], [0.0, 20.0, -1.0]] {
+            for component in vertex {
+                vertex_bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        app.geometry_mut().insert(GeometryDesc {
+            vertex_bytes: Bytes::from(vertex_bytes),
+            index_bytes: Bytes::from_static(&[0, 0, 1, 0, 2, 0]),
+            vertex_stride: 12,
+            index_type: IndexType::U16,
+            topology: Topology::TriangleList,
+            bounds: Rect::new(0.0, 0.0, 40.0, 20.0),
+            pipeline: GeometryPipeline::Ui,
+        })
+    }
+
+    /// The canvas node the fixture built under its surface.
+    fn canvas_node(harness: &WidgetTestApp, widget: &AnyWidget) -> NodeId {
+        harness
+            .find_by_debug_prefix(widget.surface(), "TEST_CANVAS")
+            .expect("the fixture built its canvas")
+    }
+
+    /// The colour one appearance resolves `role` to.
+    fn role_color(harness: &WidgetTestApp, appearance: Appearance, role: Role) -> Color {
+        harness.services().theme.theme_for(appearance).role(role)
+    }
+
+    /// The kinds of a canvas' primitives, in paint order.
+    fn kinds(primitives: &[CanvasPrimitive]) -> Vec<PrimitiveKind> {
+        primitives.iter().map(|primitive| primitive.kind).collect()
+    }
+
+    /// P3-1j: the canvas fixture's paint is readable primitive by primitive — the clip bracket,
+    /// the quad (bounds/radius/colour), the path over registered geometry and the text run —
+    /// instead of one opaque `Canvas` entry (W4b F1, W5a).
+    #[test]
+    fn a_canvas_widget_s_draws_are_readable_primitive_by_primitive() {
+        let mut harness = WidgetTestApp::new();
+        let widget = harness.mount::<CanvasWidget>(());
+        harness.drain();
+        assert!(harness.rendered(), "the first frame paints the widget");
+        let node = canvas_node(&harness, &widget);
+
+        let own = harness.paint_entries(node);
+        assert_eq!(
+            own.iter()
+                .filter(|entry| entry.kind == PrimitiveKind::Canvas)
+                .count(),
+            1,
+            "the node's own paint is one opaque canvas entry: {own:?}"
+        );
+
+        let primitives = harness.canvas_primitives(node);
+        assert_eq!(
+            kinds(&primitives),
+            [
+                PrimitiveKind::ClipPush,
+                PrimitiveKind::Quad,
+                PrimitiveKind::Path,
+                PrimitiveKind::GlyphRun,
+                PrimitiveKind::ClipPop,
+            ],
+            "the canvas contents in push order: {primitives:?}"
+        );
+        let clip = &primitives[0];
+        assert_eq!(clip.bounds, Some(CANVAS_BOX));
+        assert_eq!(clip.corner_radius, Some([4.0; 4]));
+        let quad = &primitives[1];
+        assert_eq!(
+            quad.bounds,
+            Some(Rect::new(0.0, 0.0, 10.0, 20.0)),
+            "the first paint is progress 0"
+        );
+        assert_eq!(quad.corner_radius, Some([2.0; 4]));
+        assert_eq!(
+            quad.color,
+            Some(role_color(&harness, Appearance::Light, Role::MarketUp)),
+            "the quad carries the colour the widget wrote"
+        );
+        let path = &primitives[2];
+        assert!(
+            path.geometry.is_some(),
+            "the path names the geometry it draws: {path:?}"
+        );
+        let run = &primitives[3];
+        assert!(
+            run.glyphs > 0,
+            "one GlyphRun entry per text run, with its placed glyphs: {run:?}"
+        );
+        assert_eq!(
+            run.color,
+            Some(role_color(&harness, Appearance::Light, Role::FgDefault))
+        );
+
+        // The animation moved: the next frame draws the next progress.
+        harness.drain();
+        let grown = harness.canvas_primitives(node);
+        assert_eq!(
+            grown[1].bounds,
+            Some(Rect::new(0.0, 0.0, 20.0, 20.0)),
+            "the next frame repainted the quad at the next progress"
+        );
+    }
+
+    /// P3-1j / W4b F1 ②③: a widget that animates requests the frames it draws, and once it
+    /// settles it neither rewrites the canvas (`Arc::ptr_eq`) nor asks for another frame (I3).
+    #[test]
+    fn a_settled_canvas_is_not_rewritten_and_asks_for_no_more_frames() {
+        let mut harness = WidgetTestApp::new();
+        let widget = harness.mount::<CanvasWidget>(());
+        for _ in 0..=CANVAS_TICKS {
+            harness.drain();
+        }
+        let node = canvas_node(&harness, &widget);
+        let settled_requests = harness.frame_requests();
+        let before = harness
+            .canvas_handle(node)
+            .expect("the node holds a canvas");
+        let painted = harness.canvas_primitives(node);
+        assert_eq!(
+            painted[1].bounds,
+            Some(Rect::new(0.0, 0.0, 40.0, 20.0)),
+            "the animation reached its last progress"
+        );
+
+        harness.drain();
+        assert!(!harness.rendered(), "a settled canvas paints nothing new");
+        assert_eq!(
+            harness.frame_requests(),
+            settled_requests,
+            "the sync must not ask for another frame (I3)"
+        );
+        let after = harness
+            .canvas_handle(node)
+            .expect("the node holds a canvas");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a steady state leaves the same canvas value in place (set_canvas was not called)"
+        );
+        assert!(
+            harness.canvas_primitives(node).is_empty(),
+            "an idle round has no paint to read"
+        );
+    }
+
+    /// P3-1j / W4b F1 ②: an animating canvas keeps asking for the frames it draws. A widget that
+    /// only calls `set_canvas` in `sync` without requesting the next frame freezes in production
+    /// (no pump wake), which this reads back through `frame_requests`.
+    #[test]
+    fn an_animating_canvas_keeps_asking_for_frames() {
+        let mut harness = WidgetTestApp::new();
+        let _widget = harness.mount::<CanvasWidget>(());
+        harness.drain();
+        let first = harness.frame_requests();
+        assert!(
+            first >= 1,
+            "the fixture asks for the frame its next progress needs"
+        );
+        harness.drain();
+        assert!(
+            harness.frame_requests() > first,
+            "each animated round requests the next one"
+        );
+    }
+
+    /// P3-1j / W4b F1 ② (theme half): the canvas repaints in the colours the appearance now
+    /// resolves — the assertion a "colours baked in at mount" regression fails.
+    #[test]
+    fn switching_the_appearance_repaints_the_canvas_in_the_new_roles() {
+        let mut harness = WidgetTestApp::new();
+        let widget = harness.mount::<CanvasWidget>(());
+        harness.drain();
+        let node = canvas_node(&harness, &widget);
+        let light = harness.canvas_primitives(node);
+        let light_fill = light[1].color.expect("the quad is filled");
+        assert_eq!(
+            light_fill,
+            role_color(&harness, Appearance::Light, Role::MarketUp)
+        );
+
+        let before = harness.frame_requests();
+        let theme = harness.services().theme.clone();
+        assert!(
+            theme.set_appearance(harness.app_mut(), Appearance::Dark),
+            "the appearance moves"
+        );
+        assert!(
+            harness.frame_requests() > before,
+            "the plate reads the theme, so the switch asks for the frame that repaints"
+        );
+        harness.drain();
+        let dark = harness.canvas_primitives(node);
+        let dark_fill = dark[1].color.expect("the quad is filled");
+        assert_eq!(
+            dark_fill,
+            role_color(&harness, Appearance::Dark, Role::MarketUp)
+        );
+        assert_ne!(
+            dark_fill, light_fill,
+            "the dark appearance resolves another colour"
+        );
+        assert_eq!(
+            dark[3].color,
+            Some(role_color(&harness, Appearance::Dark, Role::FgDefault)),
+            "the text run follows the theme too"
+        );
+    }
+
+    /// P3-1j / P3-1j C: a canvas node that was never written paints no primitives (the node is
+    /// still one opaque canvas entry) — the "`set_canvas` was removed" assertion shape.
+    #[test]
+    fn a_canvas_node_that_was_never_written_paints_no_primitives() {
+        let mut harness = WidgetTestApp::new();
+        let node = harness.with_cx(|cx| {
+            let root = cx.tree().root();
+            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 16.0, 16.0)))
+                .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0))
+                .id("TEST_EMPTY_CANVAS")
+                .build(cx.tree_mut(), root)
+                .expect("the root is alive")
+        });
+        harness.drain();
+        assert!(harness.rendered(), "the node itself paints");
+        assert!(
+            harness.canvas_primitives(node).is_empty(),
+            "no set_canvas means nothing inside the canvas"
+        );
+        assert_eq!(
+            harness
+                .paint_entries(node)
+                .iter()
+                .filter(|entry| entry.kind == PrimitiveKind::Canvas)
+                .count(),
+            1,
+            "the node is still one opaque canvas in the frame's paint"
+        );
+    }
+
+    /// P3-1j / W5a D: a canvas that draws registered geometry is observable, and releasing the
+    /// widget hands the mesh back to the process-wide store.
+    #[test]
+    fn releasing_a_canvas_widget_hands_its_geometry_back() {
+        let mut harness = WidgetTestApp::new();
+        let baseline = harness.app().geometry().len();
+        let widget = harness.mount::<CanvasWidget>(());
+        harness.drain();
+        let node = canvas_node(&harness, &widget);
+        let primitives = harness.canvas_primitives(node);
+        let path = primitives
+            .iter()
+            .find(|primitive| primitive.kind == PrimitiveKind::Path)
+            .expect("the canvas draws its mesh");
+        assert!(
+            path.geometry.is_some(),
+            "the path names the geometry it draws: {path:?}"
+        );
+        assert_eq!(
+            harness.app().geometry().len(),
+            baseline + 1,
+            "one mesh is registered while the widget lives"
+        );
+
+        widget.release(harness.app_mut());
+        assert_eq!(
+            harness.app().geometry().len(),
+            baseline,
+            "releasing the widget returns its geometry"
+        );
+        assert!(
+            harness.canvas_handle(node).is_none(),
+            "the released widget's canvas node is gone"
+        );
     }
 }

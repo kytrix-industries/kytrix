@@ -503,6 +503,53 @@ if generation != self.seen {
     widget / 组件释放后 `live` 应回到 mount 前，反复开关不应让 `slots` 增长；根作用域铸造的信号永不回收，是它要抓的泄漏。
   - 断言面：`visible` / `text_of` / `has_text` / `has_canvas` / `has_inline_boxes` / `node_count` / `find_by_debug_prefix` /
     `click_recovery` / `enable_a11y_capture` + `a11y_hidden`。
+  - **canvas / 图元读点**（P3-1j）：自绘 widget 必须断言**画出来的图元**，不能只断言 `has_canvas`——删掉 `set_canvas`、
+    去掉动画的 `request_repaint`、稳态短路失效，都曾在「只有 `has_canvas` 断言」的测试下存活（W4a/W4b/W5a 审查）。
+    三个读点（E23）：
+    - `paint_entries(node)`：节点**自有**绘制（背景 quad / 文本 / 图片 / 自绘节点那条不透明 `PrimitiveKind::Canvas`），
+      用来断言「这个节点这一帧被画了」；
+    - `canvas_primitives(node) -> Vec<CanvasPrimitive>`：画布**内容**，按 `Canvas::push_*` 顺序，一 entry 一次 push：
+      quad（bounds / `corner_radius` / `color` / `border` / `gradient`）、path / geometry（`geometry` 是注册的
+      `GeometryId`）、`ClipPush` / `ClipPop` 括号、每条文本 run 一个 `GlyphRun` entry（`glyphs` = 定位字形数）；
+      颜色是 widget 写入的 `ui_core::paint::color::Color`（与 `theme.theme_for(appearance).role(role)` 直接比，不是
+      `QuadRecord` 的解析后线性预乘）；
+    - `canvas_handle(node) -> Option<Arc<Canvas>>`：节点树上的输入值，**不需要帧**；同一 `Arc` 跨稳态 sync 不变。
+
+    读帧的两个方法读的是**最近一次 `drain()` 的那一帧**：空闲轮没有绘制（都为空），断言放在 `rendered()` 为真的那一轮
+    之后；无 drain 记录时 panic（与 `rendered()` 同口径）。四种冻结写法（样板：`crates/widget/src/test_support.rs` 的
+    `CanvasWidget` 与 `test_support::tests::a_canvas_*` / `a_settled_canvas_*` / `switching_the_appearance_*` /
+    `releasing_a_canvas_*`）：
+
+    ```rust
+    // A 稳态：内容没变的 sync 不重写画布、不请求帧（I3）
+    let before = harness.canvas_handle(canvas).expect("canvas node");
+    let requests = harness.frame_requests();
+    harness.with_cx(|cx| widget.sync(cx)).expect("sync");
+    harness.drain();
+    assert!(!harness.rendered(), "稳态不出帧");
+    assert_eq!(harness.frame_requests(), requests);
+    assert!(Arc::ptr_eq(&before, &harness.canvas_handle(canvas).expect("canvas node")),
+        "稳态短路失效（每帧 set_canvas）会换掉这个 Arc");
+
+    // B 主题：颜色跟着外观重解析（不是挂载期常量）
+    theme.set_appearance(harness.app_mut(), Appearance::Dark);
+    harness.drain();
+    let primitives = harness.canvas_primitives(canvas);
+    assert_eq!(primitives[1].color, Some(theme.theme_for(Appearance::Dark).role(Role::MarketUp)));
+
+    // C 未写入：删掉 set_canvas 的变异在这条上红（节点仍是一条不透明 Canvas 图元）
+    assert!(harness.canvas_primitives(canvas).is_empty(), "没有 set_canvas 就没有内容");
+
+    // D 几何归还：画布里的几何 id 可读，释放后计数回基线
+    let path = harness.canvas_primitives(canvas).into_iter()
+        .find(|p| p.kind == PrimitiveKind::Path).expect("path");
+    assert!(path.geometry.is_some());
+    widget.release(harness.app_mut());
+    assert_eq!(harness.app().geometry().len(), baseline, "释放归还几何");
+    ```
+
+    动画帧必须 `cx.request_frame()`：headless 的 `drain()` 每轮都跑 `sync`，只 `set_canvas` 不请求帧仍会提交，所以
+    「动画会不会停」的断言面是 `frame_requests()` 随动画轮次增长，不是 `rendered()`。
 - **倒计时 / 定时器测试写法**（P3-1g；取代 W2c 自建的 `ClockHost`，补 W2b 的倒计时 timer 缺口）：
 
   ```rust
