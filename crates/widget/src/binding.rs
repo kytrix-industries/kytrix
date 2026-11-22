@@ -443,7 +443,6 @@ mod tests {
         runtime: tokio::runtime::Runtime,
         services: WidgetServices,
         window: WindowId,
-        router: FrameRouter,
         scope: SignalScope,
     }
 
@@ -456,52 +455,38 @@ mod tests {
                 .expect("the test runtime builds");
             let mut app = App::new(runtime.handle().clone());
             let window = app.create_window(WindowOptions::default());
-            let scope = app.signal_scope();
-            let language = app.signal_scoped(scope, i18n::language::codes::LanguageCode::En);
-            let config = app.signal_scoped(scope, app_config::settings::Config::default());
-            let catalog_generation = app.signal_scoped(scope, 0_u64);
-            let reduce_motion = app.signal_scoped(scope, false);
             let theme = base_ui::theme::handle::ThemeHandle::new(
                 &mut app,
                 base_ui::theme::appearance::Appearance::Light,
             );
-            let sound: Rc<dyn Fn(&'static str) -> Option<bytes::Bytes>> = Rc::new(|_| None);
-            let services = WidgetServices {
-                translate: crate::test_support::fixture_translate(
-                    i18n::language::codes::LanguageCode::En,
-                ),
-                language,
-                config,
+            let layer = Rc::new(base_ui::kit::layer::Layer::new());
+            let animation_router = Rc::new(base_ui::kit::overlay::AnimationRouter::new());
+            let router =
+                Rc::new(FrameRouter::new(&mut app).expect("the fixture owns the frame hook slot"));
+            let services = WidgetServices::builder(
+                &mut app,
+                runtime.handle().clone(),
+                crate::test_support::fixture_translate(i18n::language::codes::LanguageCode::En),
                 theme,
-                market_participants: None,
-                catalog_generation,
-                kytrix_service: None,
-                open_url: Rc::new(|_| {}),
-                sound,
-                reduce_motion,
-                runtime: runtime.handle().clone(),
-            };
-            let router = FrameRouter::new(&mut app).expect("the fixture owns the frame hook slot");
+                layer,
+                router,
+                animation_router,
+            )
+            .build();
+            let scope = app.signal_scope();
 
             Self {
                 app,
                 runtime,
                 services,
                 window,
-                router,
                 scope,
             }
         }
 
         /// Runs `body` with a context over the fixture and drops the borrow.
         fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R {
-            let mut cx = WidgetCx::new(
-                &mut self.app,
-                self.window,
-                &self.services,
-                self.scope,
-                self.router.clone(),
-            );
+            let mut cx = WidgetCx::new(&mut self.app, self.window, &self.services, self.scope);
             body(&mut cx)
         }
 
