@@ -561,7 +561,7 @@ impl ItemPanel {
             *slot = Some(content);
         }
         self.inner.list.set_disabled_rows(disabled);
-        self.inner.list.set_row_a11y(move |index| a11y(index));
+        self.inner.list.set_row_a11y(move |_cx, index| a11y(index));
         if self.inner.overlay.is_open(app) {
             self.inner.list.set_items(app, count)?;
             self.reset_measure(app)?;
