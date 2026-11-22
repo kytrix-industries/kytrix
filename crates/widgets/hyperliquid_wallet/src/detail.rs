@@ -14,10 +14,12 @@
 //!
 //! # Why the ages are the exception
 //!
-//! An age moves while nothing else does, so the tables keep one clock as a signal: a one-shot
-//! engine timer (E10) advances it once a second while a reading is on screen, the time cells
-//! read it, and the write that moves it is what asks for the frame that rewrites the ages. A
-//! tick that leaves the ages where they were asks for no frame.
+//! An age moves while nothing else does, so every tab keeps its own clock as a signal: a
+//! one-shot engine timer (E10) advances the shown tab's clock once a second while that tab's
+//! reading is on screen, the tab's time cells read it, and the write that moves it is what asks
+//! for the frame that rewrites the ages. A tick that leaves the ages where they were asks for no
+//! frame, and neither the tabs that are hidden nor the tabs with no age in them are rewritten by
+//! a tick the shown tab's clock made.
 //!
 //! # One cell function per tab
 //!
@@ -39,6 +41,14 @@
 //! language is memoised and the six tables are rebuilt under the same parent and keys when it
 //! moves. The accepted readings live in signals this module owns, so the rebuild keeps the data
 //! the user is looking at.
+//!
+//! # A reading belongs to one wallet
+//!
+//! The six tables outlive the wallet they were read for, so the pane says when they are no
+//! longer about what is on screen: opening another wallet, or a scope the readings were not
+//! read in, clears them. A cleared table is an empty table — the pane then says it is reading
+//! the tab it is about to draw, rather than leaving the last wallet's rows under a spinner or
+//! beneath a failure banner.
 
 use std::{
     cell::{Cell, RefCell},
@@ -80,14 +90,17 @@ use ui_core::{
 };
 use widget::{cx::WidgetCx, time_zone::data_time_zone};
 
-use super::model::{
-    AgeBucket, DetailData, DetailSnapshot, DetailTab, DisplayPrecision, SpotBalanceRow,
-    WalletDataError, absolute_time, age_bucket, now_millis,
+use super::{
+    model::{
+        DetailData, DetailSnapshot, DetailTab, DisplayPrecision, SpotBalanceRow, WalletDataError,
+        absolute_time, now_millis,
+    },
+    timeline::age_text,
 };
 
 /// How often the ages of a reading that is on screen are rewritten.
 ///
-/// One second is the resolution an age is read at ([`age_bucket`]): a tick that ran more often
+/// One second is the resolution an age is read at ([`age_text`]): a tick that ran more often
 /// would write a value no cell reads.
 const AGE_TICK: Duration = Duration::from_secs(1);
 
@@ -166,44 +179,6 @@ impl DisplayCell {
             text: age_text(now, timestamp, translate),
             suffix: None,
             tone: CellTone::Muted,
-        }
-    }
-}
-
-/// The age of a moment, as the one relative time every row of this widget is read by.
-///
-/// It is written here rather than shared with the timeline because a row's age and a marker's
-/// age are two different readings of one clock: the timeline draws its own, and a table cell is
-/// the pane's.
-fn age_text(now: i64, timestamp: i64, translate: &Translate) -> SmolStr {
-    match age_bucket(now, timestamp) {
-        AgeBucket::Seconds(value) => {
-            t_smol!(
-                translate,
-                "widget.hyperliquid_wallet.age_seconds",
-                value = value
-            )
-        }
-        AgeBucket::Minutes(value) => {
-            t_smol!(
-                translate,
-                "widget.hyperliquid_wallet.age_minutes",
-                value = value
-            )
-        }
-        AgeBucket::Hours(value) => {
-            t_smol!(
-                translate,
-                "widget.hyperliquid_wallet.age_hours",
-                value = value
-            )
-        }
-        AgeBucket::Days(value) => {
-            t_smol!(
-                translate,
-                "widget.hyperliquid_wallet.age_days",
-                value = value
-            )
         }
     }
 }
@@ -1051,8 +1026,9 @@ struct CellContext {
     tab: DetailTab,
     /// One reading per tab, indexed by [`DetailTab::index`]: the cell draws its own tab's.
     readings: [Signal<Option<Arc<DetailSnapshot>>>; 6],
-    /// The moment the ages are read at.
-    now: Signal<i64>,
+    /// One clock per tab, indexed the same way: only the shown tab's is advanced, so a tick
+    /// rewrites the ages of the tab a reader is looking at and no others.
+    nows: [Signal<i64>; 6],
     /// The settings snapshot, for the display time zone a moment's name is read in.
     config: Signal<Config>,
     language: Signal<LanguageCode>,
@@ -1083,13 +1059,19 @@ fn build_cell(
     let tag = tab.index();
     let reading = context.readings[tag];
     let language = context.language;
-    let now = context.now;
+    let nows = context.nows;
     let translate = context.translate.clone();
     let value = NodeBuilder::text(SmolStr::default(), TextStyle::new(context.font_size));
     let value = value.bind_text(move |read| {
         let _language = *read.read(&language);
         let snapshot = read.read(&reading);
-        let now = *read.read(&now);
+        // Only a time cell reads a clock: the five tabs and the other columns of a tab with an
+        // age in it hold no moving text, so a tick does not rewrite them.
+        let now = if Some(column) == time_column(tab) {
+            *read.read(&nows[tag])
+        } else {
+            0
+        };
         displayed_cell(tab, snapshot.as_deref(), row, column, now, &translate).text
     });
     // The colour is the tone of what the row holds, which no clock moves: it is read in its own
@@ -1168,8 +1150,11 @@ pub(super) struct DetailTables {
     tab: Signal<DetailTab>,
     /// One reading per tab, indexed by [`DetailTab::index`], as the cells read it.
     readings: [Signal<Option<Arc<DetailSnapshot>>>; 6],
-    /// The moment the ages are read at, advanced once a second while a reading is shown.
-    now: Signal<i64>,
+    /// Each tab's clock, advanced once a second while that tab's ages are on screen.
+    nows: [Signal<i64>; 6],
+    /// Whether the detail page is the one the pane is showing: the ages of a hidden page are
+    /// not read, so its clocks do not run.
+    page: Signal<bool>,
     /// Whether the loading overlay is drawn.
     overlay_visible: Signal<bool>,
     /// The settings snapshot, for the display time zone a moment's name is read in.
@@ -1187,9 +1172,7 @@ pub(super) struct DetailTables {
     loading: Cell<[bool; 6]>,
     /// The language the tables' static copy was built in.
     seen_language: Cell<LanguageCode>,
-    /// Whether any tab holds a reading, which is what the ages' clock is armed for.
-    has_reading: Cell<bool>,
-    /// The one-shot timer that advances the ages' clock.
+    /// The one-shot timer that advances the shown tab's clock.
     timer: RefCell<Option<TimerId>>,
     /// Whether that timer has fired and the `sync` that sees it must arm the next one.
     timer_fired: Rc<Cell<bool>>,
@@ -1200,8 +1183,14 @@ impl DetailTables {
     ///
     /// The container is the pane's whole detail area: a stack the six tables share (the shown
     /// tab is the one whose wrapper is visible) and the loading overlay drawn over it. The
-    /// tables are built with no rows; [`DetailTables::accept`] hands each one its reading.
-    pub(super) fn build(cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<Self, EngineError> {
+    /// tables are built with no rows; [`DetailTables::accept`] hands each one its reading. The
+    /// pane's page signal is what says whether these ages are on screen at all: the clock only
+    /// runs for a page a reader is looking at.
+    pub(super) fn build(
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        page: Signal<bool>,
+    ) -> Result<Self, EngineError> {
         let theme = cx.theme().clone();
         let language = cx.language();
         let config = cx.services().config;
@@ -1209,7 +1198,8 @@ impl DetailTables {
         let tab = cx.signal(DetailTab::Spot);
         let readings: [Signal<Option<Arc<DetailSnapshot>>>; 6] =
             std::array::from_fn(|_| cx.signal(None));
-        let now = cx.signal(now_millis().unwrap_or(0));
+        let now = now_millis().unwrap_or(0);
+        let nows: [Signal<i64>; 6] = std::array::from_fn(|_| cx.signal(now));
         let overlay_visible = cx.signal(false);
         let seen_language = *cx.read(&language);
 
@@ -1313,7 +1303,8 @@ impl DetailTables {
             spinner_slot,
             tab,
             readings,
-            now,
+            nows,
+            page,
             overlay_visible,
             config,
             language,
@@ -1324,7 +1315,6 @@ impl DetailTables {
             spinner: RefCell::new(None),
             loading: Cell::new([false; 6]),
             seen_language: Cell::new(seen_language),
-            has_reading: Cell::new(false),
             timer: RefCell::new(None),
             timer_fired: Rc::new(Cell::new(false)),
         };
@@ -1336,7 +1326,8 @@ impl DetailTables {
     ///
     /// What the table is told is the reading — the cells format themselves from it on the frame
     /// that draws them — and how many rows it holds. A reading of another tab holds none of this
-    /// tab's rows, which is how a tab nobody has read yet draws an empty table.
+    /// tab's rows, which is how a tab nobody has read yet draws an empty table. The reading is
+    /// also the answer the tab was waiting for, so the wait ends with it.
     pub(super) fn accept(
         &self,
         tab: DetailTab,
@@ -1344,29 +1335,64 @@ impl DetailTables {
         cx: &mut WidgetCx<'_>,
     ) -> Result<(), EngineError> {
         let count = tab_rows(tab, &snapshot);
-        self.has_reading.set(true);
-        cx.write(&self.now, now_millis().unwrap_or(0));
+        cx.write(&self.nows[tab.index()], now_millis().unwrap_or(0));
         cx.write(&self.readings[tab.index()], Some(snapshot));
         if let Some(table) = self.tables.borrow().get(tab.index()) {
             table.set_rows(cx.app_mut(), count)?;
         }
+        let mut flags = self.loading.get();
+        flags[tab.index()] = false;
+        self.loading.set(flags);
         self.sync_loading(cx)
     }
 
     /// Shows one tab and hides the other five.
     ///
     /// The six tables keep their nodes: the tab is a signal each wrapper container reads, so a
-    /// switch is one write rather than a rebuild.
+    /// switch is one write rather than a rebuild. The tab being shown gets the moment its ages
+    /// are read at: the clocks of the hidden tabs were not the ones running.
     pub(super) fn show(&self, tab: DetailTab, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        cx.write(&self.tab, tab);
+        if *cx.read(&self.tab) != tab {
+            cx.write(&self.tab, tab);
+            cx.write(&self.nows[tab.index()], now_millis().unwrap_or(0));
+        }
         self.sync_loading(cx)
     }
 
-    /// Whether the pane is reading the shown tab with nothing on screen yet.
+    /// Drops every tab's reading: the tables the pane shows belong to one wallet, and a
+    /// reading of another wallet is not one this page may draw.
     ///
-    /// The old pane waited for a reading in the table area, so the overlay covers the tables the
-    /// shown tab would draw in — including the case of a newer reading replacing one that is
-    /// already on screen, because the answer is what the table is for.
+    /// A cleared table is an empty table, and the wait that follows is the overlay's: the pane
+    /// says it is reading the tab it is about to draw rather than leaving the last wallet's
+    /// rows under a spinner.
+    pub(super) fn clear(&self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        for (index, reading) in self.readings.iter().enumerate() {
+            cx.write(reading, None);
+            if let Some(table) = self.tables.borrow().get(index) {
+                table.set_rows(cx.app_mut(), 0)?;
+            }
+        }
+        self.loading.set([false; 6]);
+        self.sync_loading(cx)
+    }
+
+    /// Drops one tab's reading: a tab whose reading the venue refused is a tab with nothing to
+    /// draw, not one that keeps showing the reading before it.
+    pub(super) fn discard(&self, tab: DetailTab, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        cx.write(&self.readings[tab.index()], None);
+        if let Some(table) = self.tables.borrow().get(tab.index()) {
+            table.set_rows(cx.app_mut(), 0)?;
+        }
+        let mut flags = self.loading.get();
+        flags[tab.index()] = false;
+        self.loading.set(flags);
+        self.sync_loading(cx)
+    }
+
+    /// Says whether the pane is reading one tab, which is what draws the wait over it.
+    ///
+    /// A tab read again is a wait over the reading already on screen: the answer is what the
+    /// table is for, and the old pane said the same in its table area.
     pub(super) fn set_loading(
         &self,
         tab: DetailTab,
@@ -1379,8 +1405,8 @@ impl DetailTables {
         self.sync_loading(cx)
     }
 
-    /// Per-frame work: the static copy a language switch rebuilds, the ages' clock, the table
-    /// component syncs.
+    /// Per-frame work: the static copy a language switch rebuilds, the shown tab's ages' clock,
+    /// the table component syncs.
     pub(super) fn sync(&self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let language = *cx.read(&self.language);
         if language != self.seen_language.get() {
@@ -1419,7 +1445,6 @@ impl DetailTables {
             table.release(cx.app_mut());
         }
         self.wrappers.borrow_mut().clear();
-        self.has_reading.set(false);
     }
 
     /// One tab's cell node, for the pane's own tests.
@@ -1445,6 +1470,24 @@ impl DetailTables {
     #[cfg(test)]
     pub(super) fn row_count(&self, tab: DetailTab) -> usize {
         self.tables.borrow().get(tab.index()).map_or(0, Table::rows)
+    }
+
+    /// Whether the loading overlay is drawn, for the pane's own tests.
+    #[cfg(test)]
+    pub(super) fn overlay_visible(&self, app: &ui_core::app::App) -> bool {
+        *app.read(&self.overlay_visible)
+    }
+
+    /// Whether the ages' timer is armed, for the pane's own tests.
+    #[cfg(test)]
+    pub(super) fn age_clock_armed(&self) -> bool {
+        self.timer.borrow().is_some()
+    }
+
+    /// The container the six tables are built under, for the pane's own tests.
+    #[cfg(test)]
+    pub(super) fn area_node(&self) -> NodeId {
+        self.area
     }
 
     /// Builds a table and its wrapper container into the stack.
@@ -1514,7 +1557,7 @@ impl DetailTables {
         let context = CellContext {
             tab,
             readings: self.readings,
-            now: self.now,
+            nows: self.nows,
             config: self.config,
             language: self.language,
             theme: self.theme.clone(),
@@ -1560,14 +1603,16 @@ impl DetailTables {
         self.build_tables(cx)
     }
 
-    /// Draws the loading overlay while the shown tab is being read and holds nothing yet.
+    /// Draws the loading overlay while the shown tab is being read.
     ///
-    /// The spinner is built for the window it is shown in and released when the window closes
-    /// (I3): a hidden spinner would keep asking for frames for as long as the pane lives.
+    /// A reading already on screen stays under the wait: the answer is what the table is for,
+    /// so a tab being read again is waited for over the reading it still shows rather than
+    /// drawn as if the round were over. The spinner is built for the window it is shown in and
+    /// released when the wait ends (I3): a hidden spinner would keep asking for frames for as
+    /// long as the pane lives.
     fn sync_loading(&self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let shown = *cx.read(&self.tab);
-        let visible =
-            self.loading.get()[shown.index()] && cx.read(&self.readings[shown.index()]).is_none();
+        let visible = self.loading.get()[shown.index()];
         cx.write(&self.overlay_visible, visible);
         let built = self.spinner.borrow().is_some();
         if visible && !built {
@@ -1593,28 +1638,41 @@ impl DetailTables {
         Ok(())
     }
 
-    /// Advances the ages' clock once a second while a reading is on screen.
+    /// Advances the shown tab's clock once a second while its ages are on screen.
     ///
     /// The engine's timer is one-shot (E10), so the `sync` that sees it fired arms the next one.
     /// The callback's write is what asks for the frame that rewrites the ages: a tick that moved
-    /// no age writes a value no cell reads and draws nothing.
+    /// no age writes a value no cell reads and draws nothing. A page that is not showing and a tab
+    /// with no age in it run no clock at all (I3): a list page has no ages to move.
     fn sync_age_clock(&self, cx: &mut WidgetCx<'_>) {
         if self.timer_fired.get() {
             self.timer_fired.set(false);
             self.timer.borrow_mut().take();
         }
-        if !self.has_reading.get() || self.timer.borrow().is_some() {
+        let tab = *cx.read(&self.tab);
+        let shown = *cx.read(&self.page);
+        let armed =
+            shown && time_column(tab).is_some() && cx.read(&self.readings[tab.index()]).is_some();
+        if !armed {
+            if let Some(timer) = self.timer.borrow_mut().take() {
+                cx.app_mut().cancel_timer(&timer);
+            }
+            return;
+        }
+        if self.timer.borrow().is_some() {
             return;
         }
         let fired = Rc::clone(&self.timer_fired);
-        let now = self.now;
+        let nows = self.nows;
+        let tab_signal = self.tab;
         let window = cx.window();
         let scope = self.area;
         match cx
             .app_mut()
             .after_scoped(window, scope, AGE_TICK, move |app| {
                 fired.set(true);
-                app.write(&now, now_millis().unwrap_or(0));
+                let index = app.read(&tab_signal).index();
+                app.write(&nows[index], now_millis().unwrap_or(0));
             }) {
             Ok(timer) => *self.timer.borrow_mut() = Some(timer),
             Err(error) => log::warn!("the Hyperliquid wallet ages could not be timed: {error}"),
@@ -2208,7 +2266,10 @@ mod tests {
     /// Builds the six tables under the window root, where the layout gives them a size.
     fn tables(harness: &mut WidgetTestApp) -> DetailTables {
         let root = harness.tree().root();
-        harness.with_cx(|cx| DetailTables::build(cx, root).expect("the tables build"))
+        harness.with_cx(|cx| {
+            let page = cx.signal(true);
+            DetailTables::build(cx, root, page).expect("the tables build")
+        })
     }
 
     /// Runs the tables' per-frame work and a frame, the way the pane's own `sync` does.
@@ -2530,6 +2591,90 @@ mod tests {
         );
     }
 
+    /// A reading that is being read again is waited for in the table area: the reading already on
+    /// screen stays under the overlay, and the overlay is what says a newer one is coming.
+    #[test]
+    fn a_tab_that_is_read_again_should_be_waited_for_over_its_reading() {
+        let mut harness = WidgetTestApp::with_translate(translate(LanguageCode::En));
+        let tables = tables(&mut harness);
+        harness.with_cx(|cx| {
+            tables.show(DetailTab::Spot, cx).expect("the tab shows");
+            tables
+                .accept(
+                    DetailTab::Spot,
+                    Arc::new(spot_reading(vec![wallet_balance("USDC", "1")])),
+                    cx,
+                )
+                .expect("the reading is accepted");
+        });
+        settle(&mut harness, &tables);
+        let overlay = loading_overlay(&harness, &tables);
+        assert!(
+            !harness.visible(overlay),
+            "a reading in hand is not waited for"
+        );
+
+        harness.with_cx(|cx| {
+            tables
+                .set_loading(DetailTab::Spot, true, cx)
+                .expect("the reading is read again");
+        });
+        settle(&mut harness, &tables);
+        assert!(harness.visible(overlay), "the newer reading is waited for");
+        assert_eq!(
+            tables.row_count(DetailTab::Spot),
+            1,
+            "the reading on hand stays under the wait"
+        );
+
+        harness.with_cx(|cx| {
+            tables
+                .set_loading(DetailTab::Spot, false, cx)
+                .expect("the wait is over");
+        });
+        settle(&mut harness, &tables);
+        assert!(!harness.visible(overlay), "the wait ends with the answer");
+    }
+
+    /// The readings of one wallet are not the readings of another: clearing the tables is how the
+    /// pane stops drawing a wallet it is no longer about.
+    #[test]
+    fn clearing_the_tables_should_drop_every_reading() {
+        let mut harness = WidgetTestApp::with_translate(translate(LanguageCode::En));
+        let tables = tables(&mut harness);
+        harness.with_cx(|cx| {
+            tables
+                .accept(
+                    DetailTab::Spot,
+                    Arc::new(spot_reading(vec![wallet_balance("USDC", "1")])),
+                    cx,
+                )
+                .expect("the spot reading is accepted");
+            tables
+                .accept(DetailTab::Perpetual, one_position(), cx)
+                .expect("the perpetual reading is accepted");
+        });
+        settle(&mut harness, &tables);
+        assert_eq!(tables.row_count(DetailTab::Spot), 1);
+        assert_eq!(tables.row_count(DetailTab::Perpetual), 1);
+
+        harness.with_cx(|cx| tables.clear(cx).expect("the tables clear"));
+        settle(&mut harness, &tables);
+
+        assert_eq!(
+            tables.row_count(DetailTab::Spot),
+            0,
+            "a cleared table holds no rows"
+        );
+        assert_eq!(tables.row_count(DetailTab::Perpetual), 0);
+        assert!(
+            tables
+                .cell_node(DetailTab::Spot, 0, 0, harness.app())
+                .is_none(),
+            "and no cell of the reading that was dropped"
+        );
+    }
+
     /// A steady sync asks for no frame (I3): the clock tick is a timer, not a wall-clock read in
     /// `sync`, so two syncs in a row write nothing and draw nothing.
     #[test]
@@ -2616,6 +2761,62 @@ mod tests {
         );
     }
 
+    /// The ages of a page nobody is looking at are not moved: hiding the detail page stops the
+    /// clock, and a tab with no age in it never runs one.
+    #[test]
+    fn the_ages_clock_should_stop_when_its_page_is_hidden() {
+        let mut harness = WidgetTestApp::with_translate(translate(LanguageCode::En));
+        let page = harness.with_cx(|cx| cx.signal(true));
+        let root = harness.tree().root();
+        let tables =
+            harness.with_cx(|cx| DetailTables::build(cx, root, page).expect("the tables build"));
+        let wallet = address("1");
+        let reading = Arc::new(
+            DetailSnapshot::new(
+                DetailData::Trades(vec![fill(
+                    &wallet,
+                    &perp_listing(),
+                    Side::Buy,
+                    "1",
+                    "100",
+                    1,
+                    1,
+                )]),
+                perpetual_precision(),
+            )
+            .expect("a published listing should validate"),
+        );
+        harness.with_cx(|cx| {
+            tables.show(DetailTab::Trades, cx).expect("the tab shows");
+            tables
+                .accept(DetailTab::Trades, reading, cx)
+                .expect("the reading is accepted")
+        });
+        settle(&mut harness, &tables);
+        assert!(
+            tables.age_clock_armed(),
+            "the ages of the detail page move while it is on screen"
+        );
+
+        harness.app_mut().write(&page, false);
+        settle(&mut harness, &tables);
+        assert!(
+            !tables.age_clock_armed(),
+            "a page nobody is looking at asks for no frames to move its ages"
+        );
+
+        harness.app_mut().write(&page, true);
+        settle(&mut harness, &tables);
+        assert!(tables.age_clock_armed(), "showing the page starts it again");
+
+        harness.with_cx(|cx| tables.show(DetailTab::Spot, cx).expect("the tab shows"));
+        settle(&mut harness, &tables);
+        assert!(
+            !tables.age_clock_armed(),
+            "a tab with no time column has no age to move"
+        );
+    }
+
     /// The dialog-style release: every value slot the tables minted comes back, so mounting and
     /// releasing a pane repeatedly reuses the slots instead of minting fresh ones.
     #[test]
@@ -2629,7 +2830,8 @@ mod tests {
             let window = harness.window();
             let root = harness.tree().root();
             let tables = with_scope(&mut harness, scope, |cx| {
-                DetailTables::build(cx, root).expect("the tables build")
+                let page = cx.signal(true);
+                DetailTables::build(cx, root, page).expect("the tables build")
             });
             with_scope(&mut harness, scope, |cx| {
                 tables.show(DetailTab::Spot, cx).expect("the tab shows");
