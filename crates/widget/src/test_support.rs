@@ -43,6 +43,26 @@
 //! runtime is the composition root's business, and a test of such a widget drives a
 //! runtime it owns.
 //!
+//! # Moving time (E10 timers and countdowns)
+//!
+//! The host's engine is on the **engine clock**: [`TestApp`] switches the live clock
+//! off when it is built, so no wall-clock time passes however long a test runs.
+//! [`WidgetTestApp::advance`] is the only thing that moves time: it advances the
+//! engine clock by the duration the test asks for and runs one production-shaped
+//! round, so an [`App::after`] timer becomes due at exactly its deadline and never
+//! earlier. Nothing sleeps and nothing waits.
+//!
+//! One `advance` is one engine round: the frame routes run first, then one frame.
+//! The engine dispatches the timers that are due at the frame's entry — before the
+//! style / text / layout / paint passes — so a callback's writes are painted by the
+//! same round. A timer that re-arms itself (the countdown pattern,
+//! `crates/widgets/AGENTS.md` §11) fires once per call, not once per elapsed delay.
+//!
+//! The engine clock is not a widget's "now": a countdown formats the deadline the
+//! widget holds, and a test moves that state itself. Work that waits on tokio time
+//! belongs to a test-owned `#[tokio::test(start_paused = true)]` runtime, as for
+//! [`WidgetTestApp::drain_runtime`].
+//!
 //! # Injecting the host's collaborators
 //!
 //! The default host composes the same aggregate the application root does, with the
@@ -76,7 +96,7 @@
 //! the only thing that turns on `ui_core`'s own test support, so a release build of
 //! `widget` never links the engine's test host.
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
@@ -99,7 +119,7 @@ use ui_core::{
         tree::{NodeKind, NodeTree},
     },
     test_support::app::TestApp,
-    window::WindowId,
+    window::{FrameIndex, WindowId},
 };
 
 use crate::{
@@ -339,6 +359,17 @@ impl WidgetTestApp {
         &self.services
     }
 
+    /// The services aggregate as the shared handle this host owns, like the
+    /// composition root does.
+    ///
+    /// A widget that builds a host owning services takes the same handle through
+    /// [`WidgetCx::services_rc`]; a test compares the two with `Rc::ptr_eq` to pin that
+    /// the widget works over the application's one aggregate rather than a copy.
+    #[must_use]
+    pub fn services_rc(&self) -> &Rc<WidgetServices> {
+        &self.services
+    }
+
     /// The composition root's one layer stack the services carry.
     ///
     /// A test asserts an overlay opened through the widget context against this
@@ -401,6 +432,66 @@ impl WidgetTestApp {
     pub fn drain(&mut self) {
         self.tick();
         self.app.drain().expect("the frame commits");
+    }
+
+    /// Advances the engine clock by `by` and runs one production-shaped round.
+    ///
+    /// This is the host's only time source: the engine is on the engine clock, so
+    /// an E10 timer ([`App::after`]) becomes due exactly when the accumulated
+    /// `advance` calls reach its deadline — and never because wall-clock time
+    /// passed (see the module docs, "Moving time"). The round is
+    /// [`WidgetTestApp::drain`]: the frame routes first, then one frame; the engine
+    /// dispatches the due timers at that frame's entry, so a callback's writes are
+    /// painted by the same round.
+    ///
+    /// Returns whether the round committed pixels. A callback that writes no render
+    /// state leaves the round idle: `false`, and neither
+    /// [`WidgetTestApp::frame_index`] nor [`WidgetTestApp::frame_requests`] moves
+    /// (I3). A callback whose write a node reads — or one that asks for a repaint —
+    /// has that request presented by this same round: `true`.
+    ///
+    /// One call is one engine round, so a timer that re-arms itself (the countdown
+    /// pattern, `crates/widgets/AGENTS.md` §11) fires once per call, not once per
+    /// elapsed `delay`.
+    pub fn advance(&mut self, by: Duration) -> bool {
+        self.app.advance(by);
+        self.drain();
+        self.app.frame_record().rendered
+    }
+
+    /// The host window's commit cursor (`0` = nothing committed yet).
+    ///
+    /// A round that paints nothing — an idle [`WidgetTestApp::advance`], say — leaves
+    /// it unchanged (I3).
+    #[must_use]
+    pub fn frame_index(&self) -> FrameIndex {
+        self.app
+            .app()
+            .window(self.window)
+            .expect("the host's window exists")
+            .frame_index()
+    }
+
+    /// How many frames the engine has been asked for.
+    ///
+    /// This is the I3 assertion surface: an idle round adds nothing. A signal write
+    /// only asks for a frame when a node (or derived value) reads it; an explicit
+    /// [`App::request_repaint`] always asks.
+    #[must_use]
+    pub fn frame_requests(&self) -> u64 {
+        self.app.app().frame_requests()
+    }
+
+    /// Whether the last drained round committed pixels.
+    ///
+    /// [`WidgetTestApp::advance`] returns this same fact for the round it ran; this
+    /// reads it after a plain [`WidgetTestApp::drain`].
+    ///
+    /// # Panics
+    /// No round has been drained yet (there is no frame record to read).
+    #[must_use]
+    pub fn rendered(&self) -> bool {
+        self.app.frame_record().rendered
     }
 
     /// Advances the runtime the widget services were handed by one turn.
@@ -839,12 +930,13 @@ impl WidgetView for WaitingWidget {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         rc::Rc,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use app_config_provider::notification::ConfigNotification;
@@ -855,6 +947,8 @@ mod tests {
         runtime::MarketParticipantNetworkSnapshot,
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
+    use smol_str::{SmolStr, format_smolstr};
+    use ui_core::{math::Rect, node::builder::NodeBuilder, text::TextStyle};
     use widget_tokio_runtime::runtime::Runtime;
 
     use super::{FixtureFailure, WaitingWidget, WidgetTestApp};
@@ -971,6 +1065,44 @@ mod tests {
 
         assert!(harness.router().is_empty());
         harness.drain();
+    }
+
+    /// Two widget instances live in one application, each with its own signal scope and
+    /// surface: the host is a pane host, not a single-widget fixture. Closing one pane
+    /// removes only its own nodes and frame route — what a multi-pane action key has to
+    /// survive (P3-1h: keys are prefixed by the instance scope).
+    #[test]
+    fn two_widget_instances_live_side_by_side() {
+        let mut harness = WidgetTestApp::new();
+        let first = harness.mount::<WaitingWidget>(());
+        let second = harness.mount::<WaitingWidget>(());
+        harness.drain();
+
+        assert_ne!(
+            first.scope().index(),
+            second.scope().index(),
+            "each mount mints its own signal scope"
+        );
+        assert_ne!(first.surface(), second.surface());
+        assert_eq!(harness.router().len(), 2);
+        assert!(harness.tree().get(first.surface()).is_ok());
+        assert!(harness.tree().get(second.surface()).is_ok());
+
+        let released = first.release(harness.app_mut());
+        assert!(released > 0);
+        assert!(
+            harness.tree().get(first.surface()).is_err(),
+            "the closed pane's nodes are gone"
+        );
+        assert!(
+            harness.tree().get(second.surface()).is_ok(),
+            "the other pane is untouched"
+        );
+        assert_eq!(harness.router().len(), 1);
+        assert!(!second.is_released());
+
+        second.release(harness.app_mut());
+        assert!(harness.tree().get(second.surface()).is_err());
     }
 
     /// The failure path: the fixture refuses its own recovery, and the framework's
@@ -1145,7 +1277,7 @@ mod tests {
     #[test]
     fn run_until_idle_presents_the_frame_a_service_asked_for() {
         let mut harness = WidgetTestApp::new();
-        let before = harness.app().frame_requests();
+        let before = harness.frame_requests();
         let handle = harness.app().handle();
         let window = harness.window();
         harness.services().runtime.spawn(async move {
@@ -1158,12 +1290,133 @@ mod tests {
         let turns = harness.run_until_idle();
 
         assert!(
-            harness.app().frame_requests() > before,
+            harness.frame_requests() > before,
             "the service's frame request was pumped and ran"
         );
         assert!(
             turns >= 2,
             "the request is pumped after a frame and presented on the next turn: {turns}"
         );
+    }
+
+    /// E10 in the host: an [`App::after`] timer fires when [`WidgetTestApp::advance`]
+    /// reaches its deadline, and a callback that writes no render state leaves the
+    /// round idle — no frame request, no commit (I3).
+    #[test]
+    fn advance_dispatches_a_due_timer_without_asking_for_a_frame() {
+        let mut harness = WidgetTestApp::new();
+        // The host's first frame paints the window; settle it before measuring.
+        harness.drain();
+        let fired = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&fired);
+        let window = harness.window();
+        harness
+            .app_mut()
+            .after(window, Duration::from_millis(250), move |_| {
+                counter.set(counter.get() + 1);
+            })
+            .expect("the host's window takes the timer");
+        let requests = harness.frame_requests();
+        let index = harness.frame_index();
+
+        assert!(
+            !harness.advance(Duration::from_millis(250)),
+            "a callback that writes no render state commits nothing"
+        );
+        assert_eq!(fired.get(), 1, "the timer fired at its deadline");
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "dispatching a due timer asks for no frame (I3)"
+        );
+        assert_eq!(harness.frame_index(), index, "no frame was committed");
+        assert!(!harness.rendered());
+    }
+
+    /// The timer is never early: half the delay is an idle round, and the second half
+    /// reaches the deadline exactly.
+    #[test]
+    fn advance_does_not_fire_a_timer_before_its_delay() {
+        let mut harness = WidgetTestApp::new();
+        // The host's first frame paints the window; settle it before measuring.
+        harness.drain();
+        let fired = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&fired);
+        let window = harness.window();
+        harness
+            .app_mut()
+            .after(window, Duration::from_millis(250), move |_| {
+                counter.set(counter.get() + 1);
+            })
+            .expect("the host's window takes the timer");
+        let requests = harness.frame_requests();
+
+        assert!(!harness.advance(Duration::from_millis(125)));
+        assert_eq!(fired.get(), 0, "half the delay is not enough");
+        assert_eq!(harness.frame_requests(), requests);
+
+        assert!(!harness.advance(Duration::from_millis(125)));
+        assert_eq!(
+            fired.get(),
+            1,
+            "the second half reaches the deadline exactly"
+        );
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "the callback writes no render state"
+        );
+    }
+
+    /// The countdown pattern: a timer's callback writes the state a label reads, and
+    /// the same round presents it — the callback's write is the only frame request the
+    /// advance adds.
+    #[test]
+    fn a_timer_callback_s_write_is_presented_by_the_same_advance() {
+        let mut harness = WidgetTestApp::new();
+        let countdown = harness.app_mut().signal(0_u32);
+        let label = harness.with_cx(|cx| {
+            let root = cx.tree().root();
+            NodeBuilder::text(SmolStr::default(), TextStyle::new(12.0))
+                .layout_override(Rect::new(0.0, 0.0, 80.0, 20.0))
+                .bind_text(move |read| {
+                    let value = *read.read(&countdown);
+                    format_smolstr!("{value}")
+                })
+                .build(cx.tree_mut(), root)
+                .expect("the countdown label builds")
+        });
+        // The first frame evaluates the binding, so the label depends on the signal
+        // before the callback writes it.
+        harness.drain();
+        assert!(
+            harness.has_text(label, "0"),
+            "the label starts at the value the test wrote"
+        );
+        let window = harness.window();
+        harness
+            .app_mut()
+            .after(window, Duration::from_millis(250), move |app| {
+                assert!(app.write(&countdown, 1), "the countdown moves");
+            })
+            .expect("the host's window takes the timer");
+        let requests = harness.frame_requests();
+        let index = harness.frame_index();
+
+        assert!(
+            harness.advance(Duration::from_millis(250)),
+            "the callback's write asks for a frame and this round presents it"
+        );
+        assert!(
+            harness.has_text(label, "1"),
+            "the label draws the state the callback wrote: {}",
+            harness.text_of(label)
+        );
+        assert_eq!(
+            harness.frame_requests(),
+            requests + 1,
+            "the callback's write is the only frame request"
+        );
+        assert_eq!(harness.frame_index().get(), index.get() + 1);
     }
 }

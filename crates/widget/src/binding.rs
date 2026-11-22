@@ -441,7 +441,7 @@ mod tests {
     struct Fixture {
         app: App,
         runtime: tokio::runtime::Runtime,
-        services: WidgetServices,
+        services: Rc<WidgetServices>,
         window: WindowId,
         scope: SignalScope,
     }
@@ -463,16 +463,18 @@ mod tests {
             let animation_router = Rc::new(base_ui::kit::overlay::AnimationRouter::new());
             let router =
                 Rc::new(FrameRouter::new(&mut app).expect("the fixture owns the frame hook slot"));
-            let services = WidgetServices::builder(
-                &mut app,
-                runtime.handle().clone(),
-                crate::test_support::fixture_translate(i18n::language::codes::LanguageCode::En),
-                theme,
-                layer,
-                router,
-                animation_router,
-            )
-            .build();
+            let services = Rc::new(
+                WidgetServices::builder(
+                    &mut app,
+                    runtime.handle().clone(),
+                    crate::test_support::fixture_translate(i18n::language::codes::LanguageCode::En),
+                    theme,
+                    layer,
+                    router,
+                    animation_router,
+                )
+                .build(),
+            );
             let scope = app.signal_scope();
 
             Self {

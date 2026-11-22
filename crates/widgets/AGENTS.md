@@ -46,6 +46,10 @@ header 声音按钮、`perpetual_statistics` 的一 crate 多 widget 布局）�
 9. **应用设置只经注入的服务读**：语言 / 外观 / 数据时区 / 账户 / 目录 / 服务连接全部在 `WidgetServices` 里，不读进程全局、不
    自造 watch / 轮询。
 10. **动画由 widget 自己请求帧、收敛即停，并尊重 `reduce_motion`**（见 §8）。
+11. **kit 组件的 `key` / action 名必须经 `cx.unique_key(后缀)` 生成，禁止常量 key**：kit 的 key 是**应用级** Action 身份
+    （`"<key>.click"`，`App::on_action` 同 Action 后写覆盖）与调试 id 前缀。两个 pane 用同一常量 key 时，后建的覆盖先建的，
+    先 release / 先重建的一方再把对方的 handler 摘掉（点击派发到错的 pane 或没有 handler；W2a 审查 F1 实测）。后缀在
+    widget 内唯一标识控件位置；多行重复控件把行身份拼进后缀；同一控件跨帧重建必须用同一后缀。写法与释放配对见 §9。
 
 ---
 
@@ -96,6 +100,9 @@ crates/widgets/<widget_name>/
 - **稳态零帧是目标（I3）**：`sync` 在没有变化时不得写信号、不得 `request_frame()`；只在状态/内容真的变了时写。
 - **可见内容变化必须经过信号或 `sync` 的显式写**：没有写就没有失效边，就没有帧。`WidgetStatus::report` 是状态变化的唯一通道；
   正文里的动态值放进信号，用 `bind_text` / `bind_style` 读。
+- **E10 一次性定时器在 `run_frame_hook` 的最前面派发**（早于 `FrameRouter::tick` 与帧管线）：倒计时回调里的写入在同一轮
+  的路由与绘制里可见。测试装置 `WidgetTestApp::advance` 在**帧入口**派发到期的定时器（见 §11），绘制同轮可见，但路由晚
+  一轮看到——不要在 widget 里依赖「同一轮 sync 已看到定时器写入」的写法。
 
 ---
 
@@ -205,9 +212,11 @@ cx.app() / cx.app_mut()              // &App / &mut App
 cx.tree() / cx.tree_mut()            // &NodeTree / &mut NodeTree
 cx.window() / cx.window_mut()        // WindowId / &mut Window
 cx.services() / cx.translate() / cx.language() / cx.theme()
+cx.services_rc()                    // Rc<WidgetServices>：自建 selector host 等宿主时 clone 传入
 cx.config_ref(|config| ...)          // 不克隆地读设置快照（read 不登记依赖）
 cx.account() / cx.data_time_zone()   // 由设置快照派生
 cx.scope() / cx.layer() / cx.frame_router() / cx.animation()
+cx.unique_key("header.sound")       // kit 组件 key：`<后缀>@<本实例 scope>`，跨 pane 唯一（§9）
 cx.signal(v) / cx.transient(v)       // 铸进 widget scope
 cx.read(&s) / cx.write(&s, v) / cx.update(&s, f)
 cx.request_frame() / cx.request_node_repaint(node) / cx.set_a11y_patch(node, patch)
@@ -388,10 +397,40 @@ if generation != self.seen {
   - `sync`：结构 / 画布 / 实测回写（列表行内容、canvas、行高）。
 - **kit 组件也走五段式**：`new(app, …)` → `build(tree, parent)`（或 `build(app, window, parent)`）→ `mount`/`attach`（如列表）→
   `sync(app)` → `dispatch(app, &event)` → `release(app)`。控件的 `on_click` 回调是 `Rc` 闭包，捕获 widget 需要的信号与动作。
+- **kit 组件的 `key` 只从 `cx.unique_key(后缀)` 取，禁止常量**（硬约束 11）。kit 的 key 是**应用级**动作身份
+  （`Button::on_click` 由 key 派生 `Action::Custom("<key>.click")`，`App::on_action` 同 Action 后写覆盖）与调试 id 前缀。
+  两个 pane 都建同一个 header 控件时，常量 key 让后建的覆盖先建的，先 release / 先重建的一方再把对方 handler 摘掉
+  （点击派发到错 pane 或没有 handler；W2a 审查 F1 实测）。后缀是 **widget 内的控件位置名**：一个控件一个后缀；行内重复
+  控件把行身份拼进后缀（`format_smolstr!("row.{index}.sound")`）。同一控件跨帧 / 语言切换重建必须用**同一后缀**
+  （返回同一 key），重建与释放才配得上对。
+
+  ```rust
+  // body / header：key 由本实例身份派生（`<后缀>@<scope>`），两个 pane 不会撞。
+  let key = cx.unique_key("market_trade.header.instrument");
+  let theme = cx.theme().clone();
+  let window = cx.window();
+  let button = Button::new(cx.app_mut(), theme, key.clone())
+      .label(label)
+      .on_click(move |action_ctx| { /* 只写自己 pane 的模型 / 信号 */ });
+  button.build(cx.app_mut(), window, parent)?;
+  // 记住 key / action / 组件句柄（跨帧存活）；下面的重建与 release 用同一份。
+  let action = button.action_identity().expect("on_click 注册了 <key>.click");
+  self.header = Some(HeaderControl { button, key, action });
+
+  // release / 重建前（存活守卫通过后）：先摘自己建的节点，再释放组件。
+  if let Some(control) = self.header.take() {
+      control.button.release(cx.app_mut()); // off_action(<key>.click) + release_scope
+  }
+  ```
+
+  **只 `off_action` 不 `Button::release` 会漏组件作用域**（W2a 审查 F2：header 每次重建 +10 live 信号槽）；kit 组件的
+  `release` 两件事都做，所以优先在字段里保留组件句柄。需要「只摘 handler、不交还组件」的接缝属于 selector 批（§15.5）。
 - **需要组合根单例的 kit 组件用 `cx` 的访问器装配**：`Overlay` / `Tooltip` / 对话框 / selector host 的构造要
   `theme.clone()` + `layer.clone()` + `animation.clone()`（`cx.theme()` / `cx.layer()` / `cx.animation()`），`sync` 由
   `cx.frame_router()` 上的路由驱动（widget 自己的 `sync` 里调 `component.sync(cx.app_mut())` 即可，不要再注册第二个
   `App::on_frame`）。三个 `Rc` 句柄 clone 的是同一个组合根实例，widget 不新建（§5）。
+- **需要整个服务聚合的宿主**（`SelectorHost` 一类拥有 `Rc<WidgetServices>` 的宿主）用 `Rc::clone(cx.services_rc())`
+  取组合根那一个 `Rc`：不重建聚合、不逐字段复制，宿主与 widget 共用同一实例（P3-1f）。
 - **表格 / 列表的行闭包没有 `App`**：行内容里的动态值只能来自挂在节点上的 `bind_*`（读主题 / 设置信号）或行模型字段；
   需要 App 的结构性更新放到 widget 的 `sync`（`set_rows` / `set_items` / `push`）。
 - **释放顺序**：`WidgetView::release` 里 release 自己建的 kit 组件（节点仍在，可解绑 / 停动画），**不要自己删 surface 节点**；
@@ -440,20 +479,64 @@ if generation != self.seen {
   - `mount::<W>(config)` / `try_mount` / `try_mount_in_scope(parent, scope, config)`（拒绝挂载失败路径的探针）、
     `build_surface` / `sync_surface`、`report` / `switch_language`；
   - `drain()` = `router.tick` + `TestApp::drain`（生产泵序；`TestApp::drain` 本身不跑 `on_frame`）；
+  - **时钟推进与 E10 定时器**（P3-1g）：`advance(by: Duration) -> bool` 推进**引擎时钟**并跑一轮
+    （`router.tick` + 一帧），返回本轮是否提交像素。`App::after` / `after_scoped` 的 deadline 以引擎钟为基准，
+    `advance` 是唯一推进源：**不读 wall clock、不真实 sleep、不等待平台定时器**（I3）。到期的定时器在帧**入口**派发，
+    回调的写入参与同一帧绘制；自续期倒计时每 `advance` 触发**一次**（不是按经过的 delay 次数补触发）。未到 deadline 的
+    `advance` 是空闲轮：`false`，`frame_index()` / `frame_requests()` 都不变。宿主窗口在第一次 `drain()` / `advance()`
+    之前是「未提交」状态，测空闲语义前先 `drain()` 一次。widget 自己的「现在」（倒计时格式化的时间源）**不是**引擎钟：
+    测试自己写那个状态；
+  - **观测面**（P3-1g）：`frame_index()`（提交游标，`0` = 未提交）、`frame_requests()`（I3 断言面）、`rendered()`
+    （最近一轮是否提交像素；`advance` 的返回值就是本轮这个事实）。
   - 断言面：`visible` / `text_of` / `has_text` / `has_canvas` / `has_inline_boxes` / `node_count` / `find_by_debug_prefix` /
     `click_recovery` / `enable_a11y_capture` + `a11y_hidden`。
+- **倒计时 / 定时器测试写法**（P3-1g；取代 W2c 自建的 `ClockHost`，补 W2b 的倒计时 timer 缺口）：
+
+  ```rust
+  #[test]
+  fn a_countdown_should_tick_once_per_advance() {
+      let mut harness = WidgetTestApp::new();
+      let widget = harness.mount::<MyWidget>(MyConfig::default());
+      // 首帧：建 body / 求值 bind_text（首次读信号 → 登记依赖），之后写信号才会请求帧
+      harness.drain();
+
+      // 到点前：半程不触发，也不出帧
+      assert!(!harness.advance(Duration::from_millis(125)));
+      assert_eq!(harness.text_of(label), "10:00");
+
+      // 到点：回调写倒计时信号 → 请求帧 → 同一轮绘制；回调的写入是本轮唯一的帧请求
+      assert!(harness.advance(Duration::from_millis(125)));
+      assert_eq!(harness.text_of(label), "09:59");
+
+      // 再推进但没有变化：不出帧（I3；frame_requests 不增长）
+      assert!(!harness.advance(Duration::from_millis(100)));
+  }
+  ```
+
+  `label` 是 widget 自己的倒计时文本节点（自有 `TEST_*` / 选择器）；定时器由 widget 在 `load` / `sync` 里用
+  `App::after_scoped`（scope = body root）自续期注册，回调只写倒计时信号，标签未变不 `request_repaint`。
+  **两个前提**：① 信号必须先被节点读过（首帧 `bind_text` 求值）再写，否则写不请求帧；② 宿主一轮的顺序是
+  `router.tick` → 帧（定时器在帧入口派发），生产是「定时器 → `FrameRouter::tick` → 帧」（`App::run_frame_hook`）。
+  所以「`sync` 必须在本轮看到回调写入状态」的断言要多 `advance` 一次，或直接断言绘制结果——不要假设测试装置与
+  生产泵逐拍同序。
 - 测试属性：纯逻辑 `#[test]`；涉及 tokio 服务 `#[tokio::test]`（dev-deps 开 `tokio` `test-util`）。界面测试一律经
   `WidgetTestApp`，不依赖任何窗口工具包。
 - 外部 crate 用测试装置：dev-dependencies 里 `widget = { workspace = true, features = ["test-support"] }`
   （workspace 单写者统一登记）。
 - 覆盖建议：状态上报（含去重）、有 / 无内容两种失败出口、迟到消息与 `RequestId` 挡迟到、恢复动作、取消与替换、
   空快照的「暂无数据」、容器的能力裁剪、配置写回与规则 2 回默认、语言切换后的重绘、a11y hidden。
+- **多 pane / 多实例**：kit key 与 `App` 级 action 是全局的，涉及它们的行为必须用**同一 `WidgetTestApp` 的两个 widget 实例**
+  测：两个实例的 `cx.unique_key(同后缀)` 不同、两边的 handler 都在、release 一个之后另一个的 handler / 节点 / 帧路由仍在
+  （P3-1h 的契约测试是 `cx::tests::releasing_one_pane_leaves_the_other_pane_s_action_handler` 与
+  `test_support::tests::two_widget_instances_live_side_by_side`，widget crate 照此写自己的版本）。
 - **会踩的坑**：
-  1. 断言「写 → 出帧」用 `app.frame_requests()`（`App::write` 只在有节点读过该信号时才请求帧）；
+  1. 断言「写 → 出帧」用 `harness.frame_requests()`（`App::write` 只在有节点读过该信号时才请求帧）；
   2. `sync` 里才变「有内容」的正文晚一帧出现——断言前 `drain()` 或让 widget `request_frame`；
   3. 占位 / banner 的文案由 surface 解析：断言看到的是**渲染后的文本**（不应含 `<p` / `<kbd>` / `![](`）；
   4. a11y 断言要先 `enable_a11y_capture()`，且首帧是全树；
-  5. 节点 id 是框架的选择器约定，widget 不要自己起 `WIDGET_*` 名字。
+  5. 节点 id 是框架的选择器约定，widget 不要自己起 `WIDGET_*` 名字；
+  6. 定时器 / 倒计时测试不要 `std::thread::sleep`、不要等 wall clock：先 `drain()` 一次建依赖，再用 `advance(delay)`
+     （写法见本节的倒计时示例）。
 
 ---
 
@@ -469,7 +552,8 @@ if generation != self.seen {
 8. 正文：`flex_1` + `min_*_0`，无自绘底色 / 圆角 / 裁剪；空快照画 `EmptyState` + `common.no_data`。
 9. 语言文本在 `bind_text` 里读语言；颜色在 `bind_style` 里读主题；不把颜色 / 句子烤进挂载期常量。
 10. `name-key` / 文案不自己拼；错误实现 `TranslatedError`。
-11. release 释放自己建的 kit 组件与自定义作用域；不删 surface 节点。
+11. release 释放自己建的 kit 组件与自定义作用域；不删 surface 节点；kit 组件的 key 全部经 `cx.unique_key(后缀)`（§9），
+    release / 重建用与 build 相同的那个 key 或组件句柄。
 12. 删掉重构后不再使用的代码、字段、i18n key 与依赖；生产代码不允许 `#[allow(dead_code)]` / `#[expect(...)]`。
 
 **明确不做**：自动重连 / 退避；框架级 Ready 水位；widget 级缓存构件；共享恢复按钮包装；进程全局查服务；
@@ -555,19 +639,96 @@ Windows 上稳定 `CVT1100 duplicate resource` + `LNK1123`。P5 删除 gpui 依�
 
 ---
 
-## 15. 契约缺口登记（P3-1d 实测，kit 后续批处理）
+## 15. 契约缺口登记（kit / theme 后续批处理）
 
-W1（`news` / `force_order`）实迁暴露的两个 **kit 侧**缺口由 P3-1d 登记。**归属是 kit 后续批，不是 widget 批**：
-widget 侧不得各自重建组件库、另造绑定面或自实现容器。
+W1（`news` / `force_order`）实迁与 P3-1f 契约补充暴露的 **kit 侧、theme 侧**缺口登记于此。**归属是 kit 后续批（组件）
+与 theme 后续批（排版令牌），不是 widget 批**：widget 侧不得各自重建组件库、另造绑定面或自实现容器。
 
-1. **kit 静态文案组件没有绑定面**：`Badge` / `Button`（`label` / `icon`）/ `EmptyState`（`text`）的文案是构建期
-   `SmolStr` / `IconKind`；`kit::table` 的 `Column::header` / `empty_text` 同理——它们不带 `bind_text` 闭包。AGENTS §7
-   要求语言在 `bind_*` 里读，因此当前唯一通法是 widget 在 `sync` 里检测语言 / 选项 / 可用性变化 →
-   `remove_node` + 组件 `release` + 重建自己建的那一小块（surface 对静态 notice 已有先例；W1 的 header 声音按钮与空态、
-   `force_order` 的表格都这么做，并各有测试）。**登记 kit 后续批补 `bind_text` / `*_key` 形式的绑定面**；补上之前 W 批
-   按「重建自己建的节点」实现，不把这段重建逻辑抽成 widget 间共享封装、不改 kit 组件语义。
-2. **`kit::list` 无 separator、无像素 overscan**：旧 `DequeUnsizedList::separator` 与 `LIST_OVERDRAW = 150 px` 没有
-   对等能力。当前通法：行内容里自建 `kit::separator`（`index > 0`）近似 separator；`ListOptions::variable(row_height)`
-   + 默认 overscan **行数**近似像素缓冲（**已知差异**，W1 真窗口验收不据此判缺陷）。**登记 kit 后续批**：`list` 增加
-   separator 钩子与像素级 overscan 估计；在此之前 widget 不自己实现虚拟列表 / 滚动容器，也不改 `kit::list` 的
-   `ListOptions`。
+### 15.1 静态文案重建通法（kit 未补绑定面之前的唯一写法）
+
+`Badge` / `Button`（`label` / `icon`）/ `EmptyState`（`text`）的文案是**构建期** `SmolStr` / `IconKind`，`kit::table` 的
+`Column::header` / `empty_text` 同理——它们不带 `bind_text` 闭包；而 §7 要求文本在 `bind_*` 里读语言。两者相遇时的唯一
+通法是**重建（rebuilt, not re-bound）**，每个静态块四步：
+
+1. **记 key**：块构建时记下它按哪些值建的（`empty_language` / `(language, enabled, available)` / `rows_language`），
+   不记节点 id；记在 widget 自己的字段里，跨帧存活。
+2. **`sync` 比较**：在 widget 的 `sync` 里读现值（`*cx.read(&cx.language())`、`cx.config_ref`、宿主可用性），相等就直接
+   返回——稳态不写信号、不请求帧（I3）。
+3. **存活守卫摘节点 + release**：值变了，先摘自己建的节点、再释放组件作用域与 action handler。
+   - **摘节点前查存活**：`if cx.tree().get(node).is_err() { return Ok(()); }`。header 行由 pane 重建，旧控件节点已随行
+     消失；直接 `remove_node` 会返回 `StaleNode`，整次重建失败、控件再也没有（W1a2 F2 的实测缺陷）。
+   - **父节点同样查存活**：pane 重建 header 行后旧 `parent` 也是陈旧句柄；`cx.tree().get(parent).is_err()` 时直接放弃
+     重建（控件已随行消失，没有可重建的目标）。
+   - **顺序 = 「节点先删 → 组件 `release`」**：与框架 E16 / `remove_node_with_scope` 的顺序一致；`Button::release` 释放
+     组件作用域与 `"{key}.click"` action handler。
+4. **按现值重建**：用同一 key 规则 / 同一父节点的现值重建组件，并把新的 key 值记回去（`sound_built = (language, enabled, available)`）。
+
+**行内静态组件（表格 / 列表的行闭包）**没有 `App`，也不该在行闭包里做结构性更新：用容器的 `list::set_count` **重建可见
+窗口**。`news` 在 `sync` 里比较 `rows_language`，语言变了就 `list.set_count(cx.app_mut(), count)`（保留滚动位置）并
+`cx.request_frame()`（count 没变，别的路径不会为这次重建请求帧）；行里的动态文本仍各走 `bind_text`，只有分类徽标这种
+静态组件随行重建。语言切换是低频事件，重新测量可见行的代价是当前 kit 面的真实成本（§15.2）。
+
+三处参考实现（`crates/widgets/news/src/view.rs` 模块文档「Static copy is rebuilt, not re-bound」）：正文空态
+`sync_empty_state`、header 声音控件 `sync_sound_button` + `release_sound_button`、行内徽标 `rebuild_rows_for_language`；
+共用的摘节点助手是 `remove_own_node`。对应测试：`the_body_should_say_when_the_feed_is_empty`（空态）、
+`the_rows_should_be_rebuilt_when_the_language_moves`（行 + header）、
+`the_header_control_should_survive_the_pane_rebuilding_its_row`（存活守卫）。
+
+**不要**把这四步抽成 widget 间共享封装（D-10：不抽跨 widget 抽象），也**不要**在 widget 里复制 kit 外观（W1a 手写的
+badge pill 已按审查 F3 改为 `kit::badge::Badge`）。
+
+### 15.2 kit 静态文案绑定面（kit 后续批）
+
+缺绑定面的直接代价（登记，不在 widget 批解决）：
+
+- 语言 / 选项 / 可用性变化必须**重建可见块**：`news` 切语言要重建可见行（重新测量），而不是一个 `bind_text` 重算文本；
+- 重建逻辑每个 widget 各写一遍（§15.1 的三处示例 + 各自测试），`sync` 里多一份「上次按什么值建的」状态；
+- 行内静态组件只能整窗重建（`set_count`）——重建次数与批量增长的合并写法相关（见 §15.3 的 `List::push`）。
+
+**kit 后续批计划**：给 `Badge` / `Button`（`label` + `icon`）/ `EmptyState` / `kit::table::Column` 增 `bind_text` /
+`*_key` 形式的绑定面（或等价的 `Signal` 文本槽）。补上之后，widget 的对应块改回 `bind_*`、删除 §15.1 的重建状态与它们的
+测试。在此之前 W 批一律按 §15.1 写：**不改 kit 组件语义、不另造绑定面、不把重建逻辑下沉到共享封装**。
+
+### 15.3 `kit::list` 无 separator、无像素 overscan（kit 后续批）
+
+旧 `DequeUnsizedList::separator` 与 `LIST_OVERDRAW = 150 px` 没有对等能力。当前通法：行内容里自建 `kit::separator`
+（`index > 0`）近似 separator；`ListOptions::variable(row_height)` + 默认 overscan **行数**近似像素缓冲（**已知差异**，
+W1 真窗口验收不据此判缺陷）。**登记 kit 后续批**：`list` 增加 separator 钩子与像素级 overscan 估计；在此之前 widget
+不自己实现虚拟列表 / 滚动容器，也不改 `kit::list` 的 `ListOptions`。
+
+W1a2 追加登记的两处 `list` 代价：① **`List::push` 每条都重建可见窗口**（`list.rs` 自述的已知差异），双端列表 burst 时
+应合并为一次 `set_items`（或等 kit 增 `push_many`），W 批不自己实现增量缓冲；② **行容器默认 padding**
+（`padding_x=6 / padding_y=2`）叠加行内容 `padding(8.0)` → 水平 14 px、垂直 10 px，与旧 `px_2 py_2` 有视觉偏移，登记为
+已知差异，等 kit 补 `ListOptions::padding_*`。
+
+### 15.4 正文 / 次要文本排版令牌（theme 后续批）
+
+`base_ui::theme` 目前只有**控件尺寸阶梯**（`theme/components.rs` 的 `SizeTokens.font_size = 12/14`），**没有正文排版
+令牌**；W1a 的正文因此写了字面 px（标题 / 内容 `13.0`、时间 `11.0`），既违反 §7「尺寸 / 字号取 `base_ui::theme` 令牌或
+kit 尺寸档，不写字面 px」，也与旧实现漂移（旧：标题 / 内容走主题正文档，时间 `text_xs()` = 12 px）。
+
+W1a2 的当前写法：`UnifiedSize::Medium.text_size()`（14，标题 / 内容）/ `UnifiedSize::Small.text_size()`（12，时间）——
+即**借用控件尺寸档**，不是正文档；时间回到旧 12 px，标题 / 内容比旧正文档大一档。**登记 theme 后续批**：`theme` 增
+正文 / 次要文本 / 标题的排版令牌（body / secondary / caption 三级）；在此之前 W 批统一走 kit 尺寸档（或具名常量）并
+登记与旧实现的偏差，**不写裸 px**。
+
+### 15.5 已迁移 widget 的 kit key 唯一化（W 批跟进）
+
+P3-1h 冻结 `cx.unique_key` 后，**已迁移**代码里两类写法要在各自 W 批改（本批不改 `crates/widgets/**`）：
+
+- **常量 key**（W2a 审查 F1，必修）：`market_trade` 的 `HEADER_KEY = "MarketTradeInstrument"` 与表格 key
+  `"MarketTradeTable"` 是同一个 App 内多个 pane 共用的动作身份。改为 `cx.unique_key("market_trade.header.instrument")` /
+  `cx.unique_key("market_trade.table")`，并把生成出的 `Action` 存进 `HeaderControl` / 表格字段供 release 用；两个 pane
+  的回归测试按 §11「多 pane」写。
+- **按 owner 节点手拼的 key**：`news` 的 `format_smolstr!("news.sound.{}", parent.to_bits())`（`view.rs:884`）在同一实例的
+  header 行重建后会换身份（parent 变了）；它今天正确只因 widget 把 `Button` 句柄存进字段、release 用的是组件自己的 key。
+  改用 `cx.unique_key("news.sound")`（同一实例同后缀恒同 key，与 parent 无关），测试的 `find_by_debug_prefix(.., "news.sound")`
+  前缀仍然成立。`force_order` / 其它已迁移 crate 里的 kit key 同样改。
+
+**验收口径**：已迁移 widget 里不再出现字面量 kit key / 字面量 `Action::Custom`（测试里直接构造的组件除外）；kit key 只从
+`cx.unique_key` 来。
+
+**selector 批的释放面（W2a 审查 F2）**：`InstrumentButton::build` 消费掉 `Button` 只返回 `NodeId`，widget 只能
+`off_action`、不能 `Button::release`（组件信号作用域泄漏；W2a 实测 `live 18→28→38`）。selector 批需让 `build` 交还可释放
+句柄（或等价的 `release(&mut App)`）；本批只把契约写成「优先保留组件句柄，`release` 同时摘 handler 与释放 scope」。
+
