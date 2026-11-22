@@ -107,11 +107,7 @@ use widget::{
     venue::VenueDisplay,
 };
 
-use crate::{
-    host::SelectorHost,
-    instrument_button::ConfirmHandler,
-    ui::{build_node, release_input_actions},
-};
+use crate::{host::SelectorHost, instrument_button::ConfirmHandler, ui::build_node};
 
 /// Size of the content area inside the dialog panel.
 const DIALOG_WIDTH: f32 = 720.0;
@@ -1368,7 +1364,10 @@ impl SelectorState {
         self.list.release(app);
         self.tree.release(app);
         if let Some(input) = self.input.take() {
-            release_input_actions(app, &input.spec.name);
+            // Kit's own release face (P2-9): the input detaches the click-to-place / drag-to-
+            // select handlers it registered in `install`. Its state signals belong to this
+            // dialog's scope and are released below, after the nodes are unmounted.
+            input.release(app);
         }
         if let Some(id) = self.route_id.take() {
             self.router.unregister(id);
