@@ -346,17 +346,30 @@ impl Harness {
 
     /// The nearest node under the window root whose debug id starts with `prefix`.
     pub(crate) fn find(&self, prefix: &str) -> Option<NodeId> {
-        let tree = self.app.app().window(self.app.window_id())?.tree();
+        self.find_all(prefix).into_iter().next()
+    }
+
+    /// Every node under the window root whose debug id starts with `prefix`, in DFS order.
+    ///
+    /// Two dialogs of the same kind carry the same node ids (node ids are diagnostics, not
+    /// action identities), so a test that has two open has to state *which* it means: the DFS
+    /// order is the order the dialogs' overlays sit in the window.
+    pub(crate) fn find_all(&self, prefix: &str) -> Vec<NodeId> {
+        let Some(window) = self.app.app().window(self.app.window_id()) else {
+            return Vec::new();
+        };
+        let tree = window.tree();
+        let mut found = Vec::new();
         let mut stack = vec![tree.root()];
         while let Some(node) = stack.pop() {
             if tree.debug_id(node).is_some_and(|id| id.starts_with(prefix)) {
-                return Some(node);
+                found.push(node);
             }
             if let Ok(entry) = tree.get(node) {
                 stack.extend(entry.children().iter().rev().copied());
             }
         }
-        None
+        found
     }
 
     /// Every debug id in the tree, in DFS order.

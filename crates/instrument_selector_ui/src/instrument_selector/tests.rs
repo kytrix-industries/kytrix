@@ -15,7 +15,7 @@ use market_participants_model::{
     market::selection::InstrumentSelection,
     routing::CapabilityId,
 };
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 use ui_core::math::Point;
 
 use super::*;
@@ -704,6 +704,10 @@ fn click_node(harness: &mut Harness, prefix: &str) {
             harness.debug_ids()
         )
     });
+    click_node_id(harness, node);
+}
+
+fn click_node_id(harness: &mut Harness, node: ui_core::node::id::NodeId) {
     let bounds = harness.bounds(node).expect("the node is laid out");
     let centre = Point::new(
         bounds.origin.x + bounds.size.width / 2.0,
@@ -711,6 +715,46 @@ fn click_node(harness: &mut Harness, prefix: &str) {
     );
     harness.move_pointer(centre);
     harness.click(centre);
+}
+
+/// The per-instance kit key prefixes of the selectors open in the harness window, in the order
+/// the dialogs were built.
+///
+/// Every kit component of a dialog is keyed by `"instrument-selector@{scope}"`, so the debug ids
+/// the components built (`"{key}:cancel"`, `"{key}:list:row:0"`, …) state the key they were built
+/// with. The engine appends a scope slot per dialog and never recycles an index, so the keys
+/// sort in open order.
+fn selector_keys(harness: &Harness) -> Vec<SmolStr> {
+    let mut keys: Vec<SmolStr> = Vec::new();
+    for id in harness.debug_ids() {
+        let Some((key, _)) = id.split_once(':') else {
+            continue;
+        };
+        if key.starts_with("instrument-selector@") && !keys.iter().any(|known| known == key) {
+            keys.push(SmolStr::new(key));
+        }
+    }
+    keys.sort_by_key(|key| {
+        key.rsplit_once('@')
+            .and_then(|(_, index)| index.parse::<u32>().ok())
+            .unwrap_or_default()
+    });
+    keys
+}
+
+/// The kit key prefix of the one selector open in `harness`.
+fn selector_key(harness: &Harness) -> SmolStr {
+    selector_keys(harness)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no selector is open; ids: {:?}", harness.debug_ids()))
+}
+
+/// Clicks one node of the open selector: `suffix` is the part after the dialog's key
+/// (e.g. `":cancel"` or `":filter.root"`).
+fn click_selector(harness: &mut Harness, suffix: &str) {
+    let key = selector_key(harness);
+    click_node(harness, &format_smolstr!("{key}{suffix}"));
 }
 
 /// Settles the dialog through a close: the kit fade needs frames and clock movement.
@@ -723,6 +767,49 @@ fn settle_close(harness: &mut Harness) -> bool {
         harness.drain();
     }
     closed || (harness.overlay_count() == 0 && harness.router().is_empty())
+}
+
+/// Opens one selector the way a pane's instrument control does, confirming into `confirmed`.
+fn open_confirming(
+    harness: &mut Harness,
+    current: Option<InstrumentSelection>,
+    filters: InstrumentFilters,
+    confirmed: Rc<RefCell<Vec<InstrumentSelection>>>,
+) -> bool {
+    let host = harness.host().clone();
+    let window = harness.window();
+    InstrumentSelector::show_with_filters(
+        current,
+        filters,
+        Rc::new(move |selection, _, _| confirmed.borrow_mut().push(selection)),
+        &host,
+        harness.app_mut(),
+        window,
+    )
+}
+
+/// Whether every open selector has drawn a listing row of its own list.
+fn both_selectors_list(harness: &Harness) -> bool {
+    let keys = selector_keys(harness);
+    keys.len() == 2
+        && keys.iter().all(|key| {
+            let rows = format_smolstr!("{key}:list:row:");
+            harness
+                .debug_ids()
+                .iter()
+                .any(|id| id.starts_with(rows.as_str()))
+        })
+}
+
+/// Settles until the dialog whose key prefix is `key` has closed and released its nodes.
+fn settle_dialog_close(harness: &mut Harness, key: &str) -> bool {
+    let confirm = format_smolstr!("{key}:ok");
+    let closed = harness.settle_until(120, |harness| harness.find(&confirm).is_none());
+    for _ in 0..8 {
+        harness.advance(Duration::from_millis(40));
+        harness.drain();
+    }
+    closed && harness.find(&confirm).is_none()
 }
 
 #[test]
@@ -957,7 +1044,7 @@ fn the_dialog_builds_through_the_services_singletons() {
         !harness.router().is_empty(),
         "the dialog's frame route lives in the composition root's router"
     );
-    click_node(&mut harness, "instrument-selector:cancel");
+    click_selector(&mut harness, ":cancel");
     assert!(settle_close(&mut harness));
     assert!(
         harness.layer().is_empty(harness.window()),
@@ -974,13 +1061,174 @@ fn the_cancel_control_should_close_the_dialog() {
     );
     assert!(opened);
     harness.settle(4);
-    click_node(&mut harness, "instrument-selector:cancel");
+    click_selector(&mut harness, ":cancel");
     harness.settle(2);
 
     assert!(
         settle_close(&mut harness),
         "the cancel control closes the dialog and releases its route"
     );
+}
+
+#[test]
+fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
+    let spot_route = test_support::spot_route();
+    let catalog = catalog_with(
+        &spot_route,
+        vec![
+            test_support::entry(&spot_route, spot("BTC", "USDT"), "BTCUSDT"),
+            test_support::entry(&spot_route, spot("ETH", "USDT"), "ETHUSDT"),
+        ],
+    );
+    let mut harness = Harness::with_catalog(catalog);
+    let pane_filters = || InstrumentFilters {
+        kind_filter: InstrumentKindFilter::Spot,
+        status_filter: InstrumentStatusFilter::Any,
+        required_capability: CapabilityId::Candlesticks,
+        entry_predicate: None,
+        routes: loaded(vec![scope(
+            spot_route.clone(),
+            &[CapabilityId::Candlesticks],
+        )]),
+    };
+    let confirmed: [Rc<RefCell<Vec<InstrumentSelection>>>; 2] = Default::default();
+    let stats =
+        |harness: &Harness| ui_core::test_support::diagnostics::signal_slot_stats(harness.app());
+    let baseline = stats(&harness);
+    let baseline_nodes = harness.tree_len();
+
+    // Pane A follows BTC, pane B follows ETH: each confirmation must report its own listing.
+    assert!(open_confirming(
+        &mut harness,
+        Some(selection(&spot_route, "BTCUSDT")),
+        pane_filters(),
+        Rc::clone(&confirmed[0]),
+    ));
+    harness.settle(4);
+    assert!(open_confirming(
+        &mut harness,
+        Some(selection(&spot_route, "ETHUSDT")),
+        pane_filters(),
+        Rc::clone(&confirmed[1]),
+    ));
+    assert!(
+        harness.settle_until(200, both_selectors_list),
+        "both dialogs list the published catalog: {:?}",
+        harness.debug_ids()
+    );
+    let keys = selector_keys(&harness);
+    assert_eq!(keys.len(), 2, "two selectors are open: {keys:?}");
+    assert_ne!(keys[0], keys[1], "each dialog owns its own kit key prefix");
+    assert_eq!(harness.overlay_count(), 2, "both dialogs are open at once");
+
+    // The second dialog is the topmost one. Its row click and its confirm must reach the
+    // second pane's callback and nothing else: with one constant dialog key the second
+    // dialog's registration had already replaced the first pane's handler.
+    let rows = harness.find_all("INSTRUMENT_SELECTOR:row:");
+    let row_text: Vec<String> = rows.iter().map(|row| harness.text_of(*row)).collect();
+    assert_eq!(
+        row_text,
+        ["BTC/USDT", "ETH/USDT", "BTC/USDT", "ETH/USDT"],
+        "each dialog lists both published listings, the first dialog's rows first"
+    );
+    click_node_id(&mut harness, rows[3]);
+    harness.settle(2);
+    click_node(&mut harness, &format_smolstr!("{}:ok", keys[1]));
+    harness.settle(2);
+    assert_eq!(
+        confirmed[1].borrow().as_slice(),
+        [selection(&spot_route, "ETHUSDT")],
+        "the top dialog confirms into its own pane"
+    );
+    assert!(
+        confirmed[0].borrow().is_empty(),
+        "the first pane's callback was not run by the second dialog's confirm"
+    );
+    assert!(
+        settle_dialog_close(&mut harness, &keys[1]),
+        "the confirmed dialog closes and releases its route"
+    );
+    assert_eq!(
+        harness.overlay_count(),
+        1,
+        "the first pane's dialog is still open"
+    );
+
+    // The remaining dialog is now the topmost one: its own confirm handler must still be
+    // registered (the closed dialog released exactly its own identity).
+    let rows = harness.find_all("INSTRUMENT_SELECTOR:row:");
+    assert_eq!(rows.len(), 2, "only the first dialog lists rows now");
+    assert_eq!(harness.text_of(rows[0]), "BTC/USDT");
+    click_node_id(&mut harness, rows[0]);
+    harness.settle(2);
+    click_node(&mut harness, &format_smolstr!("{}:ok", keys[0]));
+    harness.settle(2);
+    assert_eq!(
+        confirmed[0].borrow().as_slice(),
+        [selection(&spot_route, "BTCUSDT")],
+        "the still-open dialog kept its own confirm handler"
+    );
+    assert_eq!(
+        confirmed[1].borrow().len(),
+        1,
+        "the closed dialog's pane was not written a second time"
+    );
+    assert!(
+        settle_close(&mut harness),
+        "the second dialog closes and releases its route"
+    );
+
+    assert_eq!(harness.overlay_count(), 0, "both dialogs are closed");
+    assert!(
+        harness.router().is_empty(),
+        "no frame route outlived the dialogs"
+    );
+    assert_eq!(
+        harness.tree_len(),
+        baseline_nodes,
+        "both dialogs' nodes are gone"
+    );
+    let settled = stats(&harness);
+    assert_eq!(
+        settled.live, baseline.live,
+        "no value slot outlived the dialogs (slots is a peak: {settled:?} vs {baseline:?})"
+    );
+    for key in &keys {
+        for suffix in [":ok.click", ":cancel.click"] {
+            let action = ui_core::event::Action::Custom(format_smolstr!("{key}{suffix}"));
+            assert!(
+                !harness.app().has_action_handler(&action),
+                "{key}{suffix} is reclaimed when the dialog finishes"
+            );
+        }
+        let list = format_smolstr!("{key}:list");
+        assert!(
+            !harness
+                .app()
+                .has_action_handler(&ui_core::event::Action::Custom(format_smolstr!(
+                    "{list}.select"
+                ))),
+            "the list's selection action is reclaimed"
+        );
+        let venues = format_smolstr!("{key}:venues");
+        assert!(
+            !harness
+                .app()
+                .has_action_handler(&ui_core::event::Action::Custom(format_smolstr!(
+                    "{venues}.up"
+                ))),
+            "the venue tree's arrow action is reclaimed"
+        );
+        let filter = format_smolstr!("{key}:filter");
+        assert!(
+            !harness
+                .app()
+                .has_action_handler(&ui_core::event::Action::Custom(format_smolstr!(
+                    "base_ui.input.{filter}.click"
+                ))),
+            "the filter input's click action is reclaimed"
+        );
+    }
 }
 
 #[test]
@@ -1114,7 +1362,7 @@ fn opening_and_closing_the_dialog_a_hundred_times_reclaims_everything() {
 
     assert!(open(&mut harness, filters.clone()));
     harness.settle(4);
-    click_node(&mut harness, "instrument-selector:cancel");
+    click_selector(&mut harness, ":cancel");
     assert!(settle_close(&mut harness), "the first close finishes");
     let settled = stats(&harness);
     let nodes = harness.tree_len();
@@ -1122,7 +1370,7 @@ fn opening_and_closing_the_dialog_a_hundred_times_reclaims_everything() {
     for cycle in 0..100 {
         assert!(open(&mut harness, filters.clone()), "cycle {cycle} opens");
         harness.settle(2);
-        click_node(&mut harness, "instrument-selector:cancel");
+        click_selector(&mut harness, ":cancel");
         assert!(settle_close(&mut harness), "cycle {cycle} closes");
     }
 
@@ -1156,11 +1404,12 @@ fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
         filters(InstrumentKindFilter::All, CapabilityId::Candlesticks)
     ));
     harness.settle(4);
-    click_node(&mut harness, "instrument-selector-filter.root");
+    let key = selector_key(&harness);
+    click_selector(&mut harness, ":filter.root");
     harness.settle(2);
     assert_eq!(
         harness.app().focused(harness.window()),
-        harness.find("instrument-selector-filter.root"),
+        harness.find(&format_smolstr!("{key}:filter.root")),
         "the click focuses the filter input"
     );
 
@@ -1176,7 +1425,7 @@ fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
     harness.settle(2);
 
     let text = harness
-        .find("instrument-selector-filter.text")
+        .find(&format_smolstr!("{key}:filter.text"))
         .expect("the input draws its text node");
     assert_eq!(
         harness.node_text(text),
@@ -1197,7 +1446,7 @@ fn the_filter_takes_its_own_text_and_leaves_every_other_event_queued() {
         "an event the dialog does not own is still readable by the application: {remaining:?}"
     );
 
-    click_node(&mut harness, "instrument-selector:cancel");
+    click_selector(&mut harness, ":cancel");
     assert!(settle_close(&mut harness));
     harness.pump(ui_core::event::Event::Input(
         ui_core::event::InputEvent::Text {
