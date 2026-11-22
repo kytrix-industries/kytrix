@@ -6,6 +6,10 @@
 //! the configure page because the default line, a group of targets and a venue of its own are all
 //! written the same way, and a page that spelled a token differently would write a route the
 //! settings never hold.
+//!
+//! The module is pure: it reads and writes the configuration values and builds nothing. The
+//! configure page draws its rows with these conversions; the server-management page does not use
+//! them, because the catalog it edits is not a line of the routing configuration.
 
 use app_config::{
     network::{ProxyRoute, ServiceTarget},

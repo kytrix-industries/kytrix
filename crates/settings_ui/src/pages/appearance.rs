@@ -1,12 +1,17 @@
 //! The appearance page: the application's theme and the language it is drawn in.
 
 use app_config::settings::{Appearance, Language};
-use gpui_kit::{AnyElement, App, IntoElement, SharedString};
-use i18n::t;
+use base_ui::kit::select::Select;
+use i18n::translate::Translate;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
 
 use crate::{
-    layout::{self, PageArgs},
+    host::SettingsHost,
+    layout,
+    pages::page::{PageBuild, PageView},
     search::{FieldSearch, PageSearch, words},
+    session::SettingsChange,
 };
 
 /// The id of this page's settings.
@@ -25,80 +30,182 @@ const LANGUAGE_OPTIONS: [(&str, &str); 2] = [
     ("en", "settings_ui.appearance.language_en"),
 ];
 
-pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
-    let mut rows = Vec::new();
-
-    if args.filter.admits_field(PAGE, "appearance") {
-        let label = t!(args.cx, "settings_ui.appearance.mode");
-        let description = t!(args.cx, "settings_ui.appearance.mode_description");
-        let selected = SharedString::new_static(appearance_id(args.config.appearance));
-        let choices = APPEARANCE_OPTIONS
-            .into_iter()
-            .map(|(id, label)| (SharedString::new_static(id), t!(args.cx, label)));
-        let select = layout::choice_select(
-            layout::element_id("settings-select", "appearance"),
-            Some(selected),
-            choices,
-            label.clone(),
-            None,
-            false,
-            layout::on_select(args.handle, |config, value| {
-                config.appearance = appearance_of(value);
-            }),
-        );
-
-        rows.push(layout::row(
-            "appearance",
-            label,
-            description,
-            select.into_any_element(),
-            layout::CONTROL_WIDTH,
-            args.cx,
-        ));
-    }
-
-    if args.filter.admits_field(PAGE, "language") {
-        let label = t!(args.cx, "settings_ui.appearance.language");
-        let description = t!(args.cx, "settings_ui.appearance.language_description");
-        let selected = SharedString::from(args.config.language.locale());
-        let choices = LANGUAGE_OPTIONS
-            .into_iter()
-            .map(|(id, label)| (SharedString::new_static(id), t!(args.cx, label)));
-        let select = layout::choice_select(
-            layout::element_id("settings-select", "language"),
-            Some(selected),
-            choices,
-            label.clone(),
-            None,
-            false,
-            layout::on_select(args.handle, |config, value| {
-                config.language = language_of(value);
-            }),
-        );
-
-        rows.push(layout::row(
-            "language",
-            label,
-            description,
-            select.into_any_element(),
-            layout::CONTROL_WIDTH,
-            args.cx,
-        ));
-    }
-
-    if rows.is_empty() {
-        return layout::page(Vec::new());
-    }
-
-    layout::page(vec![layout::section(None, "appearance_0", rows, args.cx)])
+/// The appearance page.
+pub(crate) struct AppearancePage {
+    host: SettingsHost,
+    key: SmolStr,
+    window: Option<WindowId>,
+    appearance: Option<Select>,
+    language: Option<Select>,
+    /// The setting the two controls were last written from, so a frame that moved nothing writes
+    /// nothing.
+    applied: Option<(Appearance, Language)>,
 }
 
-pub(crate) fn search(cx: &App) -> PageSearch {
-    let title = t!(cx, "settings_ui.appearance.title");
-    let mode = t!(cx, "settings_ui.appearance.mode");
-    let mode_description = t!(cx, "settings_ui.appearance.mode_description");
-    let language = t!(cx, "settings_ui.appearance.language");
-    let language_description = t!(cx, "settings_ui.appearance.language_description");
+impl AppearancePage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
+    pub(crate) fn new(host: SettingsHost, key: &str) -> Self {
+        Self {
+            host,
+            key: SmolStr::new(key),
+            window: None,
+            appearance: None,
+            language: None,
+            applied: None,
+        }
+    }
+}
+
+impl PageView for AppearancePage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
+
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        self.window = Some(window);
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let config = self.host.config(app, |config| config.clone());
+        let mut rows = Vec::with_capacity(2);
+
+        if cx.filter.admits_field(PAGE, "appearance") {
+            let label = i18n::t_smol!(translate, "settings_ui.appearance.mode");
+            let description = i18n::t_smol!(translate, "settings_ui.appearance.mode_description");
+            let choices = APPEARANCE_OPTIONS
+                .into_iter()
+                .map(|(id, label)| (SmolStr::new_static(id), i18n::t_smol!(translate, label)))
+                .collect::<Vec<_>>();
+            let host = self.host.clone();
+            let select = layout::choice_select(
+                app,
+                &self.host,
+                format_smolstr!("{}.appearance.appearance", self.key),
+                appearance_id(config.appearance),
+                choices,
+                label.clone(),
+                move |app, value| {
+                    let appearance = appearance_of(value);
+                    let _ = host.write(
+                        app,
+                        window,
+                        SettingsChange::edit(move |config| config.appearance = appearance),
+                    );
+                },
+            );
+            let control = select.clone();
+            rows.push(layout::row(
+                &theme,
+                "appearance",
+                label,
+                description,
+                move |app, window, parent| {
+                    control.mount(app, window, parent)?;
+                    Ok(())
+                },
+            ));
+            self.appearance = Some(select);
+        }
+
+        if cx.filter.admits_field(PAGE, "language") {
+            let label = i18n::t_smol!(translate, "settings_ui.appearance.language");
+            let description =
+                i18n::t_smol!(translate, "settings_ui.appearance.language_description");
+            let choices = LANGUAGE_OPTIONS
+                .into_iter()
+                .map(|(id, label)| (SmolStr::new_static(id), i18n::t_smol!(translate, label)))
+                .collect::<Vec<_>>();
+            let host = self.host.clone();
+            let select = layout::choice_select(
+                app,
+                &self.host,
+                format_smolstr!("{}.appearance.language", self.key),
+                config.language.locale(),
+                choices,
+                label.clone(),
+                move |app, value| {
+                    let language = language_of(value);
+                    let _ = host.write(
+                        app,
+                        window,
+                        SettingsChange::edit(move |config| config.language = language),
+                    );
+                },
+            );
+            let control = select.clone();
+            rows.push(layout::row(
+                &theme,
+                "language",
+                label,
+                description,
+                move |app, window, parent| {
+                    control.mount(app, window, parent)?;
+                    Ok(())
+                },
+            ));
+            self.language = Some(select);
+        }
+
+        layout::section(app, window, parent, &theme, "appearance", None, rows)?;
+        self.applied = Some((config.appearance, config.language));
+
+        Ok(())
+    }
+
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        let (appearance, language) = self
+            .host
+            .config(app, |config| (config.appearance, config.language));
+        if self.applied == Some((appearance, language)) {
+            return Ok(());
+        }
+
+        if let Some(select) = &self.appearance {
+            select.set_chosen(app, [appearance_id(appearance)], false);
+        }
+        if let Some(select) = &self.language {
+            select.set_chosen(app, [language.locale()], false);
+        }
+        self.applied = Some((appearance, language));
+
+        Ok(())
+    }
+
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        if let Some(select) = &self.appearance {
+            consumed |= select.dispatch(app, event);
+        }
+        if let Some(select) = &self.language {
+            consumed |= select.dispatch(app, event);
+        }
+        consumed
+    }
+
+    fn release(&mut self, app: &mut App) {
+        if let Some(select) = self.appearance.take() {
+            select.release(app);
+        }
+        if let Some(select) = self.language.take() {
+            select.release(app);
+        }
+        self.applied = None;
+    }
+}
+
+/// The text this page and its settings are searched by.
+pub(crate) fn search(translate: &Translate) -> PageSearch {
+    let title = i18n::t_smol!(translate, "settings_ui.appearance.title");
+    let mode = i18n::t_smol!(translate, "settings_ui.appearance.mode");
+    let mode_description = i18n::t_smol!(translate, "settings_ui.appearance.mode_description");
+    let language = i18n::t_smol!(translate, "settings_ui.appearance.language");
+    let language_description =
+        i18n::t_smol!(translate, "settings_ui.appearance.language_description");
 
     PageSearch {
         label: words(&[
@@ -112,7 +219,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
         ]),
         fields: vec![
             FieldSearch {
-                id: "appearance".into(),
+                id: SmolStr::new_static("appearance"),
                 text: words(&[
                     mode.as_ref(),
                     mode_description.as_ref(),
@@ -126,7 +233,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
                 ]),
             },
             FieldSearch {
-                id: "language".into(),
+                id: SmolStr::new_static("language"),
                 text: words(&[
                     language.as_ref(),
                     language_description.as_ref(),
@@ -142,6 +249,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
     }
 }
 
+/// The id the appearance control names one preference by.
 fn appearance_id(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Light => "Light",
@@ -150,6 +258,7 @@ fn appearance_id(appearance: Appearance) -> &'static str {
     }
 }
 
+/// The preference one choice of the appearance control names.
 fn appearance_of(value: &str) -> Appearance {
     match value {
         "Light" => Appearance::Light,
@@ -158,6 +267,7 @@ fn appearance_of(value: &str) -> Appearance {
     }
 }
 
+/// The language one choice of the language control names.
 fn language_of(value: &str) -> Language {
     match value {
         "en" => Language::En,

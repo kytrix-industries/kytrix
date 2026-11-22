@@ -1,70 +1,153 @@
 //! The data formatting page: the time zone every widget displays data timestamps in.
 
 use app_config::time_zone::DataTimeZone;
-use gpui_kit::{AnyElement, App, IntoElement, SharedString};
-use i18n::t;
+use base_ui::kit::select::Select;
+use i18n::translate::Translate;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
 
 use crate::{
-    layout::{self, PageArgs},
+    host::SettingsHost,
+    layout,
+    pages::page::{PageBuild, PageView},
     search::{FieldSearch, PageSearch, words},
+    session::SettingsChange,
 };
 
 /// The id of this page's setting.
 const PAGE: &str = "data-format";
 
-pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
-    if !args.filter.admits_field(PAGE, "data-format.offset") {
-        return layout::page(Vec::new());
-    }
-
-    let label = t!(args.cx, "settings_ui.data_format.time_zone");
-    let description = t!(args.cx, "settings_ui.data_format.description");
-    let selected = SharedString::from(args.config.data_time_zone.hours().to_string());
-    let choices = DataTimeZone::ALL.into_iter().map(|zone| {
-        (
-            SharedString::from(zone.hours().to_string()),
-            SharedString::from(zone.label().as_str()),
-        )
-    });
-    let select = layout::choice_select(
-        layout::element_id("settings-select", "data-format.offset"),
-        Some(selected),
-        choices,
-        label.clone(),
-        None,
-        false,
-        layout::on_select(args.handle, |config, value| {
-            let Ok(hours) = value.parse::<i8>() else {
-                return;
-            };
-            let Some(zone) = DataTimeZone::from_hours(hours) else {
-                return;
-            };
-            config.data_time_zone = zone;
-        }),
-    );
-
-    let row = layout::row(
-        "data-format.offset",
-        label,
-        description,
-        select.into_any_element(),
-        layout::CONTROL_WIDTH,
-        args.cx,
-    );
-
-    layout::page(vec![layout::section(
-        None,
-        "data-format_0",
-        vec![row],
-        args.cx,
-    )])
+/// The data formatting page.
+pub(crate) struct DataFormatPage {
+    host: SettingsHost,
+    /// The offset control, once the page has been built.
+    offset: Option<Select>,
+    /// The setting the control was last written from, so a frame that moved nothing writes nothing.
+    applied: Option<DataTimeZone>,
 }
 
-pub(crate) fn search(cx: &App) -> PageSearch {
-    let title = t!(cx, "settings_ui.data_format.title");
-    let label = t!(cx, "settings_ui.data_format.time_zone");
-    let description = t!(cx, "settings_ui.data_format.description");
+impl DataFormatPage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
+    pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
+        Self {
+            host,
+            offset: None,
+            applied: None,
+        }
+    }
+}
+
+impl PageView for DataFormatPage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
+
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        if !cx.filter.admits_field(PAGE, "data-format.offset") {
+            return Ok(());
+        }
+
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let config = self.host.config(app, |config| config.clone());
+        let label = i18n::t_smol!(translate, "settings_ui.data_format.time_zone");
+        let description = i18n::t_smol!(translate, "settings_ui.data_format.description");
+        let selected = format_smolstr!("{}", config.data_time_zone.hours());
+        let choices = DataTimeZone::ALL
+            .into_iter()
+            .map(|zone| (format_smolstr!("{}", zone.hours()), zone.label()))
+            .collect::<Vec<_>>();
+        let host = self.host.clone();
+        let select = layout::choice_select(
+            app,
+            &self.host,
+            cx.unique_key("offset"),
+            selected.as_str(),
+            choices,
+            label.clone(),
+            move |app, value| {
+                let Ok(hours) = value.parse::<i8>() else {
+                    return;
+                };
+                let Some(zone) = DataTimeZone::from_hours(hours) else {
+                    return;
+                };
+                let _ = host.write(
+                    app,
+                    window,
+                    SettingsChange::edit(move |config| config.data_time_zone = zone),
+                );
+            },
+        );
+        let control = select.clone();
+        let row = layout::row(
+            &theme,
+            "data-format.offset",
+            label,
+            description,
+            move |app, window, parent| {
+                control.mount(app, window, parent)?;
+                Ok(())
+            },
+        );
+
+        layout::section(
+            app,
+            window,
+            parent,
+            &theme,
+            "data-format_0",
+            None,
+            vec![row],
+        )?;
+        self.offset = Some(select);
+        self.applied = Some(config.data_time_zone);
+
+        Ok(())
+    }
+
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        let zone = self.host.config(app, |config| config.data_time_zone);
+        if self.applied == Some(zone) {
+            return Ok(());
+        }
+
+        if let Some(select) = &self.offset {
+            let hours = format_smolstr!("{}", zone.hours());
+            select.set_chosen(app, [hours.as_str()], false);
+        }
+        self.applied = Some(zone);
+
+        Ok(())
+    }
+
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        if let Some(select) = &self.offset {
+            consumed |= select.dispatch(app, event);
+        }
+        consumed
+    }
+
+    fn release(&mut self, app: &mut App) {
+        if let Some(select) = self.offset.take() {
+            select.release(app);
+        }
+        self.applied = None;
+    }
+}
+
+/// The text this page and its settings are searched by.
+pub(crate) fn search(translate: &Translate) -> PageSearch {
+    let title = i18n::t_smol!(translate, "settings_ui.data_format.title");
+    let label = i18n::t_smol!(translate, "settings_ui.data_format.time_zone");
+    let description = i18n::t_smol!(translate, "settings_ui.data_format.description");
 
     PageSearch {
         label: words(&[
@@ -78,7 +161,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
             "数据格式化",
         ]),
         fields: vec![FieldSearch {
-            id: "data-format.offset".into(),
+            id: SmolStr::new_static("data-format.offset"),
             text: words(&[
                 label.as_ref(),
                 description.as_ref(),

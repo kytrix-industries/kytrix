@@ -1,16 +1,15 @@
 //! What a search query answers, over the tree and the fields in it.
 //!
 //! A query is answered once, into a filter the sidebar and the page are drawn against. What is
-//! matched is the normalized text of every label, description and declared keyword: the
-//! caller builds that text for the language it is drawn in, so a user looking for "代理" and
-//! a user looking for "proxy" find the same setting.
+//! matched is the normalized text of every label, description and declared keyword: the caller
+//! builds that text for the language it is drawn in, so a user looking for "代理" and a user
+//! looking for "proxy" find the same setting.
 //!
-//! Matching is substring-based rather than fuzzy, and every word of a multi-word query has
-//! to appear, which is what keeps "spot private" from answering with every key on every
-//! market.
+//! Matching is substring-based rather than fuzzy, and every word of a multi-word query has to
+//! appear, which is what keeps "spot private" from answering with every key on every market.
 
 use ahash::AHashSet;
-use gpui_kit::SharedString;
+use smol_str::SmolStr;
 
 /// The text a page or a setting is searched by, from the words it is drawn with.
 ///
@@ -29,11 +28,11 @@ pub(crate) fn words(parts: &[&str]) -> String {
 
 /// One node of the tree, with the text it is searched by.
 pub(crate) struct SearchNode {
-    pub id: SharedString,
+    pub id: SmolStr,
     /// `None` for a group, whose children are searched separately.
     pub page: Option<PageSearch>,
-    /// The words a group's own label is searched by, which for a page is its rendered label
-    /// and the keywords it declares.
+    /// The words a group's own label is searched by, which for a page is its rendered label and
+    /// the keywords it declares.
     pub keywords: Vec<String>,
     pub children: Vec<SearchNode>,
 }
@@ -46,14 +45,14 @@ pub(crate) struct PageSearch {
 
 /// One field, with the text it is searched by.
 pub(crate) struct FieldSearch {
-    pub id: SharedString,
+    pub id: SmolStr,
     pub text: String,
 }
 
 /// What one query admits.
 ///
-/// An empty query is not an empty answer: it admits everything, which is why it is a case of
-/// its own rather than a filter that happens to match.
+/// An empty query is not an empty answer: it admits everything, which is why it is a case of its
+/// own rather than a filter that happens to match.
 #[derive(Clone, Debug, Default)]
 pub(crate) enum SearchFilter {
     /// Nothing was typed, so nothing is filtered out.
@@ -61,10 +60,11 @@ pub(crate) enum SearchFilter {
     All,
     /// The query admitted nothing.
     Nothing,
+    /// The query admitted the pages, groups and fields it names.
     Matching {
-        pages: AHashSet<SharedString>,
-        groups: AHashSet<SharedString>,
-        fields: AHashSet<SharedString>,
+        pages: AHashSet<SmolStr>,
+        groups: AHashSet<SmolStr>,
+        fields: AHashSet<SmolStr>,
     },
 }
 
@@ -95,8 +95,8 @@ impl SearchFilter {
 
     /// Whether anything is filtered out at all.
     ///
-    /// Only the tests ask this: the settings page draws from what a filter admits rather than
-    /// from whether the query narrowed anything.
+    /// Only the tests ask this: the settings page draws from what a filter admits rather than from
+    /// whether the query narrowed anything.
     #[cfg(test)]
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
@@ -122,9 +122,9 @@ impl SearchFilter {
 
     /// Whether one field is drawn.
     ///
-    /// A page that was admitted by its own label shows everything on it: a user searching
-    /// for "proxy" is looking for that page rather than for an empty one. A page that is only
-    /// reachable through its fields draws the fields the query matched and nothing else.
+    /// A page that was admitted by its own label shows everything on it: a user searching for
+    /// "proxy" is looking for that page rather than for an empty one. A page that is only reachable
+    /// through its fields draws the fields the query matched and nothing else.
     pub fn admits_field(&self, page: &str, field_id: &str) -> bool {
         match self {
             Self::All => true,
@@ -137,9 +137,9 @@ impl SearchFilter {
 
     /// Admits a node and, when it is a group, everything under it.
     ///
-    /// A group is admitted by its own label, which is what lets a user reach the pages under
-    /// it without knowing what they are called; a page is admitted by its label, and its fields
-    /// are admitted separately, which is what lets a field match reach the page it sits on.
+    /// A group is admitted by its own label, which is what lets a user reach the pages under it
+    /// without knowing what they are called; a page is admitted by its label, and its fields are
+    /// admitted separately, which is what lets a field match reach the page it sits on.
     fn admit(&mut self, node: &SearchNode, tokens: &[&str]) {
         let Self::Matching {
             pages,
@@ -162,9 +162,9 @@ impl SearchFilter {
                     .all(|token| keywords.iter().any(|keyword| keyword.contains(token)))
                 {
                     groups.insert(node.id.clone());
-                    // A group that was admitted brings everything under it: a user searching
-                    // for the group is looking for the group, not for the pages of it that
-                    // happen to repeat the word.
+                    // A group that was admitted brings everything under it: a user searching for
+                    // the group is looking for the group, not for the pages of it that happen to
+                    // repeat the word.
                     for child in &node.children {
                         self.admit_subtree(child);
                     }
@@ -226,8 +226,8 @@ impl SearchFilter {
 mod tests {
     use super::{FieldSearch, PageSearch, SearchFilter, SearchNode};
 
-    /// A tree with one group over one page and one page of its own, written the way the
-    /// catalog is: the group's label is its first keyword.
+    /// A tree with one group over one page and one page of its own, written the way the catalog
+    /// is: the group's label is its first keyword.
     fn tree() -> Vec<SearchNode> {
         vec![
             SearchNode {
@@ -278,7 +278,7 @@ mod tests {
     fn a_query_that_matches_nothing_should_admit_nothing() {
         let filter = SearchFilter::new("nothing at all", &tree());
 
-        assert!(matches!(filter, SearchFilter::Nothing));
+        assert!(filter.is_nothing());
         assert!(!filter.admits_page("appearance"));
         assert!(!filter.admits_page("server-management"));
         assert!(!filter.admits_field("appearance", "appearance"));
@@ -294,8 +294,8 @@ mod tests {
         assert!(!filter.admits_page("appearance"));
     }
 
-    /// A page admitted by its own label shows everything on it, which is what makes a search
-    /// for a page name useful rather than a way to reach an empty page.
+    /// A page admitted by its own label shows everything on it, which is what makes a search for a
+    /// page name useful rather than a way to reach an empty page.
     #[test]
     fn a_page_admitted_by_its_label_should_show_its_fields() {
         let filter = SearchFilter::new("外观", &tree());

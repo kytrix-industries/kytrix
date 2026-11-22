@@ -1,4 +1,4 @@
-//! The proxy catalog page, the form that changes it, and the route spelling of a proxy line.
+//! The proxy catalog: its server management view and the form that edits one server.
 
 pub(crate) mod editor;
 pub(crate) mod route;

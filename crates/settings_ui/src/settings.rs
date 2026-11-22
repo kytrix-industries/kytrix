@@ -1,566 +1,380 @@
 //! The settings page: what the application is configured by, drawn in the page area of the main
 //! window in place of the workspace.
 //!
-//! The page owns what outlives a frame: the page that is drawn and the scroll position of that
-//! page. Each page is native UI — its rows, cards and controls are written where the page is
+//! The page owns what outlives a frame: the page that is drawn and whether it is drawn in a scroll
+//! region. Each page is native UI — its rows, cards and controls are written where the page is
 //! written — and this module is the frame around them: the sidebar, the search, the routing between
 //! pages, and the one place a failed write is reported.
 //!
 //! The page has the gallery's shape: a title and the search field in its header, and the settings
 //! menu on the left with the detail page behind the selected entry on the right. There is no
-//! footer: a control writes the change it makes at once, so there is nothing to confirm and
-//! nothing to cancel, and the page is left through the workspace rows alone. The sidebar does not
-//! fold: a group is the heading over the pages under it, and a page is the one kind of row that
-//! opens anything. What a page opens is the page drawn beside the list, so the two are one thing
-//! and move together.
+//! footer: a control writes the change it makes at once, so there is nothing to confirm and nothing
+//! to cancel, and the page is left through the workspace rows alone.
 //!
-//! A control writes the settings rather than a copy of them, through the session every view of
-//! this page shares — see [`SettingsPage::apply`]. A write that cannot be stored leaves the
-//! settings as they were and is reported over the page, so what the user had is still there to try
-//! again with. A form that edits a credential set is a dialog on the window layer: it holds a draft
-//! of one set and writes nothing until it is confirmed, so a cancelled dialog leaves the settings
-//! untouched and a confirmed one writes the set through the same session.
+//! A control writes the settings rather than a copy of them, through the session every view of this
+//! page shares — see [`SettingsHost::write`]. A write that cannot be stored leaves the settings as
+//! they were and is reported over the page, so what the user had is still there to try again with.
 //!
-//! A search rebuilds the sidebar rather than dimming it: an entry that matches neither by its own
-//! label nor by a setting on it is not drawn at all, and a group with none of its pages left is not
-//! drawn either, so what is left is the way to what was searched for. What it narrows is the
-//! sidebar; a query that matches nothing is answered in both columns rather than leaving the page
-//! that was open behind.
+//! # What follows the settings
 //!
-//! A page is native UI drawn on every frame, so it follows the language the window is showing by
-//! itself. What the page holds across frames — the rows of the sidebar and the words the search is
-//! answered over — does not, so it is built again when the language moves on — see
-//! [`SettingsPage::adopt_language`].
+//! The page projects the appearance it owns: [`Self::sync`] resolves the stored preference against
+//! the system and writes the theme, because a control that changed the preference has to see the
+//! change on the frame that follows the write. The language is the composition root's projection
+//! (it keeps the translation context and the language signal in step, the way it does for every
+//! widget); the page follows the signal and rebuilds its text when it moves.
 //!
-//! The proxy catalog and the translation page are views of their own. The form that changes the
-//! proxy catalog is a dialog on the window layer, drawn over this page. A row cannot open one
-//! itself — a table cell is drawn without a window — so it records the form it wants and this page
-//! opens it on the layer. The form writes the same session, because it is one page either way.
-//! Deleting a row is the one request that is put to the user before it is written, and the alert
-//! it is put to is opened the same way — see [`SettingsPage::open_requested_form`]. The credential
-//! dialog and its clear confirmation are opened by the venue row that holds them, which is drawn
-//! with a window and with this page's session.
+//! A page is native UI, so a page's text is built when the page is: a language that moved on is
+//! what rebuilds it (the same rule `crates/widgets/AGENTS.md` §15 states for static text). The
+//! sidebar and the page behind it are rebuilt together, because a row and the page it names are one
+//! thing.
+
+use std::{cell::RefCell, rc::Rc};
 
 use base_ui::{
-    button::Button,
-    icon::{Icon, IconKind},
-    input::{Input, InputState, InputStateBuilder, InputStateEvent},
-    interactive::InteractiveVariantExt,
-    layer::LayerExt,
-    scroll_bar::Scrollbar,
-    separator::Separator,
-    size::UnifiedSizable,
-    style::theme::ThemeExt,
+    kit::{
+        alert::AlertBuilder,
+        dialog::{Dialog, DialogBuilder},
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions},
+        scroll_bar::ScrollBar,
+    },
+    style_builder::StyleBuilder,
+    theme::{
+        appearance::Appearance as ThemeAppearance, components::ControlSize, handle::ThemeHandle,
+        role::Role,
+    },
 };
-use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, ElementId, Entity, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, base::Selectable as _,
-    div, px,
+use i18n::{language::codes::LanguageCode, translate::Translate};
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    a11y::{A11yOverride, A11yRole},
+    app::App,
+    error::EngineError,
+    event::{Action, Event},
+    interaction::ScrollHandle,
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    paint::style::{PaintSpec, StylePatch},
+    text::TextStyle,
+    window::WindowId,
 };
-use i18n::{language::codes::LanguageCode, t};
 
 use crate::{
-    layout::{self, PageArgs},
+    appearance,
+    host::SettingsHost,
+    layout,
     pages::{
-        proxy::{
-            editor::ProxyEditor,
-            table::{ProxyRequest, ProxyTable},
-        },
+        page::{PageBuild, PageView},
         registry::{self, PageId},
-        translation::page::TranslationPage,
     },
     search::SearchFilter,
-    session::{SettingsChange, SettingsSession},
 };
 
-/// The widest the page's content column gets. The column holds the header and the two panels
-/// beside each other, and the page's background keeps the window's full width around it.
-const CONTENT_MAX_WIDTH: Pixels = px(1000.0);
+/// The width of the field the settings are searched with.
+const SEARCH_WIDTH: f32 = 240.0;
 
-/// The width of the field the settings are searched with, drawn at the end of the header.
-const SEARCH_WIDTH: Pixels = px(240.0);
+/// The width of the sidebar column.
+const SIDEBAR_WIDTH: f32 = 232.0;
 
-/// The element id of the search field, which is also the key of its state.
-const SEARCH_INPUT_ID: &str = "settings-search";
+/// The height of one sidebar row.
+const SIDEBAR_ROW_HEIGHT: f32 = 30.0;
 
 /// The whole of the settings, as the main window's settings page.
 pub struct SettingsPage {
-    /// The session every control of this page writes through.
-    ///
-    /// The settings themselves are not held here: a page reads them from the session on every
-    /// frame, so what it draws is what is stored rather than what a session started from.
-    session: Entity<SettingsSession>,
-    /// Held because it is what draws the page again after a write, and what a failed write
-    /// reaches the page through.
-    _session: Subscription,
-    current_page: SharedString,
-    query: SharedString,
+    /// The collaborators every control writes through.
+    host: SettingsHost,
+    /// The window the page lives in.
+    window: WindowId,
+    /// The unique key prefix of this page instance (two panes have two).
+    key: SmolStr,
+    /// The node every part of the page is built under.
+    root: NodeId,
+    /// The column the sidebar is drawn in.
+    sidebar_column: NodeId,
+    /// The node the current page is built into.
+    body: NodeId,
+    /// The current page's id.
+    current: SmolStr,
+    /// The current page, as every sidebar row reads it for its selected state.
+    current_signal: Signal<SmolStr>,
+    /// The page a sidebar row asked for, waiting for the frame that moves to it.
+    selection: Signal<Option<SmolStr>>,
+    /// The query typed into the search field.
+    query: SmolStr,
+    /// What the query admits.
     filter: SearchFilter,
     /// The language the text this page holds was built in.
-    ///
-    /// A page is drawn natively afresh on every frame, so what it shows is the text of the
-    /// frame's language. What is held across frames is not, so this is what the sidebar and the
-    /// filter are compared against.
     language: LanguageCode,
-    /// The query the sidebar was last built for, so it is rebuilt when the answer changed rather
-    /// than on every frame.
-    sidebar_query: Option<SharedString>,
+    /// The query the sidebar was last built for.
+    sidebar_query: Option<SmolStr>,
     /// The rows of the sidebar, in the order they are drawn.
-    ///
-    /// A page the search took away is not a row, and neither is a heading left over nothing:
-    /// what a heading names is the pages under it.
-    sidebar: Vec<SidebarEntry>,
-    sidebar_scroll: ScrollHandle,
-    /// The search field, which is built the first time the page is drawn: a text field is filled
-    /// in by a window, and the page is built before there is one to draw it in.
-    search_input: Option<Entity<InputState>>,
-    page_scroll: ScrollHandle,
-    proxies: Entity<ProxyTable>,
-    translation: Entity<TranslationPage>,
-    /// Held because the subscription is what answers the search: dropping it would leave a
-    /// field that is typed into and never searched by.
-    search_events: Option<Subscription>,
+    sidebar_entries: Rc<RefCell<Vec<SidebarEntry>>>,
+    /// The list the sidebar rows are drawn by, when the sidebar is drawn at all.
+    sidebar: Option<List>,
+    /// The actions one sidebar row dispatches when it is activated.
+    sidebar_actions: Vec<Action>,
+    /// The page behind the current entry.
+    page: Option<Box<dyn PageView>>,
+    /// The scroll region the current page lives in, when it scrolls.
+    page_scroll: Option<(ScrollHandle, NodeId, ScrollBar)>,
+    /// The search field and the state it edits.
+    search_input: Option<InputNode>,
+    search_state: Option<Signal<InputState>>,
+    /// The spec the search field was built with, which is what a programmatic write needs.
+    #[cfg(test)]
+    search_spec: std::sync::Arc<InputSpec>,
+    /// The dialogs this page opened and has not released yet.
+    alerts: Vec<Dialog>,
+    /// How many reports this page has opened, so each one gets a fresh key.
+    alert_count: u64,
+    /// Whether the operating system reports a dark appearance.
+    system_dark: bool,
 }
 
 impl SettingsPage {
-    /// The settings page, opened over the settings that are stored now.
+    /// Builds the settings page under `parent` and opens the page the settings start on.
     ///
-    /// Every page is drawn from the settings of the frame it is drawn in: nothing is copied when
-    /// the page opens, and every value on a page is read from and written to the settings
-    /// themselves.
+    /// `key` is the unique prefix of this page instance: two settings pages in one application (two
+    /// panes) need two, because a kit key is an application-level action identity.
     ///
-    /// The search field needs a window and is built on the first frame rather than here, because
-    /// the page is built before the window it is about to be shown in has drawn it.
-    pub fn load(cx: &mut Context<Self>) -> Self {
-        let session = cx.new(|_| SettingsSession::new());
-        let filter = SearchFilter::new("", &registry::search_nodes(cx));
-        let proxies = cx.new(|cx| ProxyTable::new(session.clone(), cx));
-        let downloads = crate::translation_downloads::entity(cx);
-        let translation = cx.new(|cx| TranslationPage::new(session.clone(), downloads, cx));
-        // Every write of this page repaints it: the page draws what is stored, and a write that
-        // failed is reported on the frame that follows it.
-        let session_changes = cx.observe(&session, |_, _, cx| cx.notify());
+    /// # Errors
+    /// Engine node-building errors, or a failure from a kit component the page builds.
+    pub fn mount(
+        host: SettingsHost,
+        key: &str,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+    ) -> Result<Self, EngineError> {
+        let key = SmolStr::new(key);
+        let theme = host.theme_handle();
+        let current = SmolStr::new_static(registry::DEFAULT_PAGE);
+        let current_signal = app.signal(current.clone());
+        let selection = app.signal(Option::<SmolStr>::None);
+        let language = host.language(app);
+        let system_dark = theme.current(app) == ThemeAppearance::Dark;
 
-        Self {
-            session,
-            _session: session_changes,
-            current_page: SharedString::new_static(registry::DEFAULT_PAGE),
-            query: SharedString::default(),
-            filter,
-            language: *cx.global::<LanguageCode>(),
-            sidebar_query: None,
-            sidebar: Vec::new(),
-            sidebar_scroll: ScrollHandle::new(),
-            search_input: None,
-            page_scroll: ScrollHandle::new(),
-            proxies,
-            translation,
-            search_events: None,
-        }
-    }
+        let root = layout::themed_box(
+            app,
+            window,
+            parent,
+            SmolStr::new_static("SETTINGS_PAGE"),
+            StyleBuilder::new()
+                .flex_col()
+                .size_full()
+                .min_width_0()
+                .min_height_0()
+                .build(),
+            PaintSpec::default(),
+            &theme,
+            Some(Role::SurfaceCanvas),
+            None,
+        )?;
 
-    /// The session every control of this page writes through, for a control that opens a dialog
-    /// of its own.
-    ///
-    /// A credential row is drawn by the page's own frame, so what it is handed is the page; the
-    /// dialog it opens writes the same session, and this is how the row gets it without reaching
-    /// back into the page entity while that entity is being rendered.
-    pub(crate) fn session_entity(&self) -> Entity<SettingsSession> {
-        self.session.clone()
-    }
-
-    /// The search field, built the first time it is drawn.
-    fn search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
-        if let Some(input) = self.search_input.as_ref() {
-            return input.clone();
-        }
-
-        let input = cx.new(|cx| {
-            InputStateBuilder::new(SEARCH_INPUT_ID)
-                .placeholder(t!(cx, "settings_ui.search.placeholder"))
-                .build(window, cx)
-        });
-        self.subscribe_search(&input, cx);
-        self.search_input = Some(input.clone());
-
-        input
-    }
-
-    /// Answers what is typed into the search field.
-    ///
-    /// The subscription is replaced with the field it belongs to, because a field that is
-    /// built again is a different entity.
-    fn subscribe_search(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
-        self.search_events = Some(cx.subscribe(
-            input,
-            |settings, _, event: &InputStateEvent, cx| {
-                let InputStateEvent::Change(query) = event else {
-                    return;
-                };
-                settings.set_query(query.clone(), cx);
-            },
+        let header = layout::build_node(app, window, root, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static("SETTINGS_HEADER"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .flex_none()
+                        .width_full()
+                        .gap(16.0)
+                        .padding_sides(16.0, 24.0, 12.0, 24.0)
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+        let title_theme = theme.clone();
+        layout::build_node(app, window, header, |tree, parent| {
+            let style = title_theme
+                .theme_for(ThemeAppearance::Dark)
+                .role(Role::FgDefault);
+            NodeBuilder::text(
+                i18n::t_smol!(host.translate(), "settings_ui.title"),
+                TextStyle::new(20.0).with_weight(700).with_color(style),
+            )
+            .id(SmolStr::new_static("SETTINGS_TITLE"))
+            .bind_style(move |cx| StylePatch {
+                foreground: Some(title_theme.role(cx, Role::FgDefault)),
+                ..StylePatch::default()
+            })
+            .build(tree, parent)
+        })?;
+        let search_box = layout::build_node(app, window, header, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static("SETTINGS_SEARCH"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .width(SEARCH_WIDTH)
+                        .min_width_0()
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+        let search_state = app.signal(InputState::new(""));
+        let search_placeholder = app.signal(i18n::t_smol!(
+            host.translate(),
+            "settings_ui.search.placeholder"
         ));
-    }
-
-    /// Rebuilds what the page holds in the language the window is showing now.
-    ///
-    /// The language is a global the whole interface is rendered through, so switching it is
-    /// what every frame that follows reads: a page follows by being drawn again, and what this
-    /// page holds is built again here, because nothing else would draw it again.
-    fn adopt_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let language = *cx.global::<LanguageCode>();
-        if language == self.language {
-            return;
-        }
-
-        self.language = language;
-        // The filter answers over the rendered text of every label, so the words it holds are
-        // of the language it was answered in.
-        self.filter = SearchFilter::new(&self.query, &registry::search_nodes(cx));
-        self.rebuild_sidebar(cx);
-        // A query answered in one language does not have to answer the same way in another: the
-        // page that is drawn may be one the new language no longer reaches, and what is drawn
-        // then is the message in both columns. The first page that is still reachable is where
-        // the page goes instead, the way a search moves it. A page the new language still reaches
-        // is not moved, so what the user scrolled to on it stays where it was: the scroll is reset
-        // by a page that moves, not by the language itself.
-        let reachable = self
-            .page()
-            .is_some_and(|page| registry::page_is_reachable(page, &self.filter, cx));
-        if !reachable && let Some(page) = registry::first_admitted_page(&self.filter, cx) {
-            let id = page.id();
-            self.move_to(id.as_ref(), cx);
-        }
-        if let Some(input) = self.search_input.as_ref() {
-            let placeholder = t!(cx, "settings_ui.search.placeholder");
-            input.update(cx, |input, cx| {
-                input.update_placeholder(placeholder, window, cx);
-            });
-        }
-    }
-
-    /// Writes one change into the settings this page draws.
-    pub(crate) fn apply(&mut self, change: SettingsChange, cx: &mut Context<Self>) {
-        self.session.update(cx, |session, cx| {
-            let _ = session.write(change, cx);
+        let spec = std::sync::Arc::new(InputSpec {
+            name: SmolStr::new_static("SETTINGS_SEARCH"),
+            placeholder: app.read(&search_placeholder).clone(),
+            masked: false,
+            multiline: false,
+            readonly: false,
+            disabled: false,
+            max_length: None,
+            size: ControlSize::Medium,
+            submit: None,
         });
-        // A control that offered a value the settings refused draws the old value again on the
-        // frame that follows: the session is not written then, so the page is told to draw.
-        cx.notify();
+        let mut search_input = {
+            let tree = app
+                .window_mut(window)
+                .ok_or(EngineError::UnknownWindow { window })?
+                .tree_mut();
+            input::build(
+                tree,
+                search_box,
+                std::sync::Arc::clone(&spec),
+                &theme,
+                &search_state,
+                &search_placeholder,
+            )
+        };
+        search_input.install(app);
+        // The field is cleared the way the old search field was: the clear control is the
+        // field's own, and clearing it is what brings the whole sidebar back.
+        search_input.set_clearable(app, true);
+
+        let body_row = layout::build_node(app, window, root, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static("SETTINGS_BODY"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_row()
+                        .flex_1()
+                        .width_full()
+                        .min_width_0()
+                        .min_height_0()
+                        .gap(12.0)
+                        .padding_sides(0.0, 24.0, 16.0, 24.0)
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+        let sidebar_column = layout::build_node(app, window, body_row, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static("SETTINGS_SIDEBAR"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .width(SIDEBAR_WIDTH)
+                        .min_width_0()
+                        .min_height_0()
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+        layout::build_node(app, window, body_row, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static("SETTINGS_DIVIDER"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .width(1.0)
+                        .height_full()
+                        .build(),
+                )
+                .bind_style(move |cx| StylePatch {
+                    background: Some(theme.role(cx, Role::LineDivider)),
+                    ..StylePatch::default()
+                })
+                .build(tree, parent)
+        })?;
+        let body = layout::build_node(app, window, body_row, |tree, parent| {
+            NodeBuilder::boxed()
+                .id(SmolStr::new_static("SETTINGS_CONTENT"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_1()
+                        .min_width_0()
+                        .min_height_0()
+                        .build(),
+                )
+                .build(tree, parent)
+        })?;
+
+        let mut page = Self {
+            host,
+            window,
+            key,
+            root,
+            sidebar_column,
+            body,
+            current,
+            current_signal,
+            selection,
+            query: SmolStr::default(),
+            filter: SearchFilter::All,
+            language,
+            sidebar_query: None,
+            sidebar_entries: Rc::new(RefCell::new(Vec::new())),
+            sidebar: None,
+            sidebar_actions: Vec::new(),
+            page: None,
+            page_scroll: None,
+            search_input: Some(search_input),
+            search_state: Some(search_state),
+            #[cfg(test)]
+            search_spec: std::sync::Arc::clone(&spec),
+            alerts: Vec::new(),
+            alert_count: 0,
+            system_dark,
+        };
+        page.filter = SearchFilter::new("", &registry::search_nodes(page.host.translate()));
+        page.register_sidebar(app)?;
+        page.rebuild_sidebar(app, window)?;
+        page.open_page(app, window)?;
+
+        Ok(page)
+    }
+
+    /// The page currently drawn, for the shell and for the tests that assert where routing left it.
+    #[must_use]
+    pub fn current_page(&self) -> &SmolStr {
+        &self.current
+    }
+
+    /// The query the page is answering, for the tests of the search.
+    #[must_use]
+    pub fn query(&self) -> &SmolStr {
+        &self.query
+    }
+
+    /// Types query into the search field, for the tests of what a query answers.
+    #[cfg(test)]
+    pub(crate) fn set_query(&mut self, app: &mut App, query: &str) {
+        let Some(state) = self.search_state else {
+            return;
+        };
+        let spec = std::sync::Arc::clone(&self.search_spec);
+        app.update(&state, |state| {
+            state.set_text(&spec, query);
+        });
     }
 
     /// Says why the last write could not be stored, if one is waiting.
     ///
-    /// The main window is what asks this before it takes the page away: a write that failed and
-    /// was not drawn by this page — the settings were left before the frame that reports it — is
-    /// carried to what is drawn next, rather than dropped with the page. The reason is taken out
-    /// of the session, so it is reported once.
-    pub fn take_write_failure(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        self.session
-            .update(cx, |session, _| session.take_failure())
-            .map(|error| error.to_string())
-    }
-
-    /// Reports the last write that could not be stored, if one is waiting.
-    ///
-    /// The reason is taken out of the session, so it is reported once. What a failed write leaves
-    /// behind is the settings as they were: a choice is drawn from them again and shows the old
-    /// value, and a dialog keeps what the user typed so the write can be made again.
-    fn report_write_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(error) = self.session.update(cx, |session, _| session.take_failure()) else {
-            return;
-        };
-
-        show_write_failure(window, cx, error.to_string());
-    }
-
-    /// Selects the page one sidebar row names.
-    ///
-    /// The caret goes with the page it was on: a control of the page being left is not drawn any
-    /// more, and a keystroke would reach something the user cannot see. Nothing is written here:
-    /// a change is written by the control that makes it, and a dialog that holds a draft writes it
-    /// only when the dialog is confirmed.
-    pub(crate) fn select(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current_page.as_ref() == id {
-            return;
-        }
-
-        window.blur(cx);
-        self.move_to(id, cx);
-    }
-
-    /// Moves the page to one entry of the sidebar.
-    ///
-    /// The page drawn and the row that names it are one thing: the row is drawn selected from
-    /// the page the settings are on, so a page moved on its own would leave the row behind it.
-    /// Nothing is written here: this is what the page moves by, and what a search or a language
-    /// switch moves it with.
-    ///
-    /// The translation page repairs its settings when it is opened, and being moved to is what
-    /// opens it: see [`crate::pages::translation::page::TranslationPage::repair_on_open`].
-    fn move_to(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.current_page.as_ref() == id {
-            return;
-        }
-
-        self.current_page = SharedString::from(id);
-        self.page_scroll = ScrollHandle::new();
-        self.reveal_current_page();
-        if registry::page(id).is_some_and(PageId::is_translation) {
-            self.translation
-                .update(cx, |page, cx| page.repair_on_open(cx));
-        }
-        cx.notify();
-    }
-
-    /// Answers a new query.
-    ///
-    /// The sidebar is rebuilt from the answer while the page is drawn, so nothing is built
-    /// here but the answer itself; the page follows the answer, because a page with neither a
-    /// matching label nor a matching setting is a page that is no longer drawn.
-    pub(crate) fn set_query(&mut self, query: SharedString, cx: &mut Context<Self>) {
-        if self.query == query {
-            return;
-        }
-
-        self.query = query;
-        self.filter = SearchFilter::new(&self.query, &registry::search_nodes(cx));
-        let reachable = self
-            .page()
-            .is_some_and(|page| registry::page_is_reachable(page, &self.filter, cx));
-        let next = (!reachable)
-            .then(|| registry::first_admitted_page(&self.filter, cx))
-            .flatten();
-        if let Some(page) = next {
-            // The page moves the way a selection moves rather than on its own: the page drawn
-            // and the row that names it are one thing, so a page moved without the sidebar is
-            // a page the sidebar has no row for.
-            let id = page.id();
-            self.move_to(id.as_ref(), cx);
-        }
-        cx.notify();
-    }
-
-    /// The page currently drawn.
-    fn page(&self) -> Option<PageId> {
-        registry::page(self.current_page.as_str())
-    }
-
-    /// Gives the sidebar the rows the current answer admits.
-    ///
-    /// The rows are built again only when the answer changed: a frame that did not move the
-    /// query would build the same rows, and the scroll position would be asked to follow them
-    /// again.
-    fn sync_sidebar(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_query.as_ref() == Some(&self.query) {
-            return;
-        }
-
-        self.rebuild_sidebar(cx);
-    }
-
-    /// Builds the rows the filter admits, labelled in the language the page is holding.
-    fn rebuild_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar = sidebar_entries(&self.filter, cx);
-        self.sidebar_query = Some(self.query.clone());
-        self.reveal_current_page();
-    }
-
-    /// Scrolls the sidebar to the row of the page that is drawn.
-    ///
-    /// A page the settings moved to by itself is not necessarily one the user can see: what it
-    /// moves to is moved into view, the way a row the user clicked already is.
-    fn reveal_current_page(&self) {
-        if let Some(index) = self
-            .sidebar
-            .iter()
-            .position(|entry| entry.page_id() == Some(&self.current_page))
-        {
-            self.sidebar_scroll.scroll_to_item(index);
-        }
-    }
-
-    /// Opens the form a proxy row asked for, or asks again about the one thing a row can do that
-    /// takes something away.
-    ///
-    /// The request is taken on the frame that draws this page, and the form is opened on the
-    /// window layer, which pushes it at the end of the effect cycle and draws it on the next frame.
-    /// That is why this can open the form from inside a frame of its own — this page is drawn
-    /// inside the layer's view — and why nothing here has to wait for a frame to come round: the
-    /// layer's deferred push is what asks for one.
-    ///
-    /// A delete is not a form: it is one decision, and it is the one row action that cannot be
-    /// taken back, because removing an entry resets every route that named it. So it is put to the
-    /// user as an alert over the settings, and only what the alert confirms is written — walking
-    /// away from it leaves the catalog the rows are drawn from as it was.
-    fn open_requested_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.proxies.update(cx, |table, _| table.take_request()) {
-            Some(ProxyRequest::Add) => ProxyEditor::show_add(self.session.clone(), window, cx),
-            Some(ProxyRequest::Edit { name }) => {
-                ProxyEditor::show_edit(&name, self.session.clone(), window, cx)
-            }
-            Some(ProxyRequest::Delete { name }) => {
-                // Both the alert and its action are `'static`, so every sentence is resolved here,
-                // where the application is still known to be in the language it is drawn in.
-                let title = t!(cx, "settings_ui.proxies.delete_title");
-                let message = t!(
-                    cx,
-                    "settings_ui.proxies.delete_message",
-                    name = name.as_str()
-                );
-                let confirm = t!(cx, "common.confirm");
-                let cancel = t!(cx, "common.cancel");
-                let session = self.session.clone();
-
-                window.alert(cx, move |alert, _, _| {
-                    alert
-                        .ok_cancel(title, message)
-                        .ok_text(confirm)
-                        .cancel_text(cancel)
-                        .ok_action(move |_, _, cx| {
-                            session.update(cx, |session, cx| {
-                                let change = SettingsChange::RemoveProxy { name: name.clone() };
-                                let _ = session.write(change, cx);
-                            });
-                        })
-                });
-            }
-            None => {}
-        }
-    }
-
-    /// The header: what the page is, and the field the settings are searched with.
-    ///
-    /// It is the gallery's header: the title on the left, and the search field at the end of the
-    /// row. The field is the one the sidebar is filtered by; drawing it here rather than above
-    /// the sidebar is what makes the two pages open the same way.
-    fn header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let input = self.search_input(window, cx);
-
-        div()
-            .debug_selector(|| "SETTINGS_HEADER".into())
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_wrap()
-            .items_end()
-            .justify_between()
-            .gap_4()
-            .px_6()
-            .pt_5()
-            .pb_3()
-            .child(
-                div().min_w_0().flex_1().child(
-                    div()
-                        .debug_selector(|| "SETTINGS_TITLE".into())
-                        .text_2xl()
-                        .font_weight(FontWeight::BOLD)
-                        .child(t!(cx, "settings_ui.title")),
-                ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "SETTINGS_SEARCH".into())
-                    .flex_none()
-                    .w(SEARCH_WIDTH)
-                    .child(
-                        Input::new(&input)
-                            .medium()
-                            .clearable(true)
-                            .prefix_icon(IconKind::MagnifyingGlass),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// The sidebar: the rows the current answer admits, inside the viewport that scrolls them.
-    ///
-    /// A heading is drawn as text rather than as a control, because a group is not something a
-    /// user opens: what it does is name the pages that follow it. A page is a button, and the
-    /// one the settings are on is drawn selected.
-    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows = div()
-            .id("settings-sidebar-scroll")
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .overflow_y_scroll()
-            .track_scroll(&self.sidebar_scroll);
-
-        for entry in &self.sidebar {
-            rows = rows.child(match entry {
-                SidebarEntry::Heading(label) => div()
-                    .flex_none()
-                    .px_2()
-                    .pt_2()
-                    .pb_1()
-                    .text_xs()
-                    .font_weight(gpui_kit::FontWeight::MEDIUM)
-                    .text_color(cx.theme().roles.fg.muted.hsla)
-                    .child(label.clone())
-                    .into_any_element(),
-                SidebarEntry::Separator => div()
-                    .flex_none()
-                    .px_2()
-                    .py_1()
-                    .debug_selector(|| "SETTINGS_SIDEBAR_SEPARATOR".into())
-                    .child(Separator::horizontal())
-                    .into_any_element(),
-                SidebarEntry::Page { id, label } => {
-                    let page = id.clone();
-                    let element_id: ElementId = (
-                        ElementId::Name(SharedString::new_static("settings-sidebar")),
-                        id.clone(),
-                    )
-                        .into();
-
-                    Button::new(element_id)
-                        .ghost()
-                        .selected(id == &self.current_page)
-                        .flex_none()
-                        .w_full()
-                        .justify_start()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("SETTINGS_ENTRY_{id}")
-                        })
-                        .child(Icon::new(IconKind::GearSix).size_4())
-                        .child(label.clone())
-                        .on_click(cx.listener(move |settings, _, window, cx| {
-                            settings.select(page.as_str(), window, cx);
-                        }))
-                        .into_any_element()
-                }
-            });
-        }
-
-        div()
-            .relative()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .child(rows)
-            .child(Scrollbar::vertical(self.sidebar_scroll.clone()))
-            .into_any_element()
-    }
-
-    /// The page the settings are on, for the tests that assert where routing left it.
-    #[cfg(test)]
-    pub(crate) fn current_page_for_test(&self) -> &SharedString {
-        &self.current_page
-    }
-
-    /// The query the page is answering, for the tests of the search.
-    #[cfg(test)]
-    pub(crate) fn query_for_test(&self) -> &SharedString {
-        &self.query
+    /// The page reports its own failures; the shell asks for one only when it takes the page away
+    /// before a frame reported it, so the reason is carried to what is drawn next rather than
+    /// dropped with the page. The reason is taken out of the session, so it is reported once.
+    pub fn take_write_failure(&mut self) -> Option<SmolStr> {
+        self.host
+            .take_failure()
+            .map(|error| SmolStr::new(error.to_string()))
     }
 
     /// What the query admits, for the tests of the search's answer.
@@ -571,231 +385,544 @@ impl SettingsPage {
 
     /// The rows the sidebar is drawing, for the tests of its labels.
     #[cfg(test)]
-    pub(crate) fn sidebar_for_test(&self) -> &[SidebarEntry] {
-        &self.sidebar
+    pub(crate) fn sidebar_labels(&self) -> Vec<SmolStr> {
+        self.sidebar_entries
+            .borrow()
+            .iter()
+            .map(SidebarEntry::label)
+            .collect()
     }
 
-    /// The proxy catalog's table, for the tests that read its rows.
-    #[cfg(test)]
-    pub(crate) fn proxies_for_test(&self) -> &Entity<ProxyTable> {
-        &self.proxies
+    /// Registers the actions one sidebar row dispatches.
+    fn register_sidebar(&mut self, app: &mut App) -> Result<(), EngineError> {
+        for page in registry::pages() {
+            let id = page.id();
+            let action = self.sidebar_action(&id);
+            let selection = self.selection;
+            app.on_action(action.clone(), move |ctx| {
+                ctx.write(&selection, Some(id.clone()));
+            });
+            self.sidebar_actions.push(action);
+        }
+        Ok(())
     }
 
-    /// The session the page writes through, for the tests that read what it stored.
-    #[cfg(test)]
-    pub(crate) fn session_for_test(&self) -> &Entity<SettingsSession> {
-        &self.session
+    /// The action one sidebar row dispatches.
+    fn sidebar_action(&self, page: &str) -> Action {
+        Action::Custom(format_smolstr!("{}.sidebar.{page}", self.key))
     }
 
-    /// The translation page this page routes to, for the tests that read its directory.
-    #[cfg(test)]
-    pub(crate) fn translation_for_test(&self) -> &Entity<TranslationPage> {
-        &self.translation
-    }
-}
+    /// Builds the sidebar rows the current filter admits, replacing the ones drawn before.
+    fn rebuild_sidebar(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
+        if let Some(list) = self.sidebar.take() {
+            list.release(app);
+        }
+        self.remove_children(app, self.sidebar_column);
+        let filter = self.filter.clone();
+        let translate = self.host.translate().clone();
+        let entries = sidebar_entries(&filter, &translate);
+        let count = entries.len();
+        let entries = Rc::new(RefCell::new(entries));
+        self.sidebar_entries = Rc::clone(&entries);
+        self.sidebar_query = Some(self.query.clone());
 
-impl Render for SettingsPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.report_write_failure(window, cx);
-        self.adopt_language(window, cx);
-        self.sync_sidebar(cx);
-        self.open_requested_form(window, cx);
-        let foreground = cx.theme().roles.fg.default.hsla;
-        let canvas = cx.theme().roles.surface.canvas.hsla;
-        let handle = cx.entity();
-        let header = self.header(window, cx);
-        // A page with neither its own label nor one of its settings admitted by the query is a
-        // page the search took away: what is left is the message, in this column as in the
-        // sidebar.
-        let selected = self
-            .page()
-            .filter(|page| registry::page_is_reachable(*page, &self.filter, cx));
-        let page = match selected {
-            Some(PageId::Translation) => div()
-                .size_full()
-                .min_w_0()
-                .min_h_0()
-                .child(self.translation.clone())
-                .into_any_element(),
-            Some(PageId::ServerManagement) => div()
-                .size_full()
-                .min_w_0()
-                .min_h_0()
-                .child(self.proxies.clone())
-                .into_any_element(),
-            Some(page) => {
-                let content = {
-                    let config = self.session.read(cx).config(cx);
-                    let filter = self.filter.clone();
-                    let mut args = PageArgs {
-                        config: config.as_ref(),
-                        filter: &filter,
-                        settings: self,
-                        handle: &handle,
-                        cx,
-                    };
-                    registry::render_page(page, &mut args)
-                };
-                layout::scroll(content, self.page_scroll.clone())
-            }
-            None => div()
-                .debug_selector(|| "SETTINGS_PAGE_NO_MATCHES".into())
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(no_matches(cx))
-                .into_any_element(),
-        };
-        // A query that admitted nothing leaves the sidebar empty as well: the column says so
-        // instead of drawing an empty list, so both columns answer the search the same way.
-        let sidebar = if self.filter.is_nothing() {
-            div()
-                .debug_selector(|| "SETTINGS_SIDEBAR_NO_MATCHES".into())
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(no_matches(cx))
-                .into_any_element()
-        } else {
-            self.sidebar(cx)
-        };
-        // The search narrows the sidebar and nothing else: the menu column is as wide as the
-        // list it holds, and the page gets the rest of the column. The search itself is in the
-        // header, where the gallery draws the field it filters its catalogue with.
-        let entries = div().w_64().flex_none().min_h_0().flex().flex_col().child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .debug_selector(|| "SETTINGS_SIDEBAR".into())
-                .child(sidebar),
+        if self.filter.is_nothing() || count == 0 {
+            let theme = self.host.theme_handle();
+            let label = i18n::t_smol!(translate, "settings_ui.no_matches");
+            layout::themed_text(
+                app,
+                window,
+                self.sidebar_column,
+                Some(SmolStr::new_static("SETTINGS_SIDEBAR_NO_MATCHES")),
+                label,
+                12.0,
+                400,
+                Role::FgMuted,
+                &theme,
+            )?;
+            return Ok(());
+        }
+
+        let theme = self.host.theme_handle();
+        let current = self.current_signal;
+        let row_theme = theme.clone();
+        let row_key = self.key.clone();
+        let list = List::new(
+            app,
+            theme,
+            format_smolstr!("{}.sidebar", self.key),
+            ListOptions::fixed(SIDEBAR_ROW_HEIGHT).padding(0.0, 4.0),
+            move |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                let entry = entries.borrow().get(index).cloned();
+                build_sidebar_row(tree, parent, entry, &row_theme, current, &row_key)
+            },
         );
+        let selection = self.selection;
+        let entries = Rc::clone(&self.sidebar_entries);
+        list.on_activate(move |app: &mut App, index: usize| {
+            let page = entries.borrow().get(index).and_then(SidebarEntry::page_id);
+            if let Some(page) = page {
+                let _ = app.write(&selection, Some(page));
+            }
+        });
+        list.mount(app, window, self.sidebar_column)?;
+        list.set_items(app, count)?;
+        self.sidebar = Some(list);
 
-        div()
-            .debug_selector(|| "SETTINGS_PAGE".into())
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .bg(canvas)
-            .text_color(foreground)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .debug_selector(|| "SETTINGS_COLUMN".into())
-                            .w(CONTENT_MAX_WIDTH)
-                            .max_w_full()
-                            .h_full()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .child(header)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .min_h_0()
-                                    .px_6()
-                                    .pb_4()
-                                    .flex()
-                                    .gap_2()
-                                    .child(entries)
-                                    .child(Separator::vertical())
-                                    .child(div().min_w_0().min_h_0().flex_1().child(page)),
-                            ),
-                    ),
-            )
+        Ok(())
     }
-}
 
-/// Shows why a change could not be stored.
-///
-/// The settings page reports its own failures with this, and so does the main window when a write
-/// that failed was carried out of the page before a frame reported it: one sentence, wherever it
-/// is reported.
-pub fn show_write_failure(window: &mut Window, cx: &mut App, reason: String) {
-    let title = t!(cx, "settings_ui.save_failed.title");
-    let message = t!(cx, "settings_ui.save_failed.message", reason = reason);
-    let confirm = t!(cx, "common.confirm");
-    window.alert(cx, move |alert, _window, _cx| {
-        alert.ok(title, message).ok_text(confirm)
-    });
-}
+    /// Releases the page that is drawn and builds the one the settings are on.
+    fn open_page(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
+        if let Some(mut page) = self.page.take() {
+            page.release(app);
+        }
+        if let Some((_, _, bar)) = self.page_scroll.take() {
+            bar.release(app);
+        }
+        self.remove_children(app, self.body);
 
-/// What a column says when the query admitted nothing it could draw.
-fn no_matches(cx: &App) -> AnyElement {
-    div()
-        .text_sm()
-        .text_color(cx.theme().roles.fg.muted.hsla)
-        .child(t!(cx, "settings_ui.no_matches"))
-        .into_any_element()
-}
+        let Some(page_id) = self
+            .page()
+            .filter(|page| registry::page_is_reachable(*page, &self.filter, self.host.translate()))
+        else {
+            let theme = self.host.theme_handle();
+            let text = i18n::t_smol!(self.host.translate(), "settings_ui.no_matches");
+            layout::themed_text(
+                app,
+                window,
+                self.body,
+                Some(SmolStr::new_static("SETTINGS_PAGE_NO_MATCHES")),
+                text,
+                13.0,
+                400,
+                Role::FgMuted,
+                &theme,
+            )?;
+            return Ok(());
+        };
 
-/// One row of the settings sidebar.
-pub(crate) enum SidebarEntry {
-    /// A group's name over the pages that follow it: text, because a group is not something a
-    /// user opens.
-    Heading(SharedString),
-    /// A page, which is the one kind of row that opens something.
-    Page {
-        id: SharedString,
-        label: SharedString,
-    },
-    /// A divider between one part of the sidebar and the next.
+        let mut page = registry::page_view(page_id, &self.host, self.key.as_str());
+        let scrolls = page.scrolls();
+        let parent = if scrolls {
+            let theme = self.host.theme_handle();
+            let (handle, content, bar) = layout::scroll_region(
+                app,
+                window,
+                self.body,
+                &theme,
+                format_smolstr!("{}.page", self.key).as_str(),
+            )?;
+            self.page_scroll = Some((handle, content, bar));
+            content
+        } else {
+            self.body
+        };
+        let filter = self.filter.clone();
+        let page_key = SmolStr::new(page.page_id());
+        let cx = PageBuild {
+            filter: &filter,
+            key: self.key.as_str(),
+            page: page_key,
+        };
+        page.build(app, window, parent, &cx)?;
+        self.page = Some(page);
+
+        Ok(())
+    }
+
+    /// The page the ids name, when the settings are on one.
+    fn page(&self) -> Option<PageId> {
+        registry::page(self.current.as_ref())
+    }
+
+    /// Moves the page to one entry of the sidebar.
+    fn move_to(&mut self, id: SmolStr, app: &mut App, window: WindowId) -> Result<(), EngineError> {
+        if self.current == id {
+            return Ok(());
+        }
+
+        self.current = id;
+        app.write(&self.current_signal, self.current.clone());
+        self.sidebar_query = None;
+        self.rebuild_sidebar(app, window)?;
+        self.open_page(app, window)
+    }
+
+    /// Answers what the search field holds.
+    fn adopt_query(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
+        let query = self
+            .search_state
+            .map(|state| SmolStr::new(app.read(&state).text()))
+            .unwrap_or_default();
+        if query == self.query {
+            return Ok(());
+        }
+
+        self.query = query;
+        self.filter = SearchFilter::new(
+            self.query.as_str(),
+            &registry::search_nodes(self.host.translate()),
+        );
+        let reachable = self.page().is_some_and(|page| {
+            registry::page_is_reachable(page, &self.filter, self.host.translate())
+        });
+        if !reachable
+            && let Some(page) = registry::first_admitted_page(&self.filter, self.host.translate())
+        {
+            self.current = page.id();
+            app.write(&self.current_signal, self.current.clone());
+        }
+        self.sidebar_query = None;
+        self.rebuild_sidebar(app, window)?;
+        self.open_page(app, window)
+    }
+
+    /// The language the interface is drawn in, as the settings name it.
+    fn adopt_language(&mut self, app: &mut App, window: WindowId) -> Result<(), EngineError> {
+        let language = self.host.language(app);
+        if language == self.language {
+            return Ok(());
+        }
+
+        self.language = language;
+        if let Some(input) = &self.search_input {
+            let placeholder =
+                i18n::t_smol!(self.host.translate(), "settings_ui.search.placeholder");
+            input.update_placeholder(app, placeholder);
+        }
+        self.sidebar_query = None;
+        self.rebuild_sidebar(app, window)?;
+        self.open_page(app, window)
+    }
+
+    /// Projects the appearance the settings name, so a control that changed it sees the change on
+    /// the frame that follows the write.
     ///
-    /// A page at the top of the sidebar is a part of its own rather than another page of the
-    /// group above it, and the divider is what says so.
-    Separator,
-}
+    /// The language is the composition root's projection: it moves the translation context and the
+    /// language signal together, and the page follows the signal in [Self::adopt_language].
+    fn project(&mut self, app: &mut App) {
+        let preference = self.host.config(app, |config| config.appearance);
+        let resolved = appearance::appearance_of(preference, self.system_dark);
+        if self.host.theme().current(app) != resolved {
+            self.host.theme().set_appearance(app, resolved);
+        }
+    }
 
-impl SidebarEntry {
-    /// The page this row opens, or `None` for anything else.
-    pub(crate) fn page_id(&self) -> Option<&SharedString> {
-        match self {
-            Self::Heading(_) | Self::Separator => None,
-            Self::Page { id, .. } => Some(id),
+    /// Reports the last write that could not be stored, if one is waiting.
+    fn report_write_failure(&mut self, app: &mut App) {
+        let Some(error) = self.host.take_failure() else {
+            return;
+        };
+        let detail = SmolStr::new(error.to_string());
+        let translate = self.host.translate().clone();
+        let title = i18n::t_smol!(translate, "settings_ui.save_failed.title");
+        let message = i18n::t_smol!(
+            translate,
+            "settings_ui.save_failed.message",
+            reason = detail.as_str()
+        );
+        let confirm = i18n::t_smol!(translate, "common.confirm");
+        self.alert_count += 1;
+        let dialog = DialogBuilder::alert(title.clone(), move |_dialog, _theme| {
+            AlertBuilder::new()
+                .ok(title.clone(), message.clone())
+                .ok_text(confirm.clone())
+        })
+        .build(
+            app,
+            self.host.theme_handle(),
+            self.host.layer(),
+            self.host.animation(),
+            format_smolstr!("{}.save-failed.{}", self.key, self.alert_count),
+        );
+        let _ = dialog.open(app, self.window);
+        self.alerts.push(dialog);
+    }
+
+    /// Drives the reports that are open and releases the ones that closed.
+    ///
+    /// A dialog is a kit component: it owns a fade-in / fade-out and the focus trap, so it has to
+    /// be synchronised on every frame the way the page's other controls are. A dialog that is not
+    /// synchronised never finishes closing, which would leave its modal scope over the page.
+    fn sync_alerts(&mut self, app: &mut App) {
+        self.alerts.retain(|dialog| {
+            if dialog.is_open(app) {
+                if let Err(error) = dialog.sync(app) {
+                    log::warn!("synchronising a settings report failed: {error}");
+                }
+                true
+            } else {
+                dialog.release(app);
+                false
+            }
+        });
+    }
+
+    /// Runs the per-frame half of the page: what the settings moved, and what the page draws.
+    ///
+    /// # Errors
+    /// Engine node-building errors from a rebuild, or a kit component that refused a write.
+    pub fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        if app.window(self.window).is_none() {
+            return Ok(());
+        }
+
+        self.report_write_failure(app);
+        self.sync_alerts(app);
+        self.project(app);
+
+        let selection = app.read(&self.selection).clone();
+        if let Some(selection) = selection {
+            app.write(&self.selection, None);
+            self.move_to(selection, app, self.window)?;
+        }
+        self.adopt_query(app, self.window)?;
+        self.adopt_language(app, self.window)?;
+        if self.sidebar_query.as_ref() != Some(&self.query) {
+            self.rebuild_sidebar(app, self.window)?;
+        }
+
+        if let Some(page) = self.page.as_mut() {
+            page.sync(app)?;
+        }
+        if let Some((handle, content, _)) = &self.page_scroll {
+            layout::sync_scroll_content(app, self.window, handle, *content);
+        }
+        if let Some(list) = &self.sidebar {
+            list.sync(app)?;
+        }
+        if let Some((_, _, bar)) = &self.page_scroll {
+            bar.sync(app)?;
+        }
+        if let Some(input) = &self.search_input {
+            input.sync(app);
+        }
+
+        Ok(())
+    }
+
+    /// Offers one platform event to the controls of the page; returns whether one consumed it.
+    pub fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        if let Event::AppearanceChanged { dark } = event {
+            self.system_dark = *dark;
+        }
+        let mut consumed = false;
+        if let Some(input) = &self.search_input {
+            consumed |= input.dispatch(app, event);
+        }
+        if let Some(page) = self.page.as_mut() {
+            consumed |= page.dispatch(app, event);
+        }
+        consumed
+    }
+
+    /// Releases every component the page owns and removes the nodes it built.
+    pub fn release(&mut self, app: &mut App) {
+        if let Some(mut page) = self.page.take() {
+            page.release(app);
+        }
+        if let Some((_, _, bar)) = self.page_scroll.take() {
+            bar.release(app);
+        }
+        if let Some(list) = self.sidebar.take() {
+            list.release(app);
+        }
+        for action in self.sidebar_actions.drain(..) {
+            app.off_action(&action);
+        }
+        if let Some(input) = self.search_input.take() {
+            input.release(app);
+        }
+        for dialog in self.alerts.drain(..) {
+            dialog.release(app);
+        }
+        if let Err(error) = app.remove_node(self.window, self.root) {
+            log::warn!("removing the settings page failed: {error}");
+        }
+    }
+
+    /// Removes every child of `parent`, which is how a rebuilt region is cleaned before it is built
+    /// again.
+    fn remove_children(&self, app: &mut App, parent: NodeId) {
+        let children = app
+            .window(self.window)
+            .and_then(|target| target.tree().get(parent).ok())
+            .map(|entry| entry.children().to_vec())
+            .unwrap_or_default();
+        for child in children {
+            if let Err(error) = app.remove_node(self.window, child) {
+                log::warn!("removing a rebuilt settings node failed: {error}");
+            }
         }
     }
 }
 
+/// One row of the settings sidebar.
+#[derive(Clone, Debug)]
+pub(crate) enum SidebarEntry {
+    /// A group's name over the pages that follow it: text, because a group is not something a user
+    /// opens.
+    Heading(SmolStr),
+    /// A page, which is the one kind of row that opens something.
+    Page { id: SmolStr, label: SmolStr },
+    /// A divider between one part of the sidebar and the next.
+    Separator,
+}
+
+impl SidebarEntry {
+    /// The text this row draws.
+    #[cfg(test)]
+    fn label(&self) -> SmolStr {
+        match self {
+            Self::Heading(label) => label.clone(),
+            Self::Page { label, .. } => label.clone(),
+            Self::Separator => SmolStr::default(),
+        }
+    }
+
+    /// The page this row opens, or `None` for anything else.
+    fn page_id(&self) -> Option<SmolStr> {
+        match self {
+            Self::Heading(_) | Self::Separator => None,
+            Self::Page { id, .. } => Some(id.clone()),
+        }
+    }
+}
+
+/// Builds one sidebar row inside the virtual list that draws them.
+fn build_sidebar_row(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    entry: Option<SidebarEntry>,
+    theme: &ThemeHandle,
+    current: Signal<SmolStr>,
+    key: &str,
+) -> Result<(), EngineError> {
+    match entry {
+        Some(SidebarEntry::Heading(label)) => {
+            layout::themed_text_in_tree(
+                tree,
+                parent,
+                None,
+                label,
+                11.0,
+                600,
+                Role::FgMuted,
+                theme,
+            )?;
+        }
+        Some(SidebarEntry::Separator) => {
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .width_full()
+                        .height(SIDEBAR_ROW_HEIGHT)
+                        .padding_sides(10.0, 6.0, 10.0, 6.0)
+                        .build(),
+                )
+                .bind_style({
+                    let theme = theme.clone();
+                    move |cx| StylePatch {
+                        border: Some(ui_core::paint::primitive::Border {
+                            width: 1.0,
+                            color: theme.role(cx, Role::LineDivider),
+                        }),
+                        ..StylePatch::default()
+                    }
+                })
+                .build(tree, parent)?;
+        }
+        Some(SidebarEntry::Page { id, label }) => {
+            let row_theme = theme.clone();
+            let action = Action::Custom(format_smolstr!("{key}.sidebar.{id}"));
+            let row = NodeBuilder::boxed()
+                .id(format_smolstr!("SETTINGS_ENTRY_{id}"))
+                .on_click(action)
+                .style(
+                    StyleBuilder::new()
+                        .flex_row()
+                        .items_center()
+                        .width_full()
+                        .height(SIDEBAR_ROW_HEIGHT)
+                        .min_width_0()
+                        .gap(8.0)
+                        .padding_sides(0.0, 8.0, 0.0, 8.0)
+                        .build(),
+                )
+                .tab_stop(true)
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Button),
+                    label: Some(label.clone()),
+                    ..A11yOverride::default()
+                })
+                .bind_style({
+                    let selected = id;
+                    move |cx| {
+                        let is_selected = cx.read(&current).as_str() == selected.as_str();
+                        StylePatch {
+                            background: if is_selected {
+                                Some(row_theme.role(cx, Role::Selection))
+                            } else {
+                                Some(row_theme.role(cx, Role::SurfaceCanvas))
+                            },
+                            ..StylePatch::default()
+                        }
+                    }
+                })
+                .build(tree, parent)?;
+            layout::themed_text_in_tree(tree, row, None, label, 12.0, 500, Role::FgDefault, theme)?;
+        }
+        None => {
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .flex_none()
+                        .width_full()
+                        .height(SIDEBAR_ROW_HEIGHT)
+                        .build(),
+                )
+                .build(tree, parent)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// The sidebar as it is drawn, holding only what the filter leaves reachable.
 ///
-/// A page is reached by its label or by a setting on it — see [`registry::page_is_reachable`] —
-/// and a group with none of its pages left is not drawn at all, which is what keeps an unmatched
-/// part of the settings out of the way instead of dimming it.
-fn sidebar_entries(filter: &SearchFilter, cx: &App) -> Vec<SidebarEntry> {
+/// A page is reached by its label or by a setting on it — see [`registry::page_is_reachable`] — and
+/// a group with none of its pages left is not drawn at all, which is what keeps an unmatched part
+/// of the settings out of the way instead of dimming it.
+fn sidebar_entries(filter: &SearchFilter, translate: &Translate) -> Vec<SidebarEntry> {
     let mut entries = Vec::new();
 
     for group in registry::groups() {
         let pages = group
             .pages
             .into_iter()
-            .filter(|page| registry::page_is_reachable(*page, filter, cx))
+            .filter(|page| registry::page_is_reachable(*page, filter, translate))
             .collect::<Vec<_>>();
         if pages.is_empty() {
             continue;
         }
 
-        entries.push(SidebarEntry::Heading(t!(cx, group.label_key)));
+        entries.push(SidebarEntry::Heading(i18n::t_smol!(
+            translate,
+            group.label_key
+        )));
         for page in pages {
             entries.push(SidebarEntry::Page {
                 id: page.id(),
-                label: page.title(cx),
+                label: page.title(translate),
             });
         }
     }
 
     let roots = registry::root_pages()
         .into_iter()
-        .filter(|page| registry::page_is_reachable(*page, filter, cx))
+        .filter(|page| registry::page_is_reachable(*page, filter, translate))
         .collect::<Vec<_>>();
     if !roots.is_empty() {
         if !entries.is_empty() {
@@ -804,7 +931,7 @@ fn sidebar_entries(filter: &SearchFilter, cx: &App) -> Vec<SidebarEntry> {
         for page in roots {
             entries.push(SidebarEntry::Page {
                 id: page.id(),
-                label: page.title(cx),
+                label: page.title(translate),
             });
         }
     }

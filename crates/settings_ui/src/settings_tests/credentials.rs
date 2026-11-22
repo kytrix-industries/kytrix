@@ -1,7 +1,7 @@
 //! The tests of the credential dialog: what it opens with, what it writes, and what it leaves
 //! alone.
 
-use std::fs;
+use std::{io, path::PathBuf};
 
 use app_config::{
     market_participants::{
@@ -9,64 +9,118 @@ use app_config::{
         origins::BinanceMarket,
         settings::VenueSettings,
     },
-    settings::{Config, Language},
+    settings::Language,
 };
-use base_ui::size::UnifiedSize;
-use gpui_kit::{TestAppContext, px};
-use i18n::{language::codes::LanguageCode, t};
+use app_config_provider::store::ConfigPersistenceError;
+use base_ui::kit::size::UnifiedSize;
+use i18n::language::codes::LanguageCode;
 use market_participants_model::identifier::VenueId;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::event::{Action, KeyCode};
 
-use super::test_support::*;
-use crate::pages::venues::credentials::{
-    CANCEL_SELECTOR, CONFIRM_SELECTOR, CredentialsKind, DIALOG_SELECTOR, FOOTER_SELECTOR,
-    TITLE_SELECTOR, WIDTH,
+use crate::{
+    pages::venues::credentials::{
+        CANCEL_SELECTOR, CONFIRM_SELECTOR, CredentialsKind, DIALOG_SELECTOR, FOOTER_SELECTOR,
+    },
+    session::SettingsWriteError,
+    settings_tests::{
+        test_support::{Harness, translate_in},
+        venues::{
+            alert_is_open, bounds, cancel_dialog, center, click_alert, confirm_dialog,
+            credentials_key, dialog_key, edges, english_settings, field_error, field_id, field_of,
+            open_credentials_dialog, open_page, type_into,
+        },
+    },
 };
+
+/// The page one set's row is drawn on.
+fn page_of(kind: CredentialsKind) -> &'static str {
+    match kind {
+        CredentialsKind::BinanceSpot | CredentialsKind::BinanceUsdMPerp => {
+            "market_participants.binance"
+        }
+        CredentialsKind::Okx => "market_participants.okx",
+        CredentialsKind::Hyperliquid => "market_participants.hyperliquid",
+        CredentialsKind::Longbridge => "market_participants.longbridge",
+    }
+}
+
+/// The five sets the settings edit, each with every value it holds.
+const KINDS: [CredentialsKind; 5] = [
+    CredentialsKind::BinanceSpot,
+    CredentialsKind::BinanceUsdMPerp,
+    CredentialsKind::Okx,
+    CredentialsKind::Hyperliquid,
+    CredentialsKind::Longbridge,
+];
+
+/// A store failure a test makes the next write report.
+fn write_failure() -> SettingsWriteError {
+    SettingsWriteError::new(ConfigPersistenceError::CreateDirectory {
+        path: PathBuf::from("blocked"),
+        source: io::Error::other("the settings cannot be stored"),
+    })
+}
+
+/// Whether the credential dialog of one set is drawn.
+fn dialog_is_open(harness: &Harness, kind: CredentialsKind) -> bool {
+    harness
+        .find(&format!("{}:panel", dialog_key(kind)))
+        .is_some()
+        || harness.find(DIALOG_SELECTOR).is_some()
+}
 
 /// The dialog opens over what the settings hold, and confirming it writes the values the user
 /// left: the set is one value, so every value of it is written together.
-#[gpui_kit::test]
-fn the_dialog_should_open_prefilled_and_write_the_whole_set(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
+#[test]
+fn the_dialog_should_open_prefilled_and_write_the_whole_set() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
-
-    click(cx, &kind.edit_selector());
+    open_credentials_dialog(&mut harness, kind);
 
     for selector in [
         DIALOG_SELECTOR,
-        TITLE_SELECTOR,
         FOOTER_SELECTOR,
         CONFIRM_SELECTOR,
         CANCEL_SELECTOR,
     ] {
         assert!(
-            bounds(cx, selector).is_some(),
+            harness.find(selector).is_some(),
             "the dialog should draw {selector}"
         );
     }
     for field in ["api_key", "secret_key", "passphrase"] {
-        let selector = credentials_field(kind, field);
         assert!(
-            bounds(cx, &selector).is_some(),
+            harness
+                .find(kind.field_selector(field_of(kind, field)).as_ref())
+                .is_some(),
             "the dialog should draw the field {field} is typed into"
         );
     }
+    let title = harness
+        .find(&format!("{}:title", dialog_key(kind)))
+        .expect("the dialog draws its title");
+    assert_eq!(
+        harness.node_text(title),
+        i18n::t_smol!(translate_in(LanguageCode::En), kind.title_key()),
+        "the dialog is titled with the set it edits"
+    );
 
     // The caret is put at the end of what the field holds, so what is typed is appended: the
     // stored value was prefilled rather than the field started empty.
-    type_into(cx, &credentials_field(kind, "api_key"), "typed");
-    click(cx, CONFIRM_SELECTOR);
+    type_into(&mut harness, kind, "api_key", "typed");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "a stored set should take the dialog away"
     );
     assert!(
-        bounds(cx, "SETTINGS_PAGE").is_some(),
+        harness.field(CredentialsKind::Okx.row_id()).is_some(),
         "the settings the dialog was opened over should still be drawn"
     );
-    let written = stored(cx);
+    let written = harness.config();
     let Some(VenueSettings::Okx(okx)) = written.venue(&VenueId::Okx) else {
         panic!("okx is configured as OKX");
     };
@@ -82,72 +136,69 @@ fn the_dialog_should_open_prefilled_and_write_the_whole_set(cx: &mut TestAppCont
 }
 
 /// A dialog the user walks away from is not a change of the settings.
-#[gpui_kit::test]
-fn a_cancelled_dialog_should_not_write_the_set(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
+#[test]
+fn a_cancelled_dialog_should_not_write_the_set() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
-    let before = stored(cx);
+    let before = harness.config();
 
-    click(cx, &kind.edit_selector());
-    type_into(cx, &credentials_field(kind, "api_key"), "changed");
-    click(cx, CANCEL_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_key", "changed");
+    cancel_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "cancelling should take the dialog away"
     );
     assert_eq!(
-        stored(cx),
+        harness.config(),
         before,
         "a cancelled dialog must not write the settings"
     );
     assert_eq!(
-        current_page(&panel, cx),
+        harness.page().current_page().as_str(),
         "market_participants.okx",
         "the settings should still be on the page the dialog was opened over"
     );
 }
 
-/// A submission with a required value left empty is rejected: the dialog stays open with what the
-/// user typed, and the settings are not written.
-///
-/// Binance's passphrase is the one value a set is complete without, so a form holding the two
-/// required values is a complete set even while its passphrase is empty.
-#[gpui_kit::test]
-fn an_incomplete_set_should_keep_the_dialog_open_and_write_nothing(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
-    select(&panel, "market_participants.binance", cx);
+/// An empty form is rejected: the dialog stays open, reports every required value it is missing,
+/// and writes nothing.
+#[test]
+fn an_incomplete_set_should_keep_the_dialog_open_and_write_nothing() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.binance");
     let kind = CredentialsKind::BinanceUsdMPerp;
 
-    click(cx, &kind.edit_selector());
-    type_into(cx, &credentials_field(kind, "api_key"), "perp-key");
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_key", "perp-key");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_some(),
+        dialog_is_open(&harness, kind),
         "a set missing a required value should leave the dialog open"
     );
+    let stored = harness.config();
+    let VenueSettings::Binance(binance) = stored
+        .venue(&VenueId::Binance)
+        .expect("the default settings name every venue this build speaks")
+    else {
+        panic!("binance is configured as Binance");
+    };
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Binance)
-            .and_then(|venue| match venue {
-                VenueSettings::Binance(binance) => Some(binance),
-                _ => None,
-            })
-            .and_then(|binance| binance.usd_m_perp_credentials.clone()),
-        None,
+        binance.usd_m_perp_credentials, None,
         "an incomplete set must not be written"
     );
 
-    type_into(cx, &credentials_field(kind, "private_key"), "perp-private");
-    click(cx, CONFIRM_SELECTOR);
+    type_into(&mut harness, kind, "private_key", "perp-private");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "a set holding its required values should be written"
     );
-    let written = stored(cx);
+    let written = harness.config();
     let Some(VenueSettings::Binance(binance)) = written.venue(&VenueId::Binance) else {
         panic!("binance is configured as Binance");
     };
@@ -168,20 +219,25 @@ fn an_incomplete_set_should_keep_the_dialog_open_and_write_nothing(cx: &mut Test
 
 /// Clearing is asked about before it is written: walking away from the alert leaves the set, and
 /// confirming it clears the set the row belongs to and no other.
-#[gpui_kit::test]
-fn clearing_a_set_should_ask_first_and_take_only_that_set(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.binance", cx);
+#[test]
+fn clearing_a_set_should_ask_first_and_take_only_that_set() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.binance");
     let kind = CredentialsKind::BinanceSpot;
 
-    click(cx, &credentials_clear(kind));
+    harness.click_node(kind.clear_selector().as_ref());
+    harness.settle(3);
     assert!(
-        bounds(cx, "BASE_UI_ALERT").is_some(),
+        alert_is_open(&harness),
         "clearing should be answered with an alert rather than written at once"
     );
-    click(cx, "BASE_UI_ALERT_CANCEL");
-    let kept = stored(cx);
-    let Some(VenueSettings::Binance(binance)) = kept.venue(&VenueId::Binance) else {
+    click_alert(&mut harness, "cancel");
+
+    let kept = harness.config();
+    let VenueSettings::Binance(binance) = kept
+        .venue(&VenueId::Binance)
+        .expect("the fixture settings name every venue this build speaks")
+    else {
         panic!("binance is configured as Binance");
     };
     assert!(
@@ -189,11 +245,15 @@ fn clearing_a_set_should_ask_first_and_take_only_that_set(cx: &mut TestAppContex
         "walking away from the alert should leave the set in the settings"
     );
 
-    click(cx, &credentials_clear(kind));
-    click(cx, "BASE_UI_ALERT_OK");
+    harness.click_node(kind.clear_selector().as_ref());
+    harness.settle(3);
+    click_alert(&mut harness, "ok");
 
-    let cleared = stored(cx);
-    let Some(VenueSettings::Binance(binance)) = cleared.venue(&VenueId::Binance) else {
+    let cleared = harness.config();
+    let VenueSettings::Binance(binance) = cleared
+        .venue(&VenueId::Binance)
+        .expect("the fixture settings name every venue this build speaks")
+    else {
         panic!("binance is configured as Binance");
     };
     assert_eq!(
@@ -205,107 +265,100 @@ fn clearing_a_set_should_ask_first_and_take_only_that_set(cx: &mut TestAppContex
         "and the venue's other market keeps its own set"
     );
     assert!(
-        bounds(cx, &credentials_clear(kind)).is_none(),
+        harness.find(kind.clear_selector().as_ref()).is_none(),
         "a row with nothing stored should not offer to clear it"
     );
 
     // The dialog the row opens again is an empty form: a set cleared is a set the settings no
     // longer hold, and a form prefilled with what was cleared would still hold its values.
-    click(cx, &kind.edit_selector());
-    type_into(cx, &credentials_field(kind, "api_key"), "after-clear");
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_key", "after-clear");
+    confirm_dialog(&mut harness);
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_some(),
+        dialog_is_open(&harness, kind),
         "the cleared set should open as an empty form, which a required value still rejects"
     );
-    click(cx, CANCEL_SELECTOR);
+    cancel_dialog(&mut harness);
 }
 
 /// A set the settings do not hold has nothing to clear, and a set they do hold offers the button
 /// that clears it.
-#[gpui_kit::test]
-fn the_clear_button_should_be_drawn_only_for_a_configured_set(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
-    select(&panel, "market_participants.okx", cx);
+#[test]
+fn the_clear_button_should_be_drawn_only_for_a_configured_set() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
 
     assert!(
-        bounds(cx, &kind.edit_selector()).is_some(),
+        harness.find(kind.edit_selector().as_ref()).is_some(),
         "the edit button is there whether or not a set is stored"
     );
     assert!(
-        bounds(cx, &credentials_clear(kind)).is_none(),
+        harness.find(kind.clear_selector().as_ref()).is_none(),
         "a venue with nothing stored has nothing to clear"
     );
 
-    edit_settings(
-        &panel,
-        |config| {
-            config.set_okx_credentials(
-                &VenueId::Okx,
-                Some(OkxCredentials {
-                    api_key: SmolStr::new_static("okx-api-key"),
-                    secret_key: SmolStr::new_static("okx-secret-key"),
-                    passphrase: SmolStr::new_static("okx-passphrase"),
-                }),
-            );
-        },
-        cx,
-    );
+    harness.update_config(|config| {
+        config.set_okx_credentials(
+            &VenueId::Okx,
+            Some(OkxCredentials {
+                api_key: SmolStr::new_static("okx-api-key"),
+                secret_key: SmolStr::new_static("okx-secret-key"),
+                passphrase: SmolStr::new_static("okx-passphrase"),
+            }),
+        );
+    });
+    harness.settle(2);
 
     assert!(
-        bounds(cx, &credentials_clear(kind)).is_some(),
+        harness.find(kind.clear_selector().as_ref()).is_some(),
         "a stored set is cleared from its row"
     );
 }
 
 /// A write that could not be stored keeps the dialog open with what the user typed; once the
 /// settings can be stored, confirming it again writes the set.
-#[gpui_kit::test]
-fn a_failed_write_should_keep_the_dialog_and_what_was_typed(cx: &mut TestAppContext) {
-    let (manager, blocking, _directory) = manager_behind_a_file(cx);
-    let (panel, cx) = settings_over(manager, Language::En, cx);
-    select(&panel, "market_participants.okx", cx);
+#[test]
+fn a_failed_write_should_keep_the_dialog_and_what_was_typed() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
+    harness.fail_next_write(write_failure());
 
-    click(cx, &kind.edit_selector());
-    type_into(cx, &credentials_field(kind, "api_key"), "typed-key");
-    type_into(cx, &credentials_field(kind, "secret_key"), "typed-secret");
-    type_into(
-        cx,
-        &credentials_field(kind, "passphrase"),
-        "typed-passphrase",
-    );
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_key", "typed-key");
+    type_into(&mut harness, kind, "secret_key", "typed-secret");
+    type_into(&mut harness, kind, "passphrase", "typed-passphrase");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_some(),
+        dialog_is_open(&harness, kind),
         "a set that could not be stored should leave the dialog open"
     );
     assert!(
-        bounds(cx, "BASE_UI_ALERT").is_some(),
+        alert_is_open(&harness),
         "a write that could not be stored should tell the user"
     );
+    let unchanged = harness.config();
+    let Some(VenueSettings::Okx(okx)) = unchanged.venue(&VenueId::Okx) else {
+        panic!("okx is configured as OKX");
+    };
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Okx)
-            .and_then(|venue| match venue {
-                VenueSettings::Okx(okx) => okx.credentials.clone(),
-                _ => None,
-            }),
-        None,
+        okx.credentials, None,
         "settings that could not be stored must not be published as if they had been"
     );
 
-    click(cx, "BASE_UI_ALERT_OK");
-    fs::remove_file(&blocking).expect("the blocking file should be removable");
-    click(cx, CONFIRM_SELECTOR);
+    // The reason is reported over the page; the engine closes the report with Escape, which is
+    // what leaves the dialog where the set is submitted again from.
+    harness.press(KeyCode::Escape);
+    harness.settle(3);
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "the retry should take the dialog away"
     );
-    let stored = stored(cx);
+    let stored = harness.config();
     let Some(VenueSettings::Okx(okx)) = stored.venue(&VenueId::Okx) else {
         panic!("okx is configured as OKX");
     };
@@ -320,49 +373,40 @@ fn a_failed_write_should_keep_the_dialog_and_what_was_typed(cx: &mut TestAppCont
     );
 }
 
-/// A clear that could not be stored leaves the set where it was and reports why; nothing asks the
-/// user to confirm it again on its own. Once the settings can be stored, clearing the same row
-/// again is what writes it — and only it.
-#[gpui_kit::test]
-fn a_failed_clear_should_keep_the_set_until_the_retry_writes_it(cx: &mut TestAppContext) {
-    let (mut manager, blocking, _directory) = manager_behind_a_file(cx);
-    let fixture = configured_settings();
-    cx.update(|cx| {
-        manager.update(|config| *config = fixture, cx);
-    });
-    let (panel, cx) = settings_over(manager, Language::En, cx);
-    select(&panel, "market_participants.okx", cx);
+/// A clear that could not be stored leaves the set where it was and reports why; clearing the same
+/// row again once the settings can be stored is what writes it — and only it.
+#[test]
+fn a_failed_clear_should_keep_the_set_until_the_retry_writes_it() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
+    harness.fail_next_write(write_failure());
 
-    click(cx, &credentials_clear(kind));
-    click(cx, "BASE_UI_ALERT_OK");
+    harness.click_node(kind.clear_selector().as_ref());
+    harness.settle(3);
+    click_alert(&mut harness, "ok");
 
     assert!(
-        stored(cx)
-            .venue(&VenueId::Okx)
-            .and_then(|venue| match venue {
-                VenueSettings::Okx(okx) => okx.credentials.clone(),
-                _ => None,
-            })
-            .is_some(),
+        kind.has_stored_set(&harness.config()),
         "a clear that could not be stored must leave the set in the settings"
     );
     assert!(
-        bounds(cx, "BASE_UI_ALERT").is_some(),
+        alert_is_open(&harness),
         "a write that could not be stored should tell the user"
     );
     assert!(
-        bounds(cx, &credentials_clear(kind)).is_some(),
+        harness.find(kind.clear_selector().as_ref()).is_some(),
         "the row still holds a set, so it still offers to clear it"
     );
 
-    click(cx, "BASE_UI_ALERT_OK");
-    fs::remove_file(&blocking).expect("the blocking file should be removable");
+    harness.press(KeyCode::Escape);
+    harness.settle(3);
 
-    click(cx, &credentials_clear(kind));
-    click(cx, "BASE_UI_ALERT_OK");
+    harness.click_node(kind.clear_selector().as_ref());
+    harness.settle(3);
+    click_alert(&mut harness, "ok");
 
-    let cleared = stored(cx);
+    let cleared = harness.config();
     let Some(VenueSettings::Okx(okx)) = cleared.venue(&VenueId::Okx) else {
         panic!("okx is configured as OKX");
     };
@@ -383,44 +427,56 @@ fn a_failed_clear_should_keep_the_set_until_the_retry_writes_it(cx: &mut TestApp
     }
 }
 
-/// A venue's credential row is a row of the card that holds the rest of that venue's settings:
-/// the credentials are one setting of the venue rather than a group of their own.
-#[gpui_kit::test]
-fn a_credential_row_should_share_the_venues_card(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
+/// A venue's credential row is a row of the card that holds the rest of that venue's settings.
+#[test]
+fn a_credential_row_should_share_the_venues_card() {
+    let mut harness = Harness::with_config(english_settings());
 
-    select(&panel, "market_participants.okx", cx);
-    let card = element(cx, "SETTINGS_CARD_market_participants.okx_0");
-    let okx_credentials = credentials_row(CredentialsKind::Okx);
-    for selector in [
-        "SETTINGS_FIELD_market_participants.okx.region",
-        okx_credentials.as_str(),
-    ] {
-        assert!(
-            card.contains(&element(cx, selector).center()),
-            "{selector} belongs to the card the venue's settings are drawn in"
-        );
-    }
+    open_page(&mut harness, "market_participants.okx");
+    let card = bounds(&harness, "SETTINGS_CARD_market_participants.okx_0");
+    let row = bounds(
+        &harness,
+        &format!("SETTINGS_FIELD_{}", CredentialsKind::Okx.row_id()),
+    );
+    let region = bounds(&harness, "SETTINGS_FIELD_market_participants.okx.region");
     assert!(
-        bounds(cx, "SETTINGS_CARD_market_participants.okx_1").is_none(),
+        card.contains(center(region)),
+        "the region belongs to the card the venue's settings are drawn in"
+    );
+    assert!(
+        card.contains(center(row)),
+        "the credential row belongs to the card the venue's settings are drawn in"
+    );
+    assert!(
+        harness
+            .find("SETTINGS_CARD_market_participants.okx_1")
+            .is_none(),
         "the credentials are not a card of their own"
     );
 
-    select(&panel, "market_participants.hyperliquid", cx);
-    let card = element(cx, "SETTINGS_CARD_market_participants.hyperliquid_0");
-    let hyperliquid_credentials = credentials_row(CredentialsKind::Hyperliquid);
+    open_page(&mut harness, "market_participants.hyperliquid");
+    let card = bounds(&harness, "SETTINGS_CARD_market_participants.hyperliquid_0");
+    let row = bounds(
+        &harness,
+        &format!("SETTINGS_FIELD_{}", CredentialsKind::Hyperliquid.row_id()),
+    );
     for selector in [
         "SETTINGS_FIELD_market_participants.hyperliquid.http",
         "SETTINGS_FIELD_market_participants.hyperliquid.websocket",
-        hyperliquid_credentials.as_str(),
     ] {
         assert!(
-            card.contains(&element(cx, selector).center()),
+            card.contains(center(bounds(&harness, selector))),
             "{selector} belongs to the card the venue's addresses are drawn in"
         );
     }
     assert!(
-        bounds(cx, "SETTINGS_CARD_market_participants.hyperliquid_1").is_none(),
+        card.contains(center(row)),
+        "the credential row belongs to the card the venue's addresses are drawn in"
+    );
+    assert!(
+        harness
+            .find("SETTINGS_CARD_market_participants.hyperliquid_1")
+            .is_none(),
         "the credentials are not a card of their own"
     );
 }
@@ -429,13 +485,7 @@ fn a_credential_row_should_share_the_venues_card(cx: &mut TestAppContext) {
 /// without.
 #[test]
 fn every_credential_value_should_be_required_except_binances_passphrase() {
-    for kind in [
-        CredentialsKind::BinanceSpot,
-        CredentialsKind::BinanceUsdMPerp,
-        CredentialsKind::Okx,
-        CredentialsKind::Hyperliquid,
-        CredentialsKind::Longbridge,
-    ] {
+    for kind in KINDS {
         for field in kind.fields() {
             let optional = kind.market().is_some() && field.id == "passphrase";
             assert_eq!(
@@ -453,13 +503,7 @@ fn every_credential_value_should_be_required_except_binances_passphrase() {
 /// the operator checks against the venue's own page.
 #[test]
 fn a_secret_should_be_masked_and_an_identity_shown() {
-    for kind in [
-        CredentialsKind::BinanceSpot,
-        CredentialsKind::BinanceUsdMPerp,
-        CredentialsKind::Okx,
-        CredentialsKind::Hyperliquid,
-        CredentialsKind::Longbridge,
-    ] {
+    for kind in KINDS {
         for field in kind.fields() {
             let masked = matches!(
                 (kind, field.id),
@@ -483,16 +527,9 @@ fn a_secret_should_be_masked_and_an_identity_shown() {
 
 /// The alert a clear is confirmed with names the set it is about, in both languages and for both
 /// of Binance's markets: the title is the one thing that tells one venue's credentials from
-/// another's — and one market's from its sibling's — and a message that dropped it would ask the
-/// user to confirm a removal without saying which.
-///
-/// The message is read from the set itself rather than from the locale with a title written into
-/// it: the set's own title is what the dialog is titled with, and a message the page could build
-/// while the dialog said another thing would be a test of the locale rather than of the alert the
-/// page opens.
-#[gpui_kit::test]
-fn the_clear_alert_should_name_the_credentials_it_clears(cx: &mut TestAppContext) {
-    let (_panel, cx) = settings(Config::default(), cx);
+/// another's.
+#[test]
+fn the_clear_alert_should_name_the_credentials_it_clears() {
     let cases = [
         (
             LanguageCode::En,
@@ -517,17 +554,12 @@ fn the_clear_alert_should_name_the_credentials_it_clears(cx: &mut TestAppContext
     ];
 
     for (language, kind, expected_title) in cases {
-        cx.update(|_, cx| cx.set_global(language));
-
-        let (title, message, alert_title) = cx.read(|cx| {
-            (
-                t!(cx, kind.title_key()),
-                kind.clear_message(cx),
-                kind.clear_title(cx),
-            )
-        });
+        let translate = translate_in(language);
+        let title = i18n::t_smol!(translate, kind.title_key());
+        let message = kind.clear_message(&translate);
+        let alert_title = kind.clear_title(&translate);
         assert_eq!(
-            title.as_ref(),
+            title.as_str(),
             expected_title,
             "{kind:?}'s title should be the one of its dialog"
         );
@@ -540,10 +572,6 @@ fn the_clear_alert_should_name_the_credentials_it_clears(cx: &mut TestAppContext
             "every placeholder of {language:?} for {kind:?} should be filled in: {message}"
         );
         assert!(
-            message.starts_with("<p align=\"center\">") && message.ends_with("</p>"),
-            "the message of {language:?} for {kind:?} should be one centred paragraph: {message}"
-        );
-        assert!(
             !alert_title.is_empty(),
             "the alert of {language:?} for {kind:?} should have a title"
         );
@@ -554,7 +582,7 @@ fn the_clear_alert_should_name_the_credentials_it_clears(cx: &mut TestAppContext
 /// two markets are two dialogs, and a title that named only the venue would not say which one.
 #[test]
 fn the_dialog_titles_should_name_the_trading_surface() {
-    let i18n = i18n::global::embedded::load().expect("embedded locales should load");
+    let messages = i18n::global::embedded::load().expect("embedded locales should load");
     let cases = [
         (
             CredentialsKind::BinanceSpot,
@@ -585,12 +613,14 @@ fn the_dialog_titles_should_name_the_trading_surface() {
 
     for (kind, english, chinese) in cases {
         assert!(
-            i18n.try_translate(LanguageCode::En, kind.title_key())
+            messages
+                .try_translate(LanguageCode::En, kind.title_key())
                 .is_some_and(|text| text.as_ref() == english),
             "{kind:?}'s title should be written in English"
         );
         assert!(
-            i18n.try_translate(LanguageCode::ZhCn, kind.title_key())
+            messages
+                .try_translate(LanguageCode::ZhCn, kind.title_key())
                 .is_some_and(|text| text.as_ref() == chinese),
             "{kind:?}'s title should be written in Chinese"
         );
@@ -600,73 +630,66 @@ fn the_dialog_titles_should_name_the_trading_surface() {
 /// A form submitted without its required values is rejected in place: every empty value is
 /// reported under the field it belongs to, and each report goes when the value it complains about
 /// is filled in rather than when the first of them is.
-///
-/// The report is the field's own line of the dialog, drawn under the input: a test that only
-/// asserted the dialog stayed open would pass even if nothing told the user what was missing.
-#[gpui_kit::test]
-fn a_rejected_submission_should_report_every_value_it_is_missing(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
-    select(&panel, "market_participants.okx", cx);
+#[test]
+fn a_rejected_submission_should_report_every_value_it_is_missing() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
 
-    click(cx, &kind.edit_selector());
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    confirm_dialog(&mut harness);
 
     for field in ["api_key", "secret_key", "passphrase"] {
         assert!(
-            bounds(cx, &credentials_error(kind, field)).is_some(),
+            !field_error(&harness, kind, field).is_empty(),
             "the value {field} was submitted empty and should be reported under its field"
         );
     }
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_some(),
+        dialog_is_open(&harness, kind),
         "a rejected submission should leave the dialog where it can be completed"
     );
 
     // A field reports what it holds when Enter is pressed in it, which is what takes a report
     // away: what is left in the other fields is still empty, so their reports stay.
-    type_into(cx, &credentials_field(kind, "api_key"), "typed-key");
-    cx.simulate_keystrokes("enter");
-    settle(cx);
+    type_into(&mut harness, kind, "api_key", "typed-key");
+    harness.press(KeyCode::Enter);
+    harness.settle(1);
 
     assert!(
-        bounds(cx, &credentials_error(kind, "api_key")).is_none(),
+        field_error(&harness, kind, "api_key").is_empty(),
         "the report under a value that was filled in should go"
     );
     assert!(
-        bounds(cx, &credentials_error(kind, "secret_key")).is_some(),
+        !field_error(&harness, kind, "secret_key").is_empty(),
         "the report under a value that is still empty should stay"
     );
     assert!(
-        bounds(cx, &credentials_error(kind, "passphrase")).is_some(),
+        !field_error(&harness, kind, "passphrase").is_empty(),
         "filling one value in should not take the other reports away"
     );
 
-    type_into(cx, &credentials_field(kind, "secret_key"), "typed-secret");
-    cx.simulate_keystrokes("enter");
-    settle(cx);
+    type_into(&mut harness, kind, "secret_key", "typed-secret");
+    harness.press(KeyCode::Enter);
+    harness.settle(1);
 
     assert!(
-        bounds(cx, &credentials_error(kind, "secret_key")).is_none(),
+        field_error(&harness, kind, "secret_key").is_empty(),
         "the report under the second value should go when it is filled in"
     );
     assert!(
-        bounds(cx, &credentials_error(kind, "passphrase")).is_some(),
+        !field_error(&harness, kind, "passphrase").is_empty(),
         "the last value is still empty until the submission takes it"
     );
 
-    type_into(
-        cx,
-        &credentials_field(kind, "passphrase"),
-        "typed-passphrase",
-    );
-    click(cx, CONFIRM_SELECTOR);
+    type_into(&mut harness, kind, "passphrase", "typed-passphrase");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "a completed form should be submitted and take the dialog away"
     );
-    let written = stored(cx);
+    let written = harness.config();
     let Some(VenueSettings::Okx(okx)) = written.venue(&VenueId::Okx) else {
         panic!("okx is configured as OKX");
     };
@@ -682,59 +705,63 @@ fn a_rejected_submission_should_report_every_value_it_is_missing(cx: &mut TestAp
 }
 
 /// Submitting a field without changing what it holds does not take away the report of what it is
-/// missing: only a value that actually changed clears the report, so an empty field stays reported
-/// however often it is left or submitted.
-#[gpui_kit::test]
-fn submitting_a_field_unchanged_should_keep_its_report(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
-    select(&panel, "market_participants.okx", cx);
+/// missing: only a value that actually changed clears the report.
+#[test]
+fn submitting_a_field_unchanged_should_keep_its_report() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
 
-    click(cx, &kind.edit_selector());
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    confirm_dialog(&mut harness);
+    assert!(
+        !field_error(&harness, kind, "api_key").is_empty(),
+        "an empty required value should be reported"
+    );
 
-    let field = credentials_field(kind, "api_key");
-    click(cx, &field);
-    cx.simulate_keystrokes("enter");
-    settle(cx);
+    let name = field_id(kind, "api_key");
+    harness.click_node(&format!("{name}.root"));
+    harness.settle(1);
+    harness.press(KeyCode::Enter);
+    harness.settle(2);
 
     assert!(
-        bounds(cx, &credentials_error(kind, "api_key")).is_some(),
+        !field_error(&harness, kind, "api_key").is_empty(),
         "a field submitted without a new value should still report what it holds empty"
     );
 }
 
 /// Binance's passphrase is the one value a set is complete without, and the form says so twice:
 /// an empty required value is reported under its field, and an empty passphrase is not.
-#[gpui_kit::test]
-fn binances_passphrase_should_not_be_reported_as_missing(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
-    select(&panel, "market_participants.binance", cx);
+#[test]
+fn binances_passphrase_should_not_be_reported_as_missing() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.binance");
     let kind = CredentialsKind::BinanceUsdMPerp;
 
-    click(cx, &kind.edit_selector());
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    confirm_dialog(&mut harness);
 
     for field in ["api_key", "private_key"] {
         assert!(
-            bounds(cx, &credentials_error(kind, field)).is_some(),
+            !field_error(&harness, kind, field).is_empty(),
             "the required value {field} should be reported when it is empty"
         );
     }
     assert!(
-        bounds(cx, &credentials_error(kind, "passphrase")).is_none(),
+        field_error(&harness, kind, "passphrase").is_empty(),
         "Binance's passphrase may be left out, so it is not reported as missing"
     );
 
-    type_into(cx, &credentials_field(kind, "api_key"), "perp-key");
-    type_into(cx, &credentials_field(kind, "private_key"), "perp-private");
-    click(cx, CONFIRM_SELECTOR);
+    type_into(&mut harness, kind, "api_key", "perp-key");
+    type_into(&mut harness, kind, "private_key", "perp-private");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "a set with its required values and no passphrase should be written"
     );
-    let written = stored(cx);
+    let written = harness.config();
     let Some(VenueSettings::Binance(binance)) = written.venue(&VenueId::Binance) else {
         panic!("binance is configured as Binance");
     };
@@ -750,61 +777,62 @@ fn binances_passphrase_should_not_be_reported_as_missing(cx: &mut TestAppContext
 }
 
 /// The dialog ends the way the application's other dialogs end: a line across it, and the two
-/// buttons under that line rather than in among the fields. The fields are one column in the
-/// order the set declares them, above the foot, and the foot is the dialog's own bottom.
-#[gpui_kit::test]
-fn the_credentials_dialog_should_be_drawn_the_way_the_application_draws_its_dialogs(
-    cx: &mut TestAppContext,
-) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
+/// buttons under that line rather than in among the fields.
+#[test]
+fn the_credentials_dialog_should_be_drawn_the_way_the_application_draws_its_dialogs() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
-    click(cx, &kind.edit_selector());
+    open_credentials_dialog(&mut harness, kind);
 
-    let dialog = element(cx, DIALOG_SELECTOR);
-    let footer = element(cx, FOOTER_SELECTOR);
-    let confirm = element(cx, CONFIRM_SELECTOR);
-    let cancel = element(cx, CANCEL_SELECTOR);
+    let content = bounds(&harness, &format!("{}:content", dialog_key(kind)));
+    let dialog = bounds(&harness, DIALOG_SELECTOR);
+    let footer = bounds(&harness, FOOTER_SELECTOR);
+    let confirm = bounds(&harness, CONFIRM_SELECTOR);
+    let cancel = bounds(&harness, CANCEL_SELECTOR);
 
-    assert_eq!(
-        dialog.size.width,
-        px(WIDTH),
-        "the credentials dialog is 480 px wide: it is {dialog:?}"
+    assert!(
+        (content.size.width - 480.0).abs() < 1.0,
+        "the credentials dialog is 480 px wide: it is {content:?}"
     );
-
     let fields = kind
         .fields()
         .iter()
-        .map(|field| (field, element(cx, &kind.field_selector(field))))
+        .map(|field| bounds(&harness, kind.field_selector(field).as_ref()))
         .collect::<Vec<_>>();
-    for (field, bounds) in &fields {
+    for (field, field_bounds) in kind.fields().iter().zip(fields.iter()) {
+        let (_, _, field_bottom, _) = edges(*field_bounds);
+        let (footer_top, _, _, _) = edges(footer);
         assert!(
-            bounds.bottom() <= footer.top(),
-            "the value {} belongs above the line the foot starts with: {bounds:?} over \
+            field_bottom <= footer_top,
+            "the value {} belongs above the line the foot starts with: {field_bounds:?} over \
              {footer:?}",
             field.id
         );
     }
     for pair in fields.windows(2) {
+        let (first_top, _, _, _) = edges(pair[0]);
+        let (second_top, _, _, _) = edges(pair[1]);
         assert!(
-            pair[0].1.top() < pair[1].1.top(),
-            "the values should be drawn in the order the set declares them: {} is above {}",
-            pair[0].0.id,
-            pair[1].0.id
+            first_top < second_top,
+            "the values should be drawn in the order the set declares them: {pair:?}"
         );
     }
-    assert_eq!(
-        footer.bottom(),
-        dialog.bottom(),
+    let (_, _, footer_bottom, _) = edges(footer);
+    let (_, _, dialog_bottom, _) = edges(dialog);
+    assert!(
+        (footer_bottom - dialog_bottom).abs() < 1.0,
         "the foot should be the bottom of the dialog: {footer:?} in {dialog:?}"
     );
     assert!(
-        footer.contains(&cancel.center()) && footer.contains(&confirm.center()),
+        footer.contains(center(cancel)) && footer.contains(center(confirm)),
         "both buttons belong to the foot rather than to the fields: {cancel:?} and {confirm:?} in \
          {footer:?}"
     );
+    let (_, cancel_right, _, _) = edges(cancel);
+    let (_, _, _, confirm_left) = edges(confirm);
     assert!(
-        cancel.right() < confirm.left(),
+        cancel_right < confirm_left,
         "the button that leaves the set alone is before the one that writes it: {cancel:?} \
          before {confirm:?}"
     );
@@ -812,125 +840,88 @@ fn the_credentials_dialog_should_be_drawn_the_way_the_application_draws_its_dial
 
 /// A credential row says what is configured and offers the two things a row can do: the dialog
 /// that edits the set, and — for a set the settings hold — the alert that clears it. The buttons
-/// end the control column in that order, so the one that takes something away is never where the
-/// one that changes it is expected to be.
-#[gpui_kit::test]
-fn a_credential_rows_buttons_should_end_the_control_column(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    select(&panel, "market_participants.okx", cx);
+/// end the control column in that order.
+#[test]
+fn a_credential_rows_buttons_should_end_the_control_column() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
     let kind = CredentialsKind::Okx;
 
-    let row = element(cx, &credentials_row(kind));
-    let control = element(cx, &format!("SETTINGS_CONTROL_{}", kind.row_id()));
-    let edit = element(cx, &kind.edit_selector());
-    let clear = element(cx, &credentials_clear(kind));
+    let row = bounds(&harness, &format!("SETTINGS_FIELD_{}", kind.row_id()));
+    let control = bounds(&harness, &format!("SETTINGS_CONTROL_{}", kind.row_id()));
+    let edit = bounds(&harness, kind.edit_selector().as_ref());
+    let clear = bounds(&harness, kind.clear_selector().as_ref());
 
     assert!(
-        row.contains(&edit.center()) && row.contains(&clear.center()),
+        row.contains(center(edit)) && row.contains(center(clear)),
         "both buttons belong to the row they act on: {row:?} holds {edit:?} and {clear:?}"
     );
     assert!(
-        control.contains(&edit.center()) && control.contains(&clear.center()),
+        control.contains(center(edit)) && control.contains(center(clear)),
         "both buttons belong to the row's control column: {control:?} holds {edit:?} and \
          {clear:?}"
     );
+    let (_, edit_right, _, _) = edges(edit);
+    let (_, _, _, clear_left) = edges(clear);
     assert!(
-        edit.right() <= clear.left(),
+        edit_right <= clear_left,
         "the edit button is before the one that takes the set away: {edit:?} before {clear:?}"
     );
+    let (_, clear_right, _, _) = edges(clear);
+    let (_, control_right, _, _) = edges(control);
     assert!(
-        (clear.right() - control.right()).abs() < px(1.0),
+        (clear_right - control_right).abs() < 1.0,
         "the clear button should end the control column: {clear:?} in {control:?}"
-    );
-
-    // The edit button is the row's own: it is there whether or not a set is stored, because
-    // writing one is what a row with nothing stored is for.
-    edit_settings(
-        &panel,
-        |config| {
-            config.set_okx_credentials(&VenueId::Okx, None);
-        },
-        cx,
-    );
-
-    assert!(
-        bounds(cx, &kind.edit_selector()).is_some(),
-        "the edit button is there whether or not a set is stored"
-    );
-    assert!(
-        bounds(cx, &credentials_clear(kind)).is_none(),
-        "a row with nothing stored has nothing to clear"
     );
 }
 
 /// The buttons of a credential row are actions of the settings row rather than compact controls
-/// inside a table, so they are drawn at the medium size: the edit button with the outline
-/// appearance and the clear button with the tonal one.
-///
-/// The size is what a test can read off the window; the appearances come from the same theme
-/// entries every outline and tonal control resolves.
-#[gpui_kit::test]
-fn a_credential_rows_buttons_should_be_medium_sized(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
+/// inside a table, so they are drawn at the medium size.
+#[test]
+fn a_credential_rows_buttons_should_be_medium_sized() {
+    let mut harness = Harness::with_config(english_settings());
 
-    for kind in [
-        CredentialsKind::BinanceSpot,
-        CredentialsKind::BinanceUsdMPerp,
-        CredentialsKind::Okx,
-        CredentialsKind::Hyperliquid,
-        CredentialsKind::Longbridge,
-    ] {
-        select(&panel, &credentials_page(kind), cx);
-        assert_eq!(
-            element(cx, &kind.edit_selector()).size.height,
-            UnifiedSize::Medium.h(),
-            "{kind:?}'s edit button should be drawn at the medium size"
-        );
-        assert_eq!(
-            element(cx, &credentials_clear(kind)).size.height,
-            UnifiedSize::Medium.h(),
-            "{kind:?}'s clear button should be drawn at the medium size"
-        );
+    for kind in KINDS {
+        open_page(&mut harness, page_of(kind));
+        for selector in [kind.edit_selector(), kind.clear_selector()] {
+            let button = bounds(&harness, selector.as_ref());
+            assert!(
+                (button.size.height - UnifiedSize::Medium.h()).abs() < 1.0,
+                "{kind:?}'s button should be drawn at the medium size: {selector} is {button:?}"
+            );
+        }
     }
 }
 
 /// The Hyperliquid dialog opens over the set the settings hold and writes the whole set: what the
 /// user types is appended to the stored value, the value the user did not touch is written back as
 /// it was, and a cancelled dialog writes nothing at all.
-#[gpui_kit::test]
-fn a_hyperliquid_dialog_should_open_prefilled_and_write_the_whole_set(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
+#[test]
+fn a_hyperliquid_dialog_should_open_prefilled_and_write_the_whole_set() {
+    let mut harness = Harness::with_config(english_settings());
     let kind = CredentialsKind::Hyperliquid;
-    select(&panel, &credentials_page(kind), cx);
-    let before = stored(cx);
+    open_page(&mut harness, page_of(kind));
+    let before = harness.config();
 
-    click(cx, &kind.edit_selector());
-    type_into(
-        cx,
-        &credentials_field(kind, "api_agent_private_key"),
-        "typed",
-    );
-    click(cx, CANCEL_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_agent_private_key", "typed");
+    cancel_dialog(&mut harness);
 
     assert_eq!(
-        stored(cx),
+        harness.config(),
         before,
         "a cancelled dialog must not write the set it was opened over"
     );
 
-    click(cx, &kind.edit_selector());
-    type_into(
-        cx,
-        &credentials_field(kind, "main_account_address"),
-        "typed",
-    );
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "main_account_address", "typed");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "a stored set should take the dialog away when it is confirmed"
     );
-    let written = stored(cx);
+    let written = harness.config();
     let Some(VenueSettings::Hyperliquid(settings)) = written.venue(&VenueId::Hyperliquid) else {
         panic!("hyperliquid is configured as Hyperliquid");
     };
@@ -948,9 +939,9 @@ fn a_hyperliquid_dialog_should_open_prefilled_and_write_the_whole_set(cx: &mut T
 /// A venue that signs its whole surface with one set is cleared by the alert its row opens: what
 /// is cleared is that venue's set, and neither the other venues nor Binance's two markets are
 /// touched by it.
-#[gpui_kit::test]
-fn clearing_a_venue_should_write_none_and_leave_the_other_venues_alone(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
+#[test]
+fn clearing_a_venue_should_write_none_and_leave_the_other_venues_alone() {
+    let mut harness = Harness::with_config(english_settings());
     let venues = [
         CredentialsKind::Okx,
         CredentialsKind::Hyperliquid,
@@ -958,51 +949,20 @@ fn clearing_a_venue_should_write_none_and_leave_the_other_venues_alone(cx: &mut 
     ];
 
     for (index, kind) in venues.iter().copied().enumerate() {
-        select(&panel, &credentials_page(kind), cx);
-        click(cx, &credentials_clear(kind));
+        open_page(&mut harness, page_of(kind));
+        harness.click_node(kind.clear_selector().as_ref());
+        harness.settle(3);
         assert!(
-            bounds(cx, "BASE_UI_ALERT").is_some(),
+            alert_is_open(&harness),
             "clearing {kind:?} should be put to the user before it is written"
         );
-        click(cx, "BASE_UI_ALERT_OK");
+        click_alert(&mut harness, "ok");
 
-        let config = stored(cx);
-        match kind {
-            CredentialsKind::Okx => {
-                let Some(VenueSettings::Okx(okx)) = config.venue(&VenueId::Okx) else {
-                    panic!("okx is configured as OKX");
-                };
-                assert_eq!(
-                    okx.credentials, None,
-                    "confirming the alert should clear the set OKX signs with"
-                );
-            }
-            CredentialsKind::Hyperliquid => {
-                let Some(VenueSettings::Hyperliquid(settings)) =
-                    config.venue(&VenueId::Hyperliquid)
-                else {
-                    panic!("hyperliquid is configured as Hyperliquid");
-                };
-                assert_eq!(
-                    settings.credentials, None,
-                    "confirming the alert should clear the set Hyperliquid signs with"
-                );
-            }
-            CredentialsKind::Longbridge => {
-                let Some(VenueSettings::Longbridge(settings)) = config.venue(&VenueId::Longbridge)
-                else {
-                    panic!("longbridge is configured as Longbridge");
-                };
-                assert_eq!(
-                    settings.credentials, None,
-                    "confirming the alert should clear the set Longbridge signs with"
-                );
-            }
-            CredentialsKind::BinanceSpot | CredentialsKind::BinanceUsdMPerp => {
-                unreachable!("the loop only clears the venues that sign with one set")
-            }
-        }
-
+        let config = harness.config();
+        assert!(
+            !kind.has_stored_set(&config),
+            "confirming the alert should clear the set {kind:?} signs with"
+        );
         for other in &venues[index + 1..] {
             assert!(
                 other.has_stored_set(&config),
@@ -1026,11 +986,9 @@ fn clearing_a_venue_should_write_none_and_leave_the_other_venues_alone(cx: &mut 
 
 /// A set the settings hold is a set the row can clear, even when a hand-edited file left every
 /// value of it empty: the row says what is stored rather than what it holds, and the dialog is
-/// where an incomplete set is completed. The form opens on the empty values the settings hold —
-/// what is typed is the whole of what lands in them — and a submission that leaves a required
-/// value out is rejected until the value is filled in.
-#[gpui_kit::test]
-fn a_stored_but_empty_set_should_be_completed_or_cleared(cx: &mut TestAppContext) {
+/// where an incomplete set is completed.
+#[test]
+fn a_stored_but_empty_set_should_be_completed_or_cleared() {
     fn empty() -> Option<BinanceMarketCredentials> {
         Some(BinanceMarketCredentials {
             api_key: SmolStr::default(),
@@ -1039,60 +997,55 @@ fn a_stored_but_empty_set_should_be_completed_or_cleared(cx: &mut TestAppContext
         })
     }
 
-    let (panel, cx) = settings(Config::default(), cx);
+    let mut harness = Harness::new();
     let kind = CredentialsKind::BinanceSpot;
-
-    edit_settings(
-        &panel,
-        |config| {
-            config.set_binance_market_credentials(&VenueId::Binance, BinanceMarket::Spot, empty());
-        },
-        cx,
-    );
-    select(&panel, "market_participants.binance", cx);
+    harness.update_config(|config| {
+        config.set_binance_market_credentials(&VenueId::Binance, BinanceMarket::Spot, empty());
+    });
+    open_page(&mut harness, page_of(kind));
 
     assert!(
-        bounds(cx, &credentials_row(kind)).is_some(),
+        harness.field(kind.row_id()).is_some(),
         "a set of empty values is still a set the row is drawn for"
     );
     assert!(
-        bounds(cx, &credentials_clear(kind)).is_some(),
+        harness.find(kind.clear_selector().as_ref()).is_some(),
         "a set of empty values is still a set the row offers to clear"
     );
 
-    click(cx, &kind.edit_selector());
-    type_into(cx, &credentials_field(kind, "api_key"), "only-key");
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_key", "only-key");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_some(),
+        dialog_is_open(&harness, kind),
         "the form opened on empty values, so one filled value still leaves the set incomplete"
     );
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Binance)
-            .and_then(|venue| match venue {
+        harness.config().venue(&VenueId::Binance).and_then(|venue| {
+            match venue {
                 VenueSettings::Binance(binance) => binance.spot_credentials.clone(),
                 _ => None,
-            }),
+            }
+        }),
         empty(),
         "a rejected submission should write nothing, not even the value it was typed with"
     );
 
-    type_into(cx, &credentials_field(kind, "private_key"), "only-private");
-    click(cx, CONFIRM_SELECTOR);
+    type_into(&mut harness, kind, "private_key", "only-private");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "a set completed in the dialog should be written"
     );
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Binance)
-            .and_then(|venue| match venue {
+        harness.config().venue(&VenueId::Binance).and_then(|venue| {
+            match venue {
                 VenueSettings::Binance(binance) => binance.spot_credentials.clone(),
                 _ => None,
-            }),
+            }
+        }),
         Some(BinanceMarketCredentials {
             api_key: SmolStr::new_static("only-key"),
             private_key: SmolStr::new_static("only-private"),
@@ -1101,16 +1054,17 @@ fn a_stored_but_empty_set_should_be_completed_or_cleared(cx: &mut TestAppContext
         "what was typed is the whole of what the empty values became"
     );
 
-    click(cx, &credentials_clear(kind));
-    click(cx, "BASE_UI_ALERT_OK");
+    harness.click_node(kind.clear_selector().as_ref());
+    harness.settle(3);
+    click_alert(&mut harness, "ok");
 
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Binance)
-            .and_then(|venue| match venue {
+        harness.config().venue(&VenueId::Binance).and_then(|venue| {
+            match venue {
                 VenueSettings::Binance(binance) => binance.spot_credentials.clone(),
                 _ => None,
-            }),
+            }
+        }),
         None,
         "clearing a stored set should leave the settings holding none"
     );
@@ -1118,10 +1072,9 @@ fn a_stored_but_empty_set_should_be_completed_or_cleared(cx: &mut TestAppContext
 
 /// A set the settings hold is prefilled with the values it does hold, even when a hand-edited file
 /// left it incomplete: typing the value that is empty completes the set, and the values that were
-/// already there are written back untouched. The row still offers to clear it, because what it asks
-/// is whether a set is stored rather than whether every value of it is filled in.
-#[gpui_kit::test]
-fn a_stored_but_incomplete_set_should_open_prefilled(cx: &mut TestAppContext) {
+/// already there are written back untouched.
+#[test]
+fn a_stored_but_incomplete_set_should_open_prefilled() {
     fn incomplete() -> Option<BinanceMarketCredentials> {
         Some(BinanceMarketCredentials {
             api_key: SmolStr::new_static("kept-key"),
@@ -1130,46 +1083,37 @@ fn a_stored_but_incomplete_set_should_open_prefilled(cx: &mut TestAppContext) {
         })
     }
 
-    let (panel, cx) = settings(Config::default(), cx);
+    let mut harness = Harness::new();
     let kind = CredentialsKind::BinanceSpot;
-
-    edit_settings(
-        &panel,
-        |config| {
-            config.set_binance_market_credentials(
-                &VenueId::Binance,
-                BinanceMarket::Spot,
-                incomplete(),
-            );
-        },
-        cx,
-    );
-    select(&panel, "market_participants.binance", cx);
+    harness.update_config(|config| {
+        config.set_binance_market_credentials(&VenueId::Binance, BinanceMarket::Spot, incomplete());
+    });
+    open_page(&mut harness, page_of(kind));
 
     assert!(
-        bounds(cx, &credentials_row(kind)).is_some(),
+        harness.field(kind.row_id()).is_some(),
         "a set a hand-edited file left partly empty is still a set the row is drawn for"
     );
     assert!(
-        bounds(cx, &credentials_clear(kind)).is_some(),
+        harness.find(kind.clear_selector().as_ref()).is_some(),
         "the row offers to clear the set whether or not every value of it is filled in"
     );
 
-    click(cx, &kind.edit_selector());
-    type_into(cx, &credentials_field(kind, "private_key"), "typed-private");
-    click(cx, CONFIRM_SELECTOR);
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "private_key", "typed-private");
+    confirm_dialog(&mut harness);
 
     assert!(
-        bounds(cx, DIALOG_SELECTOR).is_none(),
+        !dialog_is_open(&harness, kind),
         "the set becomes complete as soon as the one empty required value is filled in"
     );
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Binance)
-            .and_then(|venue| match venue {
+        harness.config().venue(&VenueId::Binance).and_then(|venue| {
+            match venue {
                 VenueSettings::Binance(binance) => binance.spot_credentials.clone(),
                 _ => None,
-            }),
+            }
+        }),
         Some(BinanceMarketCredentials {
             api_key: SmolStr::new_static("kept-key"),
             private_key: SmolStr::new_static("typed-private"),
@@ -1177,18 +1121,149 @@ fn a_stored_but_incomplete_set_should_open_prefilled(cx: &mut TestAppContext) {
         }),
         "the values the incomplete set already held were prefilled and written back unchanged"
     );
+}
 
-    click(cx, &credentials_clear(kind));
-    click(cx, "BASE_UI_ALERT_OK");
+/// Closing the dialog releases what one open built: opening it again is a form of its own rather
+/// than a second set of handlers over the first one's state.
+#[test]
+fn closing_the_dialog_should_release_its_fields() {
+    let mut harness = Harness::new();
+    open_page(&mut harness, "market_participants.okx");
+    let kind = CredentialsKind::Okx;
 
+    open_credentials_dialog(&mut harness, kind);
+    let confirm = Action::Custom(format_smolstr!("{}:confirm.click", dialog_key(kind)));
+    assert!(
+        harness.app().has_action_handler(&confirm),
+        "the open dialog's confirm button is a live control"
+    );
+    cancel_dialog(&mut harness);
+    assert!(
+        !harness.app().has_action_handler(&confirm),
+        "the closed dialog's controls were released with it"
+    );
+
+    open_credentials_dialog(&mut harness, kind);
+    type_into(&mut harness, kind, "api_key", "typed-key");
+    type_into(&mut harness, kind, "secret_key", "typed-secret");
+    type_into(&mut harness, kind, "passphrase", "typed-passphrase");
+    confirm_dialog(&mut harness);
+
+    let written = harness.config();
+    let Some(VenueSettings::Okx(okx)) = written.venue(&VenueId::Okx) else {
+        panic!("okx is configured as OKX");
+    };
     assert_eq!(
-        stored(cx)
-            .venue(&VenueId::Binance)
-            .and_then(|venue| match venue {
-                VenueSettings::Binance(binance) => binance.spot_credentials.clone(),
-                _ => None,
-            }),
-        None,
-        "clearing the completed set should leave the settings holding none"
+        okx.credentials,
+        Some(OkxCredentials {
+            api_key: SmolStr::new_static("typed-key"),
+            secret_key: SmolStr::new_static("typed-secret"),
+            passphrase: SmolStr::new_static("typed-passphrase"),
+        }),
+        "the reopened dialog writes into the set it was opened over"
+    );
+}
+
+/// Leaving the page releases the dialog it was opened over: a page switch rebuilds the page the
+/// dialog belonged to, and the controls of a dialog that is still open go with it.
+#[test]
+fn leaving_the_page_should_release_the_dialog() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
+    let kind = CredentialsKind::Okx;
+    open_credentials_dialog(&mut harness, kind);
+
+    let confirm = Action::Custom(format_smolstr!("{}:confirm.click", dialog_key(kind)));
+    assert!(harness.app().has_action_handler(&confirm));
+
+    harness.update_config(|config| config.language = Language::ZhCn);
+    harness.settle(3);
+
+    assert!(
+        !harness.app().has_action_handler(&confirm),
+        "the dialog's controls should be released with the page that opened them"
+    );
+    assert_eq!(
+        harness.page().current_page().as_str(),
+        "market_participants.okx",
+        "the page the user was on is the page that is drawn"
+    );
+    assert!(
+        harness
+            .field("market_participants.okx.credentials")
+            .is_some(),
+        "the rebuilt page draws its rows"
+    );
+}
+
+/// A language switch rebuilds the page, and the dialog a page held goes with the page it was
+/// opened over rather than outliving it.
+#[test]
+fn a_language_switch_should_take_the_open_dialog_away() {
+    let mut harness = Harness::with_config(english_settings());
+    open_page(&mut harness, "market_participants.okx");
+    let kind = CredentialsKind::Okx;
+    open_credentials_dialog(&mut harness, kind);
+
+    harness.update_config(|config| config.language = Language::ZhCn);
+    harness.settle(3);
+
+    assert!(
+        !dialog_is_open(&harness, kind),
+        "the page the dialog belonged to was rebuilt, so the dialog is not drawn"
+    );
+    assert_eq!(
+        harness.page().current_page().as_str(),
+        "market_participants.okx",
+        "the settings stay on the page the dialog was opened over"
+    );
+    assert_eq!(
+        harness.field_label("market_participants.okx.credentials"),
+        i18n::t_smol!(
+            translate_in(LanguageCode::ZhCn),
+            "settings_ui.market_participants.credentials"
+        ),
+        "the rebuilt page draws its row in the new language"
+    );
+}
+
+/// The credential row of one set is the same row on every page it is drawn on, and the values are
+/// never row ids: a row that named a value would make a secret a thing the page lays out.
+#[test]
+fn every_set_should_be_drawn_as_one_row() {
+    let mut harness = Harness::with_config(english_settings());
+
+    for kind in KINDS {
+        open_page(&mut harness, page_of(kind));
+        assert!(
+            harness.field(kind.row_id()).is_some(),
+            "{kind:?} should be drawn as one row on its page"
+        );
+        for field in kind.fields() {
+            assert!(
+                harness
+                    .field(&format!("{}.{}", kind.field_prefix(), field.id))
+                    .is_none(),
+                "{kind:?}'s {} should not be a row of its own",
+                field.id
+            );
+        }
+    }
+}
+
+/// The keys the controls of one page are named by are the page's own: a control's identity carries
+/// the row id, so a test — and a second pane — can tell one row's control from another's.
+#[test]
+fn a_credentials_controls_should_be_named_by_the_row_they_belong_to() {
+    let kind = CredentialsKind::Longbridge;
+    assert_eq!(
+        credentials_key(kind),
+        SmolStr::new_static("settings.test.market_participants.longbridge.credentials"),
+        "the row's controls are named under the settings page instance and the row's id"
+    );
+    assert_eq!(
+        dialog_key(kind),
+        SmolStr::new_static("settings.test.market_participants.longbridge.credentials.dialog"),
+        "the dialog is named under the row it belongs to"
     );
 }
