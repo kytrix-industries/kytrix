@@ -36,6 +36,11 @@ const BYTE_BUDGET: usize = 16 * 1024 * 1024;
 /// **不含** `scale`（R12-4：逻辑坐标 shaping，DPI 变化不再清缓存）、**不含** `color` /
 /// `alignment`（R12-11：两者不影响 glyph id / advance / 断行）。
 ///
+/// 颜色不进键的前提是**光栅期按本次请求的基础色重写基础 run**（E24 / W6b F22）：Canvas 文本
+/// 没有节点绘制期的 `bind_style.foreground` 重上色，若继续用 shape 期画刷，同字符串换色（halo
+/// 副本）会永远画第一次的颜色。命中后布局照旧复用（不重复 shape），只换画刷 —— 见
+/// `shape::current_run_color`。
+///
 /// 命中后仍要比较 `text`/`style`（防哈希碰撞），比较对象是缓存条目里的 `ShapedText`；
 /// 等价关系必须与键一致 —— 见 `TextStyle::same_shaping_inputs`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

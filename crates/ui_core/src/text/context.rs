@@ -73,6 +73,12 @@ pub(crate) struct TextContext {
     diagnostics: SmallVec<[TextDiagnostic; 8]>,
     /// 字体代际（`set_font_stack` / `reload_system_fonts` 时 +1；字形缓存与图集的失效依据，B2）。
     font_epoch: u32,
+    /// 真正跑 `RangedBuilder::build` 的次数（仅测试构建；E24 的缓存断言观测面）。
+    ///
+    /// 生产路径不需要它：节点路径的塑形次数由 `TextPassReport.shaped` 覆盖，Canvas 文本的
+    /// 次数由调用方自己控制。E24 用它断言「同文本换色命中形状缓存、不重复塑形」。
+    #[cfg(test)]
+    shapes: u32,
 }
 
 impl TextContext {
@@ -92,6 +98,8 @@ impl TextContext {
             stack_resolutions: 0,
             diagnostics: SmallVec::new(),
             font_epoch: 1,
+            #[cfg(test)]
+            shapes: 0,
         }
     }
 
@@ -228,6 +236,10 @@ impl TextContext {
                 (run.range.clone(), run_family)
             })
             .collect();
+        #[cfg(test)]
+        {
+            self.shapes += 1;
+        }
         let shaped = Rc::new(ShapedText::shape(
             &mut self.font_cx,
             &mut self.layout_cx,
@@ -238,6 +250,12 @@ impl TextContext {
         ));
         self.cache.insert(key, Rc::clone(&shaped));
         (shaped, false)
+    }
+
+    /// 真正的 parley 塑形次数（仅测试：E24 断言「换色命中形状缓存、不重复塑形」）。
+    #[cfg(test)]
+    pub(crate) fn shape_count(&self) -> u32 {
+        self.shapes
     }
 
     /// 该样式的字体栈身份（快速路径验证缓存的键的一部分）。

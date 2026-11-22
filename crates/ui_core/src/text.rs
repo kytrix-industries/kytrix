@@ -552,9 +552,10 @@ impl TextStyle {
 
     /// 该样式是否与 `other` 产生**相同的形状结果**（R12-11：忽略 `color` 与 `alignment`）。
     ///
-    /// 形状缓存键的等价类就是这个函数：`color` 只影响 run 的 brush、`alignment` 只影响
-    /// `align()` 之后的偏移，两者都不改变 glyph id / advance / 断行。缓存命中后必须用
-    /// **同一个**等价关系复验（否则「同键不同色」会被判成 miss）。
+    /// 形状缓存键的等价类就是这个函数：`alignment` 只影响 `align()` 之后的偏移，不改变
+    /// glyph id / advance / 断行，缓存命中后必须用**同一个**等价关系复验（否则「同键不同色」
+    /// 会被判成 miss）。`color` 不改变 shape 结果，但会烘进光栅产物 ⇒ 光栅期按**本次**请求的
+    /// `style.color` 重写基础 run（E24；见 `shape::current_run_color`），所以它同样不进键。
     #[must_use]
     pub fn same_shaping_inputs(&self, other: &Self) -> bool {
         self.size.to_bits() == other.size.to_bits()
