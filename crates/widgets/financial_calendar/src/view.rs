@@ -115,6 +115,7 @@ use widget::{
     cx::WidgetCx,
     error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     time_zone::data_time_zone,
     util::{format_countdown, unix_millis},
@@ -137,9 +138,12 @@ use crate::{
 
 /// How often the pane re-reads the clock behind its countdown.
 ///
-/// It is not a read: it only re-checks how long is left. A quarter of a second is
-/// faster than the label's own resolution and cheaper than a frame.
-pub(crate) const COUNTDOWN_TICK: Duration = Duration::from_millis(250);
+/// It is not a read: it only re-checks how long is left, and the label's own
+/// resolution is a second. One tick per second is therefore the cheapest wakeup this
+/// pane can ask for: a shorter period would wake the engine (and run every mounted
+/// widget's `sync`) more often without ever drawing anything new, because the label
+/// can only change once a second.
+pub(crate) const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
 
 /// The size of one importance mark.
 const MARK_SIZE: f32 = 6.0;
@@ -287,7 +291,7 @@ impl Countdown {
     ///
     /// The label is written here as well as on every tick: a new answer carries a new
     /// deadline, and the header has to state it on the frame that shows the answer
-    /// rather than a quarter of a second later.
+    /// rather than up to a tick later.
     fn update(self: &Rc<Self>, app: &mut App, deadline: Option<i64>) {
         self.deadline.set(deadline);
         if let Some(id) = self.timer.borrow_mut().take() {
@@ -381,6 +385,15 @@ pub struct FinancialCalendarWidget {
     next_refresh_at: Option<i64>,
     /// Whether a refresh this pane sent has been answered *and its answer reported*.
     refresh_pending: bool,
+    /// The framework identity of the last RPC reply this pane applied.
+    ///
+    /// The binding tags every reply with the request it answers. The pane replaces
+    /// its one command slot on every call (start, refresh, stop), and the binding
+    /// aborts the replaced call — but a reply can already be queued when the
+    /// replacement happens. Such a reply carries an identity no newer than one this
+    /// pane has already applied, and applying it would report a command the pane has
+    /// since replaced (a refused old refresh failing a pane that signed out, say).
+    last_rpc_reply: Option<RequestId>,
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
     /// The display zone the rows are grouped for, so a move regroups them once.
@@ -630,6 +643,7 @@ impl FinancialCalendarWidget {
             snapshot: None,
             next_refresh_at: None,
             refresh_pending: false,
+            last_rpc_reply: None,
             account_id,
             seen_zone,
             header_left: None,
@@ -833,7 +847,9 @@ impl FinancialCalendarWidget {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
             Inbound::Latest { key, message } => self.apply_latest(key, &message, cx),
-            Inbound::Rpc { result, .. } => self.apply_rpc_result(result, cx),
+            Inbound::Rpc { request_id, result } => {
+                self.apply_rpc_result(request_id, result, cx);
+            }
         }
     }
 
@@ -886,11 +902,32 @@ impl FinancialCalendarWidget {
     /// An accepted command stays pending until the calendar it asked for is reported:
     /// the acknowledgement and the answer are two different messages, and the service
     /// refuses a second command in between.
+    ///
+    /// The entry checks are the terminal rule and the command slot's identity:
+    ///
+    /// - `failed` is terminal (AGENTS §4.4): a message that arrives after the user's
+    ///   failure was reported may not repaint or "un-end" it. The old pane guarded
+    ///   this entry; the migration dropped the guard, and one late refusal from a
+    ///   replaced call was enough to rewrite the failure sentence the user is reading.
+    /// - A reply that is not newer than one this pane already applied answers a
+    ///   command that was replaced (the binding aborts the replaced call, so only a
+    ///   reply queued before the replacement can still arrive) and must be dropped.
+    /// - A pane nobody is signed in for is waiting, not failing: signing out replaces
+    ///   the read with a `Stop`, and a refusal of the read it replaced is not a reason
+    ///   to leave the waiting state.
     fn apply_rpc_result(
         &mut self,
+        request_id: RequestId,
         result: WidgetRpcResult<CalendarProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        if self.status.is_failed(cx.app()) || self.current_key().is_none() {
+            return;
+        }
+        if self.last_rpc_reply.is_some_and(|last| request_id <= last) {
+            return;
+        }
+        self.last_rpc_reply = Some(request_id);
         match result {
             Ok(
                 CalendarResponse::StreamStarted
@@ -938,10 +975,11 @@ impl FinancialCalendarWidget {
             };
             sink.build(tree, parent, row, column);
         };
+        let key = cx.unique_key("financial_calendar.table");
         let table = Table::new(
             cx.app_mut(),
             theme,
-            "FinancialCalendarTable",
+            key,
             columns,
             table_options(row_height),
             cells,
@@ -1006,7 +1044,7 @@ impl FinancialCalendarWidget {
         let importance = self.build_filter_control(
             parent,
             "TEST_FINANCIAL_CALENDAR_IMPORTANCE",
-            "financial_calendar.importance",
+            "financial_calendar.header.importance",
             importance_name.clone(),
             filter_trigger(&self.translate, &importance_name, &importance_choice),
             importance_items,
@@ -1033,7 +1071,7 @@ impl FinancialCalendarWidget {
         let time = self.build_filter_control(
             parent,
             "TEST_FINANCIAL_CALENDAR_TIME",
-            "financial_calendar.time",
+            "financial_calendar.header.time",
             time_name.clone(),
             filter_trigger(&self.translate, &time_name, &time_choice),
             time_items,
@@ -1063,7 +1101,7 @@ impl FinancialCalendarWidget {
         let country = self.build_filter_control(
             parent,
             "TEST_FINANCIAL_CALENDAR_COUNTRY",
-            "financial_calendar.country",
+            "financial_calendar.header.country",
             country_name.clone(),
             filter_trigger(&self.translate, &country_name, &country_choice),
             country_items,
@@ -1081,7 +1119,8 @@ impl FinancialCalendarWidget {
         let reset_label = t_smol!(self.translate, "widget.financial_calendar.reset");
         let requests = self.requests;
         let window = cx.window();
-        let mut reset = Button::new(cx.app_mut(), self.theme.clone(), "financial_calendar.reset")
+        let reset_key = cx.unique_key("financial_calendar.header.reset");
+        let mut reset = Button::new(cx.app_mut(), self.theme.clone(), reset_key)
             .ghost()
             .small()
             .icon(IconKind::FunnelX)
@@ -1147,12 +1186,13 @@ impl FinancialCalendarWidget {
             .placeholder(trigger);
         let layer = cx.layer().clone();
         let animation = cx.animation().clone();
+        let select_key = cx.unique_key(key);
         let select = Select::new(
             cx.app_mut(),
             self.theme.clone(),
             layer,
             animation,
-            key,
+            select_key,
             options,
         )
         .on_change(move |app, chosen| {
@@ -1191,23 +1231,20 @@ impl FinancialCalendarWidget {
         let requests = self.requests;
         let window = cx.window();
         let disabled = self.refresh_is_disabled(cx.app());
-        let mut refresh = Button::new(
-            cx.app_mut(),
-            self.theme.clone(),
-            "financial_calendar.refresh",
-        )
-        .ghost()
-        .small()
-        .icon(IconKind::ArrowsClockwise)
-        .a11y_label(label.clone())
-        .tooltip_text(label)
-        .on_click(move |ctx| {
-            let _ = ctx.update(&requests, |request| {
-                *request = Some(HeaderRequest::Refresh);
+        let refresh_key = cx.unique_key("financial_calendar.header.refresh");
+        let mut refresh = Button::new(cx.app_mut(), self.theme.clone(), refresh_key)
+            .ghost()
+            .small()
+            .icon(IconKind::ArrowsClockwise)
+            .a11y_label(label.clone())
+            .tooltip_text(label)
+            .on_click(move |ctx| {
+                let _ = ctx.update(&requests, |request| {
+                    *request = Some(HeaderRequest::Refresh);
+                });
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
             });
-            let window = ctx.window();
-            let _ = ctx.app_mut().request_repaint(window);
-        });
         refresh = refresh.disabled(disabled);
         refresh.build(cx.app_mut(), window, wrapper)?;
 
@@ -1721,23 +1758,15 @@ mod tests {
         settings::{AccountConfig, AccountWalletKind, Config},
         time_zone::DataTimeZone,
     };
-    use base_ui::{
-        kit::{layer::Layer, overlay::AnimationRouter},
-        theme::appearance::Appearance,
-    };
+    use base_ui::theme::appearance::Appearance;
     use kytrix_proto::types::v1 as proto_types;
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use ui_core::{
         event::{Action, ActionSource},
-        node::{builder::NodeBuilder, signal::SignalScope, tree::NodeKind},
+        node::{builder::NodeBuilder, tree::NodeKind},
         paint::color::Color,
-        test_support::app::TestApp,
-        window::WindowId,
     };
-    use widget::{
-        frame::FrameRouter, protocol::RequestId, rpc::RpcCallError, services::WidgetServices,
-        test_support::WidgetTestApp,
-    };
+    use widget::{rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
     use crate::{
@@ -1867,6 +1896,54 @@ mod tests {
         pane_with(harness, FakeSource::new([FetchPlan::Pending]))
     }
 
+    /// A pane whose countdown reads a clock the test owns.
+    ///
+    /// The engine's clock (the one `WidgetTestApp::advance` moves) schedules the
+    /// countdown's timer; the pane formats the deadline against the wall clock the
+    /// service published it in Unix milliseconds, which is this cell. A test moves both
+    /// to see a tick change the label.
+    fn pane_with_clock(
+        harness: &mut WidgetTestApp,
+        source: FakeSource,
+        clock: Rc<StdCell<i64>>,
+    ) -> Pane {
+        let scope = harness.scope();
+        let status = WidgetStatus::new(harness.app_mut(), scope);
+        let parent = harness.placeholder_parent();
+        let now: Rc<dyn Fn() -> i64> = Rc::new(move || clock.get());
+        let widget = harness.with_cx(|cx| {
+            FinancialCalendarWidget::with_clock(
+                source,
+                now,
+                status,
+                WidgetAction::new("common.retry", |_| {}),
+                cx,
+            )
+        });
+        Pane {
+            widget,
+            status,
+            parent,
+        }
+    }
+
+    /// Accepts an answer that schedules the next read `in_ms` milliseconds from the
+    /// test's wall clock, and runs the sync that arms the countdown.
+    fn accept_answer(
+        harness: &mut WidgetTestApp,
+        pane: &mut Pane,
+        clock: &StdCell<i64>,
+        in_ms: i64,
+    ) {
+        report_snapshot(
+            harness,
+            pane,
+            &test_support::snapshot(2),
+            clock.get() + in_ms,
+        );
+        sync(harness, pane);
+    }
+
     fn load(harness: &mut WidgetTestApp, pane: &mut Pane) {
         harness.with_cx(|cx| pane.widget.load(cx));
     }
@@ -1950,6 +2027,11 @@ mod tests {
     /// The label the header binds: the time left until the next read.
     fn countdown_label(harness: &WidgetTestApp, pane: &Pane) -> Option<SmolStr> {
         harness.app().read(&pane.widget.countdown.label).clone()
+    }
+
+    /// Whether the pane currently holds a one-shot timer for its countdown.
+    fn timer_armed(pane: &Pane) -> bool {
+        pane.widget.countdown.timer.borrow().is_some()
     }
 
     /// How many runtime/frame turns [`settle`] may take before it calls the test a
@@ -2124,7 +2206,6 @@ mod tests {
             "widget.financial_calendar.country",
             "widget.financial_calendar.day_label",
             "widget.financial_calendar.filter_choice",
-            "widget.financial_calendar.filter_tooltip",
             "widget.financial_calendar.importance",
             "widget.financial_calendar.logged_out",
             "widget.financial_calendar.name",
@@ -2321,8 +2402,9 @@ mod tests {
             pane.widget.refresh(cx);
             assert!(pane.widget.refresh_pending);
             pane.widget.apply_rpc_result(
+                RequestId::new(2),
                 Err(RpcCallError::Service {
-                    request_id: RequestId::new(1),
+                    request_id: RequestId::new(2),
                     source: CalendarServiceError::StreamBusy,
                 }),
                 cx,
@@ -2372,6 +2454,141 @@ mod tests {
             pane.status.state(harness.app()),
             WidgetState::Connecting,
             "the recovery the failure offered is what starts it again"
+        );
+    }
+
+    /// A message the binding delivers after the pane reported a failure is late by
+    /// definition: `failed` is terminal, and the sentence the user is reading names the
+    /// read that failed. The old pane guarded this entry; the migration dropped the
+    /// guard, and a refusal queued before the stream failed rewrote the banner into
+    /// "a refresh is already waiting".
+    #[test]
+    fn a_failure_should_not_be_rewritten_by_a_late_command_reply() {
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let mut pane = pane(&mut harness);
+        load(&mut harness, &mut pane);
+        report_snapshot(
+            &mut harness,
+            &mut pane,
+            &test_support::snapshot(2),
+            i64::MAX,
+        );
+        report_failure(&mut harness, &mut pane);
+        let failure = failure_of(&harness, &pane);
+
+        harness.with_cx(|cx| {
+            pane.widget.apply(
+                Inbound::Rpc {
+                    request_id: RequestId::new(3),
+                    result: Err(RpcCallError::Service {
+                        request_id: RequestId::new(3),
+                        source: CalendarServiceError::StreamBusy,
+                    }),
+                },
+                cx,
+            );
+        });
+
+        assert!(
+            pane.status.state(harness.app()).is_failed(),
+            "a failed pane is terminal until the user recovers it"
+        );
+        assert_eq!(
+            failure_of(&harness, &pane),
+            failure,
+            "the failure sentence the user is reading is not rewritten by a late reply"
+        );
+        assert!(
+            pane.widget.countdown.deadline().is_none(),
+            "and the late reply does not put a schedule back on the header"
+        );
+    }
+
+    /// Signing out is a waiting state, not a failure: the read the pane replaced with a
+    /// `Stop` can still have a refusal queued, and it may not paint the pane as failed.
+    #[test]
+    fn signing_out_should_not_be_failed_by_a_late_command_reply() {
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let mut pane = pane(&mut harness);
+        load(&mut harness, &mut pane);
+        report_snapshot(
+            &mut harness,
+            &mut pane,
+            &test_support::snapshot(2),
+            unix_millis() + 60_000,
+        );
+        sync(&mut harness, &mut pane);
+        harness.with_cx(|cx| pane.widget.refresh(cx));
+        assert!(pane.widget.refresh_pending);
+
+        sign_out(&mut harness);
+        sync(&mut harness, &mut pane);
+        let waiting = WidgetState::waiting(Notice::message("widget.financial_calendar.logged_out"));
+        assert_eq!(pane.status.state(harness.app()), waiting);
+
+        harness.with_cx(|cx| {
+            pane.widget.apply(
+                Inbound::Rpc {
+                    request_id: RequestId::new(4),
+                    result: Err(RpcCallError::Service {
+                        request_id: RequestId::new(4),
+                        source: CalendarServiceError::StreamBusy,
+                    }),
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(
+            pane.status.state(harness.app()),
+            waiting,
+            "a refusal of the read signing out replaced may not fail the waiting pane"
+        );
+    }
+
+    /// The framework request identity orders the command replies: a reply older than
+    /// one this pane already applied answers a command it replaced, and is dropped.
+    #[test]
+    fn a_command_reply_older_than_the_one_already_applied_should_be_ignored() {
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let mut pane = pane(&mut harness);
+        load(&mut harness, &mut pane);
+        report_snapshot(
+            &mut harness,
+            &mut pane,
+            &test_support::snapshot(2),
+            unix_millis() + 60_000,
+        );
+
+        harness.with_cx(|cx| {
+            pane.widget.refresh(cx);
+            pane.widget.apply_rpc_result(
+                RequestId::new(2),
+                Ok(CalendarResponse::RefreshQueued),
+                cx,
+            );
+            // A refusal queued before the refresh replaced its call would carry the
+            // older identity; it answers a command the pane no longer waits for.
+            pane.widget.apply_rpc_result(
+                RequestId::new(1),
+                Err(RpcCallError::Service {
+                    request_id: RequestId::new(1),
+                    source: CalendarServiceError::StreamBusy,
+                }),
+                cx,
+            );
+        });
+
+        assert!(
+            !pane.status.state(harness.app()).is_failed(),
+            "the replaced command's refusal is not this pane's failure"
+        );
+        assert!(
+            pane.widget.refresh_pending,
+            "the refresh the pane replaced its call with is still the one in flight"
         );
     }
 
@@ -2433,8 +2650,11 @@ mod tests {
             "the click closes the window itself, before anything has answered"
         );
         harness.with_cx(|cx| {
-            pane.widget
-                .apply_rpc_result(Ok(CalendarResponse::RefreshQueued), cx);
+            pane.widget.apply_rpc_result(
+                RequestId::new(2),
+                Ok(CalendarResponse::RefreshQueued),
+                cx,
+            );
         });
         assert!(
             pane.widget.refresh_is_disabled(harness.app()),
@@ -3156,7 +3376,7 @@ mod tests {
             i64::MAX,
         );
         build_body(&mut harness, &mut pane);
-        let sort = Action::Custom(SmolStr::new_static("FinancialCalendarTable.sort"));
+        let sort = Action::Custom(format_smolstr!("{}.sort", table(&pane).key()));
         assert!(
             harness.app().has_action_handler(&sort),
             "the mounted table registers its handler"
@@ -3294,33 +3514,6 @@ mod tests {
             )
             .as_str(),
             "重要性：全部"
-        );
-    }
-
-    /// Every filter's tooltip says what the control narrows, in the language showing
-    /// now.
-    #[test]
-    fn a_filter_tooltip_should_say_what_the_filter_narrows() {
-        let translate = product_translate(LanguageCode::En);
-        assert_eq!(
-            t_smol!(
-                translate,
-                "widget.financial_calendar.filter_tooltip",
-                filter = t_smol!(translate, "widget.financial_calendar.country")
-            )
-            .as_str(),
-            "Filter by Country"
-        );
-
-        let chinese = product_translate(LanguageCode::ZhCn);
-        assert_eq!(
-            t_smol!(
-                chinese,
-                "widget.financial_calendar.filter_tooltip",
-                filter = t_smol!(chinese, "widget.financial_calendar.country")
-            )
-            .as_str(),
-            "按国家筛选"
         );
     }
 
@@ -3682,230 +3875,54 @@ mod tests {
 
     // --------------------------------------------------------------- countdown
 
-    /// A pane whose countdown reads a clock the test owns.
-    struct ClockHost {
-        app: TestApp,
-        _runtime: tokio::runtime::Runtime,
-        window: WindowId,
-        services: Rc<WidgetServices>,
-        scope: SignalScope,
-        widget: FinancialCalendarWidget,
-        parent: NodeId,
-        clock: Rc<StdCell<i64>>,
-    }
-
-    impl ClockHost {
-        fn new() -> Self {
-            let mut app = TestApp::new();
-            let window = app.window_id();
-            let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("the host's runtime builds");
-            let layer = Rc::new(Layer::new());
-            let animation = Rc::new(AnimationRouter::new());
-            let router =
-                Rc::new(FrameRouter::new(app.app_mut()).expect("the host owns the frame slot"));
-            let services = Rc::new(
-                WidgetServices::builder(
-                    app.app_mut(),
-                    runtime.handle().clone(),
-                    product_translate(LanguageCode::En),
-                    theme,
-                    layer,
-                    router,
-                    animation,
-                )
-                .build(),
-            );
-            let scope = app.app_mut().signal_scope();
-            let parent = {
-                let mut cx = WidgetCx::new(app.app_mut(), window, &services, scope);
-                let root = cx.tree().root();
-                NodeBuilder::boxed()
-                    .id("TEST_CLOCK_BODY")
-                    .build(cx.tree_mut(), root)
-                    .expect("the body parent builds")
-            };
-            let status = WidgetStatus::new(app.app_mut(), scope);
-            let clock = Rc::new(StdCell::new(0_i64));
-            let now: Rc<dyn Fn() -> i64> = {
-                let clock = Rc::clone(&clock);
-                Rc::new(move || clock.get())
-            };
-            let mut cx = WidgetCx::new(app.app_mut(), window, &services, scope);
-            let widget = FinancialCalendarWidget::with_clock(
-                FakeSource::new([FetchPlan::Pending]),
-                now,
-                status,
-                WidgetAction::new("common.retry", |_| {}),
-                &mut cx,
-            );
-            Self {
-                app,
-                _runtime: runtime,
-                window,
-                services,
-                scope,
-                widget,
-                parent,
-                clock,
-            }
-        }
-
-        fn with_cx<R>(
-            &mut self,
-            body: impl FnOnce(&mut FinancialCalendarWidget, &mut WidgetCx<'_>) -> R,
-        ) -> R {
-            let services = Rc::clone(&self.services);
-            let mut cx = WidgetCx::new(self.app.app_mut(), self.window, &services, self.scope);
-            body(&mut self.widget, &mut cx)
-        }
-
-        fn sign_in(&mut self) {
-            let mut config = (*self.app.app().read(&self.services.config)).clone();
-            config.account = Some(AccountConfig {
-                user_id: ACCOUNT.to_owned(),
-                wallet_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                wallet_kind: AccountWalletKind::Ethereum,
-            });
-            let signal = self.services.config;
-            assert!(self.app.app_mut().write(&signal, config));
-        }
-
-        fn load(&mut self) {
-            self.with_cx(|widget, cx| widget.load(cx));
-        }
-
-        /// Accepts an answer and runs the sync that schedules its countdown, then one
-        /// frame. The body is built the way the framework would build it, so the
-        /// steady state has no "body still pending" frame request in it.
-        fn accept(&mut self, next_refresh_at: i64) {
-            let calendar = test_support::snapshot(2);
-            self.with_cx(|widget, cx| {
-                widget.apply_latest(
-                    key(ACCOUNT),
-                    &CalendarStreamMessage::Snapshot {
-                        calendar,
-                        next_refresh_at,
-                    },
-                    cx,
-                );
-            });
-            if self.widget.table.is_none() {
-                let parent = self.parent;
-                self.with_cx(|widget, cx| {
-                    widget.body(parent, cx).expect("the body builds");
-                });
-            }
-            self.frame();
-        }
-
-        fn sync(&mut self) {
-            self.with_cx(|widget, cx| widget.sync(cx).expect("the widget syncs"));
-        }
-
-        fn frame(&mut self) {
-            self.sync();
-            self.app.drain().expect("the frame commits");
-        }
-
-        fn advance(&mut self, by: Duration) {
-            self.app.advance(by);
-        }
-
-        fn label(&self) -> Option<SmolStr> {
-            self.app.app().read(&self.widget.countdown.label).clone()
-        }
-
-        fn timer_armed(&self) -> bool {
-            self.widget.countdown.timer.borrow().is_some()
-        }
-
-        fn tree(&self) -> &NodeTree {
-            self.app
-                .app()
-                .window(self.window)
-                .expect("the host's window exists")
-                .tree()
-        }
-
-        /// The nearest node under `root` whose debug id is `debug`.
-        fn node_with_debug(&self, root: NodeId, debug: &str) -> Option<NodeId> {
-            let tree = self.tree();
-            let mut stack = vec![root];
-            while let Some(current) = stack.pop() {
-                if tree.debug_id(current) == Some(debug) {
-                    return Some(current);
-                }
-                stack.extend(
-                    tree.get(current)
-                        .expect("a node")
-                        .children()
-                        .iter()
-                        .copied(),
-                );
-            }
-            None
-        }
-
-        /// The text the subtree under `node` draws, in document order.
-        fn text_of(&self, node: NodeId) -> String {
-            let tree = self.tree();
-            let mut texts = Vec::new();
-            let mut stack = vec![node];
-            while let Some(current) = stack.pop() {
-                let target = tree.get(current).expect("a node");
-                if let NodeKind::Text(content) = target.kind() {
-                    texts.push(content.text.to_string());
-                }
-                stack.extend(target.children().iter().copied());
-            }
-            texts.join("\n")
-        }
-
-        fn visible(&self, node: NodeId) -> bool {
-            self.tree()
-                .get(node)
-                .expect("the node exists")
-                .style_patch()
-                .visible
-                .unwrap_or(true)
-        }
+    /// A pane whose countdown reads a clock the test owns, loaded and with its body
+    /// built: what every countdown test starts from before it accepts an answer.
+    fn countdown_pane(harness: &mut WidgetTestApp, clock: &Rc<StdCell<i64>>) -> Pane {
+        let mut pane = pane_with_clock(
+            harness,
+            FakeSource::new([FetchPlan::Pending]),
+            Rc::clone(clock),
+        );
+        load(harness, &mut pane);
+        build_body(harness, &mut pane);
+        pane
     }
 
     /// The countdown is written by the answer and ticks once per interval, and only
     /// the tick that changed the label asks for a frame (I3).
     #[test]
     fn a_countdown_tick_should_ask_for_a_frame_only_when_its_label_changed() {
-        let mut host = ClockHost::new();
-        host.sign_in();
-        host.load();
-        host.accept(600_000);
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let clock = Rc::new(StdCell::new(0_i64));
+        let mut pane = countdown_pane(&mut harness, &clock);
+        accept_answer(&mut harness, &mut pane, &clock, 600_000);
+        let (_, right) = build_header(&mut harness, &mut pane);
+        // The header's own first frame settles its text; measure after it.
+        harness.drain();
 
-        assert_eq!(host.label().as_deref(), Some("10:00"));
-        assert!(host.timer_armed(), "a ready pane keeps one timer armed");
-        let frames = host.app.app().frame_requests();
+        assert_eq!(countdown_text(&harness, right), "10:00");
+        assert!(timer_armed(&pane), "a ready pane keeps one timer armed");
+        let frames = harness.frame_requests();
 
-        // A tick that leaves the label where it was draws nothing.
-        host.advance(COUNTDOWN_TICK);
-        host.frame();
-        assert_eq!(host.label().as_deref(), Some("10:00"));
+        // A tick that leaves the label where it was draws nothing. `frame_requests` is
+        // I3's assertion surface (AGENTS §11): the idle round asks for no frame, even
+        // though the engine may still present a frame an earlier build left pending.
+        harness.advance(COUNTDOWN_TICK);
+        assert_eq!(countdown_text(&harness, right), "10:00");
         assert_eq!(
-            host.app.app().frame_requests(),
+            harness.frame_requests(),
             frames,
             "a tick that leaves the label where it was asks for nothing"
         );
 
         // A second later the label moved, and the write asks for the frame that draws
         // it.
-        host.clock.set(1_000);
-        host.advance(COUNTDOWN_TICK);
-        host.frame();
-        assert_eq!(host.label().as_deref(), Some("09:59"));
+        clock.set(1_000);
+        harness.advance(COUNTDOWN_TICK);
+        assert_eq!(countdown_text(&harness, right), "09:59");
         assert!(
-            host.app.app().frame_requests() > frames,
+            harness.frame_requests() > frames,
             "the tick that changed the label asked for the frame that draws it"
         );
     }
@@ -3914,41 +3931,46 @@ mod tests {
     /// any polling task.
     #[test]
     fn a_countdown_should_rearm_its_timer_for_each_tick() {
-        let mut host = ClockHost::new();
-        host.sign_in();
-        host.load();
-        host.accept(600_000);
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let clock = Rc::new(StdCell::new(0_i64));
+        let mut pane = countdown_pane(&mut harness, &clock);
+        accept_answer(&mut harness, &mut pane, &clock, 600_000);
+        let (_, right) = build_header(&mut harness, &mut pane);
 
         for second in 1..=3 {
-            host.clock.set(second * 1_000);
-            host.advance(COUNTDOWN_TICK);
-            host.frame();
+            clock.set(second * 1_000);
+            harness.advance(COUNTDOWN_TICK);
             assert_eq!(
-                host.label().as_deref(),
-                Some(format!("09:{:02}", 60 - second).as_str()),
+                countdown_text(&harness, right),
+                format!("09:{:02}", 60 - second),
                 "tick {second} moved the label"
             );
-            assert!(host.timer_armed(), "the timer re-armed itself");
+            assert!(timer_armed(&pane), "the timer re-armed itself");
         }
     }
 
     #[test]
     fn releasing_the_widget_should_cancel_the_countdown_timer() {
-        let mut host = ClockHost::new();
-        host.sign_in();
-        host.load();
-        host.accept(600_000);
-        assert!(host.timer_armed());
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let clock = Rc::new(StdCell::new(0_i64));
+        let mut pane = countdown_pane(&mut harness, &clock);
+        accept_answer(&mut harness, &mut pane, &clock, 600_000);
+        let _ = build_header(&mut harness, &mut pane);
+        assert!(timer_armed(&pane));
 
-        host.with_cx(|widget, cx| widget.release(cx));
+        harness.with_cx(|cx| pane.widget.release(cx));
 
-        assert!(!host.timer_armed(), "release cancels the timer");
-        assert!(host.label().is_none(), "and clears the label");
-        let frames = host.app.app().frame_requests();
-        host.advance(COUNTDOWN_TICK * 4);
-        host.app.drain().expect("the frame commits");
+        assert!(!timer_armed(&pane), "release cancels the timer");
+        assert!(
+            countdown_label(&harness, &pane).is_none(),
+            "and clears the label"
+        );
+        let frames = harness.frame_requests();
+        harness.advance(COUNTDOWN_TICK * 4);
         assert_eq!(
-            host.app.app().frame_requests(),
+            harness.frame_requests(),
             frames,
             "a released pane's timer never fires"
         );
@@ -3958,81 +3980,78 @@ mod tests {
     /// timer is gone with it.
     #[test]
     fn a_failure_should_stop_the_countdown_timer() {
-        let mut host = ClockHost::new();
-        host.sign_in();
-        host.load();
-        host.accept(unix_millis() + 60_000);
-        assert!(host.timer_armed());
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let clock = Rc::new(StdCell::new(0_i64));
+        let mut pane = countdown_pane(&mut harness, &clock);
+        accept_answer(&mut harness, &mut pane, &clock, 60_000);
+        assert!(timer_armed(&pane));
 
-        let calendar_key = key(ACCOUNT);
-        host.with_cx(|widget, cx| {
-            widget.apply_reliable(
-                calendar_key,
-                &CalendarStreamMessage::Failed {
-                    error: CalendarFetchError::Service(KytrixServiceError::Connect(
-                        "the test source refused".into(),
-                    )),
-                },
-                cx,
-            );
-            widget.sync(cx).expect("the widget syncs");
-        });
+        report_failure(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
 
-        assert!(!host.timer_armed(), "the failed pane's timer is cancelled");
-        assert!(host.label().is_none());
+        assert!(!timer_armed(&pane), "the failed pane's timer is cancelled");
+        assert!(countdown_label(&harness, &pane).is_none());
     }
 
     /// The countdown belongs to a ready pane: a read in flight has nothing to count
     /// down to.
     #[test]
     fn an_accepted_command_should_leave_nothing_to_count_down_to() {
-        let mut host = ClockHost::new();
-        host.sign_in();
-        host.load();
-        host.accept(unix_millis() + 60_000);
-        assert!(host.label().is_some());
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let clock = Rc::new(StdCell::new(0_i64));
+        let mut pane = countdown_pane(&mut harness, &clock);
+        accept_answer(&mut harness, &mut pane, &clock, 60_000);
+        assert!(countdown_label(&harness, &pane).is_some());
 
-        host.with_cx(|widget, cx| widget.refresh(cx));
-        assert!(host.widget.refresh_pending);
-        host.frame();
+        harness.with_cx(|cx| pane.widget.refresh(cx));
+        assert!(pane.widget.refresh_pending);
+        sync(&mut harness, &mut pane);
 
-        assert!(host.label().is_none(), "the read in flight has no schedule");
-        assert!(!host.timer_armed());
+        assert!(
+            countdown_label(&harness, &pane).is_none(),
+            "the read in flight has no schedule"
+        );
+        assert!(!timer_armed(&pane));
     }
 
     /// The countdown is a signal drawn beside the refresh control: an idle pane draws
     /// no countdown at all, and an accepted answer states the time left.
     #[test]
     fn the_header_should_draw_the_countdown_beside_the_refresh_control() {
-        let mut host = ClockHost::new();
-        host.sign_in();
-        host.load();
-        let right = host.with_cx(|_, cx| {
-            let root = cx.tree().root();
-            NodeBuilder::boxed()
-                .id("TEST_HEADER_RIGHT")
-                .build(cx.tree_mut(), root)
-                .expect("the header parent builds")
-        });
-        host.with_cx(|widget, cx| {
-            widget
-                .header(HeaderGroup::Right, right, cx)
-                .expect("the header builds")
-        });
-        host.frame();
+        let mut harness = harness();
+        sign_in(&mut harness);
+        let clock = Rc::new(StdCell::new(0_i64));
+        let mut pane = pane_with_clock(
+            &mut harness,
+            FakeSource::new([FetchPlan::Pending]),
+            Rc::clone(&clock),
+        );
+        load(&mut harness, &mut pane);
+        let right = header_parent(&mut harness, "TEST_HEADER_RIGHT");
+        harness
+            .with_cx(|cx| pane.widget.header(HeaderGroup::Right, right, cx))
+            .expect("the header builds");
+        harness.drain();
 
-        let countdown = host
-            .node_with_debug(right, "TEST_FINANCIAL_CALENDAR_COUNTDOWN")
+        let countdown = harness
+            .find_by_debug_prefix(right, "TEST_FINANCIAL_CALENDAR_COUNTDOWN")
             .expect("the header draws the countdown label");
-        assert_eq!(host.text_of(countdown), "", "nothing has been accepted yet");
+        assert_eq!(
+            harness.text_of(countdown),
+            "",
+            "nothing has been accepted yet"
+        );
         assert!(
-            !host.visible(countdown),
+            !harness.visible(countdown),
             "and there is nothing to count down to"
         );
 
-        host.accept(600_000);
+        accept_answer(&mut harness, &mut pane, &clock, 600_000);
+        harness.drain();
 
-        assert_eq!(host.text_of(countdown), "10:00");
-        assert!(host.visible(countdown));
+        assert_eq!(harness.text_of(countdown), "10:00");
+        assert!(harness.visible(countdown));
     }
 }

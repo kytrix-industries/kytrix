@@ -618,7 +618,6 @@ widget:
     country: 国家
     day_label: '%{year}年%{month}%{day}日 %{weekday}'
     filter_choice: '%{filter}：%{value}'
-    filter_tooltip: 按%{filter}筛选
     importance: 重要性
     importance_level:
       high: 高
