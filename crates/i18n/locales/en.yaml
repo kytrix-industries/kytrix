@@ -993,6 +993,7 @@ widget:
     account_ratio: Account Ratio
     amount: Amount
     buy_volume: Buy Volume
+    chart: Perpetual statistics chart
     contracts_unit: Contracts
     interval: Statistics interval
     long_accounts: Long Accounts

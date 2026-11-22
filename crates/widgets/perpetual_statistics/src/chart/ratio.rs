@@ -1,31 +1,29 @@
 //! The long/short ratio chart: the ratio as a line, with the two sides it implies
 //! stacked behind it.
 //!
-//! Only the ratio is published, and it is the long side over the short side, so
-//! the two shares a stacked bar needs are that ratio resolved against a whole.
-//! Drawing both is the point: the ratio says how lopsided the market is, and the
-//! stack says which way, which a ratio below one makes easy to misread.
+//! Only the ratio is published, and it is the long side over the short side, so the two
+//! shares a stacked bar needs are that ratio resolved against a whole. Drawing both is
+//! the point: the ratio says how lopsided the market is, and the stack says which way,
+//! which a ratio below one makes easy to misread.
 
 use std::sync::Arc;
 
-use gpui_kit::{App, Bounds, Pixels, Point, SharedString};
-use i18n::t;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_model::listing::rules::ListingPrecision;
 use smol_str::SmolStr;
 use time::UtcOffset;
-use widget::time_zone::data_time_zone;
 
 use super::{
-    ChartData,
     axes::{AxisScale, ChartLayout, ratio_domain, share_scale, valid_index},
-    paint::{FrameKey, Hover, Prepared, Tooltip, TooltipEntry, prepare_ratio, time_labels},
+    canvas::ChartData,
+    paint::{Prepared, Tooltip, TooltipEntry, prepare_ratio, time_labels},
     palette::{Series, SeriesLabel},
     text::{format_axis_time, format_ratio, format_share, format_tooltip_time, labelled_value},
 };
 use crate::model::{LongShortRatioPoint, StatisticsPoints, ratio_as_f64, ratio_shares};
 
-/// The share axis: a whole is one, so its ticks are the same whatever the data
-/// says, and they are written as the percentages the shares are read as.
+/// The share axis: a whole is one, so its ticks are the same whatever the data says, and
+/// they are written as the percentages the shares are read as.
 const SHARE_TICKS: [(f64, &str); 5] = [
     (0.0, "0%"),
     (0.25, "25%"),
@@ -34,59 +32,45 @@ const SHARE_TICKS: [(f64, &str); 5] = [
     (1.0, "100%"),
 ];
 
-/// The names one ratio chart shows, resolved from the active locale.
+/// The names one ratio chart shows, resolved from the active language.
 ///
-/// The three ratio widgets share this chart but not their wording: "long
-/// accounts" and "long positions" are different readings of the same series, so
-/// the names are given to the chart rather than chosen by it.
+/// The three ratio widgets share this chart but not their wording: "long accounts" and
+/// "long positions" are different readings of the same series, so the names are given to
+/// the chart rather than chosen by it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Labels {
-    pub long: SmolStr,
-    pub short: SmolStr,
-    pub ratio: SmolStr,
+struct Labels {
+    long: SmolStr,
+    short: SmolStr,
+    ratio: SmolStr,
 }
 
 impl Labels {
     /// Resolves the series names from three message keys.
-    pub(super) fn resolve(cx: &App, long: &str, short: &str, ratio: &str) -> Self {
+    fn resolve(translate: &Translate, keys: [&'static str; 3]) -> Self {
         Self {
-            long: SmolStr::new(t!(cx, long).as_ref()),
-            short: SmolStr::new(t!(cx, short).as_ref()),
-            ratio: SmolStr::new(t!(cx, ratio).as_ref()),
+            long: t_smol!(translate, keys[0]),
+            short: t_smol!(translate, keys[1]),
+            ratio: t_smol!(translate, keys[2]),
         }
-    }
-
-    /// The names as a legend, in the order the series are drawn.
-    fn legend(&self) -> Box<[SeriesLabel]> {
-        vec![
-            SeriesLabel {
-                series: Series::Long,
-                label: self.long.clone(),
-            },
-            SeriesLabel {
-                series: Series::Short,
-                label: self.short.clone(),
-            },
-            SeriesLabel {
-                series: Series::Ratio,
-                label: self.ratio.clone(),
-            },
-        ]
-        .into_boxed_slice()
     }
 }
 
 /// The ratio chart's state.
 pub(crate) struct RatioChart {
     points: Arc<[LongShortRatioPoint]>,
+    /// The three message keys the labels were resolved from, kept so a language change
+    /// can resolve them again.
+    keys: [&'static str; 3],
     labels: Labels,
+    locale: LanguageCode,
     revision: u64,
     shares: AxisScale,
     ratio: AxisScale,
     time_labels: Box<[SmolStr]>,
     tooltips: Arc<[Tooltip]>,
-    /// The indices whose ratio is a reading, which is what a hover may land on
-    /// and the only points the chart draws.
+    legend: Box<[SeriesLabel]>,
+    /// The indices whose ratio is a reading, which is what a hover may land on and the
+    /// only points the chart draws.
     valid: Box<[usize]>,
     /// The zone the axis labels and tooltips were written in.
     zone: UtcOffset,
@@ -94,19 +78,30 @@ pub(crate) struct RatioChart {
 
 impl RatioChart {
     /// Builds an empty chart of `labels`' series.
-    pub(super) fn new(cx: &App, long: &str, short: &str, ratio: &str) -> Self {
+    pub(crate) fn new(
+        translate: &Translate,
+        long: &'static str,
+        short: &'static str,
+        ratio: &'static str,
+        zone: UtcOffset,
+    ) -> Self {
+        let keys = [long, short, ratio];
         Self::build(
             Arc::from(Vec::new()),
             0,
-            Labels::resolve(cx, long, short, ratio),
-            data_time_zone(cx),
+            keys,
+            Labels::resolve(translate, keys),
+            translate.language(),
+            zone,
         )
     }
 
     fn build(
         points: Arc<[LongShortRatioPoint]>,
         revision: u64,
+        keys: [&'static str; 3],
         labels: Labels,
+        locale: LanguageCode,
         zone: UtcOffset,
     ) -> Self {
         let valid = points
@@ -158,7 +153,24 @@ impl RatioChart {
             .into();
         Self {
             points,
+            keys,
+            legend: vec![
+                SeriesLabel {
+                    series: Series::Long,
+                    label: labels.long.clone(),
+                },
+                SeriesLabel {
+                    series: Series::Short,
+                    label: labels.short.clone(),
+                },
+                SeriesLabel {
+                    series: Series::Ratio,
+                    label: labels.ratio.clone(),
+                },
+            ]
+            .into_boxed_slice(),
             labels,
+            locale,
             revision,
             shares,
             ratio,
@@ -188,38 +200,26 @@ impl ChartData for RatioChart {
         self.revision
     }
 
-    fn frame_key(&self, bounds: Bounds<Pixels>) -> FrameKey {
-        FrameKey::new(bounds, self.revision, true, self.zone)
+    fn scales(&self) -> (Option<&AxisScale>, &AxisScale) {
+        (Some(&self.shares), &self.ratio)
     }
 
-    fn scales(&self) -> (Option<&AxisScale>, &AxisScale, Option<&AxisScale>) {
-        (Some(&self.shares), &self.ratio, None)
+    fn legend(&self) -> &[SeriesLabel] {
+        &self.legend
     }
 
-    fn legend(&self, _cx: &App) -> Box<[SeriesLabel]> {
-        self.labels.legend()
-    }
-
-    fn axis_titles(&self, _cx: &App) -> (Option<SharedString>, SharedString) {
-        (None, SharedString::default())
-    }
-
-    fn hover_point(
-        &self,
-        index: usize,
-        cursor: Point<Pixels>,
-        _layout: ChartLayout,
-    ) -> Option<Hover> {
-        // A point whose ratio is not a reading has no shares to annotate, so a
-        // hover over one moves on to the nearest that has.
-        Some(Hover {
-            index: valid_index(&self.valid, index)?,
-            cursor,
-        })
+    fn axis_titles(&self) -> (&str, &str) {
+        ("", "")
     }
 
     fn prepare(&self, layout: ChartLayout) -> Prepared {
         prepare_ratio(&self.points, &self.ratio, &self.time_labels, layout)
+    }
+
+    fn hover_point(&self, index: usize) -> Option<usize> {
+        // A point whose ratio is not a reading has no shares to annotate, so a hover over
+        // one moves on to the nearest that has.
+        valid_index(&self.valid, index)
     }
 
     fn tooltip(&self, index: usize) -> Option<Tooltip> {
@@ -230,17 +230,38 @@ impl ChartData for RatioChart {
     }
 
     /// Rewrites the labels in another display zone.
-    ///
-    /// Returns whether anything moved: the same zone is the same labels, and the
-    /// chart is left exactly as it was.
     fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
         if self.zone == zone {
             return false;
         }
-        let points = Arc::clone(&self.points);
-        let revision = self.revision;
-        let labels = self.labels.clone();
-        *self = Self::build(points, revision, labels, zone);
+        let (points, revision, keys, labels, locale) = (
+            Arc::clone(&self.points),
+            self.revision,
+            self.keys,
+            self.labels.clone(),
+            self.locale,
+        );
+        *self = Self::build(points, revision, keys, labels, locale, zone);
+        true
+    }
+
+    fn set_locale(&mut self, translate: &Translate) -> bool {
+        if self.locale == translate.language() {
+            return false;
+        }
+        let labels = Labels::resolve(translate, self.keys);
+        if labels == self.labels {
+            self.locale = translate.language();
+            return false;
+        }
+        let (points, revision, keys, locale, zone) = (
+            Arc::clone(&self.points),
+            self.revision,
+            self.keys,
+            translate.language(),
+            self.zone,
+        );
+        *self = Self::build(points, revision, keys, labels, locale, zone);
         true
     }
 
@@ -250,15 +271,15 @@ impl ChartData for RatioChart {
         _metadata: Option<ListingPrecision>,
         points: Arc<Self::Slice>,
     ) -> bool {
-        // A revision that moved is a new window even when its points are the same
-        // values: the pane asked for this one, and it is the one it is now showing.
+        // A revision that moved is a new window even when its points are the same values:
+        // the pane asked for this one, and it is the one it is now showing.
         if revision < self.revision
             || (revision == self.revision && Arc::ptr_eq(&self.points, &points))
         {
             return false;
         }
-        let labels = self.labels.clone();
-        *self = Self::build(points, revision, labels, self.zone);
+        let (keys, labels, locale, zone) = (self.keys, self.labels.clone(), self.locale, self.zone);
+        *self = Self::build(points, revision, keys, labels, locale, zone);
         true
     }
 }

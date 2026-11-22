@@ -993,6 +993,7 @@ widget:
     account_ratio: 账户比
     amount: 数量
     buy_volume: 买入量
+    chart: 永续统计图表
     contracts_unit: 合约
     interval: 统计周期
     long_accounts: 多头账户

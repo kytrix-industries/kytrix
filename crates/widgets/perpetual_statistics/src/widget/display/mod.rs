@@ -1,3 +1,4 @@
+pub(crate) mod directory;
 pub(crate) mod pane;
 
 pub(crate) use pane::*;
