@@ -52,7 +52,7 @@ use super::{
         ui::{self, Intents},
     },
     gallery::GalleryPage,
-    pane::Pane,
+    pane::{Pane, PaneParts},
     tree::{PaneId, PaneOrientation, PaneTree, SplitId},
 };
 
@@ -118,6 +118,9 @@ pub(crate) struct Stage {
     gallery: Option<GalleryPage>,
     /// The measured stage size the panes were last laid out at.
     viewport: ui_core::math::Size,
+    /// Set when the topology or a fraction changed: the layout has to be recomputed even
+    /// though the stage's measured size did not move.
+    geometry_dirty: Cell<bool>,
     /// Set when a widget reports a config change the settings must follow.
     dirty: Rc<Cell<bool>>,
 }
@@ -168,7 +171,7 @@ impl Stage {
             intents,
             registry: Rc::clone(&composition.catalogue),
             services: Rc::clone(composition.services()),
-            language_signal: composition.language,
+            language_signal: composition.services().language,
             language,
             root,
             tree,
@@ -176,6 +179,7 @@ impl Stage {
             bars: Vec::new(),
             gallery: None,
             viewport: ui_core::math::Size::default(),
+            geometry_dirty: Cell::new(true),
             dirty,
         };
         for (pane, stored) in leaves {
@@ -217,12 +221,14 @@ impl Stage {
             self.root,
             pane,
             stored,
-            &self.registry,
-            &self.services,
-            self.config_change(),
-            self.intents(),
-            &self.theme,
-            &self.translate,
+            PaneParts {
+                registry: &self.registry,
+                services: &self.services,
+                config_change: self.config_change(),
+                intents: self.intents(),
+                theme: &self.theme,
+                translate: &self.translate,
+            },
         )?;
         self.panes.push(mounted);
 
@@ -292,7 +298,12 @@ impl Stage {
         Ok(())
     }
 
-    /// Re-lays the panes out when the stage's measured size changed.
+    /// Re-lays the panes out when the stage's measured size changed, or when the topology
+    /// or a split fraction moved since the last pass.
+    ///
+    /// The size check alone is not enough: splitting, closing, choosing a widget and
+    /// dragging a splitter all change the rectangles while the window stays the same size,
+    /// and those changes are what marks the layout dirty.
     fn apply_geometry(&mut self, app: &mut App) -> Result<(), EngineError> {
         let Some(target) = app.window(self.window) else {
             return Ok(());
@@ -302,10 +313,11 @@ impl Stage {
             .get(self.root)
             .map(|node| node.layout().bounds.size)
             .unwrap_or_default();
-        if size == self.viewport {
+        if size == self.viewport && !self.geometry_dirty.get() {
             return Ok(());
         }
         self.viewport = size;
+        self.geometry_dirty.set(false);
         let viewport = Rect::new(0.0, 0.0, size.width, size.height);
         let geometry = self.tree.layout(viewport);
         for (pane, rect) in geometry.panes {
@@ -391,6 +403,7 @@ impl Stage {
         self.mount_pane(app, window, new_pane, &stored)?;
         self.rebuild_bars(app, window)?;
         self.sync_close_buttons(app, window)?;
+        self.geometry_dirty.set(true);
         self.apply_geometry(app)?;
 
         Ok(true)
@@ -415,6 +428,7 @@ impl Stage {
         }
         self.rebuild_bars(app, self.window)?;
         self.sync_close_buttons(app, self.window)?;
+        self.geometry_dirty.set(true);
         self.apply_geometry(app)?;
         if let Some(page) = &self.gallery
             && page.pane() == pane
@@ -616,9 +630,13 @@ impl Stage {
                     PaneOrientation::Vertical => delta.y,
                 };
                 self.tree.set_fraction(split, origin + offset / extent);
+                self.geometry_dirty.set(true);
                 self.apply_geometry(app)?;
 
-                Ok(true)
+                // The drag moved the panes on screen, but the stored layout is written
+                // once, on `End`: a settings write per pointer move is a synchronous disk
+                // write per frame (ledger C7).
+                Ok(false)
             }
             DragPhase::End | DragPhase::Cancel => {
                 bar.drag_origin = None;

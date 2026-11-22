@@ -141,6 +141,29 @@ impl Harness {
         self.tree().get(node).ok().map(|node| node.layout().bounds)
     }
 
+    /// Every layout rectangle the window gives a node with this debug id, in tree order.
+    pub(crate) fn bounds_all(&self, debug_id: &str) -> Vec<Rect> {
+        let tree = self.tree();
+        self.nodes()
+            .into_iter()
+            .filter(|node| tree.debug_id(*node) == Some(debug_id))
+            .filter_map(|node| tree.get(node).ok().map(|node| node.layout().bounds))
+            .collect()
+    }
+
+    /// The first debug id in tree order that contains `needle`.
+    ///
+    /// A few components derive their debug ids from a per-instance prefix (the gallery
+    /// page does), so a test names the part it knows rather than the whole id.
+    pub(crate) fn debug_id_containing(&self, needle: &str) -> Option<SmolStr> {
+        let tree = self.tree();
+        self.nodes().into_iter().find_map(|node| {
+            tree.debug_id(node)
+                .filter(|id| id.contains(needle))
+                .map(SmolStr::from)
+        })
+    }
+
     /// Every exact text the window draws, in tree order.
     pub(crate) fn texts(&self) -> Vec<SmolStr> {
         let tree = self.tree();
@@ -221,6 +244,56 @@ impl Harness {
             }
         }
         node
+    }
+
+    /// Presses on the node with this debug id, drags it by `delta` and releases.
+    ///
+    /// The press, the move that crosses the drag threshold and the move that reports the
+    /// full delta all go through the engine's own input dispatch (the same path a platform
+    /// pump uses), so a drag target's `DragPhase::Start` / `Move` / `End` sequence is the
+    /// production one. The frame that follows applies the intents the drag reported.
+    pub(crate) fn drag(&mut self, debug_id: &str, delta: Point) {
+        let node = self
+            .node(debug_id)
+            .unwrap_or_else(|| panic!("the window should draw {debug_id}"));
+        let bounds = self
+            .tree()
+            .get(node)
+            .map(|node| node.layout().bounds)
+            .unwrap_or_else(|_| panic!("{debug_id} should have a box"));
+        assert!(
+            bounds.size.width > 0.0 && bounds.size.height > 0.0,
+            "{debug_id} should have a hit area: {bounds:?}"
+        );
+        let start = Point::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        let move_to = |offset: Point| Point::new(start.x + offset.x, start.y + offset.y);
+        let _ = self.app.inject(InputEvent::PointerDown {
+            position: start,
+            button: PointerButton::Primary,
+            modifiers: Modifiers::empty(),
+            timestamp: Instant::now(),
+        });
+        // The first move only has to cross the drag threshold; the moves after it report
+        // the deltas the drag travels through. More than one matters: a drag that persisted
+        // on every reported move would write several times, which a single move could not
+        // tell apart from one write at the end.
+        let _ = self
+            .app
+            .move_pointer(move_to(Point::new(delta.x * 0.5, delta.y * 0.5)));
+        let _ = self
+            .app
+            .move_pointer(move_to(Point::new(delta.x * 0.75, delta.y * 0.75)));
+        let _ = self.app.move_pointer(move_to(delta));
+        let _ = self.app.inject(InputEvent::PointerUp {
+            position: move_to(delta),
+            button: PointerButton::Primary,
+            modifiers: Modifiers::empty(),
+            timestamp: Instant::now(),
+        });
+        self.tick();
     }
 
     /// The frame cursor the window has published.
@@ -641,5 +714,289 @@ mod tests {
             wallet_address: "0xabc".to_owned(),
             wallet_kind: AccountWalletKind::Ethereum,
         }
+    }
+
+    /// A language write reaches the frozen services signals and the widget mounted in the
+    /// pane redraws in the new language: the P1-1 end-to-end probe.
+    ///
+    /// The pane's default widget draws the framework's hint, whose copy is resolved from
+    /// `WidgetServices::translate` in the language the surface reads from
+    /// `WidgetServices::language` — so the text changing is what proves the write reached
+    /// the consumers.
+    #[test]
+    fn a_language_write_should_reach_the_mounted_widget() {
+        let mut harness = Harness::new();
+        assert!(
+            harness
+                .texts()
+                .iter()
+                .any(|text| text.contains("select a widget")),
+            "the default widget starts in English: {:?}",
+            harness.texts()
+        );
+
+        harness
+            .composition
+            .hub
+            .edit(harness.app.app_mut(), |config| {
+                config.language = Language::ZhCn;
+            })
+            .expect("the in-memory store stores the language");
+        harness.tick();
+
+        assert_eq!(
+            *harness
+                .app
+                .app()
+                .read(&harness.composition.services().language),
+            LanguageCode::ZhCn,
+            "the frozen language signal follows the write"
+        );
+        assert_eq!(
+            harness
+                .app
+                .app()
+                .read_with(&harness.composition.services().config, |config| {
+                    config.language
+                }),
+            Language::ZhCn,
+            "the frozen config snapshot follows the write"
+        );
+        assert!(
+            harness
+                .texts()
+                .iter()
+                .any(|text| text.contains("选择一个部件")),
+            "the mounted widget redraws in the new language: {:?}",
+            harness.texts()
+        );
+    }
+
+    /// The settings page is built from `WidgetServices` too: a language write while it is
+    /// open rebuilds its chrome (P1-1's settings-page half).
+    #[test]
+    fn a_language_write_should_rebuild_the_settings_page() {
+        let mut harness = Harness::new();
+        harness.click("SIDEBAR_FOOTER_SETTINGS");
+        assert!(
+            harness
+                .texts()
+                .iter()
+                .any(|text| text.as_str() == "Appearance"),
+            "the settings page starts in English: {:?}",
+            harness.texts()
+        );
+
+        harness
+            .composition
+            .hub
+            .edit(harness.app.app_mut(), |config| {
+                config.language = Language::ZhCn;
+            })
+            .expect("the in-memory store stores the language");
+        harness.tick();
+
+        assert!(
+            harness.texts().iter().any(|text| text.as_str() == "外观"),
+            "the settings page follows the language signal: {:?}",
+            harness.texts()
+        );
+    }
+
+    /// Splitting lays both panes out: a new pane gets a real share of the stage instead of
+    /// the zero rectangle its frame is built with (P1-2).
+    #[test]
+    fn splitting_should_lay_the_new_pane_out() {
+        let mut harness = Harness::new();
+        let stage = harness
+            .bounds("WORKSPACE_STAGE")
+            .expect("the stage is drawn");
+
+        harness.click("PANE_SPLIT_RIGHT");
+
+        let bodies = harness.bounds_all("PANE_BODY");
+        assert_eq!(bodies.len(), 2, "the split mounts a second pane");
+        for body in &bodies {
+            assert!(
+                body.size.width > 0.0 && body.size.height > 0.0,
+                "every pane has a real rectangle: {bodies:?}"
+            );
+        }
+        assert!(
+            (bodies[0].size.width + bodies[1].size.width) <= stage.size.width,
+            "the panes fit inside the stage: stage {stage:?}, panes {bodies:?}"
+        );
+        assert!(
+            (bodies[0].size.width - bodies[1].size.width).abs() < 1.0,
+            "an even split gives both panes the same width: {bodies:?}"
+        );
+    }
+
+    /// Closing a pane gives the survivor the whole stage again (the topology changed, the
+    /// window did not).
+    #[test]
+    fn closing_a_pane_should_give_the_survivor_the_whole_stage() {
+        let mut harness = Harness::new();
+        let stage = harness
+            .bounds("WORKSPACE_STAGE")
+            .expect("the stage is drawn");
+        harness.click("PANE_SPLIT_RIGHT");
+
+        harness.click("PANE_CLOSE_BUTTON");
+
+        let bodies = harness.bounds_all("PANE_BODY");
+        assert_eq!(bodies.len(), 1, "the closed pane is gone");
+        let width_ratio = bodies[0].size.width / stage.size.width;
+        assert!(
+            width_ratio > 0.9,
+            "the surviving pane fills the stage: stage {stage:?}, pane {:?}",
+            bodies[0]
+        );
+    }
+
+    /// Dragging the split bar moves the panes: the geometry follows the fraction (P1-2)
+    /// while the stored layout is written once, when the drag ends (P2-③).
+    #[test]
+    fn dragging_the_split_bar_should_move_the_panes_and_persist_once() {
+        let mut harness = Harness::new();
+        harness.click("PANE_SPLIT_RIGHT");
+        let bar = harness
+            .debug_id_containing("SPLIT_BAR")
+            .expect("the split draws a bar");
+        let before = harness.bounds_all("PANE_BODY");
+        let commits = harness.composition.hub.commits();
+
+        harness.drag(&bar, Point::new(80.0, 0.0));
+
+        let after = harness.bounds_all("PANE_BODY");
+        assert!(
+            after[0].size.width > before[0].size.width + 40.0,
+            "the head pane follows the bar: before {before:?}, after {after:?}"
+        );
+        assert!(
+            after[1].size.width > 0.0,
+            "the tail pane keeps a real rectangle: {after:?}"
+        );
+        assert_eq!(
+            harness.composition.hub.commits(),
+            commits + 1,
+            "a drag writes the layout once, on End, not once per pointer move"
+        );
+    }
+
+    /// A rebuilt sidebar keeps its place in the window's child order, below the self-drawn
+    /// title bar (P2-④): window children are painted in that order, and a panel rebuilt by
+    /// appending would cover the chrome.
+    #[test]
+    fn a_rebuilt_sidebar_should_stay_below_the_title_bar() {
+        let mut harness = Harness::new();
+        let child_ids = |harness: &Harness| {
+            let tree = harness.tree();
+            let root = tree.root();
+            tree.get(root)
+                .expect("the window has a root")
+                .children()
+                .iter()
+                .filter_map(|child| tree.debug_id(*child).map(SmolStr::from))
+                .collect::<Vec<_>>()
+        };
+        let before = child_ids(&harness);
+
+        // The toggle rebuilds the panel; so does a workspace-list change, but the toggle is
+        // the one a test can drive without the add/rename dialogs.
+        harness.click("TITLE_BAR_SIDEBAR_TOGGLE");
+        harness.click("TITLE_BAR_SIDEBAR_TOGGLE");
+
+        let after = child_ids(&harness);
+        assert_eq!(
+            before, after,
+            "a rebuild does not append the panel to the window root"
+        );
+        let sidebar = after
+            .iter()
+            .position(|id| id.as_str() == "SIDEBAR")
+            .expect("the window draws a sidebar");
+        let title_bar = after
+            .iter()
+            .position(|id| id.as_str() == "TITLE_BAR")
+            .expect("the window draws a title bar");
+        assert!(
+            sidebar < title_bar,
+            "the sidebar is painted below the title bar: {after:?}"
+        );
+        assert_eq!(
+            title_bar,
+            after.len() - 1,
+            "the title bar stays the window's last child: {after:?}"
+        );
+    }
+
+    /// Confirming a choice in the gallery replaces the pane's widget: the old instance is
+    /// released (its frame route and nodes go) and the new one mounts (P2-⑤).
+    #[test]
+    fn the_gallery_confirm_should_replace_the_pane_widget_and_release_the_old_one() {
+        let mut harness = Harness::new();
+        let routes = harness.composition.frame_router.len();
+
+        harness.click("PANE_WIDGET_BUTTON");
+        assert!(harness.shell.borrow().pages().stage().gallery_open());
+        let row = harness
+            .debug_id_containing(".row.kytrix.")
+            .expect("the gallery lists a widget");
+        let chosen = row
+            .as_str()
+            .rsplit_once(".row.")
+            .expect("a row's id ends in the widget id")
+            .1
+            .to_owned();
+        harness.click(&row);
+
+        let confirm = harness
+            .debug_id_containing(".confirm")
+            .expect("the gallery footer draws its confirm control");
+        harness.click(&confirm);
+
+        assert!(
+            !harness.shell.borrow().pages().stage().gallery_open(),
+            "the page leaves once it reported"
+        );
+        assert_eq!(
+            harness.composition.frame_router.len(),
+            routes,
+            "the old widget's route is released as the new widget's route registers"
+        );
+        let layout = harness.shell.borrow().pages().stage().snapshot();
+        let WorkspaceLayout::Pane { widget } = layout else {
+            panic!("a fresh workspace is one pane");
+        };
+        assert_eq!(
+            widget.id.as_str(),
+            chosen,
+            "the pane shows the widget the gallery confirmed"
+        );
+        assert_eq!(harness.count("WIDGET_SURFACE"), 1, "one widget, not two");
+    }
+
+    /// Cancelling the gallery leaves the page, releases it and changes no pane (P2-⑤).
+    #[test]
+    fn the_gallery_cancel_should_release_the_page_and_keep_the_pane_widget() {
+        let mut harness = Harness::new();
+        let routes = harness.composition.frame_router.len();
+        let before = harness.shell.borrow().pages().stage().snapshot();
+
+        harness.click("PANE_WIDGET_BUTTON");
+        let cancel = harness
+            .debug_id_containing(".cancel")
+            .expect("the gallery footer draws its cancel control");
+        harness.click(&cancel);
+
+        assert!(!harness.shell.borrow().pages().stage().gallery_open());
+        assert_eq!(harness.composition.frame_router.len(), routes);
+        assert_eq!(
+            harness.shell.borrow().pages().stage().snapshot(),
+            before,
+            "a cancelled page chooses nothing"
+        );
+        assert_eq!(harness.count("WIDGET_SURFACE"), 1);
     }
 }

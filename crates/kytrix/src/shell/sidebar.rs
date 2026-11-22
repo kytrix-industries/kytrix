@@ -107,7 +107,7 @@ impl Sidebar {
             theme: composition.theme.clone(),
             translate: composition.translate.clone(),
             intents,
-            language_signal: composition.language,
+            language_signal: composition.services().language,
             language: composition
                 .hub
                 .read(|config| crate::language::code(config.language)),
@@ -124,6 +124,11 @@ impl Sidebar {
     }
 
     /// Draws the panel in `mode`, releasing whatever the previous state owned.
+    ///
+    /// The panel's own node survives a rebuild: only its contents are dropped and built
+    /// again. Appending a fresh root would put the panel after the title bar in the
+    /// window's child order, and the window paints its children in that order — a rebuilt
+    /// sidebar would cover the self-drawn chrome (P2-④).
     fn build_panel(
         &mut self,
         app: &mut App,
@@ -131,23 +136,25 @@ impl Sidebar {
         workspaces: &Workspaces,
     ) -> Result<(), EngineError> {
         self.release_controls(app);
-        if let Some(node) = self.node.take() {
-            let _ = app.remove_node(self.window, node);
-        }
-        let node = ui::named(
-            app,
-            self.window,
-            self.parent,
-            SIDEBAR,
-            StyleBuilder::new()
-                .relative()
-                .flex_none()
-                .width(metrics::width(mode))
-                .height_full()
-                .flex_col()
-                .overflow_hidden()
-                .build(),
-        )?;
+        let style = StyleBuilder::new()
+            .relative()
+            .flex_none()
+            .width(metrics::width(mode))
+            .height_full()
+            .flex_col()
+            .overflow_hidden()
+            .build();
+        let node = match self.node {
+            Some(node) => {
+                let children = ui::tree(app, self.window)?.get(node)?.children().to_vec();
+                for child in children {
+                    app.remove_node(self.window, child)?;
+                }
+                ui::tree(app, self.window)?.set_style(node, style)?;
+                node
+            }
+            None => ui::named(app, self.window, self.parent, SIDEBAR, style)?,
+        };
         self.node = Some(node);
         self.mode = mode;
         if mode == SidebarMode::Hidden {

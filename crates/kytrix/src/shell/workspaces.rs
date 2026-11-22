@@ -300,7 +300,7 @@ mod tests {
     /// Deleting the active workspace shows the one before it; deleting an earlier one
     /// shifts the marker without changing what is shown.
     #[test]
-    fn deleting_should_choose_the_following_workspace() {
+    fn deleting_should_choose_the_previous_workspace() {
         let mut workspaces = workspaces(&["one", "two", "three"]);
         workspaces.select("three");
         assert!(workspaces.delete_entry("three"));

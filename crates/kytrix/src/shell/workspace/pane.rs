@@ -31,8 +31,7 @@ use ui_core::{
     window::WindowId,
 };
 use widget::{
-    any::AnyWidget, config::WidgetConfigChange, instrument_link::InstrumentLink,
-    services::WidgetServices, view::HeaderGroup,
+    any::AnyWidget, config::WidgetConfigChange, services::WidgetServices, view::HeaderGroup,
 };
 use widget_registry::registry::{WidgetMountError, WidgetRegistry};
 
@@ -68,7 +67,6 @@ pub(crate) struct Pane {
     widget: Option<AnyWidget>,
     widget_id: SmolStr,
     config: Option<VersionedWidgetConfig>,
-    instrument_link: Option<InstrumentLink>,
     intents: Intents,
     theme: ThemeHandle,
     translate: Translate,
@@ -76,22 +74,36 @@ pub(crate) struct Pane {
     close_button_visible: bool,
 }
 
+/// The collaborators one pane is mounted with: the application's registry and services,
+/// the widget's config-change sink, the shell's intent queue, and the theme and translator
+/// the pane's own chrome is built from.
+pub(crate) struct PaneParts<'a> {
+    pub registry: &'a WidgetRegistry,
+    pub services: &'a std::rc::Rc<WidgetServices>,
+    pub config_change: WidgetConfigChange,
+    pub intents: Intents,
+    pub theme: &'a ThemeHandle,
+    pub translate: &'a Translate,
+}
+
 impl Pane {
     /// Builds a pane and mounts the widget its layout stored.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mount(
         app: &mut App,
         window: WindowId,
         parent: NodeId,
         id: PaneId,
         stored: &WorkspaceWidget,
-        registry: &WidgetRegistry,
-        services: &std::rc::Rc<WidgetServices>,
-        config_change: WidgetConfigChange,
-        intents: Intents,
-        theme: &ThemeHandle,
-        translate: &Translate,
+        parts: PaneParts<'_>,
     ) -> Result<Self, EngineError> {
+        let PaneParts {
+            registry,
+            services,
+            config_change,
+            intents,
+            theme,
+            translate,
+        } = parts;
         let container = build_frame(app, window, parent, theme)?;
         let header_slot = ui::container(
             app,
@@ -123,7 +135,6 @@ impl Pane {
             widget: None,
             widget_id: stored.id.clone(),
             config: stored.config.clone(),
-            instrument_link: None,
             intents,
             theme: theme.clone(),
             translate: translate.clone(),
@@ -183,7 +194,6 @@ impl Pane {
         };
 
         self.widget_id = SmolStr::new(mounted.widget_id().as_str());
-        self.instrument_link = mounted.instrument_link();
         self.widget = Some(mounted);
 
         Ok(())
@@ -260,20 +270,18 @@ impl Pane {
             header,
             StyleBuilder::new().flex_row().items_center().build(),
         )?;
+        let chrome = HeaderChrome {
+            theme: &self.theme,
+            translate: &self.translate,
+            intents: &self.intents,
+        };
         for action in [
             HeaderAction::Widget,
             HeaderAction::SplitRight,
             HeaderAction::SplitDown,
         ] {
             buttons.push(build_header_control(
-                app,
-                window,
-                header,
-                self.id,
-                action,
-                &self.theme,
-                &self.translate,
-                &self.intents,
+                app, window, header, self.id, action, &chrome,
             )?);
         }
         if self.close_button_visible {
@@ -283,9 +291,7 @@ impl Pane {
                 header,
                 self.id,
                 HeaderAction::Close,
-                &self.theme,
-                &self.translate,
-                &self.intents,
+                &chrome,
             )?);
         }
         if let Some(widget) = &self.widget {
@@ -442,18 +448,27 @@ fn build_header_row(
         .build(ui::tree(app, window)?, parent)
 }
 
+/// The chrome every header control of one pane is built from.
+struct HeaderChrome<'a> {
+    theme: &'a ThemeHandle,
+    translate: &'a Translate,
+    intents: &'a Intents,
+}
+
 /// One pane header control.
-#[allow(clippy::too_many_arguments)]
 fn build_header_control(
     app: &mut App,
     window: WindowId,
     header: NodeId,
     pane: PaneId,
     action: HeaderAction,
-    theme: &ThemeHandle,
-    translate: &Translate,
-    intents: &Intents,
+    chrome: &HeaderChrome<'_>,
 ) -> Result<Button, EngineError> {
+    let HeaderChrome {
+        theme,
+        translate,
+        intents,
+    } = *chrome;
     let label = t_smol!(translate, action.label_key());
     let intents = intents.clone();
     let button = Button::new(app, theme.clone(), header_action_key(pane, action))
