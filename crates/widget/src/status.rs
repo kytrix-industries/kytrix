@@ -5,19 +5,20 @@
 //! never assembles a sentence for it. A report is one value of [`WidgetState`], so
 //! no two of those can be true at once and a write replaces the state whole.
 //!
-//! [`WidgetStatus`] **is not a view**: it does not implement `Render`, and it is
-//! only ever read by [`WidgetSurface`](crate::surface::WidgetSurface), so an
-//! `Entity<WidgetStatus>` cannot be placed in an element tree.
+//! The state lives in an engine [`Signal`]: a write goes through
+//! [`WidgetStatus::report`], which is the deduplication rule
+//! (`App::write` short-circuits an equal value) and the invalidation rule (a signal
+//! write marks every node that read the signal in its `bind_*` closure, which is
+//! what requests the frame that redraws the presentation).
 //!
 //! # Nothing here is language-dependent
 //!
 //! What a widget hands over is a reference to the catalogue ([`Notice`]) or a typed
 //! error ([`Failure`]); the sentence is resolved by the surface, on the frame that
-//! draws it, in the language showing then. A language change is therefore not
-//! something a widget has to report: the application switches the language with
-//! `App::set_global` followed by `App::refresh_windows`, and that frame re-resolves
-//! every sentence. The framework registers no observer of the language, and a
-//! widget neither.
+//! draws it, through the [`Translate`] context that frame was handed. A language
+//! change is therefore not something a widget has to report: the composition root
+//! switches the translator and writes the language signal, and the surface — which
+//! reads both — redraws the sentences it draws.
 //!
 //! # Deduplication
 //!
@@ -25,15 +26,21 @@
 //! a hard requirement rather than an optimization: a streaming widget publishes on
 //! every snapshot it receives, and without deduplication each of those writes would
 //! schedule a frame. The comparison is the state's own `PartialEq`, and there is no
-//! second one.
+//! second one. Unlike the version this module replaces, the rule is implemented
+//! by the engine's [`App::write`] (equal value ⇒ `false`), so there is no separate
+//! write path to keep in step.
 
 use std::{fmt, rc::Rc, sync::Arc};
 
-use gpui_kit::{App, AppContext, Context, Entity, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_model::identifier::VenueId;
+use smol_str::SmolStr;
+use ui_core::{
+    app::App,
+    node::signal::{Signal, SignalScope},
+};
 
-use crate::{error::LocalizedError, venue};
+use crate::{error::TranslatedError, venue};
 
 /// What a widget instance reports. Mutually exclusive situations, as a sum type.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,7 +67,7 @@ impl WidgetState {
     ///
     /// The error is handed over as a shared handle: a widget that reports the same
     /// failure again through the same handle reports no change at all.
-    pub fn failed(error: Arc<dyn LocalizedError>, action: WidgetAction) -> Self {
+    pub fn failed(error: Arc<dyn TranslatedError>, action: WidgetAction) -> Self {
         Self::Failed(Failure { error, action })
     }
 
@@ -133,99 +140,76 @@ impl Notice {
         Self::Message(key)
     }
 
+    /// Whether [`resolve`](Self::resolve) answers rich text rather than plain text.
+    ///
+    /// `common.market_not_loaded` is authored as an aligned HTML paragraph with a
+    /// `<kbd>` icon and one markdown line per venue, so the placeholder draws it
+    /// through `base_ui::kit::markdown`; a plain [`Notice::Message`] is drawn as a
+    /// sentence. The distinction is a property of the catalogue entry, not of the
+    /// state, so it lives here beside the variant that carries it.
+    pub const fn is_markdown(&self) -> bool {
+        matches!(self, Self::MarketNotLoaded { .. })
+    }
+
     /// Resolves the reference into the sentence the catalogue holds in the language
     /// showing now.
-    pub fn resolve(&self, cx: &App) -> SharedString {
+    pub fn resolve(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Message(key) => t!(cx, *key),
+            Self::Message(key) => t_smol!(translate, *key),
             Self::MarketNotLoaded { supported, .. } => {
-                venue::market_not_loaded_sentence(cx, supported)
+                venue::market_not_loaded_sentence(translate, supported)
             }
         }
     }
 }
 
-/// The state of a widget instance: its single point of writing, of deduplication,
-/// and of notification.
+/// The state cell of one widget instance: the single point of reading and writing.
 ///
-/// It **is not a view**: it does not implement `Render` and is only read by
-/// [`WidgetSurface`](crate::surface::WidgetSurface), so an `Entity<WidgetStatus>`
-/// cannot be placed in an element tree.
-pub struct WidgetStatus {
-    state: WidgetState,
-}
+/// It is a handle over a scoped engine [`Signal`], not an entity: `Copy`, no
+/// borrow, no notification obligation. The framework mints it when the widget is
+/// constructed and hands it to both the widget and the surface that presents it,
+/// so the two cannot disagree about which cell is the truth.
+///
+/// The signal belongs to the widget's own [`SignalScope`], which the framework
+/// releases after the surface's nodes are removed — see [`App::remove_node_with_scope`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidgetStatus(Signal<WidgetState>);
 
 impl WidgetStatus {
-    /// The state of a new instance: someone asked for this widget, so the first
-    /// thing it does is establish its connection.
-    pub const fn new() -> Self {
-        Self {
-            state: WidgetState::Connecting,
-        }
+    /// Creates the state cell of a new instance in `scope`: someone asked for this
+    /// widget, so the first thing it does is establish its connection.
+    pub fn new(app: &mut App, scope: SignalScope) -> Self {
+        Self(app.signal_scoped(scope, WidgetState::Connecting))
     }
 
     /// Returns the state the widget published.
-    pub const fn state(&self) -> &WidgetState {
-        &self.state
+    pub fn state(&self, app: &App) -> WidgetState {
+        app.read_with(&self.0, |state| state.clone())
     }
 
     /// Moves to `next`. A state equal to the current one is neither stored nor
-    /// notified.
-    pub fn set(&mut self, next: WidgetState, cx: &mut Context<Self>) {
-        if self.state == next {
-            return;
-        }
-
-        self.state = next;
-        cx.notify();
+    /// notified, and the return value says which happened.
+    pub fn report(&self, app: &mut App, next: WidgetState) -> bool {
+        app.write(&self.0, next)
     }
-}
-
-impl Default for WidgetStatus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The four ways in and out of a widget's state.
-///
-/// `Entity` is a type of another crate, so an inherent impl on
-/// `Entity<WidgetStatus>` is rejected (E0116) whatever its type argument is. The
-/// entry points are therefore an extension trait, exactly as `VenueDisplay` and
-/// `ThemeExt` are in this workspace; a file that reports state has to
-/// `use widget::status::WidgetStatusExt;`, or the call is E0599.
-pub trait WidgetStatusExt {
-    /// Reports a state. A state equal to the current one does not notify.
-    fn report<C: AppContext>(&self, state: WidgetState, cx: &mut C);
 
     /// Returns whether the widget is in a failure.
     ///
     /// Every message entry point asks this before applying what arrived: a failure
     /// is terminal, and nothing but the user's recovery leaves it.
-    fn is_failed<C: AppContext>(&self, cx: &C) -> bool;
+    pub fn is_failed(&self, app: &App) -> bool {
+        app.read_with(&self.0, WidgetState::is_failed)
+    }
 
     /// Returns whether the widget is working.
-    fn is_busy<C: AppContext>(&self, cx: &C) -> bool;
-
-    /// Returns a snapshot of the state.
-    fn state<C: AppContext>(&self, cx: &C) -> WidgetState;
-}
-
-impl WidgetStatusExt for Entity<WidgetStatus> {
-    fn report<C: AppContext>(&self, state: WidgetState, cx: &mut C) {
-        self.update(cx, |status, cx| status.set(state, cx));
+    pub fn is_busy(&self, app: &App) -> bool {
+        app.read_with(&self.0, WidgetState::is_busy)
     }
 
-    fn is_failed<C: AppContext>(&self, cx: &C) -> bool {
-        self.read_with(cx, |status, _| status.state().is_failed())
-    }
-
-    fn is_busy<C: AppContext>(&self, cx: &C) -> bool {
-        self.read_with(cx, |status, _| status.state().is_busy())
-    }
-
-    fn state<C: AppContext>(&self, cx: &C) -> WidgetState {
-        self.read_with(cx, |status, _| status.state().clone())
+    /// The signal itself, for the surface's `bind_*` closures: reading it there is
+    /// what registers the dependency that a report invalidates.
+    pub const fn signal(&self) -> Signal<WidgetState> {
+        self.0
     }
 }
 
@@ -235,18 +219,18 @@ impl WidgetStatusExt for Entity<WidgetStatus> {
 /// failure follows a language change like every other sentence of the interface.
 #[derive(Clone)]
 pub struct Failure {
-    error: Arc<dyn LocalizedError>,
+    error: Arc<dyn TranslatedError>,
     action: WidgetAction,
 }
 
 impl Failure {
-    /// The failure's detail, in the language showing now.
+    /// The failure's detail, in the language `translate` renders.
     ///
     /// It is shown exactly as the error type produces it: neither of the two places
     /// a failure can appear adds a prefix or any other wrapper, so the same failure
     /// reads the same whether it lands in a banner or in a placeholder.
-    pub fn text(&self, cx: &App) -> SharedString {
-        self.error.localized_message(cx)
+    pub fn text(&self, translate: &Translate) -> SmolStr {
+        self.error.translated_message(translate)
     }
 
     /// The control that recovers from this failure.
@@ -259,10 +243,10 @@ impl Failure {
 /// recovery.
 ///
 /// This is the only rule by which a failure counts as a change, because it is the
-/// rule [`WidgetStatus::set`] applies. A widget that wants a repeated report of the
-/// same failure to cost nothing holds on to the handle it reported (most of them
-/// keep it in their own failure enum already); reporting it through a new handle
-/// costs one frame, and a failure is terminal with every message entry point
+/// rule the state's own `PartialEq` applies. A widget that wants a repeated report
+/// of the same failure to cost nothing holds on to the handle it reported (most of
+/// them keep it in their own failure enum already); reporting it through a new
+/// handle costs one frame, and a failure is terminal with every message entry point
 /// guarding on `is_failed`.
 impl PartialEq for Failure {
     fn eq(&self, other: &Self) -> bool {
@@ -275,7 +259,8 @@ impl fmt::Debug for Failure {
         formatter
             .debug_struct("Failure")
             .field("action", &self.action)
-            // The text needs an `App` to resolve, and a `Debug` render has none.
+            // The text needs a translation context to resolve, and a `Debug` render
+            // has none.
             .field("error", &"<typed error>")
             .finish_non_exhaustive()
     }
@@ -285,7 +270,8 @@ impl fmt::Debug for Failure {
 ///
 /// The label is a catalogue key rather than a resolved sentence: the control is
 /// drawn by the framework on every frame of a failure, and the language it reads in
-/// is the one showing then.
+/// is the one showing then. The recovery runs against the application context,
+/// because that is what the framework has when a click arrives.
 #[derive(Clone)]
 pub struct WidgetAction {
     label_key: &'static str,
@@ -303,9 +289,9 @@ impl WidgetAction {
         }
     }
 
-    /// The control's label, in the language showing now.
-    pub fn label(&self, cx: &App) -> SharedString {
-        t!(cx, self.label_key)
+    /// The control's label, in the language `translate` renders.
+    pub fn label(&self, translate: &Translate) -> SmolStr {
+        t_smol!(translate, self.label_key)
     }
 
     /// The catalogue key the label is read from.
@@ -328,8 +314,8 @@ impl WidgetAction {
     }
 
     /// Runs the recovery.
-    pub fn run(&self, cx: &mut App) {
-        (self.run)(cx);
+    pub fn run(&self, app: &mut App) {
+        (self.run)(app);
     }
 
     /// The recovery itself, as a handle the presentation can move into a click
@@ -365,23 +351,14 @@ impl fmt::Debug for WidgetAction {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
-    use gpui_kit::{
-        App, AppContext, Context, Entity, InteractiveElement, IntoElement, Render, Subscription,
-        TestAppContext, Window, div,
-    };
-    use i18n::{language::codes::LanguageCode, translator::types::I18n};
+    use i18n::{language::codes::LanguageCode, translate::Translate, translator::types::I18n};
+    use smol_str::SmolStr;
 
-    use super::{
-        Failure, LocalizedError, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt,
-    };
-    use crate::status::Notice;
+    use super::{Failure, Notice, WidgetAction, WidgetState, WidgetStatus};
+    use crate::error::TranslatedError;
 
-    /// The messages the fixture translator is built from.
-    ///
-    /// `test.waiting` is the copy a widget of these tests reports as its own, and
-    /// `sample.failure` is the detail of the fixture error type.
     const MESSAGES_EN: &str = r#"
     common:
       retry: Retry
@@ -402,37 +379,44 @@ mod tests {
       waiting: 正在等待订单
     "#;
 
-    /// A typed error whose text is resolved in the language showing now.
+    /// A typed error whose text is resolved in the language the context renders.
     struct SampleError;
 
-    impl LocalizedError for SampleError {
-        fn localized_message(&self, cx: &App) -> gpui_kit::SharedString {
-            i18n::t!(cx, "sample.failure")
+    impl TranslatedError for SampleError {
+        fn translated_message(&self, translate: &Translate) -> SmolStr {
+            i18n::t_smol!(translate, "sample.failure")
         }
     }
 
-    /// Installs the fixture catalogue in both languages, so a test can move between
-    /// them.
-    fn install_both(cx: &mut App) {
-        let i18n = I18n::builder()
+    /// The fixture catalogue in both languages.
+    fn catalogue() -> I18n {
+        I18n::builder()
             .locale_yaml(LanguageCode::En, MESSAGES_EN)
             .expect("test locale should parse")
             .locale_yaml(LanguageCode::ZhCn, MESSAGES_ZH)
             .expect("test locale should parse")
-            .language(LanguageCode::En)
             .fallback(LanguageCode::En)
             .build()
-            .expect("test translator should build");
-
-        cx.set_global(i18n);
-        cx.set_global(LanguageCode::En);
+            .expect("test translator should build")
     }
 
-    /// The state cell of a new widget, over the fixture catalogue.
-    fn status(cx: &mut App) -> Entity<WidgetStatus> {
-        install_both(cx);
+    fn translate() -> Translate {
+        Translate::new(Rc::new(catalogue()), LanguageCode::En)
+    }
 
-        cx.new(|_| WidgetStatus::new())
+    /// A headless engine application: the state cell lives in its signal store, so
+    /// every read and write in this module goes through the real `App`.
+    fn app() -> ui_core::app::App {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("the test runtime builds");
+        ui_core::app::App::new(runtime.handle().clone())
+    }
+
+    /// The state cell of a new widget.
+    fn status(app: &mut ui_core::app::App) -> WidgetStatus {
+        let scope = app.signal_scope();
+        WidgetStatus::new(app, scope)
     }
 
     /// The default recovery: the key every widget of the workspace uses for it.
@@ -442,56 +426,17 @@ mod tests {
 
     /// A failure of the fixture error type.
     fn failed() -> WidgetState {
-        WidgetState::failed(std::sync::Arc::new(SampleError), retry())
-    }
-
-    /// Counts the notifications one pane receives from a status it reads.
-    struct PaneProbe {
-        notifications: Rc<Cell<usize>>,
-        _observation: Subscription,
-    }
-
-    impl Render for PaneProbe {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().debug_selector(|| "STATUS_PANE_PROBE".into())
-        }
-    }
-
-    /// Reads `cell` from a pane-shaped view, so a write's notification is observable
-    /// from the outside.
-    ///
-    /// The probe is a view a window hosts, which is the shape a pane has and what keeps
-    /// it alive for as long as the test runs; the delivery does not depend on that. GPUI
-    /// notifies the observers of an entity whether or not a window is displaying it — with
-    /// none displaying it, `App::notify` queues its `Effect::Notify` itself and the flush
-    /// runs every observer, and one displaying it only decides that the window is dirty as
-    /// well. What every write here does need is an update of its own, because GPUI
-    /// coalesces the notifications that pile up inside one.
-    fn observe(cx: &mut TestAppContext, cell: &Entity<WidgetStatus>) -> Rc<Cell<usize>> {
-        let notifications = Rc::new(Cell::new(0));
-        let (probe, _) = cx.add_window_view({
-            let notifications = notifications.clone();
-            let observed = cell.clone();
-            move |_, cx| PaneProbe {
-                notifications: notifications.clone(),
-                _observation: cx.observe(&observed, |probe: &mut PaneProbe, _, _| {
-                    probe.notifications.set(probe.notifications.get() + 1);
-                }),
-            }
-        });
-        probe.update(cx, |_, cx| cx.notify());
-        cx.run_until_parked();
-
-        notifications
+        WidgetState::failed(Arc::new(SampleError), retry())
     }
 
     /// A widget is created because someone asked for it, so the first state it reports is
     /// that it is establishing the connection its work depends on.
     #[test]
     fn a_new_status_should_start_connecting() {
-        let status = WidgetStatus::new();
+        let mut app = app();
+        let status = status(&mut app);
 
-        assert_eq!(status.state(), &WidgetState::Connecting);
+        assert_eq!(status.state(&app), WidgetState::Connecting);
     }
 
     #[test]
@@ -508,246 +453,181 @@ mod tests {
         }
     }
 
-    /// A report of exactly what the cell holds is no change: it neither notifies
-    /// nor is it a write at all. Two reports of the same words, and two reports of
-    /// the same failure handle, are the two halves of that.
-    ///
-    /// Every write is made in an update of its own, because GPUI coalesces the
-    /// notifications that pile up inside one.
-    #[gpui_kit::test]
-    fn repeating_a_state_should_not_notify_the_pane(cx: &mut TestAppContext) {
-        let cell = cx.update(status);
-        let notifications = observe(cx, &cell);
-        let error = std::sync::Arc::new(SampleError);
+    /// A report of exactly what the cell holds is no change: it neither stores nor
+    /// is a write at all. Two reports of the same words, and two reports of the same
+    /// failure handle, are the two halves of that. The write's own return value is the
+    /// engine's equality short-circuit; whether a frame follows depends on a node
+    /// having read the signal, which is the surface's business (surface tests).
+    #[test]
+    fn repeating_a_state_should_not_be_a_write() {
+        let mut app = app();
+        let status = status(&mut app);
+        let error = Arc::new(SampleError);
         let action = retry();
 
         let notice = || WidgetState::waiting(Notice::message("test.waiting"));
-        cx.update(|cx| cell.report(notice(), cx));
-        cx.update(|cx| cell.report(notice(), cx));
-        cx.update(|cx| cell.report(WidgetState::failed(error.clone(), action.clone()), cx));
-        cx.update(|cx| cell.report(WidgetState::failed(error, action), cx));
-
-        assert_eq!(
-            notifications.get(),
-            2,
-            "the repeated message and the repeated failure handle are no write, and the \
-             two states themselves are"
+        assert!(status.report(&mut app, notice()), "the first report writes");
+        assert!(
+            !status.report(&mut app, notice()),
+            "the same notice is no write"
+        );
+        assert!(status.report(&mut app, WidgetState::failed(error.clone(), action.clone())));
+        assert!(
+            !status.report(&mut app, WidgetState::failed(error, action)),
+            "the same failure handle and control are no write"
         );
     }
 
     /// The other half of the rule, pinned so it cannot drift: a failure reported
     /// through a new handle is a new state, because the failure's equality is the
     /// identity of the handle it carries.
-    ///
-    /// The control is the same one both times, so the one thing the state can tell the
-    /// two reports apart by is the error handle itself.
-    #[gpui_kit::test]
-    fn a_failure_through_a_new_handle_should_notify_the_pane(cx: &mut TestAppContext) {
-        let cell = cx.update(status);
-        let notifications = observe(cx, &cell);
+    #[test]
+    fn a_failure_through_a_new_handle_should_be_a_change() {
+        let mut app = app();
+        let status = status(&mut app);
         let action = retry();
 
-        cx.update(|cx| {
-            cell.report(
-                WidgetState::failed(std::sync::Arc::new(SampleError), action.clone()),
-                cx,
-            );
-        });
-        cx.update(|cx| {
-            cell.report(
-                WidgetState::failed(std::sync::Arc::new(SampleError), action),
-                cx,
-            );
-        });
-
-        assert_eq!(
-            notifications.get(),
-            2,
+        assert!(status.report(
+            &mut app,
+            WidgetState::failed(Arc::new(SampleError), action.clone())
+        ));
+        assert!(
+            status.report(&mut app, WidgetState::failed(Arc::new(SampleError), action)),
             "the same failure behind another handle is another state"
         );
     }
 
-    #[gpui_kit::test]
-    fn each_distinct_transition_should_notify_the_pane_once(cx: &mut TestAppContext) {
-        let cell = cx.update(status);
-        let notifications = observe(cx, &cell);
-        let failure = cx.update(|cx| {
+    #[test]
+    fn each_distinct_transition_should_be_reported_once() {
+        let mut app = app();
+        let status = status(&mut app);
+        let failure = {
             let failure = failed();
-            cell.report(failure.clone(), cx);
-
+            assert!(status.report(&mut app, failure.clone()));
             failure
-        });
+        };
 
-        cx.update(|cx| cell.report(WidgetState::waiting(Notice::message("test.waiting")), cx));
-
+        assert!(status.report(
+            &mut app,
+            WidgetState::waiting(Notice::message("test.waiting"))
+        ));
         assert_eq!(
-            notifications.get(),
-            2,
-            "two distinct transitions, two frames"
+            status.state(&app),
+            WidgetState::waiting(Notice::message("test.waiting"))
         );
-        cx.update(|cx| {
-            let state = cell.state(cx);
-            assert_eq!(state, WidgetState::waiting(Notice::message("test.waiting")));
-        });
-
-        cx.update(|cx| cell.report(failure.clone(), cx));
-
-        assert_eq!(
-            notifications.get(),
-            3,
+        assert!(
+            status.report(&mut app, failure),
             "and the failure is a third, because it is not what the cell holds"
         );
-        cx.update(|cx| assert!(cell.is_failed(cx)));
+        assert!(status.is_failed(&app));
     }
 
     /// The last thing a widget does before it fails is often to report that it is
     /// loading; the state is replaced whole, so nothing of the earlier one survives.
     #[test]
     fn a_state_should_replace_the_one_before_it_whole() {
-        let cx = TestAppContext::single();
-        let cell = cx.update(status);
+        let mut app = app();
+        let status = status(&mut app);
 
-        cx.update(|cx| {
-            cell.report(WidgetState::waiting(Notice::message("test.waiting")), cx);
-            cell.report(
-                WidgetState::failed(std::sync::Arc::new(SampleError), retry()),
-                cx,
-            );
-            assert!(cell.is_failed(cx));
-            assert!(
-                cell.state(cx).notice().is_none(),
-                "a failure does not carry the copy the widget waited with"
-            );
+        assert!(status.report(
+            &mut app,
+            WidgetState::waiting(Notice::message("test.waiting"))
+        ));
+        assert!(status.report(
+            &mut app,
+            WidgetState::failed(Arc::new(SampleError), retry())
+        ));
+        assert!(status.is_failed(&app));
+        assert!(
+            status.state(&app).notice().is_none(),
+            "a failure does not carry the copy the widget waited with"
+        );
 
-            cell.report(WidgetState::waiting(Notice::message("test.waiting")), cx);
-            assert!(!cell.is_failed(cx), "a neutral notice is not a failure");
-            assert_eq!(
-                cell.state(cx).notice(),
-                Some(&Notice::message("test.waiting"))
-            );
-
-            cell.report(WidgetState::Connecting, cx);
-            assert!(
-                cell.state(cx).notice().is_none(),
-                "working again clears the copy the widget waited with"
-            );
-            assert!(cell.state(cx).is_busy());
-        });
+        assert!(status.report(
+            &mut app,
+            WidgetState::waiting(Notice::message("test.waiting"))
+        ));
+        assert!(!status.is_failed(&app), "a neutral notice is not a failure");
+        assert_eq!(
+            status.state(&app).notice(),
+            Some(&Notice::message("test.waiting"))
+        );
     }
 
     /// A catalogue reference is published whole: what is compared is the key and its
     /// arguments, and what the surface resolves is the sentence they name.
     #[test]
     fn a_notice_should_publish_the_key_it_was_given_and_resolve_into_its_sentence() {
-        let cx = TestAppContext::single();
-        let cell = cx.update(status);
+        let notice = Notice::message("test.waiting");
+        let translate = translate();
 
-        cx.update(|cx| {
-            cell.report(WidgetState::waiting(Notice::message("test.waiting")), cx);
-            assert_eq!(
-                cell.state(cx).notice(),
-                Some(&Notice::message("test.waiting"))
-            );
+        assert_eq!(notice.resolve(&translate).as_str(), "Waiting for orders");
 
-            let notice = Notice::message("test.waiting");
-            assert_eq!(notice.resolve(cx).as_ref(), "Waiting for orders");
-
-            cx.set_global(LanguageCode::ZhCn);
-            assert_eq!(
-                notice.resolve(cx).as_ref(),
-                "正在等待订单",
-                "the same reference resolves in the language showing now"
-            );
-        });
+        let zh = translate;
+        assert!(zh.set_language(LanguageCode::ZhCn));
+        assert_eq!(
+            notice.resolve(&zh).as_str(),
+            "正在等待订单",
+            "the same reference resolves in the language showing now"
+        );
     }
 
     /// A failure's detail is resolved where it is read rather than where it was
     /// written, so it follows a language change with every other sentence.
     #[test]
     fn a_failure_should_resolve_its_text_in_the_language_showing_now() {
-        let cx = TestAppContext::single();
+        let translate = translate();
+        let failure = Failure {
+            error: Arc::new(SampleError),
+            action: retry(),
+        };
 
-        cx.update(|cx| {
-            let cell = status(cx);
-            cell.report(
-                WidgetState::failed(std::sync::Arc::new(SampleError), retry()),
-                cx,
-            );
+        assert_eq!(failure.text(&translate).as_str(), "Sample failure");
 
-            let failure = cell
-                .state(cx)
-                .failure()
-                .cloned()
-                .expect("a failure should be published");
-            assert_eq!(failure.text(cx).as_ref(), "Sample failure");
-
-            cx.set_global(LanguageCode::ZhCn);
-            assert_eq!(
-                failure.text(cx).as_ref(),
-                "示例失败",
-                "the detail is read in the language showing now"
-            );
-        });
+        let zh = translate;
+        assert!(zh.set_language(LanguageCode::ZhCn));
+        assert_eq!(
+            failure.text(&zh).as_str(),
+            "示例失败",
+            "the detail is read in the language showing now"
+        );
     }
 
     /// The control a failure offers is read the same way: its label key is resolved
     /// where the button is drawn.
     #[test]
     fn a_failure_should_carry_the_action_it_was_given() {
-        let cx = TestAppContext::single();
+        let translate = translate();
+        let action = retry();
+        let failure = Failure {
+            error: Arc::new(SampleError),
+            action: action.clone(),
+        };
 
-        cx.update(|cx| {
-            let cell = status(cx);
-            let action = retry();
-            cell.report(
-                WidgetState::failed(std::sync::Arc::new(SampleError), action.clone()),
-                cx,
-            );
+        assert_eq!(failure.action(), &action);
+        assert_eq!(failure.action().label_key(), "common.retry");
+        assert_eq!(failure.action().label(&translate).as_str(), "Retry");
 
-            let failure = cell
-                .state(cx)
-                .failure()
-                .cloned()
-                .expect("a failure should be published");
-            assert_eq!(failure.action(), &action);
-            assert_eq!(failure.action().label_key(), "common.retry");
-            assert_eq!(failure.action().label(cx).as_ref(), "Retry");
-
-            cx.set_global(LanguageCode::ZhCn);
-            assert_eq!(
-                failure.action().label(cx).as_ref(),
-                "重试",
-                "the label is read in the language showing now"
-            );
-        });
+        let zh = translate;
+        assert!(zh.set_language(LanguageCode::ZhCn));
+        assert_eq!(
+            failure.action().label(&zh).as_str(),
+            "重试",
+            "the label is read in the language showing now"
+        );
     }
 
     #[test]
     fn a_recovery_should_run_the_action_the_widget_published() {
-        let cx = TestAppContext::single();
+        let mut app = app();
         let retries = Rc::new(Cell::new(0));
+        let counted = retries.clone();
+        let action = WidgetAction::new("common.retry", move |_| counted.set(counted.get() + 1));
 
-        cx.update(|cx| {
-            let cell = status(cx);
-            let counted = retries.clone();
-            cell.report(
-                WidgetState::failed(
-                    std::sync::Arc::new(SampleError),
-                    WidgetAction::new("common.retry", move |_| counted.set(counted.get() + 1)),
-                ),
-                cx,
-            );
+        assert!(action.is_enabled());
+        action.run(&mut app);
 
-            let action = cell
-                .state(cx)
-                .failure()
-                .map(|failure| failure.action().clone())
-                .expect("a failure should offer its recovery");
-            assert!(action.is_enabled());
-            action.run(cx);
-
-            assert_eq!(retries.get(), 1);
-        });
+        assert_eq!(retries.get(), 1);
     }
 
     #[test]
@@ -757,64 +637,58 @@ mod tests {
         assert!(!action.is_enabled());
     }
 
-    /// The control a failure carries is part of the state, and what it reads is part of
-    /// the control: a failure whose control was relabelled is another failure, and so is
-    /// the same control with input refused.
-    ///
-    /// One error handle is behind all three states, so none of the differences here can
-    /// hide behind a difference in identity — and the first assertion is the other half
-    /// of the rule: the same handle and the same control are no change at all.
+    /// The control a failure carries is part of the state, and what it reads is part
+    /// of the control: a failure whose control was relabelled is another failure, and
+    /// so is the same control with input refused. One error handle is behind all
+    /// three states, so none of the differences here can hide behind a difference in
+    /// identity — and the first assertion is the other half of the rule: the same
+    /// handle and the same control are no change at all.
     #[test]
     fn a_relabelled_or_refused_recovery_should_be_a_change() {
-        let cx = TestAppContext::single();
+        let translate = translate();
+        let error = Arc::new(SampleError);
+        let action = retry();
+        let repeated = WidgetState::failed(error.clone(), action.clone());
+        let relabelled =
+            WidgetState::failed(error.clone(), WidgetAction::new("common.resume", |_| {}));
+        let refused = WidgetState::failed(error.clone(), action.clone().enabled(false));
 
-        cx.update(|cx| {
-            install_both(cx);
+        assert_eq!(
+            repeated,
+            WidgetState::failed(error, action),
+            "the same error handle and the same control are the same state"
+        );
+        assert_ne!(
+            repeated, relabelled,
+            "a control that reads differently is another state"
+        );
+        assert_ne!(
+            repeated, refused,
+            "the same control with input refused is another state"
+        );
 
-            let error = std::sync::Arc::new(SampleError);
-            let action = retry();
-            let repeated = WidgetState::failed(error.clone(), action.clone());
-            let relabelled =
-                WidgetState::failed(error.clone(), WidgetAction::new("common.resume", |_| {}));
-            let refused = WidgetState::failed(error.clone(), action.clone().enabled(false));
-
-            assert_eq!(
-                repeated,
-                WidgetState::failed(error, action),
-                "the same error handle and the same control are the same state"
-            );
-            assert_ne!(
-                repeated, relabelled,
-                "a control that reads differently is another state"
-            );
-            assert_ne!(
-                repeated, refused,
-                "the same control with input refused is another state"
-            );
-
-            let label = |state: &WidgetState| {
-                state
-                    .failure()
-                    .expect("every state of this test is a failure")
-                    .action()
-                    .label(cx)
-            };
-            assert_ne!(
-                label(&repeated),
-                label(&relabelled),
-                "and the two controls really do read differently"
-            );
-        });
+        let label = |state: &WidgetState| {
+            state
+                .failure()
+                .expect("every state of this test is a failure")
+                .action()
+                .label(&translate)
+        };
+        assert_ne!(
+            label(&repeated),
+            label(&relabelled),
+            "and the two controls really do read differently"
+        );
     }
 
-    /// The two exit conditions of the equality rule on its own, without a cell:
-    /// the same handles are one failure, and the same action behind another closure
-    /// is not.
+    /// The two exit conditions of the equality rule on its own, without a cell: the
+    /// same handles are one failure, and the same action behind another closure is
+    /// not.
     #[test]
     fn a_failure_should_be_one_failure_only_through_the_handles_it_carries() {
         let action = retry();
         let first = Failure {
-            error: std::sync::Arc::new(SampleError),
+            error: Arc::new(SampleError),
             action,
         };
         let same = Failure {

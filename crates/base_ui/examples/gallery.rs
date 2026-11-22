@@ -1468,7 +1468,8 @@ impl Gallery {
         );
         let doc = Arc::new(parse_document(MARKDOWN_SOURCE, &NoAssets));
         // 主题化挂载：外观切换时 `MarkdownNode::sync` 按新主题重建（逐 run 颜色无动态通道）。
-        let markdown = MarkdownNode::mount(app, window, s11, theme.clone(), doc);
+        let markdown = MarkdownNode::mount(app, window, s11, theme.clone(), doc)
+            .expect("the gallery's markdown mounts");
 
         // ⑫ 浮层 ─────────────────────────────────────────────────────────────
         let s12 = section(
