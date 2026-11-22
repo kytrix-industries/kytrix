@@ -3021,9 +3021,7 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "app_config_provider",
  "base_ui",
- "gpui-kit",
  "i18n",
  "kytrix_proto",
  "kytrix_service_provider",
@@ -3034,8 +3032,8 @@ dependencies = [
  "smol_str",
  "thiserror 2.0.21",
  "tokio",
+ "ui_core",
  "widget",
- "widget_tokio_runtime",
 ]
 
 [[package]]

@@ -29,7 +29,7 @@
 use std::{future::Future, sync::Arc};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use gpui_kit::{App, SharedString};
+use i18n::{t_smol, translate::Translate};
 use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
@@ -48,7 +48,7 @@ use tokio::{
     time::Instant,
 };
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     rpc::RpcRequestContext,
     runtime::{ServiceContext, WidgetService},
@@ -157,21 +157,29 @@ pub(super) enum FinancialIndexStreamError {
     },
 }
 
-impl LocalizedError for FinancialIndexStreamError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for FinancialIndexStreamError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::Transport(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Transport(error) => error.translated_message(translate),
             Self::FinancialIndexLimit { limit: Some(limit) } => {
                 // A limit of one is a single index, and the sentence says so.
                 if *limit == 1 {
-                    i18n::t!(cx, "error.financial_index.index_limit_one", limit = limit)
+                    t_smol!(
+                        translate,
+                        "error.financial_index.index_limit_one",
+                        limit = limit
+                    )
                 } else {
-                    i18n::t!(cx, "error.financial_index.index_limit", limit = limit)
+                    t_smol!(
+                        translate,
+                        "error.financial_index.index_limit",
+                        limit = limit
+                    )
                 }
             }
             Self::FinancialIndexLimit { limit: None } => {
-                i18n::t!(cx, "error.financial_index.index_limit_unknown")
+                t_smol!(translate, "error.financial_index.index_limit_unknown")
             }
         }
     }
@@ -204,11 +212,11 @@ pub(super) enum FinancialIndexServiceError {
     Data(#[from] super::model::FinancialIndexDataError),
 }
 
-impl LocalizedError for FinancialIndexServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for FinancialIndexServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::Data(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::Data(error) => error.translated_message(translate),
         }
     }
 }
