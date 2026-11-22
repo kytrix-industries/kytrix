@@ -116,15 +116,19 @@ const VENUE_COLUMN_WIDTH: f32 = 180.0;
 /// The height of one listing row, and the height the list is told to use before it has
 /// measured anything.
 const ROW_HEIGHT: f32 = 26.0;
-/// Element id of the listing list. Stable across frames: the list keeps its
-/// layout state, and the scroll handle keeps the viewport, under this id.
-const LIST_KEY: &str = "instrument-selector-list";
-/// The kit key of the dialog itself.
-const DIALOG_KEY: &str = "instrument-selector";
-/// The node id of the selector's own content area, which tests look for.
+/// The base of every kit key one dialog registers.
+///
+/// One dialog appends its own signal-scope index ([`SelectorState::key`]), so two panes that
+/// open the selector at the same time own two identities. A constant key would make the later
+/// dialog replace the earlier one's handlers: `App::on_action` replaces a handler of the same
+/// `Action`, and the kit derives every button / list / tree / input action from its key.
+const KEY_BASE: &str = "instrument-selector";
+/// The node id of the selector's own content area (and of its listing rows), which tests of
+/// this dialog and of the panes that open it look for.
+///
+/// Node ids are diagnostics rather than action identities, so they stay the same in every
+/// dialog instance: a pane that opens a selector names the selector it opened by this id.
 const PANEL_ID: &str = "INSTRUMENT_SELECTOR";
-/// The kit key of the filter input.
-const FILTER_INPUT_ID: &str = "instrument-selector-filter";
 
 /// The matcher ranks candidates by a single column.
 const MATCHER_COLUMNS: u32 = 1;
@@ -432,6 +436,16 @@ pub struct InstrumentSelector {
 struct SelectorState {
     host: SelectorHost,
     window: WindowId,
+    /// The per-instance prefix of every kit key this dialog registers:
+    /// `"instrument-selector@{scope}"`.
+    ///
+    /// The selector is not a widget, so it has no
+    /// [`WidgetCx::unique_key`](widget::cx::WidgetCx::unique_key); it mints its own signal
+    /// scope instead (the engine appends one scope slot per dialog and never recycles an
+    /// index), and this prefix is derived from that scope. Every button, list, tree and
+    /// input the dialog builds is keyed by it, so a second pane's selector cannot overwrite
+    /// the first's confirm / cancel / selection handlers.
+    key: SmolStr,
     /// The selector's own signal scope: every signal this dialog mints belongs to it, and
     /// [`Self::finish`] releases it after the kit components have unmounted their nodes
     /// (E16). A root-scope signal would never be reclaimed, so every open/close cycle
@@ -561,15 +575,18 @@ impl SelectorState {
             Some(MATCHER_THREADS),
             MATCHER_COLUMNS,
         );
+        // One scope per dialog: every signal below is reclaimed when `finish` releases it, and
+        // the scope's index is what tells this dialog's kit keys from another pane's selector
+        // (see `SelectorState::key`).
+        let scope = app.signal_scope();
+        let key = format_smolstr!("{KEY_BASE}@{}", scope.index());
         let tree = Tree::new(
             app,
             theme.clone(),
-            format_smolstr!("{DIALOG_KEY}:venues"),
+            format_smolstr!("{key}:venues"),
             venue_rows(&filters, &translate),
             TreeOptions::default(),
         );
-        // One scope per dialog: every signal below is reclaimed when `finish` releases it.
-        let scope = app.signal_scope();
         let selected = app.signal_scoped(scope, None);
         let rows: Rc<RefCell<Arc<[ListingRow]>>> = Rc::new(RefCell::new(Arc::default()));
         // The list owns the hovered-row signal, and the row closure is built before the
@@ -585,7 +602,7 @@ impl SelectorState {
             List::new(
                 app,
                 theme,
-                LIST_KEY,
+                format_smolstr!("{key}:list"),
                 ListOptions::fixed(ROW_HEIGHT).selection(SelectionMode::Single),
                 move |tree: &mut NodeTree, parent: NodeId, index: usize| {
                     let row = rows.borrow().get(index).cloned();
@@ -617,6 +634,7 @@ impl SelectorState {
         Self {
             host: host.clone(),
             window,
+            key,
             scope,
             filters,
             route,
@@ -652,7 +670,7 @@ impl SelectorState {
     /// Builds the kit dialog: the content is this selector's two-pane area, the button
     /// row is the dialog's own (so the confirm button is the one the dialog closes with).
     fn build_dialog(selector: &Rc<InstrumentSelector>, app: &mut App) -> Dialog {
-        let (theme, translate, layer, animation, closed) = {
+        let (theme, translate, layer, animation, closed, key) = {
             let inner = selector.inner.borrow();
             (
                 inner.host.theme().clone(),
@@ -660,6 +678,7 @@ impl SelectorState {
                 inner.host.layer().clone(),
                 inner.host.animation(),
                 Rc::clone(&inner.closed),
+                inner.key.clone(),
             )
         };
         let weak = Rc::downgrade(selector);
@@ -689,7 +708,7 @@ impl SelectorState {
                 }
             })
             .on_close(move |_close, _app| closed.set(true))
-            .build(app, theme, layer, animation, DIALOG_KEY)
+            .build(app, theme, layer, animation, key)
     }
 
     /// Registers the per-frame route that drives the dialog.
@@ -786,7 +805,7 @@ impl SelectorState {
                 .build(tree, right)
         })?;
         let spec = Arc::new(InputSpec {
-            name: SmolStr::new_static(FILTER_INPUT_ID),
+            name: format_smolstr!("{}:filter", self.key),
             placeholder: SmolStr::default(),
             masked: false,
             multiline: false,
@@ -1344,7 +1363,12 @@ impl SelectorState {
         }
         self.list.release(app);
         self.tree.release(app);
-        self.input = None;
+        if let Some(input) = self.input.take() {
+            // Kit's own release face (P2-9): the input detaches the click-to-place / drag-to-
+            // select handlers it registered in `install`. Its state signals belong to this
+            // dialog's scope and are released below, after the nodes are unmounted.
+            input.release(app);
+        }
         if let Some(id) = self.route_id.take() {
             self.router.unregister(id);
         }

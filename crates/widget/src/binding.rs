@@ -38,6 +38,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use ahash::HashMapExt;
 use tokio::task::JoinHandle;
 use ui_core::{app::AppHandle, window::WindowId};
 
@@ -161,6 +162,96 @@ impl<P: WidgetProtocol> fmt::Debug for WidgetInbox<P> {
     }
 }
 
+/// The RPC commands one binding has in flight, keyed by the identity
+/// [`WidgetBinding::call`] returned.
+///
+/// A binding replaces — and aborts — the call before it when the widget issues another
+/// call on the same binding, so only the newest command can still be answered:
+/// [`Pending::track`] forgets every older entry. A widget takes the entry a reply
+/// belongs to ([`Pending::take`]); a reply whose identity is not there is a late answer
+/// to a call the widget has already replaced. It is **dropped and counted** rather than
+/// applied to whichever command happens to be pending, which is what stops a replaced
+/// command's failure from being swallowed and a late reply from steering the pane's
+/// state.
+///
+/// One table belongs to one binding: the replacement rule above is the binding's
+/// (a widget with two bindings keeps two tables).
+pub struct Pending<C> {
+    commands: ahash::HashMap<RequestId, C>,
+    dropped: usize,
+}
+
+impl<C> Pending<C> {
+    /// Creates an empty table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            commands: ahash::HashMap::with_capacity(1),
+            dropped: 0,
+        }
+    }
+
+    /// Records `command` as the answer `request_id` will carry.
+    ///
+    /// The binding aborted the call before it, so an entry that is still here answers a
+    /// call that can no longer reply: tracking the replacing command forgets it.
+    pub fn track(&mut self, request_id: RequestId, command: C) {
+        self.commands.clear();
+        self.commands.insert(request_id, command);
+    }
+
+    /// Takes the command `request_id` answers.
+    ///
+    /// `None` means the reply answers no call this widget is waiting for (it is late,
+    /// already answered, or never was this binding's): it is dropped and counted.
+    pub fn take(&mut self, request_id: RequestId) -> Option<C> {
+        match self.commands.remove(&request_id) {
+            Some(command) => Some(command),
+            None => {
+                self.dropped += 1;
+                None
+            }
+        }
+    }
+
+    /// How many replies this table has dropped as late or unknown.
+    #[must_use]
+    pub const fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Whether a call is waiting for its answer.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    /// Forgets the command in flight without counting a drop.
+    ///
+    /// A widget calls this when it abandons the command for a reason of its own (it
+    /// signed out, failed, or left the market it was reading): the reply will still
+    /// arrive, and then [`Pending::take`] counts it as the late answer it is.
+    pub fn clear(&mut self) {
+        self.commands.clear();
+    }
+}
+
+impl<C> Default for Pending<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C> fmt::Debug for Pending<C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Pending")
+            .field("waiting", &self.commands.len())
+            .field("dropped", &self.dropped)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The widget-side owner of one service and the tasks forwarding its messages.
 ///
 /// Concrete widgets define their protocol, service and business handlers; the
@@ -256,10 +347,13 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
 
     /// Starts one RPC call, replacing (and aborting) the previous one.
     ///
-    /// The reply arrives in the inbox as [`Inbound::Rpc`] with the framework request
-    /// identity, so a widget can reject a late response after it replaced the call —
-    /// the engine's version of the old "stale update" check.
-    pub fn call(&mut self, cx: &mut WidgetCx<'_>, request: P::Request) {
+    /// Returns the framework request identity the reply will carry: the reply arrives
+    /// in the inbox as [`Inbound::Rpc`] with that identity, so a widget that has to
+    /// attribute answers — two commands sharing one binding, or a command replaced in
+    /// the same frame — matches them exactly instead of guessing from a pending flag.
+    /// [`Pending`] is that table; a reply whose identity is not in it is a late answer
+    /// to a call that was replaced and must be dropped.
+    pub fn call(&mut self, cx: &mut WidgetCx<'_>, request: P::Request) -> RequestId {
         if let Some(task) = self.rpc_task.take() {
             task.abort();
         }
@@ -269,19 +363,21 @@ impl<P: WidgetProtocol> WidgetBinding<P> {
             .as_ref()
             .expect("the binding's runtime is alive")
             .client();
+        let request_id = client.reserve_request_id();
         let inbox = self.inbox.clone();
         let handle = cx.handle();
         let window = cx.window();
 
         self.rpc_task = Some(cx.runtime().spawn(async move {
-            let response = client.call(request).await;
-            let request_id = response
-                .as_ref()
-                .map_or_else(|error| error.request_id(), |response| response.request_id());
-            let result = response.map(|response| response.into_value());
+            let result = client
+                .call_with_id(request_id, request)
+                .await
+                .map(|response| response.into_value());
             inbox.push(Inbound::Rpc { request_id, result });
             request_frame(&handle, window);
         }));
+
+        request_id
     }
 
     /// Stops the service and aborts the forwarding tasks.
@@ -362,7 +458,7 @@ mod tests {
         window::{WindowId, WindowOptions},
     };
 
-    use super::{Inbound, WidgetBinding, WidgetInbox};
+    use super::{Inbound, Pending, WidgetBinding, WidgetInbox};
     use crate::{
         cx::WidgetCx,
         frame::FrameRouter,
@@ -531,14 +627,14 @@ mod tests {
         assert!(inbox.drain().is_empty());
     }
 
-    /// The bridge's whole purpose: an RPC's reply reaches the widget's inbox, with the
-    /// framework request identity.
+    /// The bridge's whole purpose: an RPC's reply reaches the widget's inbox, under the
+    /// identity the call returned before the request was sent.
     #[test]
-    fn an_rpc_reply_reaches_the_inbox() {
+    fn a_call_returns_the_identity_its_reply_carries() {
         let mut fixture = Fixture::new();
         let mut binding = fixture.with_cx(|cx| WidgetBinding::spawn(cx, EchoService));
 
-        fixture.with_cx(|cx| binding.call(cx, 42));
+        let expected = fixture.with_cx(|cx| binding.call(cx, 42));
         let messages = fixture.wait_for_one(&binding);
 
         let (request_id, result) = messages
@@ -548,7 +644,8 @@ mod tests {
                 _ => None,
             })
             .expect("the RPC reply arrived");
-        assert_eq!(request_id, RequestId::new(1));
+        assert_eq!(request_id, expected, "the caller knew the reply's identity");
+        assert_eq!(expected, RequestId::new(1), "identities count from one");
         assert_eq!(result.ok(), Some(42));
     }
 
@@ -569,9 +666,14 @@ mod tests {
         };
         let mut binding = fixture.with_cx(|cx| WidgetBinding::spawn(cx, service));
 
-        fixture.with_cx(|cx| binding.call(cx, 1));
+        let first = fixture.with_cx(|cx| binding.call(cx, 1));
         fixture.wait_until(|| received.load(Ordering::SeqCst) >= 1, "the first request");
-        fixture.with_cx(|cx| binding.call(cx, 2));
+        let second = fixture.with_cx(|cx| binding.call(cx, 2));
+        assert_eq!(
+            (first, second),
+            (RequestId::new(1), RequestId::new(2)),
+            "each call takes the next identity, replaced or not"
+        );
         fixture.wait_until(
             || {
                 answered
@@ -627,5 +729,63 @@ mod tests {
             !matches!(exit, RuntimeExit::Panicked(_)),
             "the service stopped without panicking: {exit:?}"
         );
+    }
+
+    /// The table answers exactly one question: is this reply the one the widget waits
+    /// for? A tracked identity is taken once; everything else is a late answer, and it
+    /// is dropped and counted rather than handed to the command now in flight.
+    #[test]
+    fn a_pending_table_matches_identities_and_counts_late_answers() {
+        let mut pending = Pending::new();
+        pending.track(RequestId::new(1), "load");
+
+        assert_eq!(pending.take(RequestId::new(1)), Some("load"));
+        assert!(pending.is_empty());
+        assert_eq!(pending.dropped(), 0);
+        assert_eq!(
+            pending.take(RequestId::new(1)),
+            None,
+            "an answer is taken once"
+        );
+        assert_eq!(pending.dropped(), 1, "the duplicate is counted");
+        assert_eq!(
+            pending.take(RequestId::new(2)),
+            None,
+            "an identity this table never tracked is not this binding's answer"
+        );
+        assert_eq!(pending.dropped(), 2);
+    }
+
+    /// A binding aborts the call it replaces, so tracking the replacing command makes
+    /// the replaced one's identity unknown: its reply, if one was already queued, is a
+    /// late answer — never the replacing command's.
+    #[test]
+    fn tracking_a_replacement_makes_the_replaced_identity_unknown() {
+        let mut pending = Pending::new();
+        pending.track(RequestId::new(1), "load");
+        pending.track(RequestId::new(2), "refresh");
+
+        assert_eq!(pending.take(RequestId::new(1)), None, "the replaced call");
+        assert_eq!(pending.dropped(), 1);
+        assert_eq!(
+            pending.take(RequestId::new(2)),
+            Some("refresh"),
+            "the command really in flight still answers"
+        );
+        assert_eq!(pending.dropped(), 1);
+    }
+
+    /// A widget that abandons its command (it signed out, say) forgets it without
+    /// counting anything: the answer, when it arrives, is the late reply it then is.
+    #[test]
+    fn clearing_abandons_the_command_without_counting_it() {
+        let mut pending = Pending::new();
+        pending.track(RequestId::new(1), "load");
+        pending.clear();
+
+        assert!(pending.is_empty());
+        assert_eq!(pending.dropped(), 0);
+        assert_eq!(pending.take(RequestId::new(1)), None);
+        assert_eq!(pending.dropped(), 1);
     }
 }

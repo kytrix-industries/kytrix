@@ -88,12 +88,13 @@ use ui_core::{
     text::TextStyle,
 };
 use widget::{
-    binding::{Inbound, WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
     error::is_catalog_not_loaded,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     time_zone::data_time_zone,
     venue::{VenueDisplay, joined_names, route_display_string},
@@ -364,12 +365,27 @@ fn columns(translate: &Translate) -> Vec<Column> {
         .collect()
 }
 
+/// One command this pane sent and has not seen the answer to.
+///
+/// The pane reads through one binding and issues one kind of command, so the tag names
+/// the read rather than telling commands apart: it is the identity the binding returned
+/// that decides which answer applies. A reply whose identity is not tracked answers a
+/// call the pane has already replaced; it is dropped and counted instead of failing the
+/// pane over a command no longer in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// The read: `Load` or `Retry`.
+    Start,
+}
+
 pub struct ForceOrderWidget {
     /// The executor bridge, when this host has a directory to drive a service from.
     ///
     /// A headless host without a connector has nothing to start: the pane waits for
     /// the directory instead of spawning a service it could never ask a question.
     binding: Option<WidgetBinding<ForceOrderProtocol>>,
+    /// The command in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     /// The table, once the body has been built (the framework builds a body only once
     /// the pane has content).
     table: Option<Table>,
@@ -515,7 +531,8 @@ impl WidgetView for ForceOrderWidget {
             ForceOrderRequest::Load { routes }
         };
         if let Some(binding) = self.binding.as_mut() {
-            binding.call(cx, request);
+            let request_id = binding.call(cx, request);
+            self.pending.track(request_id, PendingCommand::Start);
         }
     }
 
@@ -655,6 +672,7 @@ impl ForceOrderWidget {
 
         Self {
             binding,
+            pending: Pending::new(),
             table: None,
             table_slot: None,
             status,
@@ -806,7 +824,28 @@ impl ForceOrderWidget {
         match inbound {
             Inbound::Reliable { key, message } => self.apply_reliable(key, &message, cx),
             Inbound::Latest { key, message } => self.apply_latest(key, &message, cx),
-            Inbound::Rpc { result, .. } => self.apply_rpc_result(result, cx),
+            Inbound::Rpc { request_id, result } => {
+                self.apply_rpc(request_id, result, cx);
+            }
+        }
+    }
+
+    /// Applies one RPC reply, once its identity says it answers the command in flight.
+    ///
+    /// The binding replaces its command slot on every load, but a reply can already be
+    /// queued when that happens: only the identity [`WidgetBinding::call`] returned may
+    /// reach the pane, and a reply this table does not know is dropped and counted.
+    fn apply_rpc(
+        &mut self,
+        request_id: RequestId,
+        result: WidgetRpcResult<ForceOrderProtocol>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Start) => self.apply_rpc_result(result, cx),
+            // Late or unknown: the reply answers a read this pane replaced, and the
+            // table has counted it.
+            None => {}
         }
     }
 
@@ -880,6 +919,12 @@ impl ForceOrderWidget {
         result: WidgetRpcResult<ForceOrderProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        // A failure is terminal and a pane waiting for its market has already reported
+        // the notice the framework draws: neither may be repainted by a late answer
+        // (AGENTS §4.4).
+        if self.status.is_failed(cx.app()) || self.awaiting_market {
+            return;
+        }
         match result {
             Ok(ForceOrderResponse::StreamStarted) => {}
             Err(error) => {
@@ -950,7 +995,7 @@ mod tests {
         window::{WindowId, WindowOptions},
     };
     use widget::{
-        error::TranslatedError, frame::FrameRouter, services::WidgetServices,
+        error::TranslatedError, frame::FrameRouter, rpc::RpcCallError, services::WidgetServices,
         test_support::WidgetTestApp,
     };
 
@@ -1356,6 +1401,14 @@ mod tests {
                     cx,
                 );
             });
+        }
+
+        fn apply_rpc(
+            &mut self,
+            request_id: RequestId,
+            result: WidgetRpcResult<ForceOrderProtocol>,
+        ) {
+            self.with_cx(|widget, cx| widget.apply_rpc(request_id, result, cx));
         }
 
         fn clear_orders(&mut self) {
@@ -2011,6 +2064,68 @@ mod tests {
         assert_eq!(fixture.status(), failed);
         assert!(fixture.status().is_failed());
         assert!(fixture.snapshot_len().is_none());
+    }
+
+    /// The answer to the read the pane sent is reported: the binding returned the
+    /// identity before the request went out, and the reply carrying it is the pane's.
+    #[test]
+    fn the_answer_to_the_read_it_sent_should_be_reported() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+
+        fixture.apply_rpc(
+            RequestId::new(1),
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(1),
+            }),
+        );
+
+        assert!(
+            fixture.status().is_failed(),
+            "the read's refusal is the pane's failure"
+        );
+    }
+
+    /// A read the pane replaced answers a command no longer waiting: the reply is
+    /// dropped and counted, and it does not fail the read that replaced it.
+    #[test]
+    fn the_answer_to_a_replaced_read_should_be_dropped() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.load();
+
+        fixture.apply_rpc(
+            RequestId::new(1),
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(1),
+            }),
+        );
+
+        assert!(
+            !fixture.status().is_failed(),
+            "the replaced read's refusal is not this pane's failure"
+        );
+        assert_eq!(
+            fixture.widget.pending.dropped(),
+            1,
+            "the late answer is dropped and counted"
+        );
+    }
+
+    /// A failed pane is terminal: even the reply to the read it was still waiting for
+    /// may not rewrite the failure sentence.
+    #[test]
+    fn a_failed_pane_should_not_be_repainted_by_a_late_reply() {
+        let mut fixture = Fixture::new(PendingForceOrderSource, true);
+        fixture.report_failure();
+        let failed = fixture.status();
+
+        fixture.apply_rpc(
+            RequestId::new(1),
+            Err(RpcCallError::ServiceClosed {
+                request_id: RequestId::new(1),
+            }),
+        );
+
+        assert_eq!(fixture.status(), failed);
     }
 
     #[test]

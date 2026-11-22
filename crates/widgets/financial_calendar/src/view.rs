@@ -109,7 +109,7 @@ use ui_core::{
     window::WindowId,
 };
 use widget::{
-    binding::{Inbound, WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
     cx::WidgetCx,
@@ -343,6 +343,23 @@ impl Countdown {
     }
 }
 
+/// One command this pane sent and has not seen the answer to.
+///
+/// The pane replaces its one command slot on every call (start, refresh, stop), and the
+/// binding aborts the replaced call — but an answer can already be queued when that
+/// happens. The identity [`WidgetBinding::call`] returned is what says whose answer
+/// arrived: an answer this table does not know answers a command the pane has replaced,
+/// and it is dropped and counted rather than reported as the command now in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// The read that starts or restarts the stream: `Load` or `Retry`.
+    Load,
+    /// The read the refresh control brought forward.
+    Refresh,
+    /// The stop of a stream nobody follows any more: its answer is nothing to report.
+    Stop,
+}
+
 /// One financial calendar pane: the account it follows, the table it draws, and its
 /// refresh control.
 pub struct FinancialCalendarWidget {
@@ -351,6 +368,8 @@ pub struct FinancialCalendarWidget {
     /// A host without one has nothing to ask: the pane reports that its stream is
     /// unavailable rather than starting a service it could never answer.
     binding: Option<WidgetBinding<CalendarProtocol>>,
+    /// The command in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
     status: WidgetStatus,
     recovery: WidgetAction,
     translate: Translate,
@@ -385,15 +404,6 @@ pub struct FinancialCalendarWidget {
     next_refresh_at: Option<i64>,
     /// Whether a refresh this pane sent has been answered *and its answer reported*.
     refresh_pending: bool,
-    /// The framework identity of the last RPC reply this pane applied.
-    ///
-    /// The binding tags every reply with the request it answers. The pane replaces
-    /// its one command slot on every call (start, refresh, stop), and the binding
-    /// aborts the replaced call — but a reply can already be queued when the
-    /// replacement happens. Such a reply carries an identity no newer than one this
-    /// pane has already applied, and applying it would report a command the pane has
-    /// since replaced (a refused old refresh failing a pane that signed out, say).
-    last_rpc_reply: Option<RequestId>,
     /// The account this pane is for, or `None` while nobody is signed in.
     account_id: Option<SmolStr>,
     /// The display zone the rows are grouped for, so a move regroups them once.
@@ -626,6 +636,7 @@ impl FinancialCalendarWidget {
 
         Self {
             binding,
+            pending: Pending::new(),
             status,
             recovery,
             translate,
@@ -643,7 +654,6 @@ impl FinancialCalendarWidget {
             snapshot: None,
             next_refresh_at: None,
             refresh_pending: false,
-            last_rpc_reply: None,
             account_id,
             seen_zone,
             header_left: None,
@@ -708,6 +718,9 @@ impl FinancialCalendarWidget {
     /// Starts reading, or restarts for an account the user is retrying.
     fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
         self.refresh_pending = false;
+        // The command that was in flight belongs to the scope this call replaces, so
+        // its answer is not something to wait for any more.
+        self.pending.clear();
         let key = self.current_key();
         let has_service = self.binding.is_some();
         match key {
@@ -718,7 +731,8 @@ impl FinancialCalendarWidget {
                 // polling for a reader who is no longer there.
                 self.clear_answer(cx);
                 if let Some(binding) = self.binding.as_mut() {
-                    binding.call(cx, CalendarRequest::Stop);
+                    let request_id = binding.call(cx, CalendarRequest::Stop);
+                    self.pending.track(request_id, PendingCommand::Stop);
                 }
                 self.status.report(
                     cx.app_mut(),
@@ -743,7 +757,7 @@ impl FinancialCalendarWidget {
                 }
                 self.status.report(cx.app_mut(), WidgetState::Connecting);
                 if let Some(binding) = self.binding.as_mut() {
-                    binding.call(
+                    let request_id = binding.call(
                         cx,
                         if retry {
                             CalendarRequest::Retry(key)
@@ -751,6 +765,7 @@ impl FinancialCalendarWidget {
                             CalendarRequest::Load(key)
                         },
                     );
+                    self.pending.track(request_id, PendingCommand::Load);
                 }
                 let _ = cx.request_frame();
             }
@@ -817,7 +832,8 @@ impl FinancialCalendarWidget {
         // on its way at the old time.
         Countdown::update(&self.countdown, cx.app_mut(), None);
         if let Some(binding) = self.binding.as_mut() {
-            binding.call(cx, CalendarRequest::Refresh);
+            let request_id = binding.call(cx, CalendarRequest::Refresh);
+            self.pending.track(request_id, PendingCommand::Refresh);
         }
         let _ = cx.request_frame();
     }
@@ -897,7 +913,7 @@ impl FinancialCalendarWidget {
         self.apply_snapshot(Arc::clone(calendar), *next_refresh_at, cx);
     }
 
-    /// Applies the answer to a command.
+    /// Applies the answer to a command, attributed by the identity the binding returned.
     ///
     /// An accepted command stays pending until the calendar it asked for is reported:
     /// the acknowledgement and the answer are two different messages, and the service
@@ -909,9 +925,12 @@ impl FinancialCalendarWidget {
     ///   failure was reported may not repaint or "un-end" it. The old pane guarded
     ///   this entry; the migration dropped the guard, and one late refusal from a
     ///   replaced call was enough to rewrite the failure sentence the user is reading.
-    /// - A reply that is not newer than one this pane already applied answers a
-    ///   command that was replaced (the binding aborts the replaced call, so only a
-    ///   reply queued before the replacement can still arrive) and must be dropped.
+    /// - The pane replaces its command slot on every call, and the binding aborts the
+    ///   replaced call — but an answer can already be queued when the replacement
+    ///   happens. Only the identity [`WidgetBinding::call`] returned answers a command
+    ///   this pane waits for; an answer the table does not know answers a command that
+    ///   was replaced and is dropped and counted (a refused old refresh failing a pane
+    ///   that signed out, say).
     /// - A pane nobody is signed in for is waiting, not failing: signing out replaces
     ///   the read with a `Stop`, and a refusal of the read it replaced is not a reason
     ///   to leave the waiting state.
@@ -921,29 +940,34 @@ impl FinancialCalendarWidget {
         result: WidgetRpcResult<CalendarProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
-        if self.status.is_failed(cx.app()) || self.current_key().is_none() {
-            return;
-        }
-        if self.last_rpc_reply.is_some_and(|last| request_id <= last) {
-            return;
-        }
-        self.last_rpc_reply = Some(request_id);
-        match result {
-            Ok(
-                CalendarResponse::StreamStarted
-                | CalendarResponse::RefreshQueued
-                | CalendarResponse::Stopped,
-            ) => {}
-            Err(error) => {
-                self.refresh_pending = false;
-                // A failed read has no schedule left to count down to.
-                Countdown::stop(&self.countdown, cx.app_mut());
-                self.status.report(
-                    cx.app_mut(),
-                    WidgetState::failed(Arc::new(error), self.recovery.clone()),
-                );
-                let _ = cx.request_frame();
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Load | PendingCommand::Refresh) => {
+                if self.status.is_failed(cx.app()) || self.current_key().is_none() {
+                    return;
+                }
+                match result {
+                    Ok(
+                        CalendarResponse::StreamStarted
+                        | CalendarResponse::RefreshQueued
+                        | CalendarResponse::Stopped,
+                    ) => {}
+                    Err(error) => {
+                        self.refresh_pending = false;
+                        // A failed read has no schedule left to count down to.
+                        Countdown::stop(&self.countdown, cx.app_mut());
+                        self.status.report(
+                            cx.app_mut(),
+                            WidgetState::failed(Arc::new(error), self.recovery.clone()),
+                        );
+                        let _ = cx.request_frame();
+                    }
+                }
             }
+            // The answer to the stop of a stream nobody follows: nothing to report.
+            Some(PendingCommand::Stop) => {}
+            None => log::debug!(
+                "the financial calendar pane ignored reply {request_id}: no command is waiting for it"
+            ),
         }
     }
 
@@ -2503,6 +2527,11 @@ mod tests {
             pane.widget.countdown.deadline().is_none(),
             "and the late reply does not put a schedule back on the header"
         );
+        assert_eq!(
+            pane.widget.pending.dropped(),
+            1,
+            "the late reply was dropped and counted"
+        );
     }
 
     /// Signing out is a waiting state, not a failure: the read the pane replaced with a
@@ -2546,10 +2575,15 @@ mod tests {
             waiting,
             "a refusal of the read signing out replaced may not fail the waiting pane"
         );
+        assert_eq!(
+            pane.widget.pending.dropped(),
+            1,
+            "the refusal of the replaced read was dropped and counted"
+        );
     }
 
-    /// The framework request identity orders the command replies: a reply older than
-    /// one this pane already applied answers a command it replaced, and is dropped.
+    /// The request identity decides whose answer arrived: a reply older than the command
+    /// in flight answers a command the pane already replaced, and is dropped and counted.
     #[test]
     fn a_command_reply_older_than_the_one_already_applied_should_be_ignored() {
         let mut harness = harness();
@@ -2589,6 +2623,11 @@ mod tests {
         assert!(
             pane.widget.refresh_pending,
             "the refresh the pane replaced its call with is still the one in flight"
+        );
+        assert_eq!(
+            pane.widget.pending.dropped(),
+            1,
+            "the answer to the replaced command was dropped and counted"
         );
     }
 

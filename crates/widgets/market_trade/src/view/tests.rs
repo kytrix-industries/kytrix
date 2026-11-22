@@ -568,6 +568,10 @@ impl Fixture {
         });
     }
 
+    fn apply_rpc(&mut self, request_id: RequestId, result: WidgetRpcResult<MarketTradeProtocol>) {
+        self.with_cx(|widget, cx| widget.apply_rpc(request_id, result, cx));
+    }
+
     fn accept_snapshot(&mut self, snapshot: MarketTradeSnapshot) {
         self.with_cx(|widget, cx| {
             widget.ready_received = true;
@@ -986,6 +990,50 @@ fn an_rpc_result_while_waiting_for_the_market_should_not_replace_the_wait() {
         "the pane keeps waiting for its market"
     );
     assert!(!fixture.status().is_failed());
+}
+
+/// The answer to the read the tape sent is reported: the binding returned the identity
+/// before the request went out, and the reply carrying it is the tape's own.
+#[test]
+fn the_answer_to_the_read_it_sent_should_be_reported() {
+    let mut fixture = Fixture::over_listing(PendingSource, true);
+
+    fixture.apply_rpc(
+        RequestId::new(1),
+        Err(RpcCallError::ServiceClosed {
+            request_id: RequestId::new(1),
+        }),
+    );
+
+    assert!(
+        fixture.status().is_failed(),
+        "the read's refusal is the tape's failure"
+    );
+}
+
+/// A read the tape replaced answers a command no longer waiting: the reply is dropped and
+/// counted, and it does not fail the read that replaced it.
+#[test]
+fn the_answer_to_a_replaced_read_should_be_dropped() {
+    let mut fixture = Fixture::over_listing(PendingSource, true);
+    fixture.load();
+
+    fixture.apply_rpc(
+        RequestId::new(1),
+        Err(RpcCallError::ServiceClosed {
+            request_id: RequestId::new(1),
+        }),
+    );
+
+    assert!(
+        !fixture.status().is_failed(),
+        "the replaced read's refusal is not this tape's failure"
+    );
+    assert_eq!(
+        fixture.widget.pending.dropped(),
+        1,
+        "the late answer is dropped and counted"
+    );
 }
 
 /// Both streams are keyed by the listing they were opened for, and a message from a
