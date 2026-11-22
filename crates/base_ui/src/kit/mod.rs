@@ -1,23 +1,18 @@
-//! base_ui 的引擎化基座（迁移新模块树 `kit/`）。
+//! base_ui 的引擎化组件库（`kit/`）。
 //!
-//! # 迁移状态（P2 批次，2026-11-21）
+//! # 状态（P5-2 收口）
 //!
-//! 本模块树是 `base_ui` 从 `gpui-kit` 迁到自研引擎 `ui_core` 的**目标 API**，当前处于
-//! 「新旧并存」期：本文件公开的 `icon` / `assets` / `brand` / `size` / `format` / `motion` /
-//! `animation` / `join` / `markdown` / `input` / `list` / `scroll_bar` / `table` / `tree` /
-//! `alert` / `dialog` / `overlay` / `layer` / `tooltip` 是
-//! 引擎化版本；旧顶层模块（`crate::icon`、`crate::assets`、`crate::markdown`、`crate::input`、
-//! `crate::table`…）由尚未迁移的 gpui 组件继续使用，P2-5 迁完后删除。按 AGENTS §1.1，这里
-//! **不提供**任何兼容层 / 转发函数 —— 两个模块树各自独立，组件迁移时整模块切换过去。//!
-//! 本模块树**只依赖 `ui_core`、`smol_str`、`comrak` 等非 gpui 依赖**，任何 gpui 类型都不得
-//! 出现在这里。
+//! 旧顶层组件模块（`crate::icon`、`crate::assets`、`crate::markdown`、`crate::input`、
+//! `crate::table`…）已在 P5-2 删除；本模块树是 `base_ui` 唯一的组件面，只依赖 `ui_core`、
+//! `smol_str`、`comrak` 等非 UI 框架依赖，任何 UI 框架类型都不得出现。按 AGENTS §1.1，
+//! **不提供**任何兼容层 / 转发函数。
 //!
 //! `test_support` 只在测试构建里存在（`#[cfg(test)]`）：它依赖 `ui_core` 的 `test-support`
 //! feature，而该 feature 由 `base_ui` 的 dev-dependencies 打开，发布物里不能引用。
 //!
 //! # 模块一览
 //!
-//! | 模块 | 职责 | 旧实现 |
+//! | 模块 | 职责 | 迁移来源（P5-2 已删除） |
 //! |---|---|---|
 //! | [`icon`] | 55 个 Phosphor 图标的枚举 / 名称 / 两档构建期 PNG / E7 图片节点挂载（`Fill` + 颜色调制） | `crate::icon` |
 //! | [`assets`] | 品牌图与 Widget 预览图的注册表、路径查找、引擎异步解码接线、E7 pending 节点来源 | `crate::assets` |

@@ -1,6 +1,6 @@
 //! markdown 子系统（引擎化）：comrak 解析 → 只读 IR → 引擎富文本节点树。
 //!
-//! 数据流（与旧 `crate::markdown` 一一对应，但整条链路不依赖 gpui）：
+//! 数据流（与旧 `crate::markdown` 一一对应，但整条链路不依赖 旧 UI 层）：
 //!
 //! ```text
 //! parse::parse_document(&str, &dyn MarkdownAssets) -> document::MarkdownDocument

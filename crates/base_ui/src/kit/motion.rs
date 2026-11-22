@@ -4,7 +4,7 @@
 //! 在引擎 `App::animate` / `Transient` 的驱动下按帧调用本函数；本模块只保证「同一段时间无论被
 //! 切成几帧，结果一致」这一条（指数响应而不是线性逼近）。
 //!
-//! 数值与旧实现逐位一致（常量 + 公式照搬；测试直接对旧函数现场比对，不硬编码期望值）。
+//! 数值与旧实现逐位一致（常量 + 公式照搬；P5-2 删除旧实现前把曲线采样冻结成基线表）。
 
 use std::time::Duration;
 
@@ -43,24 +43,50 @@ mod tests {
 
     use super::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after};
 
-    /// 旧实现与新实现在一组输入上逐位一致（旧模块还在 crate 里，现场比对）。
+    /// 旧实现的 30 个采样点（P5-2 在旧模块删除前逐位冻结）：(progress, span, elapsed_ms, 输出)。
+    const FROZEN_SAMPLES: [(f32, f32, u64, f32); 30] = [
+        (0.0, 1.0, 0, 0.0),
+        (0.0, 1.0, 8, 0.091535985),
+        (0.0, 1.0, 33, 0.3269933),
+        (0.0, 1.0, 150, 0.8347011),
+        (0.0, 1.0, 1000, 1.0),
+        (0.0, 0.0005, 0, 1.0),
+        (0.0, 0.0005, 8, 1.0),
+        (0.0, 0.0005, 33, 1.0),
+        (0.0, 0.0005, 150, 1.0),
+        (0.0, 0.0005, 1000, 1.0),
+        (0.25, 1.0, 0, 0.25),
+        (0.25, 1.0, 8, 0.31865197),
+        (0.25, 1.0, 33, 0.49524498),
+        (0.25, 1.0, 150, 0.87602586),
+        (0.25, 1.0, 1000, 1.0),
+        (0.25, 0.0005, 0, 1.0),
+        (0.25, 0.0005, 8, 1.0),
+        (0.25, 0.0005, 33, 1.0),
+        (0.25, 0.0005, 150, 1.0),
+        (0.25, 0.0005, 1000, 1.0),
+        (0.9, 1.0, 0, 0.9),
+        (0.9, 1.0, 8, 0.9091536),
+        (0.9, 1.0, 33, 0.9326993),
+        (0.9, 1.0, 150, 0.9834701),
+        (0.9, 1.0, 1000, 1.0),
+        (0.9, 0.0005, 0, 1.0),
+        (0.9, 0.0005, 8, 1.0),
+        (0.9, 0.0005, 33, 1.0),
+        (0.9, 0.0005, 150, 1.0),
+        (0.9, 0.0005, 1000, 1.0),
+    ];
+
+    /// 曲线与旧实现的冻结采样逐位一致（旧实现已删，基线见 [`FROZEN_SAMPLES`]）。
     #[test]
-    fn the_curve_is_bit_identical_to_the_legacy_implementation() {
-        let mut checked = 0usize;
-        for progress in [0.0, 0.1, 0.5, 0.9, 1.0, -1.0, 2.0] {
-            for span in [0.0, 0.001, 0.5, 1.0, 42.0] {
-                for millis in [0u64, 1, 8, 16, 33, 100, 150, 1000] {
-                    let elapsed = Duration::from_millis(millis);
-                    assert_eq!(
-                        depth_animation_progress_after(progress, span, elapsed),
-                        crate::motion::depth_animation_progress_after(progress, span, elapsed),
-                        "progress={progress} span={span} elapsed={millis}ms 的曲线漂移"
-                    );
-                    checked += 1;
-                }
-            }
+    fn the_curve_matches_the_frozen_legacy_samples() {
+        for (progress, span, millis, expected) in FROZEN_SAMPLES {
+            assert_eq!(
+                depth_animation_progress_after(progress, span, Duration::from_millis(millis)),
+                expected,
+                "progress={progress} span={span} elapsed={millis}ms 的曲线漂移"
+            );
         }
-        assert!(checked >= 100, "抽样数必须足够（实际 {checked}）");
     }
 
     /// 语义旧测试（保留旧用例的断言口径）：1 ms 内已经动、150 ms 未完成、结算阈值、越界 clamp。

@@ -31,7 +31,7 @@ use crate::kit::{
     size::UnifiedSize,
 };
 
-/// 菜单的哪个角落落在右键点上（旧 `gpui_kit::Anchor`）。
+/// 菜单的哪个角落落在右键点上（旧锚点类型）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MenuAnchor {
     /// 菜单左上角在点上（菜单向右下展开；旧的默认）。

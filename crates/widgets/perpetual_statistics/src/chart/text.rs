@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use base_ui::format::group_digits;
+use base_ui::kit::format::group_digits;
 use market_participants_model::decimal::{Price, Quantity, Tick};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};

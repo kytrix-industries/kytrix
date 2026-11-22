@@ -85,7 +85,7 @@
 //!
 //! 引擎没有「同条目数下强制重建已挂载行」的入口，双端 push 走
 //! `set_virtual_items(0)` → `set_virtual_items(n)` 强制重建可见窗口（行内容按新下标重新生成）；
-//! 代价是每次 push 重挂可见行，与旧 gpui `splice` 保测量不同，登记为已知差异。
+//! 代价是每次 push 重挂可见行，与旧实现 `splice` 保测量不同，登记为已知差异。
 
 use std::{
     cell::{Cell, RefCell},
@@ -1390,7 +1390,7 @@ impl List {
         let Some(index) = self.row_index_at_node(ctx.app_mut(), hit_node) else {
             return;
         };
-        // 不可交互行：点击既不选中也不激活（旧 gpui `Button::disabled` 语义）。
+        // 不可交互行：点击既不选中也不激活（旧实现 `Button::disabled` 语义）。
         if self.is_disabled(index) {
             return;
         }
@@ -2132,7 +2132,7 @@ mod ui_tests {
         assert_eq!(harness.list.count(harness.app.app()), 5);
     }
 
-    /// 禁用行：点击不选中、程序化选中被拒绝（旧 gpui `Button::disabled` 语义）。
+    /// 禁用行：点击不选中、程序化选中被拒绝（旧实现 `Button::disabled` 语义）。
     #[test]
     fn disabled_rows_reject_clicks_and_programmatic_selection() {
         let mut harness = harness(5);

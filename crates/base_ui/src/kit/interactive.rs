@@ -1,6 +1,6 @@
 //! 通用交互状态机（旧 `crate::interactive` 的引擎化重建，P2-4a）。
 //!
-//! 旧实现把 hover / active 存在 GPUI 的 keyed state 里、把三种颜色交给 `transition()` 做隐式过渡，
+//! 旧实现把 hover / active 存在 旧 UI 层的 keyed state 里、把三种颜色交给 `transition()` 做隐式过渡，
 //! 点击由调用方用 `InteractiveElement::on_click` 注入。新引擎只提供两样东西：节点上的 `Action`
 //! 声明（指针点击 + 焦点节点的 Enter/Space 激活走同一条分发）和 `bind_style` 的 `StylePatch`。
 //! 本模块因此是**应用层**的状态机：
@@ -39,7 +39,7 @@
 //!
 //! # tooltip
 //!
-//! tooltip 组件在 P2-4b（`crate::tooltip` 仍依赖 GPUI）。本模块只保留挂点：`tooltip_text` 存
+//! tooltip 组件在 P2-4b 建立。本模块只保留挂点：`tooltip_text` 存
 //! 一段文本、`tooltip()` 读出，由 P2-4b 的 tooltip 层按节点几何挂载；本批不画任何浮层。
 //!
 //! # 生命周期
@@ -49,7 +49,7 @@
 //!
 //! # 与旧 API 的形态差异
 //!
-//! 旧 `Interactive` 是 GPUI 元素（`Styled` / `ParentElement` / `InteractiveElement`），新组件是
+//! 旧 `Interactive` 是 UI 元素（`Styled` / `ParentElement` / `InteractiveElement`），新组件是
 //! **挂载期 builder**：`new(app, theme, key)` 建状态，`build(app, window, parent, content)` 建节点
 //! 并注册回调（content 拿 `&mut App` 是因为图标节点要写引擎资源缓存），`sync(app)` 帧驱动镜像，
 //! `dispatch(app, event)` 转发指针事件。没有 `Styled` / `refine_style`（D24）。

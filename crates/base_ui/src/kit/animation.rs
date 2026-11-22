@@ -50,7 +50,6 @@ pub fn popup_should_render(opened: bool, progress: f32) -> bool {
 mod tests {
     use std::time::Duration;
 
-    use gpui_kit::base::{MotionStatus, PresencePhase, PresenceSample};
     use ui_core::interaction::{AnimatedValue, AnimationSpec, Easing};
 
     use super::{animation_tick, popup_should_render};
@@ -60,33 +59,6 @@ mod tests {
     #[test]
     fn the_animation_tick_is_the_themed_legacy_interval() {
         assert_eq!(animation_tick(), Duration::from_millis(150));
-        assert_eq!(animation_tick(), crate::animation::ANIMATION_TICK);
-    }
-
-    /// 判据与旧 `popup_should_render` 逐值等价（旧 `PresenceSample` 的字段是公开的，直接造样本）。
-    #[test]
-    fn the_render_predicate_matches_the_legacy_implementation() {
-        for opened in [false, true] {
-            for phase in [
-                PresencePhase::Entering,
-                PresencePhase::Present,
-                PresencePhase::Exiting,
-                PresencePhase::Absent,
-            ] {
-                for progress in [0.0f32, 0.25, 1.0] {
-                    let sample = PresenceSample {
-                        phase,
-                        progress,
-                        status: MotionStatus::Running,
-                    };
-                    assert_eq!(
-                        popup_should_render(opened, progress),
-                        crate::animation::popup_should_render(opened, sample),
-                        "opened={opened} phase={phase:?} progress={progress} 的判据漂移"
-                    );
-                }
-            }
-        }
     }
 
     /// 真值表：关闭且淡出已结束 ⇒ 不进树；打开或淡出中 ⇒ 进树。

@@ -14,9 +14,9 @@ use crate::kit::markdown::{
 
 /// 测试用的资源源：只认 [`INTRINSIC_ASSET`] 一条路径，交出一张 [`INTRINSIC_BYTES`] 里的位图。
 ///
-/// 生产代码的资源源就是产品自己的 [`Assets`](crate::assets::Assets)，这里换成一份最小的假资源，
-/// 是为了让"没写 `size` 就用资源自身的尺寸"这条在解析层可验；真资源的那份断言在
-/// `source::tests` 里。
+/// 生产代码的资源源由调用方提供（例如 widget 的嵌入资源源读 `crate::kit::assets::bytes`），这里
+/// 换成一份最小的假资源，是为了让"没写 `size` 就用资源自身的尺寸"这条在解析层可验；真资源的那份
+/// 断言在 `source::tests` 里。
 struct TestAssets;
 
 /// [`TestAssets`] 唯一认得的那条路径。

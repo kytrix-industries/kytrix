@@ -1,7 +1,7 @@
 //! 应用层文本编辑状态机 + 引擎（`ui_core`）渲染（P2-3）。
 //!
-//! 旧 `crate::input` 是 gpui 之上的一层壳：值/掩码/禁用/只读/占位符/光标与选区全部委托给
-//! gpui-base 的 11,955 行编辑状态机。引擎化之后**编辑状态机归应用层**（本模块），引擎只提供
+//! 旧 `input` 模块是 UI 框架之上的一层壳：值/掩码/禁用/只读/占位符/光标与选区全部委托给
+//! 旧输入组件库的 11,955 行编辑状态机。引擎化之后**编辑状态机归应用层**（本模块），引擎只提供
 //! 三件事：文本 shaping 与几何查询（`Window::text_caret_rect` / `Window::text_byte_index_at` /
 //! `NodeTree::text_selection_rects`）、逐帧失效与绘制（`bind_text` / `bind_style` /
 //! `Window::set_canvas`）、以及输入路由（`App::drain_events` / IME caret hint）。
@@ -38,7 +38,7 @@
 //!   删除并保证**永不切断 UTF-8**；组合附加符号 / ZWJ 序列会被拆成多个 `char`。
 //! - **上下方向键**：视觉行不是公开 API（`ShapedLine` 只在 crate 内可达），因此 `↑/↓` 不消费
 //!   （不伪造「跳到段首/段尾」的语义）。左右方向键 / Home / End / Ctrl+Home / Ctrl+End 可用。
-//!   旧 gpui-base 在单行输入上同样早退，因此当前产品没有回归。
+//!   旧输入组件库在单行输入上同样早退，因此当前产品没有回归。
 //! - **密码框 IME 语义**：Linux 的 `Window::set_ime_content_type(ImeContentType::Password)`
 //!   是窗口级接口且属平台批次，未接线。
 //!
@@ -1714,7 +1714,7 @@ impl InputNode {
 
     /// 运行时写值（旧 `set_value` 的**程序化契约**；生产调用点在 P2-5 接线时直接换过来）。
     ///
-    /// 与用户级 [`InputState::set_text`] 的差别（对照旧 gpui-base `input/base/state.rs`）：
+    /// 与用户级 [`InputState::set_text`] 的差别（对照旧输入组件库的 `input/base/state.rs`）：
     /// - **绕过 `readonly` / `disabled`**：这两种模式只拒绝**用户**编辑，程序化写值必须能更新
     ///   （旧 `replace_text` 在 `with_edits_allowed` 里执行；旧测试
     ///   `test_readonly_rejects_user_edits_only` 明确「程序化 API 不受只读限制」）；
@@ -4104,7 +4104,7 @@ mod tests {
     }
 
     /// 旧 `set_value` 契约：`readonly` / `disabled` 只拒绝**用户**编辑，程序化写值必须能更新
-    /// （旧 gpui-base `test_readonly_rejects_user_edits_only` + `with_edits_allowed`）。
+    /// （旧输入组件库的 `test_readonly_rejects_user_edits_only` + `with_edits_allowed`）。
     #[test]
     fn update_value_bypasses_readonly_and_disabled() {
         let mut readonly = harness(

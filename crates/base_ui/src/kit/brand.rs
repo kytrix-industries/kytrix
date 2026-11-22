@@ -9,8 +9,8 @@
 //!
 //! # 显式尺寸是 **Contain**（等比内嵌 + 居中），不是拉伸
 //!
-//! 旧 `Brand` 的 `img()` 用 GPUI `Img` 的默认 `ImageStyle`，其 `object_fit` 是
-//! **`ObjectFit::Contain`**（`gpui-pre-0.3.12/src/elements/img.rs` 的 `impl Default`；paint 时
+//! 旧 `Brand` 的 `img()` 用旧 UI 层 `Img` 的默认 `ImageStyle`，其 `object_fit` 是
+//! **`ObjectFit::Contain`**（旧 UI 层 0.3.12 的 `elements/img.rs` 的 `impl Default`；paint 时
 //! `object_fit.get_bounds(bounds, image_size)`，`src/style.rs`）。旧调用点给的是正方形盒子
 //! （`profile_ui/src/menu.rs` 的 `.size(px(14.))`、`base_ui` 的 `.size_4()`），于是非正方形
 //! logo（Ethereum 44×72、Solana 81×72）是**等比内缩 + 居中**、两侧留白，而不是被拉扁。
@@ -71,6 +71,31 @@ pub enum BrandKind {
     Solana,
 }
 
+/// Ethereum 的资产路径（相对 `crates/base_ui/assets`）。
+///
+/// 路径只在这里写一次：命名者（Widget 占位文案里的内联图片）与画图者（[`Brand`]）读同一个常量。
+pub const ETHEREUM: &str = "brands/Ethereum/colored@72px.png";
+
+/// Solana 的资产路径。
+pub const SOLANA: &str = "brands/Solana/colored@72px.png";
+
+/// Binance 的资产路径。
+pub const BINANCE: &str = "brands/Binance/binance.png";
+
+/// OKX 的资产路径。
+pub const OKX: &str = "brands/OKX/okx.png";
+
+/// Hyperliquid 的资产路径。
+pub const HYPERLIQUID: &str = "brands/Hyperliquid/hyperliquid.png";
+
+/// Polymarket 的资产路径。
+pub const POLYMARKET: &str = "brands/Polymarket/polymarket.png";
+
+/// Longbridge 的资产路径。
+///
+/// 文件是占位图，正式资产要在取得展示权后替换；路径不变（设计 §8.5 的合规缺口只登记）。
+pub const LONGBRIDGE: &str = "brands/Longbridge/longbridge.png";
+
 impl BrandKind {
     /// 全部品牌（顺序 = 旧模块的常量顺序：Ethereum / Solana / Binance / OKX / Hyperliquid /
     /// Polymarket / Longbridge 的字母序，便于清单比对）。
@@ -98,17 +123,17 @@ impl BrandKind {
         }
     }
 
-    /// 资产路径（相对 `crates/base_ui/assets`；与旧 `crate::brand::{ETHEREUM, ..}` 常量逐字一致）。
+    /// 资产路径（相对 `crates/base_ui/assets`；就是本模块的 7 条公开常量）。
     #[must_use]
     pub const fn asset_path(self) -> &'static str {
         match self {
-            BrandKind::Binance => "brands/Binance/binance.png",
-            BrandKind::Ethereum => "brands/Ethereum/colored@72px.png",
-            BrandKind::Hyperliquid => "brands/Hyperliquid/hyperliquid.png",
-            BrandKind::Longbridge => "brands/Longbridge/longbridge.png",
-            BrandKind::Okx => "brands/OKX/okx.png",
-            BrandKind::Polymarket => "brands/Polymarket/polymarket.png",
-            BrandKind::Solana => "brands/Solana/colored@72px.png",
+            BrandKind::Binance => BINANCE,
+            BrandKind::Ethereum => ETHEREUM,
+            BrandKind::Hyperliquid => HYPERLIQUID,
+            BrandKind::Longbridge => LONGBRIDGE,
+            BrandKind::Okx => OKX,
+            BrandKind::Polymarket => POLYMARKET,
+            BrandKind::Solana => SOLANA,
         }
     }
 
@@ -135,7 +160,7 @@ pub struct Brand {
     pub kind: BrandKind,
     /// 逻辑边长（正方形**节点盒**；`None` = 用固有宽高）。
     ///
-    /// 语义是旧 GPUI `img()` 的默认 `ObjectFit::Contain`：logo 由 E7 [`ImageFit::Contain`]
+    /// 语义是旧实现 `img()` 的默认 `ObjectFit::Contain`：logo 由 E7 [`ImageFit::Contain`]
     /// **等比内嵌**进这个正方形并居中，非正方形 logo（Ethereum 44×72 / Solana 81×72）会留白，
     /// 而不是被拉伸成正方形（见模块文档与 spec-delta §6 第 5 条）。
     pub size: Option<f32>,
@@ -162,7 +187,7 @@ impl Brand {
         self
     }
 
-    /// 可访问名（旧 GPUI `img().alt(..)` 的对位；E7 走 `A11yOverride::label`）。
+    /// 可访问名（旧实现 `img().alt(..)` 的对位；E7 走 `A11yOverride::label`）。
     #[must_use]
     pub fn with_alt(mut self, alt: impl Into<SmolStr>) -> Self {
         self.alt = Some(alt.into());
@@ -359,7 +384,10 @@ mod tests {
         test_support::app::TestApp,
     };
 
-    use super::{Brand, BrandError, BrandKind};
+    use super::{
+        BINANCE, Brand, BrandError, BrandKind, ETHEREUM, HYPERLIQUID, LONGBRIDGE, OKX, POLYMARKET,
+        SOLANA,
+    };
     use crate::{
         kit::test_support::{
             assert_single_image, bounds, image_primitives, test_app, test_app_with_scale,
@@ -367,23 +395,41 @@ mod tests {
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
-    /// 7 个品牌：名字唯一、路径与旧模块的常量逐字一致、字节与旧 rust-embed 资产逐字节一致。
+    /// 7 个品牌：名字唯一、路径与旧模块的路径常量逐字一致、字节就是注册表里的 PNG。
     #[test]
     fn every_brand_matches_the_legacy_paths_and_bytes() {
         assert_eq!(BrandKind::ALL.len(), 7);
+        // (品牌, 冻结路径, 公开常量)：旧实现的 7 条路径常量（P5-2 搬入本模块，逐字冻结）。
         let legacy = [
-            (BrandKind::Ethereum, crate::brand::ETHEREUM),
-            (BrandKind::Solana, crate::brand::SOLANA),
-            (BrandKind::Binance, crate::brand::BINANCE),
-            (BrandKind::Okx, crate::brand::OKX),
-            (BrandKind::Hyperliquid, crate::brand::HYPERLIQUID),
-            (BrandKind::Polymarket, crate::brand::POLYMARKET),
-            (BrandKind::Longbridge, crate::brand::LONGBRIDGE),
+            (
+                BrandKind::Ethereum,
+                "brands/Ethereum/colored@72px.png",
+                ETHEREUM,
+            ),
+            (BrandKind::Solana, "brands/Solana/colored@72px.png", SOLANA),
+            (BrandKind::Binance, "brands/Binance/binance.png", BINANCE),
+            (BrandKind::Okx, "brands/OKX/okx.png", OKX),
+            (
+                BrandKind::Hyperliquid,
+                "brands/Hyperliquid/hyperliquid.png",
+                HYPERLIQUID,
+            ),
+            (
+                BrandKind::Polymarket,
+                "brands/Polymarket/polymarket.png",
+                POLYMARKET,
+            ),
+            (
+                BrandKind::Longbridge,
+                "brands/Longbridge/longbridge.png",
+                LONGBRIDGE,
+            ),
         ];
-        for (kind, path) in legacy {
+        for (kind, path, constant) in legacy {
             assert_eq!(kind.asset_path(), path, "{kind:?} 的路径与旧常量不一致");
-            let old = crate::assets::Assets::get(path).expect("旧嵌入资产里必须有同名文件");
-            assert_eq!(kind.bytes(), old.data.as_ref(), "{kind:?} 的字节漂移");
+            assert_eq!(constant, path, "{kind:?} 的公开常量与旧路径不一致");
+            let registered = crate::kit::assets::bytes(path).expect("注册表里必须有同名文件");
+            assert_eq!(kind.bytes(), registered, "{kind:?} 的字节漂移");
         }
         let mut names: Vec<&str> = BrandKind::ALL.iter().map(|kind| kind.name()).collect();
         names.sort_unstable();

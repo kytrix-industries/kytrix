@@ -52,11 +52,12 @@ const MIN_INTRINSIC_SIZE: f32 = 1.;
 
 /// markdown 解析期需要的只读资源面。
 ///
-/// 引擎没有 `AssetSource`（那是 gpui trait）；这里只留解析真正用到的一件事：按路径取字节
-/// （`![…](file://…)` 没写 `size` 时要读文件头拿固有尺寸）。视图层的图片绘制要的是引擎
-/// `ResourceId`，那属于资产批次（`kit::asset`）的职责，本模块不依赖它。
+/// 引擎没有资源寻址抽象（旧资产源 trait 属于已删除的旧 UI 框架）；这里只留解析真正用到的一件事：
+/// 按路径取字节（`![…](file://…)` 没写 `size` 时要读文件头拿固有尺寸）。视图层的图片绘制要的是
+/// 引擎 `ResourceId`，那属于资产批次（`kit::assets`）的职责，本模块不依赖它。
 ///
-/// 生产实现见本文件末尾的 `impl MarkdownAssets for crate::assets::Assets`；测试用最小的假资源。
+/// 生产实现由调用方提供（例如 `widget` 的嵌入资源源直接读 [`crate::kit::assets::bytes`]）；本模块
+/// 不绑定具体资源存储。测试用最小的假资源。
 pub trait MarkdownAssets {
     /// 资源路径 → 字节；资源不存在时 `None`。
     fn load(&self, path: &str) -> Option<Cow<'static, [u8]>>;
@@ -241,26 +242,28 @@ fn intrinsic_size(bytes: &[u8]) -> Option<Size> {
     Some(Size::new(width as f32, height as f32))
 }
 
-/// 产品资源源（`rust-embed`）接入 markdown 解析期资源面。
-///
-/// 只用 `get`：解析期只读文件头取固有尺寸。视图层的图片绘制走引擎 `ResourceCache`，
-/// 由资产批次（`kit::asset`）接线，本模块不依赖它。
-impl MarkdownAssets for crate::assets::Assets {
-    fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
-        if path.is_empty() {
-            return None;
-        }
-        crate::assets::Assets::get(path).map(|file| file.data)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use smol_str::SmolStr;
     use ui_core::math::Size;
 
     use super::{InlineImageFormat, InlineImageSource, MarkdownAssets};
-    use crate::assets::Assets;
+
+    /// 测试用资源源：读 `kit::assets` 注册表（生产实现由调用方提供，例如 widget 的嵌入资源）。
+    ///
+    /// 它同时固定 trait 自己的约定：**空路径即无资源**，不靠底层查表恰好落空。
+    struct EmbeddedAssets;
+
+    impl MarkdownAssets for EmbeddedAssets {
+        fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+            if path.is_empty() {
+                return None;
+            }
+            crate::kit::assets::bytes(path).map(Cow::Borrowed)
+        }
+    }
 
     /// 一条解析成功的 URI：路径、画法与显式尺寸。
     fn parsed(uri: &str) -> (SmolStr, InlineImageFormat, Option<Size>) {
@@ -373,12 +376,12 @@ mod tests {
             let default = Size::new(16., 16.);
 
             assert_eq!(
-                Assets.load(&source.path),
+                EmbeddedAssets.load(&source.path),
                 None,
                 "{uri} should not name anything the asset source can read"
             );
             assert_eq!(
-                source.resolve(&Assets),
+                source.resolve(&EmbeddedAssets),
                 default,
                 "{uri} should fall back to the default size"
             );
@@ -545,7 +548,7 @@ mod tests {
         let resolve = |uri: &str| {
             InlineImageSource::parse(uri)
                 .expect("the fixture URI should be usable")
-                .resolve(&Assets)
+                .resolve(&EmbeddedAssets)
         };
 
         assert_eq!(
@@ -579,7 +582,7 @@ mod tests {
         let resolve = |uri: &str| {
             InlineImageSource::parse(uri)
                 .expect("the fixture URI should be usable")
-                .resolve(&Assets)
+                .resolve(&EmbeddedAssets)
         };
 
         assert_eq!(
@@ -597,7 +600,7 @@ mod tests {
     fn a_resource_that_is_not_a_bitmap_falls_back_to_the_default_size() {
         let resolved = InlineImageSource::parse("file://icons/phosphoricons/graph.svg?type=img")
             .expect("the fixture URI should be usable")
-            .resolve(&Assets);
+            .resolve(&EmbeddedAssets);
         let default = Size::new(16., 16.);
 
         assert_eq!(resolved, default);
@@ -607,20 +610,31 @@ mod tests {
     /// panic，按没有固有尺寸处理。
     #[test]
     fn an_unreadable_asset_falls_back_to_the_default_size() {
+        /// 只有一条非位图资源（SVG 的 XML 文本）的测试源：注册表只收 PNG / JPEG / WebP，
+        /// 「资源在但读不出尺寸」这条必须由 trait 的使用者自己保证。
+        struct SvgOnly;
+
+        impl MarkdownAssets for SvgOnly {
+            fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+                (path == "icons/phosphoricons/graph.svg")
+                    .then_some(Cow::Borrowed(b"<svg/>" as &[u8]))
+            }
+        }
+
         let source = InlineImageSource::parse("file://icons/phosphoricons/graph.svg")
             .expect("the fixture URI should be usable");
         let default = Size::new(16., 16.);
 
-        assert_eq!(source.resolve(&Assets), default);
-        assert!(Assets.load(&source.path).is_some(), "the asset exists");
+        assert_eq!(source.resolve(&SvgOnly), default);
+        assert!(SvgOnly.load(&source.path).is_some(), "the asset exists");
     }
 
-    /// `MarkdownAssets` 对空路径的约定：没有资源。`parse` 也拒绝空路径，这里把生产资源源那一层
-    /// 的早退单独固定住——"空路径即无资源"是该 trait 自己的约定，不靠底层查表恰好落空。
+    /// `MarkdownAssets` 对空路径的约定：没有资源。`parse` 也拒绝空路径，这里把资源源那一层的
+    /// 早退单独固定住——"空路径即无资源"是该 trait 自己的约定，不靠底层查表恰好落空。
     #[test]
     fn an_empty_path_names_no_asset() {
         assert_eq!(
-            Assets.load(""),
+            EmbeddedAssets.load(""),
             None,
             "an empty path should not name any asset"
         );

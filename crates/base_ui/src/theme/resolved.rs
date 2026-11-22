@@ -170,16 +170,439 @@ mod tests {
         }
     }
 
-    /// 全 128 对（64 角色 × 2 外观）与旧实现 8 位 sRGB 的逐值对照。
+    /// 旧实现（`style/roles.rs`）的 8 位 sRGB 基线（P5-2 在旧模块删除前逐位冻结）。
+    ///
+    /// (外观, 角色, 是否越出 sRGB 色域, 旧实现画出的 8 位 sRGB)。
+    const LEGACY_SRGB: [(Appearance, Role, bool, [u8; 3]); 128] = [
+        (
+            Appearance::Light,
+            Role::SurfaceCanvas,
+            false,
+            [248, 248, 248],
+        ),
+        (
+            Appearance::Light,
+            Role::SurfaceRaised,
+            false,
+            [255, 255, 255],
+        ),
+        (
+            Appearance::Light,
+            Role::SurfaceSunken,
+            false,
+            [238, 238, 238],
+        ),
+        (
+            Appearance::Light,
+            Role::SurfaceOverlay,
+            false,
+            [255, 255, 255],
+        ),
+        (
+            Appearance::Light,
+            Role::SurfaceControl,
+            false,
+            [255, 255, 255],
+        ),
+        (Appearance::Light, Role::SurfaceInverse, false, [29, 31, 46]),
+        (Appearance::Light, Role::LineDivider, false, [189, 190, 195]),
+        (Appearance::Light, Role::LineBorder, false, [140, 142, 150]),
+        (Appearance::Light, Role::LineStrong, false, [87, 89, 101]),
+        (Appearance::Light, Role::LineFocus, true, [0, 109, 189]),
+        (Appearance::Light, Role::FgDefault, false, [29, 31, 46]),
+        (Appearance::Light, Role::FgMuted, false, [87, 89, 101]),
+        (Appearance::Light, Role::FgSubtle, false, [129, 131, 140]),
+        (Appearance::Light, Role::FgDisabled, false, [156, 158, 165]),
+        (Appearance::Light, Role::FgOnBrand, false, [248, 248, 248]),
+        (Appearance::Light, Role::FgOnInverse, false, [248, 248, 248]),
+        (Appearance::Light, Role::BrandBase, true, [0, 109, 189]),
+        (Appearance::Light, Role::BrandHover, true, [0, 95, 175]),
+        (Appearance::Light, Role::BrandActive, true, [0, 86, 165]),
+        (
+            Appearance::Light,
+            Role::StatusDangerBase,
+            false,
+            [194, 40, 42],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusDangerSurface,
+            false,
+            [247, 240, 239],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusDangerBorder,
+            false,
+            [236, 175, 168],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusWarningBase,
+            true,
+            [150, 101, 0],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusWarningSurface,
+            false,
+            [244, 242, 239],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusWarningBorder,
+            false,
+            [211, 191, 163],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusSuccessBase,
+            false,
+            [20, 125, 70],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusSuccessSurface,
+            false,
+            [239, 243, 240],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusSuccessBorder,
+            false,
+            [168, 200, 177],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusInfoBase,
+            false,
+            [16, 117, 157],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusInfoSurface,
+            false,
+            [239, 242, 244],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusInfoBorder,
+            false,
+            [168, 197, 214],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusElevatedBase,
+            false,
+            [179, 77, 17],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusElevatedSurface,
+            false,
+            [246, 241, 239],
+        ),
+        (
+            Appearance::Light,
+            Role::StatusElevatedBorder,
+            false,
+            [226, 183, 164],
+        ),
+        (Appearance::Light, Role::MarketUp, false, [20, 123, 64]),
+        (Appearance::Light, Role::MarketDown, false, [194, 50, 60]),
+        (Appearance::Light, Role::MarketFlat, false, [129, 131, 140]),
+        (
+            Appearance::Light,
+            Role::MarketUpSurface,
+            false,
+            [239, 243, 240],
+        ),
+        (
+            Appearance::Light,
+            Role::MarketDownSurface,
+            false,
+            [247, 240, 240],
+        ),
+        (Appearance::Light, Role::MarketUpWeak, false, [20, 123, 64]),
+        (
+            Appearance::Light,
+            Role::MarketDownWeak,
+            false,
+            [194, 50, 60],
+        ),
+        (
+            Appearance::Light,
+            Role::FearGreedExtremeFear,
+            false,
+            [182, 20, 41],
+        ),
+        (Appearance::Light, Role::FearGreedFear, false, [246, 70, 93]),
+        (
+            Appearance::Light,
+            Role::FearGreedNeutral,
+            false,
+            [248, 211, 58],
+        ),
+        (
+            Appearance::Light,
+            Role::FearGreedGreed,
+            false,
+            [47, 228, 159],
+        ),
+        (
+            Appearance::Light,
+            Role::FearGreedExtremeGreed,
+            false,
+            [39, 161, 114],
+        ),
+        (Appearance::Light, Role::ChartGrid, false, [205, 205, 208]),
+        (Appearance::Light, Role::ChartAxis, false, [129, 131, 140]),
+        (
+            Appearance::Light,
+            Role::ChartCrosshair,
+            false,
+            [114, 116, 126],
+        ),
+        (
+            Appearance::Light,
+            Role::ChartMapOcean,
+            false,
+            [170, 211, 223],
+        ),
+        (
+            Appearance::Light,
+            Role::ChartMapLand,
+            false,
+            [242, 239, 233],
+        ),
+        (
+            Appearance::Light,
+            Role::ChartMapBorder,
+            false,
+            [168, 117, 201],
+        ),
+        (Appearance::Light, Role::ChartMapRoad, false, [220, 42, 103]),
+        (
+            Appearance::Light,
+            Role::ChartMapRoadMinor,
+            false,
+            [160, 107, 1],
+        ),
+        (Appearance::Light, Role::ChartSeries0, false, [192, 111, 10]),
+        (Appearance::Light, Role::ChartSeries1, false, [79, 86, 183]),
+        (Appearance::Light, Role::ChartSeries2, true, [0, 139, 139]),
+        (Appearance::Light, Role::ChartSeries3, false, [185, 64, 130]),
+        (Appearance::Light, Role::ChartSeries4, true, [102, 121, 0]),
+        (Appearance::Light, Role::ChartSeries5, false, [104, 97, 99]),
+        (Appearance::Light, Role::Selection, false, [164, 195, 228]),
+        (Appearance::Light, Role::VeilHover, false, [29, 31, 46]),
+        (Appearance::Light, Role::VeilActive, false, [29, 31, 46]),
+        (Appearance::Light, Role::Scrim, false, [0, 0, 0]),
+        (Appearance::Dark, Role::SurfaceCanvas, false, [20, 26, 33]),
+        (Appearance::Dark, Role::SurfaceRaised, false, [31, 37, 44]),
+        (Appearance::Dark, Role::SurfaceSunken, false, [12, 17, 24]),
+        (Appearance::Dark, Role::SurfaceOverlay, false, [35, 41, 48]),
+        (Appearance::Dark, Role::SurfaceControl, false, [27, 33, 40]),
+        (
+            Appearance::Dark,
+            Role::SurfaceInverse,
+            false,
+            [235, 241, 248],
+        ),
+        (Appearance::Dark, Role::LineDivider, false, [72, 78, 86]),
+        (Appearance::Dark, Role::LineBorder, false, [107, 114, 121]),
+        (Appearance::Dark, Role::LineStrong, false, [129, 135, 143]),
+        (Appearance::Dark, Role::LineFocus, false, [80, 174, 239]),
+        (Appearance::Dark, Role::FgDefault, false, [235, 241, 248]),
+        (Appearance::Dark, Role::FgMuted, false, [163, 169, 177]),
+        (Appearance::Dark, Role::FgSubtle, false, [118, 124, 132]),
+        (Appearance::Dark, Role::FgDisabled, false, [93, 99, 106]),
+        (Appearance::Dark, Role::FgOnBrand, false, [9, 18, 25]),
+        (Appearance::Dark, Role::FgOnInverse, false, [12, 17, 24]),
+        (Appearance::Dark, Role::BrandBase, false, [80, 174, 239]),
+        (Appearance::Dark, Role::BrandHover, false, [95, 189, 255]),
+        (Appearance::Dark, Role::BrandActive, true, [105, 198, 255]),
+        (
+            Appearance::Dark,
+            Role::StatusDangerBase,
+            false,
+            [249, 110, 116],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusDangerSurface,
+            false,
+            [41, 35, 41],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusDangerBorder,
+            false,
+            [100, 59, 64],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusWarningBase,
+            false,
+            [242, 187, 60],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusWarningSurface,
+            false,
+            [39, 40, 39],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusWarningBorder,
+            false,
+            [96, 82, 53],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusSuccessBase,
+            false,
+            [66, 206, 144],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusSuccessSurface,
+            false,
+            [26, 41, 43],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusSuccessBorder,
+            false,
+            [42, 88, 73],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusInfoBase,
+            false,
+            [75, 190, 231],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusInfoSurface,
+            false,
+            [27, 40, 49],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusInfoBorder,
+            false,
+            [43, 82, 101],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusElevatedBase,
+            false,
+            [250, 147, 78],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusElevatedSurface,
+            false,
+            [40, 37, 39],
+        ),
+        (
+            Appearance::Dark,
+            Role::StatusElevatedBorder,
+            false,
+            [100, 70, 55],
+        ),
+        (Appearance::Dark, Role::MarketUp, false, [98, 212, 128]),
+        (Appearance::Dark, Role::MarketDown, false, [253, 101, 109]),
+        (Appearance::Dark, Role::MarketFlat, false, [118, 124, 132]),
+        (Appearance::Dark, Role::MarketUpSurface, false, [28, 42, 42]),
+        (
+            Appearance::Dark,
+            Role::MarketDownSurface,
+            false,
+            [41, 34, 40],
+        ),
+        (Appearance::Dark, Role::MarketUpWeak, false, [98, 212, 128]),
+        (
+            Appearance::Dark,
+            Role::MarketDownWeak,
+            false,
+            [253, 101, 109],
+        ),
+        (
+            Appearance::Dark,
+            Role::FearGreedExtremeFear,
+            false,
+            [204, 50, 60],
+        ),
+        (
+            Appearance::Dark,
+            Role::FearGreedFear,
+            false,
+            [250, 103, 115],
+        ),
+        (
+            Appearance::Dark,
+            Role::FearGreedNeutral,
+            false,
+            [248, 211, 58],
+        ),
+        (
+            Appearance::Dark,
+            Role::FearGreedGreed,
+            false,
+            [47, 228, 159],
+        ),
+        (
+            Appearance::Dark,
+            Role::FearGreedExtremeGreed,
+            false,
+            [60, 176, 128],
+        ),
+        (Appearance::Dark, Role::ChartGrid, false, [37, 43, 50]),
+        (Appearance::Dark, Role::ChartAxis, false, [118, 124, 132]),
+        (
+            Appearance::Dark,
+            Role::ChartCrosshair,
+            false,
+            [124, 130, 138],
+        ),
+        (Appearance::Dark, Role::ChartMapOcean, false, [11, 11, 11]),
+        (Appearance::Dark, Role::ChartMapLand, false, [42, 42, 42]),
+        (
+            Appearance::Dark,
+            Role::ChartMapBorder,
+            false,
+            [213, 178, 237],
+        ),
+        (Appearance::Dark, Role::ChartMapRoad, false, [138, 138, 138]),
+        (
+            Appearance::Dark,
+            Role::ChartMapRoadMinor,
+            false,
+            [108, 108, 108],
+        ),
+        (Appearance::Dark, Role::ChartSeries0, false, [242, 176, 54]),
+        (Appearance::Dark, Role::ChartSeries1, false, [152, 153, 244]),
+        (Appearance::Dark, Role::ChartSeries2, false, [59, 207, 208]),
+        (Appearance::Dark, Role::ChartSeries3, false, [247, 121, 186]),
+        (Appearance::Dark, Role::ChartSeries4, false, [148, 171, 57]),
+        (Appearance::Dark, Role::ChartSeries5, false, [152, 144, 146]),
+        (Appearance::Dark, Role::Selection, false, [44, 77, 104]),
+        (Appearance::Dark, Role::VeilHover, false, [235, 241, 248]),
+        (Appearance::Dark, Role::VeilActive, false, [235, 241, 248]),
+        (Appearance::Dark, Role::Scrim, false, [0, 0, 0]),
+    ];
+
+    /// 全 128 对（64 角色 × 2 外观）与旧实现 8 位 sRGB 的逐值对照（旧实现已删，基线冻结在
+    /// [`LEGACY_SRGB`]）。
     ///
     /// 差异只有一个来源：旧实现逐通道 clamp、引擎做 CSS Color 4 chroma 二分。实测**只有 8 对越界色**
     /// 受影响（其余 120 对逐位相同），本测试把「只有这 8 对」这个事实钉住：多一对、少一对、或
     /// in-gamut 角色被改色，都会红。8 对的具体差异由下一个测试锁定，越界映射的裁决见
     /// `spec-deltas/theme.md` §3（用户裁决：以引擎映射为准）。
     #[test]
-    fn every_role_is_compared_with_the_old_style_srgb_output() {
-        use crate::style::{palette::Palette as OldPalette, roles::Roles as OldRoles};
-
+    fn every_role_is_compared_with_the_frozen_legacy_srgb_baseline() {
         // 实测越界清单（角色 × 外观）；顺序与枚举顺序一致，便于阅读。
         let expected_out_of_gamut = [
             (Appearance::Light, Role::LineFocus),
@@ -192,35 +615,32 @@ mod tests {
             (Appearance::Dark, Role::BrandActive),
         ];
 
+        let light = Theme::of(Appearance::Light);
+        let dark = Theme::of(Appearance::Dark);
         let mut compared = 0;
         let mut found_out_of_gamut = Vec::with_capacity(expected_out_of_gamut.len());
-        for (appearance, old_palette) in [
-            (Appearance::Light, OldPalette::light()),
-            (Appearance::Dark, OldPalette::dark()),
-        ] {
-            let theme = Theme::of(appearance);
-            let old = OldRoles::resolve(&old_palette);
+        for (appearance, role, out_of_gamut, old_color) in LEGACY_SRGB {
+            let theme = match appearance {
+                Appearance::Light => &light,
+                Appearance::Dark => &dark,
+            };
+            compared += 1;
 
-            for role in Role::ALL {
-                let (out_of_gamut, old_color) = old_srgb8(old_color(&old, role));
-                compared += 1;
+            if out_of_gamut {
+                found_out_of_gamut.push((appearance, role));
+                continue;
+            }
 
-                if out_of_gamut {
-                    found_out_of_gamut.push((appearance, role));
-                    continue;
-                }
-
-                let actual = crate::theme::color::to_srgb8(theme.role(role));
-                for channel in 0..3 {
-                    let difference = i32::from(actual[channel]) - i32::from(old_color[channel]);
-                    assert!(
-                        difference.abs() <= 1,
-                        "{appearance:?} {} 通道 {channel}: 新 {} vs 旧 {}（in-gamut 角色只允许 8 位舍入）",
-                        role.name(),
-                        actual[channel],
-                        old_color[channel]
-                    );
-                }
+            let actual = crate::theme::color::to_srgb8(theme.role(role));
+            for channel in 0..3 {
+                let difference = i32::from(actual[channel]) - i32::from(old_color[channel]);
+                assert!(
+                    difference.abs() <= 1,
+                    "{appearance:?} {} 通道 {channel}: 新 {} vs 旧 {}（in-gamut 角色只允许 8 位舍入）",
+                    role.name(),
+                    actual[channel],
+                    old_color[channel]
+                );
             }
         }
 
@@ -231,15 +651,13 @@ mod tests {
         );
     }
 
-    /// 8 对越界色的新基线：引擎 gamut mapping 的 8 位 sRGB，与旧实现逐通道 clamp 的差异。
+    /// 8 对越界色的新基线：引擎 gamut mapping 的 8 位 sRGB，与旧实现逐通道 clamp 的冻结差异。
     ///
-    /// 用户裁决：以引擎映射为准，不改调色板源值、不在应用层 clamp。这张表同时锁旧值与新值，
-    /// 任何一侧改动（调色板、引擎解析器、旧实现）都必须重新做 M2 视觉确认。
+    /// 用户裁决：以引擎映射为准，不改调色板源值、不在应用层 clamp。这张表同时锁旧值（冻结）与新值，
+    /// 任何一侧改动（调色板、引擎解析器）都必须重新做 M2 视觉确认。
     #[test]
     fn the_eight_out_of_gamut_roles_are_locked_to_the_engine_gamut_mapping() {
-        use crate::style::{palette::Palette as OldPalette, roles::Roles as OldRoles};
-
-        // (外观, 角色, 旧逐通道 clamp, 引擎 gamut mapping)。
+        // (外观, 角色, 旧逐通道 clamp（冻结）, 引擎 gamut mapping)。
         let cases: [(Appearance, Role, [u8; 3], [u8; 3]); 8] = [
             (
                 Appearance::Light,
@@ -302,23 +720,23 @@ mod tests {
                 role.name()
             );
 
-            // 旧值从旧实现现场计算：登记表不是抄来的常数，旧实现改了也会红。
-            let old_palette = match appearance {
-                Appearance::Light => OldPalette::light(),
-                Appearance::Dark => OldPalette::dark(),
-            };
-            let old_roles = OldRoles::resolve(&old_palette);
-            let (out_of_gamut, old) = old_srgb8(old_color(&old_roles, role));
-            assert!(out_of_gamut, "{appearance:?} {} 必须是越界色", role.name());
+            // 旧值必须与冻结基线表一致（两张表互相印证）。
+            let frozen = LEGACY_SRGB
+                .into_iter()
+                .find(|(frozen_appearance, frozen_role, _, _)| {
+                    *frozen_appearance == appearance && *frozen_role == role
+                })
+                .expect("越界角色必须在冻结基线表里");
+            assert!(frozen.2, "{appearance:?} {} 必须是越界色", role.name());
             assert_eq!(
-                [old[0], old[1], old[2]],
+                frozen.3,
                 old_expected,
                 "{appearance:?} {} 的旧逐通道 clamp 值",
                 role.name()
             );
 
             for channel in 0..3 {
-                let difference = i32::from(new[channel]) - i32::from(old[channel]);
+                let difference = i32::from(new[channel]) - i32::from(old_expected[channel]);
                 worst_difference = worst_difference.max(difference.abs());
                 assert!(
                     difference.abs() <= 15,
@@ -332,132 +750,5 @@ mod tests {
             worst_difference, 15,
             "登记的最大差是 Dark brand.active 的 15/255；上限变化必须同步台账"
         );
-    }
-
-    /// 旧 `ResolvedColor` 的角色选择（保持与旧 `roles.rs` 的 64 个字段一一对应的显式映射）。
-    fn old_color(
-        old: &crate::style::roles::Roles,
-        role: Role,
-    ) -> crate::style::color::ResolvedColor {
-        use crate::style::roles::Roles;
-
-        let Roles {
-            surface,
-            line,
-            fg,
-            brand,
-            status,
-            market,
-            fear_greed,
-            chart,
-            selection,
-            veil,
-            scrim,
-        } = *old;
-
-        match role {
-            Role::SurfaceCanvas => surface.canvas,
-            Role::SurfaceRaised => surface.raised,
-            Role::SurfaceSunken => surface.sunken,
-            Role::SurfaceOverlay => surface.overlay,
-            Role::SurfaceControl => surface.control,
-            Role::SurfaceInverse => surface.inverse,
-            Role::LineDivider => line.divider,
-            Role::LineBorder => line.border,
-            Role::LineStrong => line.strong,
-            Role::LineFocus => line.focus,
-            Role::FgDefault => fg.default,
-            Role::FgMuted => fg.muted,
-            Role::FgSubtle => fg.subtle,
-            Role::FgDisabled => fg.disabled,
-            Role::FgOnBrand => fg.on_brand,
-            Role::FgOnInverse => fg.on_inverse,
-            Role::BrandBase => brand.base,
-            Role::BrandHover => brand.hover,
-            Role::BrandActive => brand.active,
-            Role::StatusDangerBase => status.danger.base,
-            Role::StatusDangerSurface => status.danger.surface,
-            Role::StatusDangerBorder => status.danger.border,
-            Role::StatusWarningBase => status.warning.base,
-            Role::StatusWarningSurface => status.warning.surface,
-            Role::StatusWarningBorder => status.warning.border,
-            Role::StatusSuccessBase => status.success.base,
-            Role::StatusSuccessSurface => status.success.surface,
-            Role::StatusSuccessBorder => status.success.border,
-            Role::StatusInfoBase => status.info.base,
-            Role::StatusInfoSurface => status.info.surface,
-            Role::StatusInfoBorder => status.info.border,
-            Role::StatusElevatedBase => status.elevated.base,
-            Role::StatusElevatedSurface => status.elevated.surface,
-            Role::StatusElevatedBorder => status.elevated.border,
-            Role::MarketUp => market.up,
-            Role::MarketDown => market.down,
-            Role::MarketFlat => market.flat,
-            Role::MarketUpSurface => market.up_surface,
-            Role::MarketDownSurface => market.down_surface,
-            Role::MarketUpWeak => market.up_weak,
-            Role::MarketDownWeak => market.down_weak,
-            Role::FearGreedExtremeFear => fear_greed.extreme_fear,
-            Role::FearGreedFear => fear_greed.fear,
-            Role::FearGreedNeutral => fear_greed.neutral,
-            Role::FearGreedGreed => fear_greed.greed,
-            Role::FearGreedExtremeGreed => fear_greed.extreme_greed,
-            Role::ChartGrid => chart.grid,
-            Role::ChartAxis => chart.axis,
-            Role::ChartCrosshair => chart.crosshair,
-            Role::ChartMapOcean => chart.map_ocean,
-            Role::ChartMapLand => chart.map_land,
-            Role::ChartMapBorder => chart.map_border,
-            Role::ChartMapRoad => chart.map_road,
-            Role::ChartMapRoadMinor => chart.map_road_minor,
-            Role::ChartSeries0 => chart.series[0],
-            Role::ChartSeries1 => chart.series[1],
-            Role::ChartSeries2 => chart.series[2],
-            Role::ChartSeries3 => chart.series[3],
-            Role::ChartSeries4 => chart.series[4],
-            Role::ChartSeries5 => chart.series[5],
-            Role::Selection => selection,
-            Role::VeilHover => veil.hover,
-            Role::VeilActive => veil.active,
-            Role::Scrim => scrim,
-        }
-    }
-
-    /// 旧颜色的 8 位 sRGB，以及它是否越出 sRGB 色域。
-    ///
-    /// 越界标志用**未 clamp** 的 OKLCH → sRGB 转换判定；返回的 8 位值则是旧实现真正画出来的像素
-    /// （旧 `Oklch::hsla()` 逐通道 clamp 后转 HSL，`Rgba::from` 再回到 sRGB 编码空间）。
-    fn old_srgb8(color: crate::style::color::ResolvedColor) -> (bool, [u8; 4]) {
-        use color::{ColorSpaceTag, DynamicColor, Flags};
-        use gpui_kit::Rgba;
-
-        let oklch = color.oklch;
-        let srgb = DynamicColor {
-            cs: ColorSpaceTag::Oklch,
-            flags: Flags::default(),
-            components: [
-                oklch.lightness(),
-                oklch.chroma(),
-                oklch.hue(),
-                oklch.alpha(),
-            ],
-        }
-        .convert(ColorSpaceTag::Srgb)
-        .components;
-        let out_of_gamut = srgb[..3]
-            .iter()
-            .any(|channel| !(-1e-4..=1.0 + 1e-4).contains(channel));
-
-        let rgba = Rgba::from(color.hsla);
-
-        (
-            out_of_gamut,
-            [
-                (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (rgba.a.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ],
-        )
     }
 }

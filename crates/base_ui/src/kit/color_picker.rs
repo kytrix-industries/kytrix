@@ -1,6 +1,6 @@
 //! 颜色选择器（旧 `crate::color_picker` 的引擎化重建，P2-4d2）。
 //!
-//! 旧实现是一个 gpui 视图：触发器 + [`Overlay`] 面板（色板 / HSLA 四条滑条 / HEX 输入 / 确认
+//! 旧实现是一个 视图：触发器 + [`Overlay`] 面板（色板 / HSLA 四条滑条 / HEX 输入 / 确认
 //! 按钮），颜色、草稿、悬停预览与标签都归视图所有，`ColorChanged` 只在按确认按钮时发出一次。
 //! 本模块按同一语义重建，但把「谁拥有什么」拆成引擎的通道：
 //!
@@ -13,8 +13,8 @@
 //! | `canvas()` + `paint_quad` | E1 自绘画布：`NodeBuilder::canvas` + `Window::set_canvas` |
 //! | `on_mouse_move` 色板悬停 | 144 个透明命中格（引擎没有指针坐标读点，见「已知差异」） |
 //! | `on_drag_move` + `HslaDrag` | 节点 `on_drag` + 引擎拖拽会话（`App::drag`）+ 指针捕获 |
-//! | `InputState`（gpui-base） | [`crate::kit::input`]（应用层编辑状态机 + 引擎绘制） |
-//! | `Overlay`（gpui） | [`crate::kit::overlay::Overlay`]（浮层 / 12 向定位 / 淡入淡出 / a11y） |
+//! | `InputState`（旧输入组件库） | [`crate::kit::input`]（应用层编辑状态机 + 引擎绘制） |
+//! | `Overlay`（旧实现） | [`crate::kit::overlay::Overlay`]（浮层 / 12 向定位 / 淡入淡出 / a11y） |
 //!
 //! # 状态与事件（旧语义逐条保留）
 //!
@@ -184,7 +184,7 @@ const CHECKER_CELL: f32 = 4.0;
 
 // ── 颜色的 HSL 表示与换算（纯逻辑） ────────────────────────────────────────
 
-/// HSL + alpha（旧 gpui `Hsla` 的等价物；只在模块内部做通道编辑）。
+/// HSL + alpha（旧实现 `Hsla` 的等价物；只在模块内部做通道编辑）。
 ///
 /// 公开面不发这个类型：调用方给 / 收 [`Color`]，内部把它规范成 HSL 再编辑。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,7 +204,7 @@ const fn hsla(h: f32, s: f32, l: f32, a: f32) -> Hsla {
     Hsla { h, s, l, a }
 }
 
-/// HSL → sRGB 的 `Color`（旧 gpui `Hsla → Rgba` 的等价换算）。
+/// HSL → sRGB 的 `Color`（旧实现 `Hsla → Rgba` 的等价换算）。
 ///
 /// 标准的 CSS `hsl()` 公式：色相按 0..=1 归一，饱和度 0 时三段同值（灰）。
 fn hsla_to_color(color: Hsla) -> Color {
@@ -227,7 +227,7 @@ fn hsla_to_color(color: Hsla) -> Color {
     Color::srgb(r1 + m, g1 + m, b1 + m, a)
 }
 
-/// 颜色 → HSL（旧 gpui `Rgba → Hsla` 的等价换算）。
+/// 颜色 → HSL（旧实现 `Rgba → Hsla` 的等价换算）。
 ///
 /// `Srgb` 变体直接取分量；其它色彩空间先经 [`ColorResolver`] 解析到线性 sRGB，再做传递函数
 /// 反变换回 sRGB（sRGB ↔ 线性 sRGB 是互逆的 IEC 61966-2-1 曲线）。
@@ -3064,7 +3064,7 @@ mod tests {
         assert_eq!(labels.confirm.as_str(), "OK");
     }
 }
-// ── 引擎交互测试（旧 `#[gpui_kit::test]` 的移植） ────────────────────────────
+// ── 引擎交互测试（旧 `#[旧测试宏]` 的移植） ────────────────────────────
 
 #[cfg(test)]
 mod ui_tests {

@@ -1,6 +1,6 @@
 //! 确定性进度条（旧 `crate::progress` 的引擎化重建，P2-4a）。
 //!
-//! 旧实现是 `Progress` + `ProgressTrack` + `ProgressIndicator` 三层 GPUI 元素，值在构造时决定。
+//! 旧实现是 `Progress` + `ProgressTrack` + `ProgressIndicator` 三层 UI 元素，值在构造时决定。
 //! 新实现只有两个节点：轨道（背景 `components.progress.track`）与指示器（`components.progress.progress`），
 //! 指示器宽度是**布局百分比**（`taffy::Dimension::percent`），值变化时 `sync` 用 `set_style` 重写。
 //!

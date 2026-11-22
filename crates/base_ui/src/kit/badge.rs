@@ -8,7 +8,7 @@
 //!
 //! # 与旧 API 的差异
 //!
-//! - 旧 `Badge` 是 GPUI 元素（`ParentElement` 任意子元素）；新实现只画**一段文字**（标签的语义
+//! - 旧 `Badge` 是 UI 元素（`ParentElement` 任意子元素）；新实现只画**一段文字**（标签的语义
 //!   就是一段文字），图标 / 复合内容用 [`crate::kit::interactive::Interactive`] 自己搭；
 //! - 静态绘制改成 `bind_style`（主题切换要跟着换色）；布局占位边框仍用 `StyleBuilder::border`，
 //!   与绘制边框成对写；

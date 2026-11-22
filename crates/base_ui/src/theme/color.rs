@@ -132,7 +132,7 @@ pub(crate) fn over(base: Color, veil: Color) -> Color {
 /// WCAG 对比度（`(较亮 + 0.05) / (较暗 + 0.05)`），按**线性亮度**算。
 ///
 /// 半透明前景先在**线性预乘**空间合成到（不透明的）背景上：断言的比值就是引擎合成出来的像素。
-/// 旧实现把半透明前景合成在 sRGB 编码空间（gpui `Rgba::blend` 的产物）；本模块改为线性空间，
+/// 旧实现把半透明前景合成在 sRGB 编码空间（旧 UI 层的 `Rgba::blend` 的产物）；本模块改为线性空间，
 /// 与引擎的合成本质一致——两者只在半透明前景的对比度上有可解释的差异，不透明的 58 条对比度地板
 /// 逐位相同。
 pub(crate) fn contrast(foreground: Color, background: Color) -> f32 {

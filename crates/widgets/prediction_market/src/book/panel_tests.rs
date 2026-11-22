@@ -6,7 +6,7 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use base_ui::{
-    motion::DEPTH_ANIMATION_RESPONSE_PER_SECOND,
+    kit::motion::DEPTH_ANIMATION_RESPONSE_PER_SECOND,
     style_builder::StyleBuilder,
     theme::{appearance::Appearance, role::Role},
 };
