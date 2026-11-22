@@ -1,7 +1,22 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.12（2026-11-22）
+> **版本**：v2.13（2026-11-22）
+>
+> **v2.13 变更摘要（2026-11-22）**：**P3-1j（canvas/图元测试读点）完成**。W4a/W4b/W5a 三批审查的共同缺口是
+> 「canvas 行为在 widget 测试里不可见」：引擎把自绘画布作为**一条不透明图元**记录进 `RenderedFrame.primitives`，
+> 删掉 `set_canvas`、去掉 `request_repaint`、让稳态短路失效，测试仍全绿（W4b 探针 4 条绿）。本版把观测面下钻到
+> 画布内容：§6.3 的 `RenderedFrame` 增 `canvases: Vec<CanvasRecord>`（`{ node, canvas: Arc<Canvas> }`，E23；只扩
+> `test-support`，不改生产语义），一帧画出的每个画布值因此可读；§13.2 的 `WidgetTestApp` 增三个读点
+> **`paint_entries(node) -> Vec<PrimitiveRecord>`**（节点自有绘制，含不透明的 `Canvas` 条目）、
+> **`canvas_primitives(node) -> Vec<CanvasPrimitive>`**（画布内容：quad / path / clip 括号 / 文本 run / 几何，颜色是
+> 应用写入的 `Color`，另含圆角与字形数）与 **`canvas_handle(node) -> Option<Arc<Canvas>>`**（节点树上的画布值，无需帧；
+> 稳态 `Arc::ptr_eq` 断言「没有再次 `set_canvas`」）。§13.8 冻结 widget 侧 canvas 测试的四种写法（A 稳态
+> `Arc::ptr_eq` + `frame_requests` 不增长；B 主题切换后断 primitives 颜色；C `set_canvas` 未调用 → `canvas_primitives`
+> 为空、节点仍是一条 Canvas 图元；D 几何归还：`Path` 的 `geometry` 可读、释放后 `App::geometry()` 计数回基线），
+> `crates/widgets/AGENTS.md` §11 同文。本版只扩 **test-support** 观测面：`ui_core` 生产代码、`WidgetTestApp` 既有签名与
+> 快照 golden 零变化。契约测试 177 → **183**（+6，`widget`）；`ui_core --lib` 2302 → **2303**（+1）。逐条登记
+> `.docs/gui-migration/design-changes.md` §21 与 `.docs/gui-migration/test-ledger/p3-1j.md`。
 >
 > **v2.12 变更摘要（2026-11-22）**：**P3-1i（W2b/W2c 审查共同缺口：RPC 回复归因）完成**。§13 新增
 > **`WidgetBinding::call` 返回 `RequestId`**（`pub fn call(&mut self, cx, request) -> RequestId`，破坏性变更）与
@@ -1830,13 +1845,17 @@ pub struct RenderedFrame {
     pub frame_index: FrameIndex,
     pub quads: Vec<QuadRecord>,           // { node, bounds, corner_radius, fill: LinearPremulRgba, border, gradient }
     pub primitives: Vec<PrimitiveRecord>, // { node, kind: PrimitiveKind, bounds }
+    pub canvases: Vec<CanvasRecord>,      // { node, canvas: Arc<Canvas> } —— 画布内容的只读下钻点（E23）
     pub reused_lanes: Vec<LaneId>,
 }
 ```
 
-`Primitive::Canvas` 在 `RenderedFrame.primitives` 里是**不透明**图元（一条 `Canvas`）：Canvas 内层 `GlyphRun` 的计数与
-bounds 要在 `Window::scene()` 的 Canvas 值上核对；`FrameRecord.stale_canvas_runs` 是编码期安全网丢弃的失效 run 数（§11.1），
-无失效 run 时为 0。
+`Primitive::Canvas` 在 `RenderedFrame.primitives` 里仍是**一条**图元（节点自绘的整体落点 + bounds）；应用自绘画布
+**画了什么**（quad / path / clip 括号 / 文本 run / 几何）从 `RenderedFrame.canvases` 下钻：每个 `CanvasRecord` 的
+`canvas` 就是 paint 交给编码器的那个 `Arc<Canvas>`（逐 tile 编码期安全网过滤后的值），`canvas.primitives()` 是应用写入的
+图元序列，两帧 `Arc::ptr_eq` 为真 ⟺ 画布没被重写。这是 widget 测试的 canvas 读点（§13.2 的
+`WidgetTestApp::{canvas_primitives, canvas_handle}`），只存在于 `test-support`，不影响生产帧记录；`FrameRecord.stale_canvas_runs`
+仍是编码期安全网丢弃的失效 run 数（§11.1），无失效 run 时为 0。
 
 **断言示例**：
 
@@ -4158,6 +4177,9 @@ impl WidgetTestApp {
     pub fn text_of(&self, node: NodeId) -> String;
     pub fn has_text(&self, node: NodeId, text: &str) -> bool;
     pub fn has_canvas(&self, node: NodeId) -> bool;
+    pub fn paint_entries(&self, node: NodeId) -> Vec<PrimitiveRecord>;      // 节点自有绘制（含不透明 Canvas 条目；P3-1j）
+    pub fn canvas_primitives(&self, node: NodeId) -> Vec<CanvasPrimitive>;  // 画布内容（quad/path/clip/文本 run/几何；P3-1j）
+    pub fn canvas_handle(&self, node: NodeId) -> Option<Arc<Canvas>>;       // 节点树上的画布值（稳态 Arc::ptr_eq；P3-1j）
     pub fn has_inline_boxes(&self, node: NodeId) -> bool;   // 内联图 / kbd
     pub fn node_count(&self) -> usize;                      // mount 回滚无泄漏
     pub fn tree(&self) -> &NodeTree;
@@ -4175,6 +4197,26 @@ pub struct WaitingWidget;                        // WidgetView 最小实现（�
 **类型别名/常量**：`WidgetServices` 的 `market_participants` / `kytrix_service` 为 `Option`（见 §13.9 R-1）；恢复动作 key =
 `"common.retry"`。`WidgetTestApp::recovery_action()`（P3-1 的假动作）已删除：断言走真实路径
 `click_recovery` 或 `report(WidgetState::failed(...))`。
+
+**canvas 读点（P3-1j）**：`paint_entries` / `canvas_primitives` 读的是**最近一次 drain 的那一帧**的绘制（空闲轮没有绘制，
+两者为空；断言要在 `rendered() == true` 的那一轮之后）；无 drain 记录时 panic（与 `rendered()` 同口径）。
+`paint_entries(node)` 是该节点**自有**绘制（背景 quad、文本、图片、以及自绘节点那条不透明的
+`PrimitiveKind::Canvas`），`canvas_primitives(node)` 才展开画布内容。`CanvasPrimitive`（`widget::test_support`）与
+`Primitive` 一一对应、颜色保持应用写入的 `Color`（不与 `QuadRecord` 的解析后线性预乘混用）：
+
+| 字段 | 语义 |
+|---|---|
+| `kind: PrimitiveKind` | 同一套 8 类图元 + `ClipPush` / `ClipPop`（一 entry = 一次 `Canvas::push_*`） |
+| `bounds: Option<Rect>` | 逻辑像素 AABB；`ClipPop` / `Geometry` 为 `None`（无自有几何） |
+| `corner_radius: Option<[f32; 4]>` | `Quad` / `Shadow` / `ClipPush` 的四角半径 |
+| `color: Option<Color>` | 实色填充 / path / 文本 / 阴影颜色，或渐变的起始色 |
+| `border: Option<(f32, Color)>` | quad 的内侧边框（宽, 色） |
+| `gradient: Option<(Color, GradientKind)>` | 渐变终点色 + 方向（起点色在 `color`） |
+| `glyphs: usize` | `GlyphRun` 的定位字形数（一条 run 一个 entry；0 = 非文本） |
+| `geometry: Option<GeometryId>` | `Path` / `Geometry` 引用的几何 id（几何归还断言面） |
+
+`canvas_handle(node)` 读**节点树上的输入值**（无需帧）：同一 `Arc` 跨稳态 sync 不变，因此 `Arc::ptr_eq` 是「没有再次
+`set_canvas`」的断言面；被替换过的画布是新 `Arc`（哪怕内容相同）。
 
 ### 13.3 生命周期（五段式映射）
 
@@ -4283,8 +4325,9 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **选择器约定**（`NodeBuilder::id`，契约层统一，Probe 可查）：`WIDGET_SURFACE` / `WIDGET_SLOT` / `WIDGET_CONTENT` /
   `WIDGET_PLACEHOLDER` / `WIDGET_BANNER`；框架控件 key 前缀 `widget.placeholder.action.` / `widget.banner.action.`；
   富文本 notice 的 markdown 根是 `MARKDOWN`。
-- **断言面**：`Probe`（存在/布局盒/命中）+ `FrameRecord`（帧/图元）+ `WidgetTestApp`（状态/可见性/文本/内联盒/节点数/
-  `a11y_hidden`/`frame_index`/`frame_requests`/`rendered`）。`TestApp::drain` 返回的 `&FrameRecord` 需 clone 或先作用域化再用。
+- **断言面**：`Probe`（存在/布局盒/命中）+ `FrameRecord`（帧/图元/画布内容，§6.3）+ `WidgetTestApp`（状态/可见性/文本/内联盒/节点数/
+  `a11y_hidden`/`frame_index`/`frame_requests`/`rendered`/`paint_entries`/`canvas_primitives`/`canvas_handle`）。
+  `TestApp::drain` 返回的 `&FrameRecord` 需 clone 或先作用域化再用。
 - **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
   P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
 - 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
@@ -4349,6 +4392,24 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
     `signal_slot_stats` 泄漏断言（`test_support::releasing_a_widget_reclaims_every_value_slot`：mount/release 8 轮后
     `slots`/`live` 不增长）；recovery→load 端到端（`any::the_recovery_control_runs_the_widget_load_again`：真实
     `click_recovery` 派发跑框架的 `ReloadHandle`，widget 第二次 `load` 的状态被画出）。
+  - **canvas 绘制（P3-1j，四种写法冻结）**：自绘 widget 的测试一律断言**画出来的图元**，不只断言「有 canvas 节点」。
+    widget crate 里 `test_support::tests::a_canvas_widget_s_draws_are_readable_primitive_by_primitive`（一个 canvas 假
+    widget：quad + clip 括号 + path(几何) + 一条 shaped 文本 run）是这四种写法的样板：
+    - **A 稳态**：连续 sync（内容没变）后 `canvas_handle(node)` 两次读同一 `Arc`（`Arc::ptr_eq`）、`frame_requests()`
+      不增长、该轮 `rendered() == false`——稳态短路失效 / 每帧重建画布都会让这条红
+      （`a_settled_canvas_is_not_rewritten_and_asks_for_no_more_frames`）。
+    - **B 主题**：`ThemeHandle::set_appearance` 后 `frame_requests()` 增长；下一轮 `canvas_primitives(node)` 的 quad / 文本
+      `color` 等于新外观解析的 `Role`（不是挂载期常量）
+      （`switching_the_appearance_repaints_the_canvas_in_the_new_roles`）。
+    - **C 从未写入**：canvas 节点没被 `set_canvas` 时 `canvas_primitives` 为空，但 `paint_entries` 仍有那条不透明
+      `PrimitiveKind::Canvas`（删掉 `set_canvas` 的变异在这条上红）
+      （`a_canvas_node_that_was_never_written_paints_no_primitives`）。
+    - **D 几何归还**：画布上 `Path` / `Geometry` 的 `geometry` 可读；释放 widget 后 `App::geometry().len()` 回基线、
+      `canvas_handle(node)` 为 `None`（图元里的几何 id 不是所有权转移，释放义务在 widget）
+      （`releasing_a_canvas_widget_hands_its_geometry_back`）。
+    - **动画**：自绘动画的每一轮都要 `cx.request_frame()`；测试断言 `frame_requests()` 随动画轮次增长
+      （`an_animating_canvas_keeps_asking_for_frames`：生产泵没有 wake 就不再运行 `sync`，只 `set_canvas` 不请求帧在
+      headless 的 `drain()` 下仍会提交，故 frame_requests 才是这条的断言面）。
 
 ### 13.9 残余与需裁决
 
@@ -4368,6 +4429,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-12 | P3-1g 对 P3-1f 冻结面的增量（测试装置；无引擎面变更） | `WidgetTestApp` 增 `advance(Duration) -> bool`（推进**引擎时钟** + 一轮 `router.tick` + `TestApp::drain`，返回本轮是否提交像素）与观测面 `frame_index()` / `frame_requests()` / `rendered()`。E10 定时器 deadline 只在引擎钟推进后到期：**不读 wall clock、不真实 sleep**；到期回调在帧入口派发、写入参与同一帧；未到期轮是空闲轮（I3：不出帧、不增长帧请求）。`TestApp::advance` 已存在，本批**不改 `ui_core`**；`crates/widgets/**` 也未改——W2c 分支自建的 `ClockHost`（`TestApp` + `WidgetServices::builder` + 假墙钟）在合入后删除、改用本装置；W2b 的倒计时 timer 缺口（`test-ledger/w2-pizza.md` §8：到期 → 回调 → 再武装不可自动化）可据此补测（widget 自己的「现在」仍由测试写那个状态）。测试 161 → 164，登记于 design-changes §18 |
 | R-13 | P3-1h 对 P3-1g 冻结面的增量（纯增量；`WidgetCx::new` 形状不变） | §13.2 新增 `WidgetCx::unique_key(&self, suffix: &str) -> SmolStr`：格式 `"{suffix}@{scope}"`，scope 取上下文**已持有**的 `SignalScope` 下标——不新增 `instance_id` 形参（`WidgetCx::new` 仍 4 参数，W1/W2 已迁移 widget 的测试夹具零返工）；引擎 `new_scope` 只追加 scope 槽、从不回收下标，故同一 App 内实例前缀唯一、release 后也不复用。语义 / 生命周期 / 释放配对见 §13.3，静态块重建的 key 稳定性见 §13.10；硬规则见 `crates/widgets/AGENTS.md` §1-11 / §5 / §9 / §11 / §15.5。`WidgetTestApp` 本身已支持两个 `mount` 实例并存，本批只补契约测试。测试 164 → 170。**残余（不阻断）**：① 已迁移 W1/W2 代码里的常量 / 按 parent 手拼的 kit key 由各自 W 批改为 `unique_key`（登记 AGENTS §15.5，本批不改 `crates/widgets/**`）；② 前缀是 **App 内**实例身份，不得持久化 / 跨进程 / 跨 App 复用（instance id 与 scope 下标都不是稳定业务身份）；③ 同一实例内「同后缀 = 同 key」由调用方保证后缀按控件位置唯一，契约不检测重复后缀。不改 `ui_core`，登记于 design-changes §19 |
 | R-14 | P3-1i 对 P3-1h 冻结面的增量（破坏性：`WidgetBinding::call` 签名） | `WidgetBinding::call` 返回 `RequestId`（`RpcClient` 新增 `reserve_request_id` / `call_with_id`）；§13.2 新增 `widget::binding::Pending<C>` 在飞命令表（`ahash::HashMap<RequestId, C>`）；`WidgetTestApp` 新增 `signal_slot_stats()` 透传（E21 读点，scope 泄漏断言面，W2c-R9）；`AnyWidget` recovery→load 端到端测试（F6）。答复入口按精确 id 归因，未知 id 丢弃并计数（§13.12）。W 批五处调用点（news / force_order / market_trade / pentagon_pizza_index / financial_calendar）同步改为精确匹配；其余已迁移 crate 的 `call` 调用点是语句调用，签名变化零返工。不改 `ui_core` 生产代码。登记于 design-changes §20 |
+| R-15 | P3-1j 对 P3-1i 冻结面的增量（纯增量：canvas 读点 + E23 test-support 扩展） | §6.3 的 `RenderedFrame` 增 `canvases: Vec<CanvasRecord>`（`{ node, canvas: Arc<Canvas> }`）：把「帧画出的每个画布值」记录下来，`Canvas` 不再只能经 `Window::scene()` 间接核对；只挂在 `test-support`，无生产语义与快照影响（E23）。`WidgetTestApp` 增 `paint_entries` / `canvas_primitives` / `canvas_handle` 与 `CanvasPrimitive` DTO；读的是**最近一次 drain 的那一帧**（空闲轮为空，无 drain 记录 panic，与 `rendered()` 同口径），颜色保持应用写入的 `Color`、几何 id 可读。canvas 测试四种写法冻结于 §13.8。不改 `ui_core` 生产代码、不改既有 `WidgetTestApp` 签名。契约测试 177 → 183（+6），`ui_core --lib` 2302 → 2303（+1）。登记于 design-changes §21 与 `test-ledger/p3-1j.md` |
 
 ### 13.10 静态文案重建通法（kit 未补绑定面之前的冻结写法）
 

@@ -1,13 +1,16 @@
 //! 帧记录（I12）：调度记录 [`FrameRecord`]、绘制快照 [`RenderedFrame`] 与 lane 复用日志。
 //!
 //! `FrameRecord` 记录**调度事实**（本帧是否提交、
-//! damage、统计、lane 复用），`RenderedFrame` 记录**绘制事实**（quad/primitives/布局盒），两者只在
+//! damage、统计、lane 复用），`RenderedFrame` 记录**绘制事实**（quad/primitives/画布内容/布局盒），两者只在
 //! 提交帧同时存在。
+
+use std::sync::Arc;
 
 use crate::{
     math::{PhysicalRect, Rect},
     node::{id::NodeId, tree::NodeTree},
     paint::{
+        canvas::Canvas,
         color::{ColorResolver, LinearPremulRgba},
         pass::PaintReport,
         primitive::{ClipOp, Primitive, QuadPaint},
@@ -100,8 +103,31 @@ pub struct RenderedFrame {
     pub quads: Vec<QuadRecord>,
     /// 全部 8 类图元的只读快照（按绘制序，含 `Clip` 指令）。
     pub primitives: Vec<PrimitiveRecord>,
+    /// 本帧画出的每个 `Primitive::Canvas` 的**画布内容**（按绘制序；E23）。
+    ///
+    /// [`PrimitiveRecord`] 里的 Canvas 是一条不透明图元（只有 bounds）；应用自绘画布「画了什么」
+    /// （quad/路径/clip/文本 run）从这里下钻，见 [`CanvasRecord`]。
+    pub canvases: Vec<CanvasRecord>,
     /// 本帧整桶复用的 lane。
     pub reused_lanes: Vec<LaneId>,
+}
+
+/// 一个 `Primitive::Canvas` 的只读观测面（E23）。
+///
+/// `FrameRecord` 记录的是**引擎这一帧实际画出的值**：`canvas` 是 paint 交给编码器的那个
+/// `Arc<Canvas>`（逐 tile 编码期安全网过滤后的版本；没有失效 run 时与节点树是同一个 `Arc`）。
+/// 因此
+///
+/// - `canvas.primitives()` 是应用写入的图元序列（`Quad` / `Path` / `Clip` / `GlyphRun` …），
+///   widget 测试在这种快照上断言「深度条画了几条 quad、宽度多少、什么颜色」；
+/// - 两帧的 `Arc::ptr_eq` 为真 ⟺ 画布值没被重写（应用没有再次 `set_canvas`）——稳态短路的
+///   断言面。
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasRecord {
+    /// 产生它的节点（`set_canvas` 的目标）。
+    pub node: NodeId,
+    /// 本帧编码的 Canvas 值。
+    pub canvas: Arc<Canvas>,
 }
 
 /// 一个 `Quad` 的断言面。
@@ -312,6 +338,7 @@ pub(crate) fn capture(
 
     let mut quads = Vec::new();
     let mut primitives = Vec::new();
+    let mut canvases = Vec::new();
     for lane in scene.order() {
         let Some(node) = lane_nodes.get(lane).copied() else {
             continue;
@@ -338,6 +365,12 @@ pub(crate) fn capture(
             if let Primitive::Quad(quad) = primitive {
                 quads.push(quad_record(node, quad, resolver));
             }
+            if let Primitive::Canvas(canvas) = primitive {
+                canvases.push(CanvasRecord {
+                    node,
+                    canvas: Arc::clone(canvas),
+                });
+            }
         }
     }
 
@@ -353,6 +386,7 @@ pub(crate) fn capture(
             frame_index,
             quads,
             primitives,
+            canvases,
             reused_lanes,
         }),
         stats,
@@ -421,12 +455,19 @@ fn quad_record(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::FrameRecord;
     use crate::{
         app::App,
         math::{Rect, Scale, Size},
         node::builder::NodeBuilder,
-        paint::style::StylePatch,
+        paint::{
+            canvas::Canvas,
+            color::Color,
+            primitive::{Quad, QuadPaint},
+            style::StylePatch,
+        },
         window::{FrameOutcome, WindowOptions},
     };
 
@@ -573,5 +614,81 @@ mod tests {
         // headless 不构建 `FramePayload`：这里是编码器侧的增量字节数 —— 一条 lane 的一个
         // 四边实例 = 128 B（旧实现每帧是全量 128 × N）。
         assert_eq!(second.stats.uploaded_bytes, 128);
+    }
+
+    /// E23：提交帧的 `RenderedFrame.canvases` 是**画布内容**的只读快照——Canvas 不再是不透明
+    /// 图元；空闲帧没有绘制快照（`frame == None`），因此也没有画布内容可读。
+    #[test]
+    fn a_committed_frame_records_the_canvas_it_painted() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let mut app = App::new(runtime.handle().clone());
+        let window = app.create_window(WindowOptions {
+            title: smol_str::SmolStr::new_static("canvas"),
+            size: Size::new(400.0, 300.0),
+            scale: Scale::ONE,
+            ..WindowOptions::default()
+        });
+        let root = app.window(window).expect("窗口存在").tree().root();
+        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 20.0));
+        canvas.push_quad(Quad {
+            bounds: Rect::new(0.0, 0.0, 20.0, 10.0),
+            corner_radius: [0.0; 4],
+            paint: QuadPaint::Solid {
+                fill: Color::WHITE,
+                border: None,
+            },
+        });
+        let node = NodeBuilder::canvas(canvas)
+            .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+            .id("chart")
+            .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+            .expect("canvas 节点");
+
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("首帧"),
+            FrameOutcome::Committed(_)
+        ));
+        let record: FrameRecord = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("提交帧必须有记录")
+            .clone();
+        let rendered = record.frame.as_ref().expect("提交帧必须有绘制快照");
+        let entry = rendered
+            .canvases
+            .iter()
+            .find(|entry| entry.node == node)
+            .expect("画布内容必须挂在产生它的节点上");
+        assert_eq!(entry.canvas.bounds(), Rect::new(0.0, 0.0, 40.0, 20.0));
+        assert_eq!(entry.canvas.primitives().len(), 1, "内层图元可下钻");
+        let crate::node::tree::NodeKind::Canvas(node_canvas) = app
+            .window(window)
+            .expect("窗口存在")
+            .tree()
+            .get(node)
+            .expect("节点")
+            .kind()
+        else {
+            panic!("the node is a canvas");
+        };
+        assert!(
+            Arc::ptr_eq(node_canvas, &entry.canvas),
+            "快照记录的是节点树上的同一个 Canvas 值，不深拷贝画布内容"
+        );
+
+        // 空闲帧：没有绘制快照，也没有画布内容。
+        assert!(matches!(
+            app.frame(window).expect("窗口存在").expect("空闲帧"),
+            FrameOutcome::Idle
+        ));
+        let idle = app
+            .window(window)
+            .expect("窗口存在")
+            .record()
+            .expect("空闲帧也有记录");
+        assert!(idle.frame.is_none(), "空闲帧没有绘制快照");
     }
 }
