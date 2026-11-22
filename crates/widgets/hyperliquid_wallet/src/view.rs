@@ -14,10 +14,11 @@
 //! The old toolkit drew the list and the open wallet as pages of a navigation stack, so that
 //! one page could slide over the other. The frozen contract has no page router: a body is one
 //! tree built once, and a widget updates it through signals. The list and the detail are
-//! therefore two containers of one body, and which of them is drawn is a signal the body's
-//! roots read (`StylePatch.visible`), so neither is rebuilt when the reader moves between them.
-//! The slide is gone with the router; the pane's ledger registers that as a behaviour
-//! difference (the two views and their controls are unchanged).
+//! therefore two containers of one body, laid out over the same box (the hidden one is not a
+//! page the flex flow gives room to), and which of them is drawn is a signal the body's roots
+//! read (`StylePatch.visible`), so neither is rebuilt when the reader moves between them. The
+//! slide is gone with the router; the pane's ledger registers that as a behaviour difference
+//! (the two views and their controls are unchanged).
 //!
 //! # What a wallet is
 //!
@@ -107,8 +108,9 @@ use super::{
 /// The height of one wallet's account line.
 const ACCOUNT_ROW_HEIGHT: f32 = 88.0;
 
-/// The height of one wallet's whole row: its account line above its timeline.
-const WALLET_ROW_HEIGHT: f32 = ACCOUNT_ROW_HEIGHT + timeline::HEIGHT;
+/// The height of one wallet's whole row: its account line, its timeline, and the divider it
+/// draws above itself.
+const WALLET_ROW_HEIGHT: f32 = ACCOUNT_ROW_HEIGHT + timeline::HEIGHT + 1.0;
 
 /// How many rows the list mounts either side of the viewport.
 const ROW_OVERSCAN: usize = 2;
@@ -224,6 +226,7 @@ struct WalletRowData {
     address: WalletAddress,
     overview: Option<Arc<WalletOverviewSnapshot>>,
     overview_status: ScopeStatus,
+    timeline: Option<Arc<TimelineSnapshot>>,
     timeline_status: ScopeStatus,
 }
 
@@ -356,7 +359,10 @@ struct HeaderControls {
     back_wrapper: NodeId,
     retry_wrapper: NodeId,
     refresh_wrapper: NodeId,
-    language: LanguageCode,
+    /// The row the controls were built into, so the retry control can be rebuilt in place.
+    parent: NodeId,
+    /// The count and language the retry control's copy was built from (AGENTS §15.1).
+    retry_built: (LanguageCode, usize),
 }
 
 /// One pane: the addresses it follows, and the wallet it has opened.
@@ -446,6 +452,13 @@ pub struct HyperliquidWalletWidget {
     /// frame would compare the whole reading for nothing: the pane hands a reading over
     /// once, when the stream publishes it.
     accepted_detail: Option<(WalletAddress, DetailTab, Arc<DetailSnapshot>)>,
+    /// The tab the pane has asked the venue for and not been answered about, if one is.
+    ///
+    /// A reading the pane already shows is kept while a newer one is read (the answer is what
+    /// the table is for), so "the tab is being read" is a round the pane owns rather than
+    /// something the reading in hand can say: it starts when the request is sent and ends with
+    /// the reading that answers it.
+    detail_request: Option<(WalletAddress, DetailTab)>,
 }
 
 impl WidgetView for HyperliquidWalletWidget {
@@ -517,6 +530,10 @@ impl WidgetView for HyperliquidWalletWidget {
             // right is worse than showing a reading that is about to be replaced.
             self.detail.clear();
             self.show_overview_signal(cx);
+            // The tables are read in the scope this load drops: an empty table is what the
+            // pane shows until the new scope answers.
+            self.accepted_detail = None;
+            self.clear_detail_tables(cx);
             if let Err(error) = self.seed(cx) {
                 log::error!("the hyperliquid wallet pane could not seed its rows: {error}");
             }
@@ -524,6 +541,7 @@ impl WidgetView for HyperliquidWalletWidget {
         // Starting over replaces whatever the binding was awaiting; a change the pane
         // stopped waiting for is one it does not decide (AGENTS §8.2).
         self.pending.clear();
+        self.detail_request = None;
         self.status.report(cx.app_mut(), WidgetState::Connecting);
         self.follow(retry, market_reloaded, cx);
     }
@@ -603,12 +621,20 @@ impl WidgetView for HyperliquidWalletWidget {
         self.body_root = Some(root);
 
         // ── the list ─────────────────────────────────────────────────────────────
+        // The two pages are stacked rather than laid out one under the other: a hidden page
+        // is not a page the body gives room to (the engine's `visible` hides a frame, it does
+        // not take a box out of the flex flow), so both are laid out over the whole body and
+        // the page signal decides which one is drawn.
         let overview = NodeBuilder::boxed()
             .id("TEST_HYPERLIQUID_WALLET_OVERVIEW_PAGE")
             .style(
                 StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .left(0.0)
                     .flex_col()
-                    .size_full()
                     .min_width_0()
                     .min_height_0()
                     .build(),
@@ -651,8 +677,12 @@ impl WidgetView for HyperliquidWalletWidget {
             .id("TEST_HYPERLIQUID_WALLET_DETAIL_PAGE")
             .style(
                 StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .left(0.0)
                     .flex_col()
-                    .size_full()
                     .min_width_0()
                     .min_height_0()
                     .build(),
@@ -667,6 +697,7 @@ impl WidgetView for HyperliquidWalletWidget {
         // header's back control leaves the wallet, so the page itself is where a reader
         // reads which wallet they are in.
         let heading = NodeBuilder::boxed()
+            .id("TEST_HYPERLIQUID_WALLET_DETAIL_HEADING")
             .style(
                 StyleBuilder::new()
                     .flex_none()
@@ -706,7 +737,7 @@ impl WidgetView for HyperliquidWalletWidget {
         self.tab_strip = Some(strip);
         self.build_tab_buttons(cx, strip, &theme, &translate)?;
 
-        self.tables = Some(DetailTables::build(cx, detail)?);
+        self.tables = Some(DetailTables::build(cx, detail, page)?);
         if let Some(tables) = &self.tables {
             tables.show(self.selected_tab, cx)?;
         }
@@ -840,6 +871,7 @@ impl WidgetView for HyperliquidWalletWidget {
         self.timelines.clear();
         self.detail.clear();
         self.accepted_detail = None;
+        self.detail_request = None;
     }
 }
 
@@ -913,6 +945,7 @@ impl HyperliquidWalletWidget {
             dialog: None,
             notice: None,
             accepted_detail: None,
+            detail_request: None,
         }
     }
 
@@ -1101,6 +1134,10 @@ impl HyperliquidWalletWidget {
         if self.selected.as_ref() == Some(&address) {
             return Ok(());
         }
+        // The tables hold the wallet that was open: another wallet's rows are not a reading
+        // this page may draw under its spinner or beneath its failure banner.
+        self.accepted_detail = None;
+        self.clear_detail_tables(cx);
         self.selected = Some(address.clone());
         self.selected_tab = DetailTab::Spot;
         cx.write(&self.selected_address, Some(address.clone()));
@@ -1170,13 +1207,13 @@ impl HyperliquidWalletWidget {
             .iter()
             .map(|address| {
                 let account = self.overview.get(address);
+                let timeline = self.timelines.get(address);
                 WalletRowData {
                     address: address.clone(),
                     overview: account.and_then(|row| row.snapshot.clone()),
                     overview_status: account.map_or(ScopeStatus::Loading, |row| row.status.clone()),
-                    timeline_status: self
-                        .timelines
-                        .get(address)
+                    timeline: timeline.and_then(|row| row.snapshot.clone()),
+                    timeline_status: timeline
                         .map_or(ScopeStatus::Loading, |row| row.status.clone()),
                 }
             })
@@ -1218,6 +1255,9 @@ impl HyperliquidWalletWidget {
 
     /// Sends one command through the binding, tracking the identity it was given.
     fn call(&mut self, cx: &mut WidgetCx<'_>, request: WalletRequest, command: PendingCommand) {
+        // One command per binding: sending another replaces the last, so a tab that was
+        // being read is not one an answer is still coming for.
+        self.detail_request = None;
         let Some(binding) = self.binding.as_mut() else {
             return;
         };
@@ -1287,8 +1327,9 @@ impl HyperliquidWalletWidget {
             } else {
                 WalletRequest::LoadDetail { address, tab }
             },
-            PendingCommand::Detail(key.0, key.1),
+            PendingCommand::Detail(key.0.clone(), key.1),
         );
+        self.detail_request = Some(key);
         cx.request_frame()?;
         Ok(())
     }
@@ -1402,9 +1443,18 @@ impl HyperliquidWalletWidget {
                 }
             }
             PendingCommand::Detail(address, tab) => {
+                if self.detail_request.as_ref() == Some(&(address.clone(), tab)) {
+                    self.detail_request = None;
+                }
                 if let Some(entry) = self.detail.get_mut(&(address, tab)) {
                     entry.status = ScopeStatus::Failed(failure);
                     entry.snapshot = None;
+                }
+                // The reading the tab showed is the one that was refused: the table it was
+                // drawn from goes, so nothing below the failure banner is a reading the
+                // venue stands behind.
+                if let Some(tables) = &self.tables {
+                    let _ = tables.discard(tab, cx);
                 }
             }
         }
@@ -1464,6 +1514,10 @@ impl HyperliquidWalletWidget {
                 if !self.follows(&address) {
                     return;
                 }
+                if self.detail_request.as_ref() == Some(&(address.clone(), tab)) {
+                    // The reading that answers the request: the round it was reading is over.
+                    self.detail_request = None;
+                }
                 let Some(entry) = self.detail.get_mut(&(address, tab)) else {
                     return;
                 };
@@ -1516,6 +1570,13 @@ impl HyperliquidWalletWidget {
             WalletStreamKey::Detail { address, tab } => {
                 if !self.follows(&address) {
                     return;
+                }
+                if matches!(status, WalletStatus::Failed(_))
+                    && self.detail_request.as_ref() == Some(&(address.clone(), tab))
+                {
+                    // A refusal is the answer the wait was for: the tab is not one a reading
+                    // is still on its way into.
+                    self.detail_request = None;
                 }
                 let Some(entry) = self.detail.get_mut(&(address, tab)) else {
                     return;
@@ -1590,7 +1651,10 @@ impl HyperliquidWalletWidget {
         // scopes back is a set that changed.
         self.markets = Arc::default();
         self.pending.clear();
+        self.detail_request = None;
         self.detail.clear();
+        self.accepted_detail = None;
+        self.clear_detail_tables(cx);
         self.show_overview_signal(cx);
         let _ = self.seed(cx);
         self.report_notice(cx);
@@ -1763,6 +1827,12 @@ impl HyperliquidWalletWidget {
             self.show_overview_signal(cx);
         }
         self.pending.clear();
+        self.detail_request = None;
+        // The scope the tables were read in is not the one the pane follows now: a reading
+        // of a wallet that stayed is handed over again from what the pane kept, and a wallet
+        // that left takes its rows with it.
+        self.accepted_detail = None;
+        self.clear_detail_tables(cx);
         // Adding or removing a wallet is a change to what the pane follows, not a reason
         // to read a market that is not in memory: it waits for the market first, and the
         // generation that loads it runs the load that starts the new list.
@@ -1778,38 +1848,63 @@ impl HyperliquidWalletWidget {
         Ok(())
     }
 
+    /// Drops what the detail tables hold: their readings were read for a wallet or a scope
+    /// this pane is no longer about, and a table is not one the wrong wallet's rows may fill.
+    ///
+    /// A failure to take the rows back is logged rather than reported: the next frame hands
+    /// the table its reading (or its wait) again, and a pane's screen is not the place for it.
+    fn clear_detail_tables(&self, cx: &mut WidgetCx<'_>) {
+        if let Some(tables) = &self.tables
+            && let Err(error) = tables.clear(cx)
+        {
+            log::error!("the hyperliquid wallet pane could not clear its tables: {error}");
+        }
+    }
+
     /// Draws the open wallet's tab into the tables, or says it is being read.
+    ///
+    /// What the table area draws is the tab's model, not the last frame's: a reading in hand
+    /// is the table, a tab still being read — the first time or again over a reading already
+    /// on screen — is the wait under the spinner, and a tab that failed is the failure banner
+    /// over an empty table rather than rows the venue no longer stands behind.
     fn sync_selected_tables(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        let Some(address) = self.selected.clone() else {
-            return Ok(());
-        };
-        let tab = self.selected_tab;
-        let snapshot = self
-            .detail
-            .get(&(address.clone(), tab))
-            .and_then(|entry| entry.snapshot.clone());
         let Some(tables) = &self.tables else {
             return Ok(());
         };
+        let Some(address) = self.selected.clone() else {
+            // The list page has no table area: the overlay a detail page left behind goes.
+            tables.set_loading(self.selected_tab, false, cx)?;
+            return Ok(());
+        };
+        let tab = self.selected_tab;
         tables.show(tab, cx)?;
-        match snapshot {
-            Some(snapshot) => {
+        let entry = self.detail.get(&(address.clone(), tab));
+        let snapshot = entry.and_then(|entry| entry.snapshot.clone());
+        let reading = self
+            .detail_request
+            .as_ref()
+            .is_some_and(|(held, held_tab)| held == &address && *held_tab == tab);
+        let failed = entry.is_some_and(|entry| matches!(entry.status, ScopeStatus::Failed(_)));
+        let waiting = reading || (snapshot.is_none() && !failed);
+        match &snapshot {
+            Some(snapshot) if !reading => {
                 let already =
                     self.accepted_detail
                         .as_ref()
-                        .is_some_and(|(held, held_tab, reading)| {
-                            held == &address && *held_tab == tab && Arc::ptr_eq(reading, &snapshot)
+                        .is_some_and(|(held, held_tab, accepted)| {
+                            held == &address && *held_tab == tab && Arc::ptr_eq(accepted, snapshot)
                         });
                 if !already {
-                    tables.accept(tab, snapshot.clone(), cx)?;
-                    self.accepted_detail = Some((address, tab, snapshot));
+                    tables.accept(tab, Arc::clone(snapshot), cx)?;
+                    self.accepted_detail = Some((address, tab, Arc::clone(snapshot)));
                 }
                 tables.set_loading(tab, false, cx)?;
             }
-            None => tables.set_loading(tab, true, cx)?,
+            _ => tables.set_loading(tab, waiting, cx)?,
         }
         Ok(())
     }
+
     /// Mirrors the controls' enabled/selected state to what the pane is showing.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) {
         let Some(header) = &self.header else {
@@ -1824,11 +1919,28 @@ impl HyperliquidWalletWidget {
         header.back.set_disabled(cx.app_mut(), false);
         header.retry.set_disabled(cx.app_mut(), false);
         let loading = self.selected.as_ref().is_some_and(|address| {
-            self.detail
-                .get(&(address.clone(), self.selected_tab))
-                .is_none_or(|entry| entry.snapshot.is_none())
+            let key = (address.clone(), self.selected_tab);
+            // A tab being read again is a tab with a request out: the control that asks for
+            // it is not one to press twice, and a reading already on screen is not a reason
+            // to think the round is over.
+            self.detail_request.as_ref() == Some(&key)
+                || self
+                    .detail
+                    .get(&key)
+                    .is_none_or(|entry| entry.snapshot.is_none())
         });
         header.refresh.set_disabled(cx.app_mut(), loading);
+        // The retry control's copy is a count and the catalogue is per language: the one
+        // header control that cannot bind its label is rebuilt when either moves (§15.1).
+        let failed = *cx.read(&self.failed);
+        let built = (self.language, failed);
+        let stale = self
+            .header
+            .as_ref()
+            .is_some_and(|header| header.retry_built != built);
+        if stale && let Err(error) = self.rebuild_retry_control(cx, failed) {
+            log::error!("the hyperliquid wallet header could not name the failure count: {error}");
+        }
     }
 
     /// Mirrors the open tab to the tab controls.
@@ -2104,91 +2216,41 @@ impl HyperliquidWalletWidget {
         parent: NodeId,
     ) -> Result<(), EngineError> {
         let language = self.language;
-        let page = self.page;
-        let failed = self.failed;
-        let theme = cx.theme().clone();
+        let failed = *cx.read(&self.failed);
         let translate = cx.translate().clone();
-        let window = cx.window();
         let manage_label = t_smol!(translate, "widget.hyperliquid_wallet.manage_addresses");
         let back_label = t_smol!(translate, "widget.hyperliquid_wallet.back");
-        let retry_label = t_smol!(
-            translate,
-            "widget.hyperliquid_wallet.retry_failed",
-            value = 1
-        );
         let refresh_label = t_smol!(translate, "widget.hyperliquid_wallet.refresh");
-        let intents = self.intents;
-        let intent_signal = self.intent;
-
-        let build_control = |cx: &mut WidgetCx<'_>,
-                             suffix: &str,
-                             icon: IconKind,
-                             label: SmolStr,
-                             intent: Intent,
-                             visible: Visibility|
-         -> Result<(Button, NodeId), EngineError> {
-            let key = cx.unique_key(suffix);
-            let button = Button::new(cx.app_mut(), theme.clone(), key)
-                .ghost()
-                .small()
-                .icon(icon)
-                .a11y_label(label.clone())
-                .tooltip_text(label)
-                .on_click({
-                    move |ctx| {
-                        ctx.write(&intent_signal, Some(intent.clone()));
-                        ctx.update(&intents, |count| *count += 1);
-                        let window = ctx.window();
-                        let _ = ctx.app_mut().request_repaint(window);
-                    }
-                });
-            let wrapper = NodeBuilder::boxed()
-                .style(StyleBuilder::new().flex_none().build())
-                .bind_style(move |read| StylePatch {
-                    visible: Some(match visible {
-                        Visibility::Overview => !*read.read(&page),
-                        Visibility::Detail => *read.read(&page),
-                        Visibility::Failed => !*read.read(&page) && *read.read(&failed) > 0,
-                    }),
-                    ..StylePatch::default()
-                })
-                .build(cx.tree_mut(), parent)?;
-            button.build(cx.app_mut(), window, wrapper)?;
-            Ok((button, wrapper))
-        };
-
-        let (manage, manage_wrapper) = build_control(
+        let (manage, manage_wrapper) = self.build_header_control(
             cx,
+            parent,
             "hyperliquid_wallet.header.manage",
             IconKind::Faders,
             manage_label,
             Intent::ManageAddresses,
             Visibility::Overview,
         )?;
-        let (back, back_wrapper) = build_control(
+        let (back, back_wrapper) = self.build_header_control(
             cx,
+            parent,
             "hyperliquid_wallet.header.back",
             IconKind::CaretLeft,
             back_label,
             Intent::Back,
             Visibility::Detail,
         )?;
-        let (retry, retry_wrapper) = build_control(
+        let (refresh, refresh_wrapper) = self.build_header_control(
             cx,
-            "hyperliquid_wallet.header.retry_failed",
-            IconKind::ArrowsClockwise,
-            retry_label,
-            Intent::RetryFailed,
-            Visibility::Failed,
-        )?;
-        let (refresh, refresh_wrapper) = build_control(
-            cx,
+            parent,
             "hyperliquid_wallet.header.refresh",
             IconKind::ArrowsClockwise,
             refresh_label,
             Intent::RefreshTab,
             Visibility::Detail,
         )?;
+        // The retry control is built last because it is the one rebuilt in place: a control
+        // appended to the row lands where the old one was taken from only if it was last.
+        let (retry, retry_wrapper) = self.build_retry_control(cx, parent, failed, &translate)?;
         self.header = Some(HeaderControls {
             manage,
             back,
@@ -2198,8 +2260,110 @@ impl HyperliquidWalletWidget {
             back_wrapper,
             retry_wrapper,
             refresh_wrapper,
-            language,
+            parent,
+            retry_built: (language, failed),
         });
+        Ok(())
+    }
+
+    /// Builds one header control, with the wrapper that decides which page draws it.
+    fn build_header_control(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        suffix: &str,
+        icon: IconKind,
+        label: SmolStr,
+        intent: Intent,
+        visible: Visibility,
+    ) -> Result<(Button, NodeId), EngineError> {
+        let page = self.page;
+        let failed = self.failed;
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let intents = self.intents;
+        let intent_signal = self.intent;
+        let key = cx.unique_key(suffix);
+        let button = Button::new(cx.app_mut(), theme, key)
+            .ghost()
+            .small()
+            .icon(icon)
+            .a11y_label(label.clone())
+            .tooltip_text(label)
+            .on_click(move |ctx| {
+                ctx.write(&intent_signal, Some(intent.clone()));
+                ctx.update(&intents, |count| *count += 1);
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        let wrapper = NodeBuilder::boxed()
+            .style(StyleBuilder::new().flex_none().build())
+            .bind_style(move |read| StylePatch {
+                visible: Some(match visible {
+                    Visibility::Overview => !*read.read(&page),
+                    Visibility::Detail => *read.read(&page),
+                    Visibility::Failed => !*read.read(&page) && *read.read(&failed) > 0,
+                }),
+                ..StylePatch::default()
+            })
+            .build(cx.tree_mut(), parent)?;
+        button.build(cx.app_mut(), window, wrapper)?;
+        Ok((button, wrapper))
+    }
+
+    /// Builds the header's retry control, whose copy is the number of wallets that failed.
+    fn build_retry_control(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        failed: usize,
+        translate: &Translate,
+    ) -> Result<(Button, NodeId), EngineError> {
+        self.build_header_control(
+            cx,
+            parent,
+            "hyperliquid_wallet.header.retry_failed",
+            IconKind::ArrowsClockwise,
+            retry_failed_label(translate, failed),
+            Intent::RetryFailed,
+            Visibility::Failed,
+        )
+    }
+
+    /// Rebuilds the retry control in the row it was built into.
+    ///
+    /// The kit button's label is built copy (AGENTS §15.1), and this one states a count: the
+    /// node goes before the component (E16), and the new control is built where the old one
+    /// was so the header keeps the order of its controls.
+    fn rebuild_retry_control(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        failed: usize,
+    ) -> Result<(), EngineError> {
+        let Some(parent) = self.header.as_ref().map(|header| header.parent) else {
+            return Ok(());
+        };
+        if cx.tree().get(parent).is_err() {
+            // The pane rebuilt its header row: those controls went with it, and the pane
+            // calls `header` again for the row it draws now (AGENTS §15.1).
+            self.release_header(cx);
+            self.header_parent = None;
+            return Ok(());
+        }
+        let Some(mut header) = self.header.take() else {
+            return Ok(());
+        };
+        let window = cx.window();
+        if cx.tree().get(header.retry_wrapper).is_ok() {
+            let _ = cx.app_mut().remove_node(window, header.retry_wrapper);
+        }
+        header.retry.release(cx.app_mut());
+        let translate = cx.translate().clone();
+        let (retry, retry_wrapper) = self.build_retry_control(cx, parent, failed, &translate)?;
+        header.retry = retry;
+        header.retry_wrapper = retry_wrapper;
+        header.retry_built = (self.language, failed);
+        self.header = Some(header);
         Ok(())
     }
 
@@ -2228,7 +2392,6 @@ impl HyperliquidWalletWidget {
         header.back.release(cx.app_mut());
         header.retry.release(cx.app_mut());
         header.refresh.release(cx.app_mut());
-        let _ = header.language;
     }
 
     /// Tracks the pointer over a row's timeline and repaints the rows that changed.
@@ -2315,6 +2478,26 @@ fn apply_status(status: &mut ScopeStatus, ready: &mut bool, reported: &WalletSta
                 ScopeStatus::Failed(Arc::new(HyperliquidWalletFailure::Stream(error.clone())));
             true
         }
+    }
+}
+
+/// The label of the retry control, which names how many wallets failed.
+///
+/// The catalogue writes the one-wallet case as its own sentence, so the count decides the key
+/// as well as the value.
+fn retry_failed_label(translate: &Translate, failed: usize) -> SmolStr {
+    if failed == 1 {
+        t_smol!(
+            translate,
+            "widget.hyperliquid_wallet.retry_failed_one",
+            value = failed
+        )
+    } else {
+        t_smol!(
+            translate,
+            "widget.hyperliquid_wallet.retry_failed",
+            value = failed
+        )
     }
 }
 
@@ -2430,6 +2613,9 @@ fn build_wallet_row(
     if index > 0 {
         let divider_theme = theme.clone();
         NodeBuilder::boxed()
+            .id(format_smolstr!(
+                "TEST_HYPERLIQUID_WALLET_ROW_{index}_DIVIDER"
+            ))
             .style(
                 StyleBuilder::new()
                     .width_full()
@@ -2445,9 +2631,13 @@ fn build_wallet_row(
     }
 
     let account = NodeBuilder::boxed()
+        .id(format_smolstr!(
+            "TEST_HYPERLIQUID_WALLET_ROW_{index}_ACCOUNT"
+        ))
         .style(
             StyleBuilder::new()
                 .flex_col()
+                .flex_none()
                 .justify_center()
                 .width_full()
                 .height(ACCOUNT_ROW_HEIGHT)
@@ -2665,6 +2855,9 @@ fn build_wallet_row(
 
     // ── the timeline, its state message, and the retry slot ──────────────────────
     let timeline_area = NodeBuilder::boxed()
+        .id(format_smolstr!(
+            "TEST_HYPERLIQUID_WALLET_ROW_{index}_TIMELINE_AREA"
+        ))
         .style(
             StyleBuilder::new()
                 .relative()
@@ -2681,6 +2874,9 @@ fn build_wallet_row(
     let state_translate = translate;
     let state_language = language;
     let state = NodeBuilder::boxed()
+        .id(format_smolstr!(
+            "TEST_HYPERLIQUID_WALLET_ROW_{index}_TIMELINE_STATE"
+        ))
         .style(
             StyleBuilder::new()
                 .absolute()
@@ -2691,12 +2887,14 @@ fn build_wallet_row(
                 .justify_center()
                 .build(),
         )
+        // The layer says what the timeline area is doing, so it follows the timeline rather
+        // than the totals: a wallet whose totals arrived and whose timeline is still being
+        // read — or was refused — is a row whose timeline says so.
         .bind_style(move |read| {
             let rows = read.read(&rows);
-            let visible = rows
-                .rows
-                .get(index)
-                .is_some_and(|row| row.overview.is_none());
+            let visible = rows.rows.get(index).is_some_and(|row| {
+                row.timeline.is_none() || matches!(row.timeline_status, ScopeStatus::Failed(_))
+            });
             StylePatch {
                 visible: Some(visible),
                 ..StylePatch::default()
@@ -2708,6 +2906,9 @@ fn build_wallet_row(
         SmolStr::default(),
         TextStyle::new(META_TEXT_SIZE.text_size()),
     )
+    .id(format_smolstr!(
+        "TEST_HYPERLIQUID_WALLET_ROW_{index}_TIMELINE_STATE_TEXT"
+    ))
     .bind_text(move |read| {
         let _language = *read.read(&state_language);
         let rows = read.read(&rows);
@@ -2759,7 +2960,7 @@ fn meta_text_style() -> TextStyle {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, rc::Rc, time::Duration};
 
     use app_config::widget::VersionedWidgetConfig;
     use i18n::{language::codes::LanguageCode, translate::Translate};
@@ -2767,7 +2968,7 @@ mod tests {
         account::error::AccountCatalogError, catalog::error::CatalogError,
     };
     use serde_json::json;
-    use ui_core::{event::ActionSource, node::signal::SignalScope};
+    use ui_core::{event::ActionSource, math::Rect, node::signal::SignalScope};
     use widget::test_support::WidgetTestApp;
 
     use super::*;
@@ -2858,7 +3059,10 @@ mod tests {
     ) -> Pane {
         let scope = harness.app_mut().signal_scope();
         let status = WidgetStatus::new(harness.app_mut(), scope);
-        let parent = harness.placeholder_parent();
+        // The production body is handed a content slot of a definite size. A bare placeholder
+        // has no width of its own, and both pages take their box from the body (they are laid
+        // out over it rather than beside it), so the tests mount into a slot that has one.
+        let parent = sized_parent(harness, 800.0, 600.0);
         let published = Rc::new(Cell::new(0));
         let counted = Rc::clone(&published);
         let config_change = WidgetConfigChange::new(move |_| {
@@ -4792,5 +4996,685 @@ mod tests {
                 .detail
                 .contains_key(&(a_wallet(), DetailTab::Ledger))
         );
+    }
+
+    // ── where the pages and the rows are, once the body is laid out ───────────────
+
+    /// A list-shaped parent of a fixed size, the way the pane's content slot hands the body one.
+    fn sized_parent(harness: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+        harness.with_cx(|cx| {
+            let root = cx.tree().root();
+            NodeBuilder::boxed()
+                .id("TEST_HYPERLIQUID_WALLET_BODY_PARENT")
+                .style(
+                    StyleBuilder::new()
+                        .width(width)
+                        .height(height)
+                        .flex_none()
+                        .flex_col()
+                        .build(),
+                )
+                .build(cx.tree_mut(), root)
+                .expect("the parent is built")
+        })
+    }
+
+    fn bounds_of(harness: &WidgetTestApp, node: NodeId) -> Rect {
+        harness
+            .tree()
+            .get(node)
+            .unwrap_or_else(|_| panic!("the node {node:?} is in the tree"))
+            .layout()
+            .bounds
+    }
+
+    fn find(harness: &WidgetTestApp, parent: NodeId, prefix: &str) -> NodeId {
+        harness
+            .find_by_debug_prefix(parent, prefix)
+            .unwrap_or_else(|| panic!("{prefix} is built under {parent:?}"))
+    }
+
+    fn assert_close(actual: f32, expected: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{what}: {actual} != {expected}"
+        );
+    }
+
+    /// The two pages are one slot, not two halves: both are laid out over the whole body, and
+    /// the page signal decides which one is drawn (the engine's `visible` hides a frame, it does
+    /// not take a box out of the flex flow).
+    #[test]
+    fn the_two_pages_should_fill_the_body_they_share() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
+        let parent = sized_parent(&mut harness, 600.0, 400.0);
+        pane.parent = parent;
+        build_body(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let body = pane.widget.body_root.expect("the body is built");
+        let body_bounds = bounds_of(&harness, body);
+        assert_close(
+            body_bounds.size.width,
+            600.0,
+            "the body is as wide as its slot",
+        );
+        assert_close(
+            body_bounds.size.height,
+            400.0,
+            "the body is as tall as its slot",
+        );
+
+        let overview = find(&harness, parent, "TEST_HYPERLIQUID_WALLET_OVERVIEW_PAGE");
+        let detail = find(&harness, parent, "TEST_HYPERLIQUID_WALLET_DETAIL_PAGE");
+        for (page, name) in [(overview, "the list page"), (detail, "the detail page")] {
+            let bounds = bounds_of(&harness, page);
+            assert_eq!(
+                bounds.origin, body_bounds.origin,
+                "{name} starts where the body starts rather than below its sibling"
+            );
+            assert_eq!(
+                bounds.size, body_bounds.size,
+                "{name} is the whole body, not half of it"
+            );
+        }
+        assert!(
+            harness.visible(overview) && !harness.visible(detail),
+            "the list is the page drawn, and the detail page is still laid out"
+        );
+
+        // A page whose reader has moved on is the same box: the detail page is not drawn
+        // somewhere else when it is the one showing.
+        open_wallet(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        let shown = bounds_of(&harness, detail);
+        assert_eq!(shown.origin, body_bounds.origin);
+        assert_eq!(shown.size, body_bounds.size);
+        assert!(
+            harness.visible(detail) && !harness.visible(overview),
+            "the wallet is the page drawn now"
+        );
+    }
+
+    /// The detail page's column is its heading, its tabs and its tables, with no band of the
+    /// page left unaccounted for at the bottom.
+    #[test]
+    fn the_detail_page_should_be_its_heading_its_tabs_and_its_tables() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
+        let parent = sized_parent(&mut harness, 600.0, 400.0);
+        pane.parent = parent;
+        build_body(&mut harness, &mut pane);
+        open_wallet(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let page = bounds_of(
+            &harness,
+            find(&harness, parent, "TEST_HYPERLIQUID_WALLET_DETAIL_PAGE"),
+        );
+        let heading = bounds_of(
+            &harness,
+            find(&harness, parent, "TEST_HYPERLIQUID_WALLET_DETAIL_HEADING"),
+        );
+        let strip = bounds_of(
+            &harness,
+            pane.widget.tab_strip.expect("the tab strip is built"),
+        );
+        let tables = pane.widget.tables.as_ref().expect("the tables are built");
+        let area = tables.area_node();
+        let area_bounds = bounds_of(&harness, area);
+
+        assert_close(
+            heading.origin.y,
+            page.origin.y,
+            "the heading starts the page",
+        );
+        assert_close(
+            strip.origin.y,
+            heading.max().y,
+            "the tabs follow the heading",
+        );
+        assert_close(
+            area_bounds.origin.y,
+            strip.max().y,
+            "the tables follow the tabs",
+        );
+        assert_close(
+            area_bounds.max().y,
+            page.max().y,
+            "nothing is left under the tables",
+        );
+        assert!(
+            area_bounds.size.height > 300.0,
+            "the tables fill the page under the tabs: {}",
+            area_bounds.size.height
+        );
+
+        // The shown tab is the whole table area rather than a stack entry of its own height.
+        let tab = find(&harness, area, "TEST_HYPERLIQUID_WALLET_DETAIL_TAB_0");
+        let tab_bounds = bounds_of(&harness, tab);
+        assert_eq!(tab_bounds.origin, area_bounds.origin);
+        assert_eq!(tab_bounds.size, area_bounds.size);
+    }
+
+    // ── the readings a wallet's page may draw ─────────────────────────────────────
+
+    /// The tables hold one wallet's readings: opening another wallet is not a reason to draw
+    /// the wallet that was open under its spinner.
+    #[test]
+    fn opening_another_wallet_should_empty_the_tables_of_the_one_before() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet(), address("2")]);
+        open_trades(&mut harness, &mut pane);
+        let tables = pane.widget.tables.as_ref().expect("the tables are built");
+        assert_eq!(tables.row_count(DetailTab::Trades), 1);
+
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::Back, cx)
+                .expect("the list is shown")
+        });
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::OpenWallet(1), cx)
+                .expect("the other wallet opens")
+        });
+        sync(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::SelectTab(DetailTab::Trades), cx)
+                .expect("the tab opens")
+        });
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let tables = pane.widget.tables.as_ref().expect("the tables are built");
+        assert_eq!(
+            tables.row_count(DetailTab::Trades),
+            0,
+            "the wallet that was left is not drawn under the wallet that was opened"
+        );
+        assert!(
+            tables
+                .cell_node(DetailTab::Trades, 0, 0, harness.app())
+                .is_none(),
+            "and no cell of the reading belongs to this wallet"
+        );
+        assert!(
+            tables.overlay_visible(harness.app()),
+            "the tab that has not been read is waited for under the spinner"
+        );
+        assert_eq!(current_state(&harness, &pane), WidgetState::Loading);
+    }
+
+    /// The failure of the tab that is being read is the failure banner over an empty table —
+    /// never the last wallet's rows left underneath it.
+    #[test]
+    fn a_failed_tab_should_not_leave_the_last_wallets_rows_under_it() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet(), address("2")]);
+        open_trades(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::Back, cx)
+                .expect("the list is shown")
+        });
+        sync(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::OpenWallet(1), cx)
+                .expect("the other wallet opens")
+        });
+        sync(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::SelectTab(DetailTab::Trades), cx)
+                .expect("the tab opens")
+        });
+        sync(&mut harness, &mut pane);
+        report_status(
+            &mut harness,
+            &mut pane,
+            detail_key(&address("2"), DetailTab::Trades),
+            WalletStatus::Failed(WalletStreamError::StreamClosed),
+        );
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let tables = pane.widget.tables.as_ref().expect("the tables are built");
+        assert_eq!(
+            tables.row_count(DetailTab::Trades),
+            0,
+            "the refused tab draws no reading, least of all another wallet's"
+        );
+        assert!(
+            !tables.overlay_visible(harness.app()),
+            "a refusal is not a wait"
+        );
+        assert!(current_state(&harness, &pane).is_failed());
+    }
+
+    /// The reading a wallet already has is the reading it is shown again: coming back to a
+    /// wallet whose tab was read is not another wait.
+    #[test]
+    fn reopening_a_wallet_should_draw_the_reading_it_already_has() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet(), address("2")]);
+        open_trades(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::Back, cx)
+                .expect("the list is shown")
+        });
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::OpenWallet(0), cx)
+                .expect("the wallet opens again")
+        });
+        sync(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::SelectTab(DetailTab::Trades), cx)
+                .expect("the tab opens")
+        });
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let tables = pane.widget.tables.as_ref().expect("the tables are built");
+        assert_eq!(
+            tables.row_count(DetailTab::Trades),
+            1,
+            "the reading the wallet already has is handed to its table again"
+        );
+        assert!(
+            !tables.overlay_visible(harness.app()),
+            "a reading the pane kept is not a wait"
+        );
+    }
+
+    // ── the frames a page costs ──────────────────────────────────────────────────
+
+    /// A list page has no ages to move: leaving the detail page stops the clock that rewrote
+    /// them, and a steady list asks for no frame (I3).
+    #[test]
+    fn leaving_the_detail_page_should_stop_the_ages_clock() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        open_trades(&mut harness, &mut pane);
+        assert!(
+            pane.widget
+                .tables
+                .as_ref()
+                .expect("the tables are built")
+                .age_clock_armed(),
+            "the ages of the wallet on screen are moved once a second"
+        );
+
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::Back, cx)
+                .expect("the list is shown")
+        });
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        assert!(
+            !pane
+                .widget
+                .tables
+                .as_ref()
+                .expect("the tables are built")
+                .age_clock_armed(),
+            "a list page has no ages to move"
+        );
+
+        let requests = harness.frame_requests();
+        for _ in 0..3 {
+            harness.advance(Duration::from_secs(1));
+        }
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "a steady list asks for no frame just because a second passed"
+        );
+    }
+
+    /// A tab that is read again says so in its table area: the reading on screen is kept under
+    /// the wait rather than replaced by nothing.
+    #[test]
+    fn refreshing_a_tab_should_say_it_is_loading() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        open_trades(&mut harness, &mut pane);
+        pane_cx(&mut harness, pane.scope, |cx| {
+            pane.widget
+                .apply_intent(Intent::RefreshTab, cx)
+                .expect("the tab is read again")
+        });
+        sync(&mut harness, &mut pane);
+        assert!(
+            pane.widget
+                .tables
+                .as_ref()
+                .expect("the tables are built")
+                .overlay_visible(harness.app()),
+            "a tab that is read again is waited for over the reading it shows"
+        );
+        assert_eq!(
+            pane.widget
+                .tables
+                .as_ref()
+                .expect("the tables are built")
+                .row_count(DetailTab::Trades),
+            1,
+            "the reading on hand is not thrown away while it is read again"
+        );
+
+        report_detail(
+            &mut harness,
+            &mut pane,
+            &a_wallet(),
+            DetailTab::Trades,
+            trades_reading(),
+        );
+        report_status(
+            &mut harness,
+            &mut pane,
+            detail_key(&a_wallet(), DetailTab::Trades),
+            WalletStatus::Ready,
+        );
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        let tables = pane.widget.tables.as_ref().expect("the tables are built");
+        assert!(
+            !tables.overlay_visible(harness.app()),
+            "the reading that answers ends the wait"
+        );
+        assert_eq!(tables.row_count(DetailTab::Trades), 1);
+    }
+
+    // ── what the header and the rows say ─────────────────────────────────────────
+
+    /// The retry control names how many wallets failed, in the singular if one did.
+    #[test]
+    fn the_retry_control_should_name_how_many_wallets_failed() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet(), address("2")]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &address("2"), overview_of());
+        build_header(&mut harness, &mut pane);
+        report_status(
+            &mut harness,
+            &mut pane,
+            overview_key(&a_wallet()),
+            WalletStatus::Failed(WalletStreamError::StreamClosed),
+        );
+        sync(&mut harness, &mut pane);
+        let label = pane
+            .widget
+            .header
+            .as_ref()
+            .expect("the header is built")
+            .retry
+            .a11y_label_text()
+            .expect("the control has a label")
+            .to_owned();
+        assert_eq!(
+            label, "Retry 1 failed wallet",
+            "one failed wallet is named in the singular"
+        );
+
+        report_status(
+            &mut harness,
+            &mut pane,
+            overview_key(&address("2")),
+            WalletStatus::Failed(WalletStreamError::StreamClosed),
+        );
+        sync(&mut harness, &mut pane);
+        let label = pane
+            .widget
+            .header
+            .as_ref()
+            .expect("the header is built")
+            .retry
+            .a11y_label_text()
+            .expect("the control has a label")
+            .to_owned();
+        assert_eq!(
+            label, "Retry 2 failed wallets",
+            "the control is rebuilt with the count showing now"
+        );
+    }
+
+    /// The timeline area says what it is doing once the totals have arrived: a timeline that is
+    /// still being read, or one that failed, is not an empty canvas.
+    #[test]
+    fn a_timeline_that_failed_should_say_so_after_the_totals_arrived() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
+        build_body(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let state = find(
+            &harness,
+            pane.parent,
+            "TEST_HYPERLIQUID_WALLET_ROW_0_TIMELINE_STATE",
+        );
+        assert!(
+            harness.visible(state),
+            "a wallet whose totals arrived and whose timeline has not is still waited for"
+        );
+        let message = find(
+            &harness,
+            pane.parent,
+            "TEST_HYPERLIQUID_WALLET_ROW_0_TIMELINE_STATE_TEXT",
+        );
+        assert_eq!(
+            harness.text_of(message),
+            translate(LanguageCode::En).translate("widget.hyperliquid_wallet.timeline_loading"),
+            "the row says the timeline is being read"
+        );
+
+        report_status(
+            &mut harness,
+            &mut pane,
+            timeline_key(&a_wallet()),
+            WalletStatus::Failed(WalletStreamError::StreamClosed),
+        );
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        assert!(
+            harness.visible(state),
+            "a failed timeline says so even though the totals arrived"
+        );
+        let expected = HyperliquidWalletFailure::Stream(WalletStreamError::StreamClosed)
+            .translated_message(&translate(LanguageCode::En));
+        assert_eq!(
+            harness.text_of(message),
+            expected.as_str(),
+            "the row says why its timeline is not drawn"
+        );
+    }
+
+    /// A wallet row is its account line over its timeline, and the divider a row carries sits
+    /// above the account line rather than squeezing it.
+    #[test]
+    fn a_wallet_row_should_be_its_account_line_over_its_timeline() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet(), address("2")]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
+        report_overview(&mut harness, &mut pane, &address("2"), overview_of());
+        build_body(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        let rows = pane
+            .widget
+            .list
+            .as_ref()
+            .expect("the list is built")
+            .mounted_rows(harness.app());
+        assert_eq!(rows.len(), 2, "both wallets are mounted");
+        for (index, row) in rows {
+            let row_bounds = bounds_of(&harness, row);
+            assert_close(
+                row_bounds.size.height,
+                WALLET_ROW_HEIGHT,
+                "a row is its account line and its timeline",
+            );
+            let account = find(
+                &harness,
+                row,
+                &format!("TEST_HYPERLIQUID_WALLET_ROW_{index}_ACCOUNT"),
+            );
+            let account_bounds = bounds_of(&harness, account);
+            assert_close(
+                account_bounds.size.height,
+                ACCOUNT_ROW_HEIGHT,
+                "the divider does not squeeze the account line",
+            );
+            let timeline = find(
+                &harness,
+                row,
+                &format!("TEST_HYPERLIQUID_WALLET_ROW_{index}_TIMELINE_AREA"),
+            );
+            let timeline_bounds = bounds_of(&harness, timeline);
+            assert_close(
+                timeline_bounds.size.height,
+                timeline::HEIGHT,
+                "the timeline keeps its height",
+            );
+            assert_close(
+                timeline_bounds.origin.y,
+                account_bounds.max().y,
+                "the timeline follows the account line",
+            );
+            if index > 0 {
+                let divider = find(
+                    &harness,
+                    row,
+                    &format!("TEST_HYPERLIQUID_WALLET_ROW_{index}_DIVIDER"),
+                );
+                assert_close(
+                    bounds_of(&harness, divider).size.height,
+                    1.0,
+                    "the divider is one line",
+                );
+                assert_close(
+                    account_bounds.origin.y - row_bounds.origin.y,
+                    1.0,
+                    "the divider sits above the account line, inside the row",
+                );
+                assert_close(
+                    timeline_bounds.max().y,
+                    row_bounds.max().y,
+                    "a row that carries a divider fills its height",
+                );
+            } else {
+                assert_close(
+                    timeline_bounds.max().y,
+                    row_bounds.max().y - 1.0,
+                    "the first row keeps the divider's line free, as the old one did",
+                );
+            }
+        }
+    }
+
+    /// A row's controls are taken out of the tree before their components are released: a
+    /// node left behind reads a freed scope on the next frame (E16).
+    #[test]
+    fn rebuilding_a_rows_controls_should_take_their_nodes_out_of_the_tree() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
+        build_body(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+        let before = pane
+            .widget
+            .row_controls
+            .get(&0)
+            .expect("the row has its controls")
+            .copy
+            .node()
+            .expect("the copy control is built");
+        assert!(
+            harness.tree().get(before).is_ok(),
+            "the control is in the tree"
+        );
+
+        harness.switch_language(LanguageCode::ZhCn);
+        // The first sync releases what was built in the language that left; the second builds
+        // the controls the language showing now needs.
+        sync(&mut harness, &mut pane);
+        sync(&mut harness, &mut pane);
+        drain(&mut harness);
+
+        assert!(
+            harness.tree().get(before).is_err(),
+            "the control of the row that was rebuilt is taken out of the tree"
+        );
+        let after = pane
+            .widget
+            .row_controls
+            .get(&0)
+            .expect("the row has its controls again")
+            .copy
+            .node()
+            .expect("the rebuilt control is built");
+        assert_ne!(after, before, "the control is a node of its own");
+        assert!(
+            harness.tree().get(after).is_ok(),
+            "the rebuilt control is in the tree"
+        );
+    }
+
+    /// A failure is terminal, and a status that arrives after it belongs to a stream the pane
+    /// no longer reports (AGENTS §4.4).
+    #[test]
+    fn a_status_after_a_failure_should_be_refused() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, vec![a_wallet()]);
+        load(&mut harness, &mut pane);
+        report_overview(&mut harness, &mut pane, &a_wallet(), overview_of());
+        open_wallet(&mut harness, &mut pane);
+        report_status(
+            &mut harness,
+            &mut pane,
+            detail_key(&a_wallet(), DetailTab::Spot),
+            WalletStatus::Failed(WalletStreamError::StreamClosed),
+        );
+        assert!(current_state(&harness, &pane).is_failed());
+
+        report_status(
+            &mut harness,
+            &mut pane,
+            detail_key(&a_wallet(), DetailTab::Spot),
+            WalletStatus::Ready,
+        );
+        assert!(
+            current_state(&harness, &pane).is_failed(),
+            "a late status is not a recovery"
+        );
+        assert!(matches!(
+            pane.widget.detail[&(a_wallet(), DetailTab::Spot)].status,
+            ScopeStatus::Failed(_)
+        ));
     }
 }

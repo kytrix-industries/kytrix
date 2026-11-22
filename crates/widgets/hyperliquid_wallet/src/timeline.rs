@@ -553,7 +553,10 @@ fn fill_label(row: &TooltipRow, side: Side, translate: &Translate) -> (SmolStr, 
 }
 
 /// The age of a moment, as the one relative time every row of this widget is read by.
-fn age_text(translate: &Translate, now: i64, timestamp: i64) -> SmolStr {
+///
+/// The detail tables are the widget's other reader of it: a table's time cell and a timeline's
+/// tooltip are the same sentence about the same clock, so they are one function.
+pub(super) fn age_text(now: i64, timestamp: i64, translate: &Translate) -> SmolStr {
     match age_bucket(now, timestamp) {
         AgeBucket::Seconds(value) => {
             t_smol!(
@@ -1477,7 +1480,7 @@ impl TooltipFrame<'_> {
             );
             let (label, tone) = fill_label(row, self.side, self.translate);
             let label_style = text_style(self.font, self.colors.tone(tone));
-            let age = age_text(self.translate, self.now, row.timestamp);
+            let age = age_text(self.now, row.timestamp, self.translate);
 
             let Some(quantity_line) = text.line(&quantity, &quantity_style) else {
                 continue;
@@ -2062,6 +2065,30 @@ mod tests {
                 &harness.canvas().expect("the timeline drew a canvas")
             ),
             "a steady frame keeps the canvas it is drawn from"
+        );
+    }
+
+    #[test]
+    fn a_timeline_should_reshape_its_text_when_the_atlas_lease_is_gone() {
+        let mut harness = a_timeline();
+        let before = harness.canvas().expect("the timeline drew a canvas");
+
+        // An atlas reset under the same font stack: every handle the canvas was painted from is
+        // leased from an atlas that no longer exists, while the glyphs would shape back the same.
+        // The engine drops runs whose lease is gone at encode time, so the timeline owes a frame
+        // even though nothing a reader asked for moved.
+        let stack = harness.app.app().font_stack().clone();
+        harness.app.app_mut().set_font_stack(stack);
+
+        harness.sync(None);
+        harness.app.drain();
+
+        assert!(
+            !Arc::ptr_eq(
+                &before,
+                &harness.canvas().expect("the timeline drew a canvas")
+            ),
+            "a stale glyph lease is a canvas the timeline owed"
         );
     }
 
