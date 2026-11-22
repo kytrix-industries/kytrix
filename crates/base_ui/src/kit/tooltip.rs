@@ -139,6 +139,14 @@ pub struct TooltipOptions {
     pub delay: Duration,
     /// 是否淡入淡出。
     pub fade: bool,
+    /// 内容宽度上限（逻辑像素，**不含**面板内边距；面板总宽 = 上限 + 2 × 内边距）。
+    ///
+    /// 超过上限的文本按 `TextWrap::Wrap` 换行（面板高度随之增长）。`f32::INFINITY` / 非有限
+    /// 值 / `<= 0` = 不限制（面板按内容自然宽度收缩）。
+    ///
+    /// 默认 `320.0`：旧 `base_ui` 的提示内容固定 `max_w(px(320.0))`（W3a F6 的视觉等价面），
+    /// 长句在窄 pane 里的换行宽度因此与旧实现一致。
+    pub max_width: f32,
 }
 
 impl Default for TooltipOptions {
@@ -150,6 +158,8 @@ impl Default for TooltipOptions {
             // 旧实现没有延迟；新增的 500 ms 是提示类控件的通用默认（可调到 0 立即显示）。
             delay: Duration::from_millis(500),
             fade: true,
+            // 旧实现的内容宽度上限（`max_w(px(320.0))`，W3a F6）。
+            max_width: 320.0,
         }
     }
 }
@@ -166,6 +176,13 @@ impl TooltipOptions {
     #[must_use]
     pub fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// 内容宽度上限（不含面板内边距；`f32::INFINITY` = 不限制）。
+    #[must_use]
+    pub fn max_width(mut self, max_width: f32) -> Self {
+        self.max_width = max_width;
         self
     }
 }
@@ -473,6 +490,7 @@ impl Tooltip {
         };
         let theme = self.inner.theme.clone();
         let key = self.inner.key.clone();
+        let max_width = self.inner.options.max_width;
         self.inner
             .overlay
             .set_a11y(OverlayA11y::tooltip(content.label()));
@@ -481,7 +499,7 @@ impl Tooltip {
             self.inner
                 .overlay
                 .open(app, window, Anchor::node(trigger), move |tree, panel| {
-                    build_content(tree, panel, &key, &built, &theme)
+                    build_content(tree, panel, &key, &built, &theme, max_width)
                 });
         match opened {
             Ok(opened) => {
@@ -545,23 +563,30 @@ fn is_within(tree: &NodeTree, node: NodeId, ancestor: NodeId) -> bool {
 ///
 /// `Tooltip` 角色 / 可访问名声明在**引擎浮层包装节点**上（[`Overlay::set_a11y`]，E12：包装不再
 /// 自动 `Dialog`），内容根保持通用容器 —— 两层同名角色会让 AT 读两遍（E12-R1）。
+///
+/// 宽度：`max_width` 是**内容行**的上限（面板总宽 = 上限 + 面板内边距），文本节点
+/// `min_width_0` 可收缩 ⇒ 超宽文本按 `TextWrap::Wrap` 换行、快捷键 `flex_none` 保持整块；
+/// 非有限 / `<= 0` 的上限视为不限（[`TooltipOptions::max_width`]）。
 fn build_content(
     tree: &mut NodeTree,
     panel: NodeId,
     key: &str,
     content: &TooltipContent,
     theme: &ThemeHandle,
+    max_width: f32,
 ) -> Result<(), EngineError> {
+    let limited = max_width.is_finite() && max_width > 0.0;
+    let mut row_style = StyleBuilder::new()
+        .flex_row()
+        .items_center()
+        .gap(6.0)
+        .min_width_0();
+    if limited {
+        row_style = row_style.max_width(max_width);
+    }
     let row = NodeBuilder::boxed()
         .id(format_smolstr!("{key}:tip"))
-        .style(
-            StyleBuilder::new()
-                .flex_row()
-                .items_center()
-                .gap(6.0)
-                .min_width_0()
-                .build(),
-        )
+        .style(row_style.build())
         .build(tree, panel)?;
     let tokens = ComponentTokens::standard();
     let size = tokens.small.font_size;
@@ -569,6 +594,7 @@ fn build_content(
     text_style.color = theme_role(theme, Role::FgOnInverse);
     let theme_text = theme.clone();
     NodeBuilder::text(content.text.clone(), text_style)
+        .style(StyleBuilder::new().min_width_0().build())
         .bind_style(move |cx| StylePatch {
             foreground: Some(theme_text.components(cx).tooltip.foreground),
             ..StylePatch::default()
@@ -580,6 +606,7 @@ fn build_content(
         shortcut_style.color = theme_role(theme, Role::FgOnInverse).with_opacity(0.7);
         let theme_shortcut = theme.clone();
         NodeBuilder::text(shortcut.clone(), shortcut_style)
+            .style(StyleBuilder::new().flex_none().build())
             .bind_style(move |cx| StylePatch {
                 foreground: Some(
                     theme_shortcut
@@ -656,6 +683,14 @@ mod tests {
         }
 
         fn with_layer(options: TooltipOptions, layer: Layer) -> Self {
+            Self::with_content(
+                options,
+                layer,
+                TooltipContent::new("保存").shortcut("Ctrl+S"),
+            )
+        }
+
+        fn with_content(options: TooltipOptions, layer: Layer, content: TooltipContent) -> Self {
             let mut app = TestApp::new();
             let window = app.window_id();
             let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
@@ -679,7 +714,7 @@ mod tests {
                 options,
             );
             tip.attach(app.app_mut(), window, trigger);
-            tip.set_content(Some(TooltipContent::new("保存").shortcut("Ctrl+S")));
+            tip.set_content(Some(content));
             // 首帧先把布局跑出来：指针命中依赖布局盒（否则 hover 命中不到触发器）。
             let _ = app.drain().expect("首帧");
             Self {
@@ -944,6 +979,63 @@ mod tests {
         );
         assert!(texts.contains("保存"), "提示文本渲染，实际 {texts:?}");
         assert!(texts.contains("Ctrl+S"), "快捷键渲染，实际 {texts:?}");
+    }
+
+    /// **P2-10**（W3a F6）：提示内容宽度上限。
+    ///
+    /// 旧 `base_ui` 的提示内容固定 `max_w(px(320.0))`（面板再 `p_1()`）；迁移后的 kit 没有宽度
+    /// 入口，长句在窄 pane 里的换行宽度与旧实现不同。`TooltipOptions::max_width` 恢复该能力：
+    /// 默认 320（面板总宽 = 上限 + 2 × 4 面板内边距）、可调小（换行更多 ⇒ 更高）、
+    /// `f32::INFINITY` = 不限（单行撑开、更矮）。
+    ///
+    /// 变异防线：`build_content` 忽略 `max_width`（不给内容行加 `max_width`）⇒ 面板宽 = 单行
+    /// 全文宽，三条宽度断言全红。
+    #[test]
+    fn a_tooltip_wraps_its_text_at_the_configured_max_width() {
+        const LONG: &str = "迁移期的提示内容在窄面板里必须按配置的宽度上限换行，而不是把浮层撑成一条横跨整个窗口的细长条。";
+
+        fn panel_size(options: TooltipOptions) -> (f32, f32) {
+            let mut harness =
+                Harness::with_content(options.immediate(), Layer::new(), TooltipContent::new(LONG));
+            harness.hover(harness.trigger_center());
+            let _ = harness.sync();
+            harness.settle();
+            let panel = harness.tip.overlay().panel_node().expect("面板");
+            let bounds = harness.app.probe().bounds(panel).expect("面板布局");
+            (bounds.size.width, bounds.size.height)
+        }
+
+        assert_eq!(
+            TooltipOptions::default().max_width,
+            320.0,
+            "默认恢复旧实现的 320 px 内容上限（W3a F6）"
+        );
+        let (default_width, default_height) = panel_size(TooltipOptions::default());
+        assert!(
+            (default_width - (320.0 + 8.0)).abs() <= 1.0,
+            "默认上限 320：面板总宽 = 320 + 2 × 面板内边距，实际 {default_width}"
+        );
+
+        let (narrow_width, narrow_height) = panel_size(TooltipOptions::default().max_width(120.0));
+        assert!(
+            (narrow_width - (120.0 + 8.0)).abs() <= 1.0,
+            "显式上限 120 生效，实际面板宽 {narrow_width}"
+        );
+        assert!(
+            narrow_height > default_height,
+            "上限更窄 ⇒ 换行更多 ⇒ 面板更高（{narrow_height} vs {default_height}）"
+        );
+
+        let (wide_width, wide_height) =
+            panel_size(TooltipOptions::default().max_width(f32::INFINITY));
+        assert!(
+            wide_width > default_width + 100.0,
+            "f32::INFINITY = 不限制：长句单行撑开，实际 {wide_width}"
+        );
+        assert!(
+            wide_height < default_height,
+            "单行比换行矮（{wide_height} vs {default_height}）"
+        );
     }
 
     #[test]

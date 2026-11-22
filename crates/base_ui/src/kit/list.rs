@@ -154,7 +154,12 @@ pub enum SelectionMode {
 pub struct ListOptions {
     /// 行高策略。
     pub row_height: RowHeight,
-    /// 视口外上下各多挂几行。
+    /// 视口外上下各多挂几行（**行数**口径，不是像素）。
+    ///
+    /// 像素余量 ≈ `overscan × 行高`：固定行高列表就是精确值；变高列表用
+    /// [`RowHeight::Variable`] 的 `estimate` 折算，实测行高与估计不同则像素余量随之偏移 ——
+    /// W2/W4 登记的「旧 150 px vs 新 76 px」正是这层口径差（旧实现按像素预算，内核按行数；
+    /// 需要等价余量时调用方自己用「估计行高 × 行数」折算，[`ListOptions::overscan`] 只收行数）。
     pub overscan: usize,
     /// 选中策略。
     pub selection: SelectionMode,
@@ -164,9 +169,9 @@ pub struct ListOptions {
     pub reverse: bool,
     /// 读者在最新一条上时，push 后跟着它走（双端列表）。
     pub keep_on_newest: bool,
-    /// 行左 / 右内边距。
+    /// 行左 / 右内边距（构建期用 [`ListOptions::padding_x`] 改）。
     pub padding_x: f32,
-    /// 行上 / 下内边距（变高列表的测量会把两侧加回去）。
+    /// 行上 / 下内边距（变高列表的实测会把两侧加回去；构建期用 [`ListOptions::padding_y`] 改）。
     pub padding_y: f32,
     /// 行内容是否拉满行高（表格单元格用 `true`；普通列表 `false` = 内容垂直居中）。
     pub row_stretch: bool,
@@ -222,6 +227,39 @@ impl ListOptions {
     #[must_use]
     pub fn keep_on_newest(mut self) -> Self {
         self.keep_on_newest = true;
+        self
+    }
+
+    /// 行内边距（左右 `x` / 上下 `y`，负值夹到 `0`）。
+    ///
+    /// 行容器用 `padding_sides(y, x, y, x)`；变高列表的实测行高 = 内容高 + `2 × y`，因此
+    /// 改上下内边距会直接反映到 extent 回写。`x` / `y` 只影响行内容的可用宽度 / 垂直居中，
+    /// 不改变固定行高列表的 extent。
+    #[must_use]
+    pub fn padding(mut self, x: f32, y: f32) -> Self {
+        self.padding_x = x.max(0.0);
+        self.padding_y = y.max(0.0);
+        self
+    }
+
+    /// 行左右内边距（负值夹到 `0`）。
+    #[must_use]
+    pub fn padding_x(mut self, padding: f32) -> Self {
+        self.padding_x = padding.max(0.0);
+        self
+    }
+
+    /// 行上下内边距（负值夹到 `0`；变高列表的实测把两侧加回去）。
+    #[must_use]
+    pub fn padding_y(mut self, padding: f32) -> Self {
+        self.padding_y = padding.max(0.0);
+        self
+    }
+
+    /// 视口外多挂的行数（上下各 `rows` 行；**行数**口径，像素余量 = 行数 × 行高）。
+    #[must_use]
+    pub fn overscan(mut self, rows: usize) -> Self {
+        self.overscan = rows;
         self
     }
 
@@ -2843,6 +2881,95 @@ mod ui_tests {
                 after.get(*index),
                 Some(real),
                 "第 {index} 行：同文本文本行高应一致（且不是 padding-only）：{after:?}"
+            );
+        }
+    }
+
+    /// **P2-10**（W3b）：行内边距 builder（迁移批此前只能直接改 `ListOptions` 字段）。
+    ///
+    /// 断言两件事：① builder 写字段（负值夹到 0，`padding_*` 单独可调用）；② 几何真的生效
+    /// —— 内容容器内缩 `(padding_x, padding_y)`、可用宽 = 行宽 − 2×`padding_x`，变高列表的
+    /// 实测 extent = 内容高 + 2×`padding_y`。
+    ///
+    /// 变异防线：`padding` / `padding_x` / `padding_y` 任一改成 no-op ⇒ 几何 / 实测断言红。
+    #[test]
+    fn the_padding_builders_shape_the_row_boxes_and_measurements() {
+        let options = ListOptions::fixed(ROW_EXTENT).padding(3.0, 5.0);
+        assert_eq!(
+            (options.padding_x, options.padding_y),
+            (3.0, 5.0),
+            "padding(x, y) 同时写两侧"
+        );
+        assert_eq!(ListOptions::fixed(ROW_EXTENT).padding_x(1.5).padding_x, 1.5);
+        assert_eq!(ListOptions::fixed(ROW_EXTENT).padding_y(2.5).padding_y, 2.5);
+        let clamped = ListOptions::fixed(ROW_EXTENT).padding(-4.0, -2.0);
+        assert_eq!(
+            (clamped.padding_x, clamped.padding_y),
+            (0.0, 0.0),
+            "负内边距夹到 0"
+        );
+        assert_eq!(
+            ListOptions::fixed(ROW_EXTENT).overscan(5).overscan,
+            5,
+            "overscan builder 是行数口径"
+        );
+
+        // 行盒几何：内容容器内缩 `(padding_x, padding_y)`、可用宽 = 行宽 − 2×padding_x。
+        // 用 `row_stretch` 固定「内容盒 = 行内边距盒」（默认 `items_center` 还会再加垂直居中
+        // 偏移，padding 的贡献就不能单独断言）。
+        let harness = harness_with(
+            ListOptions::fixed(ROW_EXTENT)
+                .padding(3.0, 5.0)
+                .row_stretch(),
+            4,
+            text_row,
+        );
+        let row = harness.list.row_node(harness.app.app(), 0).expect("row 0");
+        let content = harness
+            .list
+            .row_content_node(harness.app.app(), 0)
+            .expect("row 0 content");
+        let row_bounds = harness.app.probe().bounds(row).expect("row bounds");
+        let content_bounds = harness.app.probe().bounds(content).expect("content bounds");
+        assert!(
+            (content_bounds.origin.x - (row_bounds.origin.x + 3.0)).abs() < 0.5,
+            "内容左内边距 = padding_x（行 {row_bounds:?} / 内容 {content_bounds:?}）"
+        );
+        assert!(
+            (content_bounds.origin.y - (row_bounds.origin.y + 5.0)).abs() < 0.5,
+            "内容上内边距 = padding_y（行 {row_bounds:?} / 内容 {content_bounds:?}）"
+        );
+        assert!(
+            (content_bounds.size.width - (row_bounds.size.width - 6.0)).abs() < 0.5,
+            "内容可用宽 = 行宽 − 2×padding_x（行 {row_bounds:?} / 内容 {content_bounds:?}）"
+        );
+
+        // 变高列表：实测 extent = 内容高 + 2 × padding_y（这里是 5.0 × 2）。
+        let mut variable = harness_with(
+            ListOptions::variable(10.0).padding(3.0, 5.0),
+            3,
+            |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                NodeBuilder::boxed()
+                    .style(
+                        StyleBuilder::new()
+                            .width(40.0)
+                            .height(20.0 + index as f32 * 10.0)
+                            .build(),
+                    )
+                    .build(tree, parent)?;
+                Ok::<(), EngineError>(())
+            },
+        );
+        for _ in 0..3 {
+            let _ = variable.app.drain().expect("frame");
+            let _ = variable.list.sync(variable.app.app_mut()).expect("sync");
+        }
+        let heights = variable.list.row_heights();
+        for index in 0..3 {
+            assert_eq!(
+                heights.get(index),
+                Some(20.0 + index as f32 * 10.0 + 10.0),
+                "第 {index} 行 extent = 内容高 + 2 × padding_y"
             );
         }
     }

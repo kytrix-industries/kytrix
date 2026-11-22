@@ -65,7 +65,13 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event, KeyBinding, KeyCode, Modifiers},
     interaction::ActionCtx,
-    node::{builder::NodeBuilder, id::NodeId, image::ImageFit, signal::Signal, tree::NodeTree},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        image::ImageFit,
+        signal::{Signal, SignalScope},
+        tree::NodeTree,
+    },
     paint::{primitive::Border, style::StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
@@ -285,6 +291,9 @@ struct SelectInner {
     key: SmolStr,
     theme: ThemeHandle,
     options: SelectOptions,
+    /// 本组件自有的信号作用域（`a11y_label` / `revision` / `chosen` 三个信号归属它；
+    /// [`Select::release`] 一次回收，动态创建 / 销毁的选择器因此不泄漏槽位）。
+    scope: SignalScope,
     trigger: Interactive,
     panel: ItemPanel,
     icons: IconCache,
@@ -369,6 +378,7 @@ impl Select {
             key,
             theme,
             options,
+            scope,
             trigger,
             panel,
             icons: IconCache::default(),
@@ -918,7 +928,16 @@ impl Select {
         self.inner.trigger.dispatch(app, event)
     }
 
-    /// 释放组件（触发器 / 面板 / 动作 handler）。
+    /// 释放组件（触发器 / 面板 / 动作 handler / **本组件自有的信号作用域**）。
+    ///
+    /// 清理面：四个 Action handler（[`App::off_action`]）+ 触发器与面板（各自的 handler 与
+    /// 信号作用域）+ 本选择器铸造的作用域（`a11y_label` / `revision` / `chosen` 三个槽位，
+    /// W3c-F7 / W4a / W4b / W5a 的 `PICKER_SCOPE_GAP` / `SELECT_RELEASE_GAP` 缺口）。
+    ///
+    /// 返回被释放的槽位数；重复调用返回 0（幂等 —— 作用域已释放时 `App::release_scope`
+    /// 本身返回 0）。**先卸载节点再释放**：触发器上的 `bind_a11y` 读本作用域的 `a11y_label`，
+    /// 释放后一次求值就会读死句柄 panic（应用可用 `App::remove_node` /
+    /// `App::remove_node_with_scope` 保证顺序）。
     pub fn release(&self, app: &mut App) -> usize {
         for action in [
             &self.inner.actions.trigger_click,
@@ -928,7 +947,8 @@ impl Select {
         ] {
             app.off_action(action);
         }
-        self.inner.trigger.release(app) + self.inner.panel.release(app)
+        let released = self.inner.trigger.release(app) + self.inner.panel.release(app);
+        released + app.release_scope(self.inner.scope)
     }
 
     // ── 内部 ──
@@ -1398,13 +1418,13 @@ mod tests {
 
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
-    use smol_str::SmolStr;
+    use smol_str::{SmolStr, format_smolstr};
     use ui_core::{
         a11y::A11yRole,
         event::{Action, Event, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
-        test_support::app::TestApp,
+        test_support::{app::TestApp, diagnostics::signal_slot_stats},
         window::WindowId,
     };
 
@@ -2213,5 +2233,63 @@ mod tests {
 
         let bare = harness.select(SelectOptions::default());
         assert_eq!(bare.tooltip(), None, "没有设置时是 None");
+    }
+
+    /// **P2-10**：`release` 归还**自身**的信号作用域（`a11y_label` / `revision` / `chosen`）。
+    ///
+    /// W3c-F7 / W4a / W4b / W5a 四份迁移报告都用常量钉住过这个缺口（`PICKER_SCOPE_GAP = 3`、
+    /// `SELECT_RELEASE_GAP = 3×2×2`）：`Select::new` 铸作用域后没有交还给 `App`，模块内每个
+    /// 选择器每次生命周期泄漏 3 个槽位。本用例按契约「先卸载节点、再 release」跑 N 轮，
+    /// 断言每轮 `live` 回基线、重复释放幂等、槽位被复用而不是持续增长。
+    ///
+    /// 变异防线：`release` 不调 `App::release_scope(scope)` ⇒ 每轮 `live` 停在基线 + 3，红。
+    #[test]
+    fn releasing_a_select_returns_its_signal_scope() {
+        let mut app = TestApp::new();
+        let window = app.window_id();
+        let root = app.app().window(window).expect("窗口").tree().root();
+        let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
+        let layer = Layer::new();
+        let router = AnimationRouter::new();
+        let baseline = signal_slot_stats(app.app());
+        let mut steady_slots = None;
+        for round in 0..4 {
+            let select = Select::new(
+                app.app_mut(),
+                theme.clone(),
+                layer.clone(),
+                router.clone(),
+                format_smolstr!("select{round}"),
+                SelectOptions::default(),
+            );
+            select.set_items(app.app_mut(), items()).expect("条目");
+            let node = select.mount(app.app_mut(), window, root).expect("挂载");
+            let _ = app.drain().expect("帧");
+            let mounted = signal_slot_stats(app.app());
+            assert!(
+                mounted.live > baseline.live,
+                "第 {round} 轮：挂载后占用信号槽（触发器 / 面板 / 自身三个信号）"
+            );
+
+            // 契约：先卸载节点再释放作用域（触发器的 a11y / bind_style 读本组件作用域）。
+            app.app_mut().remove_node(window, node).expect("卸载触发器");
+            let released = select.release(app.app_mut());
+            assert!(
+                released >= 3,
+                "第 {round} 轮：自身三个信号槽必须归还（实际 {released}）"
+            );
+            let after = signal_slot_stats(app.app());
+            assert_eq!(
+                after.live, baseline.live,
+                "第 {round} 轮：release 后 live 回基线（缺口 = 3 ⇒ 这里停在基线 + 3）"
+            );
+            assert_eq!(select.release(app.app_mut()), 0, "重复释放幂等");
+
+            // 第 1 轮建立稳态（键 / handler 的首次分配），之后槽位必须复用而不增长。
+            match steady_slots {
+                None => steady_slots = Some(after.slots),
+                Some(slots) => assert_eq!(after.slots, slots, "第 {round} 轮：槽位复用，不增长"),
+            }
+        }
     }
 }
