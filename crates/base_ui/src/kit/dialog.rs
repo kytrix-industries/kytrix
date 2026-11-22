@@ -404,7 +404,7 @@ impl DialogBuilder {
 
     /// 关闭按钮的 a11y 可访问名（icon-only 按钮在 AT 里需要名字；默认 `Close`）。
     ///
-    /// 文案由调用方给（i18n 在调用侧解析，例如 `close_label(t!(cx, "dialog.close"))`）；只影响
+    /// 文案由调用方给（i18n 在调用侧解析，例如 `close_label(t_smol!(translate, "dialog.close"))`）；只影响
     /// 会建关闭按钮的普通对话框。
     #[must_use]
     pub fn close_label(mut self, label: impl Into<SmolStr>) -> Self {

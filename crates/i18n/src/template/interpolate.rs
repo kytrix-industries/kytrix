@@ -1,8 +1,8 @@
 use std::fmt::{Display, Write};
 
 use either::Either;
-use gpui_kit::SharedString;
 use smallvec::SmallVec;
+use smol_str::SmolStr;
 
 use super::{
     error::TemplateError,
@@ -29,7 +29,7 @@ pub enum Template {
     /// only costs a clone of an immutable string: messages up to the inline
     /// capacity of a short string copy an inline buffer, and longer ones bump a
     /// reference count. Neither path allocates.
-    Static(SharedString),
+    Static(SmolStr),
     /// A message with at least one placeholder, split into literal and
     /// placeholder parts in source order.
     Interpolated { parts: Box<[TemplatePart]> },
@@ -68,7 +68,7 @@ impl Template {
         }
 
         if parts.is_empty() {
-            return Ok(Template::Static(SharedString::from(text)));
+            return Ok(Template::Static(SmolStr::from(text)));
         }
         push_text(&mut parts, rest);
 
@@ -81,7 +81,7 @@ impl Template {
     ///
     /// This is the fast path of rendering: a message without placeholders is one
     /// string, and cloning it neither walks a template nor allocates.
-    pub fn text(&self) -> Option<&SharedString> {
+    pub fn text(&self) -> Option<&SmolStr> {
         match self {
             Template::Static(text) => Some(text),
             Template::Interpolated { .. } => None,

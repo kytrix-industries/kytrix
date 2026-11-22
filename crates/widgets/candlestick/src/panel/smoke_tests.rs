@@ -43,7 +43,7 @@ fn harness() -> (
     Signal<Option<PanelRequest>>,
     SignalSlotStats,
 ) {
-    let i18n = i18n::global::embedded::load().expect("the product catalogue loads");
+    let i18n = i18n::embedded::load().expect("the product catalogue loads");
     let translate = i18n::translate::Translate::new(std::rc::Rc::new(i18n), LanguageCode::En);
     let mut harness = WidgetTestApp::with_translate(translate);
     let baseline = harness.signal_slot_stats();

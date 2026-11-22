@@ -43,7 +43,7 @@
 //!
 //! Both [`WidgetServices::market_participants`] and
 //! [`WidgetServices::kytrix_service`] are application-shell objects: the directory
-//! connector takes a `widget_tokio_runtime` runtime, and the service connector owns
+//! connector takes the application's tokio runtime handle, and the service connector owns
 //! the process's OAuth session and its transport. Both are constructed by the
 //! composition root (the connector through its toolkit-free
 //! `KytrixServiceConnector::spawn`, P4-5). The contract layer cannot construct either

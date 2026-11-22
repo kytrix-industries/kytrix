@@ -10,9 +10,9 @@ use std::{
 };
 
 use app_config::network::{ConfigError, ResolvedProxy, RouteTarget};
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 #[cfg(target_os = "linux")]
 use super::linux;
@@ -138,7 +138,7 @@ pub(crate) fn cached_os_proxy_fingerprint() -> u64 {
 
 pub(crate) async fn refresh_os_proxy_fingerprint(
     cancellation: CancellationToken,
-    runtime: &Runtime,
+    runtime: &Handle,
 ) -> Option<u64> {
     if let Some(value) = fresh_cached_fingerprint(&FINGERPRINT_CACHE) {
         return Some(value);
@@ -149,10 +149,10 @@ pub(crate) async fn refresh_os_proxy_fingerprint(
     {
         return Some(cached_os_proxy_fingerprint());
     }
-    // Reading the OS settings is a blocking call, and the caller may be a GPUI
-    // task with no runtime context of its own: the runtime performs the read and
-    // establishes the context for it.
-    let task = runtime.clone().blocking(|| {
+    // Reading the OS settings is a blocking call, and the caller may be an
+    // executor worker with no runtime context of its own: the blocking pool of
+    // the runtime reads them.
+    let task = runtime.spawn_blocking(|| {
         struct RefreshGuard;
         impl Drop for RefreshGuard {
             fn drop(&mut self) {

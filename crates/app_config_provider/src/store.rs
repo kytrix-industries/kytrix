@@ -1,8 +1,8 @@
 //! Durable persistence of the settings snapshot and its runtime generations.
 //!
 //! [`ConfigStore`] owns the [`Config`] snapshot the application reads and the
-//! file it is stored in. It has no GPUI dependency; [`crate::manager`] holds it
-//! as process-global state.
+//! file it is stored in. It has no UI-toolkit dependency; [`crate::manager`]
+//! holds it as a plain value.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

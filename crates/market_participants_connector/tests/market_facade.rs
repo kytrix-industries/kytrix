@@ -12,6 +12,7 @@ use market_participants_connector::{
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
     market::timeframe::{Adjustment, StatisticsTimeFrame, TimeFrame},
     runtime::MarketParticipantNetworkSnapshot,
+    test_support::test_handle,
 };
 use market_participants_model::{
     identifier::{IdentifierValue, VenueId, VenueScopeId},
@@ -20,7 +21,6 @@ use market_participants_model::{
     prediction::PredictionEventRef,
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
-use widget_tokio_runtime::runtime::Runtime;
 
 /// The candlestick intervals a caller can name, with the wire spellings the
 /// crate's own queries serialize them to.
@@ -119,7 +119,7 @@ fn connector() -> MarketParticipantsConnector {
             Arc::new(TransportHub::new(TransportPolicy::default())),
             notification,
         )
-        .with_runtime(Runtime::for_test()),
+        .with_runtime(test_handle()),
     )
     .expect("MarketParticipantsConnector should build from typed runtime inputs")
 }

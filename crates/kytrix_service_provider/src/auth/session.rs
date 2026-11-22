@@ -9,10 +9,12 @@ use std::{
 use app_config::network::Config;
 use app_config_provider::notification::ConfigNotification;
 use network::transport::hub::TransportHub;
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::{
+    runtime::Handle,
+    sync::{Notify, mpsc, oneshot, watch},
+};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 #[cfg(test)]
 use super::test_support::credential_payload;
@@ -28,6 +30,8 @@ use super::{
     retire_stored_credential, validate_account,
 };
 use crate::account_profile::AccountProfile;
+#[cfg(any(test, feature = "test-support"))]
+use crate::test_support::test_handle;
 
 /// The credential a sign-out pulled out of the session, kept only long enough to tell
 /// the authority to drop it.
@@ -96,7 +100,7 @@ struct AuthSessionInner {
     actor_completion: Arc<ActorCompletion>,
     authority: Arc<dyn AuthAuthority>,
     /// The application runtime the actor thread is joined on at shutdown.
-    runtime: Runtime,
+    runtime: Handle,
 }
 
 struct ActorCompletion {
@@ -142,7 +146,7 @@ impl AuthSession {
     pub fn spawn(
         config: ConfigNotification<Config>,
         transport: Arc<TransportHub>,
-        runtime: Runtime,
+        runtime: Handle,
     ) -> Result<Self, AuthError> {
         let (changes, _) = watch::channel(SessionChange::default());
         let control = Arc::new(SessionControl::new(0, 0, changes));
@@ -165,7 +169,7 @@ impl AuthSession {
         store: Arc<dyn CredentialStore>,
         control: Arc<SessionControl>,
         authority: Arc<dyn AuthAuthority>,
-        runtime: Runtime,
+        runtime: Handle,
     ) -> Result<Self, AuthError> {
         Self::spawn_with_control_and_startup(store, control, authority, true, runtime)
     }
@@ -175,7 +179,7 @@ impl AuthSession {
         control: Arc<SessionControl>,
         authority: Arc<dyn AuthAuthority>,
         refresh_on_startup: bool,
-        runtime: Runtime,
+        runtime: Handle,
     ) -> Result<Self, AuthError> {
         let (commands, receiver) = mpsc::channel(AUTH_COMMAND_CAPACITY);
         let cancellation = CancellationToken::new();
@@ -268,7 +272,11 @@ impl AuthSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(actor) = actor {
-            let _ = self.inner.runtime.blocking(move || actor.join()).await;
+            let _ = self
+                .inner
+                .runtime
+                .spawn_blocking(move || actor.join())
+                .await;
         }
         self.inner.actor_completion.wait().await;
     }
@@ -506,7 +514,7 @@ impl AuthSession {
         control: Arc<SessionControl>,
         authority: Arc<dyn AuthAuthority>,
     ) -> Result<Self, AuthError> {
-        Self::spawn_with_control_and_startup(store, control, authority, false, Runtime::for_test())
+        Self::spawn_with_control_and_startup(store, control, authority, false, test_handle())
     }
 
     #[cfg(test)]
@@ -558,7 +566,7 @@ impl AuthSession {
             control,
             Arc::new(ServiceTestAuthority),
             false,
-            Runtime::for_test(),
+            test_handle(),
         )
     }
 }
@@ -903,7 +911,7 @@ mod tests {
             );
 
             let runtime = session.inner.runtime.clone();
-            let mut drop_task = runtime.blocking(move || drop(session));
+            let mut drop_task = runtime.spawn_blocking(move || drop(session));
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(50), &mut drop_task)
                     .await
@@ -1007,7 +1015,7 @@ mod tests {
             store,
             control,
             authority.clone(),
-            Runtime::for_test(),
+            test_handle(),
         )
         .expect("the auth actor should start");
 

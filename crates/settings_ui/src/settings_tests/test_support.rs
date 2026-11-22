@@ -56,7 +56,7 @@ use crate::{
 /// The embedded catalogue does not load (a build fault, not a test condition).
 pub(crate) fn translate_in(language: LanguageCode) -> Translate {
     Translate::new(
-        Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+        Rc::new(i18n::embedded::load().expect("the embedded locales load")),
         language,
     )
 }

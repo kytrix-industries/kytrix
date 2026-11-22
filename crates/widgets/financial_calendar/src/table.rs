@@ -270,7 +270,7 @@ mod tests {
     /// The translator the product ships, in the language a test asks for.
     fn translate(language: LanguageCode) -> Translate {
         Translate::new(
-            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            Rc::new(i18n::embedded::load().expect("the embedded locales load")),
             language,
         )
     }
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn every_message_an_empty_table_names_should_be_in_every_locale() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+        let i18n = i18n::embedded::load().expect("the embedded locales load");
 
         for key in ["common.no_data", "common.no_matches"] {
             for language in i18n.languages() {
@@ -526,7 +526,7 @@ mod tests {
     /// that says which day it is.
     #[test]
     fn every_name_a_day_label_is_built_from_should_be_in_every_locale() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales load");
+        let i18n = i18n::embedded::load().expect("the embedded locales load");
         let keys = [
             Month::January,
             Month::February,

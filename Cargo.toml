@@ -20,7 +20,6 @@ members = [
     "crates/profile_ui",
     "crates/settings_ui",
     "crates/updater_ui",
-    "crates/widget_tokio_runtime",
     "crates/widget",
     "crates/widget_gallery_ui",
     "crates/widget_registry",
@@ -330,7 +329,6 @@ updater_ui = { path = "crates/updater_ui" }
 volume_heatmap = { path = "crates/widgets/volume_heatmap" }
 watch_list = { path = "crates/widgets/watch_list" }
 x = { path = "crates/widgets/x" }
-widget_tokio_runtime = { path = "crates/widget_tokio_runtime" }
 widget = { path = "crates/widget" }
 widget_gallery_ui = { path = "crates/widget_gallery_ui" }
 widget_registry = { path = "crates/widget_registry" }

@@ -22,8 +22,7 @@ use network::{
 };
 use parking_lot::RwLock;
 use smol_str::{SmolStr, format_smolstr};
-use tokio::task::JoinHandle;
-use widget_tokio_runtime::runtime::Runtime;
+use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{
     adapter::{
@@ -122,10 +121,8 @@ pub struct MarketParticipantRuntime {
     proxy_resolver: ProxyResolver,
     /// The application runtime every request's route resolution runs on.
     ///
-    /// A request can arrive from a GPUI task, which has no Tokio context of its
-    /// own, so the runtime travels with the gateway instead of being discovered
-    /// on the thread that happens to be executing.
-    pub runtime: Runtime,
+    /// A request can arrive from a task that runs no Tokio context of its own, so\r\n    /// the runtime travels with the gateway instead of being discovered on the\r\n    /// thread that happens to be executing.
+    pub runtime: Handle,
     pub snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
 }
 
@@ -134,7 +131,7 @@ impl MarketParticipantRuntime {
         transport: Arc<TransportHub>,
         connection_pool: Arc<ConnectionPool>,
         snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
-        runtime: Runtime,
+        runtime: Handle,
     ) -> Result<Self, MarketParticipantError> {
         if !Arc::ptr_eq(&transport, &connection_pool.transport()) {
             return Err(MarketParticipantError::Configuration(
@@ -202,7 +199,7 @@ impl MarketParticipantGateway {
         transport: Arc<TransportHub>,
         connection_pool: Arc<ConnectionPool>,
         snapshot: ConfigNotification<MarketParticipantNetworkSnapshot>,
-        runtime: Runtime,
+        runtime: Handle,
     ) -> Result<Self, MarketParticipantError> {
         let runtime = MarketParticipantRuntime::from_shared_resources(
             transport,
@@ -747,7 +744,6 @@ mod tests {
         routing::{CapabilityId, IdentifierNormalizationRule},
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use widget_tokio_runtime::runtime::Runtime;
 
     use super::{Admission, MarketParticipantGateway, credential_authentication};
     use crate::{
@@ -770,7 +766,7 @@ mod tests {
         protocol::{AuthenticatedTarget, RequestIdentity, classify},
         routing::{LONGBRIDGE_US_SCOPE, PERPETUAL_SCOPE},
         runtime::MarketParticipantNetworkSnapshot,
-        test_support::fixture_config,
+        test_support::{fixture_config, test_handle},
     };
 
     /// The fixture route: the built-in Binance spot scope.
@@ -878,7 +874,7 @@ mod tests {
                 transport,
                 pool,
                 notification,
-                Runtime::for_test(),
+                test_handle(),
             )
             .expect("the fixture gateway builds");
             let catalog = Arc::new(Catalog::new());

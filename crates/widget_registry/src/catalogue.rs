@@ -185,7 +185,7 @@ mod tests {
     /// language.
     #[test]
     fn every_widget_text_should_translate_in_every_loaded_language() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales should load");
+        let i18n = i18n::embedded::load().expect("the embedded locales should load");
         let languages = i18n.languages();
         assert!(
             !languages.is_empty(),
@@ -543,7 +543,7 @@ mod tests {
     /// rather than by a list written beside it.
     #[test]
     fn every_notice_a_widget_reports_should_be_named_in_every_locale() {
-        let i18n = i18n::global::embedded::load().expect("the embedded locales should load");
+        let i18n = i18n::embedded::load().expect("the embedded locales should load");
         let registry = catalogue_registry();
         let widgets = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

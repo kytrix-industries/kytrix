@@ -6,7 +6,7 @@
 
 use std::{rc::Rc, sync::Arc};
 
-use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use time::{Date, Month, UtcOffset};
 use ui_core::paint::color::Color;
 use widget::test_support::WidgetTestApp;

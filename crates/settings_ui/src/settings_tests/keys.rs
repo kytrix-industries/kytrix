@@ -196,7 +196,7 @@ fn every_settings_source_should_be_read_by_the_key_guard() {
 /// Every key the settings name is one every locale defines, and renders as something.
 #[test]
 fn every_key_the_settings_name_should_be_defined_in_every_locale() {
-    let i18n = i18n::global::embedded::load().expect("embedded locales should load");
+    let i18n = i18n::embedded::load().expect("embedded locales should load");
     let keys = declared_keys();
 
     assert!(
@@ -219,7 +219,7 @@ fn every_key_the_settings_name_should_be_defined_in_every_locale() {
 /// Every key a locale defines for the settings is one the settings name.
 #[test]
 fn every_settings_key_is_named_by_a_source() {
-    let i18n = i18n::global::embedded::load().expect("embedded locales should load");
+    let i18n = i18n::embedded::load().expect("embedded locales should load");
     let drawn = declared_keys();
 
     for language in i18n.languages() {

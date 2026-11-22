@@ -173,11 +173,6 @@ pub enum LanguageCode {
     Zu,
 }
 
-/// The language the interface is rendered in is a global, so switching it is
-/// observable: a component that holds text read in the language it left can
-/// follow a change instead of comparing against a copy of its own.
-impl gpui_kit::Global for LanguageCode {}
-
 /// Declares the code/name table and the matching variant list from one source of
 /// truth, so `LanguageCode::as_str`, `LanguageCode::name` and `LanguageCode::all`
 /// cannot drift apart.

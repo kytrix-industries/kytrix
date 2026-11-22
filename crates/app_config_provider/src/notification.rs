@@ -42,9 +42,8 @@ impl<P: Send + Sync + 'static> ConfigNotification<P> {
     /// Replaces the shared projection and wakes the consumer.
     ///
     /// The owner publishes after it has applied the change the projection names:
-    /// the toolkit shell published through [`crate::events::ConfigEventBridge`],
-    /// and a toolkit-free composition root publishes the network projection itself
-    /// after each settings commit.
+    /// it drains its [`crate::manager::ConfigManager`] subscription and projects
+    /// the current snapshot itself after each settings commit.
     pub fn publish(&self, projection: Arc<P>) {
         // The write must precede the wake: a woken consumer reads `current()`.
         *self.shared.write() = projection;

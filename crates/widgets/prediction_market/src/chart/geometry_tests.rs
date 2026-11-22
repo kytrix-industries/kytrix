@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use market_participants_model::prediction::PredictionRange;
 use time::{Date, Month, OffsetDateTime, UtcOffset};
 use ui_core::math::{Point, Rect, Size};

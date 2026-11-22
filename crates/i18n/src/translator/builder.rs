@@ -85,7 +85,7 @@ impl Builder {
     ///     .build()?;
     ///
     /// assert_eq!(
-    ///     i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+    ///     i18n.translate(LanguageCode::En, "menu.market").as_str(),
     ///     "Market"
     /// );
     /// # Ok::<(), i18n::error::types::Error>(())

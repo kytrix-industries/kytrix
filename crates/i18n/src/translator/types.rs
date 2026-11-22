@@ -1,6 +1,6 @@
 use std::{fmt::Display, sync::Mutex};
 
-use gpui_kit::SharedString;
+use smol_str::SmolStr;
 
 use crate::{
     cache::{RenderedCache, bind_arguments},
@@ -12,7 +12,7 @@ use crate::{
 /// Renders localized text for a language.
 ///
 /// The catalogue is language-agnostic: the language to render is passed to every
-/// call, because the selected language is a global of its own.
+/// call, so one instance renders every loaded language.
 ///
 /// Messages live in YAML locale files named after their language code, using the
 /// codes from the
@@ -43,7 +43,7 @@ use crate::{
 ///     .build()?;
 ///
 /// assert_eq!(
-///     i18n.translate(LanguageCode::ZhCn, "menu.market").as_ref(),
+///     i18n.translate(LanguageCode::ZhCn, "menu.market").as_str(),
 ///     "行情"
 /// );
 /// # Ok::<(), i18n::error::types::Error>(())
@@ -57,8 +57,6 @@ pub struct I18n {
     /// Cached renderings of messages with placeholders.
     cache: Mutex<RenderedCache>,
 }
-
-impl gpui_kit::Global for I18n {}
 
 impl I18n {
     /// Assembles an instance from locales loaded by [`I18n::builder`].
@@ -113,7 +111,7 @@ impl I18n {
     /// Use [`I18n::try_translate`] to tell a missing message apart from one that
     /// is deliberately empty.
     #[inline]
-    pub fn translate(&self, language: LanguageCode, key: &str) -> SharedString {
+    pub fn translate(&self, language: LanguageCode, key: &str) -> SmolStr {
         self.try_translate(language, key).unwrap_or_default()
     }
 
@@ -123,7 +121,7 @@ impl I18n {
     /// with placeholders are rendered once per language, key and argument values,
     /// and reused afterwards.
     #[inline]
-    pub fn try_translate(&self, language: LanguageCode, key: &str) -> Option<SharedString> {
+    pub fn try_translate(&self, language: LanguageCode, key: &str) -> Option<SmolStr> {
         self.try_translate_with(language, key, &[])
     }
 
@@ -141,7 +139,7 @@ impl I18n {
     /// let name = "Ada";
     /// assert_eq!(
     ///     i18n.translate_with(LanguageCode::En, "greeting", &[("name", &name)])
-    ///         .as_ref(),
+    ///         .as_str(),
     ///     "Hello, Ada!"
     /// );
     /// # Ok::<(), i18n::error::types::Error>(())
@@ -151,7 +149,7 @@ impl I18n {
         language: LanguageCode,
         key: &str,
         arguments: &[(&str, &dyn Display)],
-    ) -> SharedString {
+    ) -> SmolStr {
         self.try_translate_with(language, key, arguments)
             .unwrap_or_default()
     }
@@ -163,7 +161,7 @@ impl I18n {
         language: LanguageCode,
         key: &str,
         arguments: &[(&str, &dyn Display)],
-    ) -> Option<SharedString> {
+    ) -> Option<SmolStr> {
         let template = self.template(language, key)?;
 
         if let Some(text) = template.text() {
@@ -183,7 +181,7 @@ impl I18n {
 
         let mut text = String::new();
         template.write_with(&arguments, &mut text);
-        let rendered = SharedString::from(text);
+        let rendered = SmolStr::from(text);
 
         self.cache
             .lock()

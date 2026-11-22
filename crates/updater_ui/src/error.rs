@@ -153,7 +153,7 @@ mod tests {
     use std::rc::Rc;
 
     use download_provider::error::DownloadFailure;
-    use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+    use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
     use url::Url;
 
     use super::*;

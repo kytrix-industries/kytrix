@@ -15,7 +15,7 @@
 use std::{rc::Rc, sync::Arc};
 
 use base_ui::theme::{appearance::Appearance, resolved::Theme, role::Role};
-use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use market_participants_model::{
     decimal::{Fraction, Ratio},
     prediction::{PredictionPricePoint, PredictionRange, PredictionSeries},

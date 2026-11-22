@@ -1,6 +1,6 @@
 mod cache;
+pub mod embedded;
 pub mod error;
-pub mod global;
 pub mod language;
 mod loader;
 mod store;

@@ -516,7 +516,6 @@ name = "app_config_provider"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "gpui-kit",
  "log",
  "market_participants_model",
  "parking_lot 0.13.0",
@@ -2591,7 +2590,6 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -4988,7 +4986,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "either",
- "gpui-kit",
  "log",
  "serde",
  "serde-saphyr 2.1.1",
@@ -5788,7 +5785,6 @@ dependencies = [
  "widget",
  "widget_gallery_ui",
  "widget_registry",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -5812,7 +5808,6 @@ dependencies = [
  "bs58",
  "bytes",
  "futures",
- "gpui-kit",
  "hyper",
  "hyper-util",
  "keyring",
@@ -5832,7 +5827,6 @@ dependencies = [
  "tokio-util",
  "url",
  "uuid",
- "widget_tokio_runtime",
  "yawc",
 ]
 
@@ -6121,7 +6115,6 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "futures",
- "gpui-kit",
  "hmac 0.13.0",
  "hyper",
  "hyper-util",
@@ -6149,7 +6142,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "widget_tokio_runtime",
  "yawc",
 ]
 
@@ -6479,7 +6471,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
- "widget_tokio_runtime",
  "windows 0.62.2",
  "yawc",
 ]
@@ -11486,7 +11477,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ui_core",
- "widget_tokio_runtime",
 ]
 
 [[package]]
@@ -11534,15 +11524,6 @@ dependencies = [
  "watch_list",
  "widget",
  "x",
-]
-
-[[package]]
-name = "widget_tokio_runtime"
-version = "0.0.3"
-dependencies = [
- "gpui-kit",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]

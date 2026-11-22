@@ -148,7 +148,7 @@ mod tests {
     /// assert what the reader actually gets.
     fn product_translate(language: LanguageCode) -> Translate {
         Translate::new(
-            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            Rc::new(i18n::embedded::load().expect("the embedded locales load")),
             language,
         )
     }

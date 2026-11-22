@@ -32,7 +32,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
-widget_tokio_runtime.workspace = true
 yawc = { workspace = true, features = ["reqwest"] }
 
 [target.'cfg(windows)'.dependencies]
