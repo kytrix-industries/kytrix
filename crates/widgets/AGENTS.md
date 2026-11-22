@@ -96,6 +96,9 @@ crates/widgets/<widget_name>/
 - **稳态零帧是目标（I3）**：`sync` 在没有变化时不得写信号、不得 `request_frame()`；只在状态/内容真的变了时写。
 - **可见内容变化必须经过信号或 `sync` 的显式写**：没有写就没有失效边，就没有帧。`WidgetStatus::report` 是状态变化的唯一通道；
   正文里的动态值放进信号，用 `bind_text` / `bind_style` 读。
+- **E10 一次性定时器在 `run_frame_hook` 的最前面派发**（早于 `FrameRouter::tick` 与帧管线）：倒计时回调里的写入在同一轮
+  的路由与绘制里可见。测试装置 `WidgetTestApp::advance` 在**帧入口**派发到期的定时器（见 §11），绘制同轮可见，但路由晚
+  一轮看到——不要在 widget 里依赖「同一轮 sync 已看到定时器写入」的写法。
 
 ---
 
@@ -443,8 +446,46 @@ if generation != self.seen {
   - `mount::<W>(config)` / `try_mount` / `try_mount_in_scope(parent, scope, config)`（拒绝挂载失败路径的探针）、
     `build_surface` / `sync_surface`、`report` / `switch_language`；
   - `drain()` = `router.tick` + `TestApp::drain`（生产泵序；`TestApp::drain` 本身不跑 `on_frame`）；
+  - **时钟推进与 E10 定时器**（P3-1g）：`advance(by: Duration) -> bool` 推进**引擎时钟**并跑一轮
+    （`router.tick` + 一帧），返回本轮是否提交像素。`App::after` / `after_scoped` 的 deadline 以引擎钟为基准，
+    `advance` 是唯一推进源：**不读 wall clock、不真实 sleep、不等待平台定时器**（I3）。到期的定时器在帧**入口**派发，
+    回调的写入参与同一帧绘制；自续期倒计时每 `advance` 触发**一次**（不是按经过的 delay 次数补触发）。未到 deadline 的
+    `advance` 是空闲轮：`false`，`frame_index()` / `frame_requests()` 都不变。宿主窗口在第一次 `drain()` / `advance()`
+    之前是「未提交」状态，测空闲语义前先 `drain()` 一次。widget 自己的「现在」（倒计时格式化的时间源）**不是**引擎钟：
+    测试自己写那个状态；
+  - **观测面**（P3-1g）：`frame_index()`（提交游标，`0` = 未提交）、`frame_requests()`（I3 断言面）、`rendered()`
+    （最近一轮是否提交像素；`advance` 的返回值就是本轮这个事实）。
   - 断言面：`visible` / `text_of` / `has_text` / `has_canvas` / `has_inline_boxes` / `node_count` / `find_by_debug_prefix` /
     `click_recovery` / `enable_a11y_capture` + `a11y_hidden`。
+- **倒计时 / 定时器测试写法**（P3-1g；取代 W2c 自建的 `ClockHost`，补 W2b 的倒计时 timer 缺口）：
+
+  ```rust
+  #[test]
+  fn a_countdown_should_tick_once_per_advance() {
+      let mut harness = WidgetTestApp::new();
+      let widget = harness.mount::<MyWidget>(MyConfig::default());
+      // 首帧：建 body / 求值 bind_text（首次读信号 → 登记依赖），之后写信号才会请求帧
+      harness.drain();
+
+      // 到点前：半程不触发，也不出帧
+      assert!(!harness.advance(Duration::from_millis(125)));
+      assert_eq!(harness.text_of(label), "10:00");
+
+      // 到点：回调写倒计时信号 → 请求帧 → 同一轮绘制；回调的写入是本轮唯一的帧请求
+      assert!(harness.advance(Duration::from_millis(125)));
+      assert_eq!(harness.text_of(label), "09:59");
+
+      // 再推进但没有变化：不出帧（I3；frame_requests 不增长）
+      assert!(!harness.advance(Duration::from_millis(100)));
+  }
+  ```
+
+  `label` 是 widget 自己的倒计时文本节点（自有 `TEST_*` / 选择器）；定时器由 widget 在 `load` / `sync` 里用
+  `App::after_scoped`（scope = body root）自续期注册，回调只写倒计时信号，标签未变不 `request_repaint`。
+  **两个前提**：① 信号必须先被节点读过（首帧 `bind_text` 求值）再写，否则写不请求帧；② 宿主一轮的顺序是
+  `router.tick` → 帧（定时器在帧入口派发），生产是「定时器 → `FrameRouter::tick` → 帧」（`App::run_frame_hook`）。
+  所以「`sync` 必须在本轮看到回调写入状态」的断言要多 `advance` 一次，或直接断言绘制结果——不要假设测试装置与
+  生产泵逐拍同序。
 - 测试属性：纯逻辑 `#[test]`；涉及 tokio 服务 `#[tokio::test]`（dev-deps 开 `tokio` `test-util`）。界面测试一律经
   `WidgetTestApp`，不依赖任何窗口工具包。
 - 外部 crate 用测试装置：dev-dependencies 里 `widget = { workspace = true, features = ["test-support"] }`
@@ -452,11 +493,13 @@ if generation != self.seen {
 - 覆盖建议：状态上报（含去重）、有 / 无内容两种失败出口、迟到消息与 `RequestId` 挡迟到、恢复动作、取消与替换、
   空快照的「暂无数据」、容器的能力裁剪、配置写回与规则 2 回默认、语言切换后的重绘、a11y hidden。
 - **会踩的坑**：
-  1. 断言「写 → 出帧」用 `app.frame_requests()`（`App::write` 只在有节点读过该信号时才请求帧）；
+  1. 断言「写 → 出帧」用 `harness.frame_requests()`（`App::write` 只在有节点读过该信号时才请求帧）；
   2. `sync` 里才变「有内容」的正文晚一帧出现——断言前 `drain()` 或让 widget `request_frame`；
   3. 占位 / banner 的文案由 surface 解析：断言看到的是**渲染后的文本**（不应含 `<p` / `<kbd>` / `![](`）；
   4. a11y 断言要先 `enable_a11y_capture()`，且首帧是全树；
-  5. 节点 id 是框架的选择器约定，widget 不要自己起 `WIDGET_*` 名字。
+  5. 节点 id 是框架的选择器约定，widget 不要自己起 `WIDGET_*` 名字；
+  6. 定时器 / 倒计时测试不要 `std::thread::sleep`、不要等 wall clock：先 `drain()` 一次建依赖，再用 `advance(delay)`
+     （写法见本节的倒计时示例）。
 
 ---
 
