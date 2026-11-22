@@ -13,11 +13,10 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use gpui_kit::SharedString;
 use market_participants_model::{
     listing::rules::ListingPrecision, market::book::ListingForceOrder,
 };
-use smol_str::{ToSmolStr, format_smolstr};
+use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
 pub(super) const MAX_FORCE_ORDERS: usize = 200;
@@ -29,7 +28,7 @@ pub(super) const MAX_FORCE_ORDERS: usize = 200;
 /// names no display for the listing is not a reason to invent one from the venue's
 /// own symbol or from an identity: the row says it is unknown, localized by the
 /// view, and the structured listing key stays in the order it came from.
-pub(super) type ForceOrderListingLabel = Option<SharedString>;
+pub(super) type ForceOrderListingLabel = Option<SmolStr>;
 
 /// What one published generation says about the listing a row draws.
 ///
@@ -68,6 +67,21 @@ impl ForceOrderSnapshot {
     }
 }
 
+/// Two snapshots are the same read of the same retained set.
+///
+/// The equality decides whether publishing a snapshot is a change at all: a batch
+/// that leaves the retained orders as they were republishes the same read, so the
+/// cells and the table that read it must not be invalidated. It is the pointer
+/// identity of the retained set, which is how [`ForceOrderState::snapshot`] hands
+/// an unchanged set back.
+impl PartialEq for ForceOrderSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.orders, &other.orders)
+    }
+}
+
+impl Eq for ForceOrderSnapshot {}
+
 #[derive(Debug)]
 pub(super) struct ForceOrderRow {
     order: ListingForceOrder,
@@ -78,6 +92,14 @@ pub(super) struct ForceOrderRow {
 impl ForceOrderRow {
     pub(super) const fn order(&self) -> &ListingForceOrder {
         &self.order
+    }
+
+    /// The name the published generation gave this row's listing, if it gave one.
+    ///
+    /// The name does not depend on the display zone, so a cell that draws only the
+    /// name reads it here instead of asking for a formatted row.
+    pub(super) fn listing_label(&self) -> &ForceOrderListingLabel {
+        &self.listing.label
     }
 
     /// The text of a row that is produced only once something draws it.
@@ -101,13 +123,9 @@ impl ForceOrderRow {
 
 #[derive(Debug)]
 pub(super) struct ForceOrderDisplay {
-    /// The listing's published display name, or nothing when the generation that
-    /// named it has none: the view localizes that case rather than the model
-    /// inventing a name.
-    pub listing: ForceOrderListingLabel,
-    pub price: SharedString,
-    pub quantity: SharedString,
-    pub time: SharedString,
+    pub price: SmolStr,
+    pub quantity: SmolStr,
+    pub time: SmolStr,
 }
 
 impl ForceOrderDisplay {
@@ -131,9 +149,8 @@ impl ForceOrderDisplay {
             ),
         };
         Self {
-            listing: listing.label.clone(),
-            price: SharedString::new(price.as_str()),
-            quantity: SharedString::new(quantity.as_str()),
+            price,
+            quantity,
             time: format_time(order.timestamp, zone),
         }
     }
@@ -212,7 +229,7 @@ impl ForceOrderState {
 }
 
 /// The time of a liquidation, read in the zone the settings display data in.
-fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+fn format_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
     // The offset can move an instant past the last date the calendar holds — a
     // timestamp at the far end of the range is one the service cannot publish, and
     // it is written as a placeholder rather than taken to a date that is not one.
@@ -220,17 +237,14 @@ fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
         .ok()
         .and_then(|datetime| datetime.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--:--:--.---"),
+            || SmolStr::new_static("--:--:--.---"),
             |datetime| {
-                SharedString::new(
-                    format_smolstr!(
-                        "{:02}:{:02}:{:02}.{:03}",
-                        datetime.hour(),
-                        datetime.minute(),
-                        datetime.second(),
-                        datetime.millisecond()
-                    )
-                    .as_str(),
+                format_smolstr!(
+                    "{:02}:{:02}:{:02}.{:03}",
+                    datetime.hour(),
+                    datetime.minute(),
+                    datetime.second(),
+                    datetime.millisecond()
                 )
             },
         )
@@ -273,7 +287,7 @@ mod tests {
         ForceOrderEntry {
             order: order(scope, symbol, timestamp),
             listing: ForceOrderListing {
-                label: Some(SharedString::new(symbol)),
+                label: Some(SmolStr::new(symbol)),
                 precision: Some(precision()),
             },
         }
@@ -426,7 +440,7 @@ mod tests {
         let display = snapshot.orders()[0].display(UtcOffset::UTC);
 
         assert_eq!(
-            [display.price.as_ref(), display.quantity.as_ref()],
+            [display.price.as_str(), display.quantity.as_str()],
             ["90000.00", "2.000"]
         );
     }
@@ -443,7 +457,7 @@ mod tests {
         let display = snapshot.orders()[0].display(UtcOffset::UTC);
 
         assert_eq!(
-            [display.price.as_ref(), display.quantity.as_ref()],
+            [display.price.as_str(), display.quantity.as_str()],
             ["100", "2"]
         );
     }
@@ -455,5 +469,22 @@ mod tests {
 
         assert_eq!(snapshot.len(), 0);
         assert!(snapshot.orders().is_empty());
+    }
+
+    /// Two snapshots are the same read only when they hold the same retained set: that
+    /// equality is what keeps an unchanged batch from invalidating the table's cells.
+    #[test]
+    fn a_snapshot_should_be_the_same_read_only_for_the_same_retained_set() {
+        let mut state = ForceOrderState::new(2);
+        state.merge(&[entry("perpetual", "BTCUSDT", 1)]);
+        let first = state.snapshot();
+        let again = state.snapshot();
+
+        assert_eq!(first, again, "an unchanged retained set is the same read");
+
+        state.merge(&[entry("perpetual", "BTCUSDT", 2)]);
+        let changed = state.snapshot();
+
+        assert_ne!(first, changed, "a changed retained set is another read");
     }
 }
