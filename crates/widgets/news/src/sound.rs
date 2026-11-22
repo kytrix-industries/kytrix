@@ -1,5 +1,13 @@
 //! The sound a pane makes when news arrives, and how often it may make it.
 //!
+//! # Who owns the clip
+//!
+//! The application owns its audio assets (design §9.5), so a pane does not read one out
+//! of the component library: the host hands the bytes over through
+//! [`WidgetServices::sound`](widget::services::WidgetServices::sound), and `None` means
+//! this host has no audio at all. That is the ordinary case in a test and never an
+//! error: a pane with no sound draws its control disabled and announces nothing.
+//!
 //! # Why a device outlives a play
 //!
 //! Playing a sound is not the expensive part of hearing one: opening an output device is.
@@ -12,7 +20,8 @@
 //!
 //! Both are also why nothing here belongs on the frame's thread. The device is opened,
 //! and the clip decoded, on the thread built for them; a pane only ever leaves a request
-//! behind, which is a non-blocking send and never a wait.
+//! behind, which is a non-blocking send and never a wait. A host whose bytes turn out not
+//! to be audio, or whose device never opens, loses the sound — not the frame.
 //!
 //! # Why a rate limit
 //!
@@ -25,17 +34,13 @@
 use std::{
     error::Error,
     io::Cursor,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, SyncSender},
-    },
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
     time::{Duration, Instant},
 };
 
-use base_ui::assets::Assets;
+use bytes::Bytes;
 use rodio::{Decoder, Source, buffer::SamplesBuffer, stream::DeviceSinkBuilder};
-use tokio::sync::watch;
 
 /// How often a pane may make itself heard.
 ///
@@ -43,8 +48,10 @@ use tokio::sync::watch;
 /// everything a reader needs from a burst, and the next one waits its turn.
 pub(super) const MINIMUM_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The clip a pane plays, as it is embedded in the assets.
-const NOTIFICATION_CLIP: &str = "sounds/news_notification.wav";
+/// The name of the clip a pane asks the host for.
+///
+/// It is a key into the application's own asset table, not a path this crate reads.
+pub(super) const NOTIFICATION_CLIP: &str = "sounds/news_notification.wav";
 
 /// The name the thread that owns an output device is given.
 const DEVICE_THREAD: &str = "news-notification-sound";
@@ -59,28 +66,18 @@ pub(super) trait NotificationSound: Send + Sync + 'static {
     /// Asks for the clip to be played, and returns immediately.
     fn play(&self);
 
-    /// Whether this sound can be heard at all: an output device is open and ready.
-    fn is_available(&self) -> bool;
-
-    /// Watches that answer, waiting on it with `wait_for(|ready| *ready)`.
+    /// Whether this pane has a clip to be heard at all.
     ///
-    /// The device is opened on the sound's own thread, which is a moment no frame knows
-    /// about: a pane that draws its control from [`is_available`](Self::is_available) is a
-    /// pane drawing the answer it read the first time until something wakes it. This is that
-    /// something, and it is a wait that *ends* — both when the device opens and when the
-    /// sound never has one — because a pane waiting on a device for as long as it lived
-    /// would be a pane whose frames never settle.
-    fn ready(&self) -> watch::Receiver<bool>;
+    /// It is the host's answer, not the device's: the bytes were supplied means the
+    /// application has audio, and a device that then fails is a play that is dropped
+    /// rather than a control that changes under the reader.
+    fn is_available(&self) -> bool;
 }
 
 /// A sound whose clip a pane hears again and again without one device per play.
 pub(super) struct SoundPlayer {
     /// The requests left for the thread that owns the device. A send never blocks a frame.
     requests: SyncSender<()>,
-    /// What the thread says about its device, which it has opened by the time this says so.
-    /// It is state two threads share rather than a message either waits for: nothing in a
-    /// pane blocks on a device, it only reads whether there is one.
-    device: watch::Receiver<bool>,
 }
 
 impl SoundPlayer {
@@ -88,23 +85,22 @@ impl SoundPlayer {
     ///
     /// Building is not playing: the thread takes the device and decodes the clip in its
     /// own time, and a pane that never hears news never waits for either.
-    pub(super) fn new() -> Self {
+    pub(super) fn new(clip: Bytes) -> Self {
         // One request outstanding is one clip: a request already waiting is the sound this
         // one would have made, so a deeper queue would be the same news twice.
         let (requests, receiver) = mpsc::sync_channel(1);
-        let (status, device) = watch::channel(false);
 
         // The thread owns itself: nothing joins it, because what it is doing when a pane
         // goes away is opening a device — a wait that has no business on a frame's thread.
         // It ends on its own when its request channel closes, which dropping this player is.
         if let Err(error) = thread::Builder::new()
             .name(DEVICE_THREAD.to_owned())
-            .spawn(move || serve(receiver, &status))
+            .spawn(move || serve(receiver, clip))
         {
             log::warn!("the notification sound has no thread: {error}");
         }
 
-        Self { requests, device }
+        Self { requests }
     }
 }
 
@@ -118,39 +114,41 @@ impl NotificationSound for SoundPlayer {
     }
 
     fn is_available(&self) -> bool {
-        *self.device.borrow()
+        true
     }
+}
 
-    /// A wait that ends either way: on the device that arrives, and on the thread that
-    /// leaves without one, because a sender that goes with it is the same answer.
-    fn ready(&self) -> watch::Receiver<bool> {
-        self.device.clone()
+/// The sound of a host that answered `None` for the clip: there is no audio here.
+///
+/// It is a real implementation rather than an `Option` so the pane's announcement path
+/// does not branch on the host it is running on: the one thing it does differently is
+/// nothing.
+pub(super) struct SilentSound;
+
+impl NotificationSound for SilentSound {
+    fn play(&self) {}
+
+    fn is_available(&self) -> bool {
+        false
     }
 }
 
 /// Owns an output device for as long as it is asked to play, which is the whole point.
-fn serve(requests: Receiver<()>, device: &watch::Sender<bool>) {
-    let clip = match open_and_decode() {
-        Ok(clip) => clip,
+fn serve(requests: Receiver<()>, clip: Bytes) {
+    let device = match open_and_decode(&clip) {
+        Ok(device) => device,
         Err(error) => {
             log::warn!("the notification sound is unavailable: {error}");
             return;
         }
     };
 
-    // The device is open and the clip is in memory, so every request from here on is heard:
-    // this is what a pane reads to know it has a sound to offer, and it is sent before the
-    // first request can be answered rather than with it.
-    device.send_replace(true);
     while requests.recv().is_ok() {
-        if let Err(error) = clip.play() {
+        if let Err(error) = device.play() {
             log::warn!("the notification sound stopped playing: {error}");
             break;
         }
     }
-    // The device goes with this thread, so what a pane reads from here on is a sound it may
-    // not offer — the same fact its request channel closing says, said where a frame reads it.
-    device.send_replace(false);
 }
 
 /// An output device, and the clip it is to play.
@@ -159,7 +157,7 @@ struct Device {
     sink: rodio::MixerDeviceSink,
     channels: rodio::ChannelCount,
     sample_rate: rodio::SampleRate,
-    samples: Arc<[f32]>,
+    samples: Vec<f32>,
 }
 
 impl Device {
@@ -172,7 +170,7 @@ impl Device {
         self.sink.mixer().add(SamplesBuffer::new(
             self.channels,
             self.sample_rate,
-            self.samples.to_vec(),
+            self.samples.clone(),
         ));
 
         Ok(())
@@ -180,28 +178,27 @@ impl Device {
 }
 
 /// Opens the default output device and reads the clip into it.
-fn open_and_decode() -> Result<Device, Box<dyn Error>> {
+fn open_and_decode(clip: &[u8]) -> Result<Device, Box<dyn Error>> {
     let mut sink = DeviceSinkBuilder::open_default_sink()?;
     // A pane closes its device whenever the pane goes, which is not something a reader
     // needs telling: what rodio would print there is the sound the pane already stopped
     // making, and the pane's own header is where that is said.
     sink.log_on_drop(false);
-    let (channels, sample_rate, samples) = notification_samples()?;
+    let (channels, sample_rate, samples) = notification_samples(clip)?;
 
     Ok(Device {
         sink,
         channels,
         sample_rate,
-        samples: samples.into(),
+        samples,
     })
 }
 
 /// The clip a pane plays, decoded once.
-fn notification_samples()
--> Result<(rodio::ChannelCount, rodio::SampleRate, Vec<f32>), Box<dyn Error>> {
-    let clip = Assets::get(NOTIFICATION_CLIP)
-        .ok_or_else(|| format!("the clip `{NOTIFICATION_CLIP}` is not in the embedded assets"))?;
-    let decoder = Decoder::try_from(Cursor::new(clip.data))?;
+fn notification_samples(
+    clip: &[u8],
+) -> Result<(rodio::ChannelCount, rodio::SampleRate, Vec<f32>), Box<dyn Error>> {
+    let decoder = Decoder::try_from(Cursor::new(clip.to_vec()))?;
     let channels = decoder.channels();
     let sample_rate = decoder.sample_rate();
     let samples = decoder.collect();
@@ -291,29 +288,58 @@ mod tests {
         );
     }
 
-    /// The clip is embedded rather than loaded from disk, so this is the test that says
-    /// the path a pane plays is one the binary actually holds — a typo here is a sound
-    /// nobody ever hears, which is not something a build would otherwise notice.
+    /// A 16-bit PCM WAV of `frames` stereo frames at 44.1 kHz, as the application's own
+    /// clip would arrive: the same reader the pane uses is what decodes it.
+    fn stereo_44k_wav(frames: u32) -> Vec<u8> {
+        const CHANNELS: u16 = 2;
+        const SAMPLE_RATE: u32 = 44_100;
+        const BITS: u16 = 16;
+        let samples = frames * u32::from(CHANNELS);
+        let data_len = samples * u32::from(BITS / 8);
+        let byte_rate = SAMPLE_RATE * u32::from(CHANNELS) * u32::from(BITS / 8);
+        let block_align = CHANNELS * (BITS / 8);
+
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&CHANNELS.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&BITS.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..samples {
+            let sample = i16::try_from(frame % 4).expect("the fixture's amplitude fits i16");
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        wav
+    }
+
+    /// The clip is bytes the host handed over, so this is the test that says the decoder
+    /// a play runs through is the reader the application's WAV format needs: a clip that
+    /// a `curl` and a text editor would accept must not decode to silence.
     #[test]
-    fn the_embedded_clip_should_decode_to_the_samples_a_device_plays() {
+    fn the_clip_the_host_hands_over_should_decode_to_the_samples_a_device_plays() {
+        let wav = stereo_44k_wav(441);
         let (channels, sample_rate, samples) =
-            notification_samples().expect("the notification clip should be in the embedded assets");
+            notification_samples(&wav).expect("a PCM WAV should decode");
 
         assert_eq!(channels.get(), 2, "the clip is a stereo recording");
         assert_eq!(
             sample_rate.get(),
             44_100,
-            "the clip is a 44.1 kHz recording"
+            "the clip is a 44,1 kHz recording"
         );
-
-        // The clip is 1.96 seconds of stereo audio, which is what a reader hears: a guard
-        // that only asked for "longer than a click" would pass for a truncated file or for
-        // the wrong clip entirely, and neither is something a build would notice.
-        let frames = samples.len() / usize::from(channels.get());
-        let seconds = frames as f64 / f64::from(sample_rate.get());
-        assert!(
-            (1.8..2.2).contains(&seconds),
-            "the notification is about two seconds long: {seconds} s"
+        assert_eq!(
+            samples.len(),
+            441 * 2,
+            "every frame the clip holds reaches the device"
         );
         assert!(
             samples.iter().all(|sample| sample.is_finite()),
@@ -325,5 +351,26 @@ mod tests {
         // recognises rather than a failure.
         let buffer = SamplesBuffer::new(channels, sample_rate, samples.clone());
         assert_eq!(buffer.count(), samples.len());
+    }
+
+    /// A host whose asset is not audio, or whose device never opens, loses the sound —
+    /// not the frame: building the player and asking it to play must not panic.
+    #[test]
+    fn a_clip_that_is_not_audio_should_be_dropped_instead_of_panicking() {
+        assert!(notification_samples(b"not a wav").is_err());
+
+        let player = SoundPlayer::new(Bytes::from_static(b"not a wav"));
+        player.play();
+        assert!(player.is_available(), "the host did supply bytes");
+    }
+
+    /// A host that answered `None` has no sound, and asking it for one is a no-op: the
+    /// pane's announcement path is the same on every host.
+    #[test]
+    fn a_host_without_audio_should_answer_a_sound_that_is_silent() {
+        let sound = SilentSound;
+
+        sound.play();
+        assert!(!sound.is_available(), "no bytes means no sound to offer");
     }
 }

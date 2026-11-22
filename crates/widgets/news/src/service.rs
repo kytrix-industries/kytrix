@@ -29,7 +29,7 @@
 
 use std::{convert::Infallible, future::Future};
 
-use gpui_kit::{App, SharedString};
+use i18n::{t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
     engine::{ErrorCode, KytrixServiceError, NewsEvent},
@@ -41,7 +41,7 @@ use network::transport::{
 use smol_str::SmolStr;
 use tokio::time::Instant;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     rpc::RpcRequestContext,
     runtime::{ServiceContext, WidgetService},
@@ -107,12 +107,12 @@ pub(super) enum NewsStreamError {
     Transport(TransportError),
 }
 
-impl LocalizedError for NewsStreamError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for NewsStreamError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Service(error) => error.localized_message(cx),
-            Self::EntitlementRequired => i18n::t!(cx, "error.news.entitlement_required"),
-            Self::Transport(error) => error.localized_message(cx),
+            Self::Service(error) => error.translated_message(translate),
+            Self::EntitlementRequired => t_smol!(translate, "error.news.entitlement_required"),
+            Self::Transport(error) => error.translated_message(translate),
         }
     }
 }
