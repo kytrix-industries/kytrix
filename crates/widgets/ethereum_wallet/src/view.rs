@@ -250,7 +250,6 @@ enum SelectionRead {
 
 /// One pane: the transfers it holds, and the addresses it manages.
 pub struct EthereumWalletWidget {
-    config: EthereumWalletConfig,
     /// The executor bridge, absent on a host that installed no Kytrix service.
     binding: Option<WidgetBinding<EthereumWalletProtocol>>,
     /// The commands in flight, keyed by the identity the binding returned.
@@ -309,7 +308,7 @@ impl WidgetView for EthereumWalletWidget {
 
     fn new(
         _instance_id: WidgetInstanceId,
-        config: Self::Config,
+        _config: Self::Config,
         status: WidgetStatus,
         _reload: ReloadHandle,
         _config_change: WidgetConfigChange,
@@ -317,7 +316,7 @@ impl WidgetView for EthereumWalletWidget {
         cx: &mut WidgetCx<'_>,
     ) -> Result<Self, EngineError> {
         let source = cx.services().kytrix_service().cloned();
-        Ok(Self::assemble(config, source, status, recovery, cx))
+        Ok(Self::assemble(source, status, recovery, cx))
     }
 
     fn load(&mut self, cx: &mut WidgetCx<'_>) {
@@ -337,11 +336,6 @@ impl WidgetView for EthereumWalletWidget {
     /// content, which leaves the slot to the framework's placeholder and its own sentence.
     fn has_content(&self) -> bool {
         self.account_has_addresses() && self.snapshot.is_some()
-    }
-
-    /// The one option this pane owns: the schema version of an otherwise empty config.
-    fn config(&self) -> Option<&Self::Config> {
-        Some(&self.config)
     }
 
     fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
@@ -438,8 +432,10 @@ impl WidgetView for EthereumWalletWidget {
 
         // The body is built by the framework from the answer `has_content` gives, and it
         // asks that question before this hook runs: content that first appeared here is
-        // one frame away, so ask for that frame.
-        if self.snapshot.is_some() && self.body_root.is_none() {
+        // one frame away, so ask for that frame. The question has to be the framework's
+        // own one — a snapshot is not content when the account monitors no address, and
+        // asking for a frame on that state would keep a waiting pane repainting forever.
+        if self.has_content() && self.body_root.is_none() {
             cx.request_frame()?;
         }
 
@@ -491,7 +487,6 @@ impl EthereumWalletWidget {
     /// argument: the production constructor answers it with the injected Kytrix service
     /// connection, and a test with a fake session.
     fn assemble<S: EthereumWalletSource>(
-        config: EthereumWalletConfig,
         source: Option<S>,
         status: WidgetStatus,
         recovery: WidgetAction,
@@ -505,7 +500,6 @@ impl EthereumWalletWidget {
         let account_id = cx.account();
 
         Self {
-            config,
             binding,
             pending: Pending::new(),
             status,
@@ -534,13 +528,12 @@ impl EthereumWalletWidget {
     /// A pane over a source the caller answers, for the crate's own tests.
     #[cfg(test)]
     fn new_with_source<S: EthereumWalletSource>(
-        config: EthereumWalletConfig,
         source: S,
         status: WidgetStatus,
         recovery: WidgetAction,
         cx: &mut WidgetCx<'_>,
     ) -> Self {
-        Self::assemble(config, Some(source), status, recovery, cx)
+        Self::assemble(Some(source), status, recovery, cx)
     }
 
     /// The scope this pane follows, which is the account it reads as.
@@ -1430,10 +1423,6 @@ fn build_transfer_row(
     let a11y_translate = context.translate.clone();
     let row = NodeBuilder::boxed()
         .id(format_smolstr!("TEST_ETHEREUM_WALLET_TRANSFER_ROW:{index}"))
-        .a11y(A11yOverride {
-            role: Some(A11yRole::Row),
-            ..A11yOverride::default()
-        })
         .style(
             StyleBuilder::new()
                 .flex_col()
@@ -1727,7 +1716,6 @@ mod tests {
         let parent = harness.placeholder_parent();
         let widget = harness.with_cx(|cx| {
             EthereumWalletWidget::new_with_source(
-                EthereumWalletConfig,
                 source,
                 status,
                 WidgetAction::new("common.retry", |_| {}),
@@ -2042,6 +2030,19 @@ mod tests {
         assert_eq!(
             decode_or_default::<EthereumWalletConfig>(None),
             EthereumWalletConfig
+        );
+    }
+
+    /// Nothing in this pane's interface is persisted: the config type exists to carry the
+    /// schema version, and `config()` answers `None` so the pane writes no envelope at all
+    /// (AGENTS §4.3; `pentagon_pizza_index` has the same shape).
+    #[test]
+    fn a_pane_that_persists_nothing_should_report_no_config() {
+        let mut harness = harness();
+        let pane = pane(&mut harness, FakeSource::default());
+        assert!(
+            pane.widget.config().is_none(),
+            "a pane with no options persists no config"
         );
     }
 
@@ -3048,7 +3049,6 @@ mod tests {
         let mut second = {
             let mut cx = WidgetCx::new(harness.app_mut(), window, &services, scope);
             EthereumWalletWidget::new_with_source(
-                EthereumWalletConfig,
                 FakeSource::default(),
                 status,
                 WidgetAction::new("common.retry", |_| {}),
@@ -3141,6 +3141,9 @@ mod tests {
     fn releasing_the_pane_should_take_its_controls_and_its_body_down() {
         let mut harness = harness();
         let mut pane = quiet_pane(&mut harness, FakeSource::default());
+        // Only the pane's own scope signals exist at this point: everything the controls,
+        // the list and the dialog mint is theirs to give back.
+        let baseline = harness.signal_slot_stats();
         build_header(&mut harness, &mut pane);
         let manage = pane
             .widget
@@ -3179,6 +3182,11 @@ mod tests {
         assert!(
             !pane.widget.has_content(),
             "a released pane holds nothing to draw"
+        );
+        assert_eq!(
+            harness.signal_slot_stats().live,
+            baseline.live,
+            "releasing the pane returns every value slot its controls, list and dialog minted"
         );
     }
 
@@ -3245,6 +3253,41 @@ mod tests {
             "a steady pane asks for no frame"
         );
         assert!(!harness.rendered(), "a steady pane paints nothing");
+    }
+
+    /// An account with no addresses has nothing to follow, and a snapshot is not content
+    /// without one: the pane waits for the user instead of asking for the body again and
+    /// again (W8a review F1 — the condition is the framework's own `has_content`).
+    #[test]
+    fn a_waiting_pane_with_a_feed_should_not_ask_for_a_frame() {
+        let mut harness = harness();
+        let mut pane = quiet_pane(&mut harness, FakeSource::default());
+        pane.widget.selections = Some(SelectionData::new(selections(Vec::new(), 3)));
+        pane.widget.selection_read = SelectionRead::Known;
+        let mut feed = FakeFeed::new();
+        report_feed(&mut harness, &mut pane, feed.push("one", 1));
+        assert!(
+            pane.widget.snapshot.is_some(),
+            "the stream published the transfers it saw"
+        );
+        assert!(
+            !pane.widget.has_content(),
+            "a feed without a monitored address is not content"
+        );
+        frame(&mut harness, &mut pane);
+        let requests = harness.frame_requests();
+
+        sync(&mut harness, &mut pane);
+        harness.drain();
+        sync(&mut harness, &mut pane);
+        harness.drain();
+
+        assert_eq!(
+            harness.frame_requests(),
+            requests,
+            "a pane waiting for its first address asks for no frame"
+        );
+        assert!(!harness.rendered(), "a waiting pane paints nothing");
     }
 
     /// The pane is content for an account with addresses as soon as the feed arrives; the

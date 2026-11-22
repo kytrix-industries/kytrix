@@ -45,6 +45,18 @@
 //! animation" state: a spinner that merely sits in a hidden block would keep asking for
 //! frames (I3). It is therefore built when the body enters its loading window and
 //! released when that window closes, which is the framework's own placeholder pattern.
+//! The spinner carries the loading sentence as its accessible name: a kit spinner without
+//! one is a decorative graphic hidden from assistive technology, and a dialog that is
+//! reading its addresses is not decoration (`ProgressIndicator` + the label is what a
+//! screen reader announces).
+//!
+//! # Enter in the address field is the add control
+//!
+//! A kit input only dispatches an action on Enter when its spec names one, and the old
+//! dialog's field added what it held on Enter. The dialog therefore registers its own
+//! submit action (keyed from its instance, like every other control) and answers it with
+//! the same "may this address be monitored" judgement the add button uses — the action
+//! entry point decides again rather than trusting the control's disabled state.
 
 use std::{
     cell::{Cell, RefCell},
@@ -76,10 +88,9 @@ use kytrix_service_provider::service::ethereum_wallet::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
-    a11y::{A11yOverride, A11yRole},
     app::App,
     error::EngineError,
-    event::{Event, InputEvent},
+    event::{Action, Event, InputEvent},
     interaction::ActionCtx,
     node::{
         builder::NodeBuilder,
@@ -290,6 +301,14 @@ impl EthereumWalletDialog {
             .get(&index)
             .map(|entry| entry.button.clone())
     }
+
+    pub(super) fn test_spinner(&self) -> Option<Spinner> {
+        self.inner.borrow().spinner.clone()
+    }
+
+    pub(super) fn test_submit_action(&self) -> Action {
+        self.inner.borrow().submit.clone()
+    }
 }
 
 /// The parts one open dialog owns.
@@ -303,6 +322,8 @@ struct DialogState {
     /// The language the kit components (the buttons, the parsed stand-ins and the field's
     /// placeholder) were built in.
     built_language: Option<LanguageCode>,
+    /// The action the address field dispatches when Enter is pressed in it.
+    submit: Action,
     dialog: Option<Dialog>,
     list: Option<List>,
     input: Option<InputNode>,
@@ -356,6 +377,7 @@ struct DialogKeys {
     dialog: SmolStr,
     list: SmolStr,
     input: SmolStr,
+    submit: SmolStr,
     refresh: SmolStr,
     add: SmolStr,
     retry: SmolStr,
@@ -381,6 +403,7 @@ struct DialogComponents {
     input: Option<InputNode>,
     list: Option<List>,
     spinner: Option<Spinner>,
+    submit: Option<Action>,
     refresh: Option<Button>,
     add: Option<Button>,
     retry: Option<Button>,
@@ -410,6 +433,7 @@ impl DialogState {
             dialog: cx.unique_key("ethereum_wallet.dialog"),
             list: cx.unique_key("ethereum_wallet.dialog.addresses"),
             input: cx.unique_key("ethereum_wallet.dialog.field"),
+            submit: cx.unique_key("ethereum_wallet.dialog.field.submit"),
             refresh: cx.unique_key("ethereum_wallet.dialog.refresh"),
             add: cx.unique_key("ethereum_wallet.dialog.add"),
             retry: cx.unique_key("ethereum_wallet.dialog.retry"),
@@ -417,6 +441,7 @@ impl DialogState {
             close: cx.unique_key("ethereum_wallet.dialog.close"),
         };
         let placeholder = t_smol!(translate, "widget.ethereum_wallet.address_placeholder");
+        let submit = Action::Custom(format_smolstr!("{}.submit", keys.submit));
         let addresses: Arc<[EthereumWalletSelection]> = Arc::from([]);
         Self {
             window: cx.window(),
@@ -426,6 +451,7 @@ impl DialogState {
             language,
             keys,
             built_language: Some(*cx.read(&language)),
+            submit,
             dialog: None,
             list: None,
             input: None,
@@ -468,8 +494,9 @@ impl DialogState {
         }
     }
 
-    /// Builds the list the dialog draws its addresses with. Called before the dialog is
-    /// opened, because the dialog's content mounts it.
+    /// Builds the list the dialog draws its addresses with, and registers the action its
+    /// address field dispatches on Enter. Called before the dialog is opened, because the
+    /// dialog's content mounts the list.
     fn create_kit(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let addresses = self.addresses;
         let slots = Rc::clone(&self.slots);
@@ -491,6 +518,33 @@ impl DialogState {
         list.set_initial_count(cx.app_mut(), count);
         self.shown_addresses = Some(count);
         self.list = Some(list);
+
+        // Enter in the address field is the add control by another route: the same
+        // judgement, made again at the action entry rather than trusting the control's
+        // disabled state (AGENTS §4.2 / §12-7).
+        let input_state = self.input_state;
+        let addresses = self.addresses;
+        let limit = self.limit;
+        let ready = self.ready;
+        let known = self.known;
+        let operation = self.operation;
+        let add_request = self.add_request;
+        cx.app_mut().on_action(self.submit.clone(), move |ctx| {
+            let address = addable_from(
+                ctx,
+                &input_state,
+                &addresses,
+                &limit,
+                &ready,
+                &known,
+                &operation,
+            );
+            if let Some(address) = address {
+                ctx.write(&add_request, Some(address));
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            }
+        });
         Ok(())
     }
 
@@ -871,7 +925,11 @@ impl DialogState {
                 spinner.sync(cx.app_mut())?;
             } else if let Some(parent) = self.spinner_parent {
                 let key = format_smolstr!("{}:spinner", self.keys.dialog);
-                let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key);
+                // A kit spinner with no accessible name is a decorative graphic, and the
+                // dialog is announcing that it is reading the addresses: the label is what
+                // puts it in the a11y tree as a progress indicator (W8a review F3).
+                let label = t_smol!(self.translate, "widget.ethereum_wallet.loading_addresses");
+                let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key).with_label(label);
                 let window = cx.window();
                 spinner.build(cx.app_mut(), window, parent)?;
                 self.spinner = Some(spinner);
@@ -1103,7 +1161,7 @@ impl DialogState {
             disabled: false,
             max_length: None,
             size: ControlSize::Medium,
-            submit: None,
+            submit: Some(self.submit.clone()),
         });
         let input = {
             let tree = app
@@ -1502,6 +1560,7 @@ impl DialogState {
             input: self.input.take(),
             list: self.list.take(),
             spinner: self.spinner.take(),
+            submit: Some(self.submit.clone()),
             refresh: self.refresh.take(),
             add: self.add.take(),
             retry: self.retry.take(),
@@ -1568,10 +1627,6 @@ fn build_address_row(
     let row_theme = theme.clone();
     let row = NodeBuilder::boxed()
         .id(format_smolstr!("{key}:row:{index}"))
-        .a11y(A11yOverride {
-            role: Some(A11yRole::Row),
-            ..A11yOverride::default()
-        })
         .style(
             StyleBuilder::new()
                 .flex_row()
@@ -1702,6 +1757,9 @@ fn release_components(app: &mut App, components: DialogComponents) {
     if let Some(dialog) = components.dialog {
         dialog.release(app);
     }
+    if let Some(action) = components.submit {
+        app.off_action(&action);
+    }
     if let Some(input) = components.input {
         input.release(app);
     }
@@ -1777,7 +1835,7 @@ mod tests {
     use kytrix_service_provider::service::ethereum_wallet::{
         EthereumWalletSelection, EthereumWalletSelectionsResponse,
     };
-    use ui_core::event::ActionSource;
+    use ui_core::event::{ActionSource, KeyCode, Modifiers};
     use widget::{protocol::RequestId, rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
@@ -1934,6 +1992,18 @@ mod tests {
         );
     }
 
+    /// Presses Enter in the address field: the field dispatches its own submit action.
+    fn press_enter(harness: &mut WidgetTestApp, dialog: &EthereumWalletDialog) {
+        let input = dialog.test_input().expect("the address field is built");
+        let window = harness.window();
+        let _ = harness.app_mut().set_focus(window, Some(input.root));
+        let event = Event::Input(InputEvent::key_down(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            input.dispatch(harness.app_mut(), &event),
+            "the focused field takes Enter"
+        );
+    }
+
     /// An Ethereum address is the address it names in either case, and the whitespace a
     /// paste can bring along is not part of one — but the case the service holds it in is
     /// the lowercase one, so a checksummed address is folded before it is read.
@@ -2028,6 +2098,31 @@ mod tests {
         );
     }
 
+    /// Enter in the address field is the add control by another route: it offers what the
+    /// field holds, and it refuses what the control would refuse.
+    #[test]
+    fn pressing_enter_in_the_address_field_should_offer_the_typed_address() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        press_enter(&mut harness, &dialog);
+        assert!(
+            requests(&mut harness, &mut dialog).is_empty(),
+            "an empty field has nothing to offer"
+        );
+
+        type_address(&mut harness, &dialog, SECOND);
+        settle_frames(&mut harness, &mut dialog, &view);
+        press_enter(&mut harness, &dialog);
+        assert_eq!(
+            requests(&mut harness, &mut dialog),
+            vec![DialogRequest::Add(SmolStr::new_static(SECOND))],
+            "Enter offers the address the field holds, as the add control does"
+        );
+    }
+
     #[test]
     fn a_full_quota_should_refuse_another_address() {
         let mut harness = harness();
@@ -2074,6 +2169,103 @@ mod tests {
             requests(&mut harness, &mut dialog),
             vec![DialogRequest::Delete(SmolStr::new_static(FIRST))],
             "the address of the row that was clicked is the one that was asked to leave"
+        );
+    }
+
+    /// A list that shrank gives up the controls of the rows it no longer shows: a control
+    /// left behind would draw over whatever row takes that place, and keep its value slots.
+    #[test]
+    fn a_shrunk_address_list_should_release_the_controls_it_no_longer_shows() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let two_rows = view(
+            true,
+            true,
+            Some(data(vec![address(FIRST), address(SECOND)], 3)),
+        );
+        settle_frames(&mut harness, &mut dialog, &two_rows);
+        let before = harness.signal_slot_stats();
+        assert!(
+            dialog.test_delete_button(1).is_some(),
+            "the second row carries its control"
+        );
+
+        let one_row = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &one_row);
+
+        assert!(
+            dialog.test_delete_button(1).is_none(),
+            "the control of the row that is gone is let go"
+        );
+        assert!(
+            dialog.test_delete_button(0).is_some(),
+            "the row still shown keeps its control"
+        );
+        assert!(
+            harness.signal_slot_stats().live < before.live,
+            "the released control returns its value slots"
+        );
+    }
+
+    /// The row controls are static copy: a language switch rebuilds them in the language
+    /// showing now (a kit button's accessible name is chosen when it is built).
+    #[test]
+    fn the_row_controls_should_follow_the_language() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let english = t_smol!(
+            translate(LanguageCode::En),
+            "widget.ethereum_wallet.delete_address"
+        );
+        assert_eq!(
+            dialog
+                .test_delete_button(0)
+                .expect("the row carries its control")
+                .a11y_label_text(),
+            Some(english.as_str()),
+            "the row control names what it does"
+        );
+
+        harness.switch_language(LanguageCode::ZhCn);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let chinese = t_smol!(
+            translate(LanguageCode::ZhCn),
+            "widget.ethereum_wallet.delete_address"
+        );
+        assert_eq!(
+            dialog
+                .test_delete_button(0)
+                .expect("the row control is rebuilt")
+                .a11y_label_text(),
+            Some(chinese.as_str()),
+            "the control is rebuilt in the language showing now"
+        );
+    }
+
+    /// Reading the addresses is announced: the spinner is a progress indicator with the
+    /// loading sentence as its name, not a decorative graphic a screen reader skips.
+    #[test]
+    fn a_loading_address_list_should_be_announced_as_a_progress() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let mut view = view(true, true, None);
+        view.operation = Some(SelectionOperation::Loading);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let spinner = dialog
+            .test_spinner()
+            .expect("the loading block draws its spinner");
+        let node = spinner.node().expect("the spinner is mounted");
+        harness.enable_a11y_capture();
+        harness.drain();
+
+        assert!(
+            !harness.a11y_hidden(node),
+            "the progress indicator is announced with the loading sentence"
         );
     }
 
@@ -2202,6 +2394,11 @@ mod tests {
             harness.signal_slot_stats().live > baseline.live,
             "the dialog mints its own values"
         );
+        let submit = dialog.test_submit_action();
+        assert!(
+            harness.app().has_action_handler(&submit),
+            "the address field's submit action is registered"
+        );
 
         let close = dialog.test_close_button().expect("the footer is built");
         click(&mut harness, &close);
@@ -2219,6 +2416,10 @@ mod tests {
             harness.signal_slot_stats().live,
             baseline.live,
             "releasing the dialog reclaims its values"
+        );
+        assert!(
+            !harness.app().has_action_handler(&submit),
+            "releasing the dialog unregisters the address field's submit action"
         );
     }
 }
