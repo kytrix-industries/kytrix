@@ -11,6 +11,7 @@ use i18n::language::codes::LanguageCode;
 use ui_core::{
     math::Point,
     node::{builder::NodeBuilder, id::NodeId},
+    paint::primitive::Primitive,
     window::WindowId,
 };
 use widget::test_support::WidgetTestApp;
@@ -44,6 +45,19 @@ impl ChartHarness {
         app.with_cx(|cx| chart.sync_locale(cx))
     }
 
+    /// Points the chart at another history, the way a new answer does.
+    fn set_view(&mut self) -> bool {
+        let Self { app, chart, .. } = self;
+        app.with_cx(|cx| {
+            chart.set_view(
+                cx,
+                dataset(&[500.0, -250.0, 1_500.0, 3_000.0]),
+                CryptocurrencyEtfFundSelection::All,
+                CryptocurrencyEtfWindow::All,
+            )
+        })
+    }
+
     fn canvas(&self) -> &ui_core::paint::canvas::Canvas {
         self.chart
             .canvas_for_test(self.app.app(), self.window)
@@ -60,6 +74,22 @@ impl ChartHarness {
         let Self { app, chart, .. } = self;
         app.with_cx(|cx| chart.release(cx));
     }
+}
+
+/// The atlas generation the chart's glyphs were rasterized in, if it draws any.
+///
+/// The leases a canvas holds are what an atlas reset invalidates, so reading the
+/// generation back is how a test tells a canvas that was rebuilt from one that was kept.
+fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
+    harness
+        .canvas()
+        .primitives()
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => run.glyphs.first(),
+            _ => None,
+        })
+        .map(|glyph| glyph.tile.generation)
 }
 
 /// Builds a chart over a page of `width` × `height`, and lays it out.
@@ -139,8 +169,29 @@ fn a_chart_should_fill_the_box_it_is_given() {
     );
 }
 
+/// The content box is the pane's when the pane is roomier than the floor the layout keeps
+/// for its labels: that floor is a minimum, not a size the chart insists on.
 #[test]
-fn a_chart_in_a_smaller_box_should_draw_a_smaller_plot() {
+fn a_chart_in_a_roomy_box_should_fill_it_rather_than_stay_at_its_floor() {
+    // Taller and wider than the 640×360 floor, inside the headless host's 800×600 window.
+    let mut harness = harness_in(760.0, 560.0, &[1_000.0, -500.0, 2_000.0]);
+    assert!(harness.sync());
+
+    let layout = harness.layout();
+    assert_eq!(
+        layout.content.size.width, 760.0,
+        "the content follows the box it is given"
+    );
+    assert_eq!(layout.content.size.height, 560.0);
+    assert_eq!(
+        harness.canvas().bounds(),
+        layout.content,
+        "the canvas covers what the frame drew"
+    );
+}
+
+#[test]
+fn a_pane_narrower_than_the_chart_should_clip_it_rather_than_squeeze_the_plot() {
     let mut small = harness_in(320.0, 240.0, &[1_000.0, 2_000.0]);
     assert!(small.sync());
     let mut wide = harness_in(WIDTH, HEIGHT, &[1_000.0, 2_000.0]);
@@ -274,6 +325,43 @@ fn a_language_change_should_rewrite_the_labels_a_chart_is_already_showing() {
     );
 }
 
+/// The labels are drawn from shaped handles that lease glyph tiles from the atlas. When a
+/// lease is gone — the atlas was reset, a font stack changed, a tile was evicted — the
+/// engine refuses to encode those runs rather than draw reused texture, so a chart that
+/// kept the canvas it already had would lose its labels for good. A moved lease is a
+/// frame the chart owes.
+#[test]
+fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
+    let mut harness = harness();
+    assert!(harness.sync(), "the first frame paints");
+    let labels = harness.canvas().primitives().len();
+    let generation = glyph_generation(&harness).expect("a chart of three days labels its axes");
+
+    // An atlas reset under the same font stack: every handle the canvas was built from is
+    // leased from an atlas that no longer exists, while the glyphs shape back the same.
+    let stack = harness.app.app().font_stack().clone();
+    harness.app.app_mut().set_font_stack(stack);
+
+    assert!(
+        harness.sync(),
+        "a label whose lease moved is a frame the chart owes, not an idle one"
+    );
+    assert_ne!(
+        glyph_generation(&harness),
+        Some(generation),
+        "every label was shaped for the atlas that exists now"
+    );
+    assert_eq!(
+        harness.canvas().primitives().len(),
+        labels,
+        "and none of them disappeared with the old lease"
+    );
+    assert!(
+        !harness.sync(),
+        "with fresh leases the frame is steady again (I3)"
+    );
+}
+
 #[test]
 fn a_chart_should_keep_the_readings_it_was_given() {
     let harness = harness();
@@ -302,6 +390,27 @@ fn releasing_a_chart_should_leave_no_geometry_behind() {
         harness.app.app().geometry().len(),
         0,
         "the mesh is the chart's own, so it goes with it"
+    );
+}
+
+/// A new answer is a new prepared frame, and another net-asset line with it: the mesh the
+/// frame before it registered is handed back rather than stacked behind the new one.
+#[test]
+fn preparing_another_frame_should_hand_the_previous_geometry_back() {
+    let mut harness = harness();
+    assert!(harness.sync());
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        1,
+        "the net-asset line is one registered mesh"
+    );
+
+    assert!(harness.set_view(), "another answer is a new view");
+    assert!(harness.sync(), "and a new frame");
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        1,
+        "the mesh of the frame before it was released, not kept beside it"
     );
 }
 

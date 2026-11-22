@@ -272,7 +272,8 @@ impl CryptocurrencyEtfChart {
     ///
     /// The work is split in two: a *prepared* frame is rebuilt only when the box or the
     /// resolved view moved, and the *canvas* is rebuilt only when what it would draw
-    /// moved — the prepared frame, the hover, the appearance, or the line's mesh.
+    /// moved — the prepared frame, the hover, the appearance, the line's mesh, or the
+    /// atlas lease of a label it was built from.
     pub(crate) fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<bool, EngineError> {
         let Some(node) = self.node else {
             return Ok(false);
@@ -312,7 +313,13 @@ impl CryptocurrencyEtfChart {
             line: self.cache.line,
             appearance,
         };
-        if self.cache.painted == Some(painted) {
+        // The painted key names what the canvas was built from, but not what its labels
+        // were *leased* from: a shaped handle points into a shared atlas, and an atlas
+        // generation change or a per-tile eviction can take every lease the canvas holds
+        // without moving anything in the key. The engine drops such runs at encode time,
+        // so a frame that kept this canvas would show a chart with its axis, date and
+        // tooltip labels missing — for good. A stale cache is a rebuild.
+        if self.cache.painted == Some(painted) && !self.cache.text.has_stale() {
             return Ok(false);
         }
 
@@ -323,7 +330,7 @@ impl CryptocurrencyEtfChart {
             return Ok(false);
         };
         let line = self.cache.line.map(|id| (id, colors.role(Role::FgDefault)));
-        let canvas = paint(
+        let (canvas, whole) = paint(
             cx.app_mut(),
             &self.data,
             prepared,
@@ -333,8 +340,29 @@ impl CryptocurrencyEtfChart {
             &mut self.cache.text,
             line,
         );
+        // Shaping one label can evict another label's tiles, so a single pass is not
+        // always a whole frame: a refused run is shaped again and pushed by a second
+        // pass. A second refusal is left to the next frame rather than retried here, so a
+        // chart whose labels do not fit the atlas cannot spin this hook.
+        let (canvas, whole) = if whole {
+            (canvas, whole)
+        } else {
+            paint(
+                cx.app_mut(),
+                &self.data,
+                prepared,
+                layout,
+                self.hover,
+                colors,
+                &mut self.cache.text,
+                line,
+            )
+        };
         let changed = cx.set_canvas(node, canvas)?;
-        if changed {
+        // An incomplete canvas is not what the chart draws: leaving the key unrecorded is
+        // what makes the next frame build it again (I3 holds — a whole frame is still a
+        // short circuit).
+        if whole {
             self.cache.painted = Some(painted);
         }
         Ok(changed)

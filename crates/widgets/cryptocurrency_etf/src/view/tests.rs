@@ -34,6 +34,14 @@ const ACCOUNT: &str = "test-account";
 /// The size the pane's body is laid out in, which is what the chart is measured from.
 const PAGE: (f32, f32) = (640.0, 360.0);
 
+/// The value slots the three header pickers keep after their components are released.
+///
+/// `kit::select` mints a signal scope of its own (`revision` / `chosen` / `a11y_label`)
+/// and its `release` does not hand that scope back yet: three values per picker, three
+/// pickers. It is registered with the kit batch (`test-ledger/w3-etf.md` §10-5), and the
+/// release test below pins the count so the widget's own release surface stays asserted.
+const PICKER_SCOPE_GAP: usize = 3 * 3;
+
 /// The translator the product ships: what these tests assert is the catalogue's copy.
 fn product_translate(language: LanguageCode) -> Translate {
     Translate::new(
@@ -643,6 +651,31 @@ fn a_failure_should_be_terminal_until_the_user_recovers() {
     assert_eq!(reported(&harness, &pane), WidgetState::Connecting);
 }
 
+/// A failure is terminal on every entry point, the RPC one included: the reply to a
+/// command the failure replaced answers nothing, and reporting it would put the same
+/// failure over the banner under another error object.
+#[test]
+fn a_reply_arriving_after_the_failure_should_not_replace_the_banner() {
+    let mut harness = harness();
+    let mut pane = pane(&mut harness);
+    load(&mut harness, &mut pane);
+    report_status(&mut harness, &mut pane, failed());
+    let banner = reported(&harness, &pane);
+    assert!(banner.is_failed(), "the failure is the pane's state");
+
+    // The load command's reply arrives after the failure it can no longer answer.
+    let late = Err(RpcCallError::ServiceClosed {
+        request_id: RequestId::new(1),
+    });
+    harness.with_cx(|cx| pane.widget.apply_rpc(RequestId::new(1), late, cx));
+
+    assert_eq!(
+        reported(&harness, &pane),
+        banner,
+        "a failure is not replaced by the reply to a command it ended"
+    );
+}
+
 #[test]
 fn a_pane_without_a_service_connection_should_report_a_failure() {
     let mut harness = harness();
@@ -1113,10 +1146,98 @@ fn rebuilding_the_header_should_hand_its_components_back() {
     );
 }
 
+/// A pane hands its components back when it goes: the widget's own values and the four
+/// header controls' action handlers belong to the pane, so releasing it must leave the
+/// application with no value slot the pane minted.
+#[test]
+fn releasing_a_pane_should_hand_its_signals_and_components_back() {
+    let mut harness = harness();
+    sign_in(&mut harness, ACCOUNT);
+    let baseline = harness.signal_slot_stats();
+
+    // A pane that never built its header is the widget's own values: releasing it leaves
+    // the application exactly as it was, and the cycles after the first one — which sets
+    // the peak the slot table has to hold — reuse those slots instead of growing it.
+    let mut needed = 0;
+    for cycle in 0..3 {
+        let pane = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
+        assert!(
+            harness.signal_slot_stats().live > baseline.live,
+            "cycle {cycle}: a mounted pane mints values of its own"
+        );
+        pane.release(harness.app_mut());
+        assert_eq!(
+            harness.signal_slot_stats().live,
+            baseline.live,
+            "cycle {cycle}: release hands every value slot back"
+        );
+        let slots = harness.signal_slot_stats().slots;
+        if cycle == 0 {
+            needed = slots;
+        } else {
+            assert_eq!(
+                slots, needed,
+                "cycle {cycle}: the slots the first mount needed are reused, not grown"
+            );
+        }
+    }
+
+    // The header's four controls are kit components. They are released with the pane, and
+    // what stays behind is the kit's registered gap rather than this widget's: `Select`
+    // mints a signal scope its `release` does not hand back yet (three values per picker,
+    // three pickers — registered with the kit batch). Pinning the count is what makes a
+    // release that reclaimed less than this fail here, and it is also the assertion that
+    // goes red the day the kit closes the gap.
+    let pane = harness.mount::<CryptocurrencyEtfWidget>(CryptocurrencyEtfConfig);
+    let group = page(&mut harness);
+    pane.header(harness.app_mut(), HeaderGroup::Right, group)
+        .expect("the pane builds its header");
+    let mounted = harness.signal_slot_stats().live;
+    pane.release(harness.app_mut());
+    let released = harness.signal_slot_stats().live;
+    assert_eq!(
+        released,
+        baseline.live + PICKER_SCOPE_GAP,
+        "the pane releases its components; what remains is the kit's picker scopes ({mounted} while mounted)"
+    );
+}
+
+/// The pane rebuilds the row it calls `header` for, and the controls go with that row. A
+/// sync that runs after it must not touch their old nodes: the components are released,
+/// and the synchronization still succeeds.
+#[test]
+fn a_taken_down_header_row_should_be_released_rather_than_synchronized() {
+    let mut harness = harness();
+    let mut pane = pane(&mut harness);
+    build_header(&mut harness, &mut pane);
+    let row = pane
+        .widget
+        .header
+        .as_ref()
+        .expect("the header is built")
+        .root;
+
+    harness.with_cx(|cx| {
+        let window = cx.window();
+        cx.app_mut()
+            .remove_node(window, row)
+            .expect("the pane's row is taken down");
+    });
+
+    // The sync helper panics if the hook reports an error, which is what touching a stale
+    // control node would do.
+    frame(&mut harness, &mut pane);
+    assert!(
+        pane.widget.header.is_none(),
+        "the controls' components are released, not synchronized against a gone row"
+    );
+}
+
 // ── two panes ────────────────────────────────────────────────────────────────────
 
-/// Two panes of this widget in one application: the header's controls are application
-/// level actions, so the second pane must not take the first one's handler away.
+/// Two panes of this widget in one application: the header's four controls are application
+/// level actions, so neither pane may share a key with the other, and releasing one must
+/// leave the other's handlers alone.
 #[test]
 fn two_panes_should_keep_their_own_header_handlers() {
     let mut harness = harness();
@@ -1134,30 +1255,60 @@ fn two_panes_should_keep_their_own_header_handlers() {
         .header(harness.app_mut(), HeaderGroup::Right, second_group)
         .expect("the second pane builds its header");
 
-    let key_of = |scope: ui_core::node::signal::SignalScope| {
-        format_smolstr!("{}{}{}", super::REFRESH_KEY_SUFFIX, "@", scope.index())
+    let suffixes = [
+        super::REFRESH_KEY_SUFFIX,
+        super::ASSET_KEY_SUFFIX,
+        super::FUND_KEY_SUFFIX,
+        super::WINDOW_KEY_SUFFIX,
+    ];
+    // The keys `cx.unique_key` mints for one instance: the suffix at the instance's own
+    // scope. Asserting the handlers of *these* keys is what pins the widget to them — a
+    // picker built with a constant key registers a handler under that key instead, and no
+    // derived key has one.
+    let keys_of = |scope: ui_core::node::signal::SignalScope| {
+        suffixes
+            .iter()
+            .map(|suffix| format_smolstr!("{suffix}@{}", scope.index()))
+            .collect::<Vec<_>>()
     };
-    let first_key = key_of(first.scope());
-    let second_key = key_of(second.scope());
-    assert_ne!(
-        first_key, second_key,
-        "two panes never mint the same component key"
-    );
+    let first_keys = keys_of(first.scope());
+    let second_keys = keys_of(second.scope());
+    for (position, (first_key, second_key)) in first_keys.iter().zip(&second_keys).enumerate() {
+        assert_ne!(
+            first_key, second_key,
+            "two panes never mint the same component key for control {position}"
+        );
+    }
 
-    let first_action = ui_core::event::Action::Custom(format_smolstr!("{first_key}.click"));
-    let second_action = ui_core::event::Action::Custom(format_smolstr!("{second_key}.click"));
-    assert!(harness.app().has_action_handler(&first_action));
-    assert!(harness.app().has_action_handler(&second_action));
+    // The refresh control is a button, whose click is `<key>.click`; the three pickers are
+    // selects, whose trigger action is what a click on one dispatches.
+    let action_of = |key: &SmolStr| {
+        if key.starts_with(super::REFRESH_KEY_SUFFIX) {
+            ui_core::event::Action::Custom(format_smolstr!("{key}.click"))
+        } else {
+            ui_core::event::Action::Custom(format_smolstr!("{key}.trigger"))
+        }
+    };
+    for key in first_keys.iter().chain(&second_keys) {
+        assert!(
+            harness.app().has_action_handler(&action_of(key)),
+            "every pane's control keeps its own handler: {key}"
+        );
+    }
 
     first.release(harness.app_mut());
-    assert!(
-        !harness.app().has_action_handler(&first_action),
-        "the released pane takes its own handler down"
-    );
-    assert!(
-        harness.app().has_action_handler(&second_action),
-        "and leaves the other pane's handler alone"
-    );
+    for key in &first_keys {
+        assert!(
+            !harness.app().has_action_handler(&action_of(key)),
+            "the released pane takes its own handler down: {key}"
+        );
+    }
+    for key in &second_keys {
+        assert!(
+            harness.app().has_action_handler(&action_of(key)),
+            "and leaves the other pane's handler alone: {key}"
+        );
+    }
 }
 
 // ── the canvas and the pointer ────────────────────────────────────────────────────

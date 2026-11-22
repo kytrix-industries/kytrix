@@ -889,6 +889,12 @@ impl CryptocurrencyEtfWidget {
         result: WidgetRpcResult<CryptocurrencyEtfProtocol>,
         cx: &mut WidgetCx<'_>,
     ) {
+        // A failure is terminal, and every entry point has to say so: the reply to a
+        // command the recovery replaced would otherwise report the same failure again —
+        // under another error object, over the banner the user is reading.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
         if self
             .last_request_id
             .is_some_and(|answered| request_id <= answered)
@@ -1064,6 +1070,10 @@ impl CryptocurrencyEtfWidget {
         };
         if chart.node().is_none() {
             chart.build(cx, host)?;
+            // The node has no box until the frame that lays it out, so this frame cannot
+            // draw it. Ask for that frame here rather than relying on another write in
+            // this hook to schedule one.
+            let _ = cx.request_frame();
         }
         if chart.sync(cx)? {
             self.sync_chart_metrics(cx);
@@ -1528,20 +1538,23 @@ impl CryptocurrencyEtfWidget {
     /// rebuild. What a picker *offers* is likewise its item list, which a snapshot
     /// (`set_items`) or a selection (`set_chosen`) moves without a rebuild.
     fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        let Some(language) = self.header.as_ref().map(|header| header.language) else {
+        // The pane rebuilds the row it calls `header` for, so the row this widget built
+        // into may already be gone — and it took the controls with it. Touching a stale
+        // node would fail the whole synchronization, so a row that is missing is a release
+        // and nothing else (the components outlive their nodes; see
+        // [`CryptocurrencyEtfWidget::release_header`]).
+        let Some((root, slot, language)) = self
+            .header
+            .as_ref()
+            .map(|header| (header.root, header.refresh_slot, header.language))
+        else {
             return Ok(());
         };
+        if cx.tree().get(root).is_err() {
+            self.release_header(cx, false);
+            return Ok(());
+        }
         if language != *cx.read(&cx.language()) {
-            let Some(header) = self.header.as_ref() else {
-                return Ok(());
-            };
-            let slot = header.refresh_slot;
-            if cx.tree().get(slot).is_err() {
-                // The pane took its row down; the controls went with it, and only the
-                // components are left to release.
-                self.release_header(cx, false);
-                return Ok(());
-            }
             self.replace_refresh_button(cx, slot)?;
             let translate = cx.translate().clone();
             let asset = asset_items();

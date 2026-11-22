@@ -14,11 +14,19 @@
 //!
 //! A shaped handle carries an atlas lease: the glyphs it points at can be evicted
 //! (an atlas generation change, or a per-tile LRU sweep), and a handle whose lease is
-//! gone is re-shaped here rather than drawn from stale texture coordinates. The
-//! cache therefore checks [`ShapedTextHandle::is_stale`] on every hit, and the canvas
-//! that a frame builds is rebuilt whenever the chart redraws — an application that
-//! pushed stale glyphs would be told by `Canvas::push_shaped_text` returning `false`,
-//! which this module treats as "shape it again".
+//! gone is re-shaped here rather than drawn from stale texture coordinates. Two things
+//! keep a dead lease from quietly taking a label off the screen, and they are the two
+//! halves of the same promise:
+//!
+//! - the cache checks [`ShapedTextHandle::is_stale`] on every hit, and it answers
+//!   [`ChartTextCache::has_stale`] so the chart's whole-frame short-circuit cannot
+//!   decide "nothing changed" over a cache of dead handles. A lease that moved between
+//!   frames is therefore a frame the chart rebuilds — labels included — instead of
+//!   keeping a canvas the engine will no longer encode;
+//! - a line the engine refuses while the canvas is being built
+//!   (`Canvas::push_shaped_text` answers `false`) makes that canvas incomplete, and the
+//!   frame does not count as what the chart draws: the next one shapes and pushes again
+//!   rather than leaving the missing run missing.
 
 use std::sync::Arc;
 
@@ -106,6 +114,20 @@ impl ChartTextCache {
     /// The width `text` occupies, shaped in `style`.
     pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
         self.line(app, text, style).size().width
+    }
+
+    /// Whether any line this cache holds can no longer be drawn from the atlas.
+    ///
+    /// This is what the chart asks before it decides a frame changed nothing: a canvas
+    /// is a value and the chart keeps the one it built, but the *glyphs* a canvas names
+    /// are leased from a shared atlas, and an atlas generation change (a font stack
+    /// change, a reset) or a per-tile eviction leaves every handle the canvas was built
+    /// from pointing at reused texture. The engine drops such runs at encode time
+    /// (`Canvas::without_stale_glyph_runs`), so a chart that did not rebuild would lose
+    /// its axis, date and tooltip labels permanently. Nothing is stale in the steady
+    /// state, so the scan of a few dozen handles is the whole cost of the guard.
+    pub(crate) fn has_stale(&self) -> bool {
+        self.entries.iter().any(|entry| entry.handle.is_stale())
     }
 }
 

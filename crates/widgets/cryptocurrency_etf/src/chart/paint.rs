@@ -343,6 +343,12 @@ pub(crate) fn line_geometry(points: &[Option<Point>], width: f32) -> Option<Geom
 /// The canvas is built whole rather than patched: an engine canvas is a value, and a
 /// chart whose box, data or pointer moved is a different value. The chart keeps the
 /// last one it built and only rebuilds when [`CacheKey`] or the pointer says so.
+///
+/// The second half of the answer says whether every label reached the canvas. A line
+/// whose atlas lease died before it could be pushed is refused by the engine rather
+/// than encoded from reused texture, so the frame that ran into it is missing that run:
+/// it is not a frame the chart can keep (see [`ChartTextCache::has_stale`] for the other
+/// half of the same guard).
 pub(crate) fn paint(
     app: &mut App,
     data: &PreparedData,
@@ -352,8 +358,13 @@ pub(crate) fn paint(
     theme: &Theme,
     text: &mut ChartTextCache,
     line: Option<(GeometryId, Color)>,
-) -> Canvas {
-    let mut context = PaintContext { app, theme, text };
+) -> (Canvas, bool) {
+    let mut context = PaintContext {
+        app,
+        theme,
+        text,
+        whole: true,
+    };
     let chart = theme.components().chart;
     let mut canvas = Canvas::new(layout.content);
     paint_plot_rules(&mut canvas, layout, chart.grid);
@@ -386,7 +397,8 @@ pub(crate) fn paint(
     if let Some(hover) = hover.filter(|hover| hover.index < data.points.len()) {
         paint_hover(&mut canvas, data, hover, layout, theme, &mut context);
     }
-    canvas
+    let whole = context.whole;
+    (canvas, whole)
 }
 
 /// Paints one frame with the shaped text and the theme it needs.
@@ -394,6 +406,8 @@ struct PaintContext<'a> {
     app: &'a mut App,
     theme: &'a Theme,
     text: &'a mut ChartTextCache,
+    /// Whether every line this pass placed reached the canvas; see [`paint`].
+    whole: bool,
 }
 
 impl PaintContext<'_> {
@@ -422,7 +436,12 @@ impl PaintContext<'_> {
             Align::Center => x + (width - line_width) / 2.0,
             Align::Right => x + width - line_width,
         };
-        let _ = canvas.push_shaped_text(&line, Point::new(origin_x, y));
+        // A refused line is one whose atlas lease died between being shaped and being
+        // pushed: its glyphs have been reused, so the run is left out rather than drawn
+        // from stale texture, and the pass is not a whole frame any more.
+        if !canvas.push_shaped_text(&line, Point::new(origin_x, y)) {
+            self.whole = false;
+        }
     }
 }
 
