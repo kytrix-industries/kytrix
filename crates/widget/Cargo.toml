@@ -34,6 +34,12 @@ ui_core.workspace = true
 # The framework's own tests drive `ui_core::test_support` directly; the feature is
 # only turned on for test builds (and for external users through `test-support`).
 ui_core = { workspace = true, features = ["test-support"] }
+# The test host's injection tests build a headless market-participants directory (a
+# fixture that proves the seam W1b had to work around with a crate-private source):
+# its connector takes the application runtime as a typed value and its settings
+# snapshot comes from the provider's notification.
+app_config_provider.workspace = true
+widget_tokio_runtime.workspace = true
 # The instrument-link tests build legacy payloads as dynamic JSON; production code
 # never touches `serde_json`.
 serde_json.workspace = true

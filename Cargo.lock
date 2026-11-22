@@ -11378,6 +11378,7 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
+ "app_config_provider",
  "base_ui",
  "bytes",
  "i18n",
@@ -11394,6 +11395,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ui_core",
+ "widget_tokio_runtime",
 ]
 
 [[package]]

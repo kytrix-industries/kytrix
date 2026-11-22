@@ -197,8 +197,8 @@ pub trait WidgetView: Sized + 'static {
 
 ## 5. `WidgetCx`：一个上下文，一次借一个
 
-`WidgetCx<'a>` 是 widget 唯一拿得到的宿主视图：`&mut App`、`WindowId`、`&WidgetServices`、自己的 `SignalScope`、`FrameRouter`。
-节点树在 `Window` 里、`Window` 在 `App` 里，因此上下文按需借出，**同一表达式里不能同时持有两个**：
+`WidgetCx<'a>` 是 widget 唯一拿得到的宿主视图：`&mut App`、`WindowId`、`&WidgetServices`（含组合根三单例）、自己的
+`SignalScope`。节点树在 `Window` 里、`Window` 在 `App` 里，因此上下文按需借出，**同一表达式里不能同时持有两个**：
 
 ```rust
 cx.app() / cx.app_mut()              // &App / &mut App
@@ -207,12 +207,19 @@ cx.window() / cx.window_mut()        // WindowId / &mut Window
 cx.services() / cx.translate() / cx.language() / cx.theme()
 cx.config_ref(|config| ...)          // 不克隆地读设置快照（read 不登记依赖）
 cx.account() / cx.data_time_zone()   // 由设置快照派生
-cx.scope() / cx.router()
+cx.scope() / cx.layer() / cx.frame_router() / cx.animation()
 cx.signal(v) / cx.transient(v)       // 铸进 widget scope
 cx.read(&s) / cx.write(&s, v) / cx.update(&s, f)
 cx.request_frame() / cx.request_node_repaint(node) / cx.set_a11y_patch(node, patch)
 cx.handle() / cx.spawn(future) / cx.runtime()
 ```
+
+**组合根三单例（`cx.layer()` / `cx.frame_router()` / `cx.animation()`）**：`Layer`（浮层层序）、`FrameRouter`（`App::on_frame`
+单槽唯一注册者）、`AnimationRouter`（`App::on_animation_complete` 单槽唯一注册者）都是**应用级唯一实例**，由组合根创建、
+经 `WidgetServices` 注入。构建需要用它们的 kit 组件（`Overlay` / `Tooltip` / 对话框 / selector host）时 **clone 传入**
+（三者都是 `Rc` 句柄，clone 共享同一实例）。**widget 不得自建**：第二个 `Layer` 会让两个浮层对谁在上意见不一；第二个
+`AnimationRouter` 会静默覆盖引擎的完成槽，先前登记的淡出永远收不了尾；第二个 `FrameRouter` 装不上（单槽已被占用），
+它上面的路由永远不会跑。
 
 **借用通法**：先拿 `parent`（`NodeId` 是 `Copy`），再调组件的 `build(cx.app_mut(), window, parent)`；kit 组件的
 `build` 需要 `&mut App` 时先 `let window = cx.window();`。`bind_*` 闭包里要 `Translate` / `ThemeHandle` 时先 `clone()`
@@ -243,11 +250,16 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 
 ### 6.2 `Notice`：等待文案是目录引用，不是句子
 
-- `Notice::message("widget.x.y")`：一条没有参数的目录文案。
+- `Notice::message("widget.x.y")`：一条没有参数的目录文案。**它可能是富文本**：目录把若干 widget 自己的文案写成
+  `<p align="center">…</p>`（`widget.news.logged_out`、`widget.empty.hint` 等），surface 会按内容判断并交给
+  `base_ui::kit::markdown` 画，widget 不需要（也不能）自己标记。
 - `Notice::MarketNotLoaded { venues, supported }`：`venues` 是自己在等的市场（只是状态身份，句子不读它），`supported` 是句子
   列出来的、本组件能读的全部市场（从静态定义表取，与用户选了什么无关）。句子 `common.market_not_loaded` 由 `widget::venue`
   供给；它**是富文本**（对齐段落 + `<kbd>` 图标 + 一行一个市场名和 logo），surface 用 `base_ui::kit::markdown` 画，
   widget 不拼文本、不插值、不自己渲染。
+- **判断口径是「解析后的目录值」**：`Notice::is_markdown(&Translate)` 解析当前语言的文案，含 HTML 标签 / markdown 链接、
+  图片 / `**强调**` / 行内代码就是富文本，否则是一句话。同一 key 在不同语言可以一边富文本、一边纯文本。widget 侧只报
+  `Notice`，不预判、不缓存 `is_markdown`。
 - 等待占位**没有动作按钮**，所以文案只能是一句话（和它指向的控件图标）；「未加载」是等待，不是失败。
 - **行内图片是占位色块**：`common.market_not_loaded` 的市场 logo 与 `<kbd>` 图标在资产批接入前由
   `PlaceholderImagePaint` 画成灰块；文字、`<kbd>` 与粗体已经正确。**W1 真窗口验收不据此判缺陷**（资产批次事项，
@@ -308,7 +320,7 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 | 字段 | 用途 | 注意 |
 |---|---|---|
 | `translate` / `language` | 文案 + 语言依赖 | 见 §7 |
-| `config: Signal<Config>` | 设置快照 | `bind_*` 里读才跟随；`sync`/`load` 里用 `cx.config_ref(..)` |
+| `config: Signal<Config>` | 设置快照 | `bind_*` 里读才跟随；`sync`/`load` 里用 `cx.config_ref(..)`。**框架 surface 根也读它**：设置写入即便 widget 无正文也调度一帧（`sync` 能看到新账户 / 时区），widget 不要自己 `request_frame` |
 | `theme: ThemeHandle` | 语义色 | 只在 `bind_style` 里读 |
 | `market_participants: Option<MarketParticipantsConnector>` | 市场目录 | 应用根永远 `Some`；headless 测试为 `None`，widget 自己映射为业务 notice/failure。**P4 补缝后改必填** |
 | `catalog_generation: Signal<u64>` | 目录已发布世代（组合根写、框架 surface 根读） | widget 在 `sync` 里比较它判断目录是否发布过新世代（§8.3）；`0` = 尚未发布；不在 `body` 里轮询 `catalog()` |
@@ -316,6 +328,9 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 | `open_url: Rc<dyn Fn(&str)>` | 打开外部链接 | 调用即可，不碰浏览器 / shell |
 | `sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>` | 应用层音效字节 | `None` = 本宿主无音频（测试通常如此），不是错误 |
 | `reduce_motion: Signal<bool>` | 无障碍减弱动效 | 动画前 `cx.read(&services.reduce_motion)`，为真直接落终值 |
+| `layer: Rc<Layer>` | 应用级唯一的浮层层序 | 经 `cx.layer()` 取；构建 `Overlay` / `Tooltip` / 对话框 / selector host 时 **clone 传入**。widget 不得自建（§5） |
+| `frame_router: Rc<FrameRouter>` | 应用级唯一的每帧扇出 | 经 `cx.frame_router()` 取；框架的 widget 路由已在上面。widget 自建 router 装不上单槽、路由永不跑 |
+| `animation_router: Rc<AnimationRouter>` | 应用级唯一的动画完成路由 | 经 `cx.animation()` 取；每个 `Overlay` / `Tooltip` 都用它。widget 自建会覆盖引擎单槽，先前淡出收不了尾 |
 | `runtime: tokio::runtime::Handle` | stream / RPC 的运行时 | 不自己建 runtime |
 
 **数据时区与账户**：画的那一帧读 `cx.data_time_zone()` / `cx.account()`（由设置快照派生，不缓存、不格式化后存快照）；
@@ -373,6 +388,10 @@ if generation != self.seen {
   - `sync`：结构 / 画布 / 实测回写（列表行内容、canvas、行高）。
 - **kit 组件也走五段式**：`new(app, …)` → `build(tree, parent)`（或 `build(app, window, parent)`）→ `mount`/`attach`（如列表）→
   `sync(app)` → `dispatch(app, &event)` → `release(app)`。控件的 `on_click` 回调是 `Rc` 闭包，捕获 widget 需要的信号与动作。
+- **需要组合根单例的 kit 组件用 `cx` 的访问器装配**：`Overlay` / `Tooltip` / 对话框 / selector host 的构造要
+  `theme.clone()` + `layer.clone()` + `animation.clone()`（`cx.theme()` / `cx.layer()` / `cx.animation()`），`sync` 由
+  `cx.frame_router()` 上的路由驱动（widget 自己的 `sync` 里调 `component.sync(cx.app_mut())` 即可，不要再注册第二个
+  `App::on_frame`）。三个 `Rc` 句柄 clone 的是同一个组合根实例，widget 不新建（§5）。
 - **表格 / 列表的行闭包没有 `App`**：行内容里的动态值只能来自挂在节点上的 `bind_*`（读主题 / 设置信号）或行模型字段；
   需要 App 的结构性更新放到 widget 的 `sync`（`set_rows` / `set_items` / `push`）。
 - **释放顺序**：`WidgetView::release` 里 release 自己建的 kit 组件（节点仍在，可解绑 / 停动画），**不要自己删 surface 节点**；
@@ -405,7 +424,19 @@ if generation != self.seen {
 - 契约层装置是 `widget::test_support::WidgetTestApp`（`#[cfg(test)]` 或 feature `test-support`）：
   - 组合与生产相同的 `WidgetServices`（目录 / 服务为 `None`，`catalog_generation` = 0，`open_url` / `sound` 是 no-op，
     `reduce_motion` = false）；
+  - **组合根三单例**（P3-1e）：宿主自建 `Layer` / `FrameRouter` / `AnimationRouter`，经 `WidgetServices::builder` 注入，
+    并用自己的句柄暴露为 `layer()` / `router()` / `animation()`；`cx.layer()` / `cx.animation()` 打开的浮层可直接在这些
+    宿主句柄上断言（注册进同一栈、装的是同一个完成路由）。测试不得另建一套单例；
   - `WidgetTestApp::new()`（fixture 目录）或 `with_translate(...)`（产品目录文案）；
+  - **注入协作者**（P3-1d，不再在 widget crate 里加私有源缝）：`with_open_url(|url| ...)`、`with_sound(|name| ...)`、
+    `with_market_participants(Option<MarketParticipantsConnector>)`、`with_kytrix_service(Option<KytrixServiceConnector>)`。
+    headless 测试可以自建 `MarketParticipantsConnector`（`MarketParticipantsConnectorInput` + `Runtime::from_handle(测试 runtime)`）
+    后交给 `mount` 驱动目录路径；`KytrixServiceConnector::install` 仍要工具包上下文，headless 只能传 `None`（设计 §13.9 R-1，
+    P4 补缝）；
+  - **runtime 驱动**（P3-1d）：`drain_runtime()` 推进 services 所在的 **current-thread** runtime 一个 turn；
+    `run_until_idle()` 交替 runtime turn 与 `drain()` 直到 `frame_requests` / 任务数都不再变化（有界 `RUNTIME_TURNS`，返回
+    turn 数）。**不 sleep、不推进时钟**：需要定时器 / 超时的测试仍用自己拥有的 `#[tokio::test(start_paused = true)]`
+    runtime；`WidgetCx::spawn` / `AppHandle` 的任务走引擎 handle，不由这两个方法驱动；
   - `mount::<W>(config)` / `try_mount` / `try_mount_in_scope(parent, scope, config)`（拒绝挂载失败路径的探针）、
     `build_surface` / `sync_surface`、`report` / `switch_language`；
   - `drain()` = `router.tick` + `TestApp::drain`（生产泵序；`TestApp::drain` 本身不跑 `on_frame`）；
@@ -521,3 +552,22 @@ Windows 上稳定 `CVT1100 duplicate resource` + `LNK1123`。P5 删除 gpui 依�
 不是测试失败，也不是可以长期保留的开关。
 
 未执行的在线 RPC、真实窗口与 release profile 验证必须在交付说明里明确写「未执行」；静态检查通过不等于性能已测量。
+
+---
+
+## 15. 契约缺口登记（P3-1d 实测，kit 后续批处理）
+
+W1（`news` / `force_order`）实迁暴露的两个 **kit 侧**缺口由 P3-1d 登记。**归属是 kit 后续批，不是 widget 批**：
+widget 侧不得各自重建组件库、另造绑定面或自实现容器。
+
+1. **kit 静态文案组件没有绑定面**：`Badge` / `Button`（`label` / `icon`）/ `EmptyState`（`text`）的文案是构建期
+   `SmolStr` / `IconKind`；`kit::table` 的 `Column::header` / `empty_text` 同理——它们不带 `bind_text` 闭包。AGENTS §7
+   要求语言在 `bind_*` 里读，因此当前唯一通法是 widget 在 `sync` 里检测语言 / 选项 / 可用性变化 →
+   `remove_node` + 组件 `release` + 重建自己建的那一小块（surface 对静态 notice 已有先例；W1 的 header 声音按钮与空态、
+   `force_order` 的表格都这么做，并各有测试）。**登记 kit 后续批补 `bind_text` / `*_key` 形式的绑定面**；补上之前 W 批
+   按「重建自己建的节点」实现，不把这段重建逻辑抽成 widget 间共享封装、不改 kit 组件语义。
+2. **`kit::list` 无 separator、无像素 overscan**：旧 `DequeUnsizedList::separator` 与 `LIST_OVERDRAW = 150 px` 没有
+   对等能力。当前通法：行内容里自建 `kit::separator`（`index > 0`）近似 separator；`ListOptions::variable(row_height)`
+   + 默认 overscan **行数**近似像素缓冲（**已知差异**，W1 真窗口验收不据此判缺陷）。**登记 kit 后续批**：`list` 增加
+   separator 钩子与像素级 overscan 估计；在此之前 widget 不自己实现虚拟列表 / 滚动容器，也不改 `kit::list` 的
+   `ListOptions`。
