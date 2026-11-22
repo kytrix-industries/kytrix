@@ -3,9 +3,12 @@
 //! A [`WidgetCx`] is a borrowed view of everything a widget needs to build nodes and
 //! to drive its own state, assembled by the framework from the four things it holds:
 //! the application context, the window the widget lives in, the injected
-//! [`WidgetServices`], and the widget's own [`SignalScope`] plus [`FrameRouter`].
-//! Nothing here is a thread-local, a global, or a type-lookup: a test composes the
-//! same context the application does.
+//! [`WidgetServices`], and the widget's own [`SignalScope`]. The frame router the
+//! widget's routes belong to is the one in the services
+//! ([`WidgetCx::frame_router`]), next to the layer stack ([`WidgetCx::layer`]) and the
+//! animation router ([`WidgetCx::animation`]) the composition root created. Nothing
+//! here is a thread-local, a global, or a type-lookup: a test composes the same
+//! context the application does.
 //!
 //! # Borrow rules
 //!
@@ -23,6 +26,25 @@
 //! A widget builds with `cx.tree_mut()`, and calls an `app`-form kit component with
 //! `cx.app_mut()` plus [`WidgetCx::window`]. Inside a widget method the context is
 //! borrowed mutably, so the two are naturally taken one after the other.
+//!
+//! # The composition-root singletons
+//!
+//! Three collaborators are application-level instances the composition root creates
+//! exactly once and injects through [`WidgetServices`]:
+//!
+//! - [`WidgetCx::layer`] — the one layer stack that decides which overlay is on top;
+//! - [`WidgetCx::frame_router`] — the one owner of the engine's frame hook;
+//! - [`WidgetCx::animation`] — the one owner of the engine's animation-completion
+//!   hook.
+//!
+//! A widget **must not build its own**. A second layer stack splits the z-order (two
+//! overlays opened through different stacks disagree about who is on top); a second
+//! animation router silently takes the engine's single completion slot over and the
+//! overlays that registered with the first one never finish fading out; a second
+//! frame router cannot install itself at all (the slot is taken, `FrameRouter::new`
+//! reports it) and its routes would never run. The context hands out the instances it
+//! was given — clone them into the kit component being built (an `Overlay`, a dialog,
+//! a selector host), never construct replacements.
 //!
 //! # Language dependency
 //!
@@ -47,7 +69,10 @@
 //! is not tracked, which is correct: loading does not draw.
 
 use app_config::settings::Config;
-use base_ui::theme::handle::ThemeHandle;
+use base_ui::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
+};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use tokio::runtime::Handle;
@@ -76,7 +101,6 @@ pub struct WidgetCx<'a> {
     window: WindowId,
     services: &'a WidgetServices,
     scope: SignalScope,
-    router: FrameRouter,
 }
 
 impl<'a> WidgetCx<'a> {
@@ -87,14 +111,12 @@ impl<'a> WidgetCx<'a> {
         window: WindowId,
         services: &'a WidgetServices,
         scope: SignalScope,
-        router: FrameRouter,
     ) -> Self {
         Self {
             app,
             window,
             services,
             scope,
-            router,
         }
     }
 
@@ -166,9 +188,11 @@ impl<'a> WidgetCx<'a> {
     /// A read here does not create a dependency — it is for decisions taken in
     /// `sync`/`load`. A widget that must redraw when a setting moves reads
     /// [`WidgetServices::config`](crate::services::WidgetServices::config) inside
-    /// the closure that draws. The snapshot is not cloned: a per-frame or per-row
-    /// read (the display time zone, the account) borrows it for the duration of the
-    /// call.
+    /// the closure that draws. The framework's surface root also reads that signal,
+    /// so a settings write schedules a frame even while the widget has no body — its
+    /// `sync` then sees the new snapshot. The snapshot is not cloned: a per-frame or
+    /// per-row read (the display time zone, the account) borrows it for the duration
+    /// of the call.
     pub fn config_ref<R>(&self, read: impl FnOnce(&Config) -> R) -> R {
         self.app.read_with(&self.services.config, read)
     }
@@ -217,9 +241,35 @@ impl<'a> WidgetCx<'a> {
         self.scope
     }
 
-    /// The frame router, so a widget can register the components it drives.
-    pub const fn router(&self) -> &FrameRouter {
-        &self.router
+    /// The application's one layer stack, for the overlays the widget builds.
+    ///
+    /// Clone it into the kit component (the component keeps its own `Layer` handle;
+    /// every handle shares the same stack). Never build a `Layer::new()` here: a
+    /// second stack would disagree with the composition root about the z-order (see
+    /// the module documentation).
+    pub fn layer(&self) -> &Layer {
+        &self.services.layer
+    }
+
+    /// The application's one frame router.
+    ///
+    /// The route the framework registered for this widget lives in this router, next
+    /// to the routes of the kit components the widget ticks (overlays, lists,
+    /// tables). A widget that needs its own per-frame work registers it here and keeps
+    /// the [`RouteId`](crate::frame::RouteId); building a second `FrameRouter` cannot
+    /// install itself and the route would never run.
+    pub fn frame_router(&self) -> &FrameRouter {
+        &self.services.frame_router
+    }
+
+    /// The application's one animation-completion router.
+    ///
+    /// Every `Overlay` / `Tooltip` the widget builds is handed a clone of this router;
+    /// the engine's completion slot belongs to it. A second router would replace the
+    /// callback and the fade-outs the first one tracks would never finish (see the
+    /// module documentation).
+    pub fn animation(&self) -> &AnimationRouter {
+        &self.services.animation_router
     }
 
     /// Mints a signal in the widget's scope.

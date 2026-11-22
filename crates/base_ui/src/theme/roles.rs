@@ -164,117 +164,118 @@ pub(crate) fn resolve_roles(palette: &Palette) -> RoleColors {
     let canvas = palette.canvas;
     let text = palette.text;
     let mut colors = [Color::TRANSPARENT; Role::COUNT];
-    let mut set = |role: Role, color: Color| colors[role.index()] = color;
-
-    // 表面：z 轴，由远及近。反色块就是文字色——浅色外观的近黑、深色外观的近白，正好是"页面的
-    // 反面"。
-    set(Role::SurfaceCanvas, canvas);
-    set(Role::SurfaceRaised, palette.surface_raised);
-    set(Role::SurfaceSunken, palette.surface_sunken);
-    set(Role::SurfaceOverlay, palette.overlay);
-    set(Role::SurfaceControl, palette.control);
-    set(Role::SurfaceInverse, text);
-
-    // 前景：正文、次级、占位、禁用，再混出两阶；两个"在填充上"的文字直接取调色板。
-    set(Role::FgDefault, text);
-    set(Role::FgMuted, mix(text, canvas, 0.30));
-    set(Role::FgSubtle, mix(text, canvas, 0.50));
-    set(Role::FgDisabled, mix(text, canvas, 0.62));
-    set(Role::FgOnBrand, palette.on_brand);
-    set(Role::FgOnInverse, palette.on_inverse);
-
-    // 线：分隔线画在页面/面板头/表格面/菜单上，按页面混；深色外观把它带得更远（那里的 `raised`
-    // 与 `overlay` 只比页面高 0.05–0.06 L）。强边缘在深色外观里少走一步，因为亮色混进暗页面比
-    // 暗色混进亮页面涨对比涨得快。
-    set(
-        Role::LineDivider,
-        mix(text, canvas, if dark { 0.72 } else { 0.76 }),
-    );
-    set(Role::LineBorder, mix(text, canvas, 0.55));
-    set(
-        Role::LineStrong,
-        mix(text, canvas, if dark { 0.45 } else { 0.30 }),
-    );
-    set(Role::LineFocus, palette.brand);
-
-    // 品牌色与它的两阶。
-    set(Role::BrandBase, palette.brand);
-    set(Role::BrandHover, step(palette.brand, 0.045, dark));
-    set(Role::BrandActive, step(palette.brand, 0.075, dark));
-
-    // 状态阶梯：一个配方给每一档——本色、几乎所有混进页面的 chip 填充、两者之间的边缘。
-    let status_role = |color: Color| [color, tint(color, canvas, dark), mix(color, canvas, 0.62)];
-    let statuses = [
-        (Role::StatusDangerBase, palette.status.danger),
-        (Role::StatusWarningBase, palette.status.warning),
-        (Role::StatusSuccessBase, palette.status.success),
-        (Role::StatusInfoBase, palette.status.info),
-        (Role::StatusElevatedBase, palette.status.elevated),
-    ];
-    for (base, color) in statuses {
-        let [base_color, surface, border] = status_role(color);
-        let index = base.index();
-        set(base, base_color);
-        set(Role::ALL[index + 1], surface);
-        set(Role::ALL[index + 2], border);
-    }
-
-    // 行情色：与状态色分离；chip 填充用同一配方，weak 是本色 22% alpha 的淡洗。
-    set(Role::MarketUp, palette.market.up);
-    set(Role::MarketDown, palette.market.down);
-    set(Role::MarketFlat, mix(text, canvas, 0.50));
-    set(Role::MarketUpSurface, tint(palette.market.up, canvas, dark));
-    set(
-        Role::MarketDownSurface,
-        tint(palette.market.down, canvas, dark),
-    );
-    set(Role::MarketUpWeak, with_alpha(palette.market.up, 0.22));
-    set(Role::MarketDownWeak, with_alpha(palette.market.down, 0.22));
-
-    // 恐慌贪婪：调色板原样（这是刻度自己的阶梯，不是状态色）。
-    set(Role::FearGreedExtremeFear, palette.fear_greed.extreme_fear);
-    set(Role::FearGreedFear, palette.fear_greed.fear);
-    set(Role::FearGreedNeutral, palette.fear_greed.neutral);
-    set(Role::FearGreedGreed, palette.fear_greed.greed);
-    set(
-        Role::FearGreedExtremeGreed,
-        palette.fear_greed.extreme_greed,
-    );
-
-    // 图表家具画在内容面（`surface.sunken`）上，因此网格与十字线按它混；地图的两个填充与三个描
-    // 边是作者写的值（它们互相读，不对表面读）。
-    set(Role::ChartGrid, mix(text, palette.surface_sunken, 0.86));
-    set(Role::ChartAxis, mix(text, canvas, 0.50));
-    set(
-        Role::ChartCrosshair,
-        mix(text, palette.surface_sunken, 0.45),
-    );
-    set(Role::ChartMapOcean, palette.map_ocean);
-    set(Role::ChartMapLand, palette.map_land);
-    set(Role::ChartMapBorder, palette.map_border);
-    set(Role::ChartMapRoad, palette.map_road);
-    set(Role::ChartMapRoadMinor, palette.map_road_minor);
-    for (position, series) in [
-        Role::ChartSeries0,
-        Role::ChartSeries1,
-        Role::ChartSeries2,
-        Role::ChartSeries3,
-        Role::ChartSeries4,
-        Role::ChartSeries5,
-    ]
-    .into_iter()
-    .zip(palette.series)
     {
-        set(position, series);
+        let mut set = |role: Role, color: Color| colors[role.index()] = color;
+
+        // 表面：z 轴，由远及近。反色块就是文字色——浅色外观的近黑、深色外观的近白，正好是"页面的
+        // 反面"。
+        set(Role::SurfaceCanvas, canvas);
+        set(Role::SurfaceRaised, palette.surface_raised);
+        set(Role::SurfaceSunken, palette.surface_sunken);
+        set(Role::SurfaceOverlay, palette.overlay);
+        set(Role::SurfaceControl, palette.control);
+        set(Role::SurfaceInverse, text);
+
+        // 前景：正文、次级、占位、禁用，再混出两阶；两个"在填充上"的文字直接取调色板。
+        set(Role::FgDefault, text);
+        set(Role::FgMuted, mix(text, canvas, 0.30));
+        set(Role::FgSubtle, mix(text, canvas, 0.50));
+        set(Role::FgDisabled, mix(text, canvas, 0.62));
+        set(Role::FgOnBrand, palette.on_brand);
+        set(Role::FgOnInverse, palette.on_inverse);
+
+        // 线：分隔线画在页面/面板头/表格面/菜单上，按页面混；深色外观把它带得更远（那里的 `raised`
+        // 与 `overlay` 只比页面高 0.05–0.06 L）。强边缘在深色外观里少走一步，因为亮色混进暗页面比
+        // 暗色混进亮页面涨对比涨得快。
+        set(
+            Role::LineDivider,
+            mix(text, canvas, if dark { 0.72 } else { 0.76 }),
+        );
+        set(Role::LineBorder, mix(text, canvas, 0.55));
+        set(
+            Role::LineStrong,
+            mix(text, canvas, if dark { 0.45 } else { 0.30 }),
+        );
+        set(Role::LineFocus, palette.brand);
+
+        // 品牌色与它的两阶。
+        set(Role::BrandBase, palette.brand);
+        set(Role::BrandHover, step(palette.brand, 0.045, dark));
+        set(Role::BrandActive, step(palette.brand, 0.075, dark));
+
+        // 状态阶梯：一个配方给每一档——本色、几乎所有混进页面的 chip 填充、两者之间的边缘。
+        let status_role =
+            |color: Color| [color, tint(color, canvas, dark), mix(color, canvas, 0.62)];
+        let statuses = [
+            (Role::StatusDangerBase, palette.status.danger),
+            (Role::StatusWarningBase, palette.status.warning),
+            (Role::StatusSuccessBase, palette.status.success),
+            (Role::StatusInfoBase, palette.status.info),
+            (Role::StatusElevatedBase, palette.status.elevated),
+        ];
+        for (base, color) in statuses {
+            let [base_color, surface, border] = status_role(color);
+            let index = base.index();
+            set(base, base_color);
+            set(Role::ALL[index + 1], surface);
+            set(Role::ALL[index + 2], border);
+        }
+
+        // 行情色：与状态色分离；chip 填充用同一配方，weak 是本色 22% alpha 的淡洗。
+        set(Role::MarketUp, palette.market.up);
+        set(Role::MarketDown, palette.market.down);
+        set(Role::MarketFlat, mix(text, canvas, 0.50));
+        set(Role::MarketUpSurface, tint(palette.market.up, canvas, dark));
+        set(
+            Role::MarketDownSurface,
+            tint(palette.market.down, canvas, dark),
+        );
+        set(Role::MarketUpWeak, with_alpha(palette.market.up, 0.22));
+        set(Role::MarketDownWeak, with_alpha(palette.market.down, 0.22));
+
+        // 恐慌贪婪：调色板原样（这是刻度自己的阶梯，不是状态色）。
+        set(Role::FearGreedExtremeFear, palette.fear_greed.extreme_fear);
+        set(Role::FearGreedFear, palette.fear_greed.fear);
+        set(Role::FearGreedNeutral, palette.fear_greed.neutral);
+        set(Role::FearGreedGreed, palette.fear_greed.greed);
+        set(
+            Role::FearGreedExtremeGreed,
+            palette.fear_greed.extreme_greed,
+        );
+
+        // 图表家具画在内容面（`surface.sunken`）上，因此网格与十字线按它混；地图的两个填充与三个描
+        // 边是作者写的值（它们互相读，不对表面读）。
+        set(Role::ChartGrid, mix(text, palette.surface_sunken, 0.86));
+        set(Role::ChartAxis, mix(text, canvas, 0.50));
+        set(
+            Role::ChartCrosshair,
+            mix(text, palette.surface_sunken, 0.45),
+        );
+        set(Role::ChartMapOcean, palette.map_ocean);
+        set(Role::ChartMapLand, palette.map_land);
+        set(Role::ChartMapBorder, palette.map_border);
+        set(Role::ChartMapRoad, palette.map_road);
+        set(Role::ChartMapRoadMinor, palette.map_road_minor);
+        for (position, series) in [
+            Role::ChartSeries0,
+            Role::ChartSeries1,
+            Role::ChartSeries2,
+            Role::ChartSeries3,
+            Role::ChartSeries4,
+            Role::ChartSeries5,
+        ]
+        .into_iter()
+        .zip(palette.series)
+        {
+            set(position, series);
+        }
+
+        // 选择与叠层。
+        set(Role::Selection, mix(palette.brand, canvas, 0.62));
+        set(Role::VeilHover, with_alpha(text, palette.veil_hover));
+        set(Role::VeilActive, with_alpha(text, palette.veil_active));
+        set(Role::Scrim, black_with_alpha(palette.scrim_alpha));
     }
-
-    // 选择与叠层。
-    set(Role::Selection, mix(palette.brand, canvas, 0.62));
-    set(Role::VeilHover, with_alpha(text, palette.veil_hover));
-    set(Role::VeilActive, with_alpha(text, palette.veil_active));
-    set(Role::Scrim, black_with_alpha(palette.scrim_alpha));
-
-    drop(set);
 
     let roles = RoleColors { colors };
     roles.assert_contrast_floors();

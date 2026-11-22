@@ -13,13 +13,16 @@
 //! | waiting (a rich [`Notice`]) | the notice's markdown through [`kit::markdown`](base_ui::kit::markdown) |
 //! | failed ([`Failure`]) | the failure's detail plus a [`kit::button`](base_ui::kit::button) that runs the recovery |
 //!
-//! A waiting notice is a **catalogue reference**, and one of its two shapes is
-//! authored as rich text: `common.market_not_loaded` is an aligned paragraph with a
-//! `<kbd>` icon and one markdown line per venue (see [`crate::venue`]). Drawing its
-//! source as plain text would put `<p align="center">…` and `![](file://…)` in front
-//! of the user, so a rich notice goes through the engine's markdown component —
-//! which is the same component the rest of the interface reads catalogue markdown
-//! with. A plain notice stays a sentence, drawn by the empty state.
+//! A waiting notice is a **catalogue reference**, and the catalogue authors some of
+//! those values as rich text: `common.market_not_loaded` is an aligned paragraph
+//! with a `<kbd>` icon and one markdown line per venue (see [`crate::venue`]), and
+//! several widgets' own notices (`widget.news.logged_out`, say) are `<p …>`
+//! paragraphs as well. Drawing their source as plain text would put
+//! `<p align="center">…` and `![](file://…)` in front of the user, so a notice
+//! whose resolved value carries markup goes through the engine's markdown component
+//! — which is the same component the rest of the interface reads catalogue markdown
+//! with. [`Notice::is_markdown`] answers that question in the language showing now;
+//! a plain notice stays a sentence, drawn by the empty state.
 //!
 //! This lives with the framework rather than with the shared component library
 //! because it is not a general-purpose component: it exists to be a widget body's
@@ -143,7 +146,7 @@ impl Placeholder {
         parent: NodeId,
         notice: &Notice,
     ) -> Result<Self, EngineError> {
-        if notice.is_markdown() {
+        if notice.is_markdown(cx.translate()) {
             let source = notice.resolve(cx.translate());
             let document = parse_document(source.as_str(), &EmbeddedAssets);
             let window = cx.window();
@@ -342,6 +345,39 @@ mod tests {
             harness.text_of(parent).contains("Waiting for orders"),
             "the notice's sentence is drawn: {:?}",
             harness.text_of(parent)
+        );
+        assert!(
+            harness.find_by_debug_prefix(parent, "MARKDOWN").is_none(),
+            "a plain sentence is drawn by the empty state, not the markdown component"
+        );
+    }
+
+    /// The catalogue also authors a widget's own messages as rich text; the
+    /// decision comes from the resolved value, so such a message is drawn by the
+    /// markdown component and its source markup never reaches the user.
+    #[test]
+    fn a_rich_message_notice_goes_through_the_markdown_component() {
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+
+        harness.with_cx(|cx| {
+            super::Placeholder::notice(cx, parent, &Notice::message("test.rich"))
+                .expect("the rich notice builds");
+        });
+        harness.drain();
+
+        let text = harness.text_of(parent);
+        assert!(
+            harness.find_by_debug_prefix(parent, "MARKDOWN").is_some(),
+            "the message's catalogue value is rich text: {text:?}"
+        );
+        assert!(
+            !text.contains("<p ") && !text.contains("<kbd>") && !text.contains("![]("),
+            "the source markup is not drawn as text: {text:?}"
+        );
+        assert!(
+            harness.has_inline_boxes(parent),
+            "the `<kbd>` icon is an inline box, not source text: {text:?}"
         );
     }
 
