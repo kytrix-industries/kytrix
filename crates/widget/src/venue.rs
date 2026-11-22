@@ -337,6 +337,10 @@ mod tests {
     /// The notice a pane shows while a market's metadata is not loaded is the one message
     /// of the product that asks the user to load one, and it reads out of the catalogue the
     /// product ships, in both of its languages.
+    ///
+    /// This pins the **markdown source** `Notice::resolve` supplies; that the source is
+    /// drawn as rich text (rather than shown verbatim) is pinned by the surface test
+    /// `surface::tests::a_rich_notice_is_drawn_as_rich_text`.
     #[test]
     fn a_market_notice_should_list_its_market_participants_in_both_languages() {
         for (language, names, logo) in [
@@ -354,8 +358,12 @@ mod tests {
             let notice = Notice::MarketNotLoaded {
                 venues: vec![VenueId::Binance],
                 supported: vec![VenueId::Binance, VenueId::Okx],
-            }
-            .resolve(&translate(language));
+            };
+            assert!(
+                notice.is_markdown(),
+                "the placeholder must draw this notice through the markdown component"
+            );
+            let notice = notice.resolve(&translate(language));
 
             assert!(
                 notice.contains(&format!(

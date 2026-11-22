@@ -11,10 +11,10 @@
 //! reads the old value back.
 //!
 //! The report runs against the engine's application context. It is fire-and-forget:
-//! the work it triggers runs after the current update, so a widget may report from
-//! its own frame synchronization or from a control's handler without re-entering
-//! the entity that is already running, and reporting more than once for one change
-//! is harmless.
+//! the work it triggers runs after the current frame's synchronization, so a widget
+//! may report from its own `sync` or from a control's handler without re-entering the
+//! widget that is already running, and reporting more than once for one change is
+//! harmless.
 
 use std::rc::Rc;
 

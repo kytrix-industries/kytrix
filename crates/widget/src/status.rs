@@ -140,6 +140,17 @@ impl Notice {
         Self::Message(key)
     }
 
+    /// Whether [`resolve`](Self::resolve) answers rich text rather than plain text.
+    ///
+    /// `common.market_not_loaded` is authored as an aligned HTML paragraph with a
+    /// `<kbd>` icon and one markdown line per venue, so the placeholder draws it
+    /// through `base_ui::kit::markdown`; a plain [`Notice::Message`] is drawn as a
+    /// sentence. The distinction is a property of the catalogue entry, not of the
+    /// state, so it lives here beside the variant that carries it.
+    pub const fn is_markdown(&self) -> bool {
+        matches!(self, Self::MarketNotLoaded { .. })
+    }
+
     /// Resolves the reference into the sentence the catalogue holds in the language
     /// showing now.
     pub fn resolve(&self, translate: &Translate) -> SmolStr {

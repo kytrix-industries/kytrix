@@ -11,6 +11,7 @@ test-support = ["ui_core/test-support"]
 
 [dependencies]
 ahash.workspace = true
+bytes.workspace = true
 i18n.workspace = true
 log.workspace = true
 serde = { workspace = true, features = ["derive"] }

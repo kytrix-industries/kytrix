@@ -44,11 +44,13 @@ use std::rc::Rc;
 
 use app_config::settings::Config;
 use base_ui::theme::handle::ThemeHandle;
+use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, translate::Translate, translator::types::I18n};
 use smol_str::SmolStr;
 use ui_core::{
     a11y::A11yPatch,
     app::App,
+    error::EngineError,
     event::{Action, ActionSource},
     node::{
         builder::NodeBuilder,
@@ -151,22 +153,38 @@ impl WidgetTestApp {
     /// settings snapshot, a light theme, and a frame router already installed.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_translate(fixture_translate(LanguageCode::En))
+    }
+
+    /// Builds the host over an explicit translation context.
+    ///
+    /// A test that asserts catalogue-authored copy (a notice the product ships, say)
+    /// needs the product's own catalogue rather than the fixture one; everything else
+    /// is composed exactly as [`WidgetTestApp::new`] composes it.
+    #[must_use]
+    pub fn with_translate(translate: Translate) -> Self {
         let mut app = TestApp::new();
         let window = app.window_id();
         let scope = app.app_mut().signal_scope();
         let language = app.app_mut().signal_scoped(scope, LanguageCode::En);
         let config = app.app_mut().signal_scoped(scope, Config::default());
+        let reduce_motion = app.app_mut().signal_scoped(scope, false);
         let theme = ThemeHandle::new(app.app_mut(), base_ui::theme::appearance::Appearance::Light);
         let runtime = app.app().runtime_handle().clone();
+        let sound: Rc<dyn Fn(&'static str) -> Option<Bytes>> = Rc::new(|_| None);
         let services = Rc::new(WidgetServices {
-            translate: fixture_translate(LanguageCode::En),
+            translate,
             language,
             config,
             theme,
             market_participants: None,
+            kytrix_service: None,
+            open_url: Rc::new(|_| {}),
+            sound,
+            reduce_motion,
             runtime,
         });
-        let router = FrameRouter::new(app.app_mut());
+        let router = FrameRouter::new(app.app_mut()).expect("the host owns the frame hook slot");
         let status = WidgetStatus::new(app.app_mut(), scope);
 
         Self {
@@ -330,6 +348,14 @@ impl WidgetTestApp {
 
     /// Mounts a widget through the real registration path and returns its handle.
     pub fn mount<W: WidgetView>(&mut self, config: W::Config) -> AnyWidget {
+        self.try_mount::<W>(config).expect("the widget mounts")
+    }
+
+    /// Mounts a widget, keeping the error a refused construction reports.
+    pub fn try_mount<W: WidgetView>(
+        &mut self,
+        config: W::Config,
+    ) -> Result<AnyWidget, EngineError> {
         let services = Rc::clone(&self.services);
         let router = self.router.clone();
         let parent = self.root();
@@ -343,7 +369,6 @@ impl WidgetTestApp {
             config,
             crate::config::WidgetConfigChange::default(),
         )
-        .expect("the widget mounts")
     }
 
     /// Whether the node draws (its evaluated style patch is visible).
@@ -450,11 +475,61 @@ impl WidgetTestApp {
             .expect("the node is alive");
     }
 
-    /// The recovery action the framework labelled for a widget, for assertions that
-    /// do not go through a click.
+    /// Turns on a11y capture for the following frames.
+    ///
+    /// The first drained frame is the full tree; every later one is the incremental
+    /// delivery. Assertions read [`WidgetTestApp::a11y_hidden`] against the last
+    /// drained frame.
+    pub fn enable_a11y_capture(&mut self) {
+        self.app.enable_a11y_capture();
+    }
+
+    /// Whether the engine marked `node` hidden in the last drained a11y delivery.
+    ///
+    /// This is the engine's own hidden predicate (`A11yPatch.hidden` / `visible` /
+    /// `display:none` resolved by the a11y tree), not the style patch: it is what an
+    /// assistive technology receives.
     #[must_use]
-    pub fn recovery_action(&self) -> WidgetAction {
-        WidgetAction::new("common.retry", |_| {})
+    pub fn a11y_hidden(&self, node: NodeId) -> bool {
+        let snapshot = self
+            .app
+            .a11y()
+            .expect("a11y capture is on and a frame was drained");
+        snapshot
+            .node_for(node)
+            .unwrap_or_else(|| panic!("{node:?} was not delivered in this a11y frame"))
+            .hidden
+    }
+
+    /// Whether the subtree under `node` contains a text node with inline boxes
+    /// (an inline image or a `<kbd>` span).
+    #[must_use]
+    pub fn has_inline_boxes(&self, node: NodeId) -> bool {
+        let tree = self.tree();
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let target = tree.get(current).expect("node");
+            if let NodeKind::Text(content) = target.kind()
+                && !content.inline_boxes.is_empty()
+            {
+                return true;
+            }
+            stack.extend(target.children().iter().copied());
+        }
+        false
+    }
+
+    /// How many nodes the host window's tree holds (mount-leak assertions).
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        let tree = self.tree();
+        let mut count = 0;
+        let mut stack = vec![tree.root()];
+        while let Some(current) = stack.pop() {
+            count += 1;
+            stack.extend(tree.get(current).expect("node").children().iter().copied());
+        }
+        count
     }
 
     fn collect_text(&self, node: NodeId, texts: &mut Vec<String>) {
@@ -620,6 +695,30 @@ mod tests {
             harness.text_of(placeholder).contains("正在等待订单"),
             "the stand-in follows the language: {}",
             harness.text_of(placeholder)
+        );
+
+        // The failure terminal state: the placeholder carries the typed failure and
+        // its recovery, and the state cell reports it exactly like every other state.
+        assert!(widget.status().report(
+            harness.app_mut(),
+            WidgetState::failed(
+                std::sync::Arc::new(FixtureFailure),
+                WidgetAction::new("common.retry", |_| {}),
+            )
+        ));
+        harness.drain();
+        assert!(
+            harness.text_of(placeholder).contains("示例失败"),
+            "the failure is drawn in the language showing now: {}",
+            harness.text_of(placeholder)
+        );
+        assert!(
+            !harness.visible(
+                harness
+                    .find_by_debug_prefix(surface_node, "WIDGET_CONTENT")
+                    .expect("the content slot exists")
+            ),
+            "a failed widget with no content draws the failure, not the content"
         );
 
         // Release: the route is gone, the scope is released, the hook ran, and the

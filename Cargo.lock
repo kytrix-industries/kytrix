@@ -11381,6 +11381,7 @@ dependencies = [
  "ahash",
  "app_config",
  "base_ui",
+ "bytes",
  "i18n",
  "kytrix_service_provider",
  "log",

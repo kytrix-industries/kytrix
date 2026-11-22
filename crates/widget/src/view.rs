@@ -195,6 +195,15 @@ pub trait WidgetView: Sized + 'static {
     /// heights, mirroring the pointer into a signal for the next frame. It must be
     /// cheap in the steady state and must not request a frame unless something
     /// changed — the engine's incremental invariant (I3) depends on it.
+    ///
+    /// One ordering detail is visible to a widget that *becomes* ready inside this
+    /// hook: the framework samples [`has_content`](WidgetView::has_content) before
+    /// running `sync` and presents that sample, so a body that first appears during
+    /// `sync` shows on the next frame (the state — banner/placeholder — is re-read
+    /// after `sync` and is already current). A widget that flips its own readiness
+    /// in `sync` should ask for the frame it needs
+    /// ([`WidgetCx::request_frame`](crate::cx::WidgetCx::request_frame)) instead of
+    /// expecting the same frame to show the body.
     fn sync(&mut self, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         Ok(())
     }

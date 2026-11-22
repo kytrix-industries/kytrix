@@ -22,7 +22,7 @@
 //! | content | `Failed` | the failure in a banner above the content |
 //! | content | anything else | the content alone |
 //! | no content | `Failed` | the failure in a placeholder, with its recovery |
-//! | no content | `Waiting` | the notice's sentence in a placeholder |
+//! | no content | `Waiting` | the notice's sentence (or, for a rich notice, its markdown) in a placeholder |
 //! | no content | `Connecting` | a spinner under the name of the connection |
 //! | no content | `Loading` or `Ready` | a spinner with no message of its own |
 //!
@@ -52,7 +52,10 @@
 //! catalogue reference and a failure is a typed error, and both are turned into
 //! sentences here, through the translation context the frame was handed. A notice is
 //! rebuilt when the language moves; a failure's text is a `bind_text` closure that
-//! reads the language signal, so it follows a switch without a rebuild.
+//! reads the language signal, so it follows a switch without a rebuild. A notice the
+//! catalogue authors as markdown/HTML (`common.market_not_loaded`) is drawn by the
+//! engine's markdown component, not as its source text — see
+//! [`ui::placeholder`](crate::ui::placeholder).
 //!
 //! # The body is the widget's; the box around it is the framework's
 //!
@@ -170,89 +173,17 @@ impl WidgetSurface {
             })
             .build(cx.tree_mut(), parent)?;
 
-        let slot_theme = theme;
-        let slot_placeholder = presentation;
-        let slot_content = presentation;
-        let slot = NodeBuilder::boxed()
-            .id("WIDGET_SLOT")
-            .style(
-                StyleBuilder::new()
-                    .flex_1()
-                    .min_width_0()
-                    .min_height_0()
-                    .relative()
-                    .overflow_hidden()
-                    .build(),
-            )
-            .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
-            .bind_style(move |read| StylePatch {
-                background: Some(slot_theme.role(read, Role::SurfaceSunken)),
-                border: Some(ui_core::paint::primitive::Border {
-                    width: 1.0,
-                    color: slot_theme.role(read, Role::LineDivider),
-                }),
-                ..StylePatch::default()
-            })
-            .build(cx.tree_mut(), root)?;
-
-        let content = NodeBuilder::boxed()
-            .id("WIDGET_CONTENT")
-            .style(
-                StyleBuilder::new()
-                    .flex_col()
-                    .flex_1()
-                    .min_width_0()
-                    .min_height_0()
-                    .build(),
-            )
-            .bind_style(move |read| {
-                let presentation = *read.read(&slot_content);
-                StylePatch {
-                    visible: Some(presentation.content),
-                    ..StylePatch::default()
-                }
-            })
-            .bind_a11y(move |read| {
-                let presentation = *read.read(&slot_content);
-                A11yPatch {
-                    hidden: Some(!presentation.content),
-                    ..A11yPatch::default()
-                }
-            })
-            .build(cx.tree_mut(), slot)?;
-
-        let placeholder = NodeBuilder::boxed()
-            .id("WIDGET_PLACEHOLDER")
-            .style(
-                StyleBuilder::new()
-                    .absolute()
-                    .top(0.0)
-                    .right(0.0)
-                    .bottom(0.0)
-                    .left(0.0)
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(8.0)
-                    .padding(16.0)
-                    .build(),
-            )
-            .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
-            .bind_style(move |read| {
-                let presentation = *read.read(&slot_placeholder);
-                StylePatch {
-                    visible: Some(presentation.placeholder),
-                    ..StylePatch::default()
-                }
-            })
-            .bind_a11y(move |read| {
-                let presentation = *read.read(&slot_placeholder);
-                A11yPatch {
-                    hidden: Some(!presentation.placeholder),
-                    ..A11yPatch::default()
-                }
-            })
-            .build(cx.tree_mut(), slot)?;
+        let built = build_shell(cx, root, theme, presentation);
+        let (slot, content, placeholder) = match built {
+            Ok(shell) => shell,
+            // A surface that failed halfway must not leave the nodes it already
+            // built behind: a pane would keep a shell no widget will ever present.
+            Err(error) => {
+                let window = cx.window();
+                let _ = cx.app_mut().remove_node(window, root);
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             root,
@@ -319,7 +250,7 @@ impl WidgetSurface {
                 let built = build_placeholder(cx, self.placeholder, &state)?;
                 self.rendered_placeholder = Some((key, language, built));
             }
-            if let Some((_, _, placeholder)) = &self.rendered_placeholder {
+            if let Some((_, _, placeholder)) = &mut self.rendered_placeholder {
                 placeholder.sync(cx.app_mut())?;
             }
         }
@@ -388,11 +319,9 @@ impl WidgetSurface {
             let (node, button) = build_banner(cx, self.root, &failure)?;
             // The banner belongs above the slot. The slot was built first, so it is
             // moved to the end: reparenting keeps its subtree and its node identity.
-            let window = cx.window();
             cx.tree_mut()
                 .append_child(self.root, self.slot)
                 .map_err(|_| EngineError::StaleNode { node: self.slot })?;
-            let _ = window;
             self.banner = Some(node);
             self.rendered_banner = Some((failure, language, button));
         }
@@ -405,24 +334,23 @@ impl WidgetSurface {
 
     /// Removes the banner: its nodes first, then its component's scope and handler.
     fn clear_banner(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
-        if let Some((_, _, button)) = self.rendered_banner.take()
-            && let Some(button) = button
-        {
-            let _ = button.release(cx.app_mut());
-        }
+        let button = self
+            .rendered_banner
+            .take()
+            .and_then(|(_, _, button)| button);
         if let Some(banner) = self.banner.take() {
             let window = cx.window();
             cx.app_mut().remove_node(window, banner)?;
+        }
+        if let Some(button) = button {
+            let _ = button.release(cx.app_mut());
         }
 
         Ok(())
     }
 
-    /// Removes the placeholder's contents, releasing its components first.
+    /// Removes the placeholder's contents, then releases its components.
     fn clear_placeholder(&mut self, cx: &mut WidgetCx<'_>) {
-        if let Some((_, _, placeholder)) = self.rendered_placeholder.take() {
-            let _ = placeholder.release(cx.app_mut());
-        }
         let children: Vec<NodeId> = cx
             .tree()
             .get(self.placeholder)
@@ -431,6 +359,9 @@ impl WidgetSurface {
         let window = cx.window();
         for child in children {
             let _ = cx.app_mut().remove_node(window, child);
+        }
+        if let Some((_, _, placeholder)) = self.rendered_placeholder.take() {
+            let _ = placeholder.release(cx.app_mut());
         }
     }
 }
@@ -474,6 +405,103 @@ fn build_placeholder(
         ),
         WidgetState::Loading | WidgetState::Ready => Placeholder::busy(cx, parent, None),
     }
+}
+
+/// Builds the shell's three interchangeable nodes under `root`.
+///
+/// Split out of [`WidgetSurface::build`] so a half-built shell can be removed as a
+/// whole when one of the nodes cannot be created.
+fn build_shell(
+    cx: &mut WidgetCx<'_>,
+    root: NodeId,
+    theme: base_ui::theme::handle::ThemeHandle,
+    presentation: ui_core::node::signal::Signal<Presentation>,
+) -> Result<(NodeId, NodeId, NodeId), EngineError> {
+    let slot_theme = theme;
+    let slot_placeholder = presentation;
+    let slot_content = presentation;
+    let slot = NodeBuilder::boxed()
+        .id("WIDGET_SLOT")
+        .style(
+            StyleBuilder::new()
+                .flex_1()
+                .min_width_0()
+                .min_height_0()
+                .relative()
+                .overflow_hidden()
+                .build(),
+        )
+        .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
+        .bind_style(move |read| StylePatch {
+            background: Some(slot_theme.role(read, Role::SurfaceSunken)),
+            border: Some(ui_core::paint::primitive::Border {
+                width: 1.0,
+                color: slot_theme.role(read, Role::LineDivider),
+            }),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), root)?;
+
+    let content = NodeBuilder::boxed()
+        .id("WIDGET_CONTENT")
+        .style(
+            StyleBuilder::new()
+                .flex_col()
+                .flex_1()
+                .min_width_0()
+                .min_height_0()
+                .build(),
+        )
+        .bind_style(move |read| {
+            let presentation = *read.read(&slot_content);
+            StylePatch {
+                visible: Some(presentation.content),
+                ..StylePatch::default()
+            }
+        })
+        .bind_a11y(move |read| {
+            let presentation = *read.read(&slot_content);
+            A11yPatch {
+                hidden: Some(!presentation.content),
+                ..A11yPatch::default()
+            }
+        })
+        .build(cx.tree_mut(), slot)?;
+
+    let placeholder = NodeBuilder::boxed()
+        .id("WIDGET_PLACEHOLDER")
+        .style(
+            StyleBuilder::new()
+                .absolute()
+                .top(0.0)
+                .right(0.0)
+                .bottom(0.0)
+                .left(0.0)
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(8.0)
+                .padding(16.0)
+                .build(),
+        )
+        .paint(PaintBuilder::new().rounded(SURFACE_RADIUS).build())
+        .bind_style(move |read| {
+            let presentation = *read.read(&slot_placeholder);
+            StylePatch {
+                visible: Some(presentation.placeholder),
+                ..StylePatch::default()
+            }
+        })
+        .bind_a11y(move |read| {
+            let presentation = *read.read(&slot_placeholder);
+            A11yPatch {
+                hidden: Some(!presentation.placeholder),
+                ..A11yPatch::default()
+            }
+        })
+        .build(cx.tree_mut(), slot)?;
+
+    Ok((slot, content, placeholder))
 }
 
 /// Builds the failure banner under `root`, returning its node and its control.
@@ -538,7 +566,8 @@ fn build_banner(
 mod tests {
     use std::{rc::Rc, sync::Arc};
 
-    use i18n::language::codes::LanguageCode;
+    use i18n::{language::codes::LanguageCode, translate::Translate};
+    use market_participants_model::identifier::VenueId;
 
     use crate::{
         status::{Notice, WidgetAction, WidgetState},
@@ -549,6 +578,14 @@ mod tests {
         WidgetState::failed(
             Arc::new(FixtureFailure),
             WidgetAction::new("common.retry", |_| {}),
+        )
+    }
+
+    /// The translator the product ships, in the language a test asks for.
+    fn product_translate(language: LanguageCode) -> Translate {
+        Translate::new(
+            Rc::new(i18n::global::embedded::load().expect("the embedded locales load")),
+            language,
         )
     }
 
@@ -760,6 +797,113 @@ mod tests {
             harness.app().frame_requests(),
             requests,
             "a steady surface scheduled no frame"
+        );
+    }
+
+    /// The surface's root is the dependency anchor: it reads the language signal
+    /// while it renders, so writing that signal requests the frame which presents the
+    /// new language. A read that is not inside a `bind_*` closure would not register
+    /// the edge, and the switch would leave the old language on screen.
+    #[test]
+    fn writing_the_language_signal_requests_the_redrawing_frame() {
+        let mut harness = WidgetTestApp::new();
+        let mut surface = harness.build_surface();
+        harness.report(WidgetState::Ready);
+        harness.sync_surface(&mut surface, false);
+        let requests = harness.app().frame_requests();
+        let language = harness.services().language;
+
+        assert!(harness.app_mut().write(&language, LanguageCode::ZhCn));
+
+        assert!(
+            harness.app().frame_requests() > requests,
+            "the surface read the language signal while rendering, so writing it \
+             requests a frame (no state re-report involved)"
+        );
+    }
+
+    /// `WidgetStatus::report` is a signal write: when a node renders from the state
+    /// cell, reporting a new state requests the frame that presents it.
+    #[test]
+    fn reporting_a_state_requests_the_presenting_frame() {
+        let mut harness = WidgetTestApp::new();
+        let mut surface = harness.build_surface();
+        harness.report(WidgetState::Ready);
+        harness.sync_surface(&mut surface, false);
+        let requests = harness.app().frame_requests();
+
+        harness.report(WidgetState::Loading);
+
+        assert!(
+            harness.app().frame_requests() > requests,
+            "the surface reads the state cell while rendering, so a report requests a frame"
+        );
+    }
+
+    /// R-28: the slot that is not drawn is hidden in the a11y tree, not merely
+    /// invisible in the style pass. Assistive technology receives the same switch the
+    /// user sees, and the hidden subtree is not announced.
+    #[test]
+    fn the_swapped_out_subtree_is_hidden_from_assistive_technology() {
+        let mut harness = WidgetTestApp::new();
+        harness.enable_a11y_capture();
+        let mut surface = harness.build_surface();
+        harness.report(WidgetState::Ready);
+        harness.sync_surface(&mut surface, false);
+
+        assert!(
+            harness.a11y_hidden(surface.content_slot()),
+            "no content: the content slot is hidden in the a11y tree"
+        );
+        assert!(
+            !harness.a11y_hidden(surface.placeholder),
+            "no content: the placeholder is announced"
+        );
+
+        harness.sync_surface(&mut surface, true);
+
+        assert!(
+            !harness.a11y_hidden(surface.content_slot()),
+            "content: the content slot is announced"
+        );
+        assert!(
+            harness.a11y_hidden(surface.placeholder),
+            "content: the placeholder is hidden in the a11y tree"
+        );
+    }
+
+    /// A notice the catalogue authors as markdown/HTML is drawn by the markdown
+    /// component: the reader gets the sentence, the kbd icon and the venue list, not
+    /// `<p align="center">…` / `<kbd>` / `![](file://…)` source text.
+    #[test]
+    fn a_rich_notice_is_drawn_as_rich_text() {
+        let mut harness = WidgetTestApp::with_translate(product_translate(LanguageCode::En));
+        let mut surface = harness.build_surface();
+        harness.report(WidgetState::waiting(Notice::MarketNotLoaded {
+            venues: vec![VenueId::Binance],
+            supported: vec![VenueId::Binance, VenueId::Okx],
+        }));
+
+        harness.sync_surface(&mut surface, false);
+
+        let text = harness.text_of(surface.placeholder);
+        assert!(
+            harness
+                .find_by_debug_prefix(surface.placeholder, "MARKDOWN")
+                .is_some(),
+            "the rich notice goes through the markdown component"
+        );
+        assert!(
+            !text.contains("<kbd>") && !text.contains("<p ") && !text.contains("![]("),
+            "the notice's source markup is not drawn as text: {text:?}"
+        );
+        assert!(
+            text.contains("Binance") && text.contains("OKX"),
+            "the venues are listed by name: {text:?}"
+        );
+        assert!(
+            harness.has_inline_boxes(surface.placeholder),
+            "the kbd icon and the venue logos are inline boxes, not source text"
         );
     }
 }

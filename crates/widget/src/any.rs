@@ -105,14 +105,19 @@ impl WidgetVTable {
 /// Borrows the concrete view for one call.
 ///
 /// The panic is an engine-invariant violation (the slot was filled with another
-/// type), not a state a caller can reach: the vtable is constructed by the same
-/// `mount` call that fills the cell.
+/// type, or the widget was released and its body taken), not a state a caller can
+/// reach: the vtable is constructed by the same `mount` call that fills the cell, and
+/// every public entry point guards on [`WidgetSlot::released`] before reaching a
+/// vtable function.
 fn with_view<W: WidgetView, R>(body: &ErasedBody, read: impl FnOnce(&mut W) -> R) -> R {
     let mut borrow = body.borrow_mut();
     let view = borrow
         .as_mut()
         .and_then(|erased| erased.downcast_mut::<W>())
-        .expect("the widget vtable matches the widget it was mounted with");
+        .expect(
+            "the widget vtable matches the widget it was mounted with, and a released widget's \
+             body is never reached: entry points check `released` first",
+        );
 
     read(view)
 }
@@ -237,6 +242,10 @@ impl WidgetSlot {
 
     /// Builds this widget's controls into one of a pane's header groups.
     fn header(&self, app: &mut App, group: HeaderGroup, parent: NodeId) -> Result<(), EngineError> {
+        if self.released {
+            return Ok(());
+        }
+
         let mut cx = WidgetCx::new(
             app,
             self.window,
@@ -356,7 +365,7 @@ impl AnyWidget {
             move |app| reload.reload(app)
         });
 
-        let widget = {
+        let constructed = {
             let mut cx = WidgetCx::new(app, window, services, scope, router.clone());
             W::new(
                 instance_id,
@@ -366,7 +375,24 @@ impl AnyWidget {
                 config_change,
                 recovery,
                 &mut cx,
-            )?
+            )
+        };
+        let widget = match constructed {
+            Ok(widget) => widget,
+            Err(error) => {
+                // The surface and the state cell belong to this mount attempt: a
+                // widget that failed to construct leaves the pane with no widget, so
+                // the shell must go with it. Removing the subtree through the
+                // engine's scoped removal also releases the scope the state cell was
+                // minted in — the same teardown a released widget gets.
+                let mut released = surface.release(app);
+                if let Ok(outcome) = app.remove_node_with_scope(window, surface.root(), scope) {
+                    released += outcome.released_values;
+                }
+                let _ = released;
+
+                return Err(error);
+            }
         };
         *body.borrow_mut() = Some(Box::new(widget));
 
@@ -459,6 +485,11 @@ impl AnyWidget {
     }
 
     /// Builds this widget's controls into one of the pane's header groups.
+    ///
+    /// A released widget builds nothing and reports success: the pane may rebuild its
+    /// header row in the same turn it closed a pane, and asking a released widget is a
+    /// no-op rather than a panic. The body cell is empty after release, so the vtable
+    /// entry (`with_view`) would otherwise panic.
     pub fn header(
         &self,
         app: &mut App,
@@ -576,4 +607,93 @@ fn reload_handle<W: WidgetView>(
         let mut cx = WidgetCx::new(app, window, &services, scope, router.clone());
         view.load(&mut cx);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use smol_str::SmolStr;
+    use ui_core::{error::EngineError, node::id::NodeId};
+
+    use crate::{
+        category::WidgetCategory,
+        config::WidgetConfigChange,
+        cx::WidgetCx,
+        identity::{WidgetId, WidgetInstanceId},
+        status::{WidgetAction, WidgetStatus},
+        test_support::{WaitingWidget, WidgetTestApp},
+        view::{HeaderGroup, ReloadHandle, WidgetView},
+    };
+
+    /// A widget whose construction refuses: the mount has nothing to hand a pane.
+    struct FailingWidget;
+
+    impl WidgetView for FailingWidget {
+        type Config = ();
+
+        const ID: WidgetId = WidgetId::new_static("test.failing");
+        const DISPLAY_NAME: &'static str = "test.failing";
+        const CATEGORY: WidgetCategory = WidgetCategory::Market;
+
+        fn new(
+            _instance_id: WidgetInstanceId,
+            _config: Self::Config,
+            _status: WidgetStatus,
+            _reload: ReloadHandle,
+            _config_change: WidgetConfigChange,
+            _recovery: WidgetAction,
+            _cx: &mut WidgetCx<'_>,
+        ) -> Result<Self, EngineError> {
+            Err(EngineError::FramePipeline {
+                detail: SmolStr::new_static("the fixture refuses construction"),
+            })
+        }
+
+        fn load(&mut self, _cx: &mut WidgetCx<'_>) {}
+
+        fn has_content(&self) -> bool {
+            false
+        }
+
+        fn body(&mut self, _parent: NodeId, _cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    /// A refused construction rolls the whole mount attempt back: the pane was
+    /// handed no widget, so it must not keep the shell the mount built first.
+    #[test]
+    fn a_refused_construction_removes_the_shell_it_built() {
+        let mut harness = WidgetTestApp::new();
+        let before = harness.node_count();
+
+        let error = harness
+            .try_mount::<FailingWidget>(())
+            .expect_err("the fixture refuses construction");
+
+        assert!(matches!(error, EngineError::FramePipeline { .. }));
+        assert_eq!(
+            harness.node_count(),
+            before,
+            "the surface nodes are removed with the mount attempt"
+        );
+        assert!(
+            harness.router().is_empty(),
+            "no frame route is registered for a widget that does not exist"
+        );
+    }
+
+    /// A pane may rebuild its header row after the widget was released in the same
+    /// turn; asking a released widget is a no-op, not a panic on the empty body.
+    #[test]
+    fn a_released_widget_answers_no_header_controls() {
+        let mut harness = WidgetTestApp::new();
+        let widget = harness.mount::<WaitingWidget>(());
+        widget.release(harness.app_mut());
+        let parent = harness.root();
+
+        widget
+            .header(harness.app_mut(), HeaderGroup::Left, parent)
+            .expect("a released widget builds nothing");
+        assert!(widget.is_released());
+    }
 }

@@ -9,8 +9,17 @@
 //! | situation | components |
 //! |---|---|
 //! | busy (`Connecting`, `Loading`, `Ready`) | [`kit::spinner`](base_ui::kit::spinner), labelled with the name of the work |
-//! | waiting (a [`Notice`]) | the notice's sentence in a muted [`kit::empty_state`](base_ui::kit::empty_state) |
+//! | waiting (a plain [`Notice`]) | the notice's sentence in a muted [`kit::empty_state`](base_ui::kit::empty_state) |
+//! | waiting (a rich [`Notice`]) | the notice's markdown through [`kit::markdown`](base_ui::kit::markdown) |
 //! | failed ([`Failure`]) | the failure's detail plus a [`kit::button`](base_ui::kit::button) that runs the recovery |
+//!
+//! A waiting notice is a **catalogue reference**, and one of its two shapes is
+//! authored as rich text: `common.market_not_loaded` is an aligned paragraph with a
+//! `<kbd>` icon and one markdown line per venue (see [`crate::venue`]). Drawing its
+//! source as plain text would put `<p align="center">…` and `![](file://…)` in front
+//! of the user, so a rich notice goes through the engine's markdown component —
+//! which is the same component the rest of the interface reads catalogue markdown
+//! with. A plain notice stays a sentence, drawn by the empty state.
 //!
 //! This lives with the framework rather than with the shared component library
 //! because it is not a general-purpose component: it exists to be a widget body's
@@ -19,13 +28,22 @@
 //! # Ownership
 //!
 //! A [`Placeholder`] owns the stateful components it built (a spinner, a recovery
-//! button), so the surface can drive their `sync`, forward events their way, and
-//! release them when the state moves on. The nodes themselves are removed by the
-//! surface through [`App::remove_node`], in the documented order: remove the nodes
-//! first, then release the components' scopes and action handlers.
+//! button, a markdown node), so the surface can drive their `sync`, forward events
+//! their way, and release them when the state moves on. The nodes themselves are
+//! removed by the surface through [`App::remove_node`]: the nodes are removed first,
+//! then the components' scopes and action handlers are released — the engine's
+//! documented teardown order (E16; the same order
+//! [`App::remove_node_with_scope`](ui_core::app::App::remove_node_with_scope) uses).
+
+use std::{borrow::Cow, sync::Arc};
 
 use base_ui::{
-    kit::{button::Button, empty_state::EmptyState, spinner::Spinner},
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        spinner::Spinner,
+    },
     theme::role::Role,
 };
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -49,6 +67,22 @@ const PLACEHOLDER_TEXT_SIZE: f32 = 13.0;
 /// The spinner size: visible without competing with the pane's content.
 const SPINNER_SIZE: f32 = 18.0;
 
+/// The embedded product assets, as the markdown parser's image-size seam.
+///
+/// The parser only needs the file header of an inline image, and only when the source
+/// writes no explicit `?size=`. `common.market_not_loaded` writes a size for every
+/// brand logo; the `<kbd>` icon is an SVG the engine has no rasterized asset for, so
+/// it resolves to the parser's default size. Nothing here decodes pixels: the static
+/// image payload is a marker box (the resource pipeline for rich-text images belongs
+/// to the asset batch, not to the widget contract).
+struct EmbeddedAssets;
+
+impl MarkdownAssets for EmbeddedAssets {
+    fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+        base_ui::kit::assets::bytes(path).map(Cow::Borrowed)
+    }
+}
+
 /// The components one placeholder is built from.
 ///
 /// The nodes are already in the tree; this is what the surface keeps to drive them.
@@ -56,6 +90,7 @@ const SPINNER_SIZE: f32 = 18.0;
 pub struct Placeholder {
     spinner: Option<Spinner>,
     button: Option<Button>,
+    markdown: Option<MarkdownNode>,
 }
 
 impl Placeholder {
@@ -92,21 +127,37 @@ impl Placeholder {
         Ok(Self {
             spinner: Some(spinner),
             button: None,
+            markdown: None,
         })
     }
 
-    /// Builds a widget's own notice under `parent`: the sentence the catalogue holds
-    /// in the language showing now, drawn as a muted, centred stand-in.
+    /// Builds a widget's own notice under `parent`.
     ///
-    /// The text is resolved here rather than in a `bind_text` closure because the
-    /// notice is structural: the surface rebuilds the placeholder when the notice or
-    /// the language moves, which is one rebuild per change instead of a live binding
-    /// on every text leaf.
+    /// A plain notice is one sentence: the catalogue holds it as text, and it is
+    /// resolved in the language showing now. A rich notice ([`Notice::is_markdown`])
+    /// is authored as markdown/HTML and is drawn by the engine's markdown component;
+    /// its sentence is resolved here too, because the surface rebuilds the
+    /// stand-in when the notice or the language moves.
     pub fn notice(
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
         notice: &Notice,
     ) -> Result<Self, EngineError> {
+        if notice.is_markdown() {
+            let source = notice.resolve(cx.translate());
+            let document = parse_document(source.as_str(), &EmbeddedAssets);
+            let window = cx.window();
+            let theme = cx.theme().clone();
+            let markdown =
+                MarkdownNode::mount(cx.app_mut(), window, parent, theme, Arc::new(document));
+
+            return Ok(Self {
+                spinner: None,
+                button: None,
+                markdown: Some(markdown),
+            });
+        }
+
         let text = notice.resolve(cx.translate());
         EmptyState::new(cx.theme().clone(), notice_key(parent))
             .text(text)
@@ -128,6 +179,7 @@ impl Placeholder {
         Ok(Self {
             spinner: None,
             button,
+            markdown: None,
         })
     }
 
@@ -135,13 +187,18 @@ impl Placeholder {
     ///
     /// Called only while the placeholder is on screen: a hidden spinner must not keep
     /// an animation alive, so the surface releases the placeholder instead of hiding
-    /// it.
-    pub fn sync(&self, app: &mut App) -> Result<(), EngineError> {
+    /// it. The markdown node is static payload baked for an appearance; its `sync`
+    /// rebuilds the subtree when the appearance moved (the one dynamic channel a
+    /// per-run coloured document has).
+    pub fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
         if let Some(spinner) = &self.spinner {
             spinner.sync(app)?;
         }
         if let Some(button) = &self.button {
             button.sync(app)?;
+        }
+        if let Some(markdown) = &mut self.markdown {
+            markdown.sync(app);
         }
         Ok(())
     }

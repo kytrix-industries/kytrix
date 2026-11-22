@@ -46,11 +46,10 @@
 //! closure — for example in [`WidgetView::load`](crate::view::WidgetView::load) —
 //! is not tracked, which is correct: loading does not draw.
 
-use std::sync::Arc;
-
 use app_config::settings::Config;
 use base_ui::theme::handle::ThemeHandle;
 use i18n::{language::codes::LanguageCode, translate::Translate};
+use smol_str::SmolStr;
 use tokio::runtime::Handle;
 use ui_core::{
     a11y::A11yPatch,
@@ -162,20 +161,54 @@ impl<'a> WidgetCx<'a> {
         &self.services.theme
     }
 
-    /// The current settings snapshot.
+    /// Runs `read` with a borrowed view of the current settings snapshot.
     ///
     /// A read here does not create a dependency — it is for decisions taken in
     /// `sync`/`load`. A widget that must redraw when a setting moves reads
     /// [`WidgetServices::config`](crate::services::WidgetServices::config) inside
-    /// the closure that draws.
-    pub fn config(&self) -> Arc<Config> {
-        self.app
-            .read_with(&self.services.config, |config| Arc::new(config.clone()))
+    /// the closure that draws. The snapshot is not cloned: a per-frame or per-row
+    /// read (the display time zone, the account) borrows it for the duration of the
+    /// call.
+    pub fn config_ref<R>(&self, read: impl FnOnce(&Config) -> R) -> R {
+        self.app.read_with(&self.services.config, read)
+    }
+
+    /// The account the settings currently scope the widget to, if any.
+    ///
+    /// It is derived from the settings snapshot rather than kept as a second
+    /// signal: two sources of "which account" could disagree.
+    pub fn account(&self) -> Option<SmolStr> {
+        self.config_ref(crate::account::account_of)
     }
 
     /// The display time zone the settings currently select.
     pub fn data_time_zone(&self) -> time::UtcOffset {
-        crate::time_zone::data_time_zone(&self.config())
+        self.config_ref(crate::time_zone::data_time_zone)
+    }
+
+    /// The engine window the widget's nodes live in, for the drawing paths the
+    /// context does not wrap.
+    ///
+    /// # Panics
+    /// The widget's window is gone; see [`WidgetCx::tree`].
+    pub fn window_mut(&mut self) -> &mut ui_core::window::Window {
+        self.app
+            .window_mut(self.window)
+            .expect("a live widget's window exists")
+    }
+
+    /// Replaces the canvas of a node the widget built as a canvas (the drawing
+    /// widget's path).
+    ///
+    /// Returns whether the canvas changed — the same value
+    /// [`Window::set_canvas`](ui_core::window::Window::set_canvas) answers. A node
+    /// built as anything but a canvas is not a drawing target and answers `false`.
+    pub fn set_canvas(
+        &mut self,
+        node: NodeId,
+        canvas: ui_core::paint::canvas::Canvas,
+    ) -> Result<bool, EngineError> {
+        self.window_mut().set_canvas(node, canvas)
     }
 
     /// The widget's signal scope. Every signal the widget mints through this context
@@ -263,7 +296,12 @@ impl std::fmt::Debug for WidgetCx<'_> {
 
 #[cfg(test)]
 mod tests {
-    use ui_core::node::{builder::NodeBuilder, tree::NodeKind};
+    use app_config::settings::{AccountConfig, AccountWalletKind, Config};
+    use ui_core::{
+        math::Rect,
+        node::{builder::NodeBuilder, tree::NodeKind},
+        paint::canvas::Canvas,
+    };
 
     use crate::test_support::WidgetTestApp;
 
@@ -296,5 +334,61 @@ mod tests {
         });
 
         assert!(released > 0, "the harness's widget scope owns its signals");
+    }
+
+    /// The settings view is borrowed, not cloned: the accessors read the snapshot the
+    /// services signal holds, including the account and the display time zone.
+    #[test]
+    fn the_settings_accessors_read_the_snapshot_without_cloning_it() {
+        let mut harness = WidgetTestApp::new();
+        let mut config = Config::default();
+        config.account = Some(AccountConfig {
+            user_id: String::from("11111111-1111-4111-8111-111111111111"),
+            wallet_address: String::from("0x0000000000000000000000000000000000000001"),
+            wallet_kind: AccountWalletKind::Ethereum,
+        });
+        config.data_time_zone =
+            app_config::time_zone::DataTimeZone::from_hours(8).expect("UTC+8 is offered");
+        let config_signal = harness.services().config;
+        assert!(harness.app_mut().write(&config_signal, config));
+
+        harness.with_cx(|cx| {
+            assert_eq!(
+                cx.account().as_deref(),
+                Some("11111111-1111-4111-8111-111111111111")
+            );
+            assert_eq!(cx.data_time_zone().whole_hours(), 8);
+            assert_eq!(
+                cx.config_ref(|config| crate::time_zone::data_time_zone(config).whole_hours()),
+                8,
+                "the same snapshot is visible through the borrowed read"
+            );
+        });
+    }
+
+    /// The drawing paths the context does not wrap are one call away: the window and
+    /// the canvas of a node the widget built as a canvas.
+    #[test]
+    fn the_drawing_accessors_replace_a_node_canvas() {
+        let mut harness = WidgetTestApp::new();
+        let node = harness.with_cx(|cx| {
+            let parent = cx.tree().root();
+            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0)))
+                .build(cx.tree_mut(), parent)
+                .expect("the root is alive")
+        });
+
+        let changed = harness
+            .with_cx(|cx| {
+                cx.window_mut();
+                cx.set_canvas(node, Canvas::new(Rect::new(0.0, 0.0, 16.0, 16.0)))
+            })
+            .expect("the node is alive");
+
+        assert!(changed);
+        assert!(matches!(
+            harness.tree().get(node).expect("the node exists").kind(),
+            NodeKind::Canvas(_)
+        ));
     }
 }

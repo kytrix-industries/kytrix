@@ -346,7 +346,15 @@ fn request_frame(handle: &AppHandle, window: WindowId) {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, time::Duration};
+    use std::{
+        convert::Infallible,
+        rc::Rc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use ui_core::{
         app::App,
@@ -394,6 +402,41 @@ mod tests {
         }
     }
 
+    /// Collects two RPC requests, then answers both — and records whether the answer
+    /// had a live receiver on the widget side.
+    ///
+    /// The first request is answered only after the second one arrived, so the test
+    /// controls when the call the binding already replaced gets its reply: with the
+    /// abort in place its receiver is gone and `respond` fails, without it the reply
+    /// reaches the inbox.
+    struct RecordingService {
+        received: Arc<AtomicUsize>,
+        answered: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl WidgetService<TestProtocol> for RecordingService {
+        async fn run(self, mut context: ServiceContext<TestProtocol>) {
+            let Some(first) = context.next_rpc().await else {
+                return;
+            };
+            self.received.fetch_add(1, Ordering::SeqCst);
+            let Some(second) = context.next_rpc().await else {
+                return;
+            };
+            self.received.fetch_add(1, Ordering::SeqCst);
+
+            for request in [first, second] {
+                let (reply, value) = request.into_parts();
+                let delivered = reply.respond(Ok(value)).is_ok();
+                self.answered
+                    .lock()
+                    .expect("the recording is not poisoned")
+                    .push(delivered);
+            }
+            while context.next_rpc().await.is_some() {}
+        }
+    }
+
     /// A headless engine app, the services aggregate, and a runtime owned by the test.
     struct Fixture {
         app: App,
@@ -416,10 +459,12 @@ mod tests {
             let scope = app.signal_scope();
             let language = app.signal_scoped(scope, i18n::language::codes::LanguageCode::En);
             let config = app.signal_scoped(scope, app_config::settings::Config::default());
+            let reduce_motion = app.signal_scoped(scope, false);
             let theme = base_ui::theme::handle::ThemeHandle::new(
                 &mut app,
                 base_ui::theme::appearance::Appearance::Light,
             );
+            let sound: Rc<dyn Fn(&'static str) -> Option<bytes::Bytes>> = Rc::new(|_| None);
             let services = WidgetServices {
                 translate: crate::test_support::fixture_translate(
                     i18n::language::codes::LanguageCode::En,
@@ -428,9 +473,13 @@ mod tests {
                 config,
                 theme,
                 market_participants: None,
+                kytrix_service: None,
+                open_url: Rc::new(|_| {}),
+                sound,
+                reduce_motion,
                 runtime: runtime.handle().clone(),
             };
-            let router = FrameRouter::new(&mut app);
+            let router = FrameRouter::new(&mut app).expect("the fixture owns the frame hook slot");
 
             Self {
                 app,
@@ -469,6 +518,18 @@ mod tests {
 
             panic!("the binding delivered nothing within two seconds");
         }
+
+        /// Spins until `condition` holds (the runtime's worker threads drive it).
+        fn wait_until(&self, condition: impl Fn() -> bool, what: &str) {
+            for _ in 0..2_000 {
+                if condition() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            panic!("timed out waiting for {what}");
+        }
     }
 
     /// The queue itself: empty, ordered, and draining only what arrived.
@@ -503,16 +564,60 @@ mod tests {
     }
 
     /// Replacing a call aborts the previous one: the widget cannot be handed two
-    /// replies for one command slot.
+    /// replies for one command slot, and the replaced future really is dropped.
+    ///
+    /// The service answers the replaced request *after* the replacement happened, so
+    /// the two behaviours are distinguishable: with the abort the reply has no
+    /// receiver and never reaches the inbox; without it both replies arrive.
     #[test]
     fn replacing_a_call_cancels_the_previous_one() {
         let mut fixture = Fixture::new();
-        let mut binding = fixture.with_cx(|cx| WidgetBinding::spawn(cx, PendingService));
+        let received = Arc::new(AtomicUsize::new(0));
+        let answered = Arc::new(Mutex::new(Vec::new()));
+        let service = RecordingService {
+            received: Arc::clone(&received),
+            answered: Arc::clone(&answered),
+        };
+        let mut binding = fixture.with_cx(|cx| WidgetBinding::spawn(cx, service));
 
         fixture.with_cx(|cx| binding.call(cx, 1));
+        fixture.wait_until(|| received.load(Ordering::SeqCst) >= 1, "the first request");
         fixture.with_cx(|cx| binding.call(cx, 2));
-        let exit = fixture.runtime.block_on(binding.shutdown());
+        fixture.wait_until(
+            || {
+                answered
+                    .lock()
+                    .expect("the recording is not poisoned")
+                    .len()
+                    == 2
+            },
+            "both requests to be answered",
+        );
 
+        let messages = fixture.wait_for_one(&binding);
+        assert_eq!(
+            messages.len(),
+            1,
+            "the replaced call's reply never reaches the inbox: {messages:?}"
+        );
+        let request_id = messages
+            .into_iter()
+            .find_map(|message| match message {
+                Inbound::Rpc { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .expect("the surviving call's reply arrived");
+        assert_eq!(request_id, RequestId::new(2));
+        assert_eq!(
+            answered
+                .lock()
+                .expect("the recording is not poisoned")
+                .as_slice(),
+            [false, true],
+            "the replaced call's receiver was dropped; the replacing call's was alive"
+        );
+
+        let exit = fixture.runtime.block_on(binding.shutdown());
         assert!(
             !matches!(exit, RuntimeExit::Panicked(_)),
             "the service stopped without panicking: {exit:?}"

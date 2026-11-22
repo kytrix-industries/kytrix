@@ -105,19 +105,35 @@ impl FrameRouter {
     /// This is the whole installation protocol: the composition root calls it once,
     /// after the window and the widget surfaces exist, and never registers another
     /// frame hook itself.
-    pub fn new(app: &mut App) -> Self {
+    ///
+    /// # Errors
+    /// The application's single frame-hook slot is already taken — either by another
+    /// [`FrameRouter`] or by anything else that called
+    /// [`App::on_frame`](ui_core::app::App::on_frame). Installing a second router
+    /// would silently take the first one's hook over and leave its routes dead, so it
+    /// is reported instead. The composition root builds the router once.
+    pub fn new(app: &mut App) -> Result<Self, EngineError> {
         let router = Self::default();
-        router.install(app);
-        router
+        router.install(app)?;
+        Ok(router)
     }
 
     /// Installs this router as the application's frame hook.
     ///
-    /// Idempotent: installing the same router twice leaves the first hook in place,
-    /// because the hook already points at this router's shared route table.
-    pub fn install(&self, app: &mut App) {
+    /// Idempotent for one router: installing the same router twice leaves the first
+    /// hook in place, because the hook already points at this router's shared route
+    /// table.
+    ///
+    /// # Errors
+    /// [`EngineError::FrameHookInstalled`] when another installer already owns the
+    /// application's single frame-hook slot. The caller's router stays uninstalled;
+    /// its routes would never run, and `installed()` keeps saying so.
+    pub fn install(&self, app: &mut App) -> Result<(), EngineError> {
         if self.state.borrow().installed {
-            return;
+            return Ok(());
+        }
+        if app.frame_hook_installed() {
+            return Err(EngineError::FrameHookInstalled);
         }
 
         self.state.borrow_mut().installed = true;
@@ -127,6 +143,8 @@ impl FrameRouter {
                 log::error!("a widget frame route failed: {error}");
             }
         });
+
+        Ok(())
     }
 
     /// Registers one frame route.
@@ -272,13 +290,47 @@ mod tests {
     #[test]
     fn installing_the_router_takes_the_single_frame_slot() {
         let mut app = app();
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
 
         assert!(router.installed());
-        // A second installation is a no-op, not a replacement: the hook already
-        // points at this router.
-        router.install(&mut app);
+        // Installing the same router again is a no-op, not a replacement: the hook
+        // already points at this router.
+        router
+            .install(&mut app)
+            .expect("installing twice is idempotent");
         assert!(router.installed());
+    }
+
+    /// The slot is single, and a second router would silently take the first one's
+    /// hook over. It is refused instead, and it knows it is not installed.
+    #[test]
+    fn a_second_router_cannot_install_itself() {
+        let mut app = app();
+        let first = FrameRouter::new(&mut app).expect("the slot is free");
+        let calls = Rc::new(Cell::new(0));
+        first.register(counted(&calls));
+
+        let second = FrameRouter::default();
+        let error = second
+            .install(&mut app)
+            .expect_err("the slot is already taken");
+
+        assert!(matches!(error, EngineError::FrameHookInstalled));
+        assert!(!second.installed(), "the refused router says so");
+        assert!(second.is_empty());
+        assert!(first.installed());
+    }
+
+    /// The composition root's form of the same rule: `new` reports the occupied slot
+    /// instead of returning a router whose routes would never run.
+    #[test]
+    fn a_second_router_constructor_reports_the_occupied_slot() {
+        let mut app = app();
+        let _first = FrameRouter::new(&mut app).expect("the slot is free");
+
+        let error = FrameRouter::new(&mut app).expect_err("the slot is already taken");
+
+        assert!(matches!(error, EngineError::FrameHookInstalled));
     }
 
     /// I3: an empty router never asks the application for a frame, and neither its
@@ -288,7 +340,7 @@ mod tests {
         let mut app = app();
         let before = app.frame_requests();
 
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
         router.tick(&mut app).expect("an empty tick succeeds");
 
         assert!(router.is_empty());
@@ -304,7 +356,7 @@ mod tests {
     #[test]
     fn a_tick_should_fan_out_to_every_route_once() {
         let mut app = app();
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
         let first = Rc::new(Cell::new(0));
         let second = Rc::new(Cell::new(0));
         router.register(counted(&first));
@@ -321,7 +373,7 @@ mod tests {
     #[test]
     fn unregistering_a_route_should_stop_its_delivery() {
         let mut app = app();
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
         let calls = Rc::new(Cell::new(0));
         let id = router.register(counted(&calls));
 
@@ -336,7 +388,7 @@ mod tests {
     #[test]
     fn route_ids_are_unique_and_returned_on_registration() {
         let mut app = app();
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
         let first: RouteId = router.register(|_| Ok(()));
         let second: RouteId = router.register(|_| Ok(()));
 
@@ -349,7 +401,7 @@ mod tests {
     #[test]
     fn a_failing_route_should_be_reported_without_stopping_the_others() {
         let mut app = app();
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
         let after = Rc::new(Cell::new(0));
         router.register(|_| {
             Err(EngineError::FramePipeline {
@@ -369,7 +421,7 @@ mod tests {
     #[test]
     fn a_route_can_unregister_itself_through_a_weak_handle() {
         let mut app = app();
-        let router = FrameRouter::new(&mut app);
+        let router = FrameRouter::new(&mut app).expect("the slot is free");
         let weak = router.downgrade();
         let slot = Rc::new(Cell::new(None::<RouteId>));
         let captured = slot.clone();
