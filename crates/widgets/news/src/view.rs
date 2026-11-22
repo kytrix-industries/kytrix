@@ -22,26 +22,54 @@
 //! current data with. So the rows read the feed through a signal: every row's text is a
 //! `bind_text` closure over the feed signal, the display time zone signal and the
 //! language signal, and the list itself only holds the row count and where the reader
-//! is. A newer snapshot is therefore reported to the list as the reports it has not been
+//! is. The one part of a row that is not a binding — its category badge — is rebuilt
+//! when the language moves (see “Static copy is rebuilt” below). A newer snapshot is
+//! therefore reported to the list as the reports it has not been
 //! shown rather than as a new set of rows: a list rebuilt from scratch would re-measure
 //! every row on screen and, worse, move a reader who had scrolled into the feed back to
 //! the top. The one case that does move them is a report that arrives while the newest
 //! row is the one they are reading — the newest news belongs on screen, and that is
 //! exactly where they are looking.
+//!
+//! # Static copy is rebuilt, not re-bound
+//!
+//! The kit components this pane builds choose their copy, icon and size **when they are
+//! built**: `Badge`, `Button` and `EmptyState` take a `SmolStr`/`IconKind`, not a
+//! `bind_text` closure (`crates/widgets/AGENTS.md` §15). Copy that follows a signal is
+//! therefore replaced rather than edited, and every static block in this pane follows the
+//! same four steps:
+//!
+//! 1. remember the values the block was built for (`empty_language`, `sound_built`,
+//!    `rows_language`);
+//! 2. in `sync`, compare them with the values showing now;
+//! 3. when they differ, take the block down — its own nodes first ([`remove_own_node`],
+//!    which skips a node the pane already took down with its row), then the component's
+//!    scope and action handler (`Button::release`);
+//! 4. build the block again in the values showing now, and record them.
+//!
+//! The three blocks are the empty-feed stand-in ([`NewsWidget::sync_empty_state`]), the
+//! header's sound control ([`NewsWidget::sync_sound_button`], whose node belongs to the
+//! pane's header row) and the category badge in every row
+//! ([`NewsWidget::rebuild_rows_for_language`], which rebuilds the list's visible window
+//! because a row closure has no `App` and cannot read a signal). A language switch
+//! rebuilds the blocks that are on screen in one frame:
+//! `the_rows_should_be_rebuilt_when_the_language_moves` covers the rows and the header
+//! control, `the_body_should_say_when_the_feed_is_empty` the stand-in.
 
-use std::{rc::Rc, sync::Arc, time::Instant};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::{
     kit::{
+        badge::Badge,
         button::Button,
         empty_state::EmptyState,
         icon::IconKind,
         list::{List, ListOptions, SelectionMode},
         separator::Separator,
-        size::{UnifiedSizable, UnifiedSize, UnifiedSizeStyle},
+        size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
+    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
@@ -52,7 +80,7 @@ use ui_core::{
     a11y::A11yPatch,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::{primitive::Border, style::StylePatch},
+    paint::style::StylePatch,
     text::{TextOverflow, TextStyle},
 };
 use widget::{
@@ -84,6 +112,26 @@ use super::{
 /// the viewport is enough to keep a row from appearing a moment after it was scrolled
 /// to; the list measures each row it mounts and replaces the estimate with the truth.
 const ROW_ESTIMATE: f32 = 76.0;
+
+/// The size a report's title and text are drawn at.
+///
+/// The theme has no body/paragraph typography token yet (`crates/base_ui/src/theme` only
+/// carries the control size ladder), so the row takes the ladder's regular size rather
+/// than writing a number here — the same source `kit::button` and `kit::badge` read.
+const ROW_TEXT_SIZE: UnifiedSize = UnifiedSize::Medium;
+
+/// The size a report's time is drawn at: the ladder's compact size, which is the 12 px
+/// tier the previous interface's `text_xs()` drew it in.
+const ROW_TIME_SIZE: UnifiedSize = UnifiedSize::Small;
+
+/// The categories of the feed the rows are drawing, mirroring the [`NewsSnapshot`] signal.
+///
+/// A row closure has no `App` and therefore cannot read the signal, but a kit `Badge`
+/// takes its text when it is built. The pane therefore hands the row builders the
+/// categories of the feed it is showing (updated wherever the snapshot is), and rebuilds
+/// the visible rows when the language moves so the badge is built in the language
+/// showing now — see the module documentation on static copy.
+type RowCategories = Rc<RefCell<Arc<[NewsCategory]>>>;
 
 /// The news one pane follows.
 ///
@@ -155,6 +203,12 @@ pub struct NewsWidget {
     /// The root of the body this pane built, so teardown can take its own subtree down
     /// before releasing the list component.
     body_root: Option<NodeId>,
+    /// The categories of the feed the row builders read: a row has no `App`, and a
+    /// `Badge` takes its text when it is built (see [`RowCategories`]).
+    categories: RowCategories,
+    /// The language the rows were built in: a row's category badge is static copy, so a
+    /// language switch rebuilds the list's visible window.
+    rows_language: Option<LanguageCode>,
     /// The stand-in a feed with nothing in it draws, built beside the list rather than in
     /// it: the list holds rows, and an empty feed has none.
     empty: Option<NodeId>,
@@ -247,6 +301,7 @@ impl WidgetView for NewsWidget {
             .build(cx.tree_mut(), parent)?;
         self.body_root = Some(root);
         self.list = Some(self.make_list(cx, root)?);
+        self.rows_language = Some(*cx.read(&cx.language()));
         self.sync_empty_state(cx)?;
 
         Ok(())
@@ -286,6 +341,7 @@ impl WidgetView for NewsWidget {
             self.toggle_sound(cx);
         }
 
+        self.rebuild_rows_for_language(cx)?;
         if let Some(list) = &self.list {
             list.sync(cx.app_mut())?;
         }
@@ -377,6 +433,8 @@ impl NewsWidget {
             items,
             list: None,
             body_root: None,
+            categories: Rc::new(RefCell::new(Arc::from([]))),
+            rows_language: None,
             empty: None,
             empty_language: None,
             sound,
@@ -465,6 +523,10 @@ impl NewsWidget {
         self.snapshot = None;
         self.ready = false;
         cx.write(&self.items, NewsSnapshot::default());
+        // The row builders read the categories of the feed they are drawing, and this
+        // pane is no longer drawing one; a row built before the list is emptied must
+        // name nothing rather than the account the pane left.
+        *self.categories.borrow_mut() = Arc::from([]);
         if let Some(list) = &self.list {
             list.set_items(cx.app_mut(), 0)?;
         }
@@ -639,6 +701,11 @@ impl NewsWidget {
         );
 
         cx.write(&self.items, snapshot.clone());
+        *self.categories.borrow_mut() = snapshot
+            .items()
+            .iter()
+            .map(|item| item.category())
+            .collect();
         let count = snapshot.items().len();
         match (unshown, self.list.as_ref()) {
             // The oldest of the reports it has not been shown goes in first, so the newest of
@@ -667,6 +734,7 @@ impl NewsWidget {
         let items = self.items;
         let language = cx.language();
         let config = cx.services().config;
+        let categories = Rc::clone(&self.categories);
         let theme = cx.theme().clone();
         let translate = cx.translate().clone();
         let count = cx.read(&items).items().len();
@@ -689,6 +757,7 @@ impl NewsWidget {
                     items,
                     language,
                     config,
+                    &categories,
                     theme.clone(),
                     translate.clone(),
                 )
@@ -699,6 +768,38 @@ impl NewsWidget {
         list.mount(cx.app_mut(), window, parent)?;
 
         Ok(list)
+    }
+
+    /// Rebuilds the visible rows when the language moved, so their badges are built in
+    /// the language showing now.
+    ///
+    /// A row's category badge is a `Badge`, whose text is fixed when it is built (see the
+    /// module documentation on static copy), and a row closure cannot read a signal. The
+    /// list's `set_count` rebuilds the visible window in place — the same call a feed
+    /// that changed its rows uses — while keeping the reader where they are; a language
+    /// switch is rare enough that re-measuring the rows on screen is the honest price of
+    /// following it.
+    fn rebuild_rows_for_language(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(list) = self.list.as_ref() else {
+            return Ok(());
+        };
+        let language = *cx.read(&cx.language());
+        if self.rows_language == Some(language) {
+            return Ok(());
+        }
+        self.rows_language = Some(language);
+        let count = list.count(cx.app());
+        if count == 0 {
+            // Nothing to rebuild: a feed that holds nothing draws its stand-in, which
+            // follows the language on its own.
+            return Ok(());
+        }
+        list.set_count(cx.app_mut(), count)?;
+        // The rows that were on screen are gone and the ones built in their place have
+        // not been drawn yet: the count did not move, so nothing else asks for the frame.
+        cx.request_frame()?;
+
+        Ok(())
     }
 
     /// Shows `common.no_data` over a feed that holds nothing.
@@ -714,8 +815,7 @@ impl NewsWidget {
             .is_some_and(|snapshot| snapshot.items().is_empty());
         if !empty {
             if let Some(node) = self.empty.take() {
-                let window = cx.window();
-                cx.app_mut().remove_node(window, node)?;
+                remove_own_node(cx, node)?;
                 self.empty_language = None;
             }
             return Ok(());
@@ -729,8 +829,7 @@ impl NewsWidget {
             return Ok(());
         }
         if let Some(node) = self.empty.take() {
-            let window = cx.window();
-            cx.app_mut().remove_node(window, node)?;
+            remove_own_node(cx, node)?;
         }
         let Some(root) = self.body_root else {
             return Ok(());
@@ -843,6 +942,10 @@ impl NewsWidget {
 
     /// Removes the control's node (when the widget owns the teardown) and releases the
     /// component's scope and action handler.
+    ///
+    /// The node is removed through [`remove_own_node`], so a control the pane already
+    /// took down with its header row is not this widget's to remove again — see the
+    /// module documentation on static copy.
     fn release_sound_button(
         &mut self,
         cx: &mut WidgetCx<'_>,
@@ -852,8 +955,7 @@ impl NewsWidget {
             return Ok(());
         };
         if remove_node && let Some(node) = button.node() {
-            let window = cx.window();
-            cx.app_mut().remove_node(window, node)?;
+            remove_own_node(cx, node)?;
         }
         let _ = button.release(cx.app_mut());
         self.sound_parent = None;
@@ -861,6 +963,22 @@ impl NewsWidget {
 
         Ok(())
     }
+}
+
+/// Removes a node this pane built, if it is still in the tree.
+///
+/// Every static block in this pane is taken down the same way (see the module
+/// documentation on static copy), and all of them go through this step: the nodes the
+/// pane built first, then the component's scope. A node that is already gone is not a
+/// failure — a pane rebuilds its header row, and the control this widget built into the
+/// old row went with it; asking the engine to remove it again would fail the rebuild
+/// (`StaleNode`) and leave the pane without a control.
+fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineError> {
+    if cx.tree().get(node).is_err() {
+        return Ok(());
+    }
+    let window = cx.window();
+    cx.app_mut().remove_node(window, node).map(|_| ())
 }
 
 /// The sound a host hands over: the clip's bytes, or a silent sound when it has none.
@@ -892,6 +1010,7 @@ fn build_row(
     items: Signal<NewsSnapshot>,
     language: Signal<LanguageCode>,
     config: Signal<app_config::settings::Config>,
+    categories: &RowCategories,
     theme: ThemeHandle,
     translate: Translate,
 ) -> Result<(), EngineError> {
@@ -976,15 +1095,7 @@ fn build_row(
         )
         .build(tree, meta)?;
 
-    build_category_badge(
-        tree,
-        leading,
-        index,
-        items,
-        language,
-        theme.clone(),
-        translate,
-    )?;
+    build_category_badge(tree, leading, index, categories, &theme, &translate)?;
     build_title(tree, leading, index, items, theme.clone())?;
     build_time(tree, meta, index, items, config, theme.clone())?;
     build_content(tree, content, index, items, theme)?;
@@ -994,55 +1105,32 @@ fn build_row(
 
 /// The pill that names the category of a report.
 ///
-/// It is `kit::badge`'s look (a small outlined pill) built from the row's own nodes rather
-/// than from the component: a badge's text is chosen when it is built, and a row's text has
-/// to follow the language signal the row draws in.
+/// It is the kit's `Badge` (the same outlined pill the previous interface drew), not a
+/// look-alike built from the row's own nodes: the component owns its colours, its a11y
+/// role and its size ladder. A badge's text is chosen when it is built, so the row takes
+/// it from the categories the pane mirrors for the rows (a row closure has no `App` to
+/// read the feed signal with), and the pane rebuilds the visible rows when the language
+/// moves ([`NewsWidget::rebuild_rows_for_language`]).
 fn build_category_badge(
     tree: &mut NodeTree,
     parent: NodeId,
     index: usize,
-    items: Signal<NewsSnapshot>,
-    language: Signal<LanguageCode>,
-    theme: ThemeHandle,
-    translate: Translate,
+    categories: &RowCategories,
+    theme: &ThemeHandle,
+    translate: &Translate,
 ) -> Result<(), EngineError> {
-    let shell_theme = theme.clone();
-    let badge = NodeBuilder::boxed()
-        .style(
-            StyleBuilder::new()
-                .flex_none()
-                .unified_sized(UnifiedSize::Small)
-                .build(),
-        )
-        .paint(PaintBuilder::new().rounded(4.0).build())
-        .bind_style(move |read| StylePatch {
-            background: Some(shell_theme.role(read, Role::SurfaceRaised)),
-            border: Some(Border {
-                width: 1.0,
-                color: shell_theme.role(read, Role::LineBorder),
-            }),
-            ..StylePatch::default()
-        })
-        .build(tree, parent)?;
+    let text = categories
+        .borrow()
+        .get(index)
+        .map_or_else(SmolStr::default, |category| {
+            category_label(*category, translate)
+        });
 
-    let text_theme = theme;
-    NodeBuilder::text(
-        SmolStr::default(),
-        TextStyle::new(UnifiedSize::Small.text_size()),
-    )
-    .bind_text(move |read| {
-        let _language: ui_core::node::signal::SignalRef<LanguageCode> = read.read(&language);
-        let snapshot = read.read(&items);
-        let Some(item) = snapshot.items().get(index) else {
-            return SmolStr::default();
-        };
-        category_label(item.category(), &translate)
-    })
-    .bind_style(move |read| StylePatch {
-        foreground: Some(text_theme.role(read, Role::FgDefault)),
-        ..StylePatch::default()
-    })
-    .build(tree, badge)?;
+    Badge::new(theme.clone())
+        .outline()
+        .small()
+        .text(text)
+        .build(tree, parent)?;
 
     Ok(())
 }
@@ -1056,7 +1144,7 @@ fn build_title(
     items: Signal<NewsSnapshot>,
     theme: ThemeHandle,
 ) -> Result<(), EngineError> {
-    let mut style = TextStyle::new(13.0);
+    let mut style = TextStyle::new(ROW_TEXT_SIZE.text_size());
     style.max_lines = 1;
     style.overflow = TextOverflow::Ellipsis;
     NodeBuilder::text(SmolStr::default(), style)
@@ -1088,22 +1176,25 @@ fn build_time(
     config: Signal<app_config::settings::Config>,
     theme: ThemeHandle,
 ) -> Result<(), EngineError> {
-    NodeBuilder::text(SmolStr::default(), TextStyle::new(11.0))
-        .style(StyleBuilder::new().flex_none().build())
-        .bind_text(move |read| {
-            let snapshot = read.read(&items);
-            let settings = read.read(&config);
-            let zone = data_time_zone(&settings);
-            snapshot
-                .items()
-                .get(index)
-                .map_or_else(SmolStr::default, |item| item.display(zone).time.clone())
-        })
-        .bind_style(move |read| StylePatch {
-            foreground: Some(theme.role(read, Role::FgMuted)),
-            ..StylePatch::default()
-        })
-        .build(tree, parent)?;
+    NodeBuilder::text(
+        SmolStr::default(),
+        TextStyle::new(ROW_TIME_SIZE.text_size()),
+    )
+    .style(StyleBuilder::new().flex_none().build())
+    .bind_text(move |read| {
+        let snapshot = read.read(&items);
+        let settings = read.read(&config);
+        let zone = data_time_zone(&settings);
+        snapshot
+            .items()
+            .get(index)
+            .map_or_else(SmolStr::default, |item| item.display(zone).time.clone())
+    })
+    .bind_style(move |read| StylePatch {
+        foreground: Some(theme.role(read, Role::FgMuted)),
+        ..StylePatch::default()
+    })
+    .build(tree, parent)?;
 
     Ok(())
 }
@@ -1116,20 +1207,23 @@ fn build_content(
     items: Signal<NewsSnapshot>,
     theme: ThemeHandle,
 ) -> Result<(), EngineError> {
-    NodeBuilder::text(SmolStr::default(), TextStyle::new(13.0))
-        .style(StyleBuilder::new().min_width_0().build())
-        .bind_text(move |read| {
-            let snapshot = read.read(&items);
-            snapshot
-                .items()
-                .get(index)
-                .map_or_else(SmolStr::default, |item| item.content().clone())
-        })
-        .bind_style(move |read| StylePatch {
-            foreground: Some(theme.role(read, Role::FgDefault)),
-            ..StylePatch::default()
-        })
-        .build(tree, parent)?;
+    NodeBuilder::text(
+        SmolStr::default(),
+        TextStyle::new(ROW_TEXT_SIZE.text_size()),
+    )
+    .style(StyleBuilder::new().min_width_0().build())
+    .bind_text(move |read| {
+        let snapshot = read.read(&items);
+        snapshot
+            .items()
+            .get(index)
+            .map_or_else(SmolStr::default, |item| item.content().clone())
+    })
+    .bind_style(move |read| StylePatch {
+        foreground: Some(theme.role(read, Role::FgDefault)),
+        ..StylePatch::default()
+    })
+    .build(tree, parent)?;
 
     Ok(())
 }
@@ -1145,12 +1239,7 @@ fn category_label(category: NewsCategory, translate: &Translate) -> SmolStr {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-        sync::Arc,
-        time::Duration,
-    };
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
     use app_config::{
         settings::{AccountConfig, AccountWalletKind, Config},
@@ -1161,16 +1250,8 @@ mod tests {
     use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use network::transport::error::TransportError;
-    use ui_core::{
-        app::App,
-        event::ActionSource,
-        node::signal::SignalScope,
-        window::{WindowId, WindowOptions},
-    };
-    use widget::{
-        frame::FrameRouter, protocol::RequestId, services::WidgetServices,
-        test_support::WidgetTestApp,
-    };
+    use ui_core::event::ActionSource;
+    use widget::{protocol::RequestId, test_support::WidgetTestApp};
 
     use super::*;
     use crate::{
@@ -1213,6 +1294,16 @@ mod tests {
         assert!(
             write_config(harness, config),
             "signing in is a settings change"
+        );
+    }
+
+    /// Signs the pane out the way the composition root does: a settings write.
+    fn sign_out(harness: &mut WidgetTestApp) {
+        let mut config = current_config(harness);
+        config.account = None;
+        assert!(
+            write_config(harness, config),
+            "signing out is a settings change"
         );
     }
 
@@ -1353,151 +1444,33 @@ mod tests {
         harness.drain();
     }
 
-    /// A host whose tasks run on a runtime the test owns.
+    /// How many runtime/frame turns [`settle`] may take before it calls the test a failure.
+    const SETTLE_TURNS: usize = 64;
+
+    /// Lets the host's runtime deliver what the fake source published, and the pane the
+    /// frames it asked for, until `ready` holds.
     ///
-    /// The framework's headless host runs on a current-thread runtime, and a synchronous
-    /// test cannot drive that runtime's spawned tasks: `TestApp` keeps the runtime to
-    /// itself. The live-stream tests therefore build the same context the composition
-    /// root builds over a multi-thread runtime this test can block on.
-    struct Live {
-        app: App,
-        runtime: tokio::runtime::Runtime,
-        services: WidgetServices,
-        window: WindowId,
-        scope: SignalScope,
-        router: FrameRouter,
-    }
-
-    struct LivePane {
-        widget: NewsWidget,
-        status: WidgetStatus,
-    }
-
-    impl Live {
-        fn new() -> Self {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("the test runtime builds");
-            let mut app = App::new(runtime.handle().clone());
-            let window = app.create_window(WindowOptions::default());
-            let scope = app.signal_scope();
-            let language = app.signal_scoped(scope, LanguageCode::En);
-            let config = app.signal_scoped(scope, Config::default());
-            let catalog_generation = app.signal_scoped(scope, 0_u64);
-            let reduce_motion = app.signal_scoped(scope, false);
-            let theme = ThemeHandle::new(&mut app, Appearance::Light);
-            let services = WidgetServices {
-                translate: product_translate(LanguageCode::En),
-                language,
-                config,
-                theme,
-                market_participants: None,
-                catalog_generation,
-                kytrix_service: None,
-                open_url: Rc::new(|_| {}),
-                sound: Rc::new(|_| None),
-                reduce_motion,
-                runtime: runtime.handle().clone(),
-            };
-
-            Self {
-                app,
-                runtime,
-                services,
-                window,
-                scope,
-                router: FrameRouter::default(),
+    /// The host owns the services' runtime as a current-thread one: a binding forwarder
+    /// advances only when the test turns the runtime, and one turn is one
+    /// `drain_runtime`. The widget itself is built by hand here — its source is injected
+    /// and no Kytrix service connector can be built headlessly — so it is not on the
+    /// host's frame router and the test drives `sync` between turns. Nothing sleeps and
+    /// no clock moves, which is what makes these live-stream tests deterministic.
+    fn settle(
+        harness: &mut WidgetTestApp,
+        pane: &mut Pane,
+        what: &str,
+        ready: impl Fn(&WidgetTestApp, &Pane) -> bool,
+    ) {
+        for _ in 0..SETTLE_TURNS {
+            harness.drain_runtime();
+            sync(harness, pane);
+            harness.drain();
+            if ready(harness, pane) {
+                return;
             }
         }
-
-        fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R {
-            let mut cx = WidgetCx::new(
-                &mut self.app,
-                self.window,
-                &self.services,
-                self.scope,
-                self.router.clone(),
-            );
-            body(&mut cx)
-        }
-
-        fn sign_in(&mut self, user_id: &str) {
-            let signal = self.services.config;
-            let mut config = {
-                let reference = self.app.read(&signal);
-                (*reference).clone()
-            };
-            config.account = Some(AccountConfig {
-                user_id: user_id.to_owned(),
-                wallet_address: "0x0000000000000000000000000000000000000001".to_owned(),
-                wallet_kind: AccountWalletKind::Ethereum,
-            });
-            assert!(self.app.write(&signal, config), "signing in is a change");
-        }
-
-        fn sign_out(&mut self) {
-            let signal = self.services.config;
-            let mut config = {
-                let reference = self.app.read(&signal);
-                (*reference).clone()
-            };
-            config.account = None;
-            assert!(self.app.write(&signal, config), "signing out is a change");
-        }
-
-        fn pane(&mut self, source: FakeSource) -> LivePane {
-            let scope = self.scope;
-            let status = WidgetStatus::new(&mut self.app, scope);
-            let widget = self.with_cx(|cx| {
-                NewsWidget::new_with_source(
-                    NewsConfig::default(),
-                    source,
-                    Box::new(SilentSound),
-                    status,
-                    WidgetConfigChange::default(),
-                    WidgetAction::new("common.retry", |_| {}),
-                    cx,
-                )
-            });
-
-            LivePane { widget, status }
-        }
-
-        fn load(&mut self, pane: &mut LivePane) {
-            self.with_cx(|cx| pane.widget.load(cx));
-        }
-
-        fn sync(&mut self, pane: &mut LivePane) {
-            self.with_cx(|cx| pane.widget.sync(cx))
-                .expect("the widget syncs");
-        }
-
-        /// Lets the runtime's tasks run for a moment.
-        fn drive(&self) {
-            self.runtime.block_on(async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            });
-        }
-
-        /// Runs the widget's synchronization and the runtime until `ready` holds.
-        fn settle(
-            &mut self,
-            pane: &mut LivePane,
-            what: &str,
-            ready: impl Fn(&Live, &LivePane) -> bool,
-        ) {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                self.sync(pane);
-                self.drive();
-                if ready(self, pane) {
-                    return;
-                }
-                assert!(std::time::Instant::now() < deadline, "{what} should happen");
-            }
-        }
+        panic!("{what} should happen");
     }
 
     /// A missing key is an empty string on screen rather than an error, so a gap in the
@@ -1821,110 +1794,123 @@ mod tests {
         assert_eq!(opened.borrow().as_slice(), [ACCOUNT_ORIGIN]);
     }
 
+    /// A settings write that moves the account reaches the pane on the frame the settings
+    /// signal schedules, and the pane reads the new account rather than the one it opened
+    /// with.
     #[test]
     fn an_account_change_should_read_the_new_account() {
-        let mut live = Live::new();
+        let mut harness = harness();
         let source = FakeSource::default();
-        live.sign_in(ACCOUNT);
+        sign_in(&mut harness, ACCOUNT);
         let first = source.subscribe();
         let _second = source.subscribe();
-        let mut pane = live.pane(source.clone());
+        let mut pane = pane(&mut harness, source.clone());
 
-        live.load(&mut pane);
-        live.settle(&mut pane, "the pane to subscribe", |_, _| {
+        load(&mut harness, &mut pane);
+        settle(&mut harness, &mut pane, "the pane to subscribe", |_, _| {
             source.subscriptions() == 1
         });
-        live.runtime.block_on(async {
-            first
-                .events
-                .send(Ok(event(1)))
-                .await
-                .expect("the live subscription should accept news");
-        });
-        live.settle(&mut pane, "the feed to reach the pane", |_, pane| {
-            snapshot_contents(&pane.widget) == ["News 1"]
-        });
+        first
+            .events
+            .try_send(Ok(event(1)))
+            .expect("the live subscription should accept news");
+        settle(
+            &mut harness,
+            &mut pane,
+            "the feed to reach the pane",
+            |_, pane| snapshot_contents(&pane.widget) == ["News 1"],
+        );
 
-        live.sign_in("someone-else");
+        sign_in(&mut harness, "someone-else");
 
-        live.settle(&mut pane, "the replacement subscription", |_, _| {
-            source.subscriptions() == 2
-        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the replacement subscription",
+            |_, _| source.subscriptions() == 2,
+        );
         assert_eq!(pane.widget.account_id.as_deref(), Some("someone-else"));
         assert!(
             snapshot_contents(&pane.widget).is_empty(),
             "another account is another feed, so what was read is dropped"
         );
-        live.settle(&mut pane, "the first subscription to be let go", |_, _| {
-            first.drops.load(std::sync::atomic::Ordering::SeqCst) == 1
-        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the first subscription to be let go",
+            |_, _| first.drops.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        );
     }
 
     #[test]
     fn signing_out_should_take_the_feed_with_it() {
-        let mut live = Live::new();
+        let mut harness = harness();
         let source = FakeSource::default();
-        live.sign_in(ACCOUNT);
+        sign_in(&mut harness, ACCOUNT);
         let control = source.subscribe();
-        let mut pane = live.pane(source.clone());
+        let mut pane = pane(&mut harness, source.clone());
 
-        live.load(&mut pane);
-        live.settle(&mut pane, "the pane to subscribe", |_, _| {
+        load(&mut harness, &mut pane);
+        settle(&mut harness, &mut pane, "the pane to subscribe", |_, _| {
             source.subscriptions() == 1
         });
-        live.runtime.block_on(async {
-            control
-                .events
-                .send(Ok(event(1)))
-                .await
-                .expect("the live subscription should accept news");
-        });
-        live.settle(&mut pane, "the feed to reach the pane", |_, pane| {
-            snapshot_contents(&pane.widget) == ["News 1"]
-        });
+        control
+            .events
+            .try_send(Ok(event(1)))
+            .expect("the live subscription should accept news");
+        settle(
+            &mut harness,
+            &mut pane,
+            "the feed to reach the pane",
+            |_, pane| snapshot_contents(&pane.widget) == ["News 1"],
+        );
 
-        live.sign_out();
+        sign_out(&mut harness);
 
-        live.settle(&mut pane, "the subscription to be released", |_, _| {
-            control.drops.load(std::sync::atomic::Ordering::SeqCst) == 1
-        });
+        settle(
+            &mut harness,
+            &mut pane,
+            "the subscription to be released",
+            |_, _| control.drops.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        );
         assert!(!pane.widget.has_content());
         assert_eq!(pane.widget.current_scope(), None);
         assert_eq!(
-            pane.status.state(&live.app).notice(),
+            pane.status.state(harness.app()).notice(),
             Some(&Notice::message("widget.news.logged_out"))
         );
     }
 
     #[test]
     fn the_feed_should_reach_a_live_pane_end_to_end() {
-        let mut live = Live::new();
+        let mut harness = harness();
         let source = FakeSource::default();
-        live.sign_in(ACCOUNT);
+        sign_in(&mut harness, ACCOUNT);
         let control = source.subscribe();
-        let mut pane = live.pane(source.clone());
+        let mut pane = pane(&mut harness, source.clone());
 
-        live.load(&mut pane);
-        live.settle(&mut pane, "the pane to subscribe", |_, _| {
+        load(&mut harness, &mut pane);
+        settle(&mut harness, &mut pane, "the pane to subscribe", |_, _| {
             source.subscriptions() == 1
         });
-        live.runtime.block_on(async {
-            for timestamp in [1, 2, 3] {
-                control
-                    .events
-                    .send(Ok(event(timestamp)))
-                    .await
-                    .expect("the live subscription should accept news");
-            }
-        });
+        for timestamp in [1, 2, 3] {
+            control
+                .events
+                .try_send(Ok(event(timestamp)))
+                .expect("the live subscription should accept news");
+        }
 
-        live.settle(&mut pane, "the feed to reach the pane", |_, pane| {
-            snapshot_contents(&pane.widget) == ["News 3", "News 2", "News 1"]
-        });
-        live.settle(
+        settle(
+            &mut harness,
+            &mut pane,
+            "the feed to reach the pane",
+            |_, pane| snapshot_contents(&pane.widget) == ["News 3", "News 2", "News 1"],
+        );
+        settle(
+            &mut harness,
             &mut pane,
             "the subscription to report itself live",
-            |live, pane| !pane.status.is_busy(&live.app),
+            |harness, pane| !pane.status.is_busy(harness.app()),
         );
         assert!(pane.widget.has_content());
     }
@@ -2016,6 +2002,10 @@ mod tests {
 
         harness.switch_language(LanguageCode::ZhCn);
         frame(&mut harness, &mut pane);
+        assert!(
+            harness.tree().get(empty).is_err(),
+            "the stand-in built in the old language is taken down, not left on screen"
+        );
         let rebuilt = harness
             .find_by_debug_prefix(body, "TEST_NEWS_EMPTY")
             .expect("the stand-in is still there");
@@ -2034,8 +2024,10 @@ mod tests {
         );
     }
 
-    /// The rows are drawn through `bind_text` closures over the language signal, so moving
-    /// the language redraws them without the pane reporting anything again.
+    /// The rows follow the language: their dynamic text is drawn through `bind_text`
+    /// closures over the language signal, and the category badge — a kit `Badge`, whose
+    /// copy is chosen when it is built — is rebuilt with the row. No state is reported
+    /// again for the switch.
     #[test]
     fn the_rows_should_follow_the_language() {
         let mut harness = harness();
@@ -2468,6 +2460,324 @@ mod tests {
         assert!(
             harness.router().is_empty(),
             "the frame route is unregistered"
+        );
+    }
+
+    /// A settings write wakes a mounted pane that has no body of its own.
+    ///
+    /// The framework's surface root reads the settings signal, so the write schedules the
+    /// frame that runs the pane's `sync` even while the pane is drawing a placeholder
+    /// (P3-1d's settings anchor). Before that anchor existed, a reader who signed in while
+    /// the pane was signed out left it on the stand-in for good.
+    #[test]
+    fn a_settings_write_should_wake_a_pane_that_has_no_body() {
+        let mut harness = harness();
+        let widget = harness.mount::<NewsWidget>(NewsConfig::default());
+        harness.drain();
+        harness.drain();
+        assert_eq!(
+            widget.status().state(harness.app()).notice(),
+            Some(&Notice::message("widget.news.logged_out")),
+            "a pane nobody signed in for waits on its stand-in"
+        );
+        let before = harness.app().frame_requests();
+
+        sign_in(&mut harness, ACCOUNT);
+
+        assert!(
+            harness.app().frame_requests() > before,
+            "the surface root read the settings signal while rendering, so signing in \
+             schedules the frame that runs the pane's sync"
+        );
+        harness.drain();
+        assert_ne!(
+            widget.status().state(harness.app()).notice(),
+            Some(&Notice::message("widget.news.logged_out")),
+            "the pane left the signed-out stand-in on the frame the settings write scheduled"
+        );
+        assert!(
+            widget.status().state(harness.app()).is_failed(),
+            "a host without the Kytrix service is a typed failure, not a signed-out pane"
+        );
+        let text = harness.text_of(widget.surface());
+        assert!(
+            !text.contains("register") && !text.contains("log in"),
+            "the signed-out copy is gone from the pane: {text:?}"
+        );
+    }
+
+    /// The signed-out stand-in's catalogue value is a `<p align="center">` paragraph, and
+    /// the surface draws a notice whose value carries markup through the markdown
+    /// component (P3-1d): the reader gets the sentence, never the source tags.
+    #[test]
+    fn the_logged_out_stand_in_should_be_drawn_as_rich_text() {
+        let mut harness = harness();
+        let widget = harness.mount::<NewsWidget>(NewsConfig::default());
+        harness.drain();
+        harness.drain();
+
+        let surface = widget.surface();
+        assert!(
+            harness.find_by_debug_prefix(surface, "MARKDOWN").is_some(),
+            "the notice is authored as markup, so it goes through the markdown component"
+        );
+        let text = harness.text_of(surface);
+        assert!(
+            !text.contains("<p") && !text.contains("</p>"),
+            "the notice's source markup is not drawn as text: {text:?}"
+        );
+        assert!(
+            text.contains("register") || text.contains("log in"),
+            "the reader gets the sentence the catalogue authors: {text:?}"
+        );
+
+        // The sentence is resolved on the frame that draws it, so the switch redraws the
+        // stand-in in the language showing now, still without drawing its markup.
+        harness.switch_language(LanguageCode::ZhCn);
+        harness.drain();
+        harness.drain();
+
+        let text = harness.text_of(surface);
+        assert!(
+            text.contains("登陆"),
+            "the stand-in follows the language: {text:?}"
+        );
+        assert!(
+            !text.contains("<p") && !text.contains("</p>"),
+            "the markup is still not drawn: {text:?}"
+        );
+    }
+
+    /// A language switch rebuilds the blocks of static kit copy that draw a sentence: the
+    /// rows (and their category badges, which are kit `Badge`s) and the header's sound
+    /// control. Both choose their copy when they are built, so the old nodes are taken
+    /// down rather than left to draw the old language — see the module documentation on
+    /// static copy.
+    #[test]
+    fn the_rows_should_be_rebuilt_when_the_language_moves() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let (mut pane, _sound) = audible_pane(&mut harness, FakeSource::default());
+        let header = harness.placeholder_parent();
+        harness
+            .with_cx(|cx| pane.widget.header(HeaderGroup::Right, header, cx))
+            .expect("the header control builds");
+        let sound_node = pane
+            .widget
+            .sound_button
+            .as_ref()
+            .and_then(Button::node)
+            .expect("the control is drawn");
+
+        report_feed(&mut harness, &mut pane, FakeFeed::new().push(1));
+        build_body(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        let body = pane.widget.body_root.expect("the body was built");
+        let count = pane
+            .widget
+            .list
+            .as_ref()
+            .expect("the body built the list")
+            .count(harness.app());
+        let old_row = harness
+            .find_by_debug_prefix(body, "TEST_NEWS_ROW")
+            .expect("the feed draws a row");
+        assert!(harness.text_of(old_row).contains("General"));
+
+        harness.switch_language(LanguageCode::ZhCn);
+        frame(&mut harness, &mut pane);
+
+        assert!(
+            harness.tree().get(old_row).is_err(),
+            "the row built in the old language is gone"
+        );
+        let new_row = harness
+            .find_by_debug_prefix(body, "TEST_NEWS_ROW")
+            .expect("the row is rebuilt");
+        let text = harness.text_of(new_row);
+        assert!(
+            text.contains("综合"),
+            "the badge names the kind of news in the language showing now: {text:?}"
+        );
+        assert!(
+            !text.contains("General"),
+            "the old language is gone from the row: {text:?}"
+        );
+        assert_eq!(
+            pane.widget
+                .list
+                .as_ref()
+                .expect("the body kept its list")
+                .count(harness.app()),
+            count,
+            "rebuilding the rows does not change the feed the list holds"
+        );
+
+        let rebuilt_sound = pane
+            .widget
+            .sound_button
+            .as_ref()
+            .and_then(Button::node)
+            .expect("the header control is rebuilt");
+        assert_ne!(
+            rebuilt_sound, sound_node,
+            "the control's label is chosen when it is built, so the new language rebuilds it"
+        );
+        assert!(
+            harness.tree().get(rebuilt_sound).is_ok(),
+            "the control is drawn in the header the pane built"
+        );
+    }
+
+    /// A pane lays its header row out again whenever it rebuilds it, and the control the
+    /// widget built into the old row went with it. Asking for the control again must build
+    /// a new one — not fail on the node that is no longer there (`StaleNode`) and leave
+    /// the pane without a sound control.
+    #[test]
+    fn the_header_control_should_survive_the_pane_rebuilding_its_row() {
+        let mut harness = harness();
+        let (mut pane, _sound) = audible_pane(&mut harness, FakeSource::default());
+        let first = harness.placeholder_parent();
+        harness
+            .with_cx(|cx| pane.widget.header(HeaderGroup::Right, first, cx))
+            .expect("the control builds into the first row");
+        let first_control = pane
+            .widget
+            .sound_button
+            .as_ref()
+            .and_then(Button::node)
+            .expect("the control is drawn");
+
+        // The pane takes its row down — the control it built into it goes with the row.
+        let window = harness.window();
+        harness
+            .with_cx(|cx| cx.app_mut().remove_node(window, first))
+            .expect("the pane removes its old row");
+        assert!(
+            harness.tree().get(first_control).is_err(),
+            "the old control went with the row it was built into"
+        );
+
+        let second = harness.placeholder_parent();
+        harness
+            .with_cx(|cx| pane.widget.header(HeaderGroup::Right, second, cx))
+            .expect("the control is built again rather than removed twice");
+        let second_control = pane
+            .widget
+            .sound_button
+            .as_ref()
+            .and_then(Button::node)
+            .expect("the control is drawn in the new row");
+        assert!(harness.tree().get(second_control).is_ok());
+        assert!(
+            harness
+                .find_by_debug_prefix(second, "news.sound.")
+                .is_some(),
+            "the control sits in the row the pane built now"
+        );
+
+        // And a second rebuild of the row: one control, no error.
+        let window = harness.window();
+        harness
+            .with_cx(|cx| cx.app_mut().remove_node(window, second))
+            .expect("the pane removes its row again");
+        let third = harness.placeholder_parent();
+        harness
+            .with_cx(|cx| pane.widget.header(HeaderGroup::Right, third, cx))
+            .expect("the control is built a third time");
+        let third_control = pane
+            .widget
+            .sound_button
+            .as_ref()
+            .and_then(Button::node)
+            .expect("the sound control is still drawn");
+        assert!(
+            harness.tree().get(third_control).is_ok(),
+            "the sound control is still in the header"
+        );
+        assert!(
+            harness.find_by_debug_prefix(third, "news.sound.").is_some(),
+            "the rebuilt control is the one the pane's row holds"
+        );
+    }
+
+    /// The reports a feed adds after the body was built are *pushed* into the list rather
+    /// than rebuilt for: the count grows in place, the newest report stays on screen, and
+    /// a reader who was on the newest report keeps their place (the deque list's anchor).
+    ///
+    /// This is the path a live subscription uses for the news a reader is actually told
+    /// about, and the one no test covered before.
+    #[test]
+    fn the_body_should_grow_when_the_feed_publishes_more_reports() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let mut pane = pane(&mut harness, FakeSource::default());
+        let mut feed = FakeFeed::new();
+
+        report_feed(&mut harness, &mut pane, feed.push(1));
+        build_body(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        let body = pane.widget.body_root.expect("the body was built");
+        {
+            let list = pane.widget.list.as_ref().expect("the body built the list");
+            assert_eq!(list.count(harness.app()), 1);
+            assert!(
+                list.offset(harness.app())
+                    .is_some_and(|offset| offset.abs() < 0.5),
+                "the reader is on the newest report the pane opened with"
+            );
+        }
+
+        // The same feed grows by two reports: everything the list holds survives at its
+        // tail, so what the pane has not been shown is a run at the head.
+        feed.push(2);
+        let grown = feed.push(3);
+        report_feed(&mut harness, &mut pane, grown);
+        frame(&mut harness, &mut pane);
+
+        let list = pane.widget.list.as_ref().expect("the body kept its list");
+        assert_eq!(
+            list.count(harness.app()),
+            3,
+            "the two reports the list had not been shown are pushed into it"
+        );
+        assert_eq!(
+            list.mounted_rows(harness.app()).len(),
+            3,
+            "every report the list holds is drawn"
+        );
+        assert!(
+            list.offset(harness.app())
+                .is_some_and(|offset| offset.abs() < 0.5),
+            "a reader on the newest report keeps their place when one arrives"
+        );
+        let text = harness.text_of(body);
+        for expected in ["News 3", "News 2", "News 1"] {
+            assert!(text.contains(expected), "{expected} is drawn: {text:?}");
+        }
+    }
+
+    /// Colours are read through the theme inside `bind_*` closures (G3), so switching the
+    /// appearance invalidates the nodes that read it and schedules the frame that redraws
+    /// them — no state re-report involved.
+    #[test]
+    fn switching_the_appearance_should_request_the_redrawing_frame() {
+        let mut harness = harness();
+        sign_in(&mut harness, ACCOUNT);
+        let mut pane = pane(&mut harness, FakeSource::default());
+
+        report_feed(&mut harness, &mut pane, FakeFeed::new().push(1));
+        build_body(&mut harness, &mut pane);
+        frame(&mut harness, &mut pane);
+        let before = harness.app().frame_requests();
+        let theme = harness.services().theme.clone();
+
+        assert!(theme.set_appearance(harness.app_mut(), Appearance::Dark));
+
+        assert!(
+            harness.app().frame_requests() > before,
+            "the rows read their colours through the theme while rendering, so the \
+             appearance switch schedules the frame that redraws them"
         );
     }
 }
