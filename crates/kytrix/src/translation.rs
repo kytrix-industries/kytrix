@@ -1,45 +1,31 @@
-//! Wiring for the local translation model.
+//! The local translation model seam of the composition root.
 //!
-//! The model is loaded lazily on the first real translation. The directory it is loaded from is
-//! read from the settings on every call, so a directory the user changes is used by the next
-//! translation without a restart. Startup only proves that the translation crate is linked and
-//! accepts the language codes the app uses; it must not pay for a multi-second model load
-//! before the first window.
+//! The model is loaded lazily on the first real translation. The directory it is loaded
+//! from is read from the settings on every call, so a directory the user changes is used
+//! by the next translation without a restart. Startup only proves that the translation
+//! crate is linked and accepts the language codes the app uses; it must not pay for a
+//! multi-second model load before the first window.
 //!
-//! [`AiTranslator`] is the engine the prediction-event dialog translates through. The dialog
-//! owns the batching, the deadline and the cancellation; this module only adapts its seam to
-//! the model crate and installs the result.
+//! [`AiTranslator`] is the engine the prediction-event dialog translates through. The
+//! dialog owns the batching, the deadline and the cancellation; this module only adapts
+//! its seam to the model crate. The composition root owns the one adapter this build has
+//! and hands it to the [`SelectorHost`](instrument_selector_ui::host::SelectorHost) it
+//! builds — it is a field of the root, not a process-global slot (design §11.7).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ai_translator::{
     batch::{BatchSegment, translate_batch},
     error::TranslationError,
 };
-use app_config::settings::Language;
-use app_config_provider::manager::ConfigManager;
-use gpui_kit::App;
+use app_config::settings::{Config, Language};
 use instrument_selector_ui::prediction_translation::{
     LocalTranslator, TranslatedSegment, TranslationCancel, TranslationFailure, TranslationSegment,
     TranslationSetup,
 };
 
-/// The translator the composition root hands to the prediction-event dialog.
-///
-/// The engine has no process-wide, type-keyed global store: the aggregate the
-/// composition root builds is what a dialog is opened with (design §11.7). The
-/// application root therefore owns the one engine this build has and passes it in;
-/// until the composition root (P4) moves to the engine, this startup slot is where
-/// it lives.
-static PREDICTION_TRANSLATOR: OnceLock<Arc<dyn LocalTranslator>> = OnceLock::new();
-
-/// The prediction-event dialog's translator, when startup published one.
-pub(crate) fn prediction_translator() -> Option<Arc<dyn LocalTranslator>> {
-    PREDICTION_TRANSLATOR.get().cloned()
-}
-
 /// The local model engine behind the prediction-event dialog's translation seam.
-struct AiTranslator;
+pub(crate) struct AiTranslator;
 
 impl LocalTranslator for AiTranslator {
     fn prepare(
@@ -87,6 +73,11 @@ impl LocalTranslator for AiTranslator {
     }
 }
 
+/// The translator the prediction-event dialog is handed by the composition root.
+pub(crate) fn production() -> Arc<dyn LocalTranslator> {
+    Arc::new(AiTranslator)
+}
+
 /// The model code for a display language.
 ///
 /// The model rejects the settings locale `zh-CN` and translates Chinese from the code `zh`,
@@ -125,37 +116,17 @@ fn failure(error: TranslationError) -> TranslationFailure {
     }
 }
 
-/// Translates `content` into `target_lang` through the process-wide model.
+/// Proves the translation path is usable, without loading the GGUF before the first window.
 ///
-/// The directory comes from the settings rather than from this module, so changing it in the
-/// settings page takes effect on the next call.
-pub(crate) fn translate(
-    cx: &App,
-    target_lang: &str,
-    content: &str,
-) -> Result<String, TranslationError> {
-    let config = cx.global::<ConfigManager>().read();
+/// Empty content is answered before the model is touched, so this keeps the whole
+/// translation path in the binary and fails only for a build that lost it. A failed probe
+/// aborts startup: a prediction-event dialog that cannot translate is a build defect, not a
+/// setting the user can fix.
+pub(crate) fn probe(config: &Config) -> Result<(), TranslationError> {
     let directory = config.translation.model_directory.as_deref();
     let selected_model = config.translation.selected_model;
 
-    ai_translator::translator::translate(directory, selected_model, target_lang, content)
-}
-
-/// Proves the translation path is usable and publishes the engine the prediction-event
-/// dialog translates through.
-///
-/// The empty probe keeps the whole translation path in the binary without loading the GGUF
-/// at startup. The engine is then stored as the composition root's translator, which the
-/// application root hands to the dialog it opens; a failed probe publishes nothing and
-/// returns the error to the caller.
-pub(crate) fn install(cx: &mut App) -> Result<(), TranslationError> {
-    // Empty content is answered before the model is touched. The call keeps the whole
-    // translation path in the binary without loading the GGUF at startup.
-    let _ = translate(cx, "en", "")?;
-
-    let _ = PREDICTION_TRANSLATOR.set(Arc::new(AiTranslator));
-
-    Ok(())
+    ai_translator::translator::translate(directory, selected_model, "en", "").map(|_| ())
 }
 
 #[cfg(test)]
@@ -164,44 +135,13 @@ mod tests {
 
     use ai_translator::{error::TranslationError, language::TargetLanguage};
     use app_config::settings::{Config, Language};
-    use app_config_provider::manager::ConfigManager;
-    use gpui_kit::TestAppContext;
     use instrument_selector_ui::prediction_translation::{
         LocalTranslator, TranslationCancel, TranslationFailure, TranslationSegment,
         TranslationSetup,
     };
     use smol_str::SmolStr;
 
-    use super::{AiTranslator, failure, target_code};
-
-    #[gpui_kit::test]
-    fn the_translation_entry_point_accepts_empty_content_without_a_model(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
-        });
-
-        let translated = cx.update(|cx| {
-            super::translate(cx, "en", "").expect("empty content must not load the model")
-        });
-
-        assert_eq!(translated, "");
-    }
-
-    /// Startup publishes the translator the prediction-event dialog looks up, so a build
-    /// that runs the composition root never opens the dialog without one.
-    #[gpui_kit::test]
-    fn install_should_publish_the_prediction_translator(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let manager = ConfigManager::in_memory(Config::default(), cx);
-            cx.set_global(manager);
-            super::install(cx).expect("the empty probe and the install should succeed");
-            assert!(
-                super::prediction_translator().is_some(),
-                "the dialog's translator must be published at startup"
-            );
-        });
-    }
+    use super::{AiTranslator, failure, probe, target_code};
 
     /// The dialog's display language reaches the model as one of its own codes, so the
     /// settings locale `zh-CN` — which the model rejects — never does.
@@ -349,5 +289,13 @@ mod tests {
             .expect_err("no directory is configured");
 
         assert_eq!(error, TranslationFailure::ModelDirectoryUnset);
+    }
+
+    /// The startup probe answers empty content without a configured model, which is the
+    /// state a fresh installation starts in: it proves the path is linked without loading
+    /// anything.
+    #[test]
+    fn the_startup_probe_succeeds_on_a_fresh_installation() {
+        probe(&Config::default()).expect("an empty probe must not need a model");
     }
 }
