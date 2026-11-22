@@ -16,7 +16,7 @@ use ui_core::{
 use widget::frame::RouteId;
 
 use super::{
-    dialogs::{Dialogs, NameAlert},
+    dialogs::{AlertCopy, Dialogs, NameAlert},
     intent::{Intent, IntentQueue},
     metrics,
     pages::Pages,
@@ -452,10 +452,12 @@ impl Shell {
         self.dialogs.alert_with_cancel(
             app,
             &self.composition,
-            title,
-            message,
-            confirm,
-            cancel,
+            AlertCopy {
+                title,
+                message,
+                confirm,
+                cancel,
+            },
             on_confirm,
         );
     }

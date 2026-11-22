@@ -88,10 +88,6 @@ pub(crate) enum InitializationError {
     Translations(#[from] i18n::error::types::Error),
     #[error(transparent)]
     Engine(#[from] ui_core::error::EngineError),
-    #[error(transparent)]
-    MarketParticipants(
-        #[from] market_participants_connector::connector::MarketParticipantsConnectorError,
-    ),
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     #[error(transparent)]
     AiTranslation(#[from] ai_translator::error::TranslationError),

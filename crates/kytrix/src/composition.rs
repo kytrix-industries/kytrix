@@ -3,12 +3,11 @@
 //! Every value here is created exactly once, in dependency order, and handed down; nothing
 //! in this process is a type-keyed global (the engine has no global store). The root owns:
 //!
-//! - the **settings store** ([`ConfigStore`]) and its published snapshot
-//!   ([`Signal<Config>`]), whose writes go through one seam ([`ConfigHub::edit`]:
-//!   persist the candidate, publish it, then project what changed — the translator's
-//!   language, the engine language signal, the theme's appearance);
-//! - the **translator** ([`Translate`]) and the language signal every drawn node registers
-//!   when its text must follow a language switch;
+//! - the **settings store** ([`ConfigStore`]) and its published snapshot, whose writes go
+//!   through one seam ([`ConfigHub::edit`]: persist the candidate, publish it into the
+//!   frozen services signal, then project what changed — the translator's language, the
+//!   engine language signal, the theme's appearance);
+//! - the **translator** ([`Translate`]);
 //! - the **theme** ([`ThemeHandle`]), resolved at startup from the stored appearance and
 //!   re-resolved on every appearance write; system appearance changes arrive as engine
 //!   events and are applied by the shell through [`ConfigHub::apply_system_appearance`];
@@ -17,7 +16,13 @@
 //!   (the single `App::on_animation_complete` owner);
 //! - the **services aggregate** ([`WidgetServices`]) every widget, page and title-bar
 //!   control is handed, with the two connector slots the frozen contract models as
-//!   `Option` (§13.9 R-1);
+//!   `Option` (§13.9 R-1). It is also the **one home of the four frozen signals**
+//!   ([`WidgetServices::language`], [`WidgetServices::config`],
+//!   [`WidgetServices::catalog_generation`], [`WidgetServices::reduce_motion`]): the root
+//!   is their only writer — [`ConfigHub::publish`] writes the language and the config
+//!   snapshot, the shell's route mirrors the catalogue generation, and the reduced-motion
+//!   value is seeded here at startup (this batch's settings carry no accessibility
+//!   preference yet, so it stays at the product default);
 //! - the **widget catalogue** ([`WidgetRegistry`]) a pane mounts a widget through, and the
 //!   **market participants connector** the title bar's venue menu loads through;
 //! - the **settings page seam** ([`SettingsStore`]) whose commit closure is
@@ -42,8 +47,6 @@
 //! Everything else — settings persistence, translation, theme, catalogue, market
 //! participants, selector host, frame ownership — is wired here and is what the shell
 //! draws.
-//!
-//! [`Signal<Config>`]: ui_core::node::signal::Signal
 
 use std::{
     cell::{Cell, RefCell},
@@ -57,12 +60,12 @@ use base_ui::{
     kit::{layer::Layer, overlay::AnimationRouter},
     theme::{appearance::Appearance, handle::ThemeHandle},
 };
-use i18n::{global::embedded, language::codes::LanguageCode, translate::Translate};
+use i18n::{global::embedded, translate::Translate};
 use market_participants_connector::connector::{
     MarketParticipantsConnector, MarketParticipantsConnectorInput,
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
-use ui_core::{app::App, node::signal::Signal};
+use ui_core::app::App;
 use widget::{frame::FrameRouter, services::WidgetServices};
 use widget_registry::{catalogue, registry::WidgetRegistry};
 
@@ -78,12 +81,12 @@ pub(crate) struct ConfigHub {
     /// The persisted settings. The store is behind an `Rc<RefCell<..>>` because the commit
     /// seam is a `'static` closure shared by every control that writes.
     store: RefCell<ConfigStore>,
-    /// The published snapshot every consumer reads ([`WidgetServices::config`]).
-    config: Signal<Config>,
+    /// The services aggregate whose frozen signals every consumer reads
+    /// ([`WidgetServices::config`], [`WidgetServices::language`]). The hub writes them;
+    /// nothing else mints a second copy.
+    services: Rc<WidgetServices>,
     /// The translator, whose language follows the stored one.
     translate: Translate,
-    /// The engine dependency a drawn node registers to follow a language switch.
-    language: Signal<LanguageCode>,
     /// The theme service, whose appearance follows the stored one.
     theme: ThemeHandle,
     /// How many writes the seam has committed, for tests and diagnostics.
@@ -155,14 +158,14 @@ impl ConfigHub {
             // Translator first: a node that reads the new language from the signal below
             // must find the catalogue already rendering it.
             self.translate.set_language(code);
-            app.write(&self.language, code);
+            app.write(&self.services.language, code);
         }
         if previous.appearance != candidate.appearance {
             self.theme
                 .set_appearance(app, appearance_of(candidate.appearance));
         }
 
-        app.write(&self.config, candidate);
+        app.write(&self.services.config, candidate);
         Self::repaint_all(app);
     }
 
@@ -223,9 +226,9 @@ pub(crate) struct Composition {
     pub theme: ThemeHandle,
     /// The translator every page and component is handed.
     pub translate: Translate,
-    /// The engine language signal.
-    pub language: Signal<LanguageCode>,
-    /// The services aggregate every widget, page and title-bar control is handed.
+    /// The services aggregate every widget, page and title-bar control is handed. It holds
+    /// the four frozen signals; the root writes them and the shell reads them there, so
+    /// there is no second set of engine signals to keep in step.
     pub services: Rc<WidgetServices>,
     /// The three registries kit components resolve through.
     pub layer: Rc<Layer>,
@@ -237,8 +240,6 @@ pub(crate) struct Composition {
     pub market_participants: Option<MarketParticipantsConnector>,
     /// The settings page seam (persist → publish → project).
     pub settings_store: settings_ui::session::SettingsStore,
-    /// The directory generation the catalogue publishes (0 = nothing published yet).
-    pub catalog_generation: Signal<u64>,
 
     /// Whether the settings file had to be replaced at startup.
     pub recovery: Option<ConfigRecovery>,
@@ -270,25 +271,15 @@ impl Composition {
             Rc::new(embedded::load()?),
             crate::language::code(initial.language),
         );
-        let language = app.signal(crate::language::code(initial.language));
-        let config = app.signal(initial.as_ref().clone());
-        let catalog_generation = app.signal(0_u64);
 
         let layer = Rc::new(Layer::new());
         let frame_router = Rc::new(FrameRouter::new(app)?);
         let animation_router = Rc::new(AnimationRouter::new());
 
-        let hub = Rc::new(ConfigHub {
-            store: RefCell::new(store),
-            config,
-            translate: translate.clone(),
-            language,
-            theme: theme.clone(),
-            commits: Cell::new(0),
-        });
-
         let market_participants = install_market_participants(&runtime, initial.as_ref());
 
+        // The frozen signal set is minted with the aggregate and lives there: the shell and
+        // every widget read the same four signals, and the hub below is their one writer.
         let services = Rc::new(
             WidgetServices::builder(
                 app,
@@ -302,6 +293,9 @@ impl Composition {
             .language(crate::language::code(initial.language))
             .config(initial.as_ref().clone())
             .catalog_generation(0)
+            // This batch's settings carry no accessibility preference yet, so the product
+            // default (animate) is what the root seeds. When a preference lands, it is the
+            // root that writes this signal from it, never a component.
             .reduce_motion(false)
             .market_participants(market_participants.clone())
             .kytrix_service(None)
@@ -310,7 +304,15 @@ impl Composition {
             .build(),
         );
 
-        let settings_store = settings_ui::session::SettingsStore::new(app, config, {
+        let hub = Rc::new(ConfigHub {
+            store: RefCell::new(store),
+            services: Rc::clone(&services),
+            translate: translate.clone(),
+            theme: theme.clone(),
+            commits: Cell::new(0),
+        });
+
+        let settings_store = settings_ui::session::SettingsStore::new(app, services.config, {
             let hub = Rc::clone(&hub);
             move |app, candidate| {
                 hub.edit(app, |settings| *settings = candidate)
@@ -331,7 +333,6 @@ impl Composition {
             hub,
             theme,
             translate,
-            language,
             services,
             layer,
             frame_router,
@@ -339,7 +340,6 @@ impl Composition {
             catalogue: Rc::new(catalogue::registry()?),
             market_participants,
             settings_store,
-            catalog_generation,
             recovery,
         }))
     }
@@ -349,7 +349,7 @@ impl Composition {
         &self.services
     }
 
-    /// Mirrors the market-participants catalogue generation into its engine signal.
+    /// Mirrors the market-participants catalogue generation into its frozen services signal.
     ///
     /// Called once per frame by the shell's route: reading the generation costs nothing and
     /// writing it only when it moved is what asks every widget waiting on a directory for
@@ -359,9 +359,16 @@ impl Composition {
         let Some(connector) = &self.market_participants else {
             return;
         };
-        let published = connector.catalog().generation_id().get();
-        if app.read_with(&self.catalog_generation, |current| *current) != published {
-            app.write(&self.catalog_generation, published);
+        self.publish_catalog_generation(app, connector.catalog().generation_id().get());
+    }
+
+    /// Publishes `generation` as the services signal when it moved.
+    ///
+    /// The shell's route reaches this through [`Self::sync_catalog_generation`]; the
+    /// split lets a test drive the publication without a network connector behind it.
+    fn publish_catalog_generation(&self, app: &mut App, generation: u64) {
+        if app.read_with(&self.services.catalog_generation, |current| *current) != generation {
+            app.write(&self.services.catalog_generation, generation);
         }
     }
 
@@ -473,7 +480,28 @@ fn no_audio(_name: &'static str) -> Option<bytes::Bytes> {
 
 #[cfg(test)]
 mod tests {
+    use app_config::settings::Language;
+    use i18n::language::codes::LanguageCode;
+    use ui_core::{
+        node::builder::NodeBuilder, paint::style::StylePatch, test_support::app::TestApp,
+    };
+
     use super::*;
+
+    /// The application the binary builds, over the headless engine and an in-memory store.
+    fn headless() -> (TestApp, Rc<Composition>) {
+        let mut app = TestApp::new();
+        let runtime = app.app().runtime_handle().clone();
+        let composition = Composition::with_store(
+            app.app_mut(),
+            runtime,
+            ConfigStore::in_memory(Config::default()),
+            None,
+        )
+        .expect("the composition root builds headlessly");
+
+        (app, composition)
+    }
 
     /// The stored appearance preference resolves to a palette, and `System` starts in the
     /// product default (dark) until the platform reports otherwise.
@@ -490,41 +518,122 @@ mod tests {
         assert!(no_audio("widget.news.sound").is_none());
     }
 
-    /// The commit seam persists first and publishes second: a write the store refuses
-    /// leaves the published snapshot exactly as it was.
+    /// A committed settings write lands in the frozen services signals — the ones every
+    /// widget and page reads — and in the translator and the theme, in one publication.
+    ///
+    /// This is what P1-1 regressed: the composition root used to keep a second set of
+    /// engine signals of its own, so consumers of `WidgetServices` never saw a write.
     #[test]
-    fn a_refused_write_should_leave_the_snapshot_alone() {
-        let mut app = ui_core::test_support::app::TestApp::new();
+    fn a_settings_write_should_publish_into_the_services_signals() {
+        let (mut app, composition) = headless();
+        let services = Rc::clone(composition.services());
         let app = app.app_mut();
-        let (store, _) = (
-            ConfigStore::in_memory(Config::default()),
-            None::<ConfigRecovery>,
-        );
-        let snapshot = store.read();
-        let theme = ThemeHandle::new(app, Appearance::Dark);
-        let translate = Translate::new(
-            Rc::new(embedded::load().expect("embedded")),
-            LanguageCode::En,
-        );
-        let language = app.signal(LanguageCode::En);
-        let config = app.signal(snapshot.as_ref().clone());
-        let hub = ConfigHub {
-            store: RefCell::new(store),
-            config,
-            translate,
-            language,
-            theme,
-            commits: Cell::new(0),
-        };
 
-        hub.edit(app, |config| config.appearance = StoredAppearance::Light)
+        composition
+            .hub
+            .edit(app, |config| {
+                config.language = Language::ZhCn;
+                config.appearance = StoredAppearance::Light;
+            })
             .expect("an in-memory store stores every write");
 
-        assert_eq!(hub.commits(), 1);
+        assert_eq!(composition.hub.commits(), 1);
+        assert_eq!(*app.read(&services.language), LanguageCode::ZhCn);
         assert_eq!(
-            app.read_with(&config, |config| config.appearance),
+            app.read_with(&services.config, |config| config.language),
+            Language::ZhCn
+        );
+        assert_eq!(
+            app.read_with(&services.config, |config| config.appearance),
             StoredAppearance::Light
         );
-        assert_eq!(hub.theme.current(app), Appearance::Light);
+        assert_eq!(composition.theme.current(app), Appearance::Light);
+        assert_eq!(composition.translate.language(), LanguageCode::ZhCn);
+    }
+
+    /// The commit seam persists first: a write the store refuses leaves the frozen
+    /// services snapshot (and the theme and the translator) exactly as they were.
+    #[test]
+    fn a_refused_write_should_leave_the_services_snapshot_alone() {
+        let mut app = TestApp::new();
+        let runtime = app.app().runtime_handle().clone();
+        // A file where the settings directory would go makes the store's own write fail
+        // (`create_dir_all` on a file is refused) without needing a read-only filesystem.
+        let blocker =
+            std::env::temp_dir().join(format!("kytrix-p4-3b-refused-write-{}", std::process::id()));
+        std::fs::write(&blocker, b"not a directory").expect("the blocker file is written");
+        let store = ConfigStore::from_path(blocker.join("config.json"))
+            .expect("a missing settings file loads the defaults");
+        let composition = Composition::with_store(app.app_mut(), runtime, store, None)
+            .expect("the composition root builds over the store");
+        let services = Rc::clone(composition.services());
+        let before = app.app().read_with(&services.config, Clone::clone);
+        let before_language = *app.app().read(&services.language);
+
+        let result = composition.hub.edit(app.app_mut(), |config| {
+            config.appearance = StoredAppearance::Light;
+        });
+
+        assert!(result.is_err(), "the store cannot write under a file");
+        assert_eq!(composition.hub.commits(), 0, "nothing was published");
+        assert_eq!(
+            app.app().read_with(&services.config, Clone::clone),
+            before,
+            "the frozen snapshot is exactly what it was"
+        );
+        assert_eq!(*app.app().read(&services.language), before_language);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// A catalogue generation written by the root reaches the frozen services signal and
+    /// redraws the nodes that read it: a widget waiting on the directory reruns its `load`
+    /// on that frame (§13.5).
+    #[test]
+    fn a_catalog_generation_write_should_redraw_its_readers() {
+        let (mut app, composition) = headless();
+        let services = Rc::clone(composition.services());
+        let window = app.window_id();
+        let generation = services.catalog_generation;
+
+        let root = {
+            let target = app
+                .app()
+                .window(window)
+                .expect("the test host has a window");
+            target.tree().root()
+        };
+        let probe = NodeBuilder::boxed()
+            .id(smol_str::SmolStr::new_static("CATALOG_GENERATION_PROBE"))
+            .bind_style(move |cx| StylePatch {
+                visible: Some(*cx.read(&generation) > 0),
+                ..StylePatch::default()
+            })
+            .build(
+                app.app_mut()
+                    .window_mut(window)
+                    .expect("the test host has a window")
+                    .tree_mut(),
+                root,
+            )
+            .expect("the probe node builds");
+        let visible = |app: &TestApp| {
+            app.app()
+                .window(window)
+                .and_then(|target| target.tree().get(probe).ok())
+                .and_then(|node| node.style_patch().visible)
+        };
+
+        let _ = app.drain();
+        assert_eq!(visible(&app), Some(false), "nothing is published yet");
+
+        composition.publish_catalog_generation(app.app_mut(), 7);
+        let _ = app.drain();
+
+        assert_eq!(*app.app().read(&services.catalog_generation), 7);
+        assert_eq!(
+            visible(&app),
+            Some(true),
+            "the node that reads the signal is redrawn with the new value"
+        );
     }
 }

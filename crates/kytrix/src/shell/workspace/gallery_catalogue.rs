@@ -12,7 +12,7 @@
 
 use std::rc::Rc;
 
-use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
+use ui_core::{app::App, node::id::NodeId, window::WindowId};
 use widget::{
     any::AnyWidget, config::WidgetConfigChange, descriptor::WidgetDescriptor, identity::WidgetId,
     services::WidgetServices,
@@ -62,12 +62,6 @@ impl GalleryCatalogue for RegistryCatalogue {
                 WidgetMountError::Mount(error) => GalleryError::Engine(error),
             })
     }
-}
-
-/// The adapter's own engine error surface, kept out of the page's trait.
-#[allow(dead_code)]
-fn engine_error(error: EngineError) -> GalleryError {
-    GalleryError::Engine(error)
 }
 
 #[cfg(test)]
