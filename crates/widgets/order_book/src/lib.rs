@@ -1,3 +1,4 @@
+mod directory;
 mod model;
 mod paint;
 mod service;

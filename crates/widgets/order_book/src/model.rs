@@ -27,7 +27,6 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use gpui_kit::SharedString;
 use market_participants_model::{
     asset::AssetId,
     decimal::{Price, Quantity, Tick},
@@ -37,7 +36,7 @@ use market_participants_model::{
         units::QuantityUnit,
     },
 };
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 
 /// The price-grouping multipliers, in the order they are offered.
 pub(super) const PRICE_MULTIPLIERS: [u32; 5] = [1, 10, 100, 1_000, 10_000];
@@ -84,13 +83,10 @@ std::thread_local! {
     static FORMAT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn format_shared<T>(format: impl FnOnce() -> T) -> SharedString
-where
-    T: AsRef<str>,
-{
+fn format_label(format: impl FnOnce() -> SmolStr) -> SmolStr {
     #[cfg(test)]
     FORMAT_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-    SharedString::new(format().as_ref())
+    format()
 }
 
 /// The increments and the units every label of one book is written in, and how
@@ -169,9 +165,9 @@ pub(super) struct GroupedLevel {
     pub price: Price,
     pub quantity: Quantity,
     pub cumulative_quantity: Quantity,
-    pub price_text: SharedString,
-    pub quantity_text: SharedString,
-    pub cumulative_quantity_text: SharedString,
+    pub price_text: SmolStr,
+    pub quantity_text: SmolStr,
+    pub cumulative_quantity_text: SmolStr,
     /// The depth-bar ratio this level was last painted with, and the ratio it is
     /// heading for. A frame interpolates between them; the model only decides
     /// where the movement starts from.
@@ -194,10 +190,10 @@ pub(super) struct GroupedBook {
     /// with.
     pub quantity_unit: QuantityUnit,
     pub mid_price: Option<Price>,
-    pub spread_text: Option<SharedString>,
-    pub mid_price_text: Option<SharedString>,
-    pub ask_imbalance_text: SharedString,
-    pub bid_imbalance_text: SharedString,
+    pub spread_text: Option<SmolStr>,
+    pub mid_price_text: Option<SmolStr>,
+    pub ask_imbalance_text: SmolStr,
+    pub bid_imbalance_text: SmolStr,
     /// The ask share of the visible quantity when this book was last painted, and
     /// the share it is heading for.
     pub previous_imbalance: f32,
@@ -305,23 +301,23 @@ impl GroupedBook {
             .filter(|book| book.price_tick == input.price_tick && book.spread == spread)
             .and_then(|book| book.spread_text.clone())
             .or_else(|| {
-                spread.map(|price| format_shared(|| price.format_and_round_tick(input.price_tick)))
+                spread.map(|price| format_label(|| price.format_and_round_tick(input.price_tick)))
             });
         let mid_price_text = previous
             .filter(|book| book.price_tick == input.price_tick && book.mid_price == mid_price)
             .and_then(|book| book.mid_price_text.clone())
             .or_else(|| {
                 mid_price
-                    .map(|price| format_shared(|| price.format_and_round_tick(input.price_tick)))
+                    .map(|price| format_label(|| price.format_and_round_tick(input.price_tick)))
             });
         let ask_imbalance_text = previous
             .filter(|book| book.current_imbalance == current_imbalance)
             .map(|book| book.ask_imbalance_text.clone())
-            .unwrap_or_else(|| format_shared(|| format_smolstr!("{current_imbalance:.2}")));
+            .unwrap_or_else(|| format_label(|| format_smolstr!("{current_imbalance:.2}")));
         let bid_imbalance_text = previous
             .filter(|book| book.current_imbalance == current_imbalance)
             .map(|book| book.bid_imbalance_text.clone())
-            .unwrap_or_else(|| format_shared(|| format_smolstr!("{:.2}", 1.0 - current_imbalance)));
+            .unwrap_or_else(|| format_label(|| format_smolstr!("{:.2}", 1.0 - current_imbalance)));
 
         Self {
             asks: asks.levels.into(),
@@ -519,16 +515,16 @@ fn push_grouped_level(
     let price_text = previous
         .filter(|level| level.price == price)
         .map(|level| level.price_text.clone())
-        .unwrap_or_else(|| format_shared(|| price.format_and_round_tick(context.group_tick)));
+        .unwrap_or_else(|| format_label(|| price.format_and_round_tick(context.group_tick)));
     let quantity_text = previous
         .filter(|level| level.quantity == quantity)
         .map(|level| level.quantity_text.clone())
-        .unwrap_or_else(|| format_shared(|| quantity.format_and_round_tick(context.quantity_tick)));
+        .unwrap_or_else(|| format_label(|| quantity.format_and_round_tick(context.quantity_tick)));
     let cumulative_quantity_text = previous
         .filter(|level| level.cumulative_quantity == *cumulative)
         .map(|level| level.cumulative_quantity_text.clone())
         .unwrap_or_else(|| {
-            format_shared(|| cumulative.format_and_round_tick(context.quantity_tick))
+            format_label(|| cumulative.format_and_round_tick(context.quantity_tick))
         });
     levels.push(GroupedLevel {
         price,
@@ -641,23 +637,21 @@ fn multiplied_tick(price_tick: Tick, multiplier: u32) -> Tick {
 
 /// The label of one price-grouping choice: the step it groups to, written the way
 /// the venue writes prices.
-pub(super) fn price_step_label(price_tick: Option<Tick>, multiplier: u32) -> SharedString {
+pub(super) fn price_step_label(price_tick: Option<Tick>, multiplier: u32) -> SmolStr {
     let Some(price_tick) = price_tick else {
-        return SharedString::new_static("--");
+        return SmolStr::new_static("--");
     };
     let Some(inner) = price_tick.inner().checked_mul(u128::from(multiplier)) else {
-        return format_shared(|| format_smolstr!("{multiplier}x"));
+        return format_label(|| format_smolstr!("{multiplier}x"));
     };
     let Ok(group_tick) = Tick::from_inner(inner) else {
-        return format_shared(|| format_smolstr!("{multiplier}x"));
+        return format_label(|| format_smolstr!("{multiplier}x"));
     };
-    format_shared(|| Price::from_inner(inner).format_and_round_tick(group_tick))
+    format_label(|| Price::from_inner(inner).format_and_round_tick(group_tick))
 }
 
 /// Every price-grouping label, in the order the choices are offered.
-pub(super) fn price_step_labels(
-    price_tick: Option<Tick>,
-) -> [SharedString; PRICE_MULTIPLIERS.len()] {
+pub(super) fn price_step_labels(price_tick: Option<Tick>) -> [SmolStr; PRICE_MULTIPLIERS.len()] {
     PRICE_MULTIPLIERS.map(|multiplier| price_step_label(price_tick, multiplier))
 }
 

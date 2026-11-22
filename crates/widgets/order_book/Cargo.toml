@@ -5,39 +5,32 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
-ahash = { workspace = true }
+app_config = { workspace = true }
+base_ui = { workspace = true }
 futures = { workspace = true }
-log = { workspace = true }
-gpui-kit = { workspace = true }
 i18n = { workspace = true }
+instrument_selector_ui = { workspace = true }
+log = { workspace = true }
+market_participants_connector = { workspace = true }
+market_participants_model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-
-# Workspace members
-app_config = { workspace = true }
-base_ui = { workspace = true }
-instrument_selector_ui = { workspace = true }
-market_participants_connector = { workspace = true }
-market_participants_model = { workspace = true }
+ui_core = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
-# The connection seam a widget test connects a venue through: the crate's own
+# The connection seam a widget test publishes a catalogue through: the crate's own
 # `test-support` feature, which is never enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
-i18n = { workspace = true }
-# The market participants root the header's picker and the pane's capability question read is
-# built from typed runtime inputs, so a view test needs the transport hub those
-# inputs name.
-network = { workspace = true }
-# The configuration notification the root's snapshot handoff is built from.
-app_config_provider.workspace = true
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# The engine's node/canvas inspection the ladder tests read, and the framework's
+# headless host (`WidgetTestApp`), which is what every interface test drives the
+# widget through. Only the test build opens either feature.
+ui_core = { workspace = true, features = ["test-support"] }
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
