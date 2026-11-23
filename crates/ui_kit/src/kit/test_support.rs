@@ -254,7 +254,13 @@ pub fn assert_single_parent_per_node(snapshot: &A11yTreeSnapshot) {
 
 #[cfg(test)]
 mod tests {
-    use ui_core::{math::Rect, node::builder::NodeBuilder, resources::DecodeState};
+    use ui_core::{
+        math::Rect,
+        node::builder::NodeBuilder,
+        paint::{color::Color, style::PaintSpec},
+        resources::DecodeState,
+        test_support::diagnostics::frame_dump,
+    };
 
     use super::{
         DecodeApp, assert_single_image, bounds, frame, image_primitives, root, test_app,
@@ -308,26 +314,35 @@ mod tests {
     }
 
     #[test]
-    fn the_scale_factory_sets_the_window_scale() {
-        let hdpi = test_app_with_scale(2.0);
-        assert_eq!(
-            hdpi.app()
-                .window(hdpi.window_id())
-                .expect("窗口")
-                .scale()
-                .factor(),
-            2.0
-        );
-        let normal = test_app();
-        assert_eq!(
-            normal
-                .app()
-                .window(normal.window_id())
-                .expect("窗口")
-                .scale()
-                .factor(),
-            1.0
-        );
+    fn the_scale_factory_injects_the_device_scale() {
+        for (scale, physical) in [(1.0f32, 10.0f32), (2.0, 20.0)] {
+            let mut app = test_app_with_scale(scale);
+            let window = app.window_id();
+            let window_root = root(&app);
+            NodeBuilder::boxed()
+                .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+                .paint(PaintSpec {
+                    background: Color::WHITE,
+                    ..PaintSpec::default()
+                })
+                .build(
+                    app.app_mut().window_mut(window).expect("窗口").tree_mut(),
+                    window_root,
+                )
+                .expect("挂载");
+            let _ = app.drain().expect("首帧");
+            let dump = frame_dump(&app);
+            assert!(
+                dump.instances
+                    .iter()
+                    .any(|instance| instance.bounds == [0.0, 0.0, physical, physical]),
+                "scale {scale}: 四边图元的物理尺寸必须是 {physical}，实际 {:?}",
+                dump.instances
+                    .iter()
+                    .map(|instance| instance.bounds)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

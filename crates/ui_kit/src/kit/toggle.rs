@@ -306,11 +306,7 @@ impl Toggle {
         changed |= match self.kind {
             ToggleKind::Switch => self.sync_knob(app)?,
             ToggleKind::Checkbox => self.sync_mark(app)?,
-            ToggleKind::Radio => {
-                let mut radio_changed = self.sync_ring(app)?;
-                radio_changed |= self.sync_mark(app)?;
-                radio_changed
-            }
+            ToggleKind::Radio => false,
         };
         Ok(changed)
     }
@@ -335,50 +331,26 @@ impl Toggle {
         ) else {
             return Ok(false);
         };
-        let Some(bounds) = node_bounds(app, window, track) else {
+        let Some(bounds) = layout_bounds(app, window, track) else {
             return Ok(false);
         };
-        let scale = window_scale(app, window);
-        let track_width = (bounds.size.width * scale).round().max(1.0);
-        let track_height = (bounds.size.height * scale).round().max(1.0);
-        let inset = (KNOB_INSET * scale).round().max(1.0);
-        let knob_size = (track_height - inset * 2.0).max(1.0);
-        let travel = (track_width - knob_size - inset * 2.0).max(0.0);
-        let offset = inset + self.mix(app) * travel;
-        let rect = Rect::new(
-            offset / scale,
-            inset / scale,
-            knob_size / scale,
-            knob_size / scale,
-        );
-        set_override(app, window, knob, rect)
-    }
-
-    fn sync_ring(&self, app: &mut App) -> Result<bool, EngineError> {
-        let (Some(window), Some(control), Some(ring)) = (
-            self.inner.geometry.borrow().window,
-            self.inner.geometry.borrow().control,
-            self.inner.geometry.borrow().ring,
-        ) else {
-            return Ok(false);
-        };
-        let Some(bounds) = node_bounds(app, window, control) else {
-            return Ok(false);
-        };
-        let scale = window_scale(app, window);
-        let width = (bounds.size.width * scale).round().max(1.0);
-        let height = (bounds.size.height * scale).round().max(1.0);
-        let diameter = width.min(height);
-        let x = ((width - diameter) / 2.0).round() / scale;
-        let y = ((height - diameter) / 2.0).round() / scale;
-        let rect = Rect::new(x, y, diameter / scale, diameter / scale);
-        set_override(app, window, ring, rect)
+        let inset = track_metrics(self.size).inset;
+        let knob_size = (bounds.size.height - inset * 2.0)
+            .min(bounds.size.width - inset * 2.0)
+            .max(1.0);
+        let travel = (bounds.size.width - knob_size - inset * 2.0).max(0.0);
+        let offset =
+            (inset + self.mix(app) * travel).clamp(0.0, (bounds.size.width - knob_size).max(0.0));
+        let top = inset.min((bounds.size.height - knob_size).max(0.0));
+        set_override(
+            app,
+            window,
+            knob,
+            Rect::new(offset, top, knob_size, knob_size),
+        )
     }
 
     fn sync_mark(&self, app: &mut App) -> Result<bool, EngineError> {
-        if self.kind == ToggleKind::Switch {
-            return Ok(false);
-        }
         let (Some(window), Some(control), Some(mark)) = (
             self.inner.geometry.borrow().window,
             self.inner.geometry.borrow().control,
@@ -386,102 +358,50 @@ impl Toggle {
         ) else {
             return Ok(false);
         };
-        let Some(control_bounds) = node_bounds(app, window, control) else {
+        let Some(bounds) = layout_bounds(app, window, control) else {
             return Ok(false);
         };
-        let scale = window_scale(app, window);
-        let ring = self.inner.geometry.borrow().ring;
-        let container = if self.kind == ToggleKind::Radio {
-            ring.and_then(|ring| node_bounds(app, window, ring))
-        } else {
-            None
-        };
-        let (offset_x, offset_y, width, height) = match container {
-            Some(bounds) => (
-                bounds.origin.x - control_bounds.origin.x,
-                bounds.origin.y - control_bounds.origin.y,
-                (bounds.size.width * scale).round().max(1.0),
-                (bounds.size.height * scale).round().max(1.0),
-            ),
-            None => (
-                0.0,
-                0.0,
-                (control_bounds.size.width * scale).round().max(1.0),
-                (control_bounds.size.height * scale).round().max(1.0),
-            ),
-        };
-        let ratio = if self.kind == ToggleKind::Radio {
-            RADIO_DOT_RATIO
-        } else {
-            CHECK_ICON_RATIO
-        };
-        let mut mark_size = (width * ratio).round().max(1.0);
-        if ((mark_size as i64 - width as i64) & 1) != 0 {
-            mark_size += 1.0;
-        }
-        let x = offset_x + ((width - mark_size) / 2.0).round() / scale;
-        let y = offset_y + ((height - mark_size) / 2.0).round() / scale;
-        let mark_size = mark_size / scale;
-        let rect = Rect::new(x, y, mark_size, mark_size);
+        let mark_size = (bounds.size.width * CHECK_ICON_RATIO).max(1.0);
+        let rect = Rect::new(
+            ((bounds.size.width - mark_size) / 2.0).max(0.0),
+            ((bounds.size.height - mark_size) / 2.0).max(0.0),
+            mark_size,
+            mark_size,
+        );
         let mut changed = set_override(app, window, mark, rect)?;
-        if self.kind == ToggleKind::Checkbox {
-            let appearance = self.inner.theme.current(app);
-            let color = self
-                .inner
-                .theme
-                .theme_for(appearance)
-                .role(Role::FgOnBrand)
-                .with_opacity(self.mix(app));
-            let paint_bounds = Rect::new(
-                control_bounds.origin.x + x,
-                control_bounds.origin.y + y,
-                mark_size,
-                mark_size,
-            );
-            let paint = (paint_bounds, color);
-            if self.inner.geometry.borrow().mark_paint.get() != Some(paint) {
-                let canvas = check_canvas(paint_bounds, color);
-                app.window_mut(window)
-                    .ok_or(EngineError::UnknownWindow { window })?
-                    .set_canvas(mark, canvas)?;
-                self.inner.geometry.borrow_mut().mark_paint.set(Some(paint));
-                changed = true;
-            }
+        let appearance = self.inner.theme.current(app);
+        let color = self
+            .inner
+            .theme
+            .theme_for(appearance)
+            .role(Role::FgOnBrand)
+            .with_opacity(self.mix(app));
+        let paint_bounds = Rect::new(
+            bounds.origin.x + rect.origin.x,
+            bounds.origin.y + rect.origin.y,
+            mark_size,
+            mark_size,
+        );
+        let paint = (paint_bounds, color);
+        if self.inner.geometry.borrow().mark_paint.get() != Some(paint) {
+            let canvas = check_canvas(paint_bounds, color);
+            app.window_mut(window)
+                .ok_or(EngineError::UnknownWindow { window })?
+                .set_canvas(mark, canvas)?;
+            self.inner.geometry.borrow_mut().mark_paint.set(Some(paint));
+            changed = true;
         }
         Ok(changed)
     }
 }
 
-fn node_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
+fn layout_bounds(app: &App, window: WindowId, node: NodeId) -> Option<Rect> {
     app.window(window)?
         .tree()
         .get(node)
         .ok()
         .map(|target| target.layout().bounds)
         .filter(|bounds| !bounds.is_empty())
-}
-
-fn window_scale(app: &App, window: WindowId) -> f32 {
-    app.window(window)
-        .map_or(1.0, |target| target.scale().factor())
-}
-
-fn device_length(value: f32, scale: f32) -> f32 {
-    if !scale.is_finite() || scale <= 0.0 {
-        return value;
-    }
-    (value * scale).round().max(1.0) / scale
-}
-
-fn device_length_with_parity(value: f32, scale: f32, reference: f32) -> f32 {
-    if !scale.is_finite() || scale <= 0.0 {
-        return value;
-    }
-    let mut length = (value * scale).round().max(1.0);
-    if ((length as i64 - reference as i64) & 1) != 0 {
-        length += 1.0;
-    }
-    length / scale
 }
 
 fn check_canvas(bounds: Rect, color: Color) -> Canvas {
@@ -550,7 +470,7 @@ impl UnifiedSizable for Toggle {
     }
 }
 
-const KNOB_INSET: f32 = 2.0;
+const CONTROL_SIDE_RATIO: f32 = 1.5;
 
 const RADIO_DOT_RATIO: f32 = 0.42;
 
@@ -573,13 +493,13 @@ struct TrackMetrics {
     inset: f32,
 }
 
-fn track_metrics(size: UnifiedSize, scale: f32) -> TrackMetrics {
-    let height = device_length(size.icon_size() * 1.25, scale);
+fn track_metrics(size: UnifiedSize) -> TrackMetrics {
+    let height = size.icon_size() * 1.25;
     TrackMetrics {
-        width: device_length(height * 1.9, scale),
+        width: height * 1.9,
         height,
         radius: height / 2.0,
-        inset: device_length(KNOB_INSET, scale),
+        inset: 2.0,
     }
 }
 
@@ -595,9 +515,7 @@ fn build_control(
 ) -> Result<Control, EngineError> {
     match kind {
         ToggleKind::Checkbox | ToggleKind::Radio => {
-            let scale = window_scale(app, window);
-            let side = device_length(size.icon_size() * 1.5, scale);
-            let side_px = (side * scale).round().max(1.0);
+            let side = size.icon_size() * CONTROL_SIDE_RATIO;
             let is_radio = kind == ToggleKind::Radio;
             let control_theme = theme.clone();
             let control_mix = mix;
@@ -674,8 +592,7 @@ fn build_control(
             let mark_mix = mix;
             let (mark, mark_paint) = match kind {
                 ToggleKind::Checkbox => {
-                    let mark_size =
-                        device_length_with_parity(side * CHECK_ICON_RATIO, scale, side_px);
+                    let mark_size = side * CHECK_ICON_RATIO;
                     let inset = (side - mark_size) / 2.0;
                     let canvas = Canvas::new(Rect::default());
                     let mark = NodeBuilder::canvas(canvas)
@@ -698,7 +615,7 @@ fn build_control(
                     (Some(mark), None)
                 }
                 ToggleKind::Radio => {
-                    let dot = device_length_with_parity(side * RADIO_DOT_RATIO, scale, side_px);
+                    let dot = side * RADIO_DOT_RATIO;
                     let inset = (side - dot) / 2.0;
                     let theme_dot = theme;
                     let mark = NodeBuilder::boxed()
@@ -732,7 +649,7 @@ fn build_control(
             })
         }
         ToggleKind::Switch => {
-            let metrics = track_metrics(size, window_scale(app, window));
+            let metrics = track_metrics(size);
             let theme_track = theme.clone();
             let track_mix = mix;
             let track = NodeBuilder::boxed()
@@ -813,15 +730,18 @@ mod tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Scale},
-        node::id::NodeId,
+        math::{Point, Rect, Size},
+        node::{builder::NodeBuilder, id::NodeId},
         paint::color::{Color, ColorResolver},
-        test_support::app::TestApp,
-        window::WindowOptions,
+        test_support::{app::TestApp, diagnostics::frame_dump},
     };
 
     use super::{Toggle, ToggleKind};
-    use crate::theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role};
+    use crate::{
+        kit::test_support::test_app_with_scale,
+        style_builder::StyleBuilder,
+        theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
+    };
 
     struct Harness {
         app: TestApp,
@@ -844,10 +764,16 @@ mod tests {
         checked: bool,
         configure: impl FnOnce(Toggle) -> Toggle,
     ) -> Harness {
-        let mut app = TestApp::with_options(WindowOptions {
-            scale: Scale::new(scale).expect("测试 DPI 必须是有限正数"),
-            ..WindowOptions::default()
-        });
+        harness_in(test_app_with_scale(scale), None, kind, checked, configure)
+    }
+
+    fn harness_in(
+        mut app: TestApp,
+        parent_width: Option<f32>,
+        kind: ToggleKind,
+        checked: bool,
+        configure: impl FnOnce(Toggle) -> Toggle,
+    ) -> Harness {
         let theme = ThemeHandle::new(app.app_mut(), Appearance::Light);
         let reported = Rc::new(Cell::new(None));
         let sink = reported.clone();
@@ -864,7 +790,22 @@ mod tests {
         let toggle = configure(toggle);
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
-        let node = toggle.build(app.app_mut(), window, root).expect("build");
+        let parent = parent_width.map_or(root, |width| {
+            NodeBuilder::boxed()
+                .style(
+                    StyleBuilder::new()
+                        .width(width)
+                        .height(30.0)
+                        .flex_col()
+                        .build(),
+                )
+                .build(
+                    app.app_mut().window_mut(window).expect("window").tree_mut(),
+                    root,
+                )
+                .expect("窄容器")
+        });
+        let node = toggle.build(app.app_mut(), window, parent).expect("build");
         let _ = app.drain().expect("frame");
         let _ = toggle.sync(app.app_mut());
         let _ = app.drain().expect("frame");
@@ -951,6 +892,30 @@ mod tests {
             .borrow()
             .ring
             .expect("单选外圈节点")
+    }
+
+    fn override_rect(harness: &Harness, node: NodeId) -> Rect {
+        let window = harness.app.window_id();
+        harness
+            .app
+            .app()
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(node)
+            .expect("开关几何节点")
+            .layout_override()
+            .expect("布局覆盖")
+            .rect
+    }
+
+    fn override_geometry(harness: &Harness) -> Vec<Rect> {
+        let geometry = harness.toggle.inner.geometry.borrow();
+        [geometry.knob, geometry.ring, geometry.mark]
+            .into_iter()
+            .flatten()
+            .map(|node| override_rect(harness, node))
+            .collect()
     }
 
     fn mark_patch(harness: &Harness) -> ui_core::paint::style::StylePatch {
@@ -1057,25 +1022,15 @@ mod tests {
         let mut harness = harness(ToggleKind::Switch, false);
         let knob = harness.toggle.knob_node().expect("knob");
         let track = harness.toggle.control_node().expect("track");
-        let window = harness.app.window_id();
-        let left = |harness: &Harness| {
-            harness
-                .app
-                .app()
-                .window(window)
-                .expect("window")
-                .tree()
-                .get(knob)
-                .expect("knob")
-                .layout_override()
-                .expect("override")
-                .rect
-        };
-        let before = left(&harness);
-        assert_eq!(before.origin.x, super::KNOB_INSET, "未选中滑块贴左");
+        let before = override_rect(&harness, knob);
+        assert_eq!(
+            before.origin.x,
+            super::track_metrics(crate::kit::size::UnifiedSize::Medium).inset,
+            "未选中滑块贴左"
+        );
         click(&mut harness);
         settle(&mut harness);
-        let after = left(&harness);
+        let after = override_rect(&harness, knob);
         assert!(after.origin.x > before.origin.x, "选中后滑块向右移动");
         let track_bounds = harness.app.probe().bounds(track).expect("track");
         assert!(
@@ -1275,126 +1230,204 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_knob_is_vertically_centered_on_every_device_scale() {
-        for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            let harness = harness_at_scale(scale, ToggleKind::Switch, true, std::convert::identity);
-            let track = harness
-                .app
-                .probe()
-                .bounds(harness.toggle.control_node().expect("track"))
-                .expect("track bounds");
-            let knob = harness
-                .app
-                .probe()
-                .bounds(harness.toggle.knob_node().expect("knob"))
-                .expect("knob bounds");
-            let top = ((knob.origin.y - track.origin.y) * scale).round();
-            let bottom = (((track.origin.y + track.size.height)
-                - (knob.origin.y + knob.size.height))
-                * scale)
-                .round();
-            assert_eq!(top, bottom, "scale {scale}: 滑块上下边距必须相等");
+    fn toggle_logical_geometry_is_stable_at_every_dpi() {
+        for kind in [ToggleKind::Switch, ToggleKind::Checkbox, ToggleKind::Radio] {
+            let origin = harness_at_scale(1.0, kind, true, std::convert::identity);
             assert_eq!(
-                (knob.size.width * scale).round(),
-                (knob.size.height * scale).round(),
-                "scale {scale}: 滑块必须是物理像素正方形"
+                frame_dump(&origin.app).scale,
+                1.0,
+                "{kind:?}: 基准 DPI 注入必须生效"
             );
-        }
-    }
-
-    #[test]
-    fn the_mark_is_square_and_centered_on_every_device_scale() {
-        for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            for kind in [ToggleKind::Checkbox, ToggleKind::Radio] {
-                let harness = harness_at_scale(scale, kind, true, std::convert::identity);
-                let control = harness
-                    .app
-                    .probe()
-                    .bounds(harness.toggle.control_node().expect("control"))
-                    .expect("control bounds");
-                let container = if kind == ToggleKind::Radio {
-                    harness
-                        .app
-                        .probe()
-                        .bounds(ring_node(&harness))
-                        .expect("ring bounds")
-                } else {
-                    control
-                };
-                if kind == ToggleKind::Radio {
-                    assert_eq!(
-                        (container.size.width * scale).round(),
-                        (container.size.height * scale).round(),
-                        "scale {scale}: 单选外圈必须是物理像素正圆"
-                    );
-                }
-                let mark = harness
-                    .app
-                    .probe()
-                    .bounds(mark_node(&harness))
-                    .expect("mark bounds");
-                let left = ((mark.origin.x - container.origin.x) * scale).round();
-                let right = (((container.origin.x + container.size.width)
-                    - (mark.origin.x + mark.size.width))
-                    * scale)
-                    .round();
-                let top = ((mark.origin.y - container.origin.y) * scale).round();
-                let bottom = (((container.origin.y + container.size.height)
-                    - (mark.origin.y + mark.size.height))
-                    * scale)
-                    .round();
-                assert_eq!(left, right, "scale {scale} {kind:?}: 标记左右边距必须相等");
-                assert_eq!(top, bottom, "scale {scale} {kind:?}: 标记上下边距必须相等");
+            let baseline = override_geometry(&origin);
+            assert!(
+                !baseline.is_empty(),
+                "{kind:?}: Toggle 必须有 LayoutOverride 几何"
+            );
+            for scale in [1.25f32, 1.5, 2.0, 3.0] {
+                let scaled = harness_at_scale(scale, kind, true, std::convert::identity);
                 assert_eq!(
-                    (mark.size.width * scale).round(),
-                    (mark.size.height * scale).round(),
-                    "scale {scale} {kind:?}: 标记必须是物理像素正方形"
+                    frame_dump(&scaled.app).scale,
+                    scale,
+                    "{kind:?} @ {scale}: DPI 注入必须生效"
+                );
+                assert_eq!(
+                    override_geometry(&scaled),
+                    baseline,
+                    "{kind:?} @ {scale}: LayoutOverride 逻辑几何必须与 DPI 无关"
                 );
             }
         }
     }
 
     #[test]
-    fn the_radio_ring_stays_circular_after_a_device_scale_change() {
-        let mut harness = harness(ToggleKind::Radio, true);
-        let window = harness.app.window_id();
-        harness
-            .app
-            .app_mut()
-            .window_mut(window)
-            .expect("window")
-            .set_scale(Scale::new(1.25).expect("scale"));
-        let _ = harness.app.drain().expect("frame");
-        let _ = harness.toggle.sync(harness.app.app_mut());
-        let _ = harness.app.drain().expect("frame");
+    fn the_medium_toggle_geometry_is_frozen_in_logical_pixels() {
+        let metrics = super::track_metrics(crate::kit::size::UnifiedSize::Medium);
+        assert_eq!(metrics.width, 28.5);
+        assert_eq!(metrics.height, 15.0);
+        assert_eq!(metrics.radius, 7.5);
+        assert_eq!(metrics.inset, 2.0);
+        let travel = metrics.width - (metrics.height - metrics.inset * 2.0) - metrics.inset * 2.0;
+        assert_eq!(travel, 13.5);
 
-        let control = harness
+        let unchecked = harness(ToggleKind::Switch, false);
+        let track = unchecked
             .app
             .probe()
-            .bounds(harness.toggle.control_node().expect("control"))
-            .expect("control bounds");
-        let ring = harness
-            .app
-            .probe()
-            .bounds(ring_node(&harness))
-            .expect("ring bounds");
-        let scale = 1.25;
+            .bounds(unchecked.toggle.control_node().expect("track"))
+            .expect("track bounds");
+        assert_eq!(track.size, Size::new(28.5, 15.0), "switch 轨道逻辑尺寸");
+        let knob = unchecked.toggle.knob_node().expect("knob");
         assert_eq!(
-            (ring.size.width * scale).round(),
-            (ring.size.height * scale).round(),
-            "单选外圈必须是物理像素正圆"
+            override_rect(&unchecked, knob),
+            Rect::new(2.0, 2.0, 11.0, 11.0),
+            "未选中滑块几何"
         );
-        let left = ((ring.origin.x - control.origin.x) * scale).round();
-        let right = (((control.origin.x + control.size.width) - (ring.origin.x + ring.size.width))
-            * scale)
-            .round();
-        let top = ((ring.origin.y - control.origin.y) * scale).round();
-        let bottom = (((control.origin.y + control.size.height)
-            - (ring.origin.y + ring.size.height))
-            * scale)
-            .round();
-        assert_eq!(left, right, "单选外圈左右边距必须相等");
-        assert_eq!(top, bottom, "单选外圈上下边距必须相等");
+
+        let mut checked = harness(ToggleKind::Switch, true);
+        checked.app.invalidate_all_lanes();
+        let record = checked.app.drain().expect("frame").clone();
+        let rendered = record.frame.as_ref().expect("全量重绘必须提交绘制快照");
+        let track_quad = rendered
+            .quads
+            .iter()
+            .find(|quad| quad.node == checked.toggle.control_node().expect("track"))
+            .expect("轨道四边图元");
+        assert_eq!(track_quad.corner_radius, [7.5; 4], "switch 轨道圆角半径");
+        assert_eq!(
+            override_rect(&checked, checked.toggle.knob_node().expect("knob")),
+            Rect::new(15.5, 2.0, 11.0, 11.0),
+            "选中滑块几何：inset 2 + travel 13.5"
+        );
+
+        let checkbox = harness(ToggleKind::Checkbox, true);
+        let control = checkbox
+            .app
+            .probe()
+            .bounds(checkbox.toggle.control_node().expect("control"))
+            .expect("control bounds");
+        assert_eq!(control.size, Size::new(18.0, 18.0), "checkbox 方框逻辑尺寸");
+        let mark = override_rect(&checkbox, mark_node(&checkbox));
+        assert!((mark.origin.x - 0.9).abs() < 1e-4, "checkbox mark 内缩");
+        assert!((mark.size.width - 16.2).abs() < 1e-4, "checkbox mark 尺寸");
+        assert!(
+            (mark.origin.x * 2.0 + mark.size.width - 18.0).abs() < 1e-4,
+            "checkbox mark 水平居中"
+        );
+
+        let radio = harness(ToggleKind::Radio, true);
+        assert_eq!(
+            override_rect(&radio, ring_node(&radio)),
+            Rect::new(0.0, 0.0, 18.0, 18.0),
+            "单选外圈几何"
+        );
+        let dot = override_rect(&radio, mark_node(&radio));
+        assert!((dot.origin.x - 5.22).abs() < 1e-4, "单选内点内缩");
+        assert!((dot.size.width - 7.56).abs() < 1e-4, "单选内点尺寸");
+        assert!(
+            (dot.origin.x * 2.0 + dot.size.width - 18.0).abs() < 1e-4,
+            "单选内点水平居中"
+        );
+        assert!(
+            (dot.origin.y * 2.0 + dot.size.height - 18.0).abs() < 1e-4,
+            "单选内点垂直居中"
+        );
+    }
+
+    #[test]
+    fn a_narrow_row_clamps_the_knob_inside_the_track() {
+        for width in [20.0f32, 30.0, 35.0] {
+            let harness = harness_in(
+                test_app_with_scale(1.0),
+                Some(width),
+                ToggleKind::Switch,
+                true,
+                std::convert::identity,
+            );
+            let track = harness
+                .app
+                .probe()
+                .bounds(harness.toggle.control_node().expect("track"))
+                .expect("track bounds");
+            let knob = override_rect(&harness, harness.toggle.knob_node().expect("knob"));
+            assert!(
+                track.size.width < 28.5,
+                "宽度 {width}: track 必须确实被压窄（实际 {}）",
+                track.size.width
+            );
+            assert!(knob.origin.x >= 0.0, "宽度 {width}: 滑块左缘越界");
+            assert!(
+                knob.origin.x + knob.size.width <= track.size.width + 1e-4,
+                "宽度 {width}: 滑块右缘 {} 超出轨道宽 {}",
+                knob.origin.x + knob.size.width,
+                track.size.width
+            );
+            assert!(
+                knob.origin.y + knob.size.height <= track.size.height + 1e-4,
+                "宽度 {width}: 滑块下缘 {} 超出轨道高 {}",
+                knob.origin.y + knob.size.height,
+                track.size.height
+            );
+        }
+    }
+
+    #[test]
+    fn the_track_and_knob_physical_bounds_are_frozen_device_pixels() {
+        let expected = [
+            (1.0f32, [6.0f32, 8.0, 29.0, 15.0], [22.0, 10.0, 11.0, 11.0]),
+            (1.25, [8.0, 9.0, 35.0, 19.0], [27.0, 12.0, 14.0, 14.0]),
+            (1.5, [9.0, 11.0, 43.0, 23.0], [32.0, 14.0, 17.0, 17.0]),
+            (2.0, [12.0, 15.0, 57.0, 30.0], [43.0, 19.0, 22.0, 22.0]),
+            (3.0, [18.0, 23.0, 86.0, 45.0], [65.0, 29.0, 33.0, 33.0]),
+        ];
+        for (scale, track_px, knob_px) in expected {
+            let mut harness =
+                harness_at_scale(scale, ToggleKind::Switch, true, std::convert::identity);
+            harness.app.invalidate_all_lanes();
+            let record = harness.app.drain().expect("frame").clone();
+            let rendered = record.frame.as_ref().expect("全量重绘必须提交绘制快照");
+            let dump = frame_dump(&harness.app);
+            assert_eq!(dump.scale, scale, "DPI 注入必须生效");
+            let checks = [
+                (
+                    "track",
+                    harness.toggle.control_node().expect("track"),
+                    Rect::new(6.0, 7.5, 28.5, 15.0),
+                    track_px,
+                ),
+                (
+                    "knob",
+                    harness.toggle.knob_node().expect("knob"),
+                    Rect::new(21.5, 9.5, 11.0, 11.0),
+                    knob_px,
+                ),
+            ];
+            for (label, node, logical, physical) in checks {
+                let quad = rendered
+                    .quads
+                    .iter()
+                    .find(|quad| quad.node == node)
+                    .unwrap_or_else(|| panic!("{label} @ {scale}: 帧记录里必须有四边图元"));
+                assert_eq!(quad.bounds, logical, "{label} @ {scale}: 逻辑四边");
+                let instance = dump
+                    .instances
+                    .iter()
+                    .find(|instance| instance.bounds == physical)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{label} @ {scale}: 编码后的物理边界必须是 {physical:?}，实际 {:?}",
+                            dump.instances
+                                .iter()
+                                .map(|instance| instance.bounds)
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                assert!(
+                    instance.bounds.iter().all(|value| value.fract() == 0.0),
+                    "{label} @ {scale}: 物理边界必须是整数设备像素 {:?}",
+                    instance.bounds
+                );
+            }
+        }
     }
 
     #[test]
