@@ -1,6 +1,6 @@
 use ui_core::{
     event::{InputEvent, KeyCode, Modifiers},
-    math::Scale,
+    math::DevicePixelRatio,
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
 };
@@ -11,7 +11,7 @@ pub(super) fn setup() -> (TestApp, WindowId, Scene) {
     let mut test = TestApp::with_options(WindowOptions {
         title: TITLE.into(),
         size: window_size(),
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let window = test.window_id();

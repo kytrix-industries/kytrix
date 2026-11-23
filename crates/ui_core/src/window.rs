@@ -33,7 +33,7 @@ use crate::{
     error::EngineError,
     interaction::{FocusScope, PointerState},
     layout::LayoutReport,
-    math::{PhysicalRect, Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
     paint::{
         atlas::{AtlasKind, MAX_IMAGE_PAGES},
@@ -134,16 +134,16 @@ pub enum ImeContentType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowOptions {
     pub title: SmolStr,
-    pub size: Size,
-    pub position: Option<Point>,
-    pub min_size: Option<Size>,
-    pub max_size: Option<Size>,
+    pub size: LogicalSize,
+    pub position: Option<LogicalPoint>,
+    pub min_size: Option<LogicalSize>,
+    pub max_size: Option<LogicalSize>,
     pub owner: Option<WindowId>,
     pub modal: bool,
     pub always_on_top: bool,
     pub decorations: Decorations,
     pub icon: Option<Bytes>,
-    pub scale: Scale,
+    pub scale: DevicePixelRatio,
     pub background: Color,
 }
 
@@ -151,7 +151,7 @@ impl Default for WindowOptions {
     fn default() -> Self {
         Self {
             title: SmolStr::new_static(""),
-            size: Size::new(800.0, 600.0),
+            size: LogicalSize::new(px(800.0), px(600.0)),
             position: None,
             min_size: None,
             max_size: None,
@@ -160,7 +160,7 @@ impl Default for WindowOptions {
             always_on_top: false,
             decorations: Decorations::Native,
             icon: None,
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
             background: Color::BLACK,
         }
     }
@@ -240,7 +240,7 @@ pub struct Window {
     options: WindowOptions,
     tree: NodeTree,
     scene: Scene,
-    scale: Scale,
+    scale: DevicePixelRatio,
     surface: (u32, u32),
     surface_from_platform: bool,
     #[cfg(target_os = "linux")]
@@ -252,7 +252,7 @@ pub struct Window {
     pending_delta: Option<SceneDelta>,
     pending_payload: Option<crate::render::compose::ComposedFrame>,
     delta_builder: crate::render::delta::DeltaBuilder,
-    scroll_slots: Vec<(crate::math::Point, PhysicalRect)>,
+    scroll_slots: Vec<(crate::math::LogicalPoint, DeviceRect)>,
     scroll_slot_nodes: Vec<crate::node::id::NodeId>,
     resync: crate::render::frame::ResyncGate,
     compositor_ticket: Option<crate::render::compositor_thread::CompositorTicket>,
@@ -282,18 +282,18 @@ pub struct Window {
     inline_box_image_diagnostics: Vec<crate::text::TextDiagnostic>,
     focus: FocusScope,
     pointer: PointerState,
-    pointer_position: Option<Point>,
-    pending_damage: Option<Rect>,
+    pointer_position: Option<LogicalPoint>,
+    pending_damage: Option<LogicalRect>,
     a11y: crate::a11y::adapter::A11yBridge,
     ime_cursor: Option<ImeCursorRequest>,
-    titlebar_drag_regions: Vec<Rect>,
+    titlebar_drag_regions: Vec<LogicalRect>,
     #[cfg(target_os = "linux")]
     ime_content: ImeContentType,
     state: WindowState,
     #[cfg(target_os = "macos")]
-    traffic_light_inset: Option<Point>,
+    traffic_light_inset: Option<LogicalPoint>,
     #[cfg(target_os = "macos")]
-    traffic_light_position: Option<Point>,
+    traffic_light_position: Option<LogicalPoint>,
     #[cfg(feature = "hud")]
     render_stats: crate::render::RenderStats,
     #[cfg(feature = "hud")]
@@ -452,11 +452,11 @@ impl Window {
     }
 
     #[must_use]
-    pub fn pointer_position(&self) -> Option<Point> {
+    pub fn pointer_position(&self) -> Option<LogicalPoint> {
         self.pointer_position
     }
 
-    pub(crate) fn note_pointer_position(&mut self, position: Point) {
+    pub(crate) fn note_pointer_position(&mut self, position: LogicalPoint) {
         self.pointer_position = Some(position);
     }
 
@@ -681,10 +681,10 @@ impl Window {
     }
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn scroll_slots(&self) -> &[(crate::math::Point, PhysicalRect)] {
+    pub(crate) fn scroll_slots(&self) -> &[(crate::math::LogicalPoint, DeviceRect)] {
         &self.scroll_slots
     }
-    pub(crate) fn request_damage(&mut self, rect: Rect) {
+    pub(crate) fn request_damage(&mut self, rect: LogicalRect) {
         paint::request_damage(self, rect)
     }
     pub(crate) fn request_repaint(&mut self) {
@@ -703,10 +703,10 @@ impl Window {
         surface::set_background_color(self, color)
     }
     #[must_use]
-    pub fn size(&self) -> Size {
+    pub fn size(&self) -> LogicalSize {
         surface::size(self)
     }
-    pub fn set_size(&mut self, size: Size) {
+    pub fn set_size(&mut self, size: LogicalSize) {
         surface::set_size(self, size)
     }
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
@@ -860,15 +860,15 @@ impl Window {
     pub(crate) fn take_composition_pending(&self) -> bool {
         surface::take_composition_pending(self)
     }
-    fn frame_rect(&self) -> PhysicalRect {
+    fn frame_rect(&self) -> DeviceRect {
         surface::frame_rect(self)
     }
 
     #[must_use]
-    pub fn scale(&self) -> Scale {
+    pub fn scale(&self) -> DevicePixelRatio {
         scale::scale(self)
     }
-    pub fn set_scale(&mut self, scale: Scale) {
+    pub fn set_scale(&mut self, scale: DevicePixelRatio) {
         scale::set_scale(self, scale)
     }
     #[must_use]
@@ -883,13 +883,17 @@ impl Window {
     pub(crate) fn focus_mut(&mut self) -> &mut FocusScope {
         focus::focus_mut(self)
     }
-    pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
+    pub fn text_caret_rect(
+        &self,
+        node: NodeId,
+        byte_index: usize,
+    ) -> Result<LogicalRect, EngineError> {
         focus::text_caret_rect(self, node, byte_index)
     }
     pub fn text_byte_index_at(
         &self,
         node: NodeId,
-        local_point: Point,
+        local_point: LogicalPoint,
     ) -> Result<usize, EngineError> {
         focus::text_byte_index_at(self, node, local_point)
     }
@@ -899,11 +903,11 @@ impl Window {
     pub(crate) fn clear_ime_cursor_request(&mut self) -> bool {
         focus::clear_ime_cursor_request(self)
     }
-    pub(crate) fn ime_cursor_area(&self) -> Result<Option<Rect>, EngineError> {
+    pub(crate) fn ime_cursor_area(&self) -> Result<Option<LogicalRect>, EngineError> {
         focus::ime_cursor_area(self)
     }
 
-    pub fn set_drag_regions(&mut self, regions: &[Rect]) {
+    pub fn set_drag_regions(&mut self, regions: &[LogicalRect]) {
         if self.titlebar_drag_regions == regions {
             return;
         }
@@ -912,7 +916,7 @@ impl Window {
     }
 
     #[must_use]
-    pub(crate) fn drag_regions(&self) -> &[Rect] {
+    pub(crate) fn drag_regions(&self) -> &[LogicalRect] {
         &self.titlebar_drag_regions
     }
 
@@ -947,7 +951,7 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn set_traffic_light_inset(&mut self, inset: Option<Point>) -> bool {
+    pub(crate) fn set_traffic_light_inset(&mut self, inset: Option<LogicalPoint>) -> bool {
         if self.traffic_light_inset == inset {
             return false;
         }
@@ -957,18 +961,18 @@ impl Window {
 
     #[cfg(target_os = "macos")]
     #[must_use]
-    pub(crate) fn traffic_light_inset(&self) -> Option<Point> {
+    pub(crate) fn traffic_light_inset(&self) -> Option<LogicalPoint> {
         self.traffic_light_inset
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn set_traffic_light_position(&mut self, inset: Point) {
+    pub(crate) fn set_traffic_light_position(&mut self, inset: LogicalPoint) {
         self.traffic_light_position = Some(inset);
     }
 
     #[cfg(target_os = "macos")]
     #[must_use]
-    pub(crate) fn traffic_light_position(&self) -> Option<Point> {
+    pub(crate) fn traffic_light_position(&self) -> Option<LogicalPoint> {
         self.traffic_light_position
     }
 

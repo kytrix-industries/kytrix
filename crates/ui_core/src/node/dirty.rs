@@ -108,7 +108,7 @@ mod tests {
 
     use super::{DirtyFlags, DirtySet, affects_parent, depends_on_children};
     use crate::{
-        math::Rect,
+        math::{LogicalRect, px},
         node::{
             builder::NodeBuilder,
             id::NodeId,
@@ -333,9 +333,14 @@ mod tests {
     fn leaf_kinds_do_not_depend_on_children() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 10.0, 10.0)))
-            .build(&mut tree, root)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(10.0),
+            px(10.0),
+        )))
+        .build(&mut tree, root)
+        .expect("挂载成功");
         let geometry = NodeBuilder::geometry(crate::paint::geometry::GeometryId::for_test(1, 1))
             .build(&mut tree, root)
             .expect("挂载成功");
@@ -389,8 +394,8 @@ mod tests {
         tree.set_layout_for_test(
             child,
             LayoutBox {
-                border: crate::math::Edges::ZERO,
-                bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+                border: crate::math::LogicalEdges::ZERO,
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
             },
         );
         assert!(tree.mark_layout(child));
@@ -398,7 +403,7 @@ mod tests {
         let damage_before = tree.get(root).expect("存在").damage();
         assert_eq!(
             tree.get(child).expect("存在").damage(),
-            Rect::new(0.0, 0.0, 4.0, 4.0),
+            LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
             "damage 必须是 prev ∪ layout"
         );
 
@@ -417,7 +422,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let (root, parent, child) = chain(&mut tree);
         tree.edit_style_for_test(child, |style| {
-            style.size_length(20.0, 20.0);
+            style.size_length(px(20.0), px(20.0));
         });
         assert!(!depends_on_children(tree.get(child).expect("存在")));
         tree.clear_all_dirty_for_test();
@@ -476,8 +481,8 @@ mod tests {
         tree.set_layout_for_test(
             child,
             LayoutBox {
-                border: crate::math::Edges::ZERO,
-                bounds: Rect::new(2.0, 3.0, 10.0, 10.0),
+                border: crate::math::LogicalEdges::ZERO,
+                bounds: LogicalRect::new(px(2.0), px(3.0), px(10.0), px(10.0)),
             },
         );
         tree.set_dirty_for_test(child, DirtyFlags::REUSABLE);

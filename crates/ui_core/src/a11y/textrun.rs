@@ -2,7 +2,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     a11y::A11yTextSelection,
-    math::Scale,
+    math::{DevicePixelRatio, PhysicalPx, px},
     node::{id::NodeId, tree::NodeTree},
     text::TextDirection,
 };
@@ -58,7 +58,7 @@ pub(crate) fn character_metrics(
     node: NodeId,
     value: &str,
     lengths: &[u8],
-    scale: Scale,
+    scale: DevicePixelRatio,
 ) -> Option<(Vec<f32>, Vec<f32>)> {
     if lengths.is_empty() {
         return None;
@@ -78,9 +78,8 @@ pub(crate) fn character_metrics(
         return None;
     }
     tree.text_caret_rect(node, 0).ok()?;
-    let width = f32::from_bits(slot.laid_width_bits());
+    let width = px(f32::from_bits(slot.laid_width_bits()));
     let alignment = content.style.alignment;
-    let scale_factor = scale.factor();
     let content_x = tree.content_offset(node).x;
 
     let first_y = shaped.caret_rect(width, alignment, 0).min().y;
@@ -88,14 +87,14 @@ pub(crate) fn character_metrics(
     let mut byte = 0usize;
     for len in lengths {
         let rect = shaped.caret_rect(width, alignment, byte);
-        positions.push((content_x + rect.min().x) * scale_factor);
+        positions.push(scale.to_physical(content_x + rect.min().x));
         byte += usize::from(*len);
     }
     let end = shaped.caret_rect(width, alignment, byte);
     if end.min().y != first_y {
         return None;
     }
-    positions.push((content_x + end.min().x) * scale_factor);
+    positions.push(scale.to_physical(content_x + end.min().x));
     let mut widths = Vec::with_capacity(lengths.len());
     for pair in positions.windows(2) {
         widths.push(pair[1] - pair[0]);
@@ -105,12 +104,15 @@ pub(crate) fn character_metrics(
         .iter()
         .chain(widths.iter())
         .any(|value| !value.is_finite())
-        || widths.iter().any(|width| *width < 0.0)
+        || widths.iter().any(|width| *width < PhysicalPx::ZERO)
     {
         return None;
     }
     debug_assert_eq!(positions.len(), lengths.len());
-    Some((positions, widths))
+    Some((
+        positions.iter().map(|value| value.value()).collect(),
+        widths.iter().map(|value| value.value()).collect(),
+    ))
 }
 
 #[cfg(test)]

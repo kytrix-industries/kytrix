@@ -63,7 +63,7 @@ impl RootUniform {
 #[cfg(test)]
 mod tests {
     use super::{INSTANCE_BASE_DWORD, ROOT_UNIFORM_DWORDS, RootUniform};
-    use crate::math::Transform;
+    use crate::math::{Transform, px};
 
     #[test]
     fn layout_is_112_bytes() {
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn geometry_overwrites_the_draw_block() {
         let frame = RootUniform::frame(800.0, 600.0, 1.5);
-        let transform = Transform::scale(2.0, 5.0).then(Transform::translate(6.0, 7.0));
+        let transform = Transform::scale(2.0, 5.0).then(Transform::translate(px(6.0), px(7.0)));
         let uniform = RootUniform::geometry(
             frame,
             transform,

@@ -4,12 +4,12 @@ use taffy::{LayoutInput, LayoutOutput, Size as TaffySize};
 
 use crate::{
     layout::Axis,
-    math::Size,
+    math::{LogicalPx, LogicalSize},
     node::{id::NodeId, tree::NodeTree},
 };
 
 pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
-    let violation: Cell<Option<(Axis, f32)>> = Cell::new(None);
+    let violation: Cell<Option<(Axis, LogicalPx)>> = Cell::new(None);
 
     let output = {
         let style = tree.taffy_style(node);
@@ -21,18 +21,18 @@ pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInpu
             |known, available| {
                 let size = match measure {
                     Some(measure) => measure(known, available),
-                    None => Size::ZERO,
+                    None => LogicalSize::ZERO,
                 };
-                let width_ok = size.width.is_finite() && size.width >= 0.0;
-                let height_ok = size.height.is_finite() && size.height >= 0.0;
+                let width_ok = size.width.is_finite() && size.width >= LogicalPx::ZERO;
+                let height_ok = size.height.is_finite() && size.height >= LogicalPx::ZERO;
                 if !width_ok {
                     violation.set(Some((Axis::X, size.width)));
                 } else if !height_ok {
                     violation.set(Some((Axis::Y, size.height)));
                 }
                 TaffySize {
-                    width: if width_ok { size.width } else { 0.0 },
-                    height: if height_ok { size.height } else { 0.0 },
+                    width: if width_ok { size.width.value() } else { 0.0 },
+                    height: if height_ok { size.height.value() } else { 0.0 },
                 }
             },
         )
@@ -51,16 +51,16 @@ mod tests {
     use crate::{
         error::EngineError,
         layout::{Axis, LayoutReport, MeasureFn},
-        math::{Rect, Size},
+        math::{LogicalPx, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::{style::Style, style_builder::StyleBuilder},
     };
 
-    fn fixed(width: f32, height: f32) -> Style {
+    fn fixed(width: LogicalPx, height: LogicalPx) -> Style {
         StyleBuilder::new().size(width, height).build()
     }
 
-    fn block(width: f32, height: f32) -> Style {
+    fn block(width: LogicalPx, height: LogicalPx) -> Style {
         let mut style = fixed(width, height);
         style.display(taffy::style::Display::Block);
         style
@@ -80,20 +80,20 @@ mod tests {
         })
     }
 
-    fn bounds(tree: &NodeTree, node: NodeId) -> Rect {
+    fn bounds(tree: &NodeTree, node: NodeId) -> LogicalRect {
         tree.get(node).expect("存在").layout().bounds
     }
 
     #[test]
     fn measure_fn_is_boxed_fn() {
-        let measure: MeasureFn = Box::new(|_known, _available| Size::new(1.0, 1.0));
+        let measure: MeasureFn = Box::new(|_known, _available| LogicalSize::new(px(1.0), px(1.0)));
         let available = taffy::geometry::Size {
             width: taffy::AvailableSpace::MaxContent,
             height: taffy::AvailableSpace::MaxContent,
         };
         assert_eq!(
             measure(taffy::geometry::Size::NONE, available),
-            Size::new(1.0, 1.0)
+            LogicalSize::new(px(1.0), px(1.0))
         );
     }
 
@@ -101,8 +101,11 @@ mod tests {
     fn leaf_without_measure_is_zero_size() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let canvas = NodeBuilder::canvas(crate::paint::canvas::Canvas::new(Rect::new(
-            0.0, 0.0, 1.0, 1.0,
+        let canvas = NodeBuilder::canvas(crate::paint::canvas::Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
         )))
         .build(&mut tree, root)
         .expect("挂载成功");
@@ -122,10 +125,10 @@ mod tests {
         let calls = Rc::new(Cell::new(0usize));
         let counter = calls.clone();
         let node = NodeBuilder::boxed()
-            .style(fixed(20.0, 20.0))
+            .style(fixed(px(20.0), px(20.0)))
             .measure(Box::new(move |_known, _available| {
                 counter.set(counter.get() + 1);
-                Size::new(1.0, 1.0)
+                LogicalSize::new(px(1.0), px(1.0))
             }))
             .build(&mut tree, root)
             .expect("挂载成功");
@@ -160,14 +163,14 @@ mod tests {
     fn measure_receives_definite_width_from_block() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let container = add(&mut tree, root, block(100.0, 100.0));
+        let container = add(&mut tree, root, block(px(100.0), px(100.0)));
         let observed = Rc::new(Cell::new(f32::NAN));
         let seen = observed.clone();
         let node = NodeBuilder::boxed()
             .measure(Box::new(move |_known, available| {
                 let width = available.width.into_option().unwrap_or(f32::NAN);
                 seen.set(width);
-                Size::new(width.min(50.0), 10.0)
+                LogicalSize::new(px(width.min(50.0)), px(10.0))
             }))
             .build(&mut tree, container)
             .expect("挂载成功");
@@ -175,8 +178,12 @@ mod tests {
         let _ = layout(&mut tree).expect("布局成功");
 
         assert_eq!(observed.get(), 100.0, "block 容器把确定宽度传给 measure");
-        assert_eq!(bounds(&tree, node).size.width, 100.0);
-        assert_eq!(bounds(&tree, node).size.height, 10.0, "高度来自 measure");
+        assert_eq!(bounds(&tree, node).size.width, px(100.0));
+        assert_eq!(
+            bounds(&tree, node).size.height,
+            px(10.0),
+            "高度来自 measure"
+        );
     }
 
     #[test]
@@ -186,14 +193,14 @@ mod tests {
         let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
         let record = seen.clone();
         let row = {
-            let mut style = fixed(200.0, 100.0);
+            let mut style = fixed(px(200.0), px(100.0));
             style.align_items(taffy::style::AlignItems::FLEX_START);
             add(&mut tree, root, style)
         };
         let _node = NodeBuilder::boxed()
             .measure(Box::new(move |_known, available| {
                 record.borrow_mut().push(available.width);
-                Size::new(80.0, 10.0)
+                LogicalSize::new(px(80.0), px(10.0))
             }))
             .build(&mut tree, row)
             .expect("挂载成功");
@@ -224,7 +231,7 @@ mod tests {
         let root = tree.root();
         let node = NodeBuilder::boxed()
             .measure(Box::new(|_known, _available| {
-                Size::new(f32::NAN, f32::INFINITY)
+                LogicalSize::new(px(f32::NAN), px(f32::INFINITY))
             }))
             .build(&mut tree, root)
             .expect("挂载成功");
@@ -272,7 +279,9 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .measure(Box::new(|_known, _available| Size::new(f32::NAN, 10.0)))
+            .measure(Box::new(|_known, _available| {
+                LogicalSize::new(px(f32::NAN), px(10.0))
+            }))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -284,7 +293,7 @@ mod tests {
                 node: reported,
                 axis: Axis::X,
                 value,
-            } if reported == node && value.is_nan()
+            } if reported == node && value.value().is_nan()
         ));
     }
 
@@ -293,7 +302,9 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .measure(Box::new(|_known, _available| Size::new(10.0, -1.0)))
+            .measure(Box::new(|_known, _available| {
+                LogicalSize::new(px(10.0), px(-1.0))
+            }))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -307,7 +318,7 @@ mod tests {
             } => {
                 assert_eq!(reported, node);
                 assert_eq!(axis, Axis::Y);
-                assert_eq!(value, -1.0);
+                assert_eq!(value, px(-1.0));
             }
             other => panic!("expected InvalidMeasure, got {other:?}"),
         }
@@ -319,11 +330,15 @@ mod tests {
             let mut tree = NodeTree::new();
             let root = tree.root();
             let first = NodeBuilder::boxed()
-                .measure(Box::new(|_known, _available| Size::new(f32::NAN, 1.0)))
+                .measure(Box::new(|_known, _available| {
+                    LogicalSize::new(px(f32::NAN), px(1.0))
+                }))
                 .build(&mut tree, root)
                 .expect("挂载成功");
             let _second = NodeBuilder::boxed()
-                .measure(Box::new(|_known, _available| Size::new(1.0, f32::INFINITY)))
+                .measure(Box::new(|_known, _available| {
+                    LogicalSize::new(px(1.0), px(f32::INFINITY))
+                }))
                 .build(&mut tree, root)
                 .expect("挂载成功");
 
@@ -351,7 +366,9 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .measure(Box::new(|_known, _available| Size::new(f32::NAN, f32::NAN)))
+            .measure(Box::new(|_known, _available| {
+                LogicalSize::new(px(f32::NAN), px(f32::NAN))
+            }))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -372,7 +389,7 @@ mod tests {
         let node = NodeBuilder::boxed()
             .measure(Box::new(move |_known, _available| {
                 counter.set(counter.get() + 1);
-                Size::new(40.0, 10.0)
+                LogicalSize::new(px(40.0), px(10.0))
             }))
             .build(&mut tree, root)
             .expect("挂载成功");
@@ -405,7 +422,7 @@ mod tests {
         use crate::text::{TextContent, TextOverflow, TextStyle};
 
         let mut text = crate::text::context::TextContext::new();
-        let style = TextStyle::new(16.0).with_overflow(TextOverflow::Ellipsis, 2);
+        let style = TextStyle::new(px(16.0)).with_overflow(TextOverflow::Ellipsis, 2);
         let content = TextContent::new(
             smol_str::SmolStr::new_static("lorem ipsum dolor sit amet consectetur adipiscing elit"),
             style,
@@ -448,7 +465,7 @@ mod tests {
                 height: None,
             },
             taffy::Size {
-                width: AvailableSpace::Definite(width),
+                width: AvailableSpace::Definite(width.value()),
                 height: AvailableSpace::MaxContent,
             },
         );
@@ -461,13 +478,13 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         {
-            let mut root_style = fixed(400.0, 400.0);
+            let mut root_style = fixed(px(400.0), px(400.0));
             root_style
                 .align_items(taffy::style::AlignItems::FLEX_START)
                 .flex_direction(taffy::style::FlexDirection::Column);
             tree.set_style(root, root_style).expect("root 存活");
         }
-        let mut node_style = fixed(width, 0.0);
+        let mut node_style = fixed(width, px(0.0));
         node_style.height(taffy::style::Dimension::auto());
         let node = NodeBuilder::boxed()
             .style(node_style)

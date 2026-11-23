@@ -3,6 +3,7 @@ use std::{cell::Cell, panic::AssertUnwindSafe, rc::Rc};
 use super::App;
 use crate::{
     event::{Action, ActionSource},
+    math::px,
     node::{
         builder::NodeBuilder,
         dependency::ReadCtx,
@@ -43,7 +44,7 @@ fn re_laid_text_marks_paint_for_the_lane() {
         window,
         node,
         "hello brave new world",
-        crate::text::TextStyle::new(16.0),
+        crate::text::TextStyle::new(px(16.0)),
     );
     refresh(&mut app, window);
     layout(&mut app, window);
@@ -68,7 +69,7 @@ fn text_app(text: &str, width: Option<f32>) -> (tokio::runtime::Runtime, App, Wi
     let window = app.create_window(WindowOptions::default());
     let w = app.window_mut(window).expect("窗口存在");
     let root = w.tree().root();
-    let node = NodeBuilder::text(text, crate::text::TextStyle::new(16.0))
+    let node = NodeBuilder::text(text, crate::text::TextStyle::new(px(16.0)))
         .style(text_style(width))
         .build(w.tree_mut(), root)
         .expect("挂载成功");
@@ -107,7 +108,7 @@ fn layout(app: &mut App, window: WindowId) -> crate::layout::LayoutReport {
         .expect("布局不报错")
 }
 
-fn layout_height(app: &App, window: WindowId, node: NodeId) -> f32 {
+fn layout_height(app: &App, window: WindowId, node: NodeId) -> crate::math::LogicalPx {
     app.window(window)
         .expect("窗口存在")
         .tree()
@@ -178,7 +179,7 @@ fn bind_text_reevaluation_updates_content_and_marks_paint() {
     let node = {
         let w = app.window_mut(window).expect("窗口存在");
         let root = w.tree().root();
-        NodeBuilder::text("", crate::text::TextStyle::new(16.0))
+        NodeBuilder::text("", crate::text::TextStyle::new(px(16.0)))
             .bind_text(move |cx| cx.read(&signal).clone())
             .build(w.tree_mut(), root)
             .expect("挂载成功")
@@ -225,7 +226,7 @@ fn text_size_change_marks_layout() {
         window,
         node,
         "a much longer text that wraps",
-        crate::text::TextStyle::new(16.0),
+        crate::text::TextStyle::new(px(16.0)),
     );
     let _ = refresh(&mut app, window);
 
@@ -256,7 +257,7 @@ fn text_same_size_still_clears_the_taffy_cache() {
         window,
         node,
         "ba",
-        crate::text::TextStyle::new(16.0),
+        crate::text::TextStyle::new(px(16.0)),
     );
     let _ = refresh(&mut app, window);
     let dirty = app
@@ -285,7 +286,7 @@ fn text_wrap_change_same_max_width_relayouts() {
     let _ = layout(&mut app, window);
     let height_before = layout_height(&app, window, node);
 
-    let mut style = crate::text::TextStyle::new(16.0);
+    let mut style = crate::text::TextStyle::new(px(16.0));
     style.wrap = crate::text::TextWrap::Anywhere;
     set_text(&mut app, window, node, "aaaaaaaaaa", style);
     let _ = refresh(&mut app, window);
@@ -342,7 +343,7 @@ fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
     let node_b = {
         let tree = app.window_mut(window_b).expect("窗口存在").tree_mut();
         let root = tree.root();
-        NodeBuilder::text("beta", crate::text::TextStyle::new(16.0))
+        NodeBuilder::text("beta", crate::text::TextStyle::new(px(16.0)))
             .build(tree, root)
             .expect("挂载")
     };
@@ -362,7 +363,7 @@ fn dpi_change_relays_text_without_rebuilding_the_shared_atlas() {
 
     app.window_mut(window_a)
         .expect("窗口存在")
-        .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
+        .set_scale(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = refresh(&mut app, window_a);
     let _ = layout(&mut app, window_a);
     let _ = text_layout(&mut app, window_a);
@@ -411,7 +412,7 @@ fn scale_change_relays_the_same_snapshot_at_the_new_ppem() {
 
     app.window_mut(window)
         .expect("窗口存在")
-        .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
+        .set_scale(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = refresh(&mut app, window);
     let _ = layout(&mut app, window);
     let second = text_layout(&mut app, window);
@@ -460,7 +461,7 @@ fn dpi_change_rerasterizes_text_only() {
 
     app.window_mut(window)
         .expect("窗口存在")
-        .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
+        .set_scale(crate::math::DevicePixelRatio::new(2.0).expect("finite scale"));
     {
         let window_ref = app.window(window).expect("窗口存在");
         let root = window_ref.tree().root();
@@ -492,24 +493,24 @@ fn dpi_change_rerasterizes_text_only() {
     let width_after = tree.text_content_width(node);
     let laid_width_after = tree.text_line(node).expect("快照").width;
     assert_eq!(
-        width_after.to_bits(),
-        width_before.to_bits(),
+        width_after.value().to_bits(),
+        width_before.value().to_bits(),
         "文本可用宽度是逻辑像素，不得随 DPI 变化"
     );
     assert_eq!(
-        laid_width_after.to_bits(),
-        laid_width_before.to_bits(),
+        laid_width_after.value().to_bits(),
+        laid_width_before.value().to_bits(),
         "文本布局宽度不得随 DPI 变化"
     );
     let measured_after = tree.text_measured_size(node).expect("测量尺寸");
     assert_eq!(
-        measured_after.width.to_bits(),
-        measured_before.width.to_bits(),
+        measured_after.width.value().to_bits(),
+        measured_before.width.value().to_bits(),
         "文本 measure 宽度不得随 DPI 变化"
     );
     assert_eq!(
-        measured_after.height.to_bits(),
-        measured_before.height.to_bits(),
+        measured_after.height.value().to_bits(),
+        measured_before.height.value().to_bits(),
         "文本 measure 高度不得随 DPI 变化"
     );
     assert_eq!(
@@ -1291,7 +1292,7 @@ fn changed_text_marks_a11y() {
     let signal: Signal<SmolStr> = app.signal(SmolStr::new_static("A"));
     let window = app.create_window(WindowOptions::default());
     let root = app.window(window).expect("窗口存在").tree().root();
-    let node = NodeBuilder::text("A", crate::text::TextStyle::new(12.0))
+    let node = NodeBuilder::text("A", crate::text::TextStyle::new(px(12.0)))
         .bind_text(move |cx| cx.read(&signal).clone())
         .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
         .expect("挂载");
@@ -1451,7 +1452,7 @@ fn layout_text_breaks_at_the_content_width() {
         "selection rects must cover the broken lines"
     );
     assert!(
-        line.width <= 60.5,
+        line.width <= px(60.5),
         "the line box must respect the content width"
     );
 }
@@ -1483,8 +1484,8 @@ fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
         .ime_cursor_area(window)
         .expect("窗口存在")
         .expect("已 shape 后有 hint");
-    assert!(area.size.width >= 1.0);
-    assert!(area.size.height > 0.0);
+    assert!(area.size.width >= px(1.0));
+    assert!(area.size.height > px(0.0));
 
     assert!(app.set_ime_cursor_area(window, node, 4).is_ok());
     assert!(matches!(
@@ -1502,7 +1503,7 @@ fn ime_cursor_area_requires_text_shape_and_can_be_cleared() {
         window,
         node,
         "abcd",
-        crate::text::TextStyle::new(16.0),
+        crate::text::TextStyle::new(px(16.0)),
     );
     assert!(
         matches!(
@@ -1568,9 +1569,9 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
     let root = app.window(window).expect("窗口").tree().root();
     let mut style = text_style(Some(200.0));
     style
-        .padding_sides(7.0, 0.0, 0.0, 9.0)
-        .border_sides(3.0, 0.0, 0.0, 2.0);
-    let node = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
+        .padding_sides(px(7.0), px(0.0), px(0.0), px(9.0))
+        .border_sides(px(3.0), px(0.0), px(0.0), px(2.0));
+    let node = NodeBuilder::text("abc", crate::text::TextStyle::new(px(16.0)))
         .style(style)
         .build(app.window_mut(window).expect("窗口").tree_mut(), root)
         .expect("挂载");
@@ -1583,8 +1584,8 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
         .expect("窗口")
         .text_caret_rect(node, 0)
         .expect("caret");
-    assert!((rect.origin.x - 11.0).abs() < 0.01, "{rect:?}");
-    assert!((rect.origin.y - 10.0).abs() < 0.01, "{rect:?}");
+    assert!((rect.origin.x - 11.0).abs() < px(0.01), "{rect:?}");
+    assert!((rect.origin.y - 10.0).abs() < px(0.01), "{rect:?}");
 }
 
 #[test]
@@ -1617,7 +1618,7 @@ fn changed_text_always_relayouts_the_snapshot() {
             window,
             node,
             text,
-            crate::text::TextStyle::new(16.0),
+            crate::text::TextStyle::new(px(16.0)),
         );
         let pass = refresh(&mut app, window);
         assert_eq!(pass.shaped, 1, "new text must reshape");
@@ -1636,7 +1637,7 @@ fn style_and_family_changes_relayout() {
     let _ = layout(&mut app, window);
     let _ = text_layout(&mut app, window);
 
-    let mut style = crate::text::TextStyle::new(24.0);
+    let mut style = crate::text::TextStyle::new(px(24.0));
     style = style.with_family(smol_str::SmolStr::new_static("Consolas"));
     set_text(&mut app, window, node, "same text", style);
 
@@ -1652,7 +1653,7 @@ fn inline_boxes_changes_relayout() {
     let spec = crate::text::InlineBoxSpec {
         id: 7,
         index: 1,
-        size: crate::math::Size::new(20.0, 20.0),
+        size: crate::math::LogicalSize::new(px(20.0), px(20.0)),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
         paint: None,
@@ -1660,7 +1661,7 @@ fn inline_boxes_changes_relayout() {
     let node = {
         let w = app.window_mut(window).expect("window");
         let root = w.tree().root();
-        NodeBuilder::text("a b", crate::text::TextStyle::new(16.0))
+        NodeBuilder::text("a b", crate::text::TextStyle::new(px(16.0)))
             .inline_boxes([spec])
             .build(w.tree_mut(), root)
             .expect("build")
@@ -1672,8 +1673,8 @@ fn inline_boxes_changes_relayout() {
     let spec2 = crate::text::InlineBoxSpec {
         id: 9,
         index: 1,
-        size: crate::math::Size::new(40.0, 10.0),
-        baseline: Some(8.0),
+        size: crate::math::LogicalSize::new(px(40.0), px(10.0)),
+        baseline: Some(px(8.0)),
         align: crate::text::InlineAlign::Top,
         paint: None,
     };
@@ -1695,7 +1696,7 @@ fn app_frame_reports_missing_inline_box_images_once() {
     let spec = crate::text::InlineBoxSpec {
         id: 11,
         index: 1,
-        size: crate::math::Size::new(16.0, 16.0),
+        size: crate::math::LogicalSize::new(px(16.0), px(16.0)),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
         paint: Some(crate::text::InlineBoxPaint::Image {
@@ -1706,7 +1707,7 @@ fn app_frame_reports_missing_inline_box_images_once() {
     {
         let w = app.window_mut(window).expect("window");
         let root = w.tree().root();
-        NodeBuilder::text("a b", crate::text::TextStyle::new(16.0))
+        NodeBuilder::text("a b", crate::text::TextStyle::new(px(16.0)))
             .inline_boxes([spec])
             .build(w.tree_mut(), root)
             .expect("build");
@@ -1754,7 +1755,7 @@ fn bind_text_preserves_inline_boxes() {
     let spec = crate::text::InlineBoxSpec {
         id: 3,
         index: 0,
-        size: crate::math::Size::new(16.0, 16.0),
+        size: crate::math::LogicalSize::new(px(16.0), px(16.0)),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
         paint: None,
@@ -1762,7 +1763,7 @@ fn bind_text_preserves_inline_boxes() {
     let node = {
         let w = app.window_mut(window).expect("window");
         let root = w.tree().root();
-        NodeBuilder::text("", crate::text::TextStyle::new(16.0))
+        NodeBuilder::text("", crate::text::TextStyle::new(px(16.0)))
             .bind_text(move |cx| cx.read(&signal).clone())
             .inline_boxes([spec])
             .build(w.tree_mut(), root)
@@ -1798,7 +1799,12 @@ fn app_frame_runs_styles_then_paints() {
     let background = app.signal(crate::paint::color::Color::WHITE);
     {
         let _ = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(0.0, 0.0, 20.0, 10.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(20.0),
+                px(10.0),
+            ))
             .bind_style(move |cx| StylePatch {
                 background: Some(*cx.read(&background)),
                 ..StylePatch::default()
@@ -2107,11 +2113,11 @@ fn traffic_light_api_is_unsupported_off_macos() {
 
     #[cfg(not(target_os = "macos"))]
     {
-        use crate::math::Point;
+        use crate::math::LogicalPoint;
 
         assert_eq!(app.traffic_light_inset(window), None, "非 macOS 没有交通灯");
         let error = app
-            .set_traffic_light_position(window, Point::new(8.0, 8.0))
+            .set_traffic_light_position(window, LogicalPoint::new(px(8.0), px(8.0)))
             .expect_err("非 macOS 必须强类型拒绝");
         let crate::error::EngineError::UnsupportedWindowCapability { capability, .. } = &error
         else {
@@ -2120,7 +2126,7 @@ fn traffic_light_api_is_unsupported_off_macos() {
         assert!(capability.contains("traffic light"), "{capability}");
 
         let error = app
-            .set_traffic_light_position(WindowId::for_test(999), Point::ZERO)
+            .set_traffic_light_position(WindowId::for_test(999), LogicalPoint::ZERO)
             .expect_err("未知窗口优先");
         assert!(matches!(
             error,

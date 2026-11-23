@@ -404,8 +404,8 @@ pub(crate) fn frame_index(window: &Window) -> FrameIndex {
 
 pub(crate) fn compute_layout(window: &mut Window) -> Result<LayoutReport, EngineError> {
     let report = window.tree.compute_layout(taffy::geometry::Size {
-        width: Some(window.options.size.width),
-        height: Some(window.options.size.height),
+        width: Some(window.options.size.width.value()),
+        height: Some(window.options.size.height.value()),
     })?;
     window.tree.mark_moved_a11y();
     Ok(report)
@@ -444,7 +444,7 @@ mod tests {
     use super::note_reset_epoch;
     use crate::{
         app::App,
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         window::{WindowId, WindowOptions},
     };
@@ -458,13 +458,13 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window: WindowId = app.create_window(WindowOptions {
             title: SmolStr::new_static("frame-release"),
-            size: Size::new(320.0, 240.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(320.0), px(240.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
         let _ = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("box");
 
@@ -488,15 +488,20 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window: WindowId = app.create_window(WindowOptions {
             title: SmolStr::new_static("resync"),
-            size: Size::new(320.0, 240.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(320.0), px(240.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
         let mut nodes = Vec::new();
         for index in 0..3 {
             let node = NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 24.0, 32.0, 20.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 24.0),
+                    px(32.0),
+                    px(20.0),
+                ))
                 .paint(crate::paint::style::PaintSpec {
                     background: crate::paint::color::Color::WHITE,
                     ..crate::paint::style::PaintSpec::default()
@@ -577,8 +582,8 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window: WindowId = app.create_window(WindowOptions {
             title: SmolStr::new_static("render-stats"),
-            size: Size::new(320.0, 240.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(320.0), px(240.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let view = app.window_mut(window).expect("window");

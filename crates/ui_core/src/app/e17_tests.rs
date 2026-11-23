@@ -1,13 +1,13 @@
 use crate::{
     event::{Action, Event, InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     test_support::app::TestApp,
     window::WindowOptions,
 };
 
-const P1: Point = Point::new(64.0, 32.0);
-const P2: Point = Point::new(80.0, 48.0);
+const P1: LogicalPoint = LogicalPoint::new(px(64.0), px(32.0));
+const P2: LogicalPoint = LogicalPoint::new(px(80.0), px(48.0));
 
 #[test]
 fn nothing_is_reported_before_the_first_pointer_event() {
@@ -28,14 +28,14 @@ fn nothing_is_reported_before_the_first_pointer_event() {
 #[test]
 fn every_pointer_event_carrying_a_position_refreshes_it() {
     let mut app = TestApp::new();
-    let enter = Point::new(10.0, 12.0);
+    let enter = LogicalPoint::new(px(10.0), px(12.0));
     app.enter_pointer(enter);
     assert_eq!(app.pointer_position(), Some(enter), "PointerEnter 带进入点");
 
     app.move_pointer(P1);
     assert_eq!(app.pointer_position(), Some(P1), "PointerMove 刷新位置");
 
-    let down = Point::new(20.0, 24.0);
+    let down = LogicalPoint::new(px(20.0), px(24.0));
     app.inject(InputEvent::pointer_down(
         down,
         PointerButton::Primary,
@@ -43,7 +43,7 @@ fn every_pointer_event_carrying_a_position_refreshes_it() {
     ));
     assert_eq!(app.pointer_position(), Some(down), "PointerDown 刷新位置");
 
-    let up = Point::new(22.0, 26.0);
+    let up = LogicalPoint::new(px(22.0), px(26.0));
     app.inject(InputEvent::pointer_up(
         up,
         PointerButton::Primary,
@@ -51,10 +51,10 @@ fn every_pointer_event_carrying_a_position_refreshes_it() {
     ));
     assert_eq!(app.pointer_position(), Some(up), "PointerUp 刷新位置");
 
-    let scrolled = Point::new(30.0, 36.0);
+    let scrolled = LogicalPoint::new(px(30.0), px(36.0));
     app.inject(InputEvent::scroll_lines(
         scrolled,
-        Point::new(0.0, 1.0),
+        LogicalPoint::new(px(0.0), px(1.0)),
         Modifiers::empty(),
     ));
     assert_eq!(app.pointer_position(), Some(scrolled), "Scroll 刷新位置");
@@ -64,7 +64,7 @@ fn every_pointer_event_carrying_a_position_refreshes_it() {
 fn leaving_keeps_the_last_known_position() {
     let mut app = TestApp::new();
     app.move_pointer(P1);
-    let leave = Point::new(795.0, 300.0);
+    let leave = LogicalPoint::new(px(795.0), px(300.0));
     app.leave_pointer(leave);
     assert_eq!(
         app.pointer_position(),
@@ -90,8 +90,8 @@ fn leaving_keeps_the_last_known_position() {
 fn reentering_the_window_refreshes_the_position() {
     let mut app = TestApp::new();
     app.move_pointer(P1);
-    app.leave_pointer(Point::new(-3.0, 5.0));
-    let reenter = Point::new(400.0, 200.0);
+    app.leave_pointer(LogicalPoint::new(px(-3.0), px(5.0)));
+    let reenter = LogicalPoint::new(px(400.0), px(200.0));
     app.enter_pointer(reenter);
     assert_eq!(app.pointer_position(), Some(reenter));
 }
@@ -105,20 +105,20 @@ fn resizing_or_changing_dpi_does_not_remap_the_logical_position() {
     app.app_mut()
         .window_mut(window)
         .expect("窗口")
-        .set_size(Size::new(1600.0, 1200.0));
+        .set_size(LogicalSize::new(px(1600.0), px(1200.0)));
     app.dispatch_event(Event::Resized {
-        size: Size::new(1600.0, 1200.0),
+        size: LogicalSize::new(px(1600.0), px(1200.0)),
     });
     assert_eq!(app.pointer_position(), Some(P1), "缩放不清除 / 不重映射");
 
-    let scale = Scale::new(2.0).expect("合法 scale");
+    let scale = DevicePixelRatio::new(2.0).expect("合法 scale");
     app.app_mut()
         .window_mut(window)
         .expect("窗口")
         .set_scale(scale);
     app.dispatch_event(Event::DpiChanged { dpi: 192, scale });
     assert_eq!(app.pointer_position(), Some(P1), "DPI 变化不重算旧位置");
-    let logical = Point::new(120.0, 90.0);
+    let logical = LogicalPoint::new(px(120.0), px(90.0));
     app.move_pointer(logical);
     assert_eq!(
         app.pointer_position(),
@@ -133,7 +133,7 @@ fn a_capture_drag_keeps_updating_the_position_outside_the_window() {
     let window = app.window_id();
     let root = app.app().window(window).expect("窗口").tree().root();
     let _grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(6.0), px(100.0)))
         .on_drag(Action::custom("split"))
         .build(
             app.app_mut().window_mut(window).expect("窗口").tree_mut(),
@@ -143,17 +143,17 @@ fn a_capture_drag_keeps_updating_the_position_outside_the_window() {
     let _ = app.drain().expect("首帧");
 
     app.inject(InputEvent::pointer_down(
-        Point::new(103.0, 20.0),
+        LogicalPoint::new(px(103.0), px(20.0)),
         PointerButton::Primary,
         Modifiers::empty(),
     ));
-    app.move_pointer(Point::new(150.0, 20.0));
+    app.move_pointer(LogicalPoint::new(px(150.0), px(20.0)));
     assert!(
         app.app().pointer_captured(window).is_some(),
         "越过拖拽阈值必须取得指针捕获"
     );
 
-    let outside = Point::new(-40.5, -12.25);
+    let outside = LogicalPoint::new(px(-40.5), px(-12.25));
     app.move_pointer(outside);
     assert_eq!(
         app.pointer_position(),
@@ -162,7 +162,7 @@ fn a_capture_drag_keeps_updating_the_position_outside_the_window() {
     );
     assert_eq!(app.app().pointer_position(window), Some(outside));
 
-    let released = Point::new(-52.0, -18.0);
+    let released = LogicalPoint::new(px(-52.0), px(-18.0));
     app.inject(InputEvent::pointer_up(
         released,
         PointerButton::Primary,

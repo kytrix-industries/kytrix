@@ -143,9 +143,9 @@ mod tests {
 
     use super::WindowComposer;
     #[cfg(target_os = "linux")]
-    use crate::math::Size;
+    use crate::math::LogicalSize;
     use crate::{
-        math::{PhysicalRect, Point, Rect, Scale},
+        math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, dp, px},
         paint::{
             color::{Color, ColorResolver},
             primitive::{Primitive, Quad, QuadPaint},
@@ -159,7 +159,7 @@ mod tests {
         window::{FrameIndex, WindowId},
     };
 
-    fn header(index: u32, plan: Plan, scale: Scale) -> FrameHeader {
+    fn header(index: u32, plan: Plan, scale: DevicePixelRatio) -> FrameHeader {
         FrameHeader {
             window: WindowId::from_raw(1),
             index: FrameIndex::from_raw(index),
@@ -167,7 +167,7 @@ mod tests {
             surface: (64, 64),
             scale,
             #[cfg(target_os = "linux")]
-            surface_local: Size::new(64.0, 64.0),
+            surface_local: LogicalSize::new(px(64.0), px(64.0)),
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             published_at: std::time::Instant::now(),
@@ -176,8 +176,8 @@ mod tests {
 
     fn quad() -> Primitive {
         Primitive::Quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
@@ -218,11 +218,11 @@ mod tests {
             &mut self,
             plan: Plan,
             full: bool,
-            scroll: &[(Point, PhysicalRect)],
+            scroll: &[(LogicalPoint, DeviceRect)],
         ) -> SceneDelta {
             let index = self.next;
             self.next += 1;
-            let mut delta = SceneDelta::empty(header(index, plan, Scale::ONE));
+            let mut delta = SceneDelta::empty(header(index, plan, DevicePixelRatio::ONE));
             self.builder
                 .collect(&mut self.scene, &self.store, scroll, full, &mut delta);
             delta
@@ -231,8 +231,8 @@ mod tests {
         fn frame_with_signals(&mut self, plan: Plan) -> SceneDelta {
             let index = self.next;
             self.next += 1;
-            let mut delta = SceneDelta::empty(header(index, plan, Scale::ONE));
-            let full = self.builder.full_for(Scale::ONE);
+            let mut delta = SceneDelta::empty(header(index, plan, DevicePixelRatio::ONE));
+            let full = self.builder.full_for(DevicePixelRatio::ONE);
             self.builder
                 .collect(&mut self.scene, &self.store, &[], full, &mut delta);
             delta
@@ -276,8 +276,12 @@ mod tests {
     #[test]
     fn a_scroll_frame_does_not_encode_anything() {
         let mut fixture = Fixture::new(4);
-        let viewport = PhysicalRect::new(0, 0, 64, 64);
-        let delta = fixture.frame(Plan::Full, true, &[(Point::new(0.0, 0.0), viewport)]);
+        let viewport = DeviceRect::new(dp(0), dp(0), dp(64), dp(64));
+        let delta = fixture.frame(
+            Plan::Full,
+            true,
+            &[(LogicalPoint::new(px(0.0), px(0.0)), viewport)],
+        );
         let first = fixture.compose(&delta);
         assert_eq!(first.stats.encoded_lanes, 4);
         assert!(first.payload.scroll().is_empty() || first.payload.scroll()[0] == [0.0, 0.0]);
@@ -287,7 +291,11 @@ mod tests {
             "首帧走全量扫描，不计入增量快路径"
         );
 
-        let delta = fixture.frame(Plan::Idle, false, &[(Point::new(0.0, -20.0), viewport)]);
+        let delta = fixture.frame(
+            Plan::Idle,
+            false,
+            &[(LogicalPoint::new(px(0.0), px(-20.0)), viewport)],
+        );
         assert!(
             delta.lanes.is_empty() && delta.order.is_none(),
             "滚动 delta 不得带 lane"
@@ -318,15 +326,23 @@ mod tests {
     #[test]
     fn scrolling_never_touches_instance_bytes() {
         let mut moving = Fixture::new(3);
-        let viewport = PhysicalRect::new(0, 0, 64, 64);
-        let delta = moving.frame(Plan::Full, true, &[(Point::new(0.0, 0.0), viewport)]);
+        let viewport = DeviceRect::new(dp(0), dp(0), dp(64), dp(64));
+        let delta = moving.frame(
+            Plan::Full,
+            true,
+            &[(LogicalPoint::new(px(0.0), px(0.0)), viewport)],
+        );
         let before = moving.compose(&delta).stats;
         let delta = moving.frame(Plan::Partial(DamageRects::new()), false, &[]);
         let baseline = moving.compose(&delta);
         assert_eq!(baseline.stats.encoded_lanes, 0);
         assert!(baseline.payload.chunks().is_empty());
         assert_eq!(before.drawn_instances, baseline.stats.drawn_instances);
-        let delta = moving.frame(Plan::Idle, false, &[(Point::new(0.0, -30.0), viewport)]);
+        let delta = moving.frame(
+            Plan::Idle,
+            false,
+            &[(LogicalPoint::new(px(0.0), px(-30.0)), viewport)],
+        );
         let scrolled = moving.compose(&delta);
         assert!(scrolled.payload.chunks().is_empty());
         assert_eq!(scrolled.stats.encoded_lanes, 0);
@@ -337,8 +353,14 @@ mod tests {
         let mut fixture = Fixture::new(3);
         let delta = fixture.frame(Plan::Full, true, &[]);
         let _ = fixture.compose(&delta);
-        let mut delta = SceneDelta::empty(header(9, Plan::Full, Scale::new(2.0).expect("scale")));
-        let full = fixture.builder.full_for(Scale::new(2.0).expect("scale"));
+        let mut delta = SceneDelta::empty(header(
+            9,
+            Plan::Full,
+            DevicePixelRatio::new(2.0).expect("scale"),
+        ));
+        let full = fixture
+            .builder
+            .full_for(DevicePixelRatio::new(2.0).expect("scale"));
         assert!(full, "DPI 变化必须整帧重建");
         fixture
             .builder
@@ -368,8 +390,8 @@ mod tests {
         assert!(fixture.scene.push(
             fixture.lane,
             Primitive::Quad(Quad {
-                bounds: Rect::new(400.0, 0.0, 4.0, 4.0),
-                corner_radius: [0.0; 4],
+                bounds: LogicalRect::new(px(400.0), px(0.0), px(4.0), px(4.0)),
+                corner_radius: [px(0.0); 4],
                 paint: QuadPaint::Solid {
                     fill: Color::WHITE,
                     border: None,
@@ -394,7 +416,8 @@ mod tests {
             .expect("至少有实例 op");
         assert!(
             rightmost >= 390,
-            "op 包围盒必须包含移动后的位置（实际 x1={rightmost}）"
+            "op 包围盒必须包含移动后的位置（实际 x1={}）",
+            rightmost.value()
         );
     }
 
@@ -463,7 +486,12 @@ mod tests {
 
         let mut direct = InstanceEncoder::new();
         direct
-            .encode(&fixture.scene, Scale::ONE, ColorResolver, &fixture.store)
+            .encode(
+                &fixture.scene,
+                DevicePixelRatio::ONE,
+                ColorResolver,
+                &fixture.store,
+            )
             .expect("direct encode");
         let composed_buffer = fixture.composer.buffer();
         assert_eq!(
@@ -480,7 +508,12 @@ mod tests {
         let delta = fixture.frame(Plan::Partial(DamageRects::new()), false, &[]);
         let composed = fixture.compose(&delta);
         direct
-            .encode(&fixture.scene, Scale::ONE, ColorResolver, &fixture.store)
+            .encode(
+                &fixture.scene,
+                DevicePixelRatio::ONE,
+                ColorResolver,
+                &fixture.store,
+            )
             .expect("direct encode");
         assert_eq!(
             direct.buffer().as_bytes(),

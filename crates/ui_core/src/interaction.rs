@@ -12,7 +12,7 @@ use crate::{
     app::App,
     event::{Action, ActionSource, Modifiers, PointerButton},
     layout::hit_test::HitResult,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{color::Color, style::Cursor},
     window::WindowId,
@@ -46,7 +46,7 @@ impl FocusScope {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PressRecord {
     pub node: Option<NodeId>,
-    pub position: Point,
+    pub position: LogicalPoint,
     pub button: PointerButton,
     pub at: Instant,
 }
@@ -55,8 +55,8 @@ pub(crate) struct PressRecord {
 pub(crate) struct DragSession {
     pub node: NodeId,
     pub action: Action,
-    pub origin: Point,
-    pub current: Point,
+    pub origin: LogicalPoint,
+    pub current: LogicalPoint,
     pub phase: DragPhase,
 }
 
@@ -64,13 +64,13 @@ pub(crate) struct DragSession {
 pub(crate) struct PendingDrag {
     pub node: NodeId,
     pub action: Action,
-    pub origin: Point,
+    pub origin: LogicalPoint,
 }
 
 impl DragSession {
     #[must_use]
-    pub fn delta(&self) -> Point {
-        Point::new(
+    pub fn delta(&self) -> LogicalPoint {
+        LogicalPoint::new(
             self.current.x - self.origin.x,
             self.current.y - self.origin.y,
         )
@@ -87,9 +87,9 @@ pub enum DragPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DragInfo {
-    pub origin: Point,
-    pub current: Point,
-    pub delta: Point,
+    pub origin: LogicalPoint,
+    pub current: LogicalPoint,
+    pub delta: LogicalPoint,
     pub phase: DragPhase,
 }
 
@@ -157,14 +157,14 @@ pub enum ScrollAxis {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollConfig {
     pub axis: ScrollAxis,
-    pub line_height: f32,
+    pub line_height: LogicalPx,
 }
 
 impl Default for ScrollConfig {
     fn default() -> Self {
         Self {
             axis: ScrollAxis::Vertical,
-            line_height: 48.0,
+            line_height: px(48.0),
         }
     }
 }
@@ -193,18 +193,18 @@ impl ScrollHandle {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollState {
-    pub offset: Point,
-    pub content: Size,
-    pub viewport: Size,
+    pub offset: LogicalPoint,
+    pub content: LogicalSize,
+    pub viewport: LogicalSize,
     pub axis: ScrollAxis,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollSlot {
-    pub offset: Point,
-    pub content: Size,
+    pub offset: LogicalPoint,
+    pub content: LogicalSize,
     pub axis: ScrollAxis,
-    pub line_height: f32,
+    pub line_height: LogicalPx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -231,8 +231,8 @@ impl VirtualList {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VirtualListConfig {
-    pub extent: f32,
-    pub extents: Option<Box<[f32]>>,
+    pub extent: LogicalPx,
+    pub extents: Option<Box<[LogicalPx]>>,
     pub overscan: usize,
 }
 
@@ -250,14 +250,14 @@ pub struct VirtualListState {
     pub first: usize,
     pub last: usize,
     pub mounted: usize,
-    pub offset: Point,
-    pub viewport: Size,
+    pub offset: LogicalPoint,
+    pub viewport: LogicalSize,
 }
 
 pub(crate) struct VirtualSlot {
-    pub extent: f32,
-    pub extents: Option<Box<[f32]>>,
-    prefix: Vec<f32>,
+    pub extent: LogicalPx,
+    pub extents: Option<Box<[LogicalPx]>>,
+    prefix: Vec<LogicalPx>,
     pub overscan: usize,
     pub count: usize,
     pub builder: Option<Box<dyn FnMut(usize) -> NodeBuilder>>,
@@ -265,7 +265,7 @@ pub(crate) struct VirtualSlot {
 }
 
 impl VirtualSlot {
-    pub(crate) fn new(extent: f32, overscan: usize) -> Self {
+    pub(crate) fn new(extent: LogicalPx, overscan: usize) -> Self {
         Self {
             extent,
             extents: None,
@@ -277,11 +277,11 @@ impl VirtualSlot {
         }
     }
 
-    pub(crate) fn set_extents(&mut self, extents: Box<[f32]>) {
+    pub(crate) fn set_extents(&mut self, extents: Box<[LogicalPx]>) {
         self.prefix.clear();
         self.prefix.reserve(extents.len() + 1);
-        self.prefix.push(0.0);
-        let mut total = 0.0;
+        self.prefix.push(LogicalPx::ZERO);
+        let mut total = LogicalPx::ZERO;
         for &height in &extents {
             total += height;
             self.prefix.push(total);
@@ -294,13 +294,13 @@ impl VirtualSlot {
         self.prefix.clear();
     }
 
-    pub(crate) fn active_extents(&self) -> Option<&[f32]> {
+    pub(crate) fn active_extents(&self) -> Option<&[LogicalPx]> {
         self.extents
             .as_deref()
             .filter(|extents| extents.len() == self.count)
     }
 
-    pub(crate) fn prefix(&self) -> &[f32] {
+    pub(crate) fn prefix(&self) -> &[LogicalPx] {
         &self.prefix
     }
 }
@@ -309,7 +309,7 @@ impl std::fmt::Debug for VirtualSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VirtualSlot")
             .field("extent", &self.extent)
-            .field("extents", &self.extents.as_deref().map(<[f32]>::len))
+            .field("extents", &self.extents.as_deref().map(<[LogicalPx]>::len))
             .field("prefix", &self.prefix.len())
             .field("overscan", &self.overscan)
             .field("count", &self.count)
@@ -335,7 +335,7 @@ pub enum AnchorSide {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OverlayPlacement {
-    Point(Point),
+    Point(LogicalPoint),
     Anchor {
         node: NodeId,
         side: AnchorSide,
@@ -355,7 +355,7 @@ pub struct OverlayOptions {
 impl Default for OverlayOptions {
     fn default() -> Self {
         Self {
-            placement: OverlayPlacement::Point(Point::ZERO),
+            placement: OverlayPlacement::Point(LogicalPoint::ZERO),
             dismiss: OverlayDismiss::OutsideClick,
             trap_focus: false,
             restore_focus: false,
@@ -626,22 +626,24 @@ impl std::fmt::Debug for NodeInteraction {
 pub(crate) fn resolve_placement(
     tree: &crate::node::tree::NodeTree,
     placement: OverlayPlacement,
-    size: crate::math::Size,
-) -> Point {
+    size: crate::math::LogicalSize,
+) -> LogicalPoint {
     match placement {
         OverlayPlacement::Point(origin) => origin,
         OverlayPlacement::Anchor { node, side, gap } => {
             let bounds = tree.get(node).map_or_else(
-                |_| Rect::default(),
+                |_| LogicalRect::default(),
                 |target| scroll::to_screen(tree, node, target.layout().bounds),
             );
             match side {
-                AnchorSide::Below => Point::new(bounds.origin.x, bounds.max().y + gap),
+                AnchorSide::Below => LogicalPoint::new(bounds.origin.x, bounds.max().y + gap),
                 AnchorSide::Above => {
-                    Point::new(bounds.origin.x, bounds.origin.y - gap - size.height)
+                    LogicalPoint::new(bounds.origin.x, bounds.origin.y - gap - size.height)
                 }
-                AnchorSide::Left => Point::new(bounds.origin.x - gap - size.width, bounds.origin.y),
-                AnchorSide::Right => Point::new(bounds.max().x + gap, bounds.origin.y),
+                AnchorSide::Left => {
+                    LogicalPoint::new(bounds.origin.x - gap - size.width, bounds.origin.y)
+                }
+                AnchorSide::Right => LogicalPoint::new(bounds.max().x + gap, bounds.origin.y),
             }
         }
     }
@@ -650,7 +652,10 @@ pub(crate) fn resolve_placement(
 #[cfg(test)]
 mod tests {
     use super::{Easing, FocusScope, InputThresholds, ScrollAxis, ScrollConfig, ScrollSlot};
-    use crate::{math::Point, node::id::NodeId};
+    use crate::{
+        math::{LogicalPoint, px},
+        node::id::NodeId,
+    };
 
     #[test]
     fn focus_scope_reports_and_dedupes() {
@@ -698,14 +703,14 @@ mod tests {
     fn scroll_config_defaults_to_vertical() {
         let config = ScrollConfig::default();
         let slot = ScrollSlot {
-            offset: Point::ZERO,
-            content: crate::math::Size::new(100.0, 200.0),
+            offset: LogicalPoint::ZERO,
+            content: crate::math::LogicalSize::new(px(100.0), px(200.0)),
             axis: config.axis,
             line_height: config.line_height,
         };
 
         assert_eq!(config.axis, ScrollAxis::Vertical);
-        assert_eq!(config.line_height, 48.0);
-        assert_eq!(slot.offset, Point::ZERO);
+        assert_eq!(config.line_height, px(48.0));
+        assert_eq!(slot.offset, LogicalPoint::ZERO);
     }
 }

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use ui_core::{
     app::App,
-    math::Scale,
+    math::DevicePixelRatio,
     paint::color::Color,
     window::{FrameOutcome, WindowId, WindowOptions},
 };
@@ -204,7 +204,7 @@ pub fn run(config: &Config) -> Result<bool, Box<dyn std::error::Error>> {
     let window = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static("kytrix acceptance"),
         size: scene::WINDOW_SIZE,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
         ..WindowOptions::default()
     });
@@ -433,7 +433,7 @@ pub fn run_breakdown(config: &Config) -> Result<bool, Box<dyn std::error::Error>
     let window = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static("kytrix acceptance"),
         size: scene::WINDOW_SIZE,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
         ..WindowOptions::default()
     });

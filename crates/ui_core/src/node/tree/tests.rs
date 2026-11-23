@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use super::{LayoutBox, Node, NodeKind, NodeSpec, NodeTree};
 use crate::{
     error::EngineError,
-    math::{Edges, Point, Rect},
+    math::{LogicalEdges, LogicalPoint, LogicalRect, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::{
         style::{Clip, Style, StylePatch},
@@ -178,8 +178,8 @@ fn node_and_handle_sizes() {
         size_of::<Option<smol_str::SmolStr>>()
     );
     println!(
-        "size_of::<Option<(u8, Option<PhysicalRect>)>>() = {}",
-        size_of::<Option<(u8, Option<crate::math::PhysicalRect>)>>()
+        "size_of::<Option<(u8, Option<DeviceRect>)>>() = {}",
+        size_of::<Option<(u8, Option<crate::math::DeviceRect>)>>()
     );
     println!("size_of::<taffy::Cache>() = {}", size_of::<taffy::Cache>());
     println!(
@@ -209,7 +209,7 @@ fn node_and_handle_sizes() {
 fn layout_box_is_32_bytes() {
     assert_eq!(
         size_of::<LayoutBox>(),
-        size_of::<Rect>() + size_of::<Edges>()
+        size_of::<LogicalRect>() + size_of::<LogicalEdges>()
     );
     assert_eq!(size_of::<LayoutBox>(), 32);
 }
@@ -356,8 +356,8 @@ fn damage_covers_current_layout_on_touch() {
     tree.set_layout_for_test(
         node,
         LayoutBox {
-            border: Edges::ZERO,
-            bounds: Rect::new(10.0, 0.0, 4.0, 4.0),
+            border: LogicalEdges::ZERO,
+            bounds: LogicalRect::new(px(10.0), px(0.0), px(4.0), px(4.0)),
         },
     );
     assert!(
@@ -370,7 +370,7 @@ fn damage_covers_current_layout_on_touch() {
     let damage = tree.get(node).expect("存在").damage();
     assert_eq!(
         damage,
-        Rect::new(10.0, 0.0, 4.0, 4.0),
+        LogicalRect::new(px(10.0), px(0.0), px(4.0), px(4.0)),
         "touch 必须把当前布局盒并入 damage"
     );
 }
@@ -442,7 +442,7 @@ fn append_child_marks_moved_subtree_paint() {
 fn text_tree(text: &str) -> (NodeTree, NodeId) {
     let mut tree = NodeTree::new();
     let root = tree.root();
-    let node = NodeBuilder::text(text, crate::text::TextStyle::new(16.0))
+    let node = NodeBuilder::text(text, crate::text::TextStyle::new(px(16.0)))
         .build(&mut tree, root)
         .expect("挂载成功");
     (tree, node)
@@ -510,7 +510,7 @@ fn text_caret_rect_reports_preconditions() {
 fn text_byte_index_at_reports_preconditions() {
     let (mut tree, node) = text_tree("abcdef");
     let root = tree.root();
-    let point = Point::new(1.0, 1.0);
+    let point = LogicalPoint::new(px(1.0), px(1.0));
 
     let error = tree
         .text_byte_index_at(node, point)
@@ -556,7 +556,7 @@ fn text_content_updates_only_text_nodes() {
 
     assert!(tree.set_text_content(
         node,
-        crate::text::TextContent::new("two", crate::text::TextStyle::new(12.0))
+        crate::text::TextContent::new("two", crate::text::TextStyle::new(px(12.0)))
     ));
     assert_eq!(tree.text_content(node).expect("文本").text, "two");
     assert!(
@@ -572,7 +572,7 @@ fn text_content_updates_only_text_nodes() {
 fn text_bind_text_round_trips() {
     let mut tree = NodeTree::new();
     let root = tree.root();
-    let node = NodeBuilder::text("x", crate::text::TextStyle::new(16.0))
+    let node = NodeBuilder::text("x", crate::text::TextStyle::new(px(16.0)))
         .bind_text(|_cx| smol_str::SmolStr::new_static("bound"))
         .build(&mut tree, root)
         .expect("挂载成功");
@@ -583,10 +583,10 @@ fn text_bind_text_round_trips() {
     assert!(tree.take_bind_text(node).is_some(), "放回后仍可取");
 }
 
-fn layout_box(bounds: Rect) -> LayoutBox {
+fn layout_box(bounds: LogicalRect) -> LayoutBox {
     LayoutBox {
         bounds,
-        border: Edges::ZERO,
+        border: LogicalEdges::ZERO,
     }
 }
 
@@ -595,7 +595,10 @@ fn settle_frame_resets_damage_bits_and_prev_layout() {
     let mut tree = NodeTree::new();
     let root = tree.root();
     let child = boxed(&mut tree, root);
-    let _ = tree.set_layout_for_test(child, layout_box(Rect::new(1.0, 2.0, 3.0, 4.0)));
+    let _ = tree.set_layout_for_test(
+        child,
+        layout_box(LogicalRect::new(px(1.0), px(2.0), px(3.0), px(4.0))),
+    );
     let _ = tree.mark_paint(child);
     let _ = tree.mark_a11y(child);
     let flags = tree.get(child).expect("存在").dirty();
@@ -625,8 +628,11 @@ fn remove_unions_subtree_bounds_into_parent_damage() {
     let root = tree.root();
     let parent = boxed(&mut tree, root);
     let child = boxed(&mut tree, parent);
-    let _ = tree.set_layout_for_test(parent, layout_box(Rect::new(0.0, 0.0, 10.0, 10.0)));
-    let outside = Rect::new(100.0, 100.0, 20.0, 20.0);
+    let _ = tree.set_layout_for_test(
+        parent,
+        layout_box(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0))),
+    );
+    let outside = LogicalRect::new(px(100.0), px(100.0), px(20.0), px(20.0));
     let _ = tree.set_layout_for_test(child, layout_box(outside));
     tree.settle_frame();
 
@@ -701,11 +707,11 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
     let third = GeometryId::for_test(3, 1);
     let draw = |id| GeometryDraw::full(id, crate::math::Transform::IDENTITY, Color::WHITE);
     let path = |id| Path {
-        bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
         geometry: id,
         fill: Color::WHITE,
     };
-    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)));
     canvas.push_geometry(draw(first));
     canvas.push_geometry(draw(first));
     canvas.push_path(path(third));
@@ -729,7 +735,7 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
     );
     assert!(!tree.geometry_bindings.contains_key(&second));
 
-    let mut fresh = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+    let mut fresh = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)));
     fresh.push_path(path(second));
     assert!(tree.set_canvas(node, fresh), "替换 Canvas 内容");
     assert!(
@@ -791,8 +797,9 @@ fn clip_key_roundtrip_and_clear() {
     let root = tree.root();
     let child = boxed(&mut tree, root);
     assert_eq!(tree.clip_key(child), None);
-    let covering = Rect::new(0.0, 0.0, 10.0, 10.0)
-        .to_physical_covering(crate::math::Scale::new(1.0).expect("scale"));
+    let covering = crate::math::DevicePixelRatio::new(1.0)
+        .expect("scale")
+        .to_covering_device_rect(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)));
     tree.set_clip_key(child, (1, Some(covering)));
     assert_eq!(tree.clip_key(child), Some((1, Some(covering))));
     tree.clear_clip_key(child);
@@ -810,7 +817,7 @@ fn node_size_after_p06() {
 }
 
 fn fixed_style(width: f32, height: f32) -> Style {
-    StyleBuilder::new().size(width, height).build()
+    StyleBuilder::new().size(px(width), px(height)).build()
 }
 
 fn layout_to(tree: &mut NodeTree, width: f32, height: f32) {
@@ -822,7 +829,7 @@ fn layout_to(tree: &mut NodeTree, width: f32, height: f32) {
         .expect("布局成功");
 }
 
-fn bounds_of(tree: &NodeTree, node: NodeId) -> Rect {
+fn bounds_of(tree: &NodeTree, node: NodeId) -> LogicalRect {
     tree.get(node).expect("存在").layout().bounds
 }
 
@@ -838,7 +845,7 @@ fn layout_bounds_equal_the_taffy_layout() {
 
     assert_eq!(
         bounds_of(&tree, child),
-        Rect::new(0.0, 0.0, 10.3, 4.4),
+        LogicalRect::new(px(0.0), px(0.0), px(10.3), px(4.4)),
         "layout bounds 必须与 taffy 布局逐位相同（不得做设备像素吸附）"
     );
 }
@@ -858,7 +865,7 @@ fn a_layout_override_is_positioned_against_the_parents_logical_box() {
         .style(fixed_style(20.0, 20.0))
         .build(&mut tree, root)
         .expect("挂载成功");
-    let over = Rect::new(0.5, 0.75, 5.0, 5.0);
+    let over = LogicalRect::new(px(0.5), px(0.75), px(5.0), px(5.0));
     let child = NodeBuilder::boxed()
         .layout_override(over)
         .build(&mut tree, parent)
@@ -867,7 +874,8 @@ fn a_layout_override_is_positioned_against_the_parents_logical_box() {
 
     let parent_origin = bounds_of(&tree, parent).origin;
     assert_eq!(
-        parent_origin.y, 10.25,
+        parent_origin.y,
+        px(10.25),
         "父盒原点必须保留 taffy 的小数布局值"
     );
     assert_eq!(

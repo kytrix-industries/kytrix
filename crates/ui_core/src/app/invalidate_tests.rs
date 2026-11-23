@@ -1,7 +1,7 @@
 use super::App;
 use crate::{
     error::EngineError,
-    math::{Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{
         color::Color,
@@ -18,8 +18,8 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let mut app = App::new(rt.handle().clone());
     let window = app.create_window(WindowOptions {
         title: "r01-16".into(),
-        size: Size::new(400.0, 300.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(400.0), px(300.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -38,21 +38,21 @@ fn paint() -> PaintSpec {
     }
 }
 
-fn positioned(rect: Rect) -> Style {
+fn positioned(rect: LogicalRect) -> Style {
     let mut style = StyleBuilder::new()
         .absolute()
         .size(rect.size.width, rect.size.height)
         .build();
     style.inset(
-        taffy::style::LengthPercentageAuto::length(rect.origin.y),
+        taffy::style::LengthPercentageAuto::length(rect.origin.y.value()),
         taffy::style::LengthPercentageAuto::length(0.0),
         taffy::style::LengthPercentageAuto::length(0.0),
-        taffy::style::LengthPercentageAuto::length(rect.origin.x),
+        taffy::style::LengthPercentageAuto::length(rect.origin.x.value()),
     );
     style
 }
 
-fn mount(app: &mut App, window: WindowId, parent: NodeId, rect: Rect) -> NodeId {
+fn mount(app: &mut App, window: WindowId, parent: NodeId, rect: LogicalRect) -> NodeId {
     NodeBuilder::boxed()
         .style(positioned(rect))
         .paint(paint())
@@ -80,11 +80,36 @@ struct Fixture {
 
 fn fixture(app: &mut App, window: WindowId) -> Fixture {
     let root = app.window(window).expect("window").tree().root();
-    let panel = mount(app, window, root, Rect::new(0.0, 0.0, 200.0, 200.0));
-    let node = mount(app, window, panel, Rect::new(10.0, 10.0, 80.0, 80.0));
-    let child_a = mount(app, window, node, Rect::new(12.0, 12.0, 20.0, 20.0));
-    let child_b = mount(app, window, node, Rect::new(40.0, 40.0, 20.0, 20.0));
-    let sibling = mount(app, window, panel, Rect::new(120.0, 10.0, 40.0, 40.0));
+    let panel = mount(
+        app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(200.0)),
+    );
+    let node = mount(
+        app,
+        window,
+        panel,
+        LogicalRect::new(px(10.0), px(10.0), px(80.0), px(80.0)),
+    );
+    let child_a = mount(
+        app,
+        window,
+        node,
+        LogicalRect::new(px(12.0), px(12.0), px(20.0), px(20.0)),
+    );
+    let child_b = mount(
+        app,
+        window,
+        node,
+        LogicalRect::new(px(40.0), px(40.0), px(20.0), px(20.0)),
+    );
+    let sibling = mount(
+        app,
+        window,
+        panel,
+        LogicalRect::new(px(120.0), px(10.0), px(40.0), px(40.0)),
+    );
     Fixture {
         root,
         panel,
@@ -175,7 +200,12 @@ fn node_repaint_rebuilds_only_subtree_lanes_and_stays_within_the_node() {
     assert!(!record.damage_full, "节点级重绘不得退化成整窗");
     assert_eq!(
         record.damage,
-        vec![crate::math::PhysicalRect::new(9, 9, 91, 91)],
+        vec![crate::math::DeviceRect::new(
+            crate::math::dp(9),
+            crate::math::dp(9),
+            crate::math::dp(91),
+            crate::math::dp(91),
+        )],
         "damage = node 盒 (10,10,80,80) + 1 px AA 外扩"
     );
 }
@@ -189,9 +219,14 @@ fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
         let w = app.window_mut(window).expect("window");
         NodeBuilder::text(
             "WWWWWWWWWWWWWW",
-            crate::text::TextStyle::new(16.0).with_wrap(crate::text::TextWrap::NoWrap),
+            crate::text::TextStyle::new(px(16.0)).with_wrap(crate::text::TextWrap::NoWrap),
         )
-        .style(positioned(Rect::new(20.0, 20.0, 60.0, 20.0)))
+        .style(positioned(LogicalRect::new(
+            px(20.0),
+            px(20.0),
+            px(60.0),
+            px(20.0),
+        )))
         .build(w.tree_mut(), root)
         .expect("文本挂载成功")
     };
@@ -202,11 +237,11 @@ fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
         let origin = target.layout().bounds.origin;
         let content = tree.content_offset(node);
         let line = tree.text_line(node).expect("首帧必须已经 shape");
-        let mut bounds = Rect::default();
+        let mut bounds = LogicalRect::default();
         for run in line.glyph_runs() {
             for glyph in &run.glyphs {
-                bounds = bounds.union(Rect::from_origin_size(
-                    crate::math::Point::new(
+                bounds = bounds.union(LogicalRect::from_origin_size(
+                    crate::math::LogicalPoint::new(
                         origin.x + content.x + glyph.position.x,
                         origin.y + content.y + glyph.position.y,
                     ),
@@ -236,7 +271,7 @@ fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
             node,
             crate::text::TextContent::new(
                 "i",
-                crate::text::TextStyle::new(16.0).with_wrap(crate::text::TextWrap::NoWrap),
+                crate::text::TextStyle::new(px(16.0)).with_wrap(crate::text::TextWrap::NoWrap),
             ),
         );
     assert!(
@@ -251,14 +286,18 @@ fn shrinking_text_damage_covers_the_old_glyphs_outside_the_node_box() {
         .record()
         .expect("commit 帧必须有记录");
     assert!(!record.damage_full, "内容收缩不得退化成整窗 damage");
-    let last_pixel_x = (old_bounds.origin.x + old_bounds.size.width - 1.0).floor() as i32;
-    let sample_y = (old_bounds.origin.y + old_bounds.size.height / 2.0).floor() as i32;
+    let last_pixel_x = (old_bounds.origin.x + old_bounds.size.width - 1.0)
+        .value()
+        .floor() as i32;
+    let sample_y = (old_bounds.origin.y + old_bounds.size.height / 2.0)
+        .value()
+        .floor() as i32;
     assert!(
         record.damage.iter().any(|rect| {
             rect.x0 <= last_pixel_x
-                && last_pixel_x < rect.x1
+                && rect.x1 > last_pixel_x
                 && rect.y0 <= sample_y
-                && sample_y < rect.y1
+                && rect.y1 > sample_y
         }),
         "damage 必须覆盖旧字形的溢出部分（旧字形右端 x≈{last_pixel_x}, y={sample_y}）；\
          旧实现只覆盖节点盒 ⇒ 残影。damage={:?}",
@@ -303,12 +342,17 @@ fn node_repaint_reports_stale_node_and_unknown_window() {
     let (_rt, mut app, window) = setup();
     let other = app.create_window(WindowOptions {
         title: "other".into(),
-        size: Size::new(100.0, 100.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(100.0), px(100.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let other_root = app.window(other).expect("window").tree().root();
-    let foreign = mount(&mut app, other, other_root, Rect::new(0.0, 0.0, 10.0, 10.0));
+    let foreign = mount(
+        &mut app,
+        other,
+        other_root,
+        LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)),
+    );
 
     assert!(matches!(
         app.request_node_repaint(window, foreign),

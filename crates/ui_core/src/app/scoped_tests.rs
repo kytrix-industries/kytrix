@@ -5,7 +5,7 @@ use crate::{
     error::EngineError,
     event::{Action, InputEvent, KeyBinding, KeyCode, Modifiers},
     interaction::{AnimatedValue, AnimationSpec, Easing, ScrollAxis, ScrollConfig},
-    math::{Scale, Size},
+    math::{DevicePixelRatio, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         id::NodeId,
@@ -22,8 +22,8 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let mut app = App::new(rt.handle().clone());
     let window = app.create_window(WindowOptions {
         title: "e8".into(),
-        size: Size::new(400.0, 300.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(400.0), px(300.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -34,7 +34,7 @@ fn root(app: &App, window: WindowId) -> NodeId {
 }
 
 fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
-    let style = StyleBuilder::new().size(40.0, 40.0).build();
+    let style = StyleBuilder::new().size(px(40.0), px(40.0)).build();
     NodeBuilder::boxed()
         .style(style)
         .on_click(Action::custom("focusable"))
@@ -47,7 +47,7 @@ fn mount_scope(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
 }
 
 fn mount_scroll_container(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
-    let mut style = StyleBuilder::new().size(200.0, 150.0).build();
+    let mut style = StyleBuilder::new().size(px(200.0), px(150.0)).build();
     style.clip = Clip::Bounds;
     NodeBuilder::boxed()
         .style(style)
@@ -168,11 +168,11 @@ fn a_scoped_binding_without_a_handler_falls_back_to_default_key_scroll() {
             container,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("content");
     settle(&mut app, window);
     set_focus(&mut app, window, inside);
@@ -190,7 +190,7 @@ fn a_scoped_binding_without_a_handler_falls_back_to_default_key_scroll() {
     );
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset.y,
-        48.0,
+        px(48.0),
         "必须回落默认方向键滚动（一行 = line_height 48）"
     );
 
@@ -203,7 +203,7 @@ fn a_scoped_binding_without_a_handler_falls_back_to_default_key_scroll() {
     assert_eq!(outcome.action, Some(action));
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset.y,
-        48.0,
+        px(48.0),
         "scoped 命中并消费后不得再走默认滚动"
     );
 }

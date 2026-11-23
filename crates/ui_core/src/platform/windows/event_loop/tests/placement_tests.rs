@@ -8,7 +8,7 @@ use super::super::native_window::collect_events;
 use crate::{
     app::App,
     event::Event,
-    math::{Point, Size},
+    math::{DevicePoint, LogicalPoint, LogicalSize, dp, px},
     platform::{
         dispatcher::Dispatcher,
         windows::{dpi, placement, window::NativeWindow},
@@ -38,10 +38,10 @@ fn encoded_point(x: i32, y: i32) -> isize {
     ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
 }
 
-fn primary_work_area() -> crate::math::PhysicalRect {
+fn primary_work_area() -> crate::math::DeviceRect {
     placement::work_areas()
         .into_iter()
-        .find(|area| area.x0 <= 0 && 0 <= area.x1 && area.y0 <= 0 && 0 <= area.y1)
+        .find(|area| area.x0 <= dp(0) && dp(0) <= area.x1 && area.y0 <= dp(0) && dp(0) <= area.y1)
         .expect("本机至少有一个包含虚拟桌面原点的工作区")
 }
 
@@ -52,13 +52,13 @@ fn a_positioned_window_lands_its_client_origin_on_the_logical_point() {
     let work = primary_work_area();
     let target = (work.x0 + 120, work.y0 + 80);
     let provisional = dpi::scale_from_dpi(dpi::system_dpi()).expect("system dpi scale");
-    let position = Point::new(
-        target.0 as f32 / provisional.factor(),
-        target.1 as f32 / provisional.factor(),
+    let position = LogicalPoint::new(
+        px(f32::from(target.0) / provisional.factor()),
+        px(f32::from(target.1) / provisional.factor()),
     );
     let options = WindowOptions {
         position: Some(position),
-        size: Size::new(320.0, 240.0),
+        size: LogicalSize::new(px(320.0), px(240.0)),
         ..WindowOptions::default()
     };
     let id = app.create_window(options.clone());
@@ -79,7 +79,7 @@ fn a_positioned_window_lands_its_client_origin_on_the_logical_point() {
         native.scale()
     );
     assert!(
-        work.x0 <= origin.0 && origin.0 < work.x1 && work.y0 <= origin.1 && origin.1 < work.y1,
+        work.x0 <= origin.0 && work.x1 > origin.0 && work.y0 <= origin.1 && work.y1 > origin.1,
         "落点必须在工作区内：{origin:?} / {work:?}"
     );
 }
@@ -89,8 +89,8 @@ fn an_off_screen_position_is_clamped_into_a_work_area() {
     let runtime = runtime();
     let mut app = App::new(runtime.handle().clone());
     let options = WindowOptions {
-        position: Some(Point::new(-5000.0, -5000.0)),
-        size: Size::new(320.0, 240.0),
+        position: Some(LogicalPoint::new(px(-5000.0), px(-5000.0))),
+        size: LogicalSize::new(px(320.0), px(240.0)),
         ..WindowOptions::default()
     };
     let id = app.create_window(options.clone());
@@ -107,9 +107,9 @@ fn an_off_screen_position_is_clamped_into_a_work_area() {
     let areas = placement::work_areas();
     assert!(
         areas.iter().any(|area| area.x0 <= origin.0
-            && origin.0 < area.x1
+            && area.x1 > origin.0
             && area.y0 <= origin.1
-            && origin.1 < area.y1),
+            && area.y1 > origin.1),
         "clamp 后客户区左上角必须落在某个显示器工作区内：{origin:?} / {areas:?}"
     );
 }
@@ -158,12 +158,9 @@ fn a_programmatic_move_is_dispatched_as_event_moved() {
     let Event::Moved { position } = moved[0].1 else {
         unreachable!()
     };
-    let expected = Point::new(
-        scale.to_logical(target.0 as f32),
-        scale.to_logical(target.1 as f32),
-    );
+    let expected = scale.to_logical_point(DevicePoint::new(dp(target.0), dp(target.1)));
     assert!(
-        (position.x - expected.x).abs() < 1e-3 && (position.y - expected.y).abs() < 1e-3,
+        (position.x - expected.x).abs() < px(1e-3) && (position.y - expected.y).abs() < px(1e-3),
         "Event::Moved 必须是按消息 scale 换算后的逻辑坐标：实际 {position:?}，期望 {expected:?}"
     );
 }

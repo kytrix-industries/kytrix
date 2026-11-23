@@ -738,7 +738,7 @@ mod tests {
     fn recovery_forces_a_full_republish_of_the_next_frame() {
         use crate::{
             app::App,
-            math::{Rect, Scale, Size},
+            math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
             node::builder::NodeBuilder,
             paint::{color::Color, style::PaintSpec},
             window::FrameOutcome,
@@ -751,15 +751,20 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("device-recovery"),
-            size: Size::new(320.0, 240.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(320.0), px(240.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
         let mut nodes = Vec::with_capacity(3);
         for index in 0..3 {
             let node = NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 24.0, 32.0, 20.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 24.0),
+                    px(32.0),
+                    px(20.0),
+                ))
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     ..PaintSpec::default()

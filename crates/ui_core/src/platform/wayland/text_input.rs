@@ -1,6 +1,10 @@
 use std::time::{Duration, Instant};
 
-use crate::{event::Modifiers, math::Rect, window::ImeContentType};
+use crate::{
+    event::Modifiers,
+    math::{LogicalRect, px},
+    window::ImeContentType,
+};
 
 pub(crate) const NO_IM_FALLBACK: Duration = Duration::from_millis(1500);
 
@@ -192,7 +196,7 @@ fn shifted(index: Option<u32>, removed: usize) -> Option<u32> {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ImeStateSnapshot {
-    pub cursor_area: Option<Rect>,
+    pub cursor_area: Option<LogicalRect>,
     pub content: ContentTypeBits,
 }
 
@@ -201,12 +205,12 @@ impl ImeStateSnapshot {
     pub(crate) fn cursor_rect(self) -> (i32, i32, i32, i32) {
         let area = self
             .cursor_area
-            .unwrap_or_else(|| Rect::new(0.0, 0.0, 1.0, 1.0));
+            .unwrap_or_else(|| LogicalRect::new(px(0.0), px(0.0), px(1.0), px(1.0)));
         (
-            area.origin.x.round() as i32,
-            area.origin.y.round() as i32,
-            area.size.width.max(1.0).round() as i32,
-            area.size.height.max(1.0).round() as i32,
+            area.origin.x.value().round() as i32,
+            area.origin.y.value().round() as i32,
+            area.size.width.max(px(1.0)).value().round() as i32,
+            area.size.height.max(px(1.0)).value().round() as i32,
         )
     }
 
@@ -276,7 +280,11 @@ mod tests {
         CONTENT_HINT_HIDDEN_TEXT, CONTENT_HINT_SENSITIVE_DATA, NO_IM_FALLBACK, TextInputRoute,
         content_type_bits, text_blocked_by_modifiers,
     };
-    use crate::{event::Modifiers, math::Rect, window::ImeContentType};
+    use crate::{
+        event::Modifiers,
+        math::{LogicalRect, px},
+        window::ImeContentType,
+    };
 
     fn route_with_text_targets(windows: &[u32]) -> TextInputRoute {
         let mut route = TextInputRoute::default();
@@ -715,7 +723,7 @@ mod tests {
     #[test]
     fn ime_state_snapshots_only_differ_when_a_field_changes() {
         let area = super::ImeStateSnapshot {
-            cursor_area: Some(Rect::new(10.0, 20.0, 2.0, 18.0)),
+            cursor_area: Some(LogicalRect::new(px(10.0), px(20.0), px(2.0), px(18.0))),
             content: content_type_bits(ImeContentType::Text),
         };
         assert_eq!(
@@ -725,7 +733,7 @@ mod tests {
         assert_ne!(
             area,
             super::ImeStateSnapshot {
-                cursor_area: Some(Rect::new(11.0, 20.0, 2.0, 18.0)),
+                cursor_area: Some(LogicalRect::new(px(11.0), px(20.0), px(2.0), px(18.0))),
                 ..area
             },
             "caret 移动必须被看见"
@@ -757,7 +765,7 @@ mod tests {
         assert_eq!(snapshot.cursor_rect(), (0, 0, 1, 1));
 
         let hinted = super::ImeStateSnapshot {
-            cursor_area: Some(Rect::new(12.4, 30.6, 0.0, 17.2)),
+            cursor_area: Some(LogicalRect::new(px(12.4), px(30.6), px(0.0), px(17.2))),
             ..snapshot
         };
         assert_eq!(
@@ -771,7 +779,7 @@ mod tests {
     fn the_same_state_is_never_committed_twice() {
         let text = content_type_bits(ImeContentType::Text);
         let snapshot = super::ImeStateSnapshot {
-            cursor_area: Some(Rect::new(10.0, 20.0, 2.0, 18.0)),
+            cursor_area: Some(LogicalRect::new(px(10.0), px(20.0), px(2.0), px(18.0))),
             content: text,
         };
 
@@ -787,7 +795,7 @@ mod tests {
         assert_eq!(snapshot.diff_from(Some(snapshot)), None);
 
         let moved = super::ImeStateSnapshot {
-            cursor_area: Some(Rect::new(10.0, 40.0, 2.0, 18.0)),
+            cursor_area: Some(LogicalRect::new(px(10.0), px(40.0), px(2.0), px(18.0))),
             ..snapshot
         };
         assert_eq!(

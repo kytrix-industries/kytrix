@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect},
     paint::{
         atlas::AtlasKind,
         primitive::{
@@ -20,20 +20,20 @@ fn is_well_formed(clip: &ClipRect) -> bool {
         && rect.origin.y.is_finite()
         && rect.size.width.is_finite()
         && rect.size.height.is_finite()
-        && rect.size.width >= 0.0
-        && rect.size.height >= 0.0
+        && rect.size.width >= LogicalPx::ZERO
+        && rect.size.height >= LogicalPx::ZERO
         && clip.corner_radius.iter().all(|radius| radius.is_finite())
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Canvas {
-    bounds: Rect,
+    bounds: LogicalRect,
     lane: Lane,
 }
 
 impl Canvas {
     #[must_use]
-    pub fn new(bounds: Rect) -> Self {
+    pub fn new(bounds: LogicalRect) -> Self {
         Self {
             bounds,
             lane: Lane::new(),
@@ -55,7 +55,7 @@ impl Canvas {
     }
 
     #[must_use]
-    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool {
+    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: LogicalPoint) -> bool {
         if handle.is_stale() {
             return false;
         }
@@ -71,7 +71,7 @@ impl Canvas {
                 for glyph in &run.glyphs {
                     glyphs.push(PositionedGlyph {
                         tile: glyph.tile,
-                        position: Point::new(
+                        position: LogicalPoint::new(
                             origin.x + glyph.position.x,
                             origin.y + glyph.position.y,
                         ),
@@ -177,7 +177,7 @@ impl Canvas {
     }
 
     #[must_use]
-    pub fn bounds(&self) -> Rect {
+    pub fn bounds(&self) -> LogicalRect {
         self.bounds
     }
 
@@ -194,7 +194,7 @@ impl Canvas {
 
 impl Default for Canvas {
     fn default() -> Self {
-        Self::new(Rect::default())
+        Self::new(LogicalRect::default())
     }
 }
 
@@ -202,7 +202,7 @@ impl Default for Canvas {
 mod tests {
     use super::Canvas;
     use crate::{
-        math::{Point, Rect, Size},
+        math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
         paint::{
             atlas::{AtlasKind, AtlasTile},
             color::Color,
@@ -214,14 +214,14 @@ mod tests {
         },
     };
 
-    fn bounds() -> Rect {
-        Rect::new(0.0, 0.0, 64.0, 32.0)
+    fn bounds() -> LogicalRect {
+        LogicalRect::new(px(0.0), px(0.0), px(64.0), px(32.0))
     }
 
     fn quad() -> Quad {
         Quad {
             bounds: bounds(),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
@@ -232,14 +232,14 @@ mod tests {
     fn clip() -> ClipRect {
         ClipRect {
             rect: bounds(),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         }
     }
 
     fn rounded_clip() -> ClipRect {
         ClipRect {
             rect: bounds(),
-            corner_radius: [4.0; 4],
+            corner_radius: [px(4.0); 4],
         }
     }
 
@@ -264,10 +264,10 @@ mod tests {
     fn shadow() -> Shadow {
         Shadow {
             rect: bounds(),
-            offset: Point::new(0.0, 1.0),
-            blur: 2.0,
+            offset: LogicalPoint::new(px(0.0), px(1.0)),
+            blur: px(2.0),
             color: Color::BLACK,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         }
     }
 
@@ -286,8 +286,8 @@ mod tests {
                     slot: 0,
                     slot_epoch: 0,
                 },
-                position: Point::new(2.0, 3.0),
-                size: Size::new(8.0, 8.0),
+                position: LogicalPoint::new(px(2.0), px(3.0)),
+                size: LogicalSize::new(px(8.0), px(8.0)),
             }],
         }
     }
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn default_canvas_is_empty() {
         let canvas = Canvas::default();
-        assert_eq!(canvas, Canvas::new(Rect::default()));
+        assert_eq!(canvas, Canvas::new(LogicalRect::default()));
         assert!(canvas.is_empty());
     }
 
@@ -405,7 +405,7 @@ mod tests {
     fn push_clip_rejects_negative_size() {
         let mut canvas = Canvas::new(bounds());
         let mut clip = clip();
-        clip.rect = Rect::new(0.0, 0.0, -1.0, 8.0);
+        clip.rect = LogicalRect::new(px(0.0), px(0.0), px(-1.0), px(8.0));
         let _ = canvas.push_clip(clip);
     }
 
@@ -459,16 +459,16 @@ mod tests {
                 slot: 0,
                 slot_epoch: 0,
             },
-            position: Point::new(2.0, 3.0),
-            size: Size::new(8.0, 8.0),
+            position: LogicalPoint::new(px(2.0), px(3.0)),
+            size: LogicalSize::new(px(8.0), px(8.0)),
         };
         let line = ShapedLine {
             text: smol_str::SmolStr::new_static("e1"),
             lines: vec![ShapedTextLine {
                 text_range: 0..2,
-                baseline: 12.0,
-                line_height: 14.0,
-                advance: 10.0,
+                baseline: px(12.0),
+                line_height: px(14.0),
+                advance: px(10.0),
                 items: vec![ShapedTextItem::GlyphRun(ShapedGlyphRun {
                     color: Color::BLACK,
                     text_range: 0..2,
@@ -476,19 +476,19 @@ mod tests {
                 })],
                 decorations: Vec::new(),
             }],
-            width: 10.0,
-            height: 14.0,
-            first_baseline: Some(12.0),
+            width: px(10.0),
+            height: px(14.0),
+            first_baseline: Some(px(12.0)),
             atlas_generation: generation,
             font_stack_version: 1,
-            scale: 1.0,
+            scale: DevicePixelRatio::ONE,
         };
         ShapedTextHandle::new(
             Arc::new(line),
             Box::new([]),
             generation,
             eviction_epoch,
-            1.0,
+            DevicePixelRatio::ONE,
             Arc::new(AtomicU64::new(pack_atlas_lease(current.0, current.1))),
         )
     }
@@ -498,7 +498,7 @@ mod tests {
         let mut canvas = Canvas::new(bounds());
         let handle = shaped_handle(7, 2, (7, 2));
         assert!(
-            canvas.push_shaped_text(&handle, Point::new(10.0, 20.0)),
+            canvas.push_shaped_text(&handle, LogicalPoint::new(px(10.0), px(20.0))),
             "当前代际的句柄必须能编码"
         );
         assert_eq!(canvas.primitives().len(), 1);
@@ -508,10 +508,10 @@ mod tests {
         let glyph = run.glyphs[0];
         assert_eq!(
             glyph.position,
-            Point::new(10.0 + 2.0, 20.0 + 3.0),
+            LogicalPoint::new(px(10.0 + 2.0), px(20.0 + 3.0)),
             "origin 是文本盒左上角的绝对窗口逻辑像素"
         );
-        assert_eq!(glyph.size, Size::new(8.0, 8.0));
+        assert_eq!(glyph.size, LogicalSize::new(px(8.0), px(8.0)));
         assert_eq!(glyph.tile.generation, 7);
         assert_eq!(run.color, Color::BLACK);
     }
@@ -524,7 +524,7 @@ mod tests {
         let stale = shaped_handle(7, 0, (8, 0));
         assert!(stale.is_stale());
         assert!(
-            !canvas.push_shaped_text(&stale, Point::ZERO),
+            !canvas.push_shaped_text(&stale, LogicalPoint::ZERO),
             "stale 句柄必须返回 false"
         );
         assert_eq!(
@@ -538,7 +538,7 @@ mod tests {
             "淘汰纪元前进必须让句柄失效（tile 已被别的字形复用）"
         );
         assert!(
-            !canvas.push_shaped_text(&evicted, Point::ZERO),
+            !canvas.push_shaped_text(&evicted, LogicalPoint::ZERO),
             "淘汰后的句柄不得编码旧 UV"
         );
         assert_eq!(canvas.primitives().len(), before);
@@ -568,51 +568,51 @@ mod tests {
                     slot: 0,
                     slot_epoch: 0,
                 },
-                position: Point::new(x, 0.0),
-                size: Size::new(8.0, 8.0),
+                position: LogicalPoint::new(px(x), px(0.0)),
+                size: LogicalSize::new(px(8.0), px(8.0)),
             }],
         };
         let line = ShapedLine {
             text: smol_str::SmolStr::new_static("ab"),
             lines: vec![ShapedTextLine {
                 text_range: 0..2,
-                baseline: 12.0,
-                line_height: 14.0,
-                advance: 16.0,
+                baseline: px(12.0),
+                line_height: px(14.0),
+                advance: px(16.0),
                 items: vec![
                     ShapedTextItem::GlyphRun(run(0.0)),
                     ShapedTextItem::InlineBox(crate::text::ShapedInlineBox {
                         id: 5,
-                        rect: Rect::new(4.0, 0.0, 8.0, 8.0),
+                        rect: LogicalRect::new(px(4.0), px(0.0), px(8.0), px(8.0)),
                         baseline: None,
                     }),
                     ShapedTextItem::GlyphRun(run(8.0)),
                 ],
                 decorations: Vec::new(),
             }],
-            width: 16.0,
-            height: 14.0,
-            first_baseline: Some(12.0),
+            width: px(16.0),
+            height: px(14.0),
+            first_baseline: Some(px(12.0)),
             atlas_generation: 3,
             font_stack_version: 1,
-            scale: 1.0,
+            scale: DevicePixelRatio::ONE,
         };
         let handle = ShapedTextHandle::new(
             Arc::new(line),
             Box::new([]),
             3,
             0,
-            1.0,
+            DevicePixelRatio::ONE,
             Arc::new(AtomicU64::new(pack_atlas_lease(3, 0))),
         );
         let mut canvas = Canvas::new(bounds());
-        assert!(canvas.push_shaped_text(&handle, Point::new(1.0, 2.0)));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::new(px(1.0), px(2.0))));
         assert_eq!(
             canvas.primitives().len(),
             2,
             "按 run 拆图元：行内盒不产生图元（E1 只保证落点可读）"
         );
-        let positions: Vec<Point> = canvas
+        let positions: Vec<LogicalPoint> = canvas
             .primitives()
             .iter()
             .filter_map(|primitive| match primitive {
@@ -620,7 +620,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(positions, vec![Point::new(1.0, 2.0), Point::new(9.0, 2.0)]);
+        assert_eq!(
+            positions,
+            vec![
+                LogicalPoint::new(px(1.0), px(2.0)),
+                LogicalPoint::new(px(9.0), px(2.0))
+            ]
+        );
     }
 
     #[test]
@@ -632,8 +638,8 @@ mod tests {
             color: Color::BLACK,
             glyphs: vec![PositionedGlyph {
                 tile,
-                position: Point::new(1.0, 2.0),
-                size: Size::new(8.0, 8.0),
+                position: LogicalPoint::new(px(1.0), px(2.0)),
+                size: LogicalSize::new(px(8.0), px(8.0)),
             }],
         };
         let mut canvas = Canvas::new(bounds());

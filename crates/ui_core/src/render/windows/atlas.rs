@@ -842,7 +842,7 @@ mod tests {
 
     use super::{AtlasUploads, STAGING_ROWS, SharedAtlas, align_up, resident_bytes};
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         paint::atlas::AtlasKind,
         render::{
             AtlasArraySpec, AtlasPageRequest,
@@ -860,7 +860,12 @@ mod tests {
 
     fn rows(y0: u32, y1: u32) -> DirtyRects {
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(0, y0 as i32, i32::MAX, y1 as i32));
+        rects.mark(DeviceRect::new(
+            dp(0),
+            dp(y0 as i32),
+            dp(i32::MAX),
+            dp(y1 as i32),
+        ));
         rects
     }
 
@@ -877,8 +882,11 @@ mod tests {
 
     fn rect(x0: u32, y0: u32, x1: u32, y1: u32) -> DirtyRects {
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(
-            x0 as i32, y0 as i32, x1 as i32, y1 as i32,
+        rects.mark(DeviceRect::new(
+            dp(x0 as i32),
+            dp(y0 as i32),
+            dp(x1 as i32),
+            dp(y1 as i32),
         ));
         rects
     }
@@ -1620,8 +1628,8 @@ mod tests {
         let mut page = vec![0x44u8; (10 * BIG_PAGE) as usize];
         page.extend(std::iter::repeat_n(0x55u8, (20 * BIG_PAGE) as usize));
         let mut dirty = DirtyRects::default();
-        dirty.mark(PhysicalRect::new(0, 10, i32::MAX, 20));
-        dirty.mark(PhysicalRect::new(0, 300, i32::MAX, 320));
+        dirty.mark(DeviceRect::new(dp(0), dp(10), dp(i32::MAX), dp(20)));
+        dirty.mark(DeviceRect::new(dp(0), dp(300), dp(i32::MAX), dp(320)));
         harness.upload(AtlasKind::Glyph, 0, spec(BIG_PAGE, 1), page, dirty);
 
         let image = harness.readback(AtlasKind::Glyph, BIG_PAGE, 0);

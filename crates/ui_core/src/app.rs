@@ -42,7 +42,7 @@ use crate::{
         ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
     node::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, ReadCtx},
@@ -157,7 +157,7 @@ struct ClickRecord {
     window: WindowId,
     node: Option<NodeId>,
     button: PointerButton,
-    position: Point,
+    position: LogicalPoint,
     at: Instant,
     count: u8,
 }
@@ -191,8 +191,8 @@ enum AnimationTarget {
     },
     Scroll {
         handle: ScrollHandle,
-        from: Point,
-        to: Point,
+        from: LogicalPoint,
+        to: LogicalPoint,
     },
 }
 
@@ -287,7 +287,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-fn overlay_style(origin: Point) -> crate::paint::style::Style {
+fn overlay_style(origin: LogicalPoint) -> crate::paint::style::Style {
     StyleBuilder::new()
         .absolute()
         .left(origin.x)
@@ -842,14 +842,14 @@ impl App {
         input::dispatch_input(self, window, event)
     }
 
-    fn hit_at(&self, window: WindowId, position: Point) -> Option<HitResult> {
+    fn hit_at(&self, window: WindowId, position: LogicalPoint) -> Option<HitResult> {
         input::hit_at(self, window, position)
     }
 
     fn on_pointer_down(
         &mut self,
         window: WindowId,
-        position: Point,
+        position: LogicalPoint,
         button: PointerButton,
         modifiers: Modifiers,
         timestamp: Instant,
@@ -863,7 +863,7 @@ impl App {
     fn on_pointer_move(
         &mut self,
         window: WindowId,
-        position: Point,
+        position: LogicalPoint,
         modifiers: Modifiers,
         outcome: &mut InputOutcome,
     ) {
@@ -873,7 +873,7 @@ impl App {
     fn on_pointer_up(
         &mut self,
         window: WindowId,
-        position: Point,
+        position: LogicalPoint,
         button: PointerButton,
         modifiers: Modifiers,
         timestamp: Instant,
@@ -891,8 +891,8 @@ impl App {
     fn on_scroll(
         &mut self,
         window: WindowId,
-        position: Point,
-        delta: Point,
+        position: LogicalPoint,
+        delta: LogicalPoint,
         unit: crate::event::ScrollUnit,
         phase: crate::event::ScrollPhase,
         modifiers: Modifiers,
@@ -903,7 +903,7 @@ impl App {
         )
     }
 
-    fn scroll_animation_target(&self, node: NodeId, window: WindowId) -> Option<Point> {
+    fn scroll_animation_target(&self, node: NodeId, window: WindowId) -> Option<LogicalPoint> {
         animation::scroll_animation_target(self, node, window)
     }
 
@@ -923,7 +923,7 @@ impl App {
         &mut self,
         window: WindowId,
         node: NodeId,
-        position: Point,
+        position: LogicalPoint,
         button: PointerButton,
         timestamp: Instant,
     ) -> u8 {
@@ -958,7 +958,7 @@ impl App {
     }
 
     #[must_use]
-    pub fn pointer_position(&self, window: WindowId) -> Option<Point> {
+    pub fn pointer_position(&self, window: WindowId) -> Option<LogicalPoint> {
         self.window(window).and_then(Window::pointer_position)
     }
 
@@ -1003,7 +1003,7 @@ impl App {
         focus::set_ime_enabled(self, window, enabled)
     }
 
-    pub fn ime_cursor_area(&self, window: WindowId) -> Result<Option<Rect>, EngineError> {
+    pub fn ime_cursor_area(&self, window: WindowId) -> Result<Option<LogicalRect>, EngineError> {
         focus::ime_cursor_area(self, window)
     }
 
@@ -1027,12 +1027,16 @@ impl App {
     pub fn set_scroll_content(
         &mut self,
         handle: &ScrollHandle,
-        content: Size,
+        content: LogicalSize,
     ) -> Result<(), EngineError> {
         scroll::set_scroll_content(self, handle, content)
     }
 
-    pub fn scroll_to(&mut self, handle: &ScrollHandle, offset: Point) -> Result<(), EngineError> {
+    pub fn scroll_to(
+        &mut self,
+        handle: &ScrollHandle,
+        offset: LogicalPoint,
+    ) -> Result<(), EngineError> {
         scroll::scroll_to(self, handle, offset)
     }
 
@@ -1044,7 +1048,11 @@ impl App {
         scroll::clamp_scroll_offsets(self, window)
     }
 
-    pub fn scroll_by(&mut self, handle: &ScrollHandle, delta: Point) -> Result<(), EngineError> {
+    pub fn scroll_by(
+        &mut self,
+        handle: &ScrollHandle,
+        delta: LogicalPoint,
+    ) -> Result<(), EngineError> {
         scroll::scroll_by(self, handle, delta)
     }
 
@@ -1056,7 +1064,7 @@ impl App {
     fn scroll_to_animated(
         &mut self,
         handle: &ScrollHandle,
-        target: Point,
+        target: LogicalPoint,
     ) -> Result<(), EngineError> {
         scroll::scroll_to_animated(self, handle, target)
     }
@@ -1092,7 +1100,7 @@ impl App {
     pub fn set_virtual_extents(
         &mut self,
         list: &VirtualList,
-        extents: &[f32],
+        extents: &[LogicalPx],
     ) -> Result<(), EngineError> {
         virtual_list::set_virtual_extents(self, list, extents)
     }
@@ -1340,7 +1348,7 @@ impl App {
         window_set::window_mut(self, id)
     }
 
-    pub fn set_drag_regions(&mut self, window: WindowId, regions: &[Rect]) {
+    pub fn set_drag_regions(&mut self, window: WindowId, regions: &[LogicalRect]) {
         window_set::set_drag_regions(self, window, regions)
     }
 
@@ -1386,13 +1394,13 @@ impl App {
     pub fn set_traffic_light_position(
         &mut self,
         window: WindowId,
-        inset: crate::math::Point,
+        inset: crate::math::LogicalPoint,
     ) -> Result<(), EngineError> {
         window_set::set_traffic_light_position(self, window, inset)
     }
 
     #[must_use]
-    pub fn traffic_light_inset(&self, window: WindowId) -> Option<crate::math::Point> {
+    pub fn traffic_light_inset(&self, window: WindowId) -> Option<crate::math::LogicalPoint> {
         window_set::traffic_light_inset(self, window)
     }
 
@@ -1588,7 +1596,7 @@ impl App {
         &mut self,
         text: &str,
         style: &TextStyle,
-        max_width: Option<f32>,
+        max_width: Option<LogicalPx>,
         inline_boxes: &[InlineBoxSpec],
     ) -> Result<ShapedTextHandle, EngineError> {
         let App {
@@ -1675,7 +1683,7 @@ impl App {
         }
     }
 
-    pub(crate) fn note_window_dpi(&mut self, window: WindowId, scale: Scale) {
+    pub(crate) fn note_window_dpi(&mut self, window: WindowId, scale: DevicePixelRatio) {
         if self.focused_window == Some(window) {
             self.apply_text_scale(scale.factor());
         }

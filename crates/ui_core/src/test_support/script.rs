@@ -6,7 +6,7 @@ use crate::{
     app::App,
     error::EngineError,
     event::InputEvent,
-    math::{Scale, Size},
+    math::{DevicePixelRatio, LogicalSize},
     node::signal::Signal,
     test_support::{app::TestApp, record::FrameRecord},
     window::WindowId,
@@ -16,8 +16,8 @@ enum FrameAction {
     Mutate(Box<dyn FnOnce(&mut App)>),
     Input(InputEvent),
     Advance(Duration),
-    Resize(Size),
-    Scale(Scale),
+    Resize(LogicalSize),
+    Scale(DevicePixelRatio),
     InvalidateLanes,
 }
 
@@ -62,13 +62,13 @@ impl ScriptFrame {
     }
 
     #[must_use]
-    pub fn resize(mut self, size: Size) -> Self {
+    pub fn resize(mut self, size: LogicalSize) -> Self {
         self.actions.push(FrameAction::Resize(size));
         self
     }
 
     #[must_use]
-    pub fn scale(mut self, scale: Scale) -> Self {
+    pub fn scale(mut self, scale: DevicePixelRatio) -> Self {
         self.actions.push(FrameAction::Scale(scale));
         self
     }
@@ -380,14 +380,14 @@ impl FrameScript {
         })
     }
 
-    fn set_window_size(&mut self, size: Size) {
+    fn set_window_size(&mut self, size: LogicalSize) {
         let window = self.app.window_id();
         if let Some(target) = self.app.app_mut().window_mut(window) {
             target.set_size(size);
         }
     }
 
-    fn set_window_scale(&mut self, scale: Scale) {
+    fn set_window_scale(&mut self, scale: DevicePixelRatio) {
         let window = self.app.window_id();
         if let Some(target) = self.app.app_mut().window_mut(window) {
             target.set_scale(scale);
@@ -409,7 +409,7 @@ mod tests {
     use crate::{
         a11y::{A11yOverride, A11yRole},
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, signal::Signal},
         paint::{
             color::Color,
@@ -425,7 +425,7 @@ mod tests {
         let background = app.app_mut().signal(Color::WHITE);
         let source = background;
         let _node = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 40.0, 16.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(40.0), px(16.0)))
             .paint(PaintSpec {
                 background: Color::WHITE,
                 ..PaintSpec::default()
@@ -487,12 +487,12 @@ mod tests {
         let mut script = FrameScript::new(app);
         script.push(ScriptFrame::new("首帧"));
         script.push(ScriptFrame::new("点击").input(InputEvent::pointer_down(
-            Point::new(4.0, 4.0),
+            LogicalPoint::new(px(4.0), px(4.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         )));
-        script.push(ScriptFrame::new("改尺寸").resize(Size::new(400.0, 300.0)));
-        script.push(ScriptFrame::new("改 DPI").scale(Scale::new(2.0).expect("scale")));
+        script.push(ScriptFrame::new("改尺寸").resize(LogicalSize::new(px(400.0), px(300.0))));
+        script.push(ScriptFrame::new("改 DPI").scale(DevicePixelRatio::new(2.0).expect("scale")));
         script.push(ScriptFrame::new("全量重绘").invalidate_lanes());
         script.run().expect("帧脚本");
         let report = script.report();
@@ -503,7 +503,12 @@ mod tests {
             "resize 必须退化为全帧：{:?}",
             report.frame(2).record.damage
         );
-        let expected = Rect::new(0.0, 0.0, 400.0, 300.0).to_physical_covering(Scale::ONE);
+        let expected = DevicePixelRatio::ONE.to_covering_device_rect(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(400.0),
+            px(300.0),
+        ));
         assert_eq!(report.frame(2).record.damage, vec![expected]);
         report.assert_rendered(3);
         report.assert_rendered(4);
@@ -515,7 +520,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
         let button = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 40.0, 16.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(40.0), px(16.0)))
             .paint(PaintSpec::default())
             .on_click(Action::custom("press"))
             .a11y(A11yOverride {
@@ -582,7 +587,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 40.0, 16.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(40.0), px(16.0)))
             .a11y(A11yOverride {
                 label: Some(smol_str::SmolStr::new_static("旧标签")),
                 ..A11yOverride::default()
@@ -733,7 +738,7 @@ mod tests {
                 root,
             )
             .expect("input");
-        NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(12.0))
+        NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(px(12.0)))
             .build(
                 app.app_mut().window_mut(window).expect("窗口").tree_mut(),
                 input,

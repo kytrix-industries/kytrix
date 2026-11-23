@@ -18,10 +18,11 @@ use super::{
 };
 use crate::{
     error::EngineError,
+    math::{DevicePoint, DeviceRect, dp},
     paint::{
         atlas::AtlasKind,
         geometry::GeometryPipeline,
-        instance::{FrameOp, GeometryDrawGpu, PhysicalBounds, scroll_offset},
+        instance::{FrameOp, GeometryDrawGpu, scroll_offset},
     },
     render::{
         RenderStats,
@@ -477,10 +478,10 @@ pub(super) fn record(
                     .build(payload.ops(), &damage, payload.scroll());
                 for rect in damage.as_slice() {
                     let scissor = RECT {
-                        left: rect.x0,
-                        top: rect.y0,
-                        right: rect.x1,
-                        bottom: rect.y1,
+                        left: rect.x0.value(),
+                        top: rect.y0.value(),
+                        right: rect.x1.value(),
+                        bottom: rect.y1.value(),
                     };
                     unsafe { list.RSSetScissorRects(&[scissor]) };
                     draw_calls = draw_calls.saturating_add(
@@ -578,7 +579,7 @@ enum PsoTag {
 
 #[derive(Default)]
 pub(super) struct OpBuckets {
-    buckets: Vec<(PhysicalBounds, Vec<u32>)>,
+    buckets: Vec<(DeviceRect, Vec<u32>)>,
     visits: u32,
     budget: u32,
 }
@@ -596,23 +597,13 @@ impl OpBuckets {
         let rects = damage.as_slice();
         self.buckets.truncate(rects.len());
         self.buckets
-            .resize_with(rects.len(), || (PhysicalBounds::EMPTY, Vec::new()));
+            .resize_with(rects.len(), || (DeviceRect::default(), Vec::new()));
         self.visits = 0;
         for (slot, rect) in self.buckets.iter_mut().zip(rects) {
-            let extent = [rect.x0, rect.y0, rect.x1, rect.y1];
-            slot.0 = PhysicalBounds {
-                x0: rect.x0,
-                y0: rect.y0,
-                x1: rect.x1,
-                y1: rect.y1,
-            };
+            slot.0 = *rect;
             slot.1.clear();
             for (index, op) in ops.iter().enumerate() {
-                if op
-                    .bounds()
-                    .translated(scroll_offset(scroll, *op))
-                    .intersects(extent)
-                {
+                if scrolled_bounds(*op, scroll).overlaps_inclusive(*rect) {
                     slot.1.push(index as u32);
                 }
             }
@@ -632,6 +623,14 @@ impl OpBuckets {
             })
             .map(|(_, bucket)| bucket.as_slice())
     }
+}
+
+fn scrolled_bounds(op: FrameOp, scroll: &[[f32; 2]]) -> DeviceRect {
+    let offset = scroll_offset(scroll, op);
+    op.bounds().translate(DevicePoint::new(
+        dp(offset[0].round() as i32),
+        dp(offset[1].round() as i32),
+    ))
 }
 
 pub(super) fn draw_ops(
@@ -658,11 +657,13 @@ pub(super) fn draw_ops(
         let Some(op) = ops.get(index as usize) else {
             continue;
         };
-        if !op
-            .bounds()
-            .translated(scroll_offset(payload.scroll(), *op))
-            .intersects([scissor.left, scissor.top, scissor.right, scissor.bottom])
-        {
+        let scissor_bounds = DeviceRect::new(
+            dp(scissor.left),
+            dp(scissor.top),
+            dp(scissor.right),
+            dp(scissor.bottom),
+        );
+        if !scrolled_bounds(*op, payload.scroll()).overlaps_inclusive(scissor_bounds) {
             continue;
         }
         visited = visited.saturating_add(1);

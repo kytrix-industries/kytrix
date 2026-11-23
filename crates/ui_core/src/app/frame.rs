@@ -319,7 +319,7 @@ mod tests {
 
     use crate::{
         app::App,
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::style::{PaintSpec, StylePatch},
         window::{FrameOutcome, WindowOptions},
@@ -336,15 +336,15 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("frame budget"),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();
         let value = app.signal(0u8);
         let source = value;
         let _node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .paint(PaintSpec {
                 background: crate::paint::color::Color::WHITE,
                 ..PaintSpec::default()

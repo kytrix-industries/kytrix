@@ -12,6 +12,7 @@ use super::{
 };
 use crate::{
     error::EngineError,
+    math::{DevicePixelRatio, LogicalPx},
     paint::atlas::AtlasKind,
     render::{AtlasAllocator, DirtyRects},
 };
@@ -27,15 +28,19 @@ pub(crate) fn shape(
     lease: &Arc<AtomicU64>,
     text: &str,
     style: &TextStyle,
-    max_width: Option<f32>,
+    max_width: Option<LogicalPx>,
     inline_boxes: &[InlineBoxSpec],
     scale: f32,
 ) -> Result<ShapedTextHandle, EngineError> {
+    let scale = DevicePixelRatio::new(scale).ok_or(EngineError::InvalidTextScale { scale })?;
     if let Some(width) = max_width
-        && (!width.is_finite() || width < 0.0)
+        && (!width.is_finite() || width < LogicalPx::ZERO)
     {
         return Err(EngineError::TextShapeStandalone {
-            detail: format_smolstr!("max_width {width} must be finite and non-negative"),
+            detail: format_smolstr!(
+                "max_width {} must be finite and non-negative",
+                width.value()
+            ),
         });
     }
     if text_context.font_stack().families().len() == 0 {
@@ -118,7 +123,7 @@ mod tests {
     use crate::{
         app::App,
         event::Event,
-        math::{Point, Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::{canvas::Canvas, color::Color, primitive::Primitive},
         text::{FontStack, InlineAlign, ShapedLine, TextOverflow, TextStyle},
@@ -140,34 +145,34 @@ mod tests {
     }
 
     fn canvas() -> Canvas {
-        Canvas::new(Rect::new(0.0, 0.0, 200.0, 120.0))
+        Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(120.0)))
     }
 
     #[test]
     fn empty_text_shapes_to_an_empty_handle() {
         let (_runtime, mut app) = new_app();
         let handle = app
-            .shape_text("", &TextStyle::new(16.0), None, &[])
+            .shape_text("", &TextStyle::new(px(16.0)), None, &[])
             .expect("空文本不是错误：与节点路径一致，产出 0 行的快照");
-        assert_eq!(handle.size(), Size::ZERO);
+        assert_eq!(handle.size(), LogicalSize::ZERO);
         assert!(handle.line().lines.is_empty());
         assert_eq!(glyph_count(handle.line()), 0);
         assert!(!handle.is_stale());
         let mut canvas = canvas();
-        assert!(canvas.push_shaped_text(&handle, Point::ZERO));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::ZERO));
         assert!(canvas.primitives().is_empty());
     }
 
     #[test]
     fn ascii_and_cjk_mix_shape_into_visible_glyphs() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let mixed = app
             .shape_text("Hello 世界", &style, None, &[])
             .expect("ASCII + CJK 必须能塑形");
         assert_eq!(mixed.line().lines.len(), 1, "max_width = None ⇒ 单行");
-        assert!(mixed.size().width > 0.0);
-        assert!(mixed.size().height > 0.0);
+        assert!(mixed.size().width > px(0.0));
+        assert!(mixed.size().height > px(0.0));
         assert_eq!(
             glyph_count(mixed.line()),
             7,
@@ -184,7 +189,7 @@ mod tests {
             mixed.size().width
         );
         let bigger = app
-            .shape_text("Hello 世界", &TextStyle::new(32.0), None, &[])
+            .shape_text("Hello 世界", &TextStyle::new(px(32.0)), None, &[])
             .expect("更大字号");
         assert!(
             bigger.size().width > mixed.size().width,
@@ -198,26 +203,33 @@ mod tests {
     fn handle_size_matches_the_shaped_line() {
         let (_runtime, mut app) = new_app();
         let handle = app
-            .shape_text("line metrics", &TextStyle::new(15.0), None, &[])
+            .shape_text("line metrics", &TextStyle::new(px(15.0)), None, &[])
             .expect("塑形");
         let line = handle.line();
         assert_eq!(handle.size(), line.size());
-        assert_eq!(handle.size(), Size::new(line.width, line.height));
-        assert!(line.first_baseline.is_some_and(|baseline| baseline > 0.0));
-        assert_eq!(line.scale, app.text_scale());
-        assert_eq!(handle.scale(), app.text_scale(), "句柄必须记录光栅 scale");
+        assert_eq!(handle.size(), LogicalSize::new(line.width, line.height));
+        assert!(
+            line.first_baseline
+                .is_some_and(|baseline| baseline > px(0.0))
+        );
+        assert_eq!(line.scale.factor(), app.text_scale());
+        assert_eq!(
+            handle.scale().factor(),
+            app.text_scale(),
+            "句柄必须记录光栅 scale"
+        );
         assert_eq!(line.text.as_str(), "line metrics");
     }
 
     #[test]
     fn max_width_breaks_the_line_and_grows_the_height() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let text = "the quick brown fox jumps over the lazy dog";
         let single = app.shape_text(text, &style, None, &[]).expect("不限宽");
         assert_eq!(single.line().lines.len(), 1);
         let wrapped = app
-            .shape_text(text, &style, Some(80.0), &[])
+            .shape_text(text, &style, Some(px(80.0)), &[])
             .expect("限宽断行");
         assert!(
             wrapped.line().lines.len() > 1,
@@ -226,7 +238,7 @@ mod tests {
         );
         let hanging = 8.0;
         assert!(
-            wrapped.size().width <= 80.0 + hanging,
+            wrapped.size().width <= px(80.0 + hanging),
             "断行后内容宽不得超过 max_width + 行末空白：{}",
             wrapped.size().width
         );
@@ -238,7 +250,7 @@ mod tests {
         );
         for line in &wrapped.line().lines {
             assert!(
-                line.advance <= 80.0 + hanging,
+                line.advance <= px(80.0 + hanging),
                 "行推进 {} 超过 max_width + 行末空白",
                 line.advance
             );
@@ -248,12 +260,12 @@ mod tests {
     #[test]
     fn max_lines_with_ellipsis_truncates_overflow() {
         let (_runtime, mut app) = new_app();
-        let mut style = TextStyle::new(16.0);
+        let mut style = TextStyle::new(px(16.0));
         style.overflow = TextOverflow::Ellipsis;
         style.max_lines = 1;
         let text = "the quick brown fox jumps over the lazy dog";
         let shaped = app
-            .shape_text(text, &style, Some(120.0), &[])
+            .shape_text(text, &style, Some(px(120.0)), &[])
             .expect("截断塑形");
         assert_eq!(
             shaped.line().lines.len(),
@@ -263,13 +275,13 @@ mod tests {
         );
         let line = &shaped.line().lines[0];
         assert!(
-            line.advance <= 120.0 + 1.0,
+            line.advance <= px(120.0 + 1.0),
             "截断后的行推进不得超过内容宽：{}",
             line.advance
         );
         assert!(glyph_count(shaped.line()) > 0, "截断后仍要有可见字形");
         let untruncated = app
-            .shape_text(text, &TextStyle::new(16.0), Some(120.0), &[])
+            .shape_text(text, &TextStyle::new(px(16.0)), Some(px(120.0)), &[])
             .expect("不截断");
         assert!(untruncated.line().lines.len() > 1);
     }
@@ -281,7 +293,7 @@ mod tests {
             InlineBoxSpec {
                 id: 7,
                 index: 2,
-                size: Size::new(12.0, 12.0),
+                size: LogicalSize::new(px(12.0), px(12.0)),
                 baseline: None,
                 align: InlineAlign::Baseline,
                 paint: None,
@@ -289,23 +301,23 @@ mod tests {
             InlineBoxSpec {
                 id: 9,
                 index: 4,
-                size: Size::new(8.0, 8.0),
-                baseline: Some(1.0),
+                size: LogicalSize::new(px(8.0), px(8.0)),
+                baseline: Some(px(1.0)),
                 align: InlineAlign::Middle,
                 paint: None,
             },
         ];
         let handle = app
-            .shape_text("ab cd", &TextStyle::new(16.0), None, &specs)
+            .shape_text("ab cd", &TextStyle::new(px(16.0)), None, &specs)
             .expect("带行内盒塑形");
         let boxes = app.shaped_inline_boxes(&handle);
         assert_eq!(boxes.len(), 2, "落点数量必须与传入的 inline_boxes 一致");
         assert_eq!(boxes[0].id, 7);
         assert_eq!(boxes[1].id, 9);
-        assert_eq!(boxes[0].rect.size, Size::new(12.0, 12.0));
-        assert_eq!(boxes[1].rect.size, Size::new(8.0, 8.0));
+        assert_eq!(boxes[0].rect.size, LogicalSize::new(px(12.0), px(12.0)));
+        assert_eq!(boxes[1].rect.size, LogicalSize::new(px(8.0), px(8.0)));
         assert_eq!(boxes[0].baseline, None);
-        assert_eq!(boxes[1].baseline, Some(1.0));
+        assert_eq!(boxes[1].baseline, Some(px(1.0)));
         assert!(
             boxes[0].rect.origin.x < boxes[1].rect.origin.x,
             "LTR 文本里先出现的行内盒必须在左边：{:?}",
@@ -328,10 +340,10 @@ mod tests {
     fn push_shaped_text_emits_one_glyph_run_per_non_empty_run() {
         let (_runtime, mut app) = new_app();
         let handle = app
-            .shape_text("push me", &TextStyle::new(16.0), None, &[])
+            .shape_text("push me", &TextStyle::new(px(16.0)), None, &[])
             .expect("塑形");
         let mut canvas = canvas();
-        assert!(canvas.push_shaped_text(&handle, Point::new(3.0, 4.0)));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::new(px(3.0), px(4.0))));
         let expected_runs = handle
             .line()
             .glyph_runs()
@@ -365,18 +377,18 @@ mod tests {
     #[test]
     fn atlas_generation_change_makes_handles_stale_and_push_refuses() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let handle = app.shape_text("Stale", &style, None, &[]).expect("塑形");
         assert!(!handle.is_stale(), "刚产出的句柄不得失活");
         let mut canvas = canvas();
-        assert!(canvas.push_shaped_text(&handle, Point::ZERO));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::ZERO));
         let before = canvas.primitives().len();
         assert!(before > 0);
 
         app.set_font_stack(FontStack::new(["Kytrix No Such Family"]));
         assert!(handle.is_stale(), "图集换代后句柄必须失活");
         assert!(
-            !canvas.push_shaped_text(&handle, Point::ZERO),
+            !canvas.push_shaped_text(&handle, LogicalPoint::ZERO),
             "stale 句柄不得编码旧 UV"
         );
         assert_eq!(
@@ -389,15 +401,15 @@ mod tests {
             .shape_text("Stale", &style, None, &[])
             .expect("重新 shape 必须成功");
         assert!(!fresh.is_stale(), "重新 shape 的句柄属于当前代际");
-        assert!(canvas.push_shaped_text(&fresh, Point::ZERO));
+        assert!(canvas.push_shaped_text(&fresh, LogicalPoint::ZERO));
     }
 
     #[test]
     fn invalid_widths_are_typed_errors() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         for width in [f32::NAN, f32::INFINITY, -1.0] {
-            match app.shape_text("x", &style, Some(width), &[]) {
+            match app.shape_text("x", &style, Some(px(width)), &[]) {
                 Err(EngineError::TextShapeStandalone { detail }) => {
                     assert!(
                         detail.contains("max_width"),
@@ -407,14 +419,14 @@ mod tests {
                 other => panic!("宽度 {width} 必须返回 TextShapeStandalone，实际 {other:?}"),
             }
         }
-        assert!(app.shape_text("x", &style, Some(0.0), &[]).is_ok());
+        assert!(app.shape_text("x", &style, Some(px(0.0)), &[]).is_ok());
     }
 
     #[test]
     fn empty_font_stack_is_a_typed_error() {
         let (_runtime, mut app) = new_app();
         app.set_font_stack(FontStack::new(std::iter::empty::<&'static str>()));
-        match app.shape_text("x", &TextStyle::new(16.0), None, &[]) {
+        match app.shape_text("x", &TextStyle::new(px(16.0)), None, &[]) {
             Err(EngineError::TextShapeStandalone { detail }) => {
                 assert!(detail.contains("font stack"), "{detail}");
             }
@@ -425,18 +437,18 @@ mod tests {
     #[test]
     fn unknown_family_falls_back_instead_of_failing() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0).with_family("Kytrix No Such Family");
+        let style = TextStyle::new(px(16.0)).with_family("Kytrix No Such Family");
         let handle = app
             .shape_text("Fallback", &style, None, &[])
             .expect("非空字体栈必须回退而不是报错");
         assert!(glyph_count(handle.line()) > 0, "回退后仍要画出字形");
-        assert!(handle.size().width > 0.0);
+        assert!(handle.size().width > px(0.0));
     }
 
     #[test]
     fn repeated_shape_reuses_the_cached_snapshot() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let shaped_before = app.shape_count_for_test();
         let first = app.shape_text("Cache me", &style, None, &[]).expect("塑形");
         let second = app.shape_text("Cache me", &style, None, &[]).expect("塑形");
@@ -472,10 +484,10 @@ mod tests {
         let text = "Halo";
         let shaped_before = app.shape_count_for_test();
         let red_handle = app
-            .shape_text(text, &TextStyle::new(16.0).with_color(red), None, &[])
+            .shape_text(text, &TextStyle::new(px(16.0)).with_color(red), None, &[])
             .expect("塑形");
         let blue_handle = app
-            .shape_text(text, &TextStyle::new(16.0).with_color(blue), None, &[])
+            .shape_text(text, &TextStyle::new(px(16.0)).with_color(blue), None, &[])
             .expect("塑形");
         assert_eq!(
             app.shape_count_for_test() - shaped_before,
@@ -505,14 +517,14 @@ mod tests {
                 .line()
                 .glyph_runs()
                 .flat_map(|run| run.glyphs.iter())
-                .map(|glyph| (glyph.position.x, glyph.position.y))
+                .map(|glyph| (glyph.position.x.value(), glyph.position.y.value()))
                 .collect()
         };
         assert_eq!(positions(&red_handle), positions(&blue_handle));
         assert_eq!(red_handle.size(), blue_handle.size());
 
         let mut canvas = canvas();
-        assert!(canvas.push_shaped_text(&blue_handle, Point::ZERO));
+        assert!(canvas.push_shaped_text(&blue_handle, LogicalPoint::ZERO));
         let mut pushed = 0usize;
         for primitive in canvas.primitives() {
             let Primitive::GlyphRun(run) = primitive else {
@@ -529,24 +541,28 @@ mod tests {
         let (_runtime, mut app) = new_app();
         assert_eq!(app.text_scale(), 1.0, "默认 scale = 1.0（逻辑像素 1:1）");
         let handle = app
-            .shape_text("scale", &TextStyle::new(16.0), None, &[])
+            .shape_text("scale", &TextStyle::new(px(16.0)), None, &[])
             .expect("塑形");
-        assert_eq!(handle.scale(), 1.0);
-        assert_eq!(handle.line().scale, 1.0, "快照与句柄记录的 scale 同源");
+        assert_eq!(handle.scale().factor(), 1.0);
+        assert_eq!(
+            handle.line().scale.factor(),
+            1.0,
+            "快照与句柄记录的 scale 同源"
+        );
     }
 
     #[test]
     fn explicit_text_scale_override_enters_the_raster_and_is_validated() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let one = app.shape_text("Hi", &style, None, &[]).expect("1.0");
-        assert_eq!(one.scale(), 1.0);
+        assert_eq!(one.scale().factor(), 1.0);
 
         app.set_text_scale(2.0).expect("有限正数是合法的");
         assert_eq!(app.text_scale(), 2.0);
         let two = app.shape_text("Hi", &style, None, &[]).expect("2.0");
-        assert_eq!(two.scale(), 2.0);
-        assert_eq!(two.line().scale, 2.0);
+        assert_eq!(two.scale().factor(), 2.0);
+        assert_eq!(two.line().scale.factor(), 2.0);
 
         let first_tile = |handle: &ShapedTextHandle| {
             handle
@@ -579,7 +595,7 @@ mod tests {
     fn focused_window_dpi_drives_the_default_text_scale() {
         let (_runtime, mut app) = new_app();
         let window = app.create_window(WindowOptions {
-            scale: Scale::new(1.5).expect("有限正数"),
+            scale: DevicePixelRatio::new(1.5).expect("有限正数"),
             ..WindowOptions::default()
         });
         assert_eq!(app.text_scale(), 1.0, "还没有焦点事件 ⇒ 保持默认 1.0");
@@ -587,12 +603,12 @@ mod tests {
         app.dispatch(window, Event::FocusChanged { focused: true });
         assert_eq!(app.text_scale(), 1.5, "焦点窗口的 DPI 成为默认 scale");
         let handle = app
-            .shape_text("dpi", &TextStyle::new(16.0), None, &[])
+            .shape_text("dpi", &TextStyle::new(px(16.0)), None, &[])
             .expect("塑形");
-        assert_eq!(handle.scale(), 1.5);
-        assert_eq!(handle.line().scale, 1.5);
+        assert_eq!(handle.scale().factor(), 1.5);
+        assert_eq!(handle.line().scale.factor(), 1.5);
 
-        let two = Scale::new(2.0).expect("有限正数");
+        let two = DevicePixelRatio::new(2.0).expect("有限正数");
         app.window_mut(window).expect("窗口存在").set_scale(two);
         app.dispatch(
             window,
@@ -617,13 +633,13 @@ mod tests {
     fn dpi_event_scale_is_authoritative_before_the_window_mirror() {
         let (_runtime, mut app) = new_app();
         let window = app.create_window(WindowOptions {
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         app.dispatch(window, Event::FocusChanged { focused: true });
         assert_eq!(app.text_scale(), 1.0);
 
-        let two = Scale::new(2.0).expect("有限正数");
+        let two = DevicePixelRatio::new(2.0).expect("有限正数");
         app.dispatch(
             window,
             Event::DpiChanged {
@@ -633,7 +649,7 @@ mod tests {
         );
         assert_eq!(
             app.window(window).expect("窗口存在").scale(),
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             "本用例必须复现「事件先于镜像」的顺序：此时 `Window::scale` 仍是旧值"
         );
         assert_eq!(
@@ -646,7 +662,7 @@ mod tests {
         assert_eq!(app.text_scale(), 2.0);
 
         app.set_text_scale(1.25).expect("合法覆盖");
-        let three = Scale::new(3.0).expect("有限正数");
+        let three = DevicePixelRatio::new(3.0).expect("有限正数");
         app.dispatch(
             window,
             Event::DpiChanged {
@@ -663,17 +679,17 @@ mod tests {
         app.cap_glyph_atlas_page_for_test(32);
         let generation = app.glyph_atlas_generation_for_test();
         let first = app
-            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .shape_text("A", &TextStyle::new(px(16.0)), None, &[])
             .expect("首个句柄");
         assert_eq!(app.glyph_atlas_eviction_epoch_for_test(), 0);
         assert!(!first.is_stale());
         let mut canvas = canvas();
-        assert!(canvas.push_shaped_text(&first, Point::ZERO));
+        assert!(canvas.push_shaped_text(&first, LogicalPoint::ZERO));
         let before = canvas.primitives().len();
         assert!(before > 0);
 
         for glyph in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"] {
-            app.shape_text(glyph, &TextStyle::new(16.0), None, &[])
+            app.shape_text(glyph, &TextStyle::new(px(16.0)), None, &[])
                 .expect("小页只能靠淘汰腾位置，单字 shape 必须成功");
         }
         assert_eq!(
@@ -686,7 +702,7 @@ mod tests {
             "淘汰必须前进纪元"
         );
         assert!(first.is_stale(), "代际不变、tile 已被复用 ⇒ 句柄也必须失效");
-        assert!(!canvas.push_shaped_text(&first, Point::ZERO));
+        assert!(!canvas.push_shaped_text(&first, LogicalPoint::ZERO));
         assert_eq!(
             canvas.primitives().len(),
             before,
@@ -694,10 +710,10 @@ mod tests {
         );
 
         let fresh = app
-            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .shape_text("A", &TextStyle::new(px(16.0)), None, &[])
             .expect("重新 shape");
         assert!(!fresh.is_stale());
-        assert!(canvas.push_shaped_text(&fresh, Point::new(1.0, 2.0)));
+        assert!(canvas.push_shaped_text(&fresh, LogicalPoint::new(px(1.0), px(2.0))));
     }
 
     #[test]
@@ -707,7 +723,7 @@ mod tests {
         let node = {
             let target = app.window_mut(window).expect("窗口存在");
             let root = target.tree().root();
-            NodeBuilder::text("node label", TextStyle::new(16.0))
+            NodeBuilder::text("node label", TextStyle::new(px(16.0)))
                 .build(target.tree_mut(), root)
                 .expect("文本节点")
         };
@@ -723,7 +739,7 @@ mod tests {
 
         app.cap_glyph_atlas_page_for_test(32);
         let handle = app
-            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .shape_text("A", &TextStyle::new(px(16.0)), None, &[])
             .expect("首个句柄");
         assert!(!handle.is_stale());
         let generation = app.glyph_atlas_generation_for_test();
@@ -731,7 +747,7 @@ mod tests {
         let error = app
             .shape_text(
                 "abcdefghijklmnopqrstuvwxyz",
-                &TextStyle::new(16.0),
+                &TextStyle::new(px(16.0)),
                 None,
                 &[],
             )
@@ -763,12 +779,12 @@ mod tests {
     #[test]
     fn cjk_and_emoji_mix_shapes_with_monotonic_metrics() {
         let (_runtime, mut app) = new_app();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let mixed = app
             .shape_text("Hello 🌍🚀 世界", &style, None, &[])
             .expect("CJK + emoji 必须能塑形");
-        assert!(mixed.size().width > 0.0);
-        assert!(mixed.size().height > 0.0);
+        assert!(mixed.size().width > px(0.0));
+        assert!(mixed.size().height > px(0.0));
         assert!(glyph_count(mixed.line()) > 0, "emoji 行必须有可见字形");
         let latin = app.shape_text("Hello ", &style, None, &[]).expect("Latin");
         assert!(
@@ -783,7 +799,7 @@ mod tests {
             "多一个 emoji 必须更宽（度量单调）"
         );
         let wrapped = app
-            .shape_text("Hello 🌍🚀 世界", &style, Some(60.0), &[])
+            .shape_text("Hello 🌍🚀 世界", &style, Some(px(60.0)), &[])
             .expect("限宽");
         assert!(wrapped.line().lines.len() > 1);
     }
@@ -804,7 +820,7 @@ mod tests {
         let window = app.window_id();
         let handle = app
             .app_mut()
-            .shape_text("Canvas text", &TextStyle::new(16.0), None, &[])
+            .shape_text("Canvas text", &TextStyle::new(px(16.0)), None, &[])
             .expect("塑形");
         assert!(!handle.is_stale());
         let run_count = handle
@@ -813,21 +829,21 @@ mod tests {
             .filter(|run| !run.glyphs.is_empty())
             .count();
         assert!(run_count > 0);
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 200.0, 40.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)));
         canvas.push_quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 200.0, 40.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
             },
         });
-        assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::new(px(2.0), px(3.0))));
         let canvas_node = {
             let target = app.app_mut().window_mut(window).expect("窗口存在");
             let root = target.tree().root();
             NodeBuilder::canvas(canvas)
-                .layout_override(Rect::new(0.0, 0.0, 200.0, 40.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)))
                 .id("canvas.text")
                 .build(target.tree_mut(), root)
                 .expect("Canvas 节点")
@@ -899,7 +915,7 @@ mod tests {
         let generation = app.app().glyph_atlas_generation_for_test();
         let handle = app
             .app_mut()
-            .shape_text("A", &TextStyle::new(16.0), None, &[])
+            .shape_text("A", &TextStyle::new(px(16.0)), None, &[])
             .expect("首个小页字形");
         assert!(!handle.is_stale());
         let run_count = handle
@@ -908,21 +924,21 @@ mod tests {
             .filter(|run| !run.glyphs.is_empty())
             .count();
         assert!(run_count > 0);
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 200.0, 40.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)));
         canvas.push_quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 200.0, 40.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
             },
         });
-        assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::new(px(2.0), px(3.0))));
         let canvas_node = {
             let target = app.app_mut().window_mut(window).expect("窗口存在");
             let root = target.tree().root();
             NodeBuilder::canvas(canvas)
-                .layout_override(Rect::new(0.0, 0.0, 200.0, 40.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)))
                 .id("canvas.evicted")
                 .build(target.tree_mut(), root)
                 .expect("Canvas 节点")
@@ -938,7 +954,7 @@ mod tests {
 
         for glyph in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"] {
             app.app_mut()
-                .shape_text(glyph, &TextStyle::new(16.0), None, &[])
+                .shape_text(glyph, &TextStyle::new(px(16.0)), None, &[])
                 .expect("小页只能靠逐 tile 淘汰腾位置，单字 shape 必须成功");
         }
         assert_eq!(
@@ -995,7 +1011,7 @@ mod tests {
 
         let mut app = TestApp::new();
         let window = app.window_id();
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let handle = app
             .app_mut()
             .shape_text("Canvas follow-up", &style, None, &[])
@@ -1006,21 +1022,21 @@ mod tests {
             .filter(|run| !run.glyphs.is_empty())
             .count();
         assert!(run_count > 0);
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 240.0, 40.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(240.0), px(40.0)));
         canvas.push_quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 240.0, 40.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(240.0), px(40.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
             },
         });
-        assert!(canvas.push_shaped_text(&handle, Point::new(2.0, 3.0)));
+        assert!(canvas.push_shaped_text(&handle, LogicalPoint::new(px(2.0), px(3.0))));
         let canvas_node = {
             let target = app.app_mut().window_mut(window).expect("窗口存在");
             let root = target.tree().root();
             NodeBuilder::canvas(canvas)
-                .layout_override(Rect::new(0.0, 0.0, 240.0, 40.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(240.0), px(40.0)))
                 .id("canvas.followup")
                 .build(target.tree_mut(), root)
                 .expect("Canvas 节点")
@@ -1065,16 +1081,16 @@ mod tests {
             .shape_text("Canvas follow-up", &style, None, &[])
             .expect("重新塑形");
         assert!(!fresh.is_stale(), "新句柄属于当前图集租约");
-        let mut rebuilt = Canvas::new(Rect::new(0.0, 0.0, 240.0, 40.0));
+        let mut rebuilt = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(240.0), px(40.0)));
         rebuilt.push_quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 240.0, 40.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(240.0), px(40.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
             },
         });
-        assert!(rebuilt.push_shaped_text(&fresh, Point::new(2.0, 3.0)));
+        assert!(rebuilt.push_shaped_text(&fresh, LogicalPoint::new(px(2.0), px(3.0))));
         assert!(
             app.app_mut()
                 .window_mut(window)
@@ -1124,14 +1140,14 @@ mod tests {
         let node = {
             let target = app.app_mut().window_mut(window).expect("窗口存在");
             let root = target.tree().root();
-            NodeBuilder::text("Frame L2 text", TextStyle::new(16.0))
-                .layout_override(Rect::new(10.0, 20.0, 220.0, 40.0))
+            NodeBuilder::text("Frame L2 text", TextStyle::new(px(16.0)))
+                .layout_override(LogicalRect::new(px(10.0), px(20.0), px(220.0), px(40.0)))
                 .id("text.l2")
                 .build(target.tree_mut(), root)
                 .expect("文本节点")
         };
         let record = app.drain().expect("帧成功");
-        let glyph_runs: Vec<(NodeId, Rect)> = record
+        let glyph_runs: Vec<(NodeId, LogicalRect)> = record
             .frame
             .as_ref()
             .expect("已提交帧")
@@ -1147,7 +1163,7 @@ mod tests {
             .glyph_runs()
             .filter(|run| !run.glyphs.is_empty())
             .count();
-        let node_runs: Vec<Rect> = glyph_runs
+        let node_runs: Vec<LogicalRect> = glyph_runs
             .into_iter()
             .filter(|(owner, _)| *owner == node)
             .map(|(_, bounds)| bounds)

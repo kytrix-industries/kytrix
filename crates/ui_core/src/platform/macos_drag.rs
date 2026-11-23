@@ -1,4 +1,4 @@
-use crate::math::{Point, Rect};
+use crate::math::{LogicalPoint, LogicalRect, px};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowDragState {
@@ -28,15 +28,15 @@ impl WindowDragState {
     }
 }
 
-pub(crate) fn drag_region_at(regions: &[Rect], point: Point) -> Option<usize> {
+pub(crate) fn drag_region_at(regions: &[LogicalRect], point: LogicalPoint) -> Option<usize> {
     if !point.x.is_finite() || !point.y.is_finite() {
         return None;
     }
     regions.iter().position(|region| {
         let (x, y) = (region.origin.x, region.origin.y);
         let (width, height) = (region.size.width, region.size.height);
-        width > 0.0
-            && height > 0.0
+        width > px(0.0)
+            && height > px(0.0)
             && point.x >= x
             && point.x < x + width
             && point.y >= y
@@ -47,10 +47,10 @@ pub(crate) fn drag_region_at(regions: &[Rect], point: Point) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{WindowDragState, drag_region_at};
-    use crate::math::{Point, Rect};
+    use crate::math::{LogicalPoint, LogicalRect, px};
 
-    fn point(x: f32, y: f32) -> Point {
-        Point::new(x, y)
+    fn point(x: f32, y: f32) -> LogicalPoint {
+        LogicalPoint::new(px(x), px(y))
     }
 
     #[test]
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn points_inside_and_outside_a_region() {
-        let regions = [Rect::new(10.0, 20.0, 100.0, 40.0)];
+        let regions = [LogicalRect::new(px(10.0), px(20.0), px(100.0), px(40.0))];
         assert_eq!(drag_region_at(&regions, point(50.0, 30.0)), Some(0));
         assert_eq!(drag_region_at(&regions, point(9.99, 30.0)), None);
         assert_eq!(drag_region_at(&regions, point(50.0, 19.99)), None);
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn region_bounds_are_half_open() {
-        let regions = [Rect::new(10.0, 20.0, 100.0, 40.0)];
+        let regions = [LogicalRect::new(px(10.0), px(20.0), px(100.0), px(40.0))];
         assert_eq!(
             drag_region_at(&regions, point(10.0, 20.0)),
             Some(0),
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn regions_use_top_left_origin_with_y_pointing_down() {
-        let regions = [Rect::new(0.0, 0.0, 400.0, 38.0)];
+        let regions = [LogicalRect::new(px(0.0), px(0.0), px(400.0), px(38.0))];
         assert_eq!(
             drag_region_at(&regions, point(200.0, 10.0)),
             Some(0),
@@ -109,9 +109,9 @@ mod tests {
     #[test]
     fn multiple_regions_report_the_first_match() {
         let regions = [
-            Rect::new(0.0, 0.0, 100.0, 30.0),
-            Rect::new(100.0, 0.0, 100.0, 30.0),
-            Rect::new(0.0, 0.0, 10.0, 10.0),
+            LogicalRect::new(px(0.0), px(0.0), px(100.0), px(30.0)),
+            LogicalRect::new(px(100.0), px(0.0), px(100.0), px(30.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)),
         ];
         assert_eq!(drag_region_at(&regions, point(5.0, 5.0)), Some(0));
         assert_eq!(drag_region_at(&regions, point(150.0, 5.0)), Some(1));
@@ -126,12 +126,12 @@ mod tests {
     #[test]
     fn degenerate_regions_and_points_never_hit() {
         let regions = [
-            Rect::new(0.0, 0.0, 0.0, 30.0),
-            Rect::new(0.0, 0.0, 100.0, 0.0),
-            Rect::new(0.0, 0.0, -10.0, -10.0),
+            LogicalRect::new(px(0.0), px(0.0), px(0.0), px(30.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(100.0), px(0.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(-10.0), px(-10.0)),
         ];
         assert_eq!(drag_region_at(&regions, point(0.0, 0.0)), None);
-        let finite = [Rect::new(0.0, 0.0, 100.0, 30.0)];
+        let finite = [LogicalRect::new(px(0.0), px(0.0), px(100.0), px(30.0))];
         assert_eq!(drag_region_at(&finite, point(f32::NAN, 5.0)), None);
         assert_eq!(drag_region_at(&finite, point(5.0, f32::INFINITY)), None);
     }

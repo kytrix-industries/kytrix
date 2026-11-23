@@ -2,10 +2,13 @@ use taffy::style::{
     AlignItems, Dimension, FlexDirection, JustifyContent, LengthPercentageAuto, Overflow, Position,
 };
 
-use crate::paint::{
-    color::Color,
-    primitive::Border,
-    style::{Clip, PaintSpec, Style},
+use crate::{
+    math::LogicalPx,
+    paint::{
+        color::Color,
+        primitive::Border,
+        style::{Clip, PaintSpec, Style},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -70,61 +73,73 @@ impl StyleBuilder {
     }
 
     #[must_use]
-    pub fn gap(mut self, px: f32) -> Self {
+    pub fn gap(mut self, px: LogicalPx) -> Self {
         self.style.gap(px);
         self
     }
 
     #[must_use]
-    pub fn padding(mut self, px: f32) -> Self {
+    pub fn padding(mut self, px: LogicalPx) -> Self {
         self.style.padding(px);
         self
     }
 
     #[must_use]
-    pub fn padding_x(mut self, px: f32) -> Self {
+    pub fn padding_x(mut self, px: LogicalPx) -> Self {
         self.style.padding_x(px);
         self
     }
 
     #[must_use]
-    pub fn padding_y(mut self, px: f32) -> Self {
+    pub fn padding_y(mut self, px: LogicalPx) -> Self {
         self.style.padding_y(px);
         self
     }
 
     #[must_use]
-    pub fn padding_sides(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
+    pub fn padding_sides(
+        mut self,
+        top: LogicalPx,
+        right: LogicalPx,
+        bottom: LogicalPx,
+        left: LogicalPx,
+    ) -> Self {
         self.style.padding_sides(top, right, bottom, left);
         self
     }
 
     #[must_use]
-    pub fn margin_sides(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
+    pub fn margin_sides(
+        mut self,
+        top: LogicalPx,
+        right: LogicalPx,
+        bottom: LogicalPx,
+        left: LogicalPx,
+    ) -> Self {
         self.style.margin_sides(top, right, bottom, left);
         self
     }
 
     #[must_use]
-    pub fn border(mut self, width: f32) -> Self {
+    pub fn border(mut self, width: LogicalPx) -> Self {
         self.style.border(width);
         self
     }
 
     #[must_use]
-    pub fn width(mut self, px: f32) -> Self {
-        self.style.width(Dimension::length(px));
+    pub fn width(mut self, px: LogicalPx) -> Self {
+        self.style.width(Dimension::length(px.value()));
         self
     }
 
     #[must_use]
-    pub fn height(mut self, px: f32) -> Self {
-        self.style.height(Dimension::length(px));
+    pub fn height(mut self, px: LogicalPx) -> Self {
+        self.style.height(Dimension::length(px.value()));
         self
     }
 
     #[must_use]
-    pub fn size(mut self, width: f32, height: f32) -> Self {
+    pub fn size(mut self, width: LogicalPx, height: LogicalPx) -> Self {
         self.style.size_length(width, height);
         self
     }
@@ -160,14 +175,16 @@ impl StyleBuilder {
     }
 
     #[must_use]
-    pub fn max_width(mut self, px: f32) -> Self {
-        self.style.max_width(LengthPercentageAuto::length(px));
+    pub fn max_width(mut self, px: LogicalPx) -> Self {
+        self.style
+            .max_width(LengthPercentageAuto::length(px.value()));
         self
     }
 
     #[must_use]
-    pub fn max_height(mut self, px: f32) -> Self {
-        self.style.max_height(LengthPercentageAuto::length(px));
+    pub fn max_height(mut self, px: LogicalPx) -> Self {
+        self.style
+            .max_height(LengthPercentageAuto::length(px.value()));
         self
     }
 
@@ -191,25 +208,25 @@ impl StyleBuilder {
     }
 
     #[must_use]
-    pub fn top(mut self, px: f32) -> Self {
+    pub fn top(mut self, px: LogicalPx) -> Self {
         self.style.inset_top(px);
         self
     }
 
     #[must_use]
-    pub fn right(mut self, px: f32) -> Self {
+    pub fn right(mut self, px: LogicalPx) -> Self {
         self.style.inset_right(px);
         self
     }
 
     #[must_use]
-    pub fn bottom(mut self, px: f32) -> Self {
+    pub fn bottom(mut self, px: LogicalPx) -> Self {
         self.style.inset_bottom(px);
         self
     }
 
     #[must_use]
-    pub fn left(mut self, px: f32) -> Self {
+    pub fn left(mut self, px: LogicalPx) -> Self {
         self.style.inset_left(px);
         self
     }
@@ -246,13 +263,13 @@ impl PaintBuilder {
     }
 
     #[must_use]
-    pub fn rounded(mut self, px: f32) -> Self {
+    pub fn rounded(mut self, px: LogicalPx) -> Self {
         self.paint.corner_radius = [px; 4];
         self
     }
 
     #[must_use]
-    pub fn border(mut self, width: f32, color: Color) -> Self {
+    pub fn border(mut self, width: LogicalPx, color: Color) -> Self {
         self.paint.border = Some(Border { width, color });
         self
     }
@@ -281,10 +298,13 @@ mod tests {
     };
 
     use super::{PaintBuilder, StyleBuilder};
-    use crate::paint::{
-        color::Color,
-        primitive::Border,
-        style::{Clip, PaintSpec, Shadows, Style},
+    use crate::{
+        math::px,
+        paint::{
+            color::Color,
+            primitive::Border,
+            style::{Clip, PaintSpec, Shadows, Style},
+        },
     };
 
     fn taffy_style() -> taffy::Style<SmolStr> {
@@ -378,7 +398,7 @@ mod tests {
             ),
             (
                 "gap",
-                |builder| builder.gap(8.0).build(),
+                |builder| builder.gap(px(8.0)).build(),
                 taffy::Style {
                     gap: TaffySize {
                         width: LengthPercentage::length(8.0),
@@ -390,7 +410,7 @@ mod tests {
             ),
             (
                 "padding",
-                |builder| builder.padding(16.0).build(),
+                |builder| builder.padding(px(16.0)).build(),
                 taffy::Style {
                     padding: Rect {
                         left: LengthPercentage::length(16.0),
@@ -404,7 +424,7 @@ mod tests {
             ),
             (
                 "padding_x_y",
-                |builder| builder.padding_x(12.0).padding_y(8.0).build(),
+                |builder| builder.padding_x(px(12.0)).padding_y(px(8.0)).build(),
                 taffy::Style {
                     padding: Rect {
                         left: LengthPercentage::length(12.0),
@@ -418,7 +438,11 @@ mod tests {
             ),
             (
                 "padding_sides",
-                |builder| builder.padding_sides(1.0, 2.0, 3.0, 4.0).build(),
+                |builder| {
+                    builder
+                        .padding_sides(px(1.0), px(2.0), px(3.0), px(4.0))
+                        .build()
+                },
                 taffy::Style {
                     padding: Rect {
                         left: LengthPercentage::length(4.0),
@@ -432,7 +456,11 @@ mod tests {
             ),
             (
                 "margin_sides",
-                |builder| builder.margin_sides(1.0, 2.0, 3.0, 4.0).build(),
+                |builder| {
+                    builder
+                        .margin_sides(px(1.0), px(2.0), px(3.0), px(4.0))
+                        .build()
+                },
                 taffy::Style {
                     margin: Rect {
                         left: LengthPercentageAuto::length(4.0),
@@ -446,7 +474,7 @@ mod tests {
             ),
             (
                 "layout_border",
-                |builder| builder.border(1.0).build(),
+                |builder| builder.border(px(1.0)).build(),
                 taffy::Style {
                     border: Rect {
                         left: LengthPercentage::length(1.0),
@@ -460,7 +488,7 @@ mod tests {
             ),
             (
                 "width_height",
-                |builder| builder.width(120.0).height(40.0).build(),
+                |builder| builder.width(px(120.0)).height(px(40.0)).build(),
                 taffy::Style {
                     size: TaffySize {
                         width: Dimension::length(120.0),
@@ -472,7 +500,7 @@ mod tests {
             ),
             (
                 "size",
-                |builder| builder.size(120.0, 40.0).build(),
+                |builder| builder.size(px(120.0), px(40.0)).build(),
                 taffy::Style {
                     size: TaffySize {
                         width: Dimension::length(120.0),
@@ -512,8 +540,8 @@ mod tests {
                     builder
                         .min_width_0()
                         .min_height_0()
-                        .max_width(640.0)
-                        .max_height(480.0)
+                        .max_width(px(640.0))
+                        .max_height(px(480.0))
                         .build()
                 },
                 taffy::Style {
@@ -535,10 +563,10 @@ mod tests {
                     builder
                         .overflow_hidden()
                         .relative()
-                        .top(1.0)
-                        .right(2.0)
-                        .bottom(3.0)
-                        .left(4.0)
+                        .top(px(1.0))
+                        .right(px(2.0))
+                        .bottom(px(3.0))
+                        .left(px(4.0))
                         .build()
                 },
                 taffy::Style {
@@ -582,7 +610,11 @@ mod tests {
         assert_eq!(centered.inner().align_items, AlignItems::CENTER);
         assert_eq!(centered.inner().justify_content, default.justify_content);
 
-        let insets = StyleBuilder::new().relative().top(4.0).left(8.0).build();
+        let insets = StyleBuilder::new()
+            .relative()
+            .top(px(4.0))
+            .left(px(8.0))
+            .build();
         assert_eq!(insets.inner().position, Position::Relative);
         assert_eq!(insets.inner().inset.top, LengthPercentageAuto::length(4.0));
         assert_eq!(insets.inner().inset.left, LengthPercentageAuto::length(8.0));
@@ -613,7 +645,7 @@ mod tests {
 
     #[test]
     fn a_layout_border_takes_space_while_the_paint_border_draws() {
-        let style = StyleBuilder::new().border(2.0).build();
+        let style = StyleBuilder::new().border(px(2.0)).build();
         for side in [
             style.inner().border.left,
             style.inner().border.right,
@@ -629,12 +661,12 @@ mod tests {
             "布局边框不画线（画线是 PaintBuilder 的职责）"
         );
 
-        let paint = PaintBuilder::new().border(2.0, Color::WHITE).build();
+        let paint = PaintBuilder::new().border(px(2.0), Color::WHITE).build();
         assert_eq!(style.inner().border.top, LengthPercentage::length(2.0));
         assert_eq!(
             paint.border,
             Some(Border {
-                width: 2.0,
+                width: px(2.0),
                 color: Color::WHITE,
             })
         );
@@ -645,8 +677,8 @@ mod tests {
         let built = StyleBuilder::new()
             .flex_col()
             .size_full()
-            .gap(8.0)
-            .padding(16.0)
+            .gap(px(8.0))
+            .padding(px(16.0))
             .items_center()
             .build();
         let expected = taffy::Style {
@@ -677,16 +709,16 @@ mod tests {
     fn paint_builder_matches_the_direct_paint_spec() {
         let built = PaintBuilder::new()
             .background(Color::srgb(1.0, 0.0, 0.0, 1.0))
-            .rounded(6.0)
-            .border(1.0, Color::WHITE)
+            .rounded(px(6.0))
+            .border(px(1.0), Color::WHITE)
             .build();
         let expected = PaintSpec {
             background: Color::srgb(1.0, 0.0, 0.0, 1.0),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: Color::WHITE,
             }),
-            corner_radius: [6.0; 4],
+            corner_radius: [px(6.0); 4],
             shadows: Shadows::default(),
             gradient: None,
         };
@@ -698,15 +730,15 @@ mod tests {
     #[test]
     fn paint_builder_rounded_and_border_are_draw_only() {
         let paint = PaintBuilder::new()
-            .rounded(4.0)
-            .border(2.0, Color::WHITE)
+            .rounded(px(4.0))
+            .border(px(2.0), Color::WHITE)
             .build();
 
-        assert_eq!(paint.corner_radius, [4.0; 4]);
+        assert_eq!(paint.corner_radius, [px(4.0); 4]);
         assert_eq!(
             paint.border,
             Some(Border {
-                width: 2.0,
+                width: px(2.0),
                 color: Color::WHITE,
             })
         );

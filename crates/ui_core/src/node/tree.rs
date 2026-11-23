@@ -23,7 +23,9 @@ use crate::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, HitShape},
     },
-    math::{Edges, PhysicalRect, Point, Rect, Size, Transform},
+    math::{
+        DeviceRect, LogicalEdges, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform,
+    },
     node::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, DirtySet},
@@ -43,8 +45,8 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutBox {
-    pub bounds: Rect,
-    pub border: Edges,
+    pub bounds: LogicalRect,
+    pub border: LogicalEdges,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,20 +131,20 @@ pub struct Node {
     layout_override: Option<LayoutOverride>,
     tab_stop: bool,
     paint: Option<Box<PaintSpec>>,
-    content_offset: Point,
+    content_offset: LogicalPoint,
     text_bind: Option<Box<dyn Fn(&mut ReadCtx<'_>) -> SmolStr>>,
-    text_measured_size: Size,
-    text_content_width: f32,
+    text_measured_size: LogicalSize,
+    text_content_width: LogicalPx,
     layout: LayoutBox,
-    local: Rect,
-    local_border: Edges,
+    local: LogicalRect,
+    local_border: LogicalEdges,
     laid_out_epoch: u32,
-    damage: Rect,
+    damage: LogicalRect,
     lanes: SmallVec<[LaneId; 2]>,
     deps: Option<Box<SmallVec<[SignalId; 8]>>>,
     dirty: DirtyFlags,
     interaction: Option<Box<NodeInteraction>>,
-    lane_offset: Point,
+    lane_offset: LogicalPoint,
     paint_opacity: f32,
 }
 
@@ -225,7 +227,7 @@ impl Node {
     }
 
     #[must_use]
-    pub fn damage(&self) -> Rect {
+    pub fn damage(&self) -> LogicalRect {
         self.damage
     }
 
@@ -286,8 +288,8 @@ pub(crate) struct PaintNodeState {
 
     pub geometry: Option<GeometryId>,
     pub children: usize,
-    pub clip_bounds: Option<Rect>,
-    pub scroll: Option<Point>,
+    pub clip_bounds: Option<LogicalRect>,
+    pub scroll: Option<LogicalPoint>,
     pub screen_baked: bool,
     pub opacity: f32,
 }
@@ -295,7 +297,7 @@ pub(crate) struct PaintNodeState {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BakedGeometryChunk {
     pub revision: u64,
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -314,8 +316,8 @@ pub struct NodeTree {
     layout_cache: ahash::HashMap<NodeId, taffy::Cache>,
     text_slots: Vec<Option<TextSlot>>,
     debug_ids: Vec<Option<SmolStr>>,
-    clip_keys: Vec<Option<(u8, Option<PhysicalRect>)>>,
-    subtree_bounds: Vec<Rect>,
+    clip_keys: Vec<Option<(u8, Option<DeviceRect>)>>,
+    subtree_bounds: Vec<LogicalRect>,
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
     images_need_refresh: bool,
     dirty_bind: DirtySet,
@@ -498,10 +500,15 @@ impl NodeTree {
     ) -> Result<(), EngineError> {
         layout::set_layout_override(self, node, layout_override)
     }
-    pub(crate) fn set_virtual_row(&mut self, node: NodeId, top: f32, height: f32) -> bool {
+    pub(crate) fn set_virtual_row(
+        &mut self,
+        node: NodeId,
+        top: LogicalPx,
+        height: LogicalPx,
+    ) -> bool {
         layout::set_virtual_row(self, node, top, height)
     }
-    pub(crate) fn set_absolute_inset(&mut self, node: NodeId, origin: Point) -> bool {
+    pub(crate) fn set_absolute_inset(&mut self, node: NodeId, origin: LogicalPoint) -> bool {
         layout::set_absolute_inset(self, node, origin)
     }
     pub(crate) fn taffy_style(&self, node: NodeId) -> &taffy::Style<SmolStr> {
@@ -534,7 +541,7 @@ impl NodeTree {
     pub(crate) fn stats_mut(&mut self) -> &mut LayoutStats {
         layout::stats_mut(self)
     }
-    pub(crate) fn note_invalid_measure(&mut self, node: NodeId, axis: Axis, value: f32) {
+    pub(crate) fn note_invalid_measure(&mut self, node: NodeId, axis: Axis, value: LogicalPx) {
         layout::note_invalid_measure(self, node, axis, value)
     }
     pub(crate) fn take_invalid_measure(&mut self) -> Option<EngineError> {
@@ -546,7 +553,7 @@ impl NodeTree {
     fn place_subtree(
         &mut self,
         node: NodeId,
-        reference: Point,
+        reference: LogicalPoint,
         epoch: u32,
         force: bool,
         parent_hidden: bool,
@@ -557,7 +564,7 @@ impl NodeTree {
     pub(crate) fn recompute_subtree_bounds(&mut self) {
         layout::recompute_subtree_bounds(self)
     }
-    pub(crate) fn subtree_bounds(&self, node: NodeId) -> Rect {
+    pub(crate) fn subtree_bounds(&self, node: NodeId) -> LogicalRect {
         layout::subtree_bounds(self, node)
     }
     fn invalidate_caches_upwards(&mut self, node: NodeId) {
@@ -570,7 +577,7 @@ impl NodeTree {
         layout::bubble_layout(self, from)
     }
     #[must_use]
-    pub fn hit_test(&self, point: Point) -> Option<HitResult> {
+    pub fn hit_test(&self, point: LogicalPoint) -> Option<HitResult> {
         layout::hit_test(self, point)
     }
     #[cfg(test)]
@@ -875,7 +882,7 @@ impl NodeTree {
         shaped: Rc<crate::text::shape::ShapedText>,
         key: crate::text::cache::ShapeKey,
         scale_epoch: u32,
-        measured: Size,
+        measured: LogicalSize,
         size_changed: bool,
     ) -> bool {
         content::set_text_shaped(self, node, shaped, key, scale_epoch, measured, size_changed)
@@ -886,7 +893,7 @@ impl NodeTree {
         node: NodeId,
         content: &crate::text::TextContent,
         line: Rc<ShapedLine>,
-        width: f32,
+        width: LogicalPx,
     ) -> bool {
         content::install_text_line_for_test(self, node, content, line, width)
     }
@@ -894,18 +901,18 @@ impl NodeTree {
         &mut self,
         node: NodeId,
         line: Rc<ShapedLine>,
-        width: f32,
+        width: LogicalPx,
         generation: u32,
     ) -> bool {
         content::set_text_line(self, node, line, width, generation)
     }
-    pub(crate) fn text_content_width(&self, node: NodeId) -> f32 {
+    pub(crate) fn text_content_width(&self, node: NodeId) -> LogicalPx {
         content::text_content_width(self, node)
     }
     pub(crate) fn text_line(&self, node: NodeId) -> Option<&Rc<ShapedLine>> {
         content::text_line(self, node)
     }
-    pub(crate) fn text_measured_size(&self, node: NodeId) -> Option<Size> {
+    pub(crate) fn text_measured_size(&self, node: NodeId) -> Option<LogicalSize> {
         content::text_measured_size(self, node)
     }
     pub(crate) fn text_slot(&self, node: NodeId) -> Option<&TextSlot> {
@@ -916,16 +923,20 @@ impl NodeTree {
         node: NodeId,
         anchor: usize,
         focus: usize,
-    ) -> Result<Vec<Rect>, EngineError> {
+    ) -> Result<Vec<LogicalRect>, EngineError> {
         content::text_selection_rects(self, node, anchor, focus)
     }
-    pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
+    pub fn text_caret_rect(
+        &self,
+        node: NodeId,
+        byte_index: usize,
+    ) -> Result<LogicalRect, EngineError> {
         content::text_caret_rect(self, node, byte_index)
     }
     pub(crate) fn text_byte_index_at(
         &self,
         node: NodeId,
-        local_point: Point,
+        local_point: LogicalPoint,
     ) -> Result<usize, EngineError> {
         content::text_byte_index_at(self, node, local_point)
     }
@@ -967,11 +978,11 @@ impl NodeTree {
         &mut self,
         node: NodeId,
         transform: Transform,
-        extra_damage: Rect,
+        extra_damage: LogicalRect,
     ) -> Result<(), EngineError> {
         content::set_geometry_transform(self, node, transform, extra_damage)
     }
-    pub(crate) fn content_offset(&self, node: NodeId) -> Point {
+    pub(crate) fn content_offset(&self, node: NodeId) -> LogicalPoint {
         content::content_offset(self, node)
     }
     pub(crate) fn lane_of(&self, node: NodeId) -> Option<LaneId> {
@@ -1016,13 +1027,13 @@ impl NodeTree {
     pub(crate) fn bind_geometry_node(&mut self, geometry: GeometryId, node: NodeId) {
         content::bind_geometry_node(self, geometry, node)
     }
-    pub(crate) fn lane_offset(&self, node: NodeId) -> Point {
+    pub(crate) fn lane_offset(&self, node: NodeId) -> LogicalPoint {
         content::lane_offset(self, node)
     }
-    pub(crate) fn set_lane_offset(&mut self, node: NodeId, offset: Point) {
+    pub(crate) fn set_lane_offset(&mut self, node: NodeId, offset: LogicalPoint) {
         content::set_lane_offset(self, node, offset)
     }
-    pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<PhysicalRect>)> {
+    pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<DeviceRect>)> {
         content::clip_key(self, node)
     }
     pub(crate) fn set_paint_opacity(&mut self, node: NodeId, opacity: f32) {
@@ -1031,9 +1042,9 @@ impl NodeTree {
     pub(crate) fn paint_state(
         &self,
         node: NodeId,
-        screen_offset: Point,
-        bake_offset: Point,
-        clip_key: (u8, Option<PhysicalRect>),
+        screen_offset: LogicalPoint,
+        bake_offset: LogicalPoint,
+        clip_key: (u8, Option<DeviceRect>),
         inherited_opacity: f32,
     ) -> Option<PaintNodeState> {
         content::paint_state(
@@ -1045,7 +1056,7 @@ impl NodeTree {
             inherited_opacity,
         )
     }
-    pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<PhysicalRect>)) {
+    pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<DeviceRect>)) {
         content::set_clip_key(self, node, key)
     }
     pub(crate) fn clear_clip_key(&mut self, node: NodeId) {

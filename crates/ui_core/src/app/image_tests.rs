@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use crate::{
     a11y::{A11yAction, A11yDiagnostic, A11yDrawKind, A11yOverride, A11yRole},
     app::App,
-    math::{Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit, tree::NodeTree},
     paint::{
         color::{Color, ColorResolver},
@@ -40,7 +40,7 @@ fn white() -> PaintSpec {
 }
 
 fn fixed(width: f32, height: f32) -> Style {
-    StyleBuilder::new().size(width, height).build()
+    StyleBuilder::new().size(px(width), px(height)).build()
 }
 
 struct Fixture {
@@ -58,8 +58,8 @@ impl Fixture {
         let mut app = App::new(rt.handle().clone());
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("image"),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let mut fixture = Self { rt, app, window };
@@ -94,7 +94,7 @@ impl Fixture {
         build(self.tree_mut(), root)
     }
 
-    fn bounds(&self, node: NodeId) -> Rect {
+    fn bounds(&self, node: NodeId) -> LogicalRect {
         self.app
             .window(self.window)
             .expect("window")
@@ -169,7 +169,7 @@ fn intrinsic_size_drives_layout_and_fill_paint() {
     let record = fixture.committed();
     assert_eq!(
         fixture.bounds(node),
-        Rect::new(0.0, 0.0, 40.0, 20.0),
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)),
         "未给尺寸时布局盒 = 资源内在尺寸"
     );
     let painted = image(&record, node);
@@ -200,7 +200,7 @@ fn explicit_style_size_wins_over_the_intrinsic_size() {
     let record = fixture.committed();
     assert_eq!(
         fixture.bounds(node),
-        Rect::new(0.0, 0.0, 16.0, 16.0),
+        LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)),
         "显式 Style 尺寸优先"
     );
     assert_eq!(image(&record, node).bounds, fixture.bounds(node));
@@ -227,7 +227,7 @@ fn contain_letterboxes_and_cover_crops_the_source_uv() {
     let contain_image = image(&record, contain);
     assert_eq!(
         contain_image.bounds,
-        Rect::new(0.0, 4.0, 16.0, 8.0),
+        LogicalRect::new(px(0.0), px(4.0), px(16.0), px(8.0)),
         "Contain = 等比内嵌居中"
     );
     assert_eq!(contain_image.image_uv, Some(tile.uv()), "Contain 不裁源");
@@ -235,7 +235,7 @@ fn contain_letterboxes_and_cover_crops_the_source_uv() {
     let cover_image = image(&record, cover);
     assert_eq!(
         cover_image.bounds,
-        Rect::new(0.0, 16.0, 16.0, 16.0),
+        LogicalRect::new(px(0.0), px(16.0), px(16.0), px(16.0)),
         "Cover 的图元 bounds = 节点盒"
     );
     let (u0, v0, u1, v1) = (tile.u0, tile.v0, tile.u1, tile.v1);
@@ -305,7 +305,10 @@ fn missing_resource_paints_no_image_primitive() {
     let record = fixture.committed();
     assert!(images(&record, node).is_empty(), "没有资源不得画图片图元");
     assert!(has_quad(&record, node), "占位 = 节点自己的背景 Quad");
-    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 16.0, 16.0));
+    assert_eq!(
+        fixture.bounds(node),
+        LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0))
+    );
 }
 
 #[test]
@@ -338,7 +341,10 @@ fn pending_image_placeholder_is_replaced_when_the_resource_arrives() {
     let second = fixture.committed();
     let painted = image(&second, node);
     assert_eq!(painted.bounds, fixture.bounds(node));
-    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 40.0, 20.0));
+    assert_eq!(
+        fixture.bounds(node),
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0))
+    );
 }
 
 #[test]
@@ -361,7 +367,7 @@ fn unloading_a_resource_repaints_without_stale_images() {
     );
     assert_eq!(
         fixture.bounds(node),
-        Rect::new(0.0, 0.0, 24.0, 12.0),
+        LogicalRect::new(px(0.0), px(0.0), px(24.0), px(12.0)),
         "卸载不改变布局（内在尺寸保留）"
     );
 }
@@ -371,8 +377,8 @@ fn closing_a_window_invalidates_images_referencing_released_resources() {
     let mut fixture = Fixture::new();
     let owner = fixture.app.create_window(WindowOptions {
         title: SmolStr::new_static("owner"),
-        size: Size::new(64.0, 64.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let bytes = png(16, 16);
@@ -430,7 +436,7 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
     let one_x = fixture
         .app
         .resources_mut()
-        .insert_at_size(&bytes, Size::new(40.0, 20.0))
+        .insert_at_size(&bytes, LogicalSize::new(px(40.0), px(20.0)))
         .expect("1x variant");
     let node = fixture.mount(|tree, root| {
         NodeBuilder::image(one_x.id, ImageFit::Fill)
@@ -438,24 +444,27 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
             .expect("image")
     });
     let _ = fixture.committed();
-    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 40.0, 20.0));
+    assert_eq!(
+        fixture.bounds(node),
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0))
+    );
 
     fixture
         .app
         .window_mut(fixture.window)
         .expect("window")
-        .set_scale(Scale::new(2.0).expect("finite scale"));
+        .set_scale(DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = fixture.committed();
     assert_eq!(
         fixture.bounds(node),
-        Rect::new(0.0, 0.0, 20.0, 10.0),
+        LogicalRect::new(px(0.0), px(0.0), px(20.0), px(10.0)),
         "内在尺寸 = tile 物理像素 ÷ 窗口 scale"
     );
 
     let two_x = fixture
         .app
         .resources_mut()
-        .insert_for_display(&bytes, Size::new(40.0, 20.0), 2.0)
+        .insert_for_display(&bytes, LogicalSize::new(px(40.0), px(20.0)), 2.0)
         .expect("2x variant");
     assert_eq!(
         (two_x.width, two_x.height),
@@ -474,7 +483,7 @@ fn dpi_change_reresolves_the_intrinsic_size_and_accepts_a_new_variant() {
     let record = fixture.committed();
     assert_eq!(
         fixture.bounds(node),
-        Rect::new(0.0, 0.0, 40.0, 20.0),
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)),
         "按新 scale 选变体后逻辑尺寸恢复"
     );
     assert_eq!(
@@ -545,7 +554,7 @@ fn image_nodes_map_to_the_image_role_with_optional_label() {
     let root = app.app().window(window).expect("window").tree().root();
     let mount = |app: &mut TestApp, label: Option<&'static str>| {
         let mut builder = NodeBuilder::image(resource.id, ImageFit::Contain)
-            .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0));
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)));
         if let Some(label) = label {
             builder = builder.a11y(A11yOverride {
                 label: Some(SmolStr::new_static(label)),
@@ -615,7 +624,7 @@ fn explicitly_decorative_images_have_no_missing_alt_diagnostic() {
     let root = app.app().window(window).expect("window").tree().root();
     let mount = |app: &mut TestApp, over: A11yOverride| {
         NodeBuilder::image(resource.id, ImageFit::Contain)
-            .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)))
             .a11y(over)
             .build(
                 app.app_mut().window_mut(window).expect("window").tree_mut(),
@@ -696,7 +705,7 @@ fn an_svg_display_variant_is_rerasterized_when_the_scale_changes() {
     let one_x = fixture
         .app
         .resources_mut()
-        .insert_svg_for_display(&bytes, Size::new(16.0, 16.0), 1.0)
+        .insert_svg_for_display(&bytes, LogicalSize::new(px(16.0), px(16.0)), 1.0)
         .expect("1× 变体");
     assert_eq!((one_x.width, one_x.height), (16, 16));
     let node = fixture.mount(|tree, root| {
@@ -705,13 +714,16 @@ fn an_svg_display_variant_is_rerasterized_when_the_scale_changes() {
             .expect("image")
     });
     let _ = fixture.committed();
-    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 16.0, 16.0));
+    assert_eq!(
+        fixture.bounds(node),
+        LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0))
+    );
 
     fixture
         .app
         .window_mut(fixture.window)
         .expect("window")
-        .set_scale(Scale::new(2.0).expect("finite scale"));
+        .set_scale(DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = fixture.committed();
     let two_x = mounted_resource(&fixture, node);
     assert_eq!(
@@ -722,7 +734,7 @@ fn an_svg_display_variant_is_rerasterized_when_the_scale_changes() {
     assert_ne!(two_x.id, one_x.id, "换的是变体，不是同一张栅格");
     assert_eq!(
         fixture.bounds(node),
-        Rect::new(0.0, 0.0, 16.0, 16.0),
+        LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)),
         "物理栅格变了，逻辑内在尺寸不变（32 ÷ 2）"
     );
 }
@@ -734,7 +746,7 @@ fn a_bitmap_display_variant_is_rerasterized_when_the_scale_changes() {
     let one_x = fixture
         .app
         .resources_mut()
-        .insert_for_display(&bytes, Size::new(40.0, 20.0), 1.0)
+        .insert_for_display(&bytes, LogicalSize::new(px(40.0), px(20.0)), 1.0)
         .expect("1× 变体");
     let node = fixture.mount(|tree, root| {
         NodeBuilder::image(one_x.id, ImageFit::Fill)
@@ -747,7 +759,7 @@ fn a_bitmap_display_variant_is_rerasterized_when_the_scale_changes() {
         .app
         .window_mut(fixture.window)
         .expect("window")
-        .set_scale(Scale::new(2.0).expect("finite scale"));
+        .set_scale(DevicePixelRatio::new(2.0).expect("finite scale"));
     let _ = fixture.committed();
     let two_x = mounted_resource(&fixture, node);
     assert_eq!(
@@ -755,5 +767,8 @@ fn a_bitmap_display_variant_is_rerasterized_when_the_scale_changes() {
         (80, 40),
         "位图的 for_display 变体同样按新 scale 重解"
     );
-    assert_eq!(fixture.bounds(node), Rect::new(0.0, 0.0, 40.0, 20.0));
+    assert_eq!(
+        fixture.bounds(node),
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0))
+    );
 }

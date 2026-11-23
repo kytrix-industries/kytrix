@@ -355,8 +355,8 @@ pub(super) fn pump(
 
 #[derive(Clone, Copy, PartialEq)]
 struct GeometryKey {
-    logical: crate::math::Size,
-    scale: crate::math::Scale,
+    logical: crate::math::LogicalSize,
+    scale: crate::math::DevicePixelRatio,
 }
 
 enum ClientProbe {
@@ -794,7 +794,7 @@ pub(super) fn frame_all(
 mod geometry_cache_tests {
     use super::{ClientProbe, GeometryCache, GeometryKey};
     use crate::{
-        math::{Scale, Size},
+        math::{DevicePixelRatio, LogicalSize, px},
         window::WindowId,
     };
 
@@ -804,8 +804,8 @@ mod geometry_cache_tests {
 
     fn key(width: f32) -> GeometryKey {
         GeometryKey {
-            logical: Size::new(width, 600.0),
-            scale: Scale::ONE,
+            logical: LogicalSize::new(px(width), px(600.0)),
+            scale: DevicePixelRatio::ONE,
         }
     }
 
@@ -854,7 +854,7 @@ mod geometry_cache_tests {
             Some((900, 700))
         );
         let mut dpi = key(900.0);
-        dpi.scale = Scale::new(1.25).expect("scale");
+        dpi.scale = DevicePixelRatio::new(1.25).expect("scale");
         assert_eq!(
             cache.client(id, dpi, || probe((1125, 875))),
             Some((1125, 875))

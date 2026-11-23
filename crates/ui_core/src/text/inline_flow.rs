@@ -5,7 +5,7 @@ use parley::{
 
 use super::{InlineAlign, InlineBoxSpec, TextDiagnostic};
 use crate::{
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     paint::color::ColorBrush,
 };
 
@@ -28,9 +28,9 @@ pub(crate) fn to_inline_box(
         id: spec.id,
         kind: InlineBoxKind::InFlow,
         index,
-        width: spec.size.width,
-        height: spec.size.height,
-        baseline: spec.baseline,
+        width: spec.size.width.value(),
+        height: spec.size.height.value(),
+        baseline: spec.baseline.map(LogicalPx::value),
         vertical_align: vertical_align(spec.align),
     };
     (inline_box, diagnostic)
@@ -61,7 +61,7 @@ pub(crate) fn selection_rects(
     layout: &parley::Layout<ColorBrush>,
     anchor: usize,
     focus: usize,
-) -> Vec<Rect> {
+) -> Vec<LogicalRect> {
     let anchor_cursor = Cursor::from_byte_index(layout, anchor, Affinity::Downstream);
     let focus_cursor = Cursor::from_byte_index(layout, focus, Affinity::Upstream);
     let selection = Selection::new(anchor_cursor, focus_cursor);
@@ -75,7 +75,7 @@ pub(crate) fn selection_rects(
         .collect()
 }
 
-pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> Rect {
+pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> LogicalRect {
     let cursor = Cursor::from_byte_index(layout, byte_index, Affinity::Downstream);
     to_rect(cursor.geometry(layout, 1.0))
 }
@@ -83,23 +83,26 @@ pub(crate) fn caret_rect(layout: &parley::Layout<ColorBrush>, byte_index: usize)
 pub(crate) fn byte_index_at(
     layout: &parley::Layout<ColorBrush>,
     text: &str,
-    point: Point,
+    point: LogicalPoint,
 ) -> usize {
-    if point.y < 0.0 {
+    if point.y < LogicalPx::ZERO {
         return 0;
     }
-    if point.y > layout.height() {
+    if point.y.value() > layout.height() {
         return text.len();
     }
-    floor_boundary(Cursor::from_point(layout, point.x, point.y).index(), text)
+    floor_boundary(
+        Cursor::from_point(layout, point.x.value(), point.y.value()).index(),
+        text,
+    )
 }
 
-fn to_rect(bounds: BoundingBox) -> Rect {
-    Rect::new(
-        bounds.x0 as f32,
-        bounds.y0 as f32,
-        (bounds.x1 - bounds.x0) as f32,
-        (bounds.y1 - bounds.y0) as f32,
+fn to_rect(bounds: BoundingBox) -> LogicalRect {
+    LogicalRect::new(
+        px(bounds.x0 as f32),
+        px(bounds.y0 as f32),
+        px((bounds.x1 - bounds.x0) as f32),
+        px((bounds.y1 - bounds.y0) as f32),
     )
 }
 
@@ -109,7 +112,7 @@ mod tests {
         byte_index_at, caret_rect, floor_boundary, selection_rects, to_inline_box, vertical_align,
     };
     use crate::{
-        math::{Point, Size},
+        math::{LogicalPoint, LogicalSize, px},
         paint::color::ColorBrush,
         text::{InlineAlign, InlineBoxSpec, TextDiagnostic},
     };
@@ -118,7 +121,7 @@ mod tests {
         InlineBoxSpec {
             id: 5,
             index,
-            size: Size::new(10.0, 10.0),
+            size: LogicalSize::new(px(10.0), px(10.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint: None,
@@ -144,9 +147,9 @@ mod tests {
         layout
     }
 
-    fn caret_center(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> Point {
+    fn caret_center(layout: &parley::Layout<ColorBrush>, byte_index: usize) -> LogicalPoint {
         let rect = caret_rect(layout, byte_index);
-        Point::new(rect.origin.x + 0.5, rect.origin.y + rect.size.height * 0.5)
+        LogicalPoint::new(rect.origin.x + 0.5, rect.origin.y + rect.size.height * 0.5)
     }
 
     #[test]
@@ -180,7 +183,7 @@ mod tests {
     #[test]
     fn inline_box_keeps_baseline_scaled_and_needs_no_diagnostic() {
         let mut spec = spec(0);
-        spec.baseline = Some(4.0);
+        spec.baseline = Some(px(4.0));
         let (inline_box, diagnostic) = to_inline_box(&spec, "x");
 
         assert_eq!(inline_box.baseline, Some(4.0), "基线也是逻辑像素");
@@ -224,9 +227,9 @@ mod tests {
         let rects = selection_rects(&layout, 0, 3);
 
         assert_eq!(rects.len(), 1);
-        assert!(rects[0].origin.x.abs() < 0.01);
-        assert!(rects[0].size.width > 0.0);
-        assert!(rects[0].size.height > 0.0);
+        assert!(rects[0].origin.x.abs() < px(0.01));
+        assert!(rects[0].size.width > px(0.0));
+        assert!(rects[0].size.height > px(0.0));
     }
 
     #[test]
@@ -254,7 +257,7 @@ mod tests {
 
         assert_eq!(rects.len(), 1);
         assert!(
-            (rects[0].origin.x + rects[0].size.width - caret.origin.x).abs() < 0.01,
+            (rects[0].origin.x + rects[0].size.width - caret.origin.x).abs() < px(0.01),
             "{:?} vs {caret:?}",
             rects[0]
         );
@@ -266,9 +269,9 @@ mod tests {
 
         let rect = caret_rect(&layout, 3);
 
-        assert!((rect.size.width - 1.0).abs() < 0.01);
+        assert!((rect.size.width - 1.0).abs() < px(0.01));
         assert!(
-            (rect.origin.x - layout.width()).abs() < 0.01,
+            (rect.origin.x - layout.width()).abs() < px(0.01),
             "caret x {} must equal line width {}",
             rect.origin.x,
             layout.width()
@@ -281,8 +284,8 @@ mod tests {
 
         let rect = caret_rect(&layout, "你好".len());
 
-        assert!(rect.origin.x > 0.0);
-        assert!(rect.size.height > 0.0);
+        assert!(rect.origin.x > px(0.0));
+        assert!(rect.size.height > px(0.0));
     }
 
     #[test]
@@ -291,8 +294,11 @@ mod tests {
 
         let rect = caret_rect(&layout, 3);
 
-        assert!((rect.size.width - 1.0).abs() < 0.01, "{rect:?}");
-        assert!((rect.origin.x - layout.width()).abs() < 0.01, "{rect:?}");
+        assert!((rect.size.width - 1.0).abs() < px(0.01), "{rect:?}");
+        assert!(
+            (rect.origin.x - layout.width()).abs() < px(0.01),
+            "{rect:?}"
+        );
     }
 
     #[test]
@@ -301,9 +307,9 @@ mod tests {
 
         let rect = caret_rect(&layout, 0);
 
-        assert_eq!(rect.origin.x, 0.0);
-        assert!((rect.size.width - 1.0).abs() < 0.01, "{rect:?}");
-        assert!(rect.size.height > 0.0, "{rect:?}");
+        assert_eq!(rect.origin.x, px(0.0));
+        assert!((rect.size.width - 1.0).abs() < px(0.01), "{rect:?}");
+        assert!(rect.size.height > px(0.0), "{rect:?}");
     }
 
     #[test]
@@ -330,28 +336,35 @@ mod tests {
 
         let line_y = caret_center(&layout, 0).y;
         assert_eq!(
-            byte_index_at(&layout, text, Point::new(0.0, -1.0)),
+            byte_index_at(&layout, text, LogicalPoint::new(px(0.0), px(-1.0))),
             0,
             "文本盒上方 → 0"
         );
         assert_eq!(
-            byte_index_at(&layout, text, Point::new(0.0, height + 1.0)),
+            byte_index_at(&layout, text, LogicalPoint::new(px(0.0), px(height + 1.0))),
             text.len(),
             "文本盒下方 → text.len()"
         );
         assert_eq!(
-            byte_index_at(&layout, text, Point::new(-50.0, line_y)),
+            byte_index_at(&layout, text, LogicalPoint::new(px(-50.0), line_y)),
             0,
             "行首左侧越界 → 行首"
         );
         assert_eq!(
-            byte_index_at(&layout, text, Point::new(width + 50.0, line_y)),
+            byte_index_at(&layout, text, LogicalPoint::new(px(width + 50.0), line_y)),
             text.len(),
             "行尾右侧越界 → 行尾"
         );
-        assert_eq!(byte_index_at(&layout, text, Point::new(-50.0, -50.0)), 0);
         assert_eq!(
-            byte_index_at(&layout, text, Point::new(width + 50.0, height + 50.0)),
+            byte_index_at(&layout, text, LogicalPoint::new(px(-50.0), px(-50.0))),
+            0
+        );
+        assert_eq!(
+            byte_index_at(
+                &layout,
+                text,
+                LogicalPoint::new(px(width + 50.0), px(height + 50.0))
+            ),
             text.len()
         );
     }
@@ -377,9 +390,9 @@ mod tests {
 
         for (line_index, line) in layout.lines().enumerate() {
             let metrics = line.metrics();
-            let point = Point::new(
-                metrics.inline_min_coord.max(0.0) + 0.5,
-                (metrics.block_min_coord + metrics.block_max_coord) * 0.5,
+            let point = LogicalPoint::new(
+                px(metrics.inline_min_coord.max(0.0) + 0.5),
+                px((metrics.block_min_coord + metrics.block_max_coord) * 0.5),
             );
             let index = byte_index_at(&layout, text, point);
             let range = line.text_range();
@@ -405,9 +418,9 @@ mod tests {
             "换行后行首 {point:?}"
         );
         let first_line = layout.lines().next().expect("第一行");
-        let first_point = Point::new(
-            first_line.metrics().inline_min_coord + 0.5,
-            (first_line.metrics().block_min_coord + first_line.metrics().block_max_coord) * 0.5,
+        let first_point = LogicalPoint::new(
+            px(first_line.metrics().inline_min_coord + 0.5),
+            px((first_line.metrics().block_min_coord + first_line.metrics().block_max_coord) * 0.5),
         );
         assert!(byte_index_at(&layout, text, first_point) <= 2);
     }
@@ -418,7 +431,7 @@ mod tests {
         let layout = layout_of(text);
         let cjk_start = text.find('中').expect("含 CJK");
         let cjk_end = cjk_start + '中'.len_utf8();
-        let middle = Point::new(
+        let middle = LogicalPoint::new(
             (caret_rect(&layout, cjk_start).origin.x + caret_rect(&layout, cjk_end).origin.x) * 0.5,
             caret_center(&layout, cjk_start).y,
         );
@@ -430,7 +443,11 @@ mod tests {
         );
         let mut x = -1.0;
         while x <= layout.width() + 1.0 {
-            let index = byte_index_at(&layout, text, Point::new(x, caret_center(&layout, 0).y));
+            let index = byte_index_at(
+                &layout,
+                text,
+                LogicalPoint::new(px(x), caret_center(&layout, 0).y),
+            );
             assert!(text.is_char_boundary(index), "x={x} 返回非边界 {index}");
             assert!(
                 index != cjk_start + 1 && index != cjk_start + 2,
@@ -448,7 +465,7 @@ mod tests {
         let emoji_end = text.find('b').expect("emoji 之后还有文本");
         assert!(emoji_end > emoji_start);
         let y = caret_center(&layout, 0).y;
-        let middle = Point::new(
+        let middle = LogicalPoint::new(
             (caret_rect(&layout, emoji_start).origin.x + caret_rect(&layout, emoji_end).origin.x)
                 * 0.5,
             y,
@@ -461,7 +478,7 @@ mod tests {
         );
         let mut x = -1.0;
         while x <= layout.width() + 1.0 {
-            let index = byte_index_at(&layout, text, Point::new(x, y));
+            let index = byte_index_at(&layout, text, LogicalPoint::new(px(x), y));
             assert!(text.is_char_boundary(index), "x={x} 返回非边界 {index}");
             assert!(
                 index <= emoji_start || index >= emoji_end,
@@ -476,9 +493,9 @@ mod tests {
         let layout = layout_of("");
 
         for point in [
-            Point::new(0.0, 0.0),
-            Point::new(-10.0, -10.0),
-            Point::new(100.0, 100.0),
+            LogicalPoint::new(px(0.0), px(0.0)),
+            LogicalPoint::new(px(-10.0), px(-10.0)),
+            LogicalPoint::new(px(100.0), px(100.0)),
         ] {
             assert_eq!(byte_index_at(&layout, "", point), 0, "{point:?}");
         }
@@ -498,8 +515,8 @@ mod tests {
             let metrics = line.metrics();
             let y = (metrics.block_min_coord + metrics.block_max_coord) * 0.5;
             let range = line.text_range();
-            let left = byte_index_at(&layout, text, Point::new(-50.0, y));
-            let right = byte_index_at(&layout, text, Point::new(width + 50.0, y));
+            let left = byte_index_at(&layout, text, LogicalPoint::new(px(-50.0), px(y)));
+            let right = byte_index_at(&layout, text, LogicalPoint::new(px(width + 50.0), px(y)));
             for (side, index) in [("左", left), ("右", right)] {
                 assert!(
                     range.start <= index && index <= range.end,
@@ -572,7 +589,7 @@ mod tests {
         byte_index: usize,
     ) {
         let rect = caret_rect(layout, byte_index);
-        let point = Point::new(rect.origin.x, rect.origin.y + rect.size.height * 0.5);
+        let point = LogicalPoint::new(rect.origin.x, rect.origin.y + rect.size.height * 0.5);
         let hit = byte_index_at(layout, text, point);
         assert!(
             text.is_char_boundary(hit),
@@ -580,9 +597,9 @@ mod tests {
         );
         let xs = caret_xs(layout, hit);
         assert!(
-            xs.iter().any(|x| (x - point.x).abs() <= 0.05),
+            xs.iter().any(|x| (x - point.x.value()).abs() <= 0.05),
             "caret({byte_index}) 精确边界 x={} 的命中 {hit} 必须共享该视觉位置（caret x = {xs:?}）",
-            point.x
+            point.x.value()
         );
     }
 
@@ -609,7 +626,7 @@ mod tests {
         let hit = byte_index_at(
             &layout,
             text,
-            Point::new(last.origin.x, last.origin.y + last.size.height * 0.5),
+            LogicalPoint::new(last.origin.x, last.origin.y + last.size.height * 0.5),
         );
         assert!(
             hit >= 6,
@@ -659,13 +676,13 @@ mod tests {
         }
 
         let y = caret_center(&layout, 0).y;
-        let right_mid = Point::new((x(0) + x(4)) * 0.5, y);
+        let right_mid = LogicalPoint::new((x(0) + x(4)) * 0.5, y);
         let right_hit = byte_index_at(&layout, text, right_mid);
         assert!(
             right_hit <= 4,
             "视觉右半必须命中逻辑 0..=4 的 run，实际 {right_hit}"
         );
-        let left_mid = Point::new((x(4) + x(12)) * 0.5, y);
+        let left_mid = LogicalPoint::new((x(4) + x(12)) * 0.5, y);
         let left_hit = byte_index_at(&layout, text, left_mid);
         assert!(
             left_hit >= 4,

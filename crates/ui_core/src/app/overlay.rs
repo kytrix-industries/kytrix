@@ -6,7 +6,7 @@ use crate::{
         Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement, OverlaySlot, focus,
         overlay as overlay_util,
     },
-    math::{Rect, Size},
+    math::{LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     window::WindowId,
 };
@@ -37,7 +37,7 @@ pub(crate) fn create_overlay(
         return Err(EngineError::UnknownWindow { window });
     };
     let root = target.tree().root();
-    let origin = interaction::resolve_placement(target.tree(), placement, Size::ZERO);
+    let origin = interaction::resolve_placement(target.tree(), placement, LogicalSize::ZERO);
     let style = overlay_style(origin);
     let node = NodeBuilder::boxed()
         .style(style)
@@ -86,13 +86,15 @@ pub(crate) fn resolve_overlay_placements(app: &mut App, window: WindowId) {
         let size = target
             .tree()
             .get(node)
-            .map_or(Size::ZERO, |target| target.layout().bounds.size);
+            .map_or(LogicalSize::ZERO, |target| target.layout().bounds.size);
         let origin = interaction::resolve_placement(target.tree(), slot.placement, size);
         let current = target
             .tree()
             .get(node)
-            .map_or(Rect::default(), |target| target.layout().bounds);
-        if (current.origin.x - origin.x).abs() < 0.5 && (current.origin.y - origin.y).abs() < 0.5 {
+            .map_or(LogicalRect::default(), |target| target.layout().bounds);
+        if (current.origin.x - origin.x).abs() < px(0.5)
+            && (current.origin.y - origin.y).abs() < px(0.5)
+        {
             continue;
         }
         let _ = target.tree_mut().set_absolute_inset(node, origin);
@@ -112,7 +114,7 @@ pub(crate) fn place_overlay(app: &mut App, overlay: &Overlay, placement: Overlay
     let size = target
         .tree()
         .get(node)
-        .map_or(Size::ZERO, |target| target.layout().bounds.size);
+        .map_or(LogicalSize::ZERO, |target| target.layout().bounds.size);
     let origin = interaction::resolve_placement(target.tree(), placement, size);
     if !target.tree_mut().set_absolute_inset(node, origin) {
         return false;

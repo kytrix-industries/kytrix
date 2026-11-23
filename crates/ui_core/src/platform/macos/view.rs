@@ -27,7 +27,7 @@ use crate::{
         PointerButton, ScrollPhase, modifier_key_transitions, scroll_delta, should_emit_text,
         timestamp_from_ticks,
     },
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect, px},
     paint::style::Cursor,
     platform::{
         dispatcher::Dispatcher,
@@ -46,12 +46,12 @@ pub(crate) struct ViewIvars {
     ime: RefCell<ImeState>,
     a11y: RefCell<Option<MacA11y>>,
     modifiers: Cell<u8>,
-    ime_cursor: Cell<Option<Rect>>,
+    ime_cursor: Cell<Option<LogicalRect>>,
     cursor: Cell<Cursor>,
     pointer_inside: Cell<bool>,
     ime_enabled: Cell<bool>,
     edit: Cell<EditAvailability>,
-    drag_regions: RefCell<Vec<Rect>>,
+    drag_regions: RefCell<Vec<LogicalRect>>,
     window_drag: Cell<WindowDragState>,
 }
 
@@ -525,10 +525,13 @@ define_class!(
             unsafe { *actual.as_ptr() = range };
             let local = match self.ivars().ime_cursor.get() {
                 Some(area) => NSRect::new(
-                    NSPoint::new(f64::from(area.origin.x), f64::from(area.origin.y)),
+                    NSPoint::new(
+                        f64::from(area.origin.x.value()),
+                        f64::from(area.origin.y.value()),
+                    ),
                     NSSize::new(
-                        f64::from(area.size.width.max(1.0)),
-                        f64::from(area.size.height.max(1.0)),
+                        f64::from(area.size.width.max(px(1.0)).value()),
+                        f64::from(area.size.height.max(px(1.0)).value()),
                     ),
                 ),
                 None => NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
@@ -663,7 +666,7 @@ impl GuiView {
         std::mem::take(&mut *self.ivars().events.borrow_mut())
     }
 
-    pub(crate) fn set_ime_cursor_area(&self, area: Option<Rect>) {
+    pub(crate) fn set_ime_cursor_area(&self, area: Option<LogicalRect>) {
         self.ivars().ime_cursor.set(area);
     }
 
@@ -678,7 +681,7 @@ impl GuiView {
         }
     }
 
-    pub(crate) fn set_drag_regions(&self, regions: &[Rect]) {
+    pub(crate) fn set_drag_regions(&self, regions: &[LogicalRect]) {
         let mut slot = self.ivars().drag_regions.borrow_mut();
         if slot.as_slice() == regions {
             return;
@@ -804,9 +807,9 @@ impl GuiView {
         self.push_event(Event::Input(input));
     }
 
-    fn logical_point(&self, point: NSPoint) -> Point {
+    fn logical_point(&self, point: NSPoint) -> LogicalPoint {
         let local = self.convertPoint_fromView(point, None);
-        Point::new(local.x as f32, local.y as f32)
+        LogicalPoint::new(px(local.x as f32), px(local.y as f32))
     }
 }
 

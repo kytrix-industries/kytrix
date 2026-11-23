@@ -6,7 +6,10 @@ use smallvec::SmallVec;
 use crate::test_support::record::{LaneOutcome, LanePaintEntry, PaintLog};
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Point, Rect, Scale, Size},
+    math::{
+        DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, LogicalSize,
+        PhysicalPx, dp, physical_px, px,
+    },
     node::{
         id::NodeId,
         image::{ImageContent, ImageFit, cover_tile, fit_bounds},
@@ -34,13 +37,13 @@ pub(crate) struct PaintPass<'a> {
     pub geometry: &'a crate::paint::geometry_store::GeometryStore,
     pub scene: &'a mut Scene,
     pub damage: &'a mut DamageAccumulator,
-    pub scale: Scale,
-    pub frame: PhysicalRect,
+    pub scale: DevicePixelRatio,
+    pub frame: DeviceRect,
     pub order: &'a mut Vec<LaneId>,
     pub focused: Option<NodeId>,
     pub atlas: Option<&'a AtlasAllocator>,
     pub resources: Option<&'a ResourceCache>,
-    pub scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
+    pub scroll_slots: &'a mut Vec<(LogicalPoint, DeviceRect)>,
     pub scroll_slot_nodes: &'a mut Vec<NodeId>,
     #[cfg(feature = "test-support")]
     pub log: PaintLog,
@@ -108,7 +111,10 @@ impl PaintPass<'_> {
             order.clear();
             tree.begin_full_scroll_slots();
             scroll_slots.clear();
-            scroll_slots.push((Point::ZERO, PhysicalRect::new(0, 0, 0, 0)));
+            scroll_slots.push((
+                LogicalPoint::ZERO,
+                DeviceRect::new(dp(0), dp(0), dp(0), dp(0)),
+            ));
             scroll_slot_nodes.clear();
         }
         let mut context = PaintContext {
@@ -142,8 +148,8 @@ impl PaintPass<'_> {
             root,
             false,
             &mut clip,
-            Point::ZERO,
-            Point::ZERO,
+            LogicalPoint::ZERO,
+            LogicalPoint::ZERO,
             0,
             0,
             1.0,
@@ -195,10 +201,10 @@ struct PaintContext<'a> {
     tree: &'a mut NodeTree,
     scene: &'a mut Scene,
     damage: &'a mut DamageAccumulator,
-    scale: Scale,
+    scale: DevicePixelRatio,
     mode: PaintMode,
     order: &'a mut Vec<LaneId>,
-    scroll_slots: &'a mut Vec<(Point, PhysicalRect)>,
+    scroll_slots: &'a mut Vec<(LogicalPoint, DeviceRect)>,
     scroll_slot_nodes: &'a mut Vec<NodeId>,
     focused: Option<NodeId>,
     atlas: Option<&'a AtlasAllocator>,
@@ -215,32 +221,32 @@ struct PaintContext<'a> {
     rebuild_scratch: SmallVec<[bool; 8]>,
 }
 
-fn offset_between(total: Point, slot_offset: Point) -> Point {
-    Point::new(total.x - slot_offset.x, total.y - slot_offset.y)
+fn offset_between(total: LogicalPoint, slot_offset: LogicalPoint) -> LogicalPoint {
+    LogicalPoint::new(total.x - slot_offset.x, total.y - slot_offset.y)
 }
 
 #[derive(Default)]
 struct ClipContext {
     rects: SmallVec<[ClipRect; 8]>,
     pushed: SmallVec<[Option<ClipRect>; 8]>,
-    covering: Option<PhysicalRect>,
+    covering: Option<DeviceRect>,
 }
 
 impl ClipContext {
-    fn key(&self) -> (u8, Option<PhysicalRect>) {
+    fn key(&self) -> (u8, Option<DeviceRect>) {
         (self.rects.len() as u8, self.covering)
     }
 
-    fn push(&mut self, padding_box: Rect, scale: Scale) {
+    fn push(&mut self, padding_box: LogicalRect, scale: DevicePixelRatio) {
         let clip = ClipRect {
             rect: padding_box,
-            corner_radius: [0.0; 4],
+            corner_radius: [LogicalPx::ZERO; 4],
         };
         if self.rects.len() >= usize::from(crate::paint::scene::MAX_CLIP_DEPTH) {
             let last = self.rects.last_mut().expect("刚刚判过非空");
             let previous = *last;
             last.rect = last.rect.intersect(clip.rect);
-            last.corner_radius = [0.0; 4];
+            last.corner_radius = [LogicalPx::ZERO; 4];
             self.pushed.push(Some(previous));
             self.rebuild_covering(scale);
             return;
@@ -250,7 +256,7 @@ impl ClipContext {
         self.rebuild_covering(scale);
     }
 
-    fn pop(&mut self, scale: Scale) {
+    fn pop(&mut self, scale: DevicePixelRatio) {
         match self.pushed.pop() {
             Some(None) => {
                 let _ = self.rects.pop();
@@ -265,10 +271,10 @@ impl ClipContext {
         self.rebuild_covering(scale);
     }
 
-    fn rebuild_covering(&mut self, scale: Scale) {
-        let mut covering: Option<PhysicalRect> = None;
+    fn rebuild_covering(&mut self, scale: DevicePixelRatio) {
+        let mut covering: Option<DeviceRect> = None;
         for rect in &self.rects {
-            let physical = rect.rect.to_physical_covering(scale);
+            let physical = scale.to_covering_device_rect(rect.rect);
             covering = Some(match covering {
                 Some(parent) => parent.intersect(physical),
                 None => physical,
@@ -299,8 +305,8 @@ fn paint_node(
     node: NodeId,
     parent_hidden: bool,
     clip: &mut ClipContext,
-    total: Point,
-    slot_offset: Point,
+    total: LogicalPoint,
+    slot_offset: LogicalPoint,
     slot: u32,
     boundary: usize,
     inherited_opacity: f32,
@@ -325,7 +331,7 @@ fn paint_node(
         return Ok(());
     }
     let (node_slot, node_slot_offset) = if state.screen_baked {
-        (0, Point::ZERO)
+        (0, LogicalPoint::ZERO)
     } else {
         (slot, slot_offset)
     };
@@ -380,12 +386,12 @@ fn paint_node(
     if let Some(own) = state.scroll {
         let viewport = clip.covering.unwrap_or_else(|| {
             state.clip_bounds.map_or_else(
-                || PhysicalRect::new(0, 0, 0, 0),
-                |rect| rect.to_physical_covering(context.scale),
+                || DeviceRect::new(dp(0), dp(0), dp(0), dp(0)),
+                |rect| context.scale.to_covering_device_rect(rect),
             )
         });
         let index = scroll_slot_for(context, node, own, viewport);
-        child_total = Point::new(total.x + own.x, total.y + own.y);
+        child_total = LogicalPoint::new(total.x + own.x, total.y + own.y);
         child_slot = index;
         child_slot_offset = own;
         child_boundary = clip.rects.len();
@@ -418,8 +424,8 @@ fn paint_node(
 fn scroll_slot_for(
     context: &mut PaintContext<'_>,
     node: NodeId,
-    offset: Point,
-    viewport: PhysicalRect,
+    offset: LogicalPoint,
+    viewport: DeviceRect,
 ) -> u32 {
     let cached = context.tree.scroll_slot_cached(node);
     if context.mode.is_full() || cached == 0 {
@@ -470,7 +476,12 @@ fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
     }
 }
 
-fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext, total: Point) {
+fn hide_subtree(
+    context: &mut PaintContext<'_>,
+    node: NodeId,
+    clip: &ClipContext,
+    total: LogicalPoint,
+) {
     let previous_content = painted_content(context.tree, context.scene, node, context.scale);
     let (children, damage_rect, child_offset) = {
         let Ok(target) = context.tree.get(node) else {
@@ -491,7 +502,7 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
             + context
                 .tree
                 .scroll_slot(node)
-                .map_or(Point::ZERO, |slot| slot.offset);
+                .map_or(LogicalPoint::ZERO, |slot| slot.offset);
         (children, damage_rect, child_offset)
     };
     for index in 0..context.tree.lane_count(node) {
@@ -520,12 +531,14 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     context.tree.clear_clip_key(node);
     context.tree.set_reusable(node);
     context.tree.clear_paint(node);
-    context.damage.push_logical(damage_rect, 1.0, clip.covering);
+    context
+        .damage
+        .push_logical(damage_rect, physical_px(1.0), clip.covering);
     push_painted_shadow(context, &previous_content, total, clip.covering);
     if !previous_content.screen.is_empty() {
         context
             .damage
-            .push_logical(previous_content.screen, 1.0, clip.covering);
+            .push_logical(previous_content.screen, physical_px(1.0), clip.covering);
     }
     for child in children {
         hide_subtree(context, child, clip, child_offset);
@@ -536,9 +549,9 @@ fn rebuild_lane(
     context: &mut PaintContext<'_>,
     node: NodeId,
     clip: &ClipContext,
-    total: Point,
+    total: LogicalPoint,
     slot: u32,
-    slot_offset: Point,
+    slot_offset: LogicalPoint,
     boundary: usize,
     opacity: f32,
 ) -> Result<(), EngineError> {
@@ -643,7 +656,7 @@ fn rebuild_lane(
     if !previous_content.screen.is_empty() {
         context
             .damage
-            .push_logical(previous_content.screen, 1.0, clip.covering);
+            .push_logical(previous_content.screen, physical_px(1.0), clip.covering);
     }
 
     for _ in inner_clips.iter().rev() {
@@ -695,22 +708,22 @@ fn rebuild_lane(
 }
 
 struct GeometryNodeState {
-    bounds: Rect,
-    content_offset: Point,
+    bounds: LogicalRect,
+    content_offset: LogicalPoint,
     patch: StylePatch,
     spec: Option<PaintSpec>,
-    node_damage: Rect,
+    node_damage: LogicalRect,
     ring: Option<crate::paint::style::FocusRing>,
-    content_clip: Option<Rect>,
+    content_clip: Option<LogicalRect>,
     geometry_transform: crate::math::Transform,
-    bake: Point,
+    bake: LogicalPoint,
 }
 
 fn geometry_node_state(
     context: &PaintContext<'_>,
     node: NodeId,
-    total: Point,
-    node_slot_offset: Point,
+    total: LogicalPoint,
+    node_slot_offset: LogicalPoint,
 ) -> Option<GeometryNodeState> {
     let Ok(target) = context.tree.get(node) else {
         return None;
@@ -743,12 +756,12 @@ fn geometry_node_state(
 fn geometry_chunk_local_bounds(
     snapshot: Option<&std::sync::Arc<crate::paint::geometry::GeometrySnapshot>>,
     chunk: usize,
-) -> Option<Rect> {
+) -> Option<LogicalRect> {
     let snapshot = snapshot?;
     Some(match snapshot.chunk(chunk as u32) {
         Some(meta) if !meta.bounds.is_empty() => meta.bounds,
         Some(_) => snapshot.bounds(),
-        None => Rect::default(),
+        None => LogicalRect::default(),
     })
 }
 
@@ -775,11 +788,11 @@ fn clear_geometry_lanes(
     context: &mut PaintContext<'_>,
     node: NodeId,
     old_lanes: usize,
-    total: Point,
+    total: LogicalPoint,
     clip: &ClipContext,
-    node_damage: &Rect,
+    node_damage: &LogicalRect,
     geometry_transform: crate::math::Transform,
-    bake: Point,
+    bake: LogicalPoint,
 ) {
     for chunk in 0..old_lanes {
         let Some(previous) = context.baked_scratch.get(chunk).copied() else {
@@ -787,7 +800,9 @@ fn clear_geometry_lanes(
         };
         let damage = geometry_chunk_damage(geometry_transform, previous.bounds, total);
         if !damage.is_empty() {
-            context.damage.push_logical(damage, 1.0, clip.covering);
+            context
+                .damage
+                .push_logical(damage, physical_px(1.0), clip.covering);
         }
     }
     let mut order_changed = false;
@@ -814,9 +829,11 @@ fn clear_geometry_lanes(
     context.tree.clear_lane(node);
     context.tree.resize_baked_geometry_chunks(node, 0);
     if !node_damage.is_empty() {
-        context
-            .damage
-            .push_logical(node_damage.translate(negate(total)), 1.0, clip.covering);
+        context.damage.push_logical(
+            node_damage.translate(negate(total)),
+            physical_px(1.0),
+            clip.covering,
+        );
         context.rebuilt += 1;
     }
     context.tree.set_reusable(node);
@@ -834,14 +851,14 @@ fn paint_geometry_node(
     state: &PaintNodeState,
     geometry_id: crate::paint::geometry::GeometryId,
     clip: &ClipContext,
-    total: Point,
+    total: LogicalPoint,
     opacity: f32,
 ) -> Result<(), EngineError> {
     let snapshot = context.geometry.snapshot_arc(geometry_id);
     let desired = snapshot
         .as_ref()
         .map_or(1, |snapshot| snapshot.chunks().len().max(1));
-    let Some(node_state) = geometry_node_state(context, node, total, Point::ZERO) else {
+    let Some(node_state) = geometry_node_state(context, node, total, LogicalPoint::ZERO) else {
         return Ok(());
     };
     let GeometryNodeState {
@@ -960,10 +977,10 @@ fn paint_geometry_node(
             node_damage: if chunk == 0 {
                 node_damage
             } else {
-                Rect::default()
+                LogicalRect::default()
             },
             offset: total,
-            damage_shift: negate(Point::ZERO),
+            damage_shift: negate(LogicalPoint::ZERO),
             ring: if chunk == 0 { ring } else { None },
             geometry_transform,
             content_clip,
@@ -996,7 +1013,7 @@ fn paint_geometry_node(
             (Some(_), Some(new_bounds)) => {
                 geometry_chunk_damage(geometry_transform, new_bounds, total)
             }
-            (Some(_), None) => Rect::default(),
+            (Some(_), None) => LogicalRect::default(),
         };
         if let Some(previous) = previous {
             damage = damage.union(geometry_chunk_damage(
@@ -1006,7 +1023,9 @@ fn paint_geometry_node(
             ));
         }
         if !damage.is_empty() {
-            context.damage.push_logical(damage, 1.0, clip.covering);
+            context
+                .damage
+                .push_logical(damage, physical_px(1.0), clip.covering);
         }
         let revision = snapshot
             .as_ref()
@@ -1052,7 +1071,9 @@ fn paint_geometry_node(
         if let Some(previous) = context.baked_scratch.get(chunk) {
             let damage = geometry_chunk_damage(geometry_transform, previous.bounds, total);
             if !damage.is_empty() {
-                context.damage.push_logical(damage, 1.0, clip.covering);
+                context
+                    .damage
+                    .push_logical(damage, physical_px(1.0), clip.covering);
             }
         }
         context.scene.release_lane(lane);
@@ -1076,30 +1097,30 @@ fn paint_geometry_node(
 
 fn geometry_chunk_damage(
     transform: crate::math::Transform,
-    chunk_bounds: Rect,
-    total: Point,
-) -> Rect {
+    chunk_bounds: LogicalRect,
+    total: LogicalPoint,
+) -> LogicalRect {
     if chunk_bounds.is_empty() {
-        return Rect::default();
+        return LogicalRect::default();
     }
     let aabb = transformed_chunk_aabb(transform, chunk_bounds);
-    Rect::new(
-        aabb[0] - total.x,
-        aabb[1] - total.y,
-        (aabb[2] - aabb[0]).max(0.0),
-        (aabb[3] - aabb[1]).max(0.0),
+    LogicalRect::new(
+        px(aabb[0] - total.x.value()),
+        px(aabb[1] - total.y.value()),
+        px((aabb[2] - aabb[0]).max(0.0)),
+        px((aabb[3] - aabb[1]).max(0.0)),
     )
 }
 
-fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: Rect) -> [f32; 4] {
-    let far = Point::new(
+fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: LogicalRect) -> [f32; 4] {
+    let far = LogicalPoint::new(
         bounds.origin.x + bounds.size.width,
         bounds.origin.y + bounds.size.height,
     );
     let corners = [
         transform.apply(bounds.origin),
-        transform.apply(Point::new(far.x, bounds.origin.y)),
-        transform.apply(Point::new(bounds.origin.x, far.y)),
+        transform.apply(LogicalPoint::new(far.x, bounds.origin.y)),
+        transform.apply(LogicalPoint::new(bounds.origin.x, far.y)),
         transform.apply(far),
     ];
     if !corners
@@ -1116,10 +1137,10 @@ fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: Rect) -> [f
     ];
     for point in corners {
         aabb = [
-            aabb[0].min(point.x),
-            aabb[1].min(point.y),
-            aabb[2].max(point.x),
-            aabb[3].max(point.y),
+            aabb[0].min(point.x.value()),
+            aabb[1].min(point.y.value()),
+            aabb[2].max(point.x.value()),
+            aabb[3].max(point.y.value()),
         ];
     }
     aabb
@@ -1128,39 +1149,43 @@ fn transformed_chunk_aabb(transform: crate::math::Transform, bounds: Rect) -> [f
 struct PrimitiveEmitter {
     node: NodeId,
     lane: LaneId,
-    bounds: Rect,
-    content_offset: Point,
+    bounds: LogicalRect,
+    content_offset: LogicalPoint,
     patch: StylePatch,
     spec: Option<PaintSpec>,
-    scale: Scale,
-    clip: Option<PhysicalRect>,
+    scale: DevicePixelRatio,
+    clip: Option<DeviceRect>,
     content: Content,
     emitted: usize,
-    node_damage: Rect,
-    offset: Point,
-    damage_shift: Point,
+    node_damage: LogicalRect,
+    offset: LogicalPoint,
+    damage_shift: LogicalPoint,
     ring: Option<crate::paint::style::FocusRing>,
     geometry_transform: crate::math::Transform,
-    content_clip: Option<Rect>,
+    content_clip: Option<LogicalRect>,
     opacity: f32,
 }
 
-fn negate(offset: Point) -> Point {
-    Point::new(-offset.x, -offset.y)
+fn negate(offset: LogicalPoint) -> LogicalPoint {
+    LogicalPoint::new(-offset.x, -offset.y)
 }
 
 #[derive(Default)]
 struct PaintedContent {
-    content: Rect,
-    screen: Rect,
-    shadow: Option<(Rect, f32)>,
+    content: LogicalRect,
+    screen: LogicalRect,
+    shadow: Option<(LogicalRect, PhysicalPx)>,
 }
 
-fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -> PaintedContent {
-    let mut content = Rect::default();
-    let mut screen = Rect::default();
-    let mut shadow_spill: Option<(Rect, f32)> = None;
-    let factor = scale.factor();
+fn painted_content(
+    tree: &NodeTree,
+    scene: &Scene,
+    node: NodeId,
+    scale: DevicePixelRatio,
+) -> PaintedContent {
+    let mut content = LogicalRect::default();
+    let mut screen = LogicalRect::default();
+    let mut shadow_spill: Option<(LogicalRect, PhysicalPx)> = None;
     for index in 0..tree.lane_count(node) {
         let Some(lane) = tree.lane_at(node, index) else {
             continue;
@@ -1172,17 +1197,19 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -
             match primitive {
                 Primitive::GlyphRun(run) => {
                     for glyph in &run.glyphs {
-                        content = content.union(Rect::from_origin_size(glyph.position, glyph.size));
+                        content = content
+                            .union(LogicalRect::from_origin_size(glyph.position, glyph.size));
                     }
                 }
                 Primitive::Canvas(canvas) => screen = screen.union(canvas.bounds()),
                 Primitive::Image(image) => content = content.union(image.bounds),
                 Primitive::Quad(quad) => content = content.union(quad.bounds),
                 Primitive::Shadow(shadow) => {
-                    let blur = shadow.blur.max(0.0) * factor;
-                    let sigma = (blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
+                    let blur = scale.to_physical(shadow.blur.max(LogicalPx::ZERO));
+                    let sigma = (blur.value() * crate::paint::instance::SHADOW_SIGMA_SCALE)
                         .max(crate::paint::instance::SHADOW_SIGMA_MIN);
-                    let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0;
+                    let pad =
+                        PhysicalPx::new(crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0);
                     let rect = shadow.rect.translate(shadow.offset);
                     shadow_spill = Some(match shadow_spill {
                         Some((previous, previous_pad)) => {
@@ -1205,8 +1232,8 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -
 fn push_painted_shadow(
     context: &mut PaintContext<'_>,
     painted: &PaintedContent,
-    total: Point,
-    clip: Option<PhysicalRect>,
+    total: LogicalPoint,
+    clip: Option<DeviceRect>,
 ) {
     if let Some((rect, pad)) = painted.shadow {
         context
@@ -1221,7 +1248,12 @@ impl PrimitiveEmitter {
         self.emitted += 1;
     }
 
-    fn push_damage(&self, context: &mut PaintContext<'_>, bounds: Rect, aa_padding: f32) {
+    fn push_damage(
+        &self,
+        context: &mut PaintContext<'_>,
+        bounds: LogicalRect,
+        aa_padding: PhysicalPx,
+    ) {
         context
             .damage
             .push_logical(bounds.translate(self.damage_shift), aa_padding, self.clip);
@@ -1252,17 +1284,20 @@ impl PrimitiveEmitter {
             let primitive = Shadow {
                 rect,
                 offset: shadow.offset,
-                blur: shadow.blur.max(0.0),
+                blur: shadow.blur.max(LogicalPx::ZERO),
                 color,
-                corner_radius: radii.map(|radius| (radius + shadow.spread).max(0.0)),
+                corner_radius: radii.map(|radius| (radius + shadow.spread).max(LogicalPx::ZERO)),
             };
             self.push(context, Primitive::Shadow(primitive));
-            let factor = self.scale.factor();
-            let blur = primitive.blur * factor;
-            let sigma = (blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
+            let blur = self.scale.to_physical(primitive.blur.max(LogicalPx::ZERO));
+            let sigma = (blur.value() * crate::paint::instance::SHADOW_SIGMA_SCALE)
                 .max(crate::paint::instance::SHADOW_SIGMA_MIN);
             let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0;
-            self.push_damage(context, primitive.rect.translate(primitive.offset), pad);
+            self.push_damage(
+                context,
+                primitive.rect.translate(primitive.offset),
+                PhysicalPx::new(pad),
+            );
         }
 
         let background = self
@@ -1278,7 +1313,7 @@ impl PrimitiveEmitter {
             .patch
             .border
             .or(spec.border)
-            .filter(|border| border.width > 0.0 && !border.color.is_transparent())
+            .filter(|border| border.width > LogicalPx::ZERO && !border.color.is_transparent())
             .map(|border| crate::paint::primitive::Border {
                 width: border.width,
                 color: border.color.with_opacity(opacity),
@@ -1302,7 +1337,7 @@ impl PrimitiveEmitter {
                         paint: QuadPaint::Gradient(gradient),
                     }),
                 );
-                self.push_damage(context, self.bounds, 1.0);
+                self.push_damage(context, self.bounds, physical_px(1.0));
                 if let Some(border) = border {
                     self.push(
                         context,
@@ -1328,7 +1363,7 @@ impl PrimitiveEmitter {
                             paint: QuadPaint::Solid { fill, border },
                         }),
                     );
-                    self.push_damage(context, self.bounds, 1.0);
+                    self.push_damage(context, self.bounds, physical_px(1.0));
                 }
             }
         }
@@ -1337,7 +1372,7 @@ impl PrimitiveEmitter {
     fn emit_focus_ring(&mut self, context: &mut PaintContext<'_>, opacity: f32) {
         let radii = self.spec.clone().unwrap_or_default().corner_radius;
         if let Some(ring) = self.ring
-            && ring.width > 0.0
+            && ring.width > LogicalPx::ZERO
             && !ring.color.with_opacity(opacity).is_transparent()
         {
             let mut radii = radii;
@@ -1359,14 +1394,16 @@ impl PrimitiveEmitter {
                     },
                 }),
             );
-            self.push_damage(context, bounds, 1.0);
+            self.push_damage(context, bounds, physical_px(1.0));
         }
     }
 
     fn emit_node_damage(&mut self, context: &mut PaintContext<'_>) {
         if self.emitted > 0 || !self.node_damage.is_empty() {
             let damage = self.node_damage.translate(negate(self.offset));
-            context.damage.push_logical(damage, 1.0, self.clip);
+            context
+                .damage
+                .push_logical(damage, physical_px(1.0), self.clip);
         }
     }
 
@@ -1379,7 +1416,7 @@ impl PrimitiveEmitter {
     ) {
         let content_clip = self.content_clip.map(|rect| ClipRect {
             rect,
-            corner_radius: [0.0; 4],
+            corner_radius: [LogicalPx::ZERO; 4],
         });
         if let Some(clip_rect) = content_clip {
             let _ = context
@@ -1411,7 +1448,7 @@ impl PrimitiveEmitter {
             .filter(|_| has_content)
             .map(|rect| ClipRect {
                 rect,
-                corner_radius: [0.0; 4],
+                corner_radius: [LogicalPx::ZERO; 4],
             });
         if let Some(clip_rect) = content_clip {
             let _ = context
@@ -1432,7 +1469,9 @@ impl PrimitiveEmitter {
                 };
                 context.stale_canvas_runs += stale_runs;
                 self.push(context, Primitive::Canvas(canvas));
-                context.damage.push_logical(canvas_bounds, 1.0, self.clip);
+                context
+                    .damage
+                    .push_logical(canvas_bounds, physical_px(1.0), self.clip);
             }
             Content::Text(line) => {
                 if let Some(line) = line {
@@ -1455,7 +1494,7 @@ impl PrimitiveEmitter {
             }
             return;
         }
-        let origin = Point::new(
+        let origin = LogicalPoint::new(
             self.bounds.origin.x + self.content_offset.x,
             self.bounds.origin.y + self.content_offset.y,
         );
@@ -1478,13 +1517,13 @@ impl PrimitiveEmitter {
                             continue;
                         }
                         let mut glyphs = Vec::with_capacity(run.glyphs.len());
-                        let mut glyph_bounds = Rect::default();
+                        let mut glyph_bounds = LogicalRect::default();
                         for glyph in &run.glyphs {
-                            let position = Point::new(
+                            let position = LogicalPoint::new(
                                 origin.x + glyph.position.x,
                                 origin.y + glyph.position.y,
                             );
-                            let rect = Rect::from_origin_size(position, glyph.size);
+                            let rect = LogicalRect::from_origin_size(position, glyph.size);
                             glyph_bounds = glyph_bounds.union(rect);
                             glyphs.push(PositionedGlyph {
                                 tile: glyph.tile,
@@ -1501,7 +1540,7 @@ impl PrimitiveEmitter {
                             continue;
                         }
                         self.push(context, Primitive::GlyphRun(GlyphRun { color, glyphs }));
-                        self.push_damage(context, glyph_bounds, 0.0);
+                        self.push_damage(context, glyph_bounds, physical_px(0.0));
                     }
                     ShapedTextItem::InlineBox(inline) => {
                         let paint = inline_paints
@@ -1526,8 +1565,8 @@ impl PrimitiveEmitter {
                     .unwrap_or(decoration.color)
                     .with_opacity(opacity);
                 if color.is_transparent()
-                    || decoration.rect.size.width <= 0.0
-                    || decoration.rect.size.height <= 0.0
+                    || decoration.rect.size.width <= LogicalPx::ZERO
+                    || decoration.rect.size.height <= LogicalPx::ZERO
                 {
                     continue;
                 }
@@ -1536,14 +1575,14 @@ impl PrimitiveEmitter {
                     context,
                     Primitive::Quad(Quad {
                         bounds,
-                        corner_radius: [0.0; 4],
+                        corner_radius: [LogicalPx::ZERO; 4],
                         paint: QuadPaint::Solid {
                             fill: color,
                             border: None,
                         },
                     }),
                 );
-                self.push_damage(context, bounds, 0.0);
+                self.push_damage(context, bounds, physical_px(0.0));
             }
         }
     }
@@ -1557,7 +1596,7 @@ impl PrimitiveEmitter {
         }) else {
             return;
         };
-        let image_size = Size::new(image.width as f32, image.height as f32);
+        let image_size = LogicalSize::new(px(image.width as f32), px(image.height as f32));
         let bounds = self.bounds;
         let Some(rect) = fit_bounds(bounds, content.fit(), image_size) else {
             return;
@@ -1587,20 +1626,20 @@ impl PrimitiveEmitter {
                 modulation,
             }),
         );
-        self.push_damage(context, rect, 0.0);
+        self.push_damage(context, rect, physical_px(0.0));
     }
 
     fn emit_inline_box(
         &mut self,
         context: &mut PaintContext<'_>,
-        rect: Rect,
+        rect: LogicalRect,
         id: u64,
         paint: Option<InlineBoxPaint>,
-        origin: Point,
+        origin: LogicalPoint,
         opacity: f32,
     ) {
         let bounds = rect.translate(origin);
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        if bounds.size.width <= LogicalPx::ZERO || bounds.size.height <= LogicalPx::ZERO {
             return;
         }
         match paint {
@@ -1624,7 +1663,7 @@ impl PrimitiveEmitter {
                         },
                     }),
                 );
-                self.push_damage(context, bounds, 0.0);
+                self.push_damage(context, bounds, physical_px(0.0));
             }
             Some(InlineBoxPaint::Image {
                 resource,
@@ -1651,7 +1690,7 @@ impl PrimitiveEmitter {
                         modulation,
                     }),
                 );
-                self.push_damage(context, bounds, 0.0);
+                self.push_damage(context, bounds, physical_px(0.0));
             }
         }
     }
@@ -1663,7 +1702,9 @@ mod tests {
 
     use super::PaintPass;
     use crate::{
-        math::{PhysicalRect, Point, Rect, Scale},
+        math::{
+            DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, dp, physical_px, px,
+        },
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::{
             canvas::Canvas,
@@ -1681,8 +1722,8 @@ mod tests {
         },
     };
 
-    fn frame() -> PhysicalRect {
-        PhysicalRect::new(0, 0, 400, 300)
+    fn frame() -> DeviceRect {
+        DeviceRect::new(dp(0), dp(0), dp(400), dp(300))
     }
 
     struct Harness {
@@ -1690,13 +1731,13 @@ mod tests {
         scene: Scene,
         damage: DamageAccumulator,
         order: Vec<LaneId>,
-        scroll_slots: Vec<(Point, PhysicalRect)>,
+        scroll_slots: Vec<(LogicalPoint, DeviceRect)>,
         scroll_slot_nodes: Vec<crate::node::id::NodeId>,
         atlas: Option<crate::render::AtlasAllocator>,
         resources: Option<crate::resources::ResourceCache>,
         geometry: crate::paint::geometry_store::GeometryStore,
         focused: Option<crate::node::id::NodeId>,
-        scale: Scale,
+        scale: DevicePixelRatio,
     }
 
     impl Harness {
@@ -1705,7 +1746,7 @@ mod tests {
         }
 
         fn with_scale(factor: f32) -> Self {
-            let scale = Scale::new(factor).expect("合法 scale");
+            let scale = DevicePixelRatio::new(factor).expect("合法 scale");
             Self {
                 tree: NodeTree::new(),
                 scene: Scene::empty(),
@@ -1791,7 +1832,7 @@ mod tests {
     }
 
     fn fixed_style(width: f32, height: f32) -> Style {
-        StyleBuilder::new().size(width, height).build()
+        StyleBuilder::new().size(px(width), px(height)).build()
     }
 
     fn with_white() -> PaintSpec {
@@ -1804,10 +1845,10 @@ mod tests {
     fn layout_all(tree: &mut NodeTree) {
         let order: Vec<_> = tree.dfs_ids();
         for (index, id) in order.iter().enumerate() {
-            let bounds = Rect::new(0.0, (index as f32) * 20.0, 100.0, 20.0);
+            let bounds = LogicalRect::new(px(0.0), px((index as f32) * 20.0), px(100.0), px(20.0));
             let layout = crate::node::tree::LayoutBox {
                 bounds,
-                border: crate::math::Edges::ZERO,
+                border: crate::math::LogicalEdges::ZERO,
             };
             let _ = tree.set_layout_for_test(*id, layout);
         }
@@ -1818,20 +1859,23 @@ mod tests {
         harness.scene.lane_primitives(lane).expect("存在").to_vec()
     }
 
-    fn damage_covers(rects: &[PhysicalRect], target: PhysicalRect) -> bool {
-        (target.y0..target.y1).all(|y| {
-            (target.x0..target.x1).all(|x| {
-                rects
-                    .iter()
-                    .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
+    fn damage_covers(rects: &[DeviceRect], target: DeviceRect) -> bool {
+        (target.y0.value()..target.y1.value()).all(|y| {
+            (target.x0.value()..target.x1.value()).all(|x| {
+                rects.iter().any(|rect| {
+                    rect.x0.value() <= x
+                        && x < rect.x1.value()
+                        && rect.y0.value() <= y
+                        && y < rect.y1.value()
+                })
             })
         })
     }
 
-    fn set_layout(tree: &mut NodeTree, node: crate::node::id::NodeId, bounds: Rect) {
+    fn set_layout(tree: &mut NodeTree, node: crate::node::id::NodeId, bounds: LogicalRect) {
         let layout = crate::node::tree::LayoutBox {
             bounds,
-            border: crate::math::Edges::ZERO,
+            border: crate::math::LogicalEdges::ZERO,
         };
         assert!(tree.set_layout_for_test(node, layout), "布局写入");
     }
@@ -1840,7 +1884,7 @@ mod tests {
     fn scrolling_only_moves_the_slot_offset_not_the_lane_bytes() {
         use crate::{
             interaction::{ScrollAxis, ScrollSlot},
-            math::Size,
+            math::LogicalSize,
         };
 
         let mut h = Harness::new();
@@ -1853,7 +1897,7 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("container");
         let child = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 100.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, container)
             .expect("child");
@@ -1862,25 +1906,25 @@ mod tests {
             .ensure_interaction(container)
             .expect("interaction")
             .scroll = Some(ScrollSlot {
-            offset: Point::ZERO,
-            content: Size::new(100.0, 400.0),
+            offset: LogicalPoint::ZERO,
+            content: LogicalSize::new(px(100.0), px(400.0)),
             axis: ScrollAxis::Vertical,
-            line_height: 48.0,
+            line_height: px(48.0),
         });
         h.tree.note_scroll_container(container);
 
         let first = h.paint();
         assert!(first.rebuilt >= 2, "首帧两条 lane 都要建");
         assert_eq!(h.scroll_slots.len(), 2, "槽位 0 是哨兵，滚动容器占 1");
-        assert_eq!(h.scroll_slots[1].0, Point::ZERO);
+        assert_eq!(h.scroll_slots[1].0, LogicalPoint::ZERO);
         let container_box = h.tree.get(container).expect("container").layout().bounds;
         assert_eq!(
             h.scroll_slots[1].1,
-            PhysicalRect::new(
-                container_box.origin.x as i32,
-                container_box.origin.y as i32,
-                (container_box.origin.x + container_box.size.width) as i32,
-                (container_box.origin.y + container_box.size.height) as i32,
+            DeviceRect::new(
+                dp(container_box.origin.x.value() as i32),
+                dp(container_box.origin.y.value() as i32),
+                dp((container_box.origin.x + container_box.size.width).value() as i32),
+                dp((container_box.origin.y + container_box.size.height).value() as i32),
             ),
             "视口 = 容器的 padding box（物理像素）"
         );
@@ -1909,10 +1953,15 @@ mod tests {
 
         let lane = h.tree.lane_of(child).expect("child lane");
         let version = h.scene.lane_state(lane).expect("lane").0;
-        h.tree.scroll_slot_mut(container).expect("slot").offset = Point::new(0.0, 30.0);
+        h.tree.scroll_slot_mut(container).expect("slot").offset =
+            LogicalPoint::new(px(0.0), px(30.0));
         let second = h.paint();
         assert_eq!(second.rebuilt, 0, "滚动不得重建任何 lane");
-        assert_eq!(h.scroll_slots[1].0, Point::new(0.0, 30.0), "位移进槽位表");
+        assert_eq!(
+            h.scroll_slots[1].0,
+            LogicalPoint::new(px(0.0), px(30.0)),
+            "位移进槽位表"
+        );
         assert_eq!(
             lane_primitives(&h, child),
             before,
@@ -1932,34 +1981,40 @@ mod tests {
 
     #[test]
     fn geometry_chunk_damage_uses_the_chunk_aabb_and_transform() {
-        let chunk = Rect::new(0.0, 0.0, 200.0, 200.0);
-        let damage =
-            super::geometry_chunk_damage(crate::math::Transform::IDENTITY, chunk, Point::ZERO);
+        let chunk = LogicalRect::new(px(0.0), px(0.0), px(200.0), px(200.0));
+        let damage = super::geometry_chunk_damage(
+            crate::math::Transform::IDENTITY,
+            chunk,
+            LogicalPoint::ZERO,
+        );
         assert_eq!(damage, chunk, "无变换 / 无滚动时块 AABB 原样");
 
         let scrolled = super::geometry_chunk_damage(
             crate::math::Transform::IDENTITY,
             chunk,
-            Point::new(0.0, 50.0),
+            LogicalPoint::new(px(0.0), px(50.0)),
         );
         assert_eq!(
             scrolled,
-            Rect::new(0.0, -50.0, 200.0, 200.0),
+            LogicalRect::new(px(0.0), px(-50.0), px(200.0), px(200.0)),
             "祖先滚动累计值要换算到屏幕坐标"
         );
 
         let moved = super::geometry_chunk_damage(
-            crate::math::Transform::translate(30.0, 40.0),
+            crate::math::Transform::translate(px(30.0), px(40.0)),
             chunk,
-            Point::ZERO,
+            LogicalPoint::ZERO,
         );
-        assert_eq!(moved, Rect::new(30.0, 40.0, 200.0, 200.0));
+        assert_eq!(
+            moved,
+            LogicalRect::new(px(30.0), px(40.0), px(200.0), px(200.0))
+        );
 
         assert!(
             super::geometry_chunk_damage(
                 crate::math::Transform::IDENTITY,
-                Rect::default(),
-                Point::ZERO
+                LogicalRect::default(),
+                LogicalPoint::ZERO
             )
             .is_empty()
         );
@@ -1974,7 +2029,7 @@ mod tests {
             .paint(PaintSpec {
                 background: Color::WHITE,
                 border: Some(Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -2015,7 +2070,7 @@ mod tests {
                     kind: GradientKind::Horizontal,
                 }),
                 border: Some(Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -2039,9 +2094,9 @@ mod tests {
             .paint(PaintSpec {
                 background: Color::WHITE,
                 shadows: Shadows::from(ShadowSpec {
-                    offset: Point::new(1.0, 2.0),
-                    blur: 3.0,
-                    spread: 0.0,
+                    offset: LogicalPoint::new(px(1.0), px(2.0)),
+                    blur: px(3.0),
+                    spread: px(0.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -2125,10 +2180,15 @@ mod tests {
         let root = h.tree.root();
         let mut style = fixed_style(60.0, 20.0);
         style.clip = Clip::Bounds;
-        let mut canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut canvas = crate::paint::canvas::Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(200.0),
+            px(200.0),
+        ));
         canvas.push_quad(crate::paint::primitive::Quad {
-            bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(200.0), px(200.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: crate::paint::color::Color::WHITE,
                 border: None,
@@ -2138,10 +2198,15 @@ mod tests {
             .style(style)
             .build(&mut h.tree, root)
             .expect("挂载");
-        let mut plain_canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 200.0, 200.0));
+        let mut plain_canvas = crate::paint::canvas::Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(200.0),
+            px(200.0),
+        ));
         plain_canvas.push_quad(crate::paint::primitive::Quad {
-            bounds: Rect::new(0.0, 0.0, 200.0, 200.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(200.0), px(200.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: crate::paint::color::Color::WHITE,
                 border: None,
@@ -2225,10 +2290,15 @@ mod tests {
     fn canvas_and_geometry_emit_primitives() {
         let mut h = Harness::new();
         let root = h.tree.root();
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 10.0, 10.0)))
-            .style(fixed_style(10.0, 10.0))
-            .build(&mut h.tree, root)
-            .expect("挂载");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(10.0),
+            px(10.0),
+        )))
+        .style(fixed_style(10.0, 10.0))
+        .build(&mut h.tree, root)
+        .expect("挂载");
         let geometry = NodeBuilder::geometry(GeometryId::for_test(0, 1))
             .style(fixed_style(10.0, 10.0))
             .build(&mut h.tree, root)
@@ -2273,8 +2343,8 @@ mod tests {
             text_range,
             glyphs: vec![crate::paint::primitive::PositionedGlyph {
                 tile: glyph_tile(),
-                position: Point::new(x, 2.0),
-                size: crate::math::Size::new(8.0, 8.0),
+                position: LogicalPoint::new(px(x), px(2.0)),
+                size: crate::math::LogicalSize::new(px(8.0), px(8.0)),
             }],
         }
     }
@@ -2284,18 +2354,18 @@ mod tests {
             text: smol_str::SmolStr::new_static("ab"),
             lines: vec![ShapedTextLine {
                 text_range: 0..2,
-                baseline: 12.0,
-                line_height: 16.0,
-                advance: 20.0,
+                baseline: px(12.0),
+                line_height: px(16.0),
+                advance: px(20.0),
                 items,
                 decorations,
             }],
-            width: 20.0,
-            height: 16.0,
-            first_baseline: Some(12.0),
+            width: px(20.0),
+            height: px(16.0),
+            first_baseline: Some(px(12.0)),
             atlas_generation: 0,
             font_stack_version: 1,
-            scale: 1.0,
+            scale: DevicePixelRatio::ONE,
         }
     }
 
@@ -2309,14 +2379,14 @@ mod tests {
         assert!(h.tree.set_text_content(node, content), "text content");
         assert!(
             h.tree
-                .install_text_line_for_test(node, &content_for_shaping, Rc::new(line), 20.0),
+                .install_text_line_for_test(node, &content_for_shaping, Rc::new(line), px(20.0)),
             "text line"
         );
         layout_all(&mut h.tree);
         node
     }
 
-    fn text_origin(h: &Harness, node: NodeId) -> Point {
+    fn text_origin(h: &Harness, node: NodeId) -> LogicalPoint {
         h.tree.get(node).expect("node").layout().bounds.origin
     }
 
@@ -2343,7 +2413,7 @@ mod tests {
         let mut h = Harness::new();
         let node = spawn_text(
             &mut h,
-            TextContent::new("ab", TextStyle::new(16.0)),
+            TextContent::new("ab", TextStyle::new(px(16.0))),
             shaped_line(
                 vec![
                     ShapedTextItem::GlyphRun(glyph_run(red, 0..1, 0.0)),
@@ -2398,12 +2468,12 @@ mod tests {
             b: 0.2,
             alpha: 1.0,
         };
-        let under = Rect::new(1.0, 14.5, 10.0, 1.0);
-        let strike = Rect::new(11.0, 8.0, 6.0, 2.0);
+        let under = LogicalRect::new(px(1.0), px(14.5), px(10.0), px(1.0));
+        let strike = LogicalRect::new(px(11.0), px(8.0), px(6.0), px(2.0));
         let mut h = Harness::new();
         let node = spawn_text(
             &mut h,
-            TextContent::new("ab", TextStyle::new(16.0)),
+            TextContent::new("ab", TextStyle::new(px(16.0))),
             shaped_line(
                 vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
                 vec![
@@ -2435,7 +2505,7 @@ mod tests {
                 expected[index].0.translate(origin),
                 "装饰 Quad 的 bounds = 局部矩形 + 文本盒原点"
             );
-            assert_eq!(quad.corner_radius, [0.0; 4]);
+            assert_eq!(quad.corner_radius, [LogicalPx::ZERO; 4]);
             let QuadPaint::Solid { fill, border } = &quad.paint else {
                 panic!("装饰必须是实色 Quad");
             };
@@ -2468,16 +2538,16 @@ mod tests {
         let mut h = Harness::new();
         let node = spawn_text(
             &mut h,
-            TextContent::new("ab", TextStyle::new(16.0).with_color(text_color)),
+            TextContent::new("ab", TextStyle::new(px(16.0)).with_color(text_color)),
             shaped_line(
                 vec![ShapedTextItem::GlyphRun(glyph_run(text_color, 0..2, 0.0))],
                 vec![
                     ShapedDecoration {
-                        rect: Rect::new(0.0, 14.5, 10.0, 1.0),
+                        rect: LogicalRect::new(px(0.0), px(14.5), px(10.0), px(1.0)),
                         color: text_color,
                     },
                     ShapedDecoration {
-                        rect: Rect::new(10.0, 8.0, 10.0, 1.0),
+                        rect: LogicalRect::new(px(10.0), px(8.0), px(10.0), px(1.0)),
                         color: explicit_line,
                     },
                 ],
@@ -2553,18 +2623,18 @@ mod tests {
         let spec = |id: u64, index: usize, paint: Option<InlineBoxPaint>| InlineBoxSpec {
             id,
             index,
-            size: crate::math::Size::new(12.0, 12.0),
+            size: crate::math::LogicalSize::new(px(12.0), px(12.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint,
         };
-        let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([
+        let content = TextContent::new("a b", TextStyle::new(px(16.0))).with_inline_boxes([
             spec(
                 7,
                 1,
                 Some(InlineBoxPaint::Quad {
                     color: fill,
-                    corner_radius: [2.0, 3.0, 4.0, 5.0],
+                    corner_radius: [px(2.0), px(3.0), px(4.0), px(5.0)],
                 }),
             ),
             spec(8, 2, None),
@@ -2572,12 +2642,12 @@ mod tests {
         let boxes = [
             ShapedInlineBox {
                 id: 7,
-                rect: Rect::new(4.0, 0.0, 12.0, 12.0),
+                rect: LogicalRect::new(px(4.0), px(0.0), px(12.0), px(12.0)),
                 baseline: None,
             },
             ShapedInlineBox {
                 id: 8,
-                rect: Rect::new(20.0, 0.0, 12.0, 12.0),
+                rect: LogicalRect::new(px(20.0), px(0.0), px(12.0), px(12.0)),
                 baseline: None,
             },
         ];
@@ -2604,7 +2674,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(quad.bounds, boxes[0].rect.translate(origin));
-        assert_eq!(quad.corner_radius, [2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(quad.corner_radius, [px(2.0), px(3.0), px(4.0), px(5.0)]);
     }
 
     #[test]
@@ -2616,12 +2686,12 @@ mod tests {
         let spec = |id: u64, paint: InlineBoxPaint| InlineBoxSpec {
             id,
             index: 1,
-            size: crate::math::Size::new(8.0, 8.0),
+            size: crate::math::LogicalSize::new(px(8.0), px(8.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint: Some(paint),
         };
-        let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([
+        let content = TextContent::new("a b", TextStyle::new(px(16.0))).with_inline_boxes([
             spec(
                 5,
                 InlineBoxPaint::Image {
@@ -2640,12 +2710,12 @@ mod tests {
         let boxes = [
             ShapedInlineBox {
                 id: 5,
-                rect: Rect::new(2.0, 1.0, 8.0, 8.0),
+                rect: LogicalRect::new(px(2.0), px(1.0), px(8.0), px(8.0)),
                 baseline: None,
             },
             ShapedInlineBox {
                 id: 6,
-                rect: Rect::new(14.0, 1.0, 8.0, 8.0),
+                rect: LogicalRect::new(px(14.0), px(1.0), px(8.0), px(8.0)),
                 baseline: None,
             },
         ];
@@ -2707,8 +2777,8 @@ mod tests {
         h.tree
             .set_geometry_transform(
                 geometry,
-                crate::math::Transform::translate(4.0, 6.0),
-                crate::math::Rect::default(),
+                crate::math::Transform::translate(px(4.0), px(6.0)),
+                crate::math::LogicalRect::default(),
             )
             .expect("几何节点");
         layout_all(&mut h.tree);
@@ -2718,7 +2788,7 @@ mod tests {
         };
         assert_eq!(
             draw.transform,
-            crate::math::Transform::translate(4.0, 6.0),
+            crate::math::Transform::translate(px(4.0), px(6.0)),
             "节点级几何的 transform 必须是 setter 写入的那个"
         );
         let boxed = NodeBuilder::boxed()
@@ -2729,7 +2799,7 @@ mod tests {
             h.tree.set_geometry_transform(
                 boxed,
                 crate::math::Transform::IDENTITY,
-                crate::math::Rect::default()
+                crate::math::LogicalRect::default()
             ),
             Err(crate::error::EngineError::StaleNode { .. })
         ));
@@ -2759,8 +2829,8 @@ mod tests {
         };
 
         let resize = crate::node::tree::LayoutBox {
-            bounds: Rect::new(0.0, 0.0, 60.0, 60.0),
-            border: crate::math::Edges::ZERO,
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(60.0), px(60.0)),
+            border: crate::math::LogicalEdges::ZERO,
         };
         let _ = h.tree.set_layout_for_test(clipped, resize);
         let report = h.paint();
@@ -2773,7 +2843,10 @@ mod tests {
         assert_ne!(first_rect, second_rect, "前缀矩形必须随 clip 容器更新");
         assert_eq!(
             h.tree.clip_key(child),
-            Some((1, Some(second_rect.to_physical_covering(Scale::ONE))))
+            Some((
+                1,
+                Some(DevicePixelRatio::ONE.to_covering_device_rect(second_rect))
+            ))
         );
     }
 
@@ -2820,8 +2893,8 @@ mod tests {
             .expect("挂载");
         layout_all(&mut h.tree);
         let empty = crate::node::tree::LayoutBox {
-            bounds: Rect::default(),
-            border: crate::math::Edges::ZERO,
+            bounds: LogicalRect::default(),
+            border: crate::math::LogicalEdges::ZERO,
         };
         let _ = h.tree.set_layout_for_test(clipped, empty);
         let report = h.paint();
@@ -2921,7 +2994,7 @@ mod tests {
     ) -> (
         Vec<(NodeId, Vec<Primitive>, u32)>,
         Vec<NodeId>,
-        Vec<(Point, PhysicalRect)>,
+        Vec<(LogicalPoint, DeviceRect)>,
     ) {
         let ids = h.tree.dfs_ids();
         let mut lanes = Vec::new();
@@ -2960,17 +3033,17 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("container");
         let left = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, container)
             .expect("left");
         let right = NodeBuilder::boxed()
-            .layout_override(Rect::new(60.0, 0.0, 40.0, 20.0))
+            .layout_override(LogicalRect::new(px(60.0), px(0.0), px(40.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, container)
             .expect("right");
         let sibling = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 40.0, 40.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(40.0), px(40.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, root)
             .expect("sibling");
@@ -3055,7 +3128,7 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("container");
         let child = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .paint(with_white())
             .build(&mut h.tree, container)
             .expect("child");
@@ -3096,7 +3169,7 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("container");
         let child = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .paint(with_white())
             .build(&mut h.tree, container)
             .expect("child");
@@ -3139,7 +3212,7 @@ mod tests {
         let mut h = Harness::new();
         let root = h.tree.root();
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .paint(with_white())
             .build(&mut h.tree, root)
             .expect("node");
@@ -3183,7 +3256,7 @@ mod tests {
     fn incremental_reuses_the_cached_scroll_slot() {
         use crate::{
             interaction::{ScrollAxis, ScrollSlot},
-            math::Size,
+            math::LogicalSize,
         };
 
         let mut h = Harness::new();
@@ -3196,7 +3269,7 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("container");
         let child = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 100.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, container)
             .expect("child");
@@ -3205,10 +3278,10 @@ mod tests {
             .ensure_interaction(container)
             .expect("interaction")
             .scroll = Some(ScrollSlot {
-            offset: Point::ZERO,
-            content: Size::new(100.0, 400.0),
+            offset: LogicalPoint::ZERO,
+            content: LogicalSize::new(px(100.0), px(400.0)),
             axis: ScrollAxis::Vertical,
-            line_height: 48.0,
+            line_height: px(48.0),
         });
         h.tree.note_scroll_container(container);
         let first = h.paint();
@@ -3217,14 +3290,15 @@ mod tests {
         let child_lane = h.tree.lane_of(child).expect("child lane");
         assert_eq!(h.scene.lane_scroll(child_lane), 1, "lane 登记槽位 1");
 
-        h.tree.scroll_slot_mut(container).expect("slot").offset = Point::new(0.0, 30.0);
+        h.tree.scroll_slot_mut(container).expect("slot").offset =
+            LogicalPoint::new(px(0.0), px(30.0));
         h.mark_paint(child);
         let report = h.paint_incremental(&[child]);
         assert_eq!(report.rebuilt, 1, "只有脏节点重建");
         assert_eq!(h.scroll_slots.len(), 2, "增量路径不得重排 / 追加槽位");
         assert_eq!(
             h.scroll_slots[1].0,
-            Point::new(0.0, 30.0),
+            LogicalPoint::new(px(0.0), px(30.0)),
             "偏移必须写回缓存的槽位"
         );
         assert_eq!(h.scene.lane_scroll(child_lane), 1, "槽号不得改变");
@@ -3242,17 +3316,17 @@ mod tests {
             .build(&mut h.tree, root)
             .expect("clip container");
         let inner = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .paint(with_white())
             .build(&mut h.tree, clip_container)
             .expect("inner");
         let _sibling = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 50.0, 40.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(50.0), px(40.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, root)
             .expect("sibling");
         let hider = NodeBuilder::boxed()
-            .layout_override(Rect::new(60.0, 50.0, 40.0, 20.0))
+            .layout_override(LogicalRect::new(px(60.0), px(50.0), px(40.0), px(20.0)))
             .paint(with_white())
             .build(&mut h.tree, root)
             .expect("hider");
@@ -3261,8 +3335,8 @@ mod tests {
         assert!(first.rebuilt >= 4);
 
         let resize = crate::node::tree::LayoutBox {
-            bounds: Rect::new(0.0, 0.0, 60.0, 60.0),
-            border: crate::math::Edges::ZERO,
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(60.0), px(60.0)),
+            border: crate::math::LogicalEdges::ZERO,
         };
         let _ = h.tree.set_layout_for_test(clip_container, resize);
         h.tree.set_style_patch_for_test(
@@ -3313,7 +3387,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(64.0), px(100.0)),
             pipeline: GeometryPipeline::Ui,
         }
     }
@@ -3434,7 +3508,7 @@ mod tests {
             .expect("块 1")
             .bounds;
         assert!(
-            old_tail.origin.y >= 64.0,
+            old_tail.origin.y >= px(64.0),
             "尾块的旧 AABB 必须在块的 y 段上：{old_tail:?}"
         );
 
@@ -3456,11 +3530,14 @@ mod tests {
         assert_eq!(h.tree.lane_count(node), 1, "截断后只剩一条块 lane");
         let rects = h.damage.rects();
         let hits = |x: i32, y: i32| {
-            rects
-                .iter()
-                .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
+            rects.iter().any(|rect| {
+                rect.x0.value() <= x
+                    && x < rect.x1.value()
+                    && rect.y0.value() <= y
+                    && y < rect.y1.value()
+            })
         };
-        let probe_y = old_tail.origin.y as i32;
+        let probe_y = old_tail.origin.y.value() as i32;
         assert!(
             hits(1, probe_y),
             "被移除块的旧像素必须并入 damage（否则留残影）：{rects:?}"
@@ -3541,7 +3618,7 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: Rect::new(0.0, 0.0, 400.0, 400.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(400.0), px(400.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("注册单三角形几何");
@@ -3559,9 +3636,12 @@ mod tests {
 
         let rects = h.damage.rects();
         let hits = |x: i32, y: i32| {
-            rects
-                .iter()
-                .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
+            rects.iter().any(|rect| {
+                rect.x0.value() <= x
+                    && x < rect.x1.value()
+                    && rect.y0.value() <= y
+                    && y < rect.y1.value()
+            })
         };
         assert!(hits(10, 10), "旧位置必须重画（否则留残影）：{rects:?}");
         assert!(hits(100, 60), "新位置必须重画：{rects:?}");
@@ -3629,9 +3709,9 @@ mod tests {
             .expect("注册两块几何");
         let node = mount_geometry(&mut h, id, Clip::None);
         h.paint();
-        let transform = crate::math::Transform::translate(7.0, 9.0);
+        let transform = crate::math::Transform::translate(px(7.0), px(9.0));
         h.tree
-            .set_geometry_transform(node, transform, Rect::default())
+            .set_geometry_transform(node, transform, LogicalRect::default())
             .expect("几何节点");
         let report = h.paint_incremental(&[node]);
         assert_eq!(report.rebuilt, 2, "变换烘在块 lane 里 ⇒ 两块都要重建");
@@ -3657,9 +3737,9 @@ mod tests {
         let group = NodeBuilder::boxed()
             .style(group_style)
             .paint(PaintSpec {
-                corner_radius: [8.0; 4],
+                corner_radius: [px(8.0); 4],
                 border: Some(Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: Color::BLACK,
                 }),
                 gradient: Some(Gradient {
@@ -3668,9 +3748,9 @@ mod tests {
                     kind: GradientKind::Horizontal,
                 }),
                 shadows: Shadows::from(ShadowSpec {
-                    offset: Point::new(0.0, 3.0),
-                    blur: 5.0,
-                    spread: 0.0,
+                    offset: LogicalPoint::new(px(0.0), px(3.0)),
+                    blur: px(5.0),
+                    spread: px(0.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -3779,11 +3859,11 @@ mod tests {
             .style(fixed_style(100.0, 100.0))
             .build(&mut h.tree, root)
             .expect("group");
-        let text = NodeBuilder::text("ab", TextStyle::new(16.0))
+        let text = NodeBuilder::text("ab", TextStyle::new(px(16.0)))
             .style(fixed_style(50.0, 20.0))
             .build(&mut h.tree, group)
             .expect("text");
-        let content = TextContent::new("ab", TextStyle::new(16.0));
+        let content = TextContent::new("ab", TextStyle::new(px(16.0)));
         assert!(h.tree.set_text_content(text, content.clone()));
         assert!(
             h.tree.install_text_line_for_test(
@@ -3793,7 +3873,7 @@ mod tests {
                     vec![ShapedTextItem::GlyphRun(glyph_run(Color::BLACK, 0..2, 0.0))],
                     Vec::new(),
                 )),
-                20.0,
+                px(20.0),
             ),
             "文本行注入"
         );
@@ -3808,7 +3888,7 @@ mod tests {
             .expect("geometry");
         let focus = NodeBuilder::boxed()
             .style(fixed_style(20.0, 20.0))
-            .focus_ring(FocusRing::new(2.0, 1.0, Color::BLACK))
+            .focus_ring(FocusRing::new(px(2.0), px(1.0), Color::BLACK))
             .build(&mut h.tree, group)
             .expect("focus ring");
         layout_all(&mut h.tree);
@@ -4040,9 +4120,9 @@ mod tests {
             .paint(PaintSpec {
                 background: Color::WHITE,
                 shadows: Shadows::from(ShadowSpec {
-                    offset: Point::new(0.0, 25.0),
-                    blur: 20.0,
-                    spread: 0.0,
+                    offset: LogicalPoint::new(px(0.0), px(25.0)),
+                    blur: px(20.0),
+                    spread: px(0.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -4054,13 +4134,21 @@ mod tests {
             .paint(with_white())
             .build(&mut h.tree, group)
             .expect("child");
-        set_layout(&mut h.tree, group, Rect::new(0.0, 0.0, 100.0, 60.0));
-        set_layout(&mut h.tree, child, Rect::new(149.0, 0.0, 42.0, 20.0));
+        set_layout(
+            &mut h.tree,
+            group,
+            LogicalRect::new(px(0.0), px(0.0), px(100.0), px(60.0)),
+        );
+        set_layout(
+            &mut h.tree,
+            child,
+            LogicalRect::new(px(149.0), px(0.0), px(42.0), px(20.0)),
+        );
         let _ = h.paint();
 
         let first = h.damage.rects().to_vec();
-        let shadow_spill = PhysicalRect::new(0, 61, 100, 116);
-        let overflow = PhysicalRect::new(149, 0, 191, 20);
+        let shadow_spill = DeviceRect::new(dp(0), dp(61), dp(100), dp(116));
+        let overflow = DeviceRect::new(dp(149), dp(0), dp(191), dp(20));
         assert!(
             damage_covers(&first, shadow_spill),
             "首帧旧阴影必须被画到：{first:?}"
@@ -4146,11 +4234,11 @@ mod tests {
         let node = NodeBuilder::boxed()
             .style(fixed_style(50.0, 20.0))
             .paint(PaintSpec {
-                corner_radius: [8.0; 4],
+                corner_radius: [px(8.0); 4],
                 shadows: Shadows::from(ShadowSpec {
-                    offset: Point::new(1.0, 2.0),
-                    blur: 6.0,
-                    spread: 3.0,
+                    offset: LogicalPoint::new(px(1.0), px(2.0)),
+                    blur: px(6.0),
+                    spread: px(3.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -4169,20 +4257,24 @@ mod tests {
             .expect("阴影");
         assert_eq!(
             shadow.rect,
-            bounds.outset(3.0),
+            bounds.outset(px(3.0)),
             "投影盒 = 布局盒四边外扩 spread"
         );
-        assert_eq!(shadow.corner_radius, [11.0; 4], "圆角 = 原半径 + spread");
-        assert_eq!(shadow.blur, 6.0, "σ 不随 spread 变");
+        assert_eq!(
+            shadow.corner_radius,
+            [px(11.0); 4],
+            "圆角 = 原半径 + spread"
+        );
+        assert_eq!(shadow.blur, px(6.0), "σ 不随 spread 变");
 
         let negative = NodeBuilder::boxed()
             .style(fixed_style(50.0, 20.0))
             .paint(PaintSpec {
-                corner_radius: [8.0; 4],
+                corner_radius: [px(8.0); 4],
                 shadows: Shadows::from(ShadowSpec {
-                    offset: Point::ZERO,
-                    blur: 2.0,
-                    spread: -5.0,
+                    offset: LogicalPoint::ZERO,
+                    blur: px(2.0),
+                    spread: px(-5.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -4199,8 +4291,8 @@ mod tests {
                 _ => None,
             })
             .expect("阴影");
-        assert_eq!(shadow.rect, bounds.outset(-5.0), "负 spread 收缩投影盒");
-        assert_eq!(shadow.corner_radius, [3.0; 4], "半径随负 spread 减小");
+        assert_eq!(shadow.rect, bounds.outset(px(-5.0)), "负 spread 收缩投影盒");
+        assert_eq!(shadow.corner_radius, [px(3.0); 4], "半径随负 spread 减小");
     }
 
     #[test]
@@ -4215,9 +4307,9 @@ mod tests {
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     shadows: Shadows::from(ShadowSpec {
-                        offset: Point::ZERO,
-                        blur,
-                        spread: 0.0,
+                        offset: LogicalPoint::ZERO,
+                        blur: px(blur),
+                        spread: px(0.0),
                         color: Color::BLACK,
                     }),
                     ..PaintSpec::default()
@@ -4227,7 +4319,7 @@ mod tests {
             layout_all(&mut h.tree);
             let _ = h.paint();
 
-            let scale = Scale::new(factor).expect("scale");
+            let scale = DevicePixelRatio::new(factor).expect("scale");
             let physical_blur = blur * factor;
             let sigma = (physical_blur * SHADOW_SIGMA_SCALE).max(SHADOW_SIGMA_MIN);
             let pad_physical = SHADOW_PAD_SIGMAS * sigma + 1.0;
@@ -4236,7 +4328,8 @@ mod tests {
             let (shadow_rect, painted_pad) =
                 painted.shadow.expect("painted_content 必须记录阴影外溢");
             assert_eq!(
-                painted_pad, pad_physical,
+                painted_pad,
+                physical_px(pad_physical),
                 "factor {factor} blur {blur}：shadow pad 必须是纯物理像素"
             );
             let legacy_sigma = (blur * SHADOW_SIGMA_SCALE).max(SHADOW_SIGMA_MIN);
@@ -4246,9 +4339,9 @@ mod tests {
                 "factor {factor} blur {blur}：新旧公式必须给出不同 pad（否则测试无法区分）"
             );
 
-            let physical = shadow_rect.to_physical_covering(scale);
+            let physical = scale.to_covering_device_rect(shadow_rect);
             let pad = pad_physical.ceil() as i32;
-            let expected = PhysicalRect::new(
+            let expected = DeviceRect::new(
                 physical.x0 - pad,
                 physical.y0 - pad,
                 physical.x1 + pad,
@@ -4268,9 +4361,9 @@ mod tests {
         let root = h.tree.root();
         let layers: Vec<ShadowSpec> = (0..5)
             .map(|index| ShadowSpec {
-                offset: Point::new(0.0, index as f32),
-                blur: 2.0,
-                spread: 0.0,
+                offset: LogicalPoint::new(px(0.0), px(index as f32)),
+                blur: px(2.0),
+                spread: px(0.0),
                 color: Color::BLACK,
             })
             .collect();
@@ -4299,7 +4392,7 @@ mod tests {
                 .iter()
                 .map(|shadow| shadow.offset.y)
                 .collect::<Vec<_>>(),
-            vec![0.0, 1.0, 2.0, 3.0],
+            vec![px(0.0), px(1.0), px(2.0), px(3.0)],
             "绘制序 = 数组序（后画的在上；截断丢弃尾部）"
         );
         let last_shadow = primitives
@@ -4319,7 +4412,7 @@ mod tests {
 
         use crate::{
             interaction::{AnimatedValue, AnimationSpec, Easing},
-            math::{PhysicalRect, Point},
+            math::{DeviceRect, LogicalPoint, px},
             node::{builder::NodeBuilder, dependency::ReadCtx},
             paint::{
                 color::Color,
@@ -4330,7 +4423,7 @@ mod tests {
         };
 
         fn sized(width: f32, height: f32) -> Style {
-            StyleBuilder::new().size(width, height).build()
+            StyleBuilder::new().size(px(width), px(height)).build()
         }
 
         fn white() -> PaintSpec {
@@ -4344,19 +4437,22 @@ mod tests {
             PaintSpec {
                 background: Color::WHITE,
                 shadows: Shadows::from(ShadowSpec {
-                    offset: Point::new(0.0, 25.0),
-                    blur: 20.0,
-                    spread: 0.0,
+                    offset: LogicalPoint::new(px(0.0), px(25.0)),
+                    blur: px(20.0),
+                    spread: px(0.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
             }
         }
 
-        fn damage_has_point(damage: &[PhysicalRect], x: i32, y: i32) -> bool {
-            damage
-                .iter()
-                .any(|rect| rect.x0 <= x && x < rect.x1 && rect.y0 <= y && y < rect.y1)
+        fn damage_has_point(damage: &[DeviceRect], x: i32, y: i32) -> bool {
+            damage.iter().any(|rect| {
+                rect.x0.value() <= x
+                    && x < rect.x1.value()
+                    && rect.y0.value() <= y
+                    && y < rect.y1.value()
+            })
         }
 
         fn alpha_of(
@@ -4453,11 +4549,14 @@ mod tests {
                 .expect("group")
                 .layout()
                 .bounds;
-            let spill = Point::new(
+            let spill = LogicalPoint::new(
                 group_bounds.origin.x + group_bounds.size.width * 0.5,
                 group_bounds.origin.y + group_bounds.size.height + 10.0,
             );
-            let (spill_x, spill_y) = (spill.x.floor() as i32, spill.y.floor() as i32);
+            let (spill_x, spill_y) = (
+                spill.x.value().floor() as i32,
+                spill.y.value().floor() as i32,
+            );
             assert!(
                 !done.damage_full,
                 "淡出帧不得退化为整帧（否则下面的覆盖断言没有意义）"

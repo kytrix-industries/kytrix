@@ -1,40 +1,40 @@
 use crate::{
     interaction::{ScrollAxis, ScrollSlot},
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{id::NodeId, tree::NodeTree},
 };
 
 #[must_use]
-pub(crate) fn clamp(value: f32, max: f32) -> f32 {
-    if max <= 0.0 {
-        return 0.0;
+pub(crate) fn clamp(value: LogicalPx, max: LogicalPx) -> LogicalPx {
+    if max <= LogicalPx::ZERO {
+        return LogicalPx::ZERO;
     }
-    value.clamp(0.0, max)
+    LogicalPx::new(value.value().clamp(0.0, max.value()))
 }
 
 #[must_use]
-pub(crate) fn max_offset(slot: &ScrollSlot, viewport: Size) -> Point {
-    let max_x = (slot.content.width - viewport.width).max(0.0);
-    let max_y = (slot.content.height - viewport.height).max(0.0);
+pub(crate) fn max_offset(slot: &ScrollSlot, viewport: LogicalSize) -> LogicalPoint {
+    let max_x = (slot.content.width - viewport.width).max(LogicalPx::ZERO);
+    let max_y = (slot.content.height - viewport.height).max(LogicalPx::ZERO);
     match slot.axis {
-        ScrollAxis::Vertical => Point::new(0.0, max_y),
-        ScrollAxis::Horizontal => Point::new(max_x, 0.0),
+        ScrollAxis::Vertical => LogicalPoint::new(px(0.0), max_y),
+        ScrollAxis::Horizontal => LogicalPoint::new(max_x, px(0.0)),
     }
 }
 
 #[must_use]
-pub(crate) fn clamp_offset(slot: &ScrollSlot, viewport: Size) -> Point {
+pub(crate) fn clamp_offset(slot: &ScrollSlot, viewport: LogicalSize) -> LogicalPoint {
     let max = max_offset(slot, viewport);
     match slot.axis {
-        ScrollAxis::Vertical => Point::new(0.0, clamp(slot.offset.y, max.y)),
-        ScrollAxis::Horizontal => Point::new(clamp(slot.offset.x, max.x), 0.0),
+        ScrollAxis::Vertical => LogicalPoint::new(px(0.0), clamp(slot.offset.y, max.y)),
+        ScrollAxis::Horizontal => LogicalPoint::new(clamp(slot.offset.x, max.x), px(0.0)),
     }
 }
 
 #[must_use]
-pub(crate) fn viewport(tree: &NodeTree, node: NodeId) -> Rect {
+pub(crate) fn viewport(tree: &NodeTree, node: NodeId) -> LogicalRect {
     tree.get(node).map_or_else(
-        |_| Rect::default(),
+        |_| LogicalRect::default(),
         |target| target.layout().bounds.inset(target.layout().border),
     )
 }
@@ -52,12 +52,12 @@ pub(crate) fn scroll_ancestor(tree: &NodeTree, from: NodeId) -> Option<(NodeId, 
 }
 
 #[must_use]
-pub(crate) fn ancestor_offset(tree: &NodeTree, node: NodeId) -> Point {
-    let mut total = Point::ZERO;
+pub(crate) fn ancestor_offset(tree: &NodeTree, node: NodeId) -> LogicalPoint {
+    let mut total = LogicalPoint::ZERO;
     let mut cursor = tree.get(node).ok().and_then(|target| target.parent());
     while let Some(current) = cursor {
         if let Some(slot) = tree.scroll_slot(current) {
-            total = Point::new(total.x + slot.offset.x, total.y + slot.offset.y);
+            total = LogicalPoint::new(total.x + slot.offset.x, total.y + slot.offset.y);
         }
         cursor = tree.get(current).ok().and_then(|target| target.parent());
     }
@@ -65,9 +65,9 @@ pub(crate) fn ancestor_offset(tree: &NodeTree, node: NodeId) -> Point {
 }
 
 #[must_use]
-pub(crate) fn to_screen(tree: &NodeTree, node: NodeId, rect: Rect) -> Rect {
+pub(crate) fn to_screen(tree: &NodeTree, node: NodeId, rect: LogicalRect) -> LogicalRect {
     let offset = ancestor_offset(tree, node);
-    rect.translate(Point::new(-offset.x, -offset.y))
+    rect.translate(LogicalPoint::new(-offset.x, -offset.y))
 }
 
 #[cfg(test)]
@@ -75,17 +75,17 @@ mod tests {
     use super::{ancestor_offset, clamp_offset, max_offset, scroll_ancestor, to_screen, viewport};
     use crate::{
         interaction::{ScrollAxis, ScrollConfig, ScrollSlot},
-        math::{Point, Rect, Size},
+        math::{LogicalPoint, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, tree::NodeTree},
         paint::style::{Clip, Style},
     };
 
-    fn slot(axis: ScrollAxis, content: Size) -> ScrollSlot {
+    fn slot(axis: ScrollAxis, content: LogicalSize) -> ScrollSlot {
         ScrollSlot {
-            offset: Point::ZERO,
+            offset: LogicalPoint::ZERO,
             content,
             axis,
-            line_height: 48.0,
+            line_height: px(48.0),
         }
     }
 
@@ -103,34 +103,40 @@ mod tests {
 
     #[test]
     fn clamps_both_ends() {
-        let content = Size::new(100.0, 500.0);
-        let viewport = Size::new(100.0, 200.0);
+        let content = LogicalSize::new(px(100.0), px(500.0));
+        let viewport = LogicalSize::new(px(100.0), px(200.0));
         let mut slot = slot(ScrollAxis::Vertical, content);
 
-        slot.offset = Point::new(0.0, -50.0);
-        assert_eq!(clamp_offset(&slot, viewport), Point::ZERO);
-        slot.offset = Point::new(0.0, 10_000.0);
-        assert_eq!(clamp_offset(&slot, viewport).y, 300.0);
-        assert_eq!(max_offset(&slot, viewport), Point::new(0.0, 300.0));
+        slot.offset = LogicalPoint::new(px(0.0), px(-50.0));
+        assert_eq!(clamp_offset(&slot, viewport), LogicalPoint::ZERO);
+        slot.offset = LogicalPoint::new(px(0.0), px(10_000.0));
+        assert_eq!(clamp_offset(&slot, viewport).y, px(300.0));
+        assert_eq!(
+            max_offset(&slot, viewport),
+            LogicalPoint::new(px(0.0), px(300.0))
+        );
     }
 
     #[test]
     fn zero_range_never_scrolls() {
-        let slot = slot(ScrollAxis::Vertical, Size::new(100.0, 200.0));
-        let viewport = Size::new(100.0, 200.0);
+        let slot = slot(ScrollAxis::Vertical, LogicalSize::new(px(100.0), px(200.0)));
+        let viewport = LogicalSize::new(px(100.0), px(200.0));
 
-        assert_eq!(max_offset(&slot, viewport), Point::ZERO);
-        assert_eq!(clamp_offset(&slot, viewport), Point::ZERO);
+        assert_eq!(max_offset(&slot, viewport), LogicalPoint::ZERO);
+        assert_eq!(clamp_offset(&slot, viewport), LogicalPoint::ZERO);
     }
 
     #[test]
     fn horizontal_containers_ignore_the_vertical_axis() {
-        let mut slot = slot(ScrollAxis::Horizontal, Size::new(500.0, 100.0));
-        slot.offset = Point::new(10_000.0, 999.0);
+        let mut slot = slot(
+            ScrollAxis::Horizontal,
+            LogicalSize::new(px(500.0), px(100.0)),
+        );
+        slot.offset = LogicalPoint::new(px(10_000.0), px(999.0));
 
         assert_eq!(
-            clamp_offset(&slot, Size::new(100.0, 100.0)),
-            Point::new(400.0, 0.0)
+            clamp_offset(&slot, LogicalSize::new(px(100.0), px(100.0))),
+            LogicalPoint::new(px(400.0), px(0.0))
         );
     }
 
@@ -141,26 +147,32 @@ mod tests {
         let outer = clipped_box(&mut tree, root);
         let inner = clipped_box(&mut tree, outer);
         tree.ensure_interaction(outer).expect("exists").scroll = Some(ScrollSlot {
-            offset: Point::new(0.0, 30.0),
-            content: Size::new(100.0, 400.0),
+            offset: LogicalPoint::new(px(0.0), px(30.0)),
+            content: LogicalSize::new(px(100.0), px(400.0)),
             axis: ScrollAxis::Vertical,
-            line_height: 48.0,
+            line_height: px(48.0),
         });
         tree.ensure_interaction(inner).expect("exists").scroll = Some(ScrollSlot {
-            offset: Point::new(0.0, 10.0),
-            content: Size::new(100.0, 400.0),
+            offset: LogicalPoint::new(px(0.0), px(10.0)),
+            content: LogicalSize::new(px(100.0), px(400.0)),
             axis: ScrollAxis::Vertical,
-            line_height: 48.0,
+            line_height: px(48.0),
         });
 
         assert_eq!(
             ancestor_offset(&tree, outer),
-            Point::ZERO,
+            LogicalPoint::ZERO,
             "自身 offset 不算"
         );
-        assert_eq!(ancestor_offset(&tree, inner), Point::new(0.0, 30.0));
-        let rect = Rect::new(0.0, 100.0, 50.0, 20.0);
-        assert_eq!(to_screen(&tree, inner, rect).origin, Point::new(0.0, 70.0));
+        assert_eq!(
+            ancestor_offset(&tree, inner),
+            LogicalPoint::new(px(0.0), px(30.0))
+        );
+        let rect = LogicalRect::new(px(0.0), px(100.0), px(50.0), px(20.0));
+        assert_eq!(
+            to_screen(&tree, inner, rect).origin,
+            LogicalPoint::new(px(0.0), px(70.0))
+        );
     }
 
     #[test]
@@ -168,13 +180,13 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = clipped_box(&mut tree, root);
-        let bounds = crate::math::Rect::new(10.0, 20.0, 100.0, 80.0);
-        let border = crate::math::Edges::uniform(2.0);
+        let bounds = crate::math::LogicalRect::new(px(10.0), px(20.0), px(100.0), px(80.0));
+        let border = crate::math::LogicalEdges::uniform(px(2.0));
         tree.set_layout_for_test(node, crate::node::tree::LayoutBox { bounds, border });
 
         assert_eq!(
             viewport(&tree, node),
-            crate::math::Rect::new(12.0, 22.0, 96.0, 76.0)
+            crate::math::LogicalRect::new(px(12.0), px(22.0), px(96.0), px(76.0))
         );
     }
 
@@ -188,8 +200,8 @@ mod tests {
         let config = ScrollConfig::default();
         for node in [outer, inner] {
             tree.ensure_interaction(node).expect("exists").scroll = Some(ScrollSlot {
-                offset: Point::ZERO,
-                content: Size::new(100.0, 400.0),
+                offset: LogicalPoint::ZERO,
+                content: LogicalSize::new(px(100.0), px(400.0)),
                 axis: config.axis,
                 line_height: config.line_height,
             });

@@ -7,7 +7,7 @@ use super::{
 use crate::{
     app::App,
     error::EngineError,
-    math::{PhysicalRect, Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{canvas::Canvas, color::Color, style::Style, style_builder::StyleBuilder},
     render::compositor::{DamageRects, Plan},
@@ -26,7 +26,7 @@ fn new_window_has_root_and_empty_scene() {
     assert_eq!(window.tree().len(), 1, "初始只有 root");
     assert_eq!(window.scene().lane_count(), 0);
     assert!(window.scene().is_empty());
-    assert_eq!(window.scale(), Scale::ONE);
+    assert_eq!(window.scale(), DevicePixelRatio::ONE);
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn dpi_change_does_not_invalidate_layout() {
     let bounds_before = window.tree().get(root).expect("root 存在").layout().bounds;
     let epoch = window.scale_epoch();
 
-    window.set_scale(Scale::new(2.0).expect("合法比例"));
+    window.set_scale(DevicePixelRatio::new(2.0).expect("合法比例"));
 
     let flags = window.tree().get(root).expect("root 存在").dirty();
     assert!(
@@ -74,8 +74,8 @@ fn window_options_default_values() {
     let options = WindowOptions::default();
 
     assert_eq!(options.title, "");
-    assert_eq!(options.size.width, 800.0);
-    assert_eq!(options.size.height, 600.0);
+    assert_eq!(options.size.width, px(800.0));
+    assert_eq!(options.size.height, px(600.0));
     assert_eq!(
         options.position, None,
         "默认位置由平台决定（Windows 屏幕中央附近 / macOS 级联 / Wayland compositor）"
@@ -85,7 +85,7 @@ fn window_options_default_values() {
     assert_eq!(options.owner, None, "默认没有 owner（独立顶层窗口）");
     assert!(!options.modal, "默认不是模态窗口");
     assert!(!options.always_on_top, "默认不置顶");
-    assert_eq!(options.scale, Scale::ONE);
+    assert_eq!(options.scale, DevicePixelRatio::ONE);
     assert_eq!(
         options.background,
         Color::BLACK,
@@ -98,8 +98,8 @@ fn drag_regions_are_stored_and_cleared_by_an_empty_slice() {
     let mut window = window();
     assert!(window.drag_regions().is_empty(), "默认没有拖动区");
 
-    let strip = Rect::new(0.0, 0.0, 800.0, 38.0);
-    let handle = Rect::new(0.0, 38.0, 800.0, 8.0);
+    let strip = LogicalRect::new(px(0.0), px(0.0), px(800.0), px(38.0));
+    let handle = LogicalRect::new(px(0.0), px(38.0), px(800.0), px(8.0));
     window.set_drag_regions(&[strip, handle]);
     assert_eq!(
         window.drag_regions(),
@@ -146,7 +146,7 @@ fn a_committed_frame_uses_the_platform_surface_not_the_covering_size() {
     assert!(record.damage_full, "set_surface 标全量重绘");
     assert_eq!(
         record.damage,
-        vec![crate::math::PhysicalRect::new(0, 0, 449, 300)],
+        vec![crate::math::DeviceRect::new(dp(0), dp(0), dp(449), dp(300))],
         "frame 必须用真实 surface，而不是 covering"
     );
 }
@@ -155,31 +155,58 @@ fn a_committed_frame_uses_the_platform_surface_not_the_covering_size() {
 #[test]
 fn frame_rect_uses_the_platform_buffer_on_linux() {
     let mut window = window();
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(800), dp(600))
+    );
     window.set_surface((999, 777));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(999), dp(777))
+    );
 
-    window.set_size(Size::new(256.8, 100.5));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
+    window.set_size(LogicalSize::new(px(256.8), px(100.5)));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(999), dp(777))
+    );
     window.set_surface((449, 176));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(449), dp(176))
+    );
 
     window.set_surface((0, 0));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1, 1));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(1), dp(1))
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn frame_rect_uses_the_platform_backing_on_macos() {
     let mut window = window();
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 800, 600));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(800), dp(600))
+    );
     window.set_surface((1234, 777));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(1234), dp(777))
+    );
 
-    window.set_size(Size::new(256.8, 100.5));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 1234, 777));
+    window.set_size(LogicalSize::new(px(256.8), px(100.5)));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(1234), dp(777))
+    );
     window.set_surface((449, 176));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(449), dp(176))
+    );
 }
 
 #[test]
@@ -187,7 +214,7 @@ fn surface_starts_and_tracks_the_covering_size() {
     let mut window = Window::new(
         WindowId::for_test(1),
         WindowOptions {
-            size: Size::new(800.0, 600.0),
+            size: LogicalSize::new(px(800.0), px(600.0)),
             ..WindowOptions::default()
         },
     );
@@ -198,7 +225,7 @@ fn surface_starts_and_tracks_the_covering_size() {
         (1.5, (1200, 900)),
         (1.75, (1400, 1050)),
     ] {
-        window.set_scale(Scale::new(factor).expect("合法比例"));
+        window.set_scale(DevicePixelRatio::new(factor).expect("合法比例"));
         assert_eq!(window.physical_surface(), expected, "scale {factor}");
         assert_eq!(
             window.physical_surface(),
@@ -207,13 +234,13 @@ fn surface_starts_and_tracks_the_covering_size() {
         );
     }
 
-    window.set_size(Size::new(256.8, 100.5));
+    window.set_size(LogicalSize::new(px(256.8), px(100.5)));
     assert_eq!(window.physical_surface(), (450, 176));
     assert_eq!(
         window.physical_surface(),
         covering_surface(window.size(), window.scale())
     );
-    window.set_size(Size::new(0.0, 0.0));
+    window.set_size(LogicalSize::new(px(0.0), px(0.0)));
     assert_eq!(window.physical_surface(), (1, 1));
 }
 
@@ -276,13 +303,16 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
     let epoch = window.scale_epoch();
     let root = window.tree().root();
 
-    window.set_size(Size::new(256.8, 100.5));
+    window.set_size(LogicalSize::new(px(256.8), px(100.5)));
     assert_eq!(
         window.physical_surface(),
         (999, 777),
         "平台真值不得被 covering（257×101）覆盖"
     );
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(999), dp(777))
+    );
     assert!(window.full_damage_pending, "尺寸变化仍必须整帧重绘");
     assert!(
         window
@@ -297,13 +327,16 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
 
     window.tree_mut().clear_all_dirty_for_test();
     window.full_damage_pending = false;
-    window.set_scale(Scale::new(1.25).expect("合法比例"));
+    window.set_scale(DevicePixelRatio::new(1.25).expect("合法比例"));
     assert_eq!(
         window.physical_surface(),
         (999, 777),
         "DPI 变化不得覆盖平台真值"
     );
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(999), dp(777))
+    );
     assert!(window.full_damage_pending, "DPI 变化仍必须整帧重绘");
     assert!(
         !window
@@ -317,11 +350,17 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
     assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 照常递增");
 
     window.set_surface((449, 176));
-    assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 449, 176));
+    assert_eq!(
+        window.frame_rect(),
+        DeviceRect::new(dp(0), dp(0), dp(449), dp(176))
+    );
 
     let mut same_value = Window::new(WindowId::for_test(1), WindowOptions::default());
-    same_value.set_surface(covering_surface(Size::new(800.0, 600.0), Scale::ONE));
-    same_value.set_scale(Scale::new(1.25).expect("合法比例"));
+    same_value.set_surface(covering_surface(
+        LogicalSize::new(px(800.0), px(600.0)),
+        DevicePixelRatio::ONE,
+    ));
+    same_value.set_scale(DevicePixelRatio::new(1.25).expect("合法比例"));
     assert_eq!(
         same_value.physical_surface(),
         (800, 600),
@@ -336,7 +375,7 @@ fn window_size_is_root_available_space() {
     let mut window = Window::new(
         WindowId::for_test(1),
         WindowOptions {
-            size: Size::new(120.0, 60.0),
+            size: LogicalSize::new(px(120.0), px(60.0)),
             ..WindowOptions::default()
         },
     );
@@ -347,10 +386,10 @@ fn window_size_is_root_available_space() {
 
     let report = window.compute_layout().expect("布局成功");
 
-    assert_eq!(window.size(), Size::new(120.0, 60.0));
+    assert_eq!(window.size(), LogicalSize::new(px(120.0), px(60.0)));
     assert_eq!(
         window.tree().get(root).expect("root").layout().bounds.size,
-        Size::new(120.0, 60.0),
+        LogicalSize::new(px(120.0), px(60.0)),
         "根 100% × 100% 撑满窗口"
     );
     assert!(report.laid_out >= 2, "根与子节点都要布局：{report:?}");
@@ -360,33 +399,36 @@ fn window_size_is_root_available_space() {
 #[test]
 fn dpi_change_does_not_move_logical_boxes() {
     use crate::{
-        math::Rect,
+        math::{LogicalPx, LogicalRect},
         node::builder::NodeBuilder,
         paint::{style::Style, style_builder::StyleBuilder},
     };
 
-    fn fixed(width: f32, height: f32) -> Style {
+    fn fixed(width: LogicalPx, height: LogicalPx) -> Style {
         StyleBuilder::new().size(width, height).build()
     }
 
     let mut window = Window::new(
         WindowId::for_test(1),
         WindowOptions {
-            size: Size::new(120.0, 60.0),
+            size: LogicalSize::new(px(120.0), px(60.0)),
             ..WindowOptions::default()
         },
     );
     let root = window.tree().root();
     let child = NodeBuilder::boxed()
-        .style(fixed(10.5, 3.25))
+        .style(fixed(px(10.5), px(3.25)))
         .build(window.tree_mut(), root)
         .expect("挂载成功");
     let _ = window.compute_layout().expect("布局成功");
     let before = window.tree().get(child).expect("存在").layout().bounds;
-    assert_eq!(before, Rect::new(0.0, 0.0, 10.5, 3.25));
+    assert_eq!(
+        before,
+        LogicalRect::new(px(0.0), px(0.0), px(10.5), px(3.25))
+    );
 
     for factor in [1.5f32, 2.0] {
-        window.set_scale(Scale::new(factor).expect("合法比例"));
+        window.set_scale(DevicePixelRatio::new(factor).expect("合法比例"));
         assert!(
             window.tree_mut().invalidate_layout(root),
             "前置：必须真的请求重排，否则缓存命中下测不到 DPI 相关 measure"
@@ -405,30 +447,31 @@ fn dpi_change_does_not_move_logical_boxes() {
 #[test]
 fn layout_is_identical_at_every_device_scale() {
     use crate::{
+        math::LogicalPx,
         node::builder::NodeBuilder,
         paint::{style::Style, style_builder::StyleBuilder},
     };
 
-    fn fixed(width: f32, height: f32) -> Style {
+    fn fixed(width: LogicalPx, height: LogicalPx) -> Style {
         StyleBuilder::new().size(width, height).build()
     }
 
     let mut window = Window::new(
         WindowId::for_test(1),
         WindowOptions {
-            size: Size::new(120.0, 60.0),
+            size: LogicalSize::new(px(120.0), px(60.0)),
             ..WindowOptions::default()
         },
     );
     let root = window.tree().root();
-    let mut column = fixed(100.0, 50.0);
+    let mut column = fixed(px(100.0), px(50.0));
     column.flex_direction(taffy::style::FlexDirection::Column);
     let column = NodeBuilder::boxed()
         .style(column)
         .build(window.tree_mut(), root)
         .expect("挂载成功");
     let child = NodeBuilder::boxed()
-        .style(fixed(10.5, 3.25))
+        .style(fixed(px(10.5), px(3.25)))
         .build(window.tree_mut(), column)
         .expect("挂载成功");
     let _ = window.compute_layout().expect("布局成功");
@@ -441,7 +484,7 @@ fn layout_is_identical_at_every_device_scale() {
     let reference = snapshot(&window);
 
     for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
-        window.set_scale(Scale::new(factor).expect("合法比例"));
+        window.set_scale(DevicePixelRatio::new(factor).expect("合法比例"));
         let root = window.tree().root();
         assert!(
             window.tree_mut().invalidate_layout(root),
@@ -465,7 +508,7 @@ fn resize_relayouts_percent_children() {
     let mut window = Window::new(
         WindowId::for_test(1),
         WindowOptions {
-            size: Size::new(100.0, 100.0),
+            size: LogicalSize::new(px(100.0), px(100.0)),
             ..WindowOptions::default()
         },
     );
@@ -478,15 +521,15 @@ fn resize_relayouts_percent_children() {
     let _ = window.compute_layout().expect("布局成功");
     assert_eq!(
         window.tree().get(child).expect("存在").layout().bounds.size,
-        Size::new(100.0, 100.0)
+        LogicalSize::new(px(100.0), px(100.0))
     );
 
-    window.set_size(Size::new(300.0, 50.0));
+    window.set_size(LogicalSize::new(px(300.0), px(50.0)));
     let _ = window.compute_layout().expect("布局成功");
 
     assert_eq!(
         window.tree().get(child).expect("存在").layout().bounds.size,
-        Size::new(300.0, 50.0),
+        LogicalSize::new(px(300.0), px(50.0)),
         "百分比尺寸随根可用空间变化"
     );
 }
@@ -502,24 +545,24 @@ fn set_size_marks_root_layout_and_clears_cache() {
         .expect("挂载成功");
     let _ = window.compute_layout().expect("布局成功");
 
-    window.set_size(Size::new(640.0, 480.0));
+    window.set_size(LogicalSize::new(px(640.0), px(480.0)));
 
     let flags = window.tree().get(root).expect("root 存在").dirty();
     assert!(
         flags.contains(DirtyFlags::LAYOUT),
         "尺寸变化必须标根 LAYOUT（实际 {flags:?}）"
     );
-    assert_eq!(window.size(), Size::new(640.0, 480.0));
+    assert_eq!(window.size(), LogicalSize::new(px(640.0), px(480.0)));
 }
 #[test]
 fn scale_epoch_bumps_on_dpi_change() {
     let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
     assert_eq!(window.scale_epoch(), 0);
 
-    window.set_scale(Scale::new(1.5).expect("finite scale"));
+    window.set_scale(DevicePixelRatio::new(1.5).expect("finite scale"));
     assert_eq!(window.scale_epoch(), 1);
 
-    window.set_scale(Scale::new(2.0).expect("finite scale"));
+    window.set_scale(DevicePixelRatio::new(2.0).expect("finite scale"));
     assert_eq!(window.scale_epoch(), 2);
     assert_eq!(window.scale().factor(), 2.0);
 }
@@ -530,7 +573,12 @@ fn painted_window() -> (Window, crate::node::id::NodeId) {
     let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
     let root = window.tree().root();
     let node = NodeBuilder::boxed()
-        .layout_override(crate::math::Rect::new(0.0, 0.0, 40.0, 16.0))
+        .layout_override(crate::math::LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(40.0),
+            px(16.0),
+        ))
         .paint(PaintSpec {
             background: Color::WHITE,
             ..PaintSpec::default()
@@ -551,7 +599,7 @@ fn window_frame_reports_skipped_inline_box_images() {
     let spec = InlineBoxSpec {
         id: 21,
         index: 1,
-        size: Size::new(8.0, 8.0),
+        size: LogicalSize::new(px(8.0), px(8.0)),
         baseline: None,
         align: InlineAlign::Baseline,
         paint: Some(InlineBoxPaint::Image {
@@ -559,38 +607,43 @@ fn window_frame_reports_skipped_inline_box_images() {
             modulation: Color::WHITE,
         }),
     };
-    let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([spec]);
+    let content = TextContent::new("a b", TextStyle::new(px(16.0))).with_inline_boxes([spec]);
     let shaped_line = ShapedLine {
         text: smol_str::SmolStr::new_static("a b"),
         lines: vec![ShapedTextLine {
             text_range: 0..3,
-            baseline: 12.0,
-            line_height: 16.0,
-            advance: 20.0,
+            baseline: px(12.0),
+            line_height: px(16.0),
+            advance: px(20.0),
             items: vec![ShapedTextItem::InlineBox(ShapedInlineBox {
                 id: 21,
-                rect: Rect::new(2.0, 2.0, 8.0, 8.0),
+                rect: LogicalRect::new(px(2.0), px(2.0), px(8.0), px(8.0)),
                 baseline: None,
             })],
             decorations: Vec::new(),
         }],
-        width: 20.0,
-        height: 16.0,
-        first_baseline: Some(12.0),
+        width: px(20.0),
+        height: px(16.0),
+        first_baseline: Some(px(12.0)),
         atlas_generation: 0,
         font_stack_version: 1,
-        scale: 1.0,
+        scale: DevicePixelRatio::ONE,
     };
     let node = {
         let root = window.tree().root();
-        let node = NodeBuilder::text("a b", TextStyle::new(16.0))
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 16.0))
+        let node = NodeBuilder::text("a b", TextStyle::new(px(16.0)))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(16.0)))
             .build(window.tree_mut(), root)
             .expect("挂载成功");
         let tree = window.tree_mut();
         assert!(tree.set_text_content(node, content.clone()), "文本载荷");
         assert!(
-            tree.install_text_line_for_test(node, &content, std::rc::Rc::new(shaped_line), 40.0),
+            tree.install_text_line_for_test(
+                node,
+                &content,
+                std::rc::Rc::new(shaped_line),
+                px(40.0)
+            ),
             "注入行快照"
         );
         node
@@ -608,7 +661,7 @@ fn window_frame_reports_skipped_inline_box_images() {
 #[test]
 fn frame_reaches_gpu_tracks_plan_and_target_size() {
     let mut rects = DamageRects::new();
-    assert!(rects.push(PhysicalRect::new(0, 0, 4, 4)));
+    assert!(rects.push(DeviceRect::new(dp(0), dp(0), dp(4), dp(4))));
     let partial = Plan::Partial(rects);
     let surface = (100, 50);
 
@@ -655,7 +708,7 @@ fn a_windows_surface_change_never_publishes_an_idle_plan() {
     );
 
     let mut rects = DamageRects::new();
-    assert!(rects.push(PhysicalRect::new(0, 0, 4, 4)));
+    assert!(rects.push(DeviceRect::new(dp(0), dp(0), dp(4), dp(4))));
     assert_eq!(
         surface_change_plan(Plan::Partial(rects), Some((99, 50)), surface),
         Plan::Full,
@@ -688,7 +741,12 @@ fn an_idle_plan_with_a_real_renderer_settles_node_damage() {
         .expect("offscreen renderer");
     let root = window.tree().root();
     let node = NodeBuilder::boxed()
-        .layout_override(crate::math::Rect::new(900.0, 900.0, 40.0, 16.0))
+        .layout_override(crate::math::LogicalRect::new(
+            px(900.0),
+            px(900.0),
+            px(40.0),
+            px(16.0),
+        ))
         .paint(PaintSpec {
             background: Color::WHITE,
             ..PaintSpec::default()
@@ -825,7 +883,7 @@ fn frame_aborts_on_layout_error() {
     let _ = NodeBuilder::boxed()
         .measure(Box::new(
             |_: taffy::Size<Option<f32>>, _: taffy::Size<taffy::AvailableSpace>| {
-                Size::new(f32::NAN, 10.0)
+                LogicalSize::new(px(f32::NAN), px(10.0))
             },
         ))
         .build(window.tree_mut(), root)
@@ -846,7 +904,12 @@ fn frame_rejects_bound_nodes_without_styles() {
     let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
     let root = window.tree().root();
     let _ = NodeBuilder::boxed()
-        .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
+        .layout_override(crate::math::LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(10.0),
+            px(10.0),
+        ))
         .bind_style(|_cx| StylePatch::default())
         .build(window.tree_mut(), root)
         .expect("挂载成功");
@@ -981,17 +1044,17 @@ fn window_options_carry_an_optional_icon() {
 
 fn text_style(width: f32) -> Style {
     let mut style = StyleBuilder::new()
-        .padding_sides(7.0, 0.0, 0.0, 9.0)
+        .padding_sides(px(7.0), px(0.0), px(0.0), px(9.0))
         .build();
     style
         .align_self(taffy::style::AlignSelf::START)
         .width(taffy::style::Dimension::length(width))
-        .border_sides(3.0, 0.0, 0.0, 2.0);
+        .border_sides(px(3.0), px(0.0), px(0.0), px(2.0));
     style
 }
 
 fn text_window(text: &str, width: f32) -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
-    text_window_with_style(text, width, TextStyle::new(16.0))
+    text_window_with_style(text, width, TextStyle::new(px(16.0)))
 }
 
 fn text_window_with_style(
@@ -1025,7 +1088,7 @@ fn assert_caret_round_trip(app: &App, window: WindowId, node: NodeId, byte_index
     let caret = window
         .text_caret_rect(node, byte_index)
         .expect("caret 矩形");
-    let point = Point::new(
+    let point = LogicalPoint::new(
         caret.origin.x + caret.size.width * 0.5,
         caret.origin.y + caret.size.height * 0.5,
     );
@@ -1048,15 +1111,15 @@ fn text_byte_index_at_round_trips_with_caret_rect() {
 
     let bounds = window_ref.tree().get(node).expect("节点").layout().bounds;
     let content_offset = window_ref.tree().content_offset(node);
-    assert!(content_offset.x > 0.0 && content_offset.y > 0.0);
+    assert!(content_offset.x > px(0.0) && content_offset.y > px(0.0));
     let caret = window_ref.text_caret_rect(node, 0).expect("caret");
     assert!(
-        (caret.origin.x - bounds.origin.x - content_offset.x).abs() < 0.01,
+        (caret.origin.x - bounds.origin.x - content_offset.x).abs() < px(0.01),
         "caret 绝对 x 必须含 border + padding：{caret:?} vs {content_offset:?}"
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(content_offset.x, content_offset.y))
+            .text_byte_index_at(node, LogicalPoint::new(content_offset.x, content_offset.y))
             .expect("盒首"),
         0,
         "文本盒左上角 → 0"
@@ -1090,19 +1153,22 @@ fn text_byte_index_at_round_trips_the_numeric_fast_path() {
     let line_center_y = (caret.origin.y - bounds.origin.y) + caret.size.height * 0.5;
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(0.0, -1.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(0.0), px(-1.0)))
             .expect("盒上方"),
         0
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(0.0, bounds.size.height + 50.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(0.0), bounds.size.height + 50.0))
             .expect("盒下方"),
         "1234567890".len()
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(bounds.size.width + 100.0, line_center_y))
+            .text_byte_index_at(
+                node,
+                LogicalPoint::new(bounds.size.width + 100.0, line_center_y)
+            )
             .expect("行右越界"),
         "1234567890".len()
     );
@@ -1132,7 +1198,7 @@ fn text_byte_index_at_round_trips_every_line_of_wrapped_text() {
         .y;
     for index in 0..="alpha beta gamma delta".len() {
         let caret = window_ref.text_caret_rect(node, index).expect("caret");
-        let line_key = (caret.origin.y - bounds_origin_y).round() as i32;
+        let line_key = (caret.origin.y - bounds_origin_y).value().round() as i32;
         if seen_lines.contains(&line_key) {
             continue;
         }
@@ -1154,33 +1220,36 @@ fn text_byte_index_at_clamps_in_border_box_local_coordinates() {
 
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(0.0, 0.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(0.0), px(0.0)))
             .expect("盒上方"),
         0,
         "border box 顶部在文本盒上方 ⇒ 0"
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(0.0, bounds.size.height + 50.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(0.0), bounds.size.height + 50.0))
             .expect("盒下方"),
         6,
         "border box 下方 ⇒ text.len()"
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(-100.0, line_center_y))
+            .text_byte_index_at(node, LogicalPoint::new(px(-100.0), line_center_y))
             .expect("行左越界"),
         0
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(bounds.size.width + 100.0, line_center_y))
+            .text_byte_index_at(
+                node,
+                LogicalPoint::new(bounds.size.width + 100.0, line_center_y)
+            )
             .expect("行右越界"),
         6
     );
     assert_eq!(
         window_ref
-            .text_byte_index_at(node, Point::new(-100.0, -100.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(-100.0), px(-100.0)))
             .expect("负坐标"),
         0
     );
@@ -1208,7 +1277,7 @@ fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
         assert_caret_round_trip(&app, window, node, index);
     }
 
-    let cjk_middle = Point::new((local_x(1) + local_x(4)) * 0.5, line_center_y);
+    let cjk_middle = LogicalPoint::new((local_x(1) + local_x(4)) * 0.5, line_center_y);
     let cjk_index = window_ref
         .text_byte_index_at(node, cjk_middle)
         .expect("CJK 中点");
@@ -1216,7 +1285,7 @@ fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
         cjk_index == 1 || cjk_index == 4,
         "CJK 簇中点必须吸附到边界，实际 {cjk_index}"
     );
-    let emoji_middle = Point::new((local_x(5) + local_x(9)) * 0.5, line_center_y);
+    let emoji_middle = LogicalPoint::new((local_x(5) + local_x(9)) * 0.5, line_center_y);
     let emoji_index = window_ref
         .text_byte_index_at(node, emoji_middle)
         .expect("emoji 中点");
@@ -1232,7 +1301,7 @@ fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
 #[test]
 fn text_byte_index_at_rejects_non_text_and_unshaped_nodes() {
     let (_rt, mut app, window, node) = text_window("abc", 100.0);
-    let point = Point::new(1.0, 1.0);
+    let point = LogicalPoint::new(px(1.0), px(1.0));
 
     assert!(matches!(
         app.window(window)
@@ -1290,7 +1359,7 @@ fn text_byte_index_at_is_read_only() {
         let window_ref = app.window(window).expect("窗口存在");
         for _ in 0..4 {
             let index = window_ref
-                .text_byte_index_at(node, Point::new(5.0, 12.0))
+                .text_byte_index_at(node, LogicalPoint::new(px(5.0), px(12.0)))
                 .expect("命中");
             assert!(index <= "read only".len());
         }
@@ -1314,7 +1383,7 @@ fn assert_stale_byte_index_at(app: &App, window: WindowId, node: NodeId) {
     let window_ref = app.window(window).expect("窗口存在");
     assert!(
         matches!(
-            window_ref.text_byte_index_at(node, Point::new(1.0, 1.0)),
+            window_ref.text_byte_index_at(node, LogicalPoint::new(px(1.0), px(1.0))),
             Err(EngineError::StaleNode { node: reported }) if reported == node
         ),
         "文本 pass 之后输入变了却返回旧快照索引（必须 StaleNode）"
@@ -1334,7 +1403,7 @@ fn text_byte_index_at_rejects_text_changed_after_the_text_pass() {
         let w = app.window_mut(window).expect("窗口存在");
         assert!(
             w.tree_mut()
-                .set_text_content(node, TextContent::new("abc", TextStyle::new(16.0))),
+                .set_text_content(node, TextContent::new("abc", TextStyle::new(px(16.0)))),
             "替换文本载荷"
         );
     }
@@ -1344,7 +1413,7 @@ fn text_byte_index_at_rejects_text_changed_after_the_text_pass() {
     let index = app
         .window(window)
         .expect("窗口存在")
-        .text_byte_index_at(node, Point::new(1.0, 1.0))
+        .text_byte_index_at(node, LogicalPoint::new(px(1.0), px(1.0)))
         .expect("新文本 pass 后必须可命中");
     assert!(index <= 3, "命中不得越过新文本长度，实际 {index}");
 }
@@ -1357,7 +1426,7 @@ fn text_byte_index_at_rejects_style_changed_after_the_text_pass() {
         let w = app.window_mut(window).expect("窗口存在");
         assert!(
             w.tree_mut()
-                .set_text_content(node, TextContent::new("abcdef", TextStyle::new(24.0))),
+                .set_text_content(node, TextContent::new("abcdef", TextStyle::new(px(24.0)))),
             "替换文本样式"
         );
     }
@@ -1367,7 +1436,7 @@ fn text_byte_index_at_rejects_style_changed_after_the_text_pass() {
     assert!(
         app.window(window)
             .expect("窗口存在")
-            .text_byte_index_at(node, Point::new(1.0, 1.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(1.0), px(1.0)))
             .is_ok(),
         "新样式完成文本 pass 后必须可命中"
     );
@@ -1380,7 +1449,7 @@ fn text_byte_index_at_rejects_inline_boxes_changed_after_the_text_pass() {
     let spec = InlineBoxSpec {
         id: 31,
         index: 1,
-        size: Size::new(8.0, 8.0),
+        size: LogicalSize::new(px(8.0), px(8.0)),
         baseline: None,
         align: InlineAlign::Baseline,
         paint: None,
@@ -1390,7 +1459,7 @@ fn text_byte_index_at_rejects_inline_boxes_changed_after_the_text_pass() {
         assert!(
             w.tree_mut().set_text_content(
                 node,
-                TextContent::new("abcdef", TextStyle::new(16.0)).with_inline_boxes([spec]),
+                TextContent::new("abcdef", TextStyle::new(px(16.0))).with_inline_boxes([spec]),
             ),
             "追加行内盒"
         );
@@ -1401,7 +1470,7 @@ fn text_byte_index_at_rejects_inline_boxes_changed_after_the_text_pass() {
     assert!(
         app.window(window)
             .expect("窗口存在")
-            .text_byte_index_at(node, Point::new(1.0, 1.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(1.0), px(1.0)))
             .is_ok(),
         "行内盒完成文本 pass 后必须可命中"
     );
@@ -1425,7 +1494,7 @@ fn text_byte_index_at_rejects_layout_width_changed_after_the_text_pass() {
     assert!(
         app.window(window)
             .expect("窗口存在")
-            .text_byte_index_at(node, Point::new(1.0, 1.0))
+            .text_byte_index_at(node, LogicalPoint::new(px(1.0), px(1.0)))
             .is_ok(),
         "按新宽度重排后必须可命中"
     );
@@ -1437,7 +1506,7 @@ fn text_byte_index_at_guards_the_numeric_fast_path_alignment_offset() {
         let (_rt, mut app, window, node) = text_window_with_style(
             "1234567890",
             200.0,
-            TextStyle::new(16.0).with_alignment(alignment),
+            TextStyle::new(px(16.0)).with_alignment(alignment),
         );
         let report = app
             .refresh_text(window)
@@ -1453,7 +1522,7 @@ fn text_byte_index_at_guards_the_numeric_fast_path_alignment_offset() {
         let content_offset = window_ref.tree().content_offset(node);
         let caret = window_ref.text_caret_rect(node, 0).expect("caret");
         assert!(
-            caret.origin.x - bounds.origin.x - content_offset.x > 1.0,
+            caret.origin.x - bounds.origin.x - content_offset.x > px(1.0),
             "{alignment:?} 的快速路径对齐偏移必须非零（否则本用例测不到 offset）"
         );
 
@@ -1474,10 +1543,10 @@ fn text_byte_index_at_returns_zero_for_empty_text_at_window_level() {
     commit_frame(&mut app, window);
     let window_ref = app.window(window).expect("窗口存在");
     for point in [
-        Point::new(0.0, 0.0),
-        Point::new(-5.0, -5.0),
-        Point::new(500.0, 500.0),
-        Point::new(1.0, 1.0),
+        LogicalPoint::new(px(0.0), px(0.0)),
+        LogicalPoint::new(px(-5.0), px(-5.0)),
+        LogicalPoint::new(px(500.0), px(500.0)),
+        LogicalPoint::new(px(1.0), px(1.0)),
     ] {
         assert_eq!(
             window_ref

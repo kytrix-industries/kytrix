@@ -5,7 +5,7 @@ use smol_str::SmolStr;
 use crate::{
     a11y::{A11yAction, A11yNodeId, A11yRole, A11yTreeSnapshot},
     app::App,
-    math::{PhysicalRect, Rect, Scale},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, physical_px, px},
     node::{id::NodeId, signal::SignalId},
     paint::{
         canvas::Canvas,
@@ -20,9 +20,9 @@ use crate::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameDump {
     pub frame_index: u32,
-    pub viewport: PhysicalRect,
+    pub viewport: DeviceRect,
     pub scale: f32,
-    pub damage: Vec<PhysicalRect>,
+    pub damage: Vec<DeviceRect>,
     pub instances: Vec<InstanceDump>,
     pub ops: Vec<OpDump>,
     pub clips: Vec<ClipDump>,
@@ -63,15 +63,22 @@ impl fmt::Display for FrameDump {
             f,
             "frame {} viewport {:.0},{:.0},{:.0},{:.0} scale {:.4}",
             self.frame_index,
-            self.viewport.x0,
-            self.viewport.y0,
-            self.viewport.x1,
-            self.viewport.y1,
+            self.viewport.x0.value(),
+            self.viewport.y0.value(),
+            self.viewport.x1.value(),
+            self.viewport.y1.value(),
             self.scale
         )?;
         writeln!(f, "damage {}", self.damage.len())?;
         for rect in &self.damage {
-            writeln!(f, "  rect {},{},{},{}", rect.x0, rect.y0, rect.x1, rect.y1)?;
+            writeln!(
+                f,
+                "  rect {},{},{},{}",
+                rect.x0.value(),
+                rect.y0.value(),
+                rect.x1.value(),
+                rect.y1.value()
+            )?;
         }
         writeln!(f, "instances {}", self.instances.len())?;
         for (index, instance) in self.instances.iter().enumerate() {
@@ -138,8 +145,12 @@ pub fn frame_dump(app: &TestApp) -> FrameDump {
     let record = window.record();
     FrameDump {
         frame_index: record.map_or(0, |record| record.frame_index.get()),
-        viewport: Rect::new(0.0, 0.0, window.size().width, window.size().height)
-            .to_physical_covering(window.scale()),
+        viewport: window
+            .scale()
+            .to_covering_device_rect(LogicalRect::from_origin_size(
+                LogicalPoint::ZERO,
+                window.size(),
+            )),
         scale: window.scale().factor(),
         damage: record.map_or_else(Vec::new, |record| record.damage.clone()),
         instances,
@@ -311,7 +322,7 @@ pub struct A11yNodeDump {
     pub role: A11yRole,
     pub label: Option<SmolStr>,
     pub value: Option<SmolStr>,
-    pub bounds: PhysicalRect,
+    pub bounds: DeviceRect,
     pub hidden: bool,
     pub disabled: bool,
     pub actions: Vec<A11yAction>,
@@ -361,10 +372,10 @@ impl fmt::Display for A11yTreeDump {
                 node.role,
                 node.hidden,
                 node.disabled,
-                node.bounds.x0,
-                node.bounds.y0,
-                node.bounds.x1,
-                node.bounds.y1,
+                node.bounds.x0.value(),
+                node.bounds.y0.value(),
+                node.bounds.x1.value(),
+                node.bounds.y1.value(),
                 node.actions.len(),
                 node.label
             )?;
@@ -375,7 +386,7 @@ impl fmt::Display for A11yTreeDump {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DamageOverlay {
-    pub rects: Vec<PhysicalRect>,
+    pub rects: Vec<DeviceRect>,
 }
 
 impl DamageOverlay {
@@ -387,11 +398,11 @@ impl DamageOverlay {
     }
 
     #[must_use]
-    pub fn canvas(&self, scale: Scale) -> Canvas {
-        let outline = scale.to_logical(1.0);
-        let mut union: Option<Rect> = None;
+    pub fn canvas(&self, scale: DevicePixelRatio) -> Canvas {
+        let outline = scale.to_logical(physical_px(1.0));
+        let mut union: Option<LogicalRect> = None;
         for rect in &self.rects {
-            let bounds = logical_of(rect, scale).outset(outline);
+            let bounds = scale.to_logical_rect(*rect).outset(outline);
             union = Some(match union {
                 Some(current) => current.union(bounds),
                 None => bounds,
@@ -399,30 +410,30 @@ impl DamageOverlay {
         }
         let mut canvas = Canvas::new(union.unwrap_or_default());
         for rect in &self.rects {
-            let bounds = logical_of(rect, scale);
+            let bounds = scale.to_logical_rect(*rect);
             canvas.push_quad(Quad {
                 bounds,
-                corner_radius: [0.0; 4],
+                corner_radius: [px(0.0); 4],
                 paint: QuadPaint::Solid {
                     fill: Color::from_rgba8([255, 0, 255, 32]),
                     border: None,
                 },
             });
             let edges = [
-                Rect::new(bounds.origin.x, bounds.origin.y, bounds.size.width, outline),
-                Rect::new(
+                LogicalRect::new(bounds.origin.x, bounds.origin.y, bounds.size.width, outline),
+                LogicalRect::new(
                     bounds.origin.x,
                     bounds.origin.y + bounds.size.height - outline,
                     bounds.size.width,
                     outline,
                 ),
-                Rect::new(
+                LogicalRect::new(
                     bounds.origin.x,
                     bounds.origin.y,
                     outline,
                     bounds.size.height,
                 ),
-                Rect::new(
+                LogicalRect::new(
                     bounds.origin.x + bounds.size.width - outline,
                     bounds.origin.y,
                     outline,
@@ -432,7 +443,7 @@ impl DamageOverlay {
             for edge in edges {
                 canvas.push_quad(Quad {
                     bounds: edge,
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                     paint: QuadPaint::Solid {
                         fill: Color::from_rgba8([255, 0, 255, 255]),
                         border: None,
@@ -442,15 +453,6 @@ impl DamageOverlay {
         }
         canvas
     }
-}
-
-fn logical_of(rect: &PhysicalRect, scale: Scale) -> Rect {
-    Rect::new(
-        scale.to_logical(rect.x0 as f32),
-        scale.to_logical(rect.y0 as f32),
-        scale.to_logical(rect.width() as f32),
-        scale.to_logical(rect.height() as f32),
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -467,14 +469,14 @@ mod tests {
     };
     use crate::{
         a11y::{A11yAction, A11yNodeId, A11yRole},
-        math::{PhysicalRect, Scale},
+        math::{DevicePixelRatio, DeviceRect, dp, px},
         node::builder::NodeBuilder,
         paint::{color::Color, style::PaintSpec},
         test_support::{app::TestApp, record::FrameRecord},
     };
 
     fn absolute_style(
-        rect: crate::math::Rect,
+        rect: crate::math::LogicalRect,
         clip: crate::paint::style::Clip,
     ) -> crate::paint::style::Style {
         let mut style = crate::paint::style_builder::StyleBuilder::new()
@@ -493,7 +495,12 @@ mod tests {
         let root = app.app().window(window).expect("window").tree().root();
         for index in 0..count {
             let _ = NodeBuilder::boxed()
-                .layout_override(crate::math::Rect::new(index as f32 * 10.0, 0.0, 8.0, 8.0))
+                .layout_override(crate::math::LogicalRect::new(
+                    px(index as f32 * 10.0),
+                    px(0.0),
+                    px(8.0),
+                    px(8.0),
+                ))
                 .paint(PaintSpec {
                     background: Color::WHITE,
                     ..PaintSpec::default()
@@ -558,13 +565,18 @@ mod tests {
         let root = app.app().window(window).expect("window").tree().root();
         let container = NodeBuilder::boxed()
             .style(absolute_style(
-                crate::math::Rect::new(8.25, 4.5, 40.5, 20.25),
+                crate::math::LogicalRect::new(px(8.25), px(4.5), px(40.5), px(20.25)),
                 Clip::Bounds,
             ))
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("container");
         let _ = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(10.0),
+                px(10.0),
+            ))
             .paint(PaintSpec {
                 background: Color::WHITE,
                 ..PaintSpec::default()
@@ -575,14 +587,19 @@ mod tests {
                 container,
             )
             .expect("content");
-        let mut canvas = Canvas::new(crate::math::Rect::new(8.0, 4.0, 40.0, 20.0));
+        let mut canvas = Canvas::new(crate::math::LogicalRect::new(
+            px(8.0),
+            px(4.0),
+            px(40.0),
+            px(20.0),
+        ));
         assert!(canvas.push_clip(ClipRect {
-            rect: crate::math::Rect::new(8.0, 4.0, 40.0, 20.0),
-            corner_radius: [3.0; 4],
+            rect: crate::math::LogicalRect::new(px(8.0), px(4.0), px(40.0), px(20.0)),
+            corner_radius: [px(3.0); 4],
         }));
         canvas.push_quad(Quad {
-            bounds: crate::math::Rect::new(9.0, 5.0, 10.0, 10.0),
-            corner_radius: [0.0; 4],
+            bounds: crate::math::LogicalRect::new(px(9.0), px(5.0), px(10.0), px(10.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
@@ -590,7 +607,12 @@ mod tests {
         });
         assert!(canvas.pop_clip(), "Canvas 必须 clip 平衡");
         let _ = NodeBuilder::canvas(canvas)
-            .layout_override(crate::math::Rect::new(8.0, 4.0, 40.0, 20.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(8.0),
+                px(4.0),
+                px(40.0),
+                px(20.0),
+            ))
             .id("canvas")
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("canvas node");
@@ -652,7 +674,12 @@ mod tests {
         let root = app.app().window(window).expect("window").tree().root();
         let signal = app.app_mut().signal(1u8);
         let _ = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(0.0, 0.0, 8.0, 8.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(8.0),
+                px(8.0),
+            ))
             .bind_style(move |cx| crate::paint::style::StylePatch {
                 opacity: Some(f32::from(*cx.read(&signal))),
                 ..crate::paint::style::StylePatch::default()
@@ -680,7 +707,12 @@ mod tests {
         for index in 0..3 {
             let signal = app.app_mut().signal(index as u8);
             let _ = NodeBuilder::boxed()
-                .layout_override(crate::math::Rect::new(0.0, 0.0, 8.0, 8.0))
+                .layout_override(crate::math::LogicalRect::new(
+                    px(0.0),
+                    px(0.0),
+                    px(8.0),
+                    px(8.0),
+                ))
                 .bind_style(move |cx| crate::paint::style::StylePatch {
                     opacity: Some(f32::from(*cx.read(&signal))),
                     ..crate::paint::style::StylePatch::default()
@@ -704,7 +736,12 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
         let button = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(0.0, 0.0, 40.0, 20.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(40.0),
+                px(20.0),
+            ))
             .on_click(crate::event::Action::custom("press"))
             .id("press")
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
@@ -734,8 +771,8 @@ mod tests {
             frame: None,
             stats: crate::test_support::record::FrameStats::default(),
             damage: vec![
-                PhysicalRect::new(10, 20, 30, 40),
-                PhysicalRect::new(0, 0, 4, 4),
+                DeviceRect::new(dp(10), dp(20), dp(30), dp(40)),
+                DeviceRect::new(dp(0), dp(0), dp(4), dp(4)),
             ],
             damage_full: false,
             delta: crate::test_support::record::DeltaRecord::default(),
@@ -752,10 +789,10 @@ mod tests {
         let overlay = DamageOverlay::of(&record);
         assert_eq!(overlay.rects, record.damage);
 
-        let scale = Scale::new(2.0).expect("scale");
+        let scale = DevicePixelRatio::new(2.0).expect("scale");
         let canvas = overlay.canvas(scale);
         assert_eq!(canvas.primitives().len(), overlay.rects.len() * 5);
-        assert!(canvas.bounds().size.width > 15.0);
+        assert!(canvas.bounds().size.width > px(15.0));
     }
 
     #[test]

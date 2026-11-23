@@ -3,7 +3,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
     event::Action,
-    math::Rect,
+    math::{LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::style::{Cursor, PaintSpec, StylePatch},
     window::WindowId,
@@ -27,10 +27,10 @@ const HIGHLIGHTS: [[u8; 4]; 3] = [
 
 const HEX: [&str; 3] = ["#E5484D", "#30A46C", "#0091FF"];
 
-const SLOTS: [(f32, f32, f32, f32); 3] = [
-    (18.0, 42.0, 150.0, 88.0),
-    (202.0, 42.0, 150.0, 88.0),
-    (386.0, 42.0, 150.0, 88.0),
+const SLOTS: [(LogicalPx, LogicalPx, LogicalPx, LogicalPx); 3] = [
+    (px(18.0), px(42.0), px(150.0), px(88.0)),
+    (px(202.0), px(42.0), px(150.0), px(88.0)),
+    (px(386.0), px(42.0), px(150.0), px(88.0)),
 ];
 
 pub(crate) fn build(
@@ -44,10 +44,10 @@ pub(crate) fn build(
         let base = color(BASES[index]);
         let highlight = color(HIGHLIGHTS[index]);
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(slot.0, slot.1, slot.2, slot.3))
+            .layout_override(LogicalRect::new(slot.0, slot.1, slot.2, slot.3))
             .paint(PaintSpec {
                 background: base,
-                corner_radius: [12.0; 4],
+                corner_radius: [px(12.0); 4],
                 ..PaintSpec::default()
             })
             .on_click(Action::custom("swatch.select"))
@@ -77,8 +77,8 @@ pub(crate) fn build(
         app,
         window,
         panel,
-        Rect::new(18.0, 142.0, 520.0, 20.0),
-        text_style(12.5, 400, TEXT_RGBA),
+        LogicalRect::new(px(18.0), px(142.0), px(520.0), px(20.0)),
+        text_style(px(12.5), 400, TEXT_RGBA),
         move |cx| selected_line(*cx.read(&active)),
     );
     swatches
@@ -135,7 +135,7 @@ mod showcase_tests {
     use ui_core::{
         a11y::A11yRole,
         event::{InputEvent, Modifiers, PointerButton},
-        math::Point,
+        math::LogicalPoint,
     };
 
     use crate::scene::test_support::{frame, setup_installed};
@@ -147,7 +147,7 @@ mod showcase_tests {
         frame(&mut test);
 
         let card = crate::scene::FOCUS_CARD.origin;
-        let center = Point::new(card.x + 202.0 + 75.0, card.y + 42.0 + 44.0);
+        let center = LogicalPoint::new(card.x + 202.0 + 75.0, card.y + 42.0 + 44.0);
         let _ = test.inject(InputEvent::pointer_down(
             center,
             PointerButton::Primary,

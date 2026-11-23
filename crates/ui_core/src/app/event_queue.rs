@@ -66,7 +66,7 @@ impl EventQueue {
 #[cfg(test)]
 mod tests {
     use super::{EVENT_QUEUE_CAPACITY, EventQueue};
-    use crate::{event::Event, window::WindowId};
+    use crate::{event::Event, math::px, window::WindowId};
 
     fn window() -> WindowId {
         WindowId::for_test(1)
@@ -95,7 +95,7 @@ mod tests {
             queue.push(
                 window(),
                 Event::Resized {
-                    size: crate::math::Size::new(index as f32, 1.0),
+                    size: crate::math::LogicalSize::new(px(index as f32), px(1.0)),
                 },
             );
         }
@@ -107,7 +107,7 @@ mod tests {
         assert_eq!(
             drained.first().map(|(_, event)| event.clone()),
             Some(Event::Resized {
-                size: crate::math::Size::new(10.0, 1.0)
+                size: crate::math::LogicalSize::new(px(10.0), px(1.0))
             })
         );
         assert_eq!(queue.dropped(), 10, "drain 不清丢弃计数（诊断是累计值）");
@@ -132,7 +132,7 @@ mod tests {
         queue.push(
             window(),
             Event::Resized {
-                size: crate::math::Size::new(8.0, 8.0),
+                size: crate::math::LogicalSize::new(px(8.0), px(8.0)),
             },
         );
 

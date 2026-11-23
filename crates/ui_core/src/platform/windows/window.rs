@@ -25,7 +25,10 @@ use crate::{
     app::App,
     error::EngineError,
     event::{Event, ImeEvent},
-    math::{PhysicalRect, Rect, Scale, Size},
+    math::{
+        DevicePixelRatio, DevicePoint, DeviceRect, DeviceSize, LogicalPoint, LogicalPx,
+        LogicalRect, LogicalSize, dp,
+    },
     platform::{
         dispatcher::Dispatcher,
         windows::{
@@ -73,9 +76,9 @@ pub(crate) struct NativeWindow {
     composition: Arc<Mutex<Composition>>,
     state: *mut WndProcState,
     composition_geometry: Option<((u32, u32), (u32, u32))>,
-    scale: Scale,
-    logical_size: Size,
-    ime_area: Option<(Rect, Scale)>,
+    scale: DevicePixelRatio,
+    logical_size: LogicalSize,
+    ime_area: Option<(LogicalRect, DevicePixelRatio)>,
     decorations: Decorations,
     title: SmolStr,
     icon: Option<HICON>,
@@ -194,7 +197,7 @@ impl NativeWindow {
             composition,
             state,
             composition_geometry: None,
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
             logical_size: options.size,
             ime_area: None,
             decorations: options.decorations,
@@ -258,11 +261,11 @@ impl NativeWindow {
         refresh_hz_from_display_frequency(devmode.dmDisplayFrequency)
     }
 
-    pub(crate) fn scale(&self) -> Scale {
+    pub(crate) fn scale(&self) -> DevicePixelRatio {
         self.scale
     }
 
-    pub(crate) fn logical_size(&self) -> Size {
+    pub(crate) fn logical_size(&self) -> LogicalSize {
         self.logical_size
     }
 
@@ -298,7 +301,7 @@ impl NativeWindow {
 
     fn apply_dpi_and_size(&mut self, options: &WindowOptions) -> Result<(), EngineError> {
         let requested = options.size;
-        if requested.width <= 0.0 || requested.height <= 0.0 {
+        if requested.width <= LogicalPx::ZERO || requested.height <= LogicalPx::ZERO {
             let dpi = dpi::window_dpi(self.hwnd);
             let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
                 factor: dpi as f32 / dpi::BASE_DPI as f32,
@@ -329,17 +332,19 @@ impl NativeWindow {
                     let client_origin = dpi::physical_origin(position, scale);
                     let (x, y) =
                         dpi::window_origin_for_client(client_origin, client, dpi, self.decorations);
-                    let target =
-                        PhysicalRect::new(x, y, x.saturating_add(width), y.saturating_add(height));
+                    let target = DeviceRect::from_origin_size(
+                        DevicePoint::new(dp(x), dp(y)),
+                        DeviceSize::new(dp(width), dp(height)),
+                    );
                     let placed = placement::clamp_to_work_area(target, &placement::work_areas());
                     unsafe {
                         SetWindowPos(
                             self.hwnd,
                             None,
-                            placed.x0,
-                            placed.y0,
-                            placed.width(),
-                            placed.height(),
+                            placed.x0.value(),
+                            placed.y0.value(),
+                            placed.width().value(),
+                            placed.height().value(),
                             SWP_NOZORDER | SWP_NOACTIVATE,
                         )
                     }
@@ -401,7 +406,7 @@ impl NativeWindow {
         }
         self.ime_area = next;
         let hwnd = self.hwnd;
-        let physical = area.map(|rect| rect.to_physical(self.scale));
+        let physical = area.map(|rect| self.scale.to_device_rect(rect));
         let command = self.state_mut().plan_ime_cursor_area(physical);
         if let Some(command) = command {
             let applied = ime::execute(hwnd, command);
@@ -500,18 +505,16 @@ impl NativeWindow {
         self.hwnd.is_invalid()
     }
 
-    pub(crate) fn note_scale(&mut self, scale: Scale, dpi: u32) {
+    pub(crate) fn note_scale(&mut self, scale: DevicePixelRatio, dpi: u32) {
         self.scale = scale;
         self.state_mut().note_dpi(dpi, scale);
         let _ = self.state_mut().plan_ime_cursor_area(None);
         self.ime_area = None;
     }
 
-    pub(crate) fn note_client_resize(&mut self, scale: Scale, client: (u32, u32)) {
-        self.logical_size = Size::new(
-            scale.to_logical(client.0 as f32),
-            scale.to_logical(client.1 as f32),
-        );
+    pub(crate) fn note_client_resize(&mut self, scale: DevicePixelRatio, client: (u32, u32)) {
+        self.logical_size =
+            scale.to_logical_size(DeviceSize::new(dp(client.0 as i32), dp(client.1 as i32)));
     }
 
     pub(crate) fn requery_display(&mut self, app: &mut App) {
@@ -536,10 +539,7 @@ impl NativeWindow {
         }
         let client = self.client_size();
         self.note_client_resize(scale, client);
-        window.set_size(Size::new(
-            scale.to_logical(client.0 as f32),
-            scale.to_logical(client.1 as f32),
-        ));
+        window.set_size(self.logical_size);
         window.set_surface(client);
     }
 
@@ -649,19 +649,26 @@ fn provisional_window_rect(options: &WindowOptions, dpi: u32) -> (i32, i32, i32,
         dpi,
         options.decorations,
     );
-    let target = PhysicalRect::new(
-        origin.0,
-        origin.1,
-        origin.0.saturating_add(width),
-        origin.1.saturating_add(height),
+    let target = DeviceRect::from_origin_size(
+        DevicePoint::new(dp(origin.0), dp(origin.1)),
+        DeviceSize::new(dp(width), dp(height)),
     );
     let placed = placement::clamp_to_work_area(target, &placement::work_areas());
-    (placed.x0, placed.y0, placed.width(), placed.height())
+    (
+        placed.x0.value(),
+        placed.y0.value(),
+        placed.width().value(),
+        placed.height().value(),
+    )
 }
 
-fn physical_client(size: Size, scale: Scale) -> (u32, u32) {
-    let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
-    (rect.width().max(1) as u32, rect.height().max(1) as u32)
+fn physical_client(size: LogicalSize, scale: DevicePixelRatio) -> (u32, u32) {
+    let rect =
+        scale.to_covering_device_rect(LogicalRect::from_origin_size(LogicalPoint::ZERO, size));
+    (
+        rect.width().max(dp(1)).value() as u32,
+        rect.height().max(dp(1)).value() as u32,
+    )
 }
 
 fn register_class(instance: windows::Win32::Foundation::HMODULE) -> Result<(), EngineError> {
@@ -748,7 +755,7 @@ mod tests {
     use crate::{
         app::App,
         event::{Event, ImeEvent},
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         platform::dispatcher::Dispatcher,
         text::TextStyle,
@@ -779,7 +786,10 @@ mod tests {
             }
         }
 
-        native.ime_area = Some((Rect::new(0.0, 0.0, 1.0, 18.0), Scale::ONE));
+        native.ime_area = Some((
+            LogicalRect::new(px(0.0), px(0.0), px(1.0), px(18.0)),
+            DevicePixelRatio::ONE,
+        ));
         native.sync_ime_enabled(&mut app);
         assert!(
             native.ime_area.is_some(),
@@ -833,8 +843,8 @@ mod tests {
 
         {
             let window = app.window_mut(id).expect("window");
-            window.set_scale(Scale::new(3.0).expect("scale"));
-            window.set_size(Size::new(1.0, 1.0));
+            window.set_scale(DevicePixelRatio::new(3.0).expect("scale"));
+            window.set_size(LogicalSize::new(px(1.0), px(1.0)));
         }
         native.requery_display(&mut app);
 
@@ -1144,7 +1154,7 @@ mod tests {
         let node = {
             let window = app.window_mut(id).expect("窗口存在");
             let root = window.tree().root();
-            NodeBuilder::text("abc", TextStyle::new(16.0))
+            NodeBuilder::text("abc", TextStyle::new(px(16.0)))
                 .build(window.tree_mut(), root)
                 .expect("文本节点")
         };
@@ -1319,7 +1329,7 @@ mod tests {
     fn a_frameless_window_client_is_exactly_the_requested_size() {
         let options = WindowOptions {
             decorations: Decorations::None,
-            size: Size::new(480.0, 320.0),
+            size: LogicalSize::new(px(480.0), px(320.0)),
             ..WindowOptions::default()
         };
         let native = window_with_options(34, &options);

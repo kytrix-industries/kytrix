@@ -922,6 +922,7 @@ mod tests {
         WINDOW_SRVS,
     };
     use crate::{
+        math::px,
         paint::geometry::{GeometryPipeline, IndexType, Topology},
         render::windows::device::Device,
     };
@@ -1016,7 +1017,7 @@ mod tests {
                 vertex_stride: GeometryPipeline::Ui.vertex_stride(),
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: crate::math::Rect::new(0.0, 0.0, 32.0, 32.0),
+                bounds: crate::math::LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("注册几何");

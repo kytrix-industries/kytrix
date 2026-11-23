@@ -6,7 +6,7 @@ use accesskit_unix::Adapter;
 use crate::{
     a11y::adapter::A11yConsumerEpoch,
     error::EngineError,
-    math::{Point, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalSize},
     platform::dispatcher::{Dispatcher, UserTask},
     window::WindowId,
 };
@@ -38,7 +38,12 @@ impl UnixA11y {
         self.adapter.update_if_active(factory);
     }
 
-    pub(crate) fn set_bounds(&mut self, origin: Point, size: Size, scale: Scale) {
+    pub(crate) fn set_bounds(
+        &mut self,
+        origin: LogicalPoint,
+        size: LogicalSize,
+        scale: DevicePixelRatio,
+    ) {
         let (outer, inner) = window_bounds(origin, size, scale);
         self.adapter.set_root_window_bounds(outer, inner);
     }
@@ -87,15 +92,19 @@ impl ActionHandler for UnixActions {
 
 #[must_use]
 pub(crate) fn window_bounds(
-    origin: Point,
-    size: Size,
-    scale: Scale,
+    origin: LogicalPoint,
+    size: LogicalSize,
+    scale: DevicePixelRatio,
 ) -> (accesskit::Rect, accesskit::Rect) {
     let scale_factor = f64::from(scale.factor());
-    let width = (f64::from(size.width) * scale_factor).ceil().max(1.0);
-    let height = (f64::from(size.height) * scale_factor).ceil().max(1.0);
-    let x = f64::from(origin.x);
-    let y = f64::from(origin.y);
+    let width = (f64::from(size.width.value()) * scale_factor)
+        .ceil()
+        .max(1.0);
+    let height = (f64::from(size.height.value()) * scale_factor)
+        .ceil()
+        .max(1.0);
+    let x = f64::from(origin.x.value());
+    let y = f64::from(origin.y.value());
     let rect = accesskit::Rect {
         x0: x,
         y0: y,
@@ -112,13 +121,13 @@ mod tests {
     use super::{UnixActivation, UnixDeactivation, window_bounds};
     use crate::{
         app::App,
-        math::{Point, Scale, Size},
+        math::{DevicePixelRatio, LogicalPoint, LogicalSize, px},
         platform::dispatcher::Dispatcher,
         window::WindowOptions,
     };
 
-    fn scale(factor: f32) -> Scale {
-        Scale::new(factor).expect("scale")
+    fn scale(factor: f32) -> DevicePixelRatio {
+        DevicePixelRatio::new(factor).expect("scale")
     }
 
     #[test]
@@ -182,7 +191,11 @@ mod tests {
 
     #[test]
     fn window_bounds_are_physical_pixels() {
-        let (outer, inner) = window_bounds(Point::ZERO, Size::new(400.0, 300.0), scale(2.0));
+        let (outer, inner) = window_bounds(
+            LogicalPoint::ZERO,
+            LogicalSize::new(px(400.0), px(300.0)),
+            scale(2.0),
+        );
         assert_eq!(
             (inner.x0, inner.y0, inner.x1, inner.y1),
             (0.0, 0.0, 800.0, 600.0)
@@ -192,9 +205,17 @@ mod tests {
 
     #[test]
     fn fractional_scale_is_rounded_up() {
-        let (_, inner) = window_bounds(Point::ZERO, Size::new(400.0, 300.0), scale(1.25));
+        let (_, inner) = window_bounds(
+            LogicalPoint::ZERO,
+            LogicalSize::new(px(400.0), px(300.0)),
+            scale(1.25),
+        );
         assert_eq!((inner.x1, inner.y1), (500.0, 375.0));
-        let (_, odd) = window_bounds(Point::ZERO, Size::new(401.0, 301.0), scale(1.25));
+        let (_, odd) = window_bounds(
+            LogicalPoint::ZERO,
+            LogicalSize::new(px(401.0), px(301.0)),
+            scale(1.25),
+        );
         assert_eq!(
             (odd.x1, odd.y1),
             (502.0, 377.0),
@@ -204,7 +225,11 @@ mod tests {
 
     #[test]
     fn the_screen_origin_is_passed_through() {
-        let (_, inner) = window_bounds(Point::new(120.0, 48.0), Size::new(100.0, 50.0), Scale::ONE);
+        let (_, inner) = window_bounds(
+            LogicalPoint::new(px(120.0), px(48.0)),
+            LogicalSize::new(px(100.0), px(50.0)),
+            DevicePixelRatio::ONE,
+        );
         assert_eq!((inner.x0, inner.y0), (120.0, 48.0));
         assert_eq!((inner.x1, inner.y1), (220.0, 98.0));
     }

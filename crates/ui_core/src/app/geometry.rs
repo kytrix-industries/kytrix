@@ -1,7 +1,7 @@
 use super::App;
 use crate::{
     error::EngineError,
-    math::{Rect, Transform},
+    math::{LogicalRect, Transform, px},
     node::{id::NodeId, tree::NodeKind},
     paint::geometry::{GeometryId, GeometryUpdate},
     window::WindowId,
@@ -46,7 +46,7 @@ pub(crate) fn truncate(
     Ok(update)
 }
 
-fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: Rect) -> bool {
+fn mark_bound_nodes(app: &mut App, geometry: GeometryId, damaged: LogicalRect) -> bool {
     if damaged.is_empty() {
         return false;
     }
@@ -80,23 +80,23 @@ pub(crate) fn set_geometry_transform(
     let extra_damage = match geometry.snapshot_arc(id) {
         Some(snapshot) => transformed_damage(previous, snapshot.bounds())
             .union(transformed_damage(transform, snapshot.bounds())),
-        None => Rect::default(),
+        None => LogicalRect::default(),
     };
     tree.set_geometry_transform(node, transform, extra_damage)
 }
 
-fn transformed_damage(transform: Transform, bounds: Rect) -> Rect {
+fn transformed_damage(transform: Transform, bounds: LogicalRect) -> LogicalRect {
     if bounds.is_empty() {
         return bounds;
     }
-    let far = crate::math::Point::new(
+    let far = crate::math::LogicalPoint::new(
         bounds.origin.x + bounds.size.width,
         bounds.origin.y + bounds.size.height,
     );
     let corners = [
         transform.apply(bounds.origin),
-        transform.apply(crate::math::Point::new(far.x, bounds.origin.y)),
-        transform.apply(crate::math::Point::new(bounds.origin.x, far.y)),
+        transform.apply(crate::math::LogicalPoint::new(far.x, bounds.origin.y)),
+        transform.apply(crate::math::LogicalPoint::new(bounds.origin.x, far.y)),
         transform.apply(far),
     ];
     if !corners
@@ -107,28 +107,29 @@ fn transformed_damage(transform: Transform, bounds: Rect) -> Rect {
     }
     let min_x = corners
         .iter()
-        .map(|point| point.x)
+        .map(|point| point.x.value())
         .fold(f32::INFINITY, f32::min);
     let min_y = corners
         .iter()
-        .map(|point| point.y)
+        .map(|point| point.y.value())
         .fold(f32::INFINITY, f32::min);
     let max_x = corners
         .iter()
-        .map(|point| point.x)
+        .map(|point| point.x.value())
         .fold(f32::NEG_INFINITY, f32::max);
     let max_y = corners
         .iter()
-        .map(|point| point.y)
+        .map(|point| point.y.value())
         .fold(f32::NEG_INFINITY, f32::max);
-    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y).outset(GEOMETRY_DAMAGE_PAD)
+    LogicalRect::new(px(min_x), px(min_y), px(max_x - min_x), px(max_y - min_y))
+        .outset(px(GEOMETRY_DAMAGE_PAD))
 }
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
     use crate::{
         error::EngineError,
-        math::{Rect, Transform},
+        math::{LogicalRect, Transform, px},
         node::{builder::NodeBuilder, dirty::DirtyFlags},
         paint::{
             canvas::Canvas,
@@ -152,7 +153,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 20.0, 10.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(20.0), px(10.0)),
             pipeline: GeometryPipeline::Ui,
         };
         app.app_mut().geometry_mut().insert(desc).expect("注册几何")
@@ -162,7 +163,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
         let node = NodeBuilder::geometry(id)
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("挂载成功");
         app.drain().expect("首帧");
@@ -184,7 +185,7 @@ mod tests {
     fn geometry_op_bounds(
         app: &TestApp,
         window: crate::window::WindowId,
-    ) -> Option<crate::paint::instance::PhysicalBounds> {
+    ) -> Option<crate::math::DeviceRect> {
         let payload = app.app().window(window)?.instance_buffer()?;
         payload.ops().iter().find_map(|op| match op {
             FrameOp::Geometry { bounds, .. } => Some(*bounds),
@@ -201,7 +202,7 @@ mod tests {
         let scale = app.app().window(window).expect("窗口存在").scale().factor();
         assert_eq!(painted_transform(&app, window), Some(Transform::IDENTITY));
 
-        let transform = Transform::translate(12.0, 7.0);
+        let transform = Transform::translate(px(12.0), px(7.0));
         app.app_mut()
             .set_geometry_transform(window, node, transform)
             .expect("几何节点必须接受变换");
@@ -235,7 +236,7 @@ mod tests {
         let window = app.window_id();
 
         app.app_mut()
-            .set_geometry_transform(window, node, Transform::translate(100.0, 50.0))
+            .set_geometry_transform(window, node, Transform::translate(px(100.0), px(50.0)))
             .expect("设置变换");
         let damage = app
             .app()
@@ -246,11 +247,11 @@ mod tests {
             .expect("节点存在")
             .damage();
         assert!(
-            damage.origin.x <= 0.0 && damage.origin.y <= 0.0,
+            damage.origin.x <= px(0.0) && damage.origin.y <= px(0.0),
             "旧变换下的可见范围必须并入 damage：{damage:?}"
         );
         assert!(
-            damage.max().x >= 120.0 && damage.max().y >= 60.0,
+            damage.max().x >= px(120.0) && damage.max().y >= px(60.0),
             "新变换下的可见范围必须并入 damage：{damage:?}"
         );
 
@@ -262,7 +263,7 @@ mod tests {
         assert_eq!(tree.geometry_transform(node), Transform::IDENTITY);
         let restore = tree.get(node).expect("节点存在").damage();
         assert!(
-            restore.max().x >= 120.0 && restore.max().y >= 60.0,
+            restore.max().x >= px(120.0) && restore.max().y >= px(60.0),
             "回退时位移后的旧像素也必须重画：{restore:?}"
         );
         app.drain().expect("回退帧");
@@ -277,13 +278,13 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
         let sibling = NodeBuilder::boxed()
-            .layout_override(Rect::new(200.0, 200.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(200.0), px(200.0), px(10.0), px(10.0)))
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("挂载成功");
         app.drain().expect("一帧");
 
         app.app_mut()
-            .set_geometry_transform(window, node, Transform::translate(5.0, 5.0))
+            .set_geometry_transform(window, node, Transform::translate(px(5.0), px(5.0)))
             .expect("设置变换");
         let window_state = app.app_mut().window_mut(window).expect("窗口存在");
         let tree = window_state.tree_mut();
@@ -303,14 +304,15 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
         let boxed = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("挂载成功");
 
-        match app
-            .app_mut()
-            .set_geometry_transform(window, boxed, Transform::translate(1.0, 1.0))
-        {
+        match app.app_mut().set_geometry_transform(
+            window,
+            boxed,
+            Transform::translate(px(1.0), px(1.0)),
+        ) {
             Err(EngineError::StaleNode { node }) => assert_eq!(node, boxed),
             other => panic!("普通盒子必须报 StaleNode，实际 {other:?}"),
         }
@@ -324,7 +326,7 @@ mod tests {
         }
     }
 
-    use crate::math::PhysicalRect;
+    use crate::math::{DeviceRect, dp};
 
     fn long_desc(triangles: u32) -> GeometryDesc {
         let mut vertex_bytes = Vec::with_capacity(triangles as usize * 36);
@@ -348,7 +350,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(64.0), px(100.0)),
             pipeline: GeometryPipeline::Ui,
         }
     }
@@ -401,12 +403,12 @@ mod tests {
             .expect("追加索引");
     }
 
-    fn damage_hits(damage: &[PhysicalRect], x: f32, y: f32) -> bool {
-        let point = PhysicalRect::new(
-            x.floor() as i32,
-            y.floor() as i32,
-            x.floor() as i32 + 2,
-            y.floor() as i32 + 2,
+    fn damage_hits(damage: &[DeviceRect], x: f32, y: f32) -> bool {
+        let point = DeviceRect::new(
+            dp(x.floor() as i32),
+            dp(y.floor() as i32),
+            dp(x.floor() as i32 + 2),
+            dp(y.floor() as i32 + 2),
         );
         damage.iter().any(|rect| !rect.intersect(point).is_empty())
     }
@@ -449,9 +451,9 @@ mod tests {
             "新位置必须重画：{damage:?}"
         );
         assert!(
-            update.damaged.origin.x <= 0.0
-                && update.damaged.origin.y <= 0.0
-                && update.damaged.max().x >= 100.0,
+            update.damaged.origin.x <= px(0.0)
+                && update.damaged.origin.y <= px(0.0)
+                && update.damaged.max().x >= px(100.0),
             "API 返回的 damage 必须是受影响块旧∪新：{:?}",
             update.damaged
         );
@@ -589,7 +591,7 @@ mod tests {
         for window in [first, second] {
             let root = app.app().window(window).expect("窗口存在").tree().root();
             let _ = NodeBuilder::geometry(id)
-                .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
                 .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
                 .expect("挂载几何节点");
         }
@@ -633,12 +635,12 @@ mod tests {
     fn mount_canvas(app: &mut TestApp, geometries: &[GeometryId]) -> crate::node::id::NodeId {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口存在").tree().root();
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)));
         for id in geometries {
             canvas.push_geometry(GeometryDraw::full(*id, Transform::IDENTITY, Color::WHITE));
         }
         NodeBuilder::canvas(canvas)
-            .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("挂载 Canvas")
     }
@@ -736,7 +738,7 @@ mod tests {
         clear_dirty(&mut app);
 
         let window = app.window_id();
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 40.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)));
         canvas.push_geometry(GeometryDraw::full(
             second,
             Transform::IDENTITY,
@@ -827,8 +829,8 @@ mod tests {
         assert!(
             damage_hits(
                 &record.damage,
-                removed.origin.x + 1.0,
-                removed.origin.y + 0.5
+                removed.origin.x.value() + 1.0,
+                removed.origin.y.value() + 0.5
             ),
             "被移除块的旧位置必须进帧 damage：removed={removed:?} damage={:?}",
             record.damage
@@ -882,7 +884,10 @@ mod tests {
         let snapshot = app.app().geometry().snapshot_arc(id).expect("快照");
         let first_bounds = snapshot.chunk(0).expect("块 0").bounds;
         let second_bounds = snapshot.chunk(1).expect("块 1").bounds;
-        assert_eq!(snapshot.bounds(), Rect::new(0.0, 0.0, 64.0, 100.0));
+        assert_eq!(
+            snapshot.bounds(),
+            LogicalRect::new(px(0.0), px(0.0), px(64.0), px(100.0))
+        );
 
         let _ = app
             .app_mut()
@@ -892,14 +897,14 @@ mod tests {
         assert!(
             damage_hits(
                 &record.damage,
-                first_bounds.origin.x + 1.0,
-                first_bounds.origin.y + 1.0
+                first_bounds.origin.x.value() + 1.0,
+                first_bounds.origin.y.value() + 1.0
             ),
             "被移除的块 0 必须进 damage：{:?}",
             record.damage
         );
         assert!(
-            damage_hits(&record.damage, 5.0, second_bounds.origin.y + 0.5),
+            damage_hits(&record.damage, 5.0, second_bounds.origin.y.value() + 0.5),
             "被移除的块 1 必须进 damage：{:?}",
             record.damage
         );
@@ -1020,7 +1025,7 @@ mod tests {
         clear_dirty(&mut app);
 
         let window = app.window_id();
-        let mut wide = Canvas::new(Rect::new(0.0, 0.0, 64.0, 100.0));
+        let mut wide = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(64.0), px(100.0)));
         wide.push_geometry(GeometryDraw::full(id, Transform::IDENTITY, Color::WHITE));
         assert!(
             app.app_mut()
@@ -1034,7 +1039,7 @@ mod tests {
         assert!(record.rendered, "画布扩展必须提交一帧");
         clear_dirty(&mut app);
 
-        let visible_bounds = Rect::new(0.0, 64.0, 10.0, 1.0);
+        let visible_bounds = LogicalRect::new(px(0.0), px(64.0), px(10.0), px(1.0));
         let mut canvas = Canvas::new(visible_bounds);
         canvas.push_geometry(GeometryDraw {
             id,

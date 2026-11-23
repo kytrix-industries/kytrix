@@ -3,7 +3,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use super::Persist;
 use crate::{
     error::EngineError,
-    math::PhysicalRect,
+    math::{DeviceRect, dp},
     render::{
         compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
         damage::MAX_DAMAGE_RECTS,
@@ -181,13 +181,15 @@ fn merge_damage(pending: &mut DamageRects, damage: &DamageRects) {
 }
 
 fn copy_area(rects: &DamageRects, content: (u32, u32)) -> u64 {
-    let surface = PhysicalRect::new(0, 0, content.0 as i32, content.1 as i32);
+    let surface = DeviceRect::new(dp(0), dp(0), dp(content.0 as i32), dp(content.1 as i32));
     rects
         .as_slice()
         .iter()
         .map(|rect| rect.intersect(surface))
         .filter(|rect| !rect.is_empty())
-        .map(|rect| u64::from(rect.width() as u32) * u64::from(rect.height() as u32))
+        .map(|rect| {
+            u64::from(rect.width().value() as u32) * u64::from(rect.height().value() as u32)
+        })
         .sum()
 }
 
@@ -195,7 +197,7 @@ pub(crate) fn clamp_damage(
     damage: Option<&DamageRects>,
     content: (u32, u32),
 ) -> Option<DamageRects> {
-    let surface = PhysicalRect::new(0, 0, content.0 as i32, content.1 as i32);
+    let surface = DeviceRect::new(dp(0), dp(0), dp(content.0 as i32), dp(content.1 as i32));
     let damage = damage?;
     let mut clamped = DamageRects::new();
     let mut outside = 0usize;
@@ -236,7 +238,12 @@ pub(crate) fn copy_to_back(
     );
     match extent {
         CopyExtent::Full => {
-            let whole = PhysicalRect::new(0, 0, persist.size.0 as i32, persist.size.1 as i32);
+            let whole = DeviceRect::new(
+                dp(0),
+                dp(0),
+                dp(persist.size.0 as i32),
+                dp(persist.size.1 as i32),
+            );
             copy_rect(list, &persist.texture, back, &whole);
         }
         CopyExtent::Rects(rects) => {
@@ -289,7 +296,7 @@ pub(crate) fn copy_rect(
     list: &ID3D12GraphicsCommandList,
     source: &ID3D12Resource,
     destination: &ID3D12Resource,
-    rect: &PhysicalRect,
+    rect: &DeviceRect,
 ) {
     let mut destination_location = D3D12_TEXTURE_COPY_LOCATION {
         pResource: core::mem::ManuallyDrop::new(Some(destination.clone())),
@@ -306,18 +313,18 @@ pub(crate) fn copy_rect(
         },
     };
     let region = D3D12_BOX {
-        left: rect.x0 as u32,
-        top: rect.y0 as u32,
+        left: rect.x0.value() as u32,
+        top: rect.y0.value() as u32,
         front: 0,
-        right: rect.x1 as u32,
-        bottom: rect.y1 as u32,
+        right: rect.x1.value() as u32,
+        bottom: rect.y1.value() as u32,
         back: 1,
     };
     unsafe {
         list.CopyTextureRegion(
             &destination_location,
-            rect.x0 as u32,
-            rect.y0 as u32,
+            rect.x0.value() as u32,
+            rect.y0.value() as u32,
             0,
             &source_location,
             Some(&region),
@@ -333,14 +340,14 @@ pub(crate) fn copy_rect(
 mod tests {
     use super::{BufferSyncs, CopyExtent, FrameDraw, TargetState, clamp_damage, frame_draw};
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         render::{
             compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
             damage::MAX_DAMAGE_RECTS,
         },
     };
 
-    fn damage(rects: &[PhysicalRect]) -> DamageRects {
+    fn damage(rects: &[DeviceRect]) -> DamageRects {
         let mut damage = DamageRects::new();
         for rect in rects {
             assert!(damage.push(*rect));
@@ -348,7 +355,7 @@ mod tests {
         damage
     }
 
-    fn partial(rects: &[PhysicalRect]) -> Plan {
+    fn partial(rects: &[DeviceRect]) -> Plan {
         Plan::Partial(damage(rects))
     }
 
@@ -387,7 +394,7 @@ mod tests {
         assert_eq!(
             frame_draw(
                 TargetState::Fresh,
-                partial(&[PhysicalRect::new(0, 0, 8, 8)]),
+                partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]),
                 true
             ),
             FrameDraw::Direct
@@ -395,7 +402,7 @@ mod tests {
         assert_eq!(
             frame_draw(
                 TargetState::PersistInvalid,
-                partial(&[PhysicalRect::new(0, 0, 8, 8)]),
+                partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]),
                 true
             ),
             FrameDraw::Full
@@ -403,7 +410,7 @@ mod tests {
         assert_eq!(
             frame_draw(
                 TargetState::PersistValid,
-                partial(&[PhysicalRect::new(0, 0, 8, 8)]),
+                partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]),
                 true
             ),
             FrameDraw::Incremental
@@ -415,7 +422,7 @@ mod tests {
         assert_eq!(
             frame_draw(
                 TargetState::PersistInvalid,
-                partial(&[PhysicalRect::new(0, 0, 8, 8)]),
+                partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]),
                 false
             ),
             FrameDraw::Full
@@ -423,7 +430,7 @@ mod tests {
         assert_eq!(
             frame_draw(
                 TargetState::PersistValid,
-                partial(&[PhysicalRect::new(0, 0, 8, 8)]),
+                partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]),
                 false
             ),
             FrameDraw::Incremental
@@ -433,20 +440,23 @@ mod tests {
     #[test]
     fn the_backend_clamps_damage_to_the_current_content() {
         let content = (800, 600);
-        let dirty = damage(&[PhysicalRect::new(700, 500, 1200, 900)]);
+        let dirty = damage(&[DeviceRect::new(dp(700), dp(500), dp(1200), dp(900))]);
         let clamped = clamp_damage(Some(&dirty), content).expect("inside");
-        assert_eq!(clamped.as_slice(), &[PhysicalRect::new(700, 500, 800, 600)]);
+        assert_eq!(
+            clamped.as_slice(),
+            &[DeviceRect::new(dp(700), dp(500), dp(800), dp(600))]
+        );
 
-        let outside = damage(&[PhysicalRect::new(810, 10, 900, 40)]);
+        let outside = damage(&[DeviceRect::new(dp(810), dp(10), dp(900), dp(40))]);
         assert_eq!(clamp_damage(Some(&outside), content), None);
         assert_eq!(clamp_damage(None, content), None);
         let mut many = DamageRects::new();
         for index in 0..MAX_DAMAGE_RECTS as i32 {
-            assert!(many.push(PhysicalRect::new(index, 0, index + 1, 1)));
+            assert!(many.push(DeviceRect::new(dp(index), dp(0), dp(index + 1), dp(1))));
         }
         let clamped = clamp_damage(Some(&many), content).expect("capacity fits");
         assert!(clamped.as_slice().len() <= MAX_DRAW_PASSES);
-        let small = damage(&[PhysicalRect::new(0, 0, 4, 4)]);
+        let small = damage(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]);
         let clamped = clamp_damage(Some(&small), content).expect("inside");
         assert_eq!(clamped.as_slice(), small.as_slice());
         let _ = FramePlan::new(Plan::Full, false);
@@ -458,8 +468,8 @@ mod tests {
         let mut syncs = BufferSyncs::new();
         assert_eq!(syncs.take_copy(0, None, content), CopyExtent::Full);
 
-        let frame_a = damage(&[PhysicalRect::new(0, 0, 20, 20)]);
-        let frame_b = damage(&[PhysicalRect::new(100, 100, 120, 120)]);
+        let frame_a = damage(&[DeviceRect::new(dp(0), dp(0), dp(20), dp(20))]);
+        let frame_b = damage(&[DeviceRect::new(dp(100), dp(100), dp(120), dp(120))]);
         assert_eq!(syncs.take_copy(1, None, content), CopyExtent::Full);
         assert_eq!(syncs.take_copy(2, None, content), CopyExtent::Full);
         syncs.record_missed(0, Some(&frame_a));
@@ -472,8 +482,8 @@ mod tests {
             panic!("expected rect copy, got {copy:?}");
         };
         for expected in [
-            PhysicalRect::new(0, 0, 20, 20),
-            PhysicalRect::new(100, 100, 120, 120),
+            DeviceRect::new(dp(0), dp(0), dp(20), dp(20)),
+            DeviceRect::new(dp(100), dp(100), dp(120), dp(120)),
         ] {
             assert!(
                 rects.as_slice().iter().any(|rect| rect.x0 <= expected.x0
@@ -498,12 +508,20 @@ mod tests {
         assert_eq!(syncs.take_copy(0, None, content), CopyExtent::Full);
         syncs.record_missed_others(0, None);
         assert_eq!(
-            syncs.take_copy(1, Some(&damage(&[PhysicalRect::new(0, 0, 4, 4)])), content),
+            syncs.take_copy(
+                1,
+                Some(&damage(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))])),
+                content
+            ),
             CopyExtent::Full
         );
         syncs.invalidate();
         assert_eq!(
-            syncs.take_copy(2, Some(&damage(&[PhysicalRect::new(0, 0, 4, 4)])), content),
+            syncs.take_copy(
+                2,
+                Some(&damage(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))])),
+                content
+            ),
             CopyExtent::Full
         );
     }
@@ -515,7 +533,12 @@ mod tests {
         assert_eq!(syncs.take_copy(0, None, content), CopyExtent::Full);
         let mut huge = DamageRects::new();
         for index in 0..MAX_DRAW_PASSES as i32 {
-            assert!(huge.push(PhysicalRect::new(0, index * 25, 100, index * 25 + 25)));
+            assert!(huge.push(DeviceRect::new(
+                dp(0),
+                dp(index * 25),
+                dp(100),
+                dp(index * 25 + 25)
+            )));
         }
         assert_eq!(syncs.take_copy(0, Some(&huge), content), CopyExtent::Full);
     }
@@ -523,12 +546,12 @@ mod tests {
     #[test]
     fn a_partial_frame_without_a_visible_rect_upgrades_to_a_full_draw() {
         let content = (800, 600);
-        let outside = damage(&[PhysicalRect::new(810, 10, 900, 40)]);
+        let outside = damage(&[DeviceRect::new(dp(810), dp(10), dp(900), dp(40))]);
         let frame = FramePlan::new(Plan::Partial(outside), false);
         let clamped = clamp_damage(frame.present_dirty().as_ref(), content);
         assert_eq!(clamped, None);
         assert!(super::requires_full_draw(frame, clamped.as_ref()));
-        let inside = damage(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let inside = damage(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]);
         let frame = FramePlan::new(Plan::Partial(inside), false);
         let clamped = clamp_damage(frame.present_dirty().as_ref(), content);
         assert!(!super::requires_full_draw(frame, clamped.as_ref()));

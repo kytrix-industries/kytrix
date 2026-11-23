@@ -7,7 +7,10 @@ use image::{
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformOptions, Xyzd};
 use smol_str::{SmolStr, format_smolstr};
 
-use crate::{math::Size, resources::DecodeCause};
+use crate::{
+    math::{PhysicalPx, PhysicalSize},
+    resources::DecodeCause,
+};
 
 pub(crate) const MAX_TILE_DIM: u32 = 2046;
 
@@ -94,8 +97,9 @@ pub(crate) fn decode(
     })
 }
 
-pub(crate) fn resolve_target(target: Size, source: (u32, u32)) -> (u32, u32) {
-    fn pixel(value: f32) -> u32 {
+pub(crate) fn resolve_target(target: PhysicalSize, source: (u32, u32)) -> (u32, u32) {
+    fn pixel(value: PhysicalPx) -> u32 {
+        let value = value.value();
         if !value.is_finite() || value <= 0.0 {
             1
         } else {
@@ -460,7 +464,10 @@ mod tests {
         estimate_peak, fit_into, is_srgb_profile, premultiply_channel, resolve_target, srgb_decode,
         srgb_encode, test_png, transfer_lut,
     };
-    use crate::{math::Size, resources::DecodeCause};
+    use crate::{
+        math::{PhysicalSize, physical_px},
+        resources::DecodeCause,
+    };
 
     fn decode(bytes: &[u8]) -> Result<super::DecodedImage, DecodeCause> {
         super::decode(bytes, None)
@@ -807,17 +814,53 @@ mod tests {
 
     #[test]
     fn resolve_target_rounds_up_and_clamps_to_source_and_tile() {
-        assert_eq!(resolve_target(Size::new(40.2, 20.1), (200, 100)), (41, 21));
-        assert_eq!(resolve_target(Size::new(40.0, 20.0), (200, 100)), (40, 20));
-        assert_eq!(resolve_target(Size::new(200.0, 200.0), (40, 20)), (40, 20));
-        assert_eq!(resolve_target(Size::new(500.0, 500.0), (40, 20)), (40, 20));
         assert_eq!(
-            resolve_target(Size::new(4000.0, 4000.0), (5000, 5000)),
+            resolve_target(
+                PhysicalSize::new(physical_px(40.2), physical_px(20.1)),
+                (200, 100)
+            ),
+            (41, 21)
+        );
+        assert_eq!(
+            resolve_target(
+                PhysicalSize::new(physical_px(40.0), physical_px(20.0)),
+                (200, 100)
+            ),
+            (40, 20)
+        );
+        assert_eq!(
+            resolve_target(
+                PhysicalSize::new(physical_px(200.0), physical_px(200.0)),
+                (40, 20)
+            ),
+            (40, 20)
+        );
+        assert_eq!(
+            resolve_target(
+                PhysicalSize::new(physical_px(500.0), physical_px(500.0)),
+                (40, 20)
+            ),
+            (40, 20)
+        );
+        assert_eq!(
+            resolve_target(
+                PhysicalSize::new(physical_px(4000.0), physical_px(4000.0)),
+                (5000, 5000)
+            ),
             (MAX_TILE_DIM, MAX_TILE_DIM)
         );
-        assert_eq!(resolve_target(Size::new(0.0, -3.0), (200, 100)), (1, 1));
         assert_eq!(
-            resolve_target(Size::new(f32::NAN, f32::INFINITY), (200, 100)),
+            resolve_target(
+                PhysicalSize::new(physical_px(0.0), physical_px(-3.0)),
+                (200, 100)
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            resolve_target(
+                PhysicalSize::new(physical_px(f32::NAN), physical_px(f32::INFINITY)),
+                (200, 100)
+            ),
             (1, 1)
         );
     }

@@ -35,9 +35,12 @@ impl ShapeKey {
         for inline in content.inline_boxes.iter() {
             inline.id.hash(&mut style_hasher);
             inline.index.hash(&mut style_hasher);
-            inline.size.width.to_bits().hash(&mut style_hasher);
-            inline.size.height.to_bits().hash(&mut style_hasher);
-            inline.baseline.map(f32::to_bits).hash(&mut style_hasher);
+            inline.size.width.value().to_bits().hash(&mut style_hasher);
+            inline.size.height.value().to_bits().hash(&mut style_hasher);
+            inline
+                .baseline
+                .map(|baseline| baseline.value().to_bits())
+                .hash(&mut style_hasher);
             (inline.align as u8).hash(&mut style_hasher);
         }
         Self {
@@ -124,11 +127,14 @@ impl ShapeCache {
 #[cfg(test)]
 mod tests {
     use super::ShapeKey;
-    use crate::text::{TextContent, TextStyle, TextWrap};
+    use crate::{
+        math::px,
+        text::{TextContent, TextStyle, TextWrap},
+    };
 
     #[test]
     fn shape_key_distinguishes_stack_version() {
-        let content = TextContent::new("hello", TextStyle::new(16.0));
+        let content = TextContent::new("hello", TextStyle::new(px(16.0)));
         let base = ShapeKey::new(&content, 1);
 
         assert_eq!(base, ShapeKey::new(&content, 1));
@@ -143,10 +149,10 @@ mod tests {
     fn shape_key_ignores_color_and_alignment() {
         use crate::{paint::color::Color, text::TextAlign};
 
-        let base = TextContent::new("1,234.56", TextStyle::new(13.0));
+        let base = TextContent::new("1,234.56", TextStyle::new(px(13.0)));
         let red = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_color(Color::Srgb {
+            TextStyle::new(px(13.0)).with_color(Color::Srgb {
                 r: 1.0,
                 g: 0.0,
                 b: 0.0,
@@ -155,7 +161,7 @@ mod tests {
         );
         let centered = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_alignment(TextAlign::Center),
+            TextStyle::new(px(13.0)).with_alignment(TextAlign::Center),
         );
 
         assert_eq!(ShapeKey::new(&base, 1), ShapeKey::new(&red, 1));
@@ -171,17 +177,21 @@ mod tests {
     fn shape_key_distinguishes_new_shaping_inputs() {
         use crate::text::{TextFontVariation, TextLineBreak};
 
-        let base = TextContent::new("1,234.56", TextStyle::new(13.0));
-        let locale = TextContent::new("1,234.56", TextStyle::new(13.0).with_locale("zh-Hans"));
-        let stretched = TextContent::new("1,234.56", TextStyle::new(13.0).with_stretch(80));
-        let spaced = TextContent::new("1,234.56", TextStyle::new(13.0).with_word_spacing(2.0));
+        let base = TextContent::new("1,234.56", TextStyle::new(px(13.0)));
+        let locale = TextContent::new("1,234.56", TextStyle::new(px(13.0)).with_locale("zh-Hans"));
+        let stretched = TextContent::new("1,234.56", TextStyle::new(px(13.0)).with_stretch(80));
+        let spaced = TextContent::new(
+            "1,234.56",
+            TextStyle::new(px(13.0)).with_word_spacing(px(2.0)),
+        );
         let line_break = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_line_break(TextLineBreak::Loose),
+            TextStyle::new(px(13.0)).with_line_break(TextLineBreak::Loose),
         );
         let variations = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_font_variations([TextFontVariation::new(*b"wght", 700.0)]),
+            TextStyle::new(px(13.0))
+                .with_font_variations([TextFontVariation::new(*b"wght", 700.0)]),
         );
 
         let base_key = ShapeKey::new(&base, 1);
@@ -207,35 +217,36 @@ mod tests {
     #[test]
     fn shape_key_distinguishes_inline_boxes() {
         use crate::{
-            math::Size,
+            math::{LogicalPx, LogicalSize, px},
             text::{InlineAlign, InlineBoxSpec},
         };
 
-        let spec = |id: u64, index: usize, width: f32| InlineBoxSpec {
+        let spec = |id: u64, index: usize, width: LogicalPx| InlineBoxSpec {
             id,
             index,
-            size: Size::new(width, 8.0),
+            size: LogicalSize::new(width, px(8.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint: None,
         };
         let content = |boxes: &[InlineBoxSpec]| {
-            TextContent::new("ab cd", TextStyle::new(16.0)).with_inline_boxes(boxes.iter().copied())
+            TextContent::new("ab cd", TextStyle::new(px(16.0)))
+                .with_inline_boxes(boxes.iter().copied())
         };
 
-        let plain = ShapeKey::new(&TextContent::new("ab cd", TextStyle::new(16.0)), 1);
-        let one = ShapeKey::new(&content(&[spec(1, 2, 8.0)]), 1);
-        let other_id = ShapeKey::new(&content(&[spec(2, 2, 8.0)]), 1);
-        let other_index = ShapeKey::new(&content(&[spec(1, 4, 8.0)]), 1);
-        let other_size = ShapeKey::new(&content(&[spec(1, 2, 12.0)]), 1);
-        let two = ShapeKey::new(&content(&[spec(1, 2, 8.0), spec(2, 4, 8.0)]), 1);
+        let plain = ShapeKey::new(&TextContent::new("ab cd", TextStyle::new(px(16.0))), 1);
+        let one = ShapeKey::new(&content(&[spec(1, 2, px(8.0))]), 1);
+        let other_id = ShapeKey::new(&content(&[spec(2, 2, px(8.0))]), 1);
+        let other_index = ShapeKey::new(&content(&[spec(1, 4, px(8.0))]), 1);
+        let other_size = ShapeKey::new(&content(&[spec(1, 2, px(12.0))]), 1);
+        let two = ShapeKey::new(&content(&[spec(1, 2, px(8.0)), spec(2, 4, px(8.0))]), 1);
 
         assert_ne!(plain, one, "有/无 inline_boxes 必须区分（变异 M5 的守卫）");
         assert_ne!(one, other_id, "id 必须参与键");
         assert_ne!(one, other_index, "index 必须参与键");
         assert_ne!(one, other_size, "size 必须参与键");
         assert_ne!(one, two, "行内盒序列必须参与键");
-        assert_eq!(one, ShapeKey::new(&content(&[spec(1, 2, 8.0)]), 1));
+        assert_eq!(one, ShapeKey::new(&content(&[spec(1, 2, px(8.0))]), 1));
     }
 
     #[test]
@@ -245,34 +256,38 @@ mod tests {
             text::{TextDecoration, TextRun},
         };
 
-        let plain = TextContent::new("abcdef", TextStyle::new(16.0));
-        let one = plain
-            .clone()
-            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_weight(700))]);
-        let other_range = plain
-            .clone()
-            .with_runs([TextRun::new(1..4, TextStyle::new(16.0).with_weight(700))]);
-        let other_style = plain
-            .clone()
-            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_weight(800))]);
+        let plain = TextContent::new("abcdef", TextStyle::new(px(16.0)));
+        let one = plain.clone().with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(px(16.0)).with_weight(700),
+        )]);
+        let other_range = plain.clone().with_runs([TextRun::new(
+            1..4,
+            TextStyle::new(px(16.0)).with_weight(700),
+        )]);
+        let other_style = plain.clone().with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(px(16.0)).with_weight(800),
+        )]);
         let other_size = plain
             .clone()
-            .with_runs([TextRun::new(0..3, TextStyle::new(18.0))]);
+            .with_runs([TextRun::new(0..3, TextStyle::new(px(18.0)))]);
         let colored = plain.clone().with_runs([TextRun::new(
             0..3,
-            TextStyle::new(16.0).with_color(Color::WHITE),
+            TextStyle::new(px(16.0)).with_color(Color::WHITE),
         )]);
         let decorated = plain.clone().with_runs([TextRun::new(
             0..3,
-            TextStyle::new(16.0).with_decoration(TextDecoration::underline(1.0)),
+            TextStyle::new(px(16.0)).with_decoration(TextDecoration::underline(px(1.0))),
         )]);
         let two = plain.clone().with_runs([
-            TextRun::new(0..3, TextStyle::new(16.0).with_weight(700)),
-            TextRun::new(3..6, TextStyle::new(16.0).with_weight(800)),
+            TextRun::new(0..3, TextStyle::new(px(16.0)).with_weight(700)),
+            TextRun::new(3..6, TextStyle::new(px(16.0)).with_weight(800)),
         ]);
-        let same = plain
-            .clone()
-            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_weight(700))]);
+        let same = plain.clone().with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(px(16.0)).with_weight(700),
+        )]);
 
         let base = ShapeKey::new(&plain, 1);
         let one_key = ShapeKey::new(&one, 1);
@@ -305,7 +320,7 @@ mod tests {
 
     #[test]
     fn shape_key_distinguishes_text_and_style() {
-        let style = TextStyle::new(16.0);
+        let style = TextStyle::new(px(16.0));
         let a = ShapeKey::new(&TextContent::new("ab", style.clone()), 1);
         let b = ShapeKey::new(&TextContent::new("ba", style.clone()), 1);
         let c = ShapeKey::new(
@@ -321,10 +336,10 @@ mod tests {
     fn shape_key_distinguishes_font_features() {
         use crate::text::TextFeature;
 
-        let plain = TextContent::new("12345", TextStyle::new(16.0));
+        let plain = TextContent::new("12345", TextStyle::new(px(16.0)));
         let tabular = TextContent::new(
             "12345",
-            TextStyle::new(16.0).with_font_features([TextFeature::TABULAR_NUMBERS]),
+            TextStyle::new(px(16.0)).with_font_features([TextFeature::TABULAR_NUMBERS]),
         );
 
         assert_ne!(
@@ -334,7 +349,7 @@ mod tests {
         );
         let again = TextContent::new(
             "12345",
-            TextStyle::new(16.0).with_font_features([TextFeature::TABULAR_NUMBERS]),
+            TextStyle::new(px(16.0)).with_font_features([TextFeature::TABULAR_NUMBERS]),
         );
         assert_eq!(ShapeKey::new(&tabular, 1), ShapeKey::new(&again, 1));
     }

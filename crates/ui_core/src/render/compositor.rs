@@ -1,28 +1,28 @@
 use crate::{
-    math::PhysicalRect,
+    math::{DevicePx, DeviceRect, dp},
     render::damage::{DamageSummary, MAX_DAMAGE_RECTS},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DamageRects {
-    rects: [PhysicalRect; MAX_DAMAGE_RECTS],
+    rects: [DeviceRect; MAX_DAMAGE_RECTS],
     len: usize,
 }
 
 impl DamageRects {
     pub(crate) const fn new() -> Self {
         Self {
-            rects: [PhysicalRect {
-                x0: 0,
-                y0: 0,
-                x1: 0,
-                y1: 0,
+            rects: [DeviceRect {
+                x0: dp(0),
+                y0: dp(0),
+                x1: dp(0),
+                y1: dp(0),
             }; MAX_DAMAGE_RECTS],
             len: 0,
         }
     }
 
-    pub(crate) fn push(&mut self, rect: PhysicalRect) -> bool {
+    pub(crate) fn push(&mut self, rect: DeviceRect) -> bool {
         if self.len == MAX_DAMAGE_RECTS {
             return false;
         }
@@ -44,7 +44,7 @@ impl DamageRects {
         true
     }
 
-    pub(crate) fn as_slice(&self) -> &[PhysicalRect] {
+    pub(crate) fn as_slice(&self) -> &[DeviceRect] {
         &self.rects[..self.len]
     }
 
@@ -81,14 +81,14 @@ impl DamageRects {
         let height = height.min(i32::MAX as u32) as i32;
         let mut clamped = DamageRects::new();
         for rect in self.as_slice() {
-            let x0 = rect.x0.clamp(0, width);
-            let y0 = rect.y0.clamp(0, height);
-            let x1 = rect.x1.clamp(x0, width);
-            let y1 = rect.y1.clamp(y0, height);
+            let x0 = rect.x0.clamp(dp(0), dp(width));
+            let y0 = rect.y0.clamp(dp(0), dp(height));
+            let x1 = rect.x1.clamp(x0, dp(width));
+            let y1 = rect.y1.clamp(y0, dp(height));
             if x1 == x0 || y1 == y0 {
                 continue;
             }
-            let kept = clamped.push(PhysicalRect::new(x0, y0, x1, y1));
+            let kept = clamped.push(DeviceRect::new(x0, y0, x1, y1));
             debug_assert!(kept, "clamping never grows the set");
         }
         clamped
@@ -101,8 +101,8 @@ impl DamageRects {
 
 pub(crate) const MAX_DRAW_PASSES: usize = 4;
 
-fn union_rect(a: PhysicalRect, b: PhysicalRect) -> PhysicalRect {
-    PhysicalRect {
+fn union_rect(a: DeviceRect, b: DeviceRect) -> DeviceRect {
+    DeviceRect {
         x0: a.x0.min(b.x0),
         y0: a.y0.min(b.y0),
         x1: a.x1.max(b.x1),
@@ -110,14 +110,14 @@ fn union_rect(a: PhysicalRect, b: PhysicalRect) -> PhysicalRect {
     }
 }
 
-fn union_growth(a: PhysicalRect, b: PhysicalRect) -> u64 {
+fn union_growth(a: DeviceRect, b: DeviceRect) -> u64 {
     let union = union_rect(a, b);
     union_area(union).saturating_sub(union_area(a) + union_area(b))
 }
 
-fn union_area(rect: PhysicalRect) -> u64 {
-    let width = (rect.x1 - rect.x0).max(0) as u64;
-    let height = (rect.y1 - rect.y0).max(0) as u64;
+fn union_area(rect: DeviceRect) -> u64 {
+    let width = (rect.x1 - rect.x0).max(DevicePx::ZERO).value() as u64;
+    let height = (rect.y1 - rect.y0).max(DevicePx::ZERO).value() as u64;
     width.saturating_mul(height)
 }
 
@@ -325,7 +325,7 @@ impl FramePlan {
     }
 }
 
-pub(crate) fn plan(damage: DamageSummary, merged: &[PhysicalRect], surface: PhysicalRect) -> Plan {
+pub(crate) fn plan(damage: DamageSummary, merged: &[DeviceRect], surface: DeviceRect) -> Plan {
     if damage.full {
         return Plan::Full;
     }
@@ -353,10 +353,13 @@ mod tests {
         CopyPlan, DamageRects, FramePlan, ImageCopyPlan, MAX_DAMAGE_RECTS, MAX_DRAW_PASSES, Plan,
         plan, union_growth,
     };
-    use crate::{math::PhysicalRect, render::damage::DamageSummary};
+    use crate::{
+        math::{DeviceRect, dp},
+        render::damage::DamageSummary,
+    };
 
-    fn surface() -> PhysicalRect {
-        PhysicalRect::new(0, 0, 100, 50)
+    fn surface() -> DeviceRect {
+        DeviceRect::new(dp(0), dp(0), dp(100), dp(50))
     }
 
     fn partial(rects: usize) -> DamageSummary {
@@ -379,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_fresh_swapchain_presents_without_dirty_rects_until_presented() {
-        let rect = PhysicalRect::new(0, 0, 10, 10);
+        let rect = DeviceRect::new(dp(0), dp(0), dp(10), dp(10));
         let mut frame = FramePlan::new(plan(partial(1), &[rect], surface()), true);
         assert!(matches!(frame.plan(), Plan::Partial(_)));
         assert_eq!(frame.present_dirty(), None);
@@ -410,10 +413,13 @@ mod tests {
 
     #[test]
     fn rects_are_clipped_to_the_surface() {
-        let rect = PhysicalRect::new(-5, -5, 10, 10);
+        let rect = DeviceRect::new(dp(-5), dp(-5), dp(10), dp(10));
         match plan(partial(1), &[rect], surface()) {
             Plan::Partial(rects) => {
-                assert_eq!(rects.as_slice(), &[PhysicalRect::new(0, 0, 10, 10)])
+                assert_eq!(
+                    rects.as_slice(),
+                    &[DeviceRect::new(dp(0), dp(0), dp(10), dp(10))]
+                )
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -421,13 +427,16 @@ mod tests {
 
     #[test]
     fn rects_beyond_the_right_and_bottom_edges_are_clipped() {
-        let outside = PhysicalRect::new(101, 51, 120, 70);
+        let outside = DeviceRect::new(dp(101), dp(51), dp(120), dp(70));
         assert_eq!(plan(partial(1), &[outside], surface()), Plan::Idle);
 
-        let straddling = PhysicalRect::new(90, 40, 101, 51);
+        let straddling = DeviceRect::new(dp(90), dp(40), dp(101), dp(51));
         match plan(partial(1), &[straddling], surface()) {
             Plan::Partial(rects) => {
-                assert_eq!(rects.as_slice(), &[PhysicalRect::new(90, 40, 100, 50)]);
+                assert_eq!(
+                    rects.as_slice(),
+                    &[DeviceRect::new(dp(90), dp(40), dp(100), dp(50))]
+                );
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -447,13 +456,13 @@ mod tests {
 
     #[test]
     fn fully_outside_rects_are_dropped() {
-        let rect = PhysicalRect::new(120, 60, 140, 80);
+        let rect = DeviceRect::new(dp(120), dp(60), dp(140), dp(80));
         assert_eq!(plan(partial(1), &[rect], surface()), Plan::Idle);
     }
 
     #[test]
     fn too_many_rects_degrade_to_full() {
-        let rect = PhysicalRect::new(0, 0, 1, 1);
+        let rect = DeviceRect::new(dp(0), dp(0), dp(1), dp(1));
         let many = vec![rect; MAX_DAMAGE_RECTS + 1];
         assert_eq!(plan(partial(many.len()), &many, surface()), Plan::Full);
     }
@@ -461,7 +470,7 @@ mod tests {
     #[test]
     fn rects_beyond_capacity_report_failure() {
         let mut rects = DamageRects::new();
-        let rect = PhysicalRect::new(0, 0, 1, 1);
+        let rect = DeviceRect::new(dp(0), dp(0), dp(1), dp(1));
         for _ in 0..MAX_DAMAGE_RECTS {
             assert!(rects.push(rect));
         }
@@ -470,7 +479,7 @@ mod tests {
         assert!(!rects.is_empty());
     }
 
-    fn partial_plan(rects: &[PhysicalRect]) -> Plan {
+    fn partial_plan(rects: &[DeviceRect]) -> Plan {
         let mut plan = DamageRects::new();
         for rect in rects {
             assert!(plan.push(*rect));
@@ -480,7 +489,7 @@ mod tests {
 
     #[test]
     fn merging_with_full_is_full_in_both_orders() {
-        let partial = partial_plan(&[PhysicalRect::new(0, 0, 4, 4)]);
+        let partial = partial_plan(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]);
         assert_eq!(partial.merge(Plan::Full), Plan::Full);
         assert_eq!(Plan::Full.merge(partial), Plan::Full);
         assert_eq!(Plan::Idle.merge(Plan::Full), Plan::Full);
@@ -489,7 +498,7 @@ mod tests {
 
     #[test]
     fn merging_with_idle_keeps_the_other_plan() {
-        let partial = partial_plan(&[PhysicalRect::new(1, 2, 3, 4)]);
+        let partial = partial_plan(&[DeviceRect::new(dp(1), dp(2), dp(3), dp(4))]);
         assert_eq!(partial.merge(Plan::Idle), partial);
         assert_eq!(Plan::Idle.merge(partial), partial);
         assert_eq!(Plan::Idle.merge(Plan::Idle), Plan::Idle);
@@ -498,15 +507,14 @@ mod tests {
     #[test]
     fn merging_two_partials_unions_the_rectangles() {
         let older = [
-            PhysicalRect::new(0, 0, 8, 8),
-            PhysicalRect::new(16, 0, 24, 8),
+            DeviceRect::new(dp(0), dp(0), dp(8), dp(8)),
+            DeviceRect::new(dp(16), dp(0), dp(24), dp(8)),
         ];
-        let newer = [PhysicalRect::new(0, 16, 8, 24)];
+        let newer = [DeviceRect::new(dp(0), dp(16), dp(8), dp(24))];
         let merged = partial_plan(&older).merge(partial_plan(&newer));
         match merged {
             Plan::Partial(rects) => {
-                let expected: Vec<PhysicalRect> =
-                    older.iter().chain(newer.iter()).copied().collect();
+                let expected: Vec<DeviceRect> = older.iter().chain(newer.iter()).copied().collect();
                 assert_eq!(rects.as_slice(), expected.as_slice());
             }
             other => panic!("unexpected plan: {other:?}"),
@@ -515,10 +523,10 @@ mod tests {
 
     #[test]
     fn merged_rects_beyond_capacity_degrade_to_full() {
-        let older: Vec<PhysicalRect> = (0..MAX_DAMAGE_RECTS)
-            .map(|index| PhysicalRect::new(index as i32, 0, index as i32 + 1, 1))
+        let older: Vec<DeviceRect> = (0..MAX_DAMAGE_RECTS)
+            .map(|index| DeviceRect::new(dp(index as i32), dp(0), dp(index as i32 + 1), dp(1)))
             .collect();
-        let newer = [PhysicalRect::new(0, 8, 1, 9)];
+        let newer = [DeviceRect::new(dp(0), dp(8), dp(1), dp(9))];
         assert_eq!(
             partial_plan(&older).merge(partial_plan(&newer)),
             Plan::Full,
@@ -550,13 +558,13 @@ mod tests {
     }
     #[test]
     fn damage_is_coalesced_to_the_pass_budget() {
-        let rects: Vec<PhysicalRect> = (0..12)
-            .map(|index| PhysicalRect::new(index * 4, 0, index * 4 + 2, 2))
+        let rects: Vec<DeviceRect> = (0..12)
+            .map(|index| DeviceRect::new(dp(index * 4), dp(0), dp(index * 4 + 2), dp(2)))
             .collect();
         let coalesced = plan(
             partial(rects.len()),
             &rects,
-            PhysicalRect::new(0, 0, 200, 50),
+            DeviceRect::new(dp(0), dp(0), dp(200), dp(50)),
         );
         let Plan::Partial(rects) = coalesced else {
             panic!("expected partial plan, got {coalesced:?}");
@@ -570,13 +578,20 @@ mod tests {
 
     #[test]
     fn coalescing_covers_every_original_rect() {
-        let originals: Vec<PhysicalRect> = (0..10)
-            .map(|index| PhysicalRect::new(index * 7, index * 3, index * 7 + 5, index * 3 + 4))
+        let originals: Vec<DeviceRect> = (0..10)
+            .map(|index| {
+                DeviceRect::new(
+                    dp(index * 7),
+                    dp(index * 3),
+                    dp(index * 7 + 5),
+                    dp(index * 3 + 4),
+                )
+            })
             .collect();
         let coalesced = plan(
             partial(originals.len()),
             &originals,
-            PhysicalRect::new(0, 0, 200, 50),
+            DeviceRect::new(dp(0), dp(0), dp(200), dp(50)),
         );
         let Plan::Partial(rects) = coalesced else {
             panic!("expected partial plan");
@@ -598,8 +613,8 @@ mod tests {
     #[test]
     fn small_damage_sets_are_left_alone() {
         let originals = [
-            PhysicalRect::new(0, 0, 4, 4),
-            PhysicalRect::new(50, 50, 54, 54),
+            DeviceRect::new(dp(0), dp(0), dp(4), dp(4)),
+            DeviceRect::new(dp(50), dp(50), dp(54), dp(54)),
         ];
         let coalesced = partial_plan(&originals);
         let Plan::Partial(rects) = coalesced else {
@@ -610,9 +625,9 @@ mod tests {
 
     #[test]
     fn coalescing_prefers_the_tightest_pair() {
-        let near_a = PhysicalRect::new(0, 0, 4, 4);
-        let near_b = PhysicalRect::new(0, 4, 4, 8);
-        let far = PhysicalRect::new(100, 100, 104, 104);
+        let near_a = DeviceRect::new(dp(0), dp(0), dp(4), dp(4));
+        let near_b = DeviceRect::new(dp(0), dp(4), dp(4), dp(8));
+        let far = DeviceRect::new(dp(100), dp(100), dp(104), dp(104));
         assert!(
             union_growth(near_a, near_b) < union_growth(near_a, far),
             "相邻矩形的并集增长必须小于远离的矩形"
@@ -620,7 +635,7 @@ mod tests {
         assert_eq!(union_growth(near_a, near_b), 0, "紧贴的矩形并集不增加面积");
     }
 
-    fn rects(list: &[PhysicalRect]) -> DamageRects {
+    fn rects(list: &[DeviceRect]) -> DamageRects {
         let mut rects = DamageRects::new();
         for rect in list {
             assert!(rects.push(*rect));
@@ -628,7 +643,7 @@ mod tests {
         rects
     }
 
-    fn regions(plan: CopyPlan) -> Vec<PhysicalRect> {
+    fn regions(plan: CopyPlan) -> Vec<DeviceRect> {
         match plan {
             CopyPlan::Regions(rects) => rects.as_slice().to_vec(),
             CopyPlan::Full => panic!("expected a region copy, got full"),
@@ -639,14 +654,14 @@ mod tests {
     fn a_new_swapchain_copies_every_image_in_full_once() {
         let mut plan = ImageCopyPlan::new(3);
         assert_eq!(plan.len(), 3);
-        let damage = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let damage = rects(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]);
         for image in 0..3 {
             assert!(plan.plan(image, Some(damage)).is_full(), "image {image}");
             plan.commit(image, Some(damage));
         }
         assert_eq!(
             regions(plan.plan(0, Some(damage))),
-            vec![PhysicalRect::new(0, 0, 8, 8)],
+            vec![DeviceRect::new(dp(0), dp(0), dp(8), dp(8))],
             "基线建立后只拷 damage"
         );
     }
@@ -654,30 +669,30 @@ mod tests {
     #[test]
     fn skipped_frames_accumulate_damage_for_every_image() {
         let mut plan = ImageCopyPlan::new(2);
-        let baseline = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let baseline = rects(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]);
         plan.commit(0, Some(baseline));
         plan.commit(1, Some(baseline));
-        let missed = rects(&[PhysicalRect::new(8, 0, 16, 8)]);
+        let missed = rects(&[DeviceRect::new(dp(8), dp(0), dp(16), dp(8))]);
         plan.commit(0, Some(missed));
         let pending = regions(plan.plan(1, Some(rects(&[]))));
         assert!(
-            pending.contains(&PhysicalRect::new(8, 0, 16, 8)),
+            pending.contains(&DeviceRect::new(dp(8), dp(0), dp(16), dp(8))),
             "被跳过帧的 damage 必须累积到未使用的 image 上：{pending:?}"
         );
-        let current = rects(&[PhysicalRect::new(0, 8, 8, 16)]);
+        let current = rects(&[DeviceRect::new(dp(0), dp(8), dp(8), dp(16))]);
         let pending = regions(plan.plan(1, Some(current)));
-        assert!(pending.contains(&PhysicalRect::new(8, 0, 16, 8)));
-        assert!(pending.contains(&PhysicalRect::new(0, 8, 8, 16)));
+        assert!(pending.contains(&DeviceRect::new(dp(8), dp(0), dp(16), dp(8))));
+        assert!(pending.contains(&DeviceRect::new(dp(0), dp(8), dp(8), dp(16))));
     }
 
     #[test]
     fn a_fully_synced_image_needs_no_copy() {
         let mut plan = ImageCopyPlan::new(1);
-        let damage = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let damage = rects(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]);
         plan.commit(0, Some(damage));
         assert_eq!(
             regions(plan.plan(0, Some(damage))),
-            vec![PhysicalRect::new(0, 0, 8, 8)]
+            vec![DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]
         );
         plan.commit(0, Some(damage));
         let empty = DamageRects::new();
@@ -691,31 +706,31 @@ mod tests {
     #[test]
     fn a_present_without_any_copy_keeps_the_pending_rects() {
         let mut plan = ImageCopyPlan::new(2);
-        let baseline = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let baseline = rects(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]);
         plan.commit(0, Some(baseline));
         plan.commit(1, Some(baseline));
-        let missed = rects(&[PhysicalRect::new(90, 90, 100, 100)]);
+        let missed = rects(&[DeviceRect::new(dp(90), dp(90), dp(100), dp(100))]);
         plan.commit(0, Some(missed));
         assert_eq!(
             regions(plan.plan(1, Some(rects(&[])))),
-            vec![PhysicalRect::new(90, 90, 100, 100)]
+            vec![DeviceRect::new(dp(90), dp(90), dp(100), dp(100))]
         );
 
-        let also_outside = rects(&[PhysicalRect::new(90, 0, 100, 10)]);
+        let also_outside = rects(&[DeviceRect::new(dp(90), dp(0), dp(100), dp(10))]);
         plan.commit_without_copy(1, Some(also_outside));
         let mut carried = regions(plan.plan(1, Some(rects(&[]))));
         carried.sort_by_key(|rect| (rect.x0, rect.y0));
         assert_eq!(
             carried,
             vec![
-                PhysicalRect::new(90, 0, 100, 10),
-                PhysicalRect::new(90, 90, 100, 100),
+                DeviceRect::new(dp(90), dp(0), dp(100), dp(10)),
+                DeviceRect::new(dp(90), dp(90), dp(100), dp(100)),
             ],
             "没搬像素的 present 不得把欠账清成空集（那会让可见区域变大后少拷一块）"
         );
         assert_eq!(
             regions(plan.plan(0, Some(rects(&[])))),
-            vec![PhysicalRect::new(90, 0, 100, 10)],
+            vec![DeviceRect::new(dp(90), dp(0), dp(100), dp(10))],
             "空集 early-return 不得跳过其余 image 的累积"
         );
     }
@@ -723,7 +738,7 @@ mod tests {
     #[test]
     fn a_full_frame_forces_a_full_copy() {
         let mut plan = ImageCopyPlan::new(2);
-        let damage = rects(&[PhysicalRect::new(0, 0, 4, 4)]);
+        let damage = rects(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]);
         plan.commit(0, Some(damage));
         assert!(plan.plan(0, None).is_full());
     }
@@ -731,11 +746,11 @@ mod tests {
     #[test]
     fn accumulating_beyond_capacity_degrades_to_full_copies() {
         let mut plan = ImageCopyPlan::new(2);
-        let full = rects(&[PhysicalRect::new(0, 0, 4, 4)]);
+        let full = rects(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]);
         plan.commit(0, Some(full));
         plan.commit(1, Some(full));
         for index in 0..(MAX_DAMAGE_RECTS as i32 + 2) {
-            let damage = rects(&[PhysicalRect::new(index, 0, index + 1, 1)]);
+            let damage = rects(&[DeviceRect::new(dp(index), dp(0), dp(index + 1), dp(1))]);
             plan.commit(0, Some(damage));
         }
         assert!(
@@ -747,7 +762,7 @@ mod tests {
     #[test]
     fn resetting_forgets_every_image() {
         let mut plan = ImageCopyPlan::new(2);
-        let damage = rects(&[PhysicalRect::new(0, 0, 4, 4)]);
+        let damage = rects(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]);
         plan.commit(0, Some(damage));
         plan.reset(3);
         assert_eq!(plan.len(), 3);
@@ -759,19 +774,19 @@ mod tests {
     #[test]
     fn clamping_a_rect_set_keeps_only_the_part_inside_the_image() {
         let damage = rects(&[
-            PhysicalRect::new(4, 8, 12, 16),
-            PhysicalRect::new(-3, -2, 1, 1),
-            PhysicalRect::new(58, 58, 100, 100),
-            PhysicalRect::new(80, 80, 90, 90),
-            PhysicalRect::new(64, 0, 64, 10),
+            DeviceRect::new(dp(4), dp(8), dp(12), dp(16)),
+            DeviceRect::new(dp(-3), dp(-2), dp(1), dp(1)),
+            DeviceRect::new(dp(58), dp(58), dp(100), dp(100)),
+            DeviceRect::new(dp(80), dp(80), dp(90), dp(90)),
+            DeviceRect::new(dp(64), dp(0), dp(64), dp(10)),
         ]);
         let clamped = damage.clamped(64, 64);
         assert_eq!(
             clamped.as_slice(),
             &[
-                PhysicalRect::new(4, 8, 12, 16),
-                PhysicalRect::new(0, 0, 1, 1),
-                PhysicalRect::new(58, 58, 64, 64),
+                DeviceRect::new(dp(4), dp(8), dp(12), dp(16)),
+                DeviceRect::new(dp(0), dp(0), dp(1), dp(1)),
+                DeviceRect::new(dp(58), dp(58), dp(64), dp(64)),
             ],
             "夹紧后的集合只保留落在 image 内的部分，顺序与输入一致"
         );

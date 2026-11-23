@@ -195,6 +195,9 @@ pub type PhysicalPoint = Point<PhysicalPx>;
 pub type PhysicalSize = Size<PhysicalPx>;
 pub type PhysicalRect = Rect<PhysicalPx>;
 
+pub type DevicePoint = Point<DevicePx>;
+pub type DeviceSize = Size<DevicePx>;
+
 pub struct DeviceRect {
     pub x0: DevicePx,
     pub y0: DevicePx,
@@ -218,14 +221,29 @@ impl DevicePixelRatio {
 
     pub fn to_physical(self, value: LogicalPx) -> PhysicalPx;
     pub fn to_logical(self, value: PhysicalPx) -> LogicalPx;
+    pub fn to_physical_size(self, size: LogicalSize) -> PhysicalSize;
     pub fn to_physical_rect(self, rect: LogicalRect) -> PhysicalRect;
+
+    pub fn to_device_point(self, point: LogicalPoint) -> DevicePoint;
+    pub fn to_device_size(self, size: LogicalSize) -> DeviceSize;
     pub fn to_device_rect(self, rect: LogicalRect) -> DeviceRect;
     pub fn to_covering_device_rect(self, rect: LogicalRect) -> DeviceRect;
+
+    pub fn to_logical_point(self, point: DevicePoint) -> LogicalPoint;
+    pub fn to_logical_size(self, size: DeviceSize) -> LogicalSize;
+    pub fn to_logical_rect(self, rect: DeviceRect) -> LogicalRect;
+
     pub fn stroke_width(self, width: LogicalPx) -> PhysicalPx;
 }
 ```
 
+- `DevicePixelRatio` 是唯一持有 DPI 的地方：`LogicalPx ↔ PhysicalPx / DevicePx` 的所有换算都从这里出去，别处不得乘除 DPR。
+- `to_device_rect` 是 `pixelSnappedIntRect` 的**唯一实现**（逐边 round，见 §6）；`to_covering_device_rect` 是 floor/ceil 外扩版；`to_physical_rect` 不取整，供 SDF / 阴影 / 圆角半径使用；`stroke_width` 负责边框宽度吸附。`Rect<PhysicalPx>` 在泛型 `Rect` 操作（`translate/inset/outset/union/intersect/contains/min/max/is_empty` 等）之外**额外**提供 `to_aabb()`，不再提供 `snap()`，避免出现第二条吸附实现（两条实现在 f32 下会漂移 1 物理像素）。
+- 非有限坐标、非有限/负尺寸输入统一返回零矩形 `DeviceRect::default()`（不是反向哨兵），与旧 `EMPTY_PHYSICAL` 的可见结果一致。
+
 - `DeviceRect` 保持四边 `x0/y0/x1/y1` 的整数矩形语义，用于 damage、scissor、atlas、a11y 等“边缘必须精确”的场景；`Rect<LogicalPx>` / `Rect<PhysicalPx>` 使用 origin + size。这样既保留现有 damage 代码的边界运算，又让逻辑/连续物理矩形有类型。
+- `DeviceRect` 的边界恒有序（`x0 <= x1`、`y0 <= y1`），不存在反向空哨兵：空值就是零矩形，`union` 只把“零矩形”当 identity，带位置的零尺寸矩形正常参与聚合。闭区间相交命名为 `overlaps_inclusive`，与 `Rect<T>::intersects` 的半开语义区分开。
+- 聚合有两种等价写法：需要表达“还没有任何矩形”时用 `Option<DeviceRect>`（如 `paint/instance.rs::run_bounds` 的 `filter_map(..).reduce(DeviceRect::union)`）；就地累加时以 `DeviceRect::default()`（零矩形）播种即可——零矩形是 `union` 的 identity，因此与 `Option` 写法逐位等价。`OpGroup.bounds` 属于后者（零矩形播种），功能上与 `Option` 等价。
 - 删除 `PhysicalBounds`（`paint/instance.rs`），统一使用 `DeviceRect`。
 - `Scale` 这个名字被 `DevicePixelRatio` 取代，避免与 `Transform::scale` 混淆。
 
@@ -258,17 +276,19 @@ impl DevicePixelRatio {
 ### 4.1 `math.rs` / 单位层
 
 1. 新增 `LogicalPx`、`PhysicalPx`、`DevicePx`、`Point<T>`、`Size<T>`、`Rect<T>`、`Edges<T>`、`DevicePixelRatio`。
-2. `Rect<LogicalPx>` 提供 `translate/inset/outset/union/intersect/contains`；`DeviceRect` 提供 `x0/y0/x1/y1/width/height/union/intersect`。
-3. `Rect<PhysicalPx>::snap()` 返回 `DeviceRect`，实现 WebKit `pixelSnappedIntRect`：
+2. `Rect<LogicalPx>` 提供 `translate/inset/outset/union/intersect/contains`；`DeviceRect` 提供 `x0/y0/x1/y1/width/height/union/intersect/overlaps_inclusive/translate`。
+3. `DevicePixelRatio::to_device_rect()` 返回 `DeviceRect`，是 WebKit `pixelSnappedIntRect` 的唯一实现：
 
 ```text
-x  = round(x0)
-y  = round(y0)
-x1 = round(x0 + width)
-y1 = round(y0 + height)
-width  = x1 - x
-height = y1 - y
+x0 = round(x * s)
+y0 = round(y * s)
+x1 = round((x + width) * s)
+y1 = round((y + height) * s)
+width  = x1 - x0
+height = y1 - y0
 ```
+
+右/下边直接用完整坐标 `(x + width) * s` 乘后 round，不先乘再在物理空间相加：f32 下 `x0 + (x1 - x0)` 未必等于 `x1`，那样会得到第二条吸附实现并与逐边 round 相差 1 物理像素。
 
 4. 删除：
    - `Rect::snap_to_device`
@@ -278,7 +298,7 @@ height = y1 - y
    - `Rect::to_physical_covering`
    - `snap_stroke_width`
    - `Scale`
-5. `DevicePixelRatio` 中保留 `to_covering_device_rect`（floor/ceil）用于 damage/clip；`to_device_rect`（逐边 round）用于图形；`to_physical_rect`（不取整）用于 SDF/阴影；`stroke_width` 负责边框宽度。
+5. `DevicePixelRatio` 中保留 `to_covering_device_rect`（floor/ceil）用于 damage/clip/a11y；`to_device_rect`（逐边 round）是图形吸附的唯一入口；`to_physical_rect`（不取整）用于 SDF/阴影；`stroke_width` 负责边框宽度。
 6. 为了约束逻辑长度构造，提供 `LogicalPx::new(f32)` / `px(f32)` helper；不为 `f32` 实现隐式 `Into<LogicalPx>`，避免物理裸值直接冒充逻辑值。
 7. `Transform` 的平移分量改为 `LogicalPx`，矩阵系数保持 `f32`（无量纲）；`GeometryDesc.bounds: Rect<LogicalPx>`，顶点字节仍按逻辑像素解释。
 
@@ -325,7 +345,7 @@ pub struct LayoutBox {
 
 | Primitive | 换算 | 吸附 |
 |---|---|---|
-| `Quad`（Solid/Gradient/Border/FocusRing） | `quad.bounds.to_physical_rect(dpr)` | `snap()` → `DevicePx` 边界；边框宽度 `dpr.stroke_width(border.width)`；圆角 `radius × dpr` 保持 `PhysicalPx` |
+| `Quad`（Solid/Gradient/Border/FocusRing） | `dpr.to_device_rect(quad.bounds)` | `pixelSnappedIntRect` → `DevicePx` 边界；边框宽度 `dpr.stroke_width(border.width)`；圆角 `dpr.to_physical(radius)` 保持 `PhysicalPx` |
 | `Shadow` | `shadow.rect.translate(offset).to_physical_rect(dpr)` | 不吸附；blur 为 `PhysicalPx` |
 | `Image` | `image.bounds.to_device_rect(dpr)` | 逐边 round（pixelSnappedIntRect） |
 | `GlyphRun` | `Rect::from_origin_size(position,size).to_device_rect(dpr)` | 逐边 round；文本光栅位置本身已是整数物理像素 |
@@ -520,7 +540,7 @@ fn track_metrics(size: UnifiedSize) -> TrackMetrics {
 
 - `track.layout().bounds`、`text.layout().bounds` 现在纯粹是逻辑像素；
 - Canvas 文本用 `Canvas::push_text`，不再读 `App::text_scale`；
-- 需要像素级对齐的细线（caret、underline、separator）由 `InstanceEncoder` 的 Quad snap 处理，应用只需要画逻辑矩形。
+- 需要像素级对齐的细线（caret、underline、separator）由 `InstanceEncoder` 对 Quad 做 `pixelSnappedIntRect` 处理，应用只需要画逻辑矩形。
 
 ### 5.4 `StyleBuilder` / `PaintBuilder`
 
@@ -553,21 +573,21 @@ fn track_metrics(size: UnifiedSize) -> TrackMetrics {
 采用 WebKit `pixelSnappedIntRect` 作为统一规则：
 
 ```text
-给定逻辑矩形 L 和 DPR s：
-P = L × s                          // PhysicalPx，连续
-x  = round(P.x)
-y  = round(P.y)
-x1 = round(P.x + P.width)
-y1 = round(P.y + P.height)
-DeviceRect = (x, y, x1, y1)
+给定逻辑矩形 (x, y, width, height) 和 DPR s：
+x0 = round(x * s)
+y0 = round(y * s)
+x1 = round((x + width) * s)
+y1 = round((y + height) * s)
+DeviceRect = (x0, y0, x1, y1)
 ```
 
-- 左/上边 round，右/下边由完整右/下坐标 round 后相减得到；不单独 round 宽高。这样相邻元素的共享边界会落在同一物理像素上，不会产生缝隙。
+- 左/上边由逻辑坐标乘 s 后 round，右/下边由完整右/下坐标乘 s 后 round，再相减得到宽高；不单独 round 宽高。这样相邻元素的共享边界会落在同一物理像素上，不会产生缝隙。
+- 右/下边必须是 `round((x + width) * s)`，不能写成 `round(x * s) + round((x + width) * s - x * s)` 之类的物理空间拼装：f32 下两种写法在 248k 组随机矩形上会差 1 物理像素，只保留一种实现。
 - `Quad` 的背景、渐变、边框、焦点环都使用该规则；边框宽度再用 `stroke_width` 取整且至少 1 物理像素。
 - `Image` / `Glyph` 使用同一规则；文本位图自身已经是整数物理像素。
 - `Clip` / `Damage` 使用 `floor` 左上、`ceil` 右下的外扩规则，保证不裁掉内容。
 - `Shadow` / `Path` / `Geometry` 不吸附顶点；阴影模糊和几何抗锯齿保持连续。
-- 圆角半径按 `radius × dpr` 保持 `PhysicalPx`，不强制整数；极小半径由 `normalize_corner_radius` 按外框尺寸 clamp。
+- 圆角半径按 `dpr.to_physical(radius)` 保持 `PhysicalPx`，不强制整数；极小半径由 `normalize_physical_corner_radius` / `normalize_logical_corner_radius` 按外框尺寸 clamp。
 - 物理跨度 <1 物理像素、整块经 round 退化为空的填充/渐变 `Quad` 不绘制；边框在正常尺寸 Quad 上由 `stroke_width` 保底 ≥1 物理像素。
 - 边框宽度先按 `stroke_width` 取整且至少 1 物理像素，再 clamp 到 `min(宽, 高)`：短边 1 物理像素的 Quad 上边框宽度 clamp 到短边（内盒归零），shader 不会反转内边界；中心线仍按 AA 计算约 50% alpha。
 - 小数 DPI 下轴对齐矩形最多产生 1 物理像素的尺寸/位置偏差，这是 CSS/WebKit 的既定取舍；不以此为由在 `ui_kit` 内做设备空间补偿。
@@ -708,9 +728,9 @@ Select-String -Path crates/ui_core/src/**,crates/ui_kit/src/** -Pattern 'snap_to
 
 ### 8.4 现有测试基线
 
-- `cargo test -p ui_core --lib --features hud,test-support`：2344 passed / 1 ignored。
+- `cargo test -p ui_core --lib --features hud,test-support`：2340 passed / 1 ignored；其中 `math` 单测 40 个（原 2344 中的 `to_physical_*` / `snap_stroke_width` 用例合并重写为逐档 DPR 表驱动用例）。
 - `cargo test -p ui_kit --lib`：765 passed（kit 716 / theme 49；`style_builder` 测试已随模块迁入 `ui_core`）。
-- `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden）。
+- `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden，C1 期间逐图 `max=0 avg=0.000 mismatch=0`）。
 - `gui_smoke --ignored`：6 场景 PASS（WARP）。
 - `acceptance -- cpu`：**既有缺陷**，文本帧 p99 ≈ 5.9–7.0 ms > 4 ms 阈值；与本轮重构无关。
 - Golden 数量与三端目标保持不变（42 张）。

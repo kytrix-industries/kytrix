@@ -21,7 +21,7 @@ use crate::{
         },
     },
     app::App,
-    math::Scale,
+    math::DevicePixelRatio,
     node::{
         id::NodeId,
         tree::{Node, NodeTree},
@@ -219,7 +219,7 @@ impl A11yBridge {
         &mut self,
         tree: &mut NodeTree,
         focus: Option<NodeId>,
-        scale: Scale,
+        scale: DevicePixelRatio,
         title: &str,
         caret: Option<(NodeId, usize)>,
         diagnostics: &mut Vec<A11yDiagnostic>,
@@ -639,12 +639,12 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
         node.set_sort_direction(sort_to_accesskit(sort));
     }
     if let Some(scroll) = record.scroll {
-        node.set_scroll_x(f64::from(scroll.x));
-        node.set_scroll_y(f64::from(scroll.y));
+        node.set_scroll_x(f64::from(scroll.x.value()));
+        node.set_scroll_y(f64::from(scroll.y.value()));
         node.set_scroll_x_min(0.0);
         node.set_scroll_y_min(0.0);
-        node.set_scroll_x_max(f64::from(scroll.x_max));
-        node.set_scroll_y_max(f64::from(scroll.y_max));
+        node.set_scroll_x_max(f64::from(scroll.x_max.value()));
+        node.set_scroll_y_max(f64::from(scroll.y_max.value()));
     }
     if let Some(orientation) = record.orientation {
         node.set_orientation(orientation_to_accesskit(orientation));
@@ -719,10 +719,10 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
     }
     let bounds = record.bounds;
     node.set_bounds(AkRect::new(
-        f64::from(bounds.x0),
-        f64::from(bounds.y0),
-        f64::from(bounds.x1),
-        f64::from(bounds.y1),
+        f64::from(bounds.x0.value()),
+        f64::from(bounds.y0.value()),
+        f64::from(bounds.x1.value()),
+        f64::from(bounds.y1.value()),
     ));
     node
 }
@@ -738,14 +738,14 @@ mod tests {
             A11yAction, A11yCustomAction, A11yOverride, A11yPatch, A11yRole, A11ySort,
             A11yTextSelection,
         },
-        math::Scale,
+        math::{DevicePixelRatio, dp, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::style::StylePatch,
         text::TextStyle,
     };
 
-    fn scale() -> Scale {
-        Scale::ONE
+    fn scale() -> DevicePixelRatio {
+        DevicePixelRatio::ONE
     }
 
     fn take(
@@ -1391,7 +1391,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed().build(&mut tree, root).expect("node");
-        let message = NodeBuilder::text("余额不足", TextStyle::new(12.0))
+        let message = NodeBuilder::text("余额不足", TextStyle::new(px(12.0)))
             .build(&mut tree, root)
             .expect("message");
         let mut bridge = A11yBridge::new();
@@ -1485,7 +1485,12 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let _ = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(10.0),
+                px(10.0),
+            ))
             .build(&mut tree, root)
             .expect("node");
         let mut bridge = A11yBridge::new();
@@ -1506,7 +1511,12 @@ mod tests {
             .build(&mut tree, root)
             .expect("container");
         let row = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(10.0),
+                px(10.0),
+            ))
             .build(&mut tree, container)
             .expect("row");
         let mut bridge = A11yBridge::new();
@@ -1545,7 +1555,12 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(1.0, 2.0, 10.0, 20.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(1.0),
+                px(2.0),
+                px(10.0),
+                px(20.0),
+            ))
             .a11y(A11yOverride {
                 role: Some(A11yRole::Button),
                 label: Some(SmolStr::new_static("ok")),
@@ -1558,20 +1573,20 @@ mod tests {
         tree.set_layout_for_test(
             node,
             crate::node::tree::LayoutBox {
-                bounds: crate::math::Rect::new(1.0, 2.0, 10.0, 20.0),
-                border: crate::math::Edges::ZERO,
+                bounds: crate::math::LogicalRect::new(px(1.0), px(2.0), px(10.0), px(20.0)),
+                border: crate::math::LogicalEdges::ZERO,
             },
         );
         let snapshot = take(&mut bridge, &mut tree, None).expect("首笔");
         let record = snapshot.node_for(node).expect("node");
         assert_eq!(
+            (dp(1), dp(2), dp(11), dp(22)),
             (
                 record.bounds.x0,
                 record.bounds.y0,
                 record.bounds.x1,
                 record.bounds.y1
-            ),
-            (1, 2, 11, 22)
+            )
         );
         let converted = to_accesskit(record);
         assert!(converted.supports_action(Action::Click));
@@ -1592,7 +1607,7 @@ mod tests {
             })
             .build(&mut tree, root)
             .expect("input");
-        let text = NodeBuilder::text("你好ab", TextStyle::new(12.0))
+        let text = NodeBuilder::text("你好ab", TextStyle::new(px(12.0)))
             .build(&mut tree, input)
             .expect("text");
         let mut bridge = A11yBridge::new();
@@ -1713,7 +1728,7 @@ mod tests {
             .expect("viewport");
         let (row0, _cell0) = mount_row(&mut tree, viewport, 0);
         let (row1, _cell1) = mount_row(&mut tree, viewport, 1);
-        let mut slot = VirtualSlot::new(20.0, 0);
+        let mut slot = VirtualSlot::new(px(20.0), 0);
         slot.count = 50;
         slot.mounted = vec![(0, row0), (1, row1)];
         tree.ensure_interaction(viewport)
@@ -1901,10 +1916,10 @@ mod tests {
         tree.ensure_interaction(scrolling)
             .expect("interaction")
             .scroll = Some(crate::interaction::ScrollSlot {
-            offset: crate::math::Point::ZERO,
-            content: crate::math::Size::new(10.0, 100.0),
+            offset: crate::math::LogicalPoint::ZERO,
+            content: crate::math::LogicalSize::new(px(10.0), px(100.0)),
             axis: crate::interaction::ScrollAxis::Vertical,
-            line_height: 40.0,
+            line_height: px(40.0),
         });
         let mut ids = crate::a11y::identity::A11yIds::new();
         let mut diagnostics = Vec::new();
@@ -1940,10 +1955,10 @@ mod tests {
         tree.ensure_interaction(derived)
             .expect("interaction")
             .scroll = Some(crate::interaction::ScrollSlot {
-            offset: crate::math::Point::ZERO,
-            content: crate::math::Size::new(10.0, 100.0),
+            offset: crate::math::LogicalPoint::ZERO,
+            content: crate::math::LogicalSize::new(px(10.0), px(100.0)),
             axis: crate::interaction::ScrollAxis::Vertical,
-            line_height: 40.0,
+            line_height: px(40.0),
         });
         let record = crate::a11y::tree::node_a11y_with_cache(
             &tree,

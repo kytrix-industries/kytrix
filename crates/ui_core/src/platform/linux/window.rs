@@ -1,6 +1,6 @@
-use crate::math::Size;
+use crate::math::{LogicalSize, px};
 
-pub(crate) const MIN_SIZE_LOGICAL: Size = Size::new(320.0, 200.0);
+pub(crate) const MIN_SIZE_LOGICAL: LogicalSize = LogicalSize::new(px(320.0), px(200.0));
 
 pub(crate) const SHADOW_MARGIN: f32 = 0.0;
 

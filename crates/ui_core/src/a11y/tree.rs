@@ -12,7 +12,7 @@ use crate::{
         textrun,
     },
     interaction::ScrollAxis,
-    math::Scale,
+    math::DevicePixelRatio,
     node::{
         dependency::ReadCtx,
         id::NodeId,
@@ -54,7 +54,7 @@ impl std::fmt::Debug for NodeA11y {
 pub(crate) fn node_a11y(
     tree: &NodeTree,
     node: NodeId,
-    scale: Scale,
+    scale: DevicePixelRatio,
     title: &str,
     ids: &mut A11yIds,
     diagnostics: &mut Vec<A11yDiagnostic>,
@@ -66,7 +66,7 @@ pub(crate) fn node_a11y(
 pub(crate) fn node_a11y_with_cache(
     tree: &NodeTree,
     node: NodeId,
-    scale: Scale,
+    scale: DevicePixelRatio,
     title: &str,
     ids: &mut A11yIds,
     tables: &mut CollectionSemanticsCache,
@@ -996,7 +996,7 @@ mod tests {
     use super::{collect_subtree, push_ancestors, resolve_focus};
     use crate::{
         a11y::{A11yAction, A11yOverride, A11yRole, A11ySort, identity::A11yIds},
-        math::Scale,
+        math::{DevicePixelRatio, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         text::TextStyle,
     };
@@ -1026,7 +1026,7 @@ mod tests {
         let node = super::node_a11y(
             &tree,
             price,
-            crate::math::Scale::ONE,
+            crate::math::DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut diagnostics,
@@ -1058,7 +1058,7 @@ mod tests {
         let node = super::node_a11y(
             &tree,
             slider,
-            crate::math::Scale::ONE,
+            crate::math::DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut diagnostics,
@@ -1091,7 +1091,7 @@ mod tests {
         let node = super::node_a11y(
             &tree,
             row,
-            crate::math::Scale::ONE,
+            crate::math::DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut diagnostics,
@@ -1162,8 +1162,15 @@ mod tests {
         fn snapshot(tree: &NodeTree, node: NodeId) -> crate::a11y::A11yNode {
             let mut diagnostics = Vec::new();
             let mut ids = A11yIds::new();
-            super::node_a11y(tree, node, Scale::ONE, "", &mut ids, &mut diagnostics)
-                .expect("snapshot")
+            super::node_a11y(
+                tree,
+                node,
+                DevicePixelRatio::ONE,
+                "",
+                &mut ids,
+                &mut diagnostics,
+            )
+            .expect("snapshot")
         }
 
         let mut rows = Vec::new();
@@ -1279,7 +1286,7 @@ mod tests {
         let table_node = super::node_a11y_with_cache(
             &tree,
             table,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut tables,
@@ -1293,7 +1300,7 @@ mod tests {
         let row_node = super::node_a11y_with_cache(
             &tree,
             last_row.expect("last row"),
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut tables,
@@ -1306,7 +1313,7 @@ mod tests {
         let cell_node = super::node_a11y_with_cache(
             &tree,
             last_cell.expect("last cell"),
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut tables,
@@ -1369,7 +1376,7 @@ mod tests {
             let record = super::node_a11y_with_cache(
                 &tree,
                 node,
-                Scale::ONE,
+                DevicePixelRatio::ONE,
                 "",
                 &mut ids,
                 &mut tables,
@@ -1413,7 +1420,7 @@ mod tests {
         let record = super::node_a11y_with_cache(
             &tree,
             cell,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             "",
             &mut ids,
             &mut tables,
@@ -1435,7 +1442,7 @@ mod tests {
             })
             .build(&mut tree, root)
             .expect("input");
-        let text = NodeBuilder::text("价🌍ab", TextStyle::new(12.0))
+        let text = NodeBuilder::text("价🌍ab", TextStyle::new(px(12.0)))
             .build(&mut tree, input)
             .expect("text");
         tree.set_a11y_patch(
@@ -1450,8 +1457,15 @@ mod tests {
         );
         let mut diagnostics = Vec::new();
         let mut ids = A11yIds::new();
-        let snapshot = super::node_a11y(&tree, text, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("snapshot");
+        let snapshot = super::node_a11y(
+            &tree,
+            text,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("snapshot");
         assert_eq!(snapshot.role, A11yRole::TextRun, "输入框内的文本是 TextRun");
         assert_eq!(
             snapshot.character_lengths,
@@ -1482,13 +1496,20 @@ mod tests {
     fn empty_text_has_no_grapheme_lengths() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let text = NodeBuilder::text("", TextStyle::new(12.0))
+        let text = NodeBuilder::text("", TextStyle::new(px(12.0)))
             .build(&mut tree, root)
             .expect("text");
         let mut diagnostics = Vec::new();
         let mut ids = A11yIds::new();
-        let snapshot = super::node_a11y(&tree, text, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("snapshot");
+        let snapshot = super::node_a11y(
+            &tree,
+            text,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("snapshot");
         assert!(snapshot.character_lengths.is_empty());
         assert!(snapshot.text_selection.is_none());
     }
@@ -1515,8 +1536,15 @@ mod tests {
             .expect("row");
         let mut diagnostics = Vec::new();
         let mut ids = A11yIds::new();
-        let snapshot = super::node_a11y(&tree, row, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("snapshot");
+        let snapshot = super::node_a11y(
+            &tree,
+            row,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("snapshot");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let ak = crate::a11y::adapter::to_accesskit(&snapshot);
         assert!(ak.supports_action(accesskit::Action::CustomAction));
@@ -1540,8 +1568,15 @@ mod tests {
             .expect("node");
         let mut diagnostics = Vec::new();
         let mut ids = A11yIds::new();
-        let _ = super::node_a11y(&tree, node, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("snapshot");
+        let _ = super::node_a11y(
+            &tree,
+            node,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("snapshot");
         assert!(
             diagnostics.iter().any(|diagnostic| matches!(
                 diagnostic,
@@ -1559,12 +1594,33 @@ mod tests {
         let second = NodeBuilder::boxed().build(&mut tree, root).expect("b");
         let mut ids = A11yIds::new();
         let mut diagnostics = Vec::new();
-        let a = super::node_a11y(&tree, first, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("a snapshot");
-        let b = super::node_a11y(&tree, second, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("b snapshot");
-        let a2 = super::node_a11y(&tree, first, Scale::ONE, "", &mut ids, &mut diagnostics)
-            .expect("a again");
+        let a = super::node_a11y(
+            &tree,
+            first,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("a snapshot");
+        let b = super::node_a11y(
+            &tree,
+            second,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("b snapshot");
+        let a2 = super::node_a11y(
+            &tree,
+            first,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("a again");
         assert_eq!(a.id, a2.id, "同一节点跨帧 id 必须不变");
         assert_ne!(a.id, b.id, "不同节点不得共享 id");
         assert_eq!(a.parent, ids.stable_of(root), "父 id 来自同一分配器");
@@ -1583,7 +1639,7 @@ mod tests {
             })
             .build(&mut tree, root)
             .expect("input");
-        let text = NodeBuilder::text("价🌍ab", TextStyle::new(12.0))
+        let text = NodeBuilder::text("价🌍ab", TextStyle::new(px(12.0)))
             .build(&mut tree, input)
             .expect("text run");
         let selection = crate::a11y::A11yTextSelection {
@@ -1607,9 +1663,15 @@ mod tests {
 
         let mut diagnostics = Vec::new();
         let mut ids = A11yIds::new();
-        let input_snapshot =
-            super::node_a11y(&tree, input, Scale::ONE, "", &mut ids, &mut diagnostics)
-                .expect("input snapshot");
+        let input_snapshot = super::node_a11y(
+            &tree,
+            input,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("input snapshot");
         assert!(
             input_snapshot.character_lengths.is_empty(),
             "输入框不携带字符语义（由子 TextRun 承担）"
@@ -1626,9 +1688,15 @@ mod tests {
             "输入框默认只宣告 SetValue，选区能力挂在 TextRun 上"
         );
 
-        let run_snapshot =
-            super::node_a11y(&tree, text, Scale::ONE, "", &mut ids, &mut diagnostics)
-                .expect("text run snapshot");
+        let run_snapshot = super::node_a11y(
+            &tree,
+            text,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("text run snapshot");
         assert_eq!(run_snapshot.role, A11yRole::TextRun);
         assert_eq!(run_snapshot.character_lengths, vec![3, 4, 1, 1]);
         assert!(
@@ -1655,8 +1723,16 @@ mod tests {
         tables: &mut super::CollectionSemanticsCache,
     ) -> crate::a11y::A11yNode {
         let mut diagnostics = Vec::new();
-        super::node_a11y_with_cache(tree, node, Scale::ONE, "", ids, tables, &mut diagnostics)
-            .expect("snapshot")
+        super::node_a11y_with_cache(
+            tree,
+            node,
+            DevicePixelRatio::ONE,
+            "",
+            ids,
+            tables,
+            &mut diagnostics,
+        )
+        .expect("snapshot")
     }
 
     fn declare_overlay(
@@ -1668,7 +1744,9 @@ mod tests {
         tree.ensure_interaction(node).expect("interaction").overlay =
             Some(crate::interaction::OverlaySlot {
                 dismiss: crate::interaction::OverlayDismiss::Explicit,
-                placement: crate::interaction::OverlayPlacement::Point(crate::math::Point::ZERO),
+                placement: crate::interaction::OverlayPlacement::Point(
+                    crate::math::LogicalPoint::ZERO,
+                ),
                 trap_focus,
                 opener,
                 restore_focus: false,
@@ -1783,7 +1861,7 @@ mod tests {
             rows.push(row);
             cells.push(cell);
         }
-        let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
+        let mut slot = crate::interaction::VirtualSlot::new(px(20.0), 0);
         slot.count = 100;
         slot.mounted = rows
             .iter()
@@ -1901,10 +1979,10 @@ mod tests {
         tree.ensure_interaction(viewport)
             .expect("viewport interaction")
             .scroll = Some(crate::interaction::ScrollSlot {
-            offset: crate::math::Point::new(0.0, 40.0),
-            content: crate::math::Size::new(0.0, 2000.0),
+            offset: crate::math::LogicalPoint::new(px(0.0), px(40.0)),
+            content: crate::math::LogicalSize::new(px(0.0), px(2000.0)),
             axis: crate::interaction::ScrollAxis::Vertical,
-            line_height: 20.0,
+            line_height: px(20.0),
         });
 
         let mut ids = A11yIds::new();
@@ -1920,8 +1998,8 @@ mod tests {
         let scroll = table_record
             .scroll
             .expect("集合根必须接管窗口的 scroll（E9 R2 后半）");
-        assert_eq!(scroll.y, 40.0);
-        assert_eq!(scroll.y_max, 2000.0);
+        assert_eq!(scroll.y, px(40.0));
+        assert_eq!(scroll.y_max, px(2000.0));
         assert!(scroll.vertical);
         assert!(
             table_record.clips_children,
@@ -2122,7 +2200,7 @@ mod tests {
                     .expect("item"),
             );
         }
-        let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
+        let mut slot = crate::interaction::VirtualSlot::new(px(20.0), 0);
         slot.count = 30;
         slot.mounted = items
             .iter()
@@ -2536,7 +2614,7 @@ mod tests {
         count: usize,
         mounted: &[(usize, NodeId)],
     ) {
-        let mut slot = crate::interaction::VirtualSlot::new(20.0, 0);
+        let mut slot = crate::interaction::VirtualSlot::new(px(20.0), 0);
         slot.count = count;
         slot.mounted = mounted.to_vec();
         tree.ensure_interaction(node)
@@ -2766,9 +2844,15 @@ mod tests {
 
         let mut diagnostics = Vec::new();
         let mut ids = A11yIds::new();
-        let static_record =
-            super::node_a11y(&tree, slider, Scale::ONE, "", &mut ids, &mut diagnostics)
-                .expect("slider record");
+        let static_record = super::node_a11y(
+            &tree,
+            slider,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("slider record");
         assert_eq!(
             static_record.orientation,
             Some(crate::a11y::A11yOrientation::Horizontal)
@@ -2785,9 +2869,15 @@ mod tests {
                 ..crate::a11y::A11yPatch::default()
             },
         );
-        let patch_record =
-            super::node_a11y(&tree, slider, Scale::ONE, "", &mut ids, &mut diagnostics)
-                .expect("slider record after patch");
+        let patch_record = super::node_a11y(
+            &tree,
+            slider,
+            DevicePixelRatio::ONE,
+            "",
+            &mut ids,
+            &mut diagnostics,
+        )
+        .expect("slider record after patch");
         assert_eq!(
             patch_record.orientation,
             Some(crate::a11y::A11yOrientation::Vertical),

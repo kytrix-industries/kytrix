@@ -1393,6 +1393,7 @@ mod tests {
     };
     use crate::{
         error::EngineError,
+        math::dp,
         paint::atlas::AtlasKind,
         render::{
             DirtyRects,
@@ -1405,11 +1406,11 @@ mod tests {
 
     fn dirty_rects(y0: u32, y1: u32) -> DirtyRects {
         let mut rects = DirtyRects::default();
-        rects.mark(crate::math::PhysicalRect::new(
-            0,
-            y0 as i32,
-            i32::MAX,
-            y1 as i32,
+        rects.mark(crate::math::DeviceRect::new(
+            dp(0),
+            dp(y0 as i32),
+            dp(i32::MAX),
+            dp(y1 as i32),
         ));
         rects
     }
@@ -1980,7 +1981,7 @@ mod tests {
     #[test]
     fn offscreen_snapshot_round_trips_pixels() {
         use crate::{
-            math::Scale,
+            math::DevicePixelRatio,
             paint::{color::ColorResolver, instance::InstanceEncoder, scene::Scene},
         };
 
@@ -1990,7 +1991,7 @@ mod tests {
         let buffer = encoder
             .encode(
                 &Scene::empty(),
-                Scale::ONE,
+                DevicePixelRatio::ONE,
                 ColorResolver,
                 &crate::paint::geometry_store::GeometryStore::new(),
             )

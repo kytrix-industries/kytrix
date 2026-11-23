@@ -1,4 +1,4 @@
-use crate::math::Point;
+use crate::math::{LogicalPoint, px};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LightRect {
@@ -8,7 +8,7 @@ pub(crate) struct LightRect {
     pub height: f64,
 }
 
-pub(crate) fn traffic_light_inset(lights: &[LightRect]) -> Option<Point> {
+pub(crate) fn traffic_light_inset(lights: &[LightRect]) -> Option<LogicalPoint> {
     let mut right = f64::NEG_INFINITY;
     let mut bottom = f64::NEG_INFINITY;
     let mut any = false;
@@ -29,13 +29,16 @@ pub(crate) fn traffic_light_inset(lights: &[LightRect]) -> Option<Point> {
     if !any {
         return None;
     }
-    Some(Point::new(right.max(0.0) as f32, bottom.max(0.0) as f32))
+    Some(LogicalPoint::new(
+        px(right.max(0.0) as f32),
+        px(bottom.max(0.0) as f32),
+    ))
 }
 
 pub(crate) fn traffic_light_position_to_apply(
-    applied: Option<Point>,
-    desired: Option<Point>,
-) -> Option<Point> {
+    applied: Option<LogicalPoint>,
+    desired: Option<LogicalPoint>,
+) -> Option<LogicalPoint> {
     match desired {
         Some(target) if applied.is_none() => Some(target),
         _ => None,
@@ -45,7 +48,7 @@ pub(crate) fn traffic_light_position_to_apply(
 pub(crate) fn should_refresh_traffic_light_inset(
     fullscreen: bool,
     refresh_pending: bool,
-    cached: Option<Point>,
+    cached: Option<LogicalPoint>,
 ) -> bool {
     !fullscreen && (refresh_pending || cached.is_none())
 }
@@ -56,7 +59,7 @@ mod tests {
         LightRect, should_refresh_traffic_light_inset, traffic_light_inset,
         traffic_light_position_to_apply,
     };
-    use crate::math::Point;
+    use crate::math::{LogicalPoint, px};
 
     fn standard_lights() -> Vec<LightRect> {
         [(7.0, 16.0), (27.0, 16.0), (47.0, 16.0)]
@@ -73,8 +76,8 @@ mod tests {
     #[test]
     fn the_standard_traffic_lights_occupy_their_union_bounds() {
         let inset = traffic_light_inset(&standard_lights()).expect("three lights");
-        assert_eq!(inset.x, 61.0, "最右按钮的右边界 = 47 + 14");
-        assert_eq!(inset.y, 32.0, "最低边界 = 16 + 16");
+        assert_eq!(inset.x, px(61.0), "最右按钮的右边界 = 47 + 14");
+        assert_eq!(inset.y, px(32.0), "最低边界 = 16 + 16");
     }
 
     #[test]
@@ -103,8 +106,8 @@ mod tests {
         let mut lights = standard_lights();
         lights[1] = zero;
         let inset = traffic_light_inset(&lights).expect("two valid lights");
-        assert_eq!(inset.x, 61.0);
-        assert_eq!(inset.y, 32.0);
+        assert_eq!(inset.x, px(61.0));
+        assert_eq!(inset.y, px(32.0));
     }
 
     #[test]
@@ -116,8 +119,8 @@ mod tests {
             height: 16.0,
         };
         let inset = traffic_light_inset(&[close]).expect("one light");
-        assert_eq!(inset.x, 26.0);
-        assert_eq!(inset.y, 36.0);
+        assert_eq!(inset.x, px(26.0));
+        assert_eq!(inset.y, px(36.0));
     }
 
     #[test]
@@ -129,14 +132,14 @@ mod tests {
             height: 15.75,
         };
         let inset = traffic_light_inset(&[light]).expect("light");
-        assert!((inset.x - 21.0).abs() < f32::EPSILON);
-        assert!((inset.y - 32.0).abs() < f32::EPSILON);
+        assert!((inset.x - 21.0).abs() < px(f32::EPSILON));
+        assert!((inset.y - 32.0).abs() < px(f32::EPSILON));
     }
 
     #[test]
     fn traffic_light_position_applies_once_and_never_rolls_back() {
-        let target = Point::new(8.0, 8.0);
-        let moved = Point::new(40.0, 8.0);
+        let target = LogicalPoint::new(px(8.0), px(8.0));
+        let moved = LogicalPoint::new(px(40.0), px(8.0));
         assert_eq!(
             traffic_light_position_to_apply(None, Some(target)),
             Some(target),
@@ -166,7 +169,7 @@ mod tests {
 
     #[test]
     fn the_safe_area_is_only_refreshed_when_the_buttons_could_have_moved() {
-        let cached = Some(Point::new(61.0, 32.0));
+        let cached = Some(LogicalPoint::new(px(61.0), px(32.0)));
         assert!(
             should_refresh_traffic_light_inset(false, true, cached),
             "位置应用 / 全屏转场之后必须刷新"

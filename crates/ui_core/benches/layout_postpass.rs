@@ -4,13 +4,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
-    math::{Point, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{style::StylePatch, style_builder::StyleBuilder},
     window::{WindowId, WindowOptions},
 };
 
-const VIEWPORT: Size = Size::new(1000.0, 1000.0);
+const VIEWPORT: LogicalSize = LogicalSize::new(px(1000.0), px(1000.0));
 
 const GRID_SIDE: usize = 100;
 const CELL: f32 = 8.0;
@@ -26,14 +26,14 @@ fn fixture(handle: &tokio::runtime::Handle) -> (App, WindowId) {
     let window = app.create_window(WindowOptions {
         title: SmolStr::new_static("bench"),
         size: VIEWPORT,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (app, window)
 }
 
 fn fixed(width: f32, height: f32) -> ui_core::paint::style::Style {
-    StyleBuilder::new().size(width, height).build()
+    StyleBuilder::new().size(px(width), px(height)).build()
 }
 
 fn mount_grid(app: &mut App, window: WindowId) -> Vec<NodeId> {
@@ -123,7 +123,10 @@ fn benches(c: &mut Criterion) {
     {
         let (mut app, window) = fixture(rt.handle());
         let _ = mount_grid(&mut app, window);
-        let center = Point::new(GRID_SIDE as f32 * CELL / 2.0, GRID_SIDE as f32 * CELL / 2.0);
+        let center = LogicalPoint::new(
+            px(GRID_SIDE as f32 * CELL / 2.0),
+            px(GRID_SIDE as f32 * CELL / 2.0),
+        );
         group.bench_function("hit_test_grid_10k", |b| {
             let tree = app.window(window).expect("window").tree();
             b.iter(|| black_box(tree.hit_test(black_box(center))));

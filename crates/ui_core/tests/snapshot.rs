@@ -1,5 +1,5 @@
 use ui_core::{
-    math::Scale,
+    math::DevicePixelRatio,
     test_support::snapshot::{
         GoldenError, SnapshotCase, SnapshotImage, SnapshotScene, SnapshotTheme, Tolerance,
         assert_golden, capture, compare, gpu_guard,
@@ -11,7 +11,7 @@ fn case(scene: SnapshotScene, theme: SnapshotTheme, scale: f32) -> SnapshotCase 
         scene,
         theme,
         size: scene.size(),
-        scale: Scale::new(scale).expect("golden scale must be positive"),
+        scale: DevicePixelRatio::new(scale).expect("golden scale must be positive"),
     }
 }
 
@@ -102,6 +102,7 @@ fn channel_span(a: [u8; 4], b: [u8; 4]) -> u8 {
 #[test]
 fn group_opacity_is_a_composite_multiplier_in_the_readback() {
     use ui_core::{
+        math::px,
         node::builder::NodeBuilder,
         paint::{
             color::Color,
@@ -112,7 +113,7 @@ fn group_opacity_is_a_composite_multiplier_in_the_readback() {
     };
 
     fn sized(width: f32, height: f32) -> Style {
-        StyleBuilder::new().size(width, height).build()
+        StyleBuilder::new().size(px(width), px(height)).build()
     }
     fn white() -> PaintSpec {
         PaintSpec {

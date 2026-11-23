@@ -4,7 +4,7 @@ use super::{AnimationSlot, AnimationTarget, App};
 use crate::{
     error::EngineError,
     interaction::{AnimationSpec, ScrollConfig, ScrollHandle, ScrollSlot, ScrollState, scroll},
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalPx, LogicalSize},
     node::id::NodeId,
     paint::style::Clip,
     window::WindowId,
@@ -33,12 +33,12 @@ pub(crate) fn make_scroll(
         return Err(EngineError::NotScrollable { node });
     }
     let viewport = scroll::viewport(target.tree(), node).size;
-    if !config.line_height.is_finite() || config.line_height <= 0.0 {
+    if !config.line_height.is_finite() || config.line_height <= LogicalPx::ZERO {
         return Err(EngineError::NotScrollable { node });
     }
     if let Some(slot) = target.tree_mut().ensure_interaction(node) {
         slot.scroll = Some(ScrollSlot {
-            offset: Point::ZERO,
+            offset: LogicalPoint::ZERO,
             content: viewport,
             axis: config.axis,
             line_height: config.line_height,
@@ -51,7 +51,7 @@ pub(crate) fn make_scroll(
 pub(crate) fn set_scroll_content(
     app: &mut App,
     handle: &ScrollHandle,
-    content: Size,
+    content: LogicalSize,
 ) -> Result<(), EngineError> {
     let window = handle.window();
     let node = handle.node();
@@ -74,7 +74,7 @@ pub(crate) fn set_scroll_content(
 pub(crate) fn scroll_to(
     app: &mut App,
     handle: &ScrollHandle,
-    offset: Point,
+    offset: LogicalPoint,
 ) -> Result<(), EngineError> {
     if ![offset.x, offset.y].iter().all(|value| value.is_finite()) {
         return Err(EngineError::NotScrollable {
@@ -155,12 +155,15 @@ pub(crate) fn clamp_scroll_offsets(app: &mut App, window: WindowId) -> bool {
 pub(crate) fn scroll_by(
     app: &mut App,
     handle: &ScrollHandle,
-    delta: Point,
+    delta: LogicalPoint,
 ) -> Result<(), EngineError> {
     let current = app
         .scroll_state(handle)
-        .map_or(Point::ZERO, |state| state.offset);
-    app.scroll_to(handle, Point::new(current.x + delta.x, current.y + delta.y))
+        .map_or(LogicalPoint::ZERO, |state| state.offset);
+    app.scroll_to(
+        handle,
+        LogicalPoint::new(current.x + delta.x, current.y + delta.y),
+    )
 }
 
 #[must_use]
@@ -179,7 +182,7 @@ pub(crate) fn scroll_state(app: &App, handle: &ScrollHandle) -> Option<ScrollSta
 pub(crate) fn scroll_to_animated(
     app: &mut App,
     handle: &ScrollHandle,
-    target: Point,
+    target: LogicalPoint,
 ) -> Result<(), EngineError> {
     let Some(state) = app.scroll_state(handle) else {
         return Err(EngineError::NotScrollable {

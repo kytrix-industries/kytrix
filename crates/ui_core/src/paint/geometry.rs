@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 
-use crate::{math::Rect, node::id::ArenaKey, paint::atlas::AtlasKind};
+use crate::{math::LogicalRect, node::id::ArenaKey, paint::atlas::AtlasKind};
 
 pub(crate) const GEOMETRY_CHUNK_INDICES: u32 = 12288;
 
@@ -92,14 +92,14 @@ pub struct GeometryDesc {
     pub vertex_stride: u32,
     pub index_type: IndexType,
     pub topology: Topology,
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
     pub pipeline: GeometryPipeline,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GeometryUpdate {
     pub revision: u64,
-    pub damaged: Rect,
+    pub damaged: LogicalRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub enum GeometryBuffer {
 pub(crate) struct GeometryChunk {
     pub index_first: u32,
     pub index_count: u32,
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
     pub revision: u64,
 }
 
@@ -125,7 +125,7 @@ pub(crate) struct GeometrySnapshot {
     vertex_stride: u32,
     vertex_len: u32,
     index_len: u32,
-    bounds: Rect,
+    bounds: LogicalRect,
     chunks: Box<[GeometryChunk]>,
     vertex_pages: Box<[Bytes]>,
     index_pages: Box<[Bytes]>,
@@ -154,7 +154,7 @@ impl GeometrySnapshot {
     pub(crate) fn new(
         revision: u64,
         layout: GeometryLayout,
-        bounds: Rect,
+        bounds: LogicalRect,
         chunks: Box<[GeometryChunk]>,
         vertex_pages: Box<[Bytes]>,
         index_pages: Box<[Bytes]>,
@@ -208,7 +208,7 @@ impl GeometrySnapshot {
         self.index_len / self.index_type.size()
     }
 
-    pub(crate) fn bounds(&self) -> Rect {
+    pub(crate) fn bounds(&self) -> LogicalRect {
         self.bounds
     }
 
@@ -309,7 +309,10 @@ mod tests {
         GeometryId, GeometryPipeline, IndexType, Topology, chunk_count, chunk_draw_range,
         chunk_index_range,
     };
-    use crate::{math::Rect, paint::atlas::AtlasKind};
+    use crate::{
+        math::{LogicalRect, px},
+        paint::atlas::AtlasKind,
+    };
 
     #[test]
     fn index_type_sizes() {
@@ -368,7 +371,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
             pipeline: GeometryPipeline::Ui,
         };
         let text = format!("{desc:?}");
@@ -428,7 +431,7 @@ mod tests {
         GeometryChunk {
             index_first,
             index_count,
-            bounds: Rect::default(),
+            bounds: LogicalRect::default(),
             revision: 0,
         }
     }

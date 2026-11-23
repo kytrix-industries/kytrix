@@ -6,7 +6,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use crate::math::Size;
+use crate::math::LogicalSize;
 use crate::{
     paint::instance::{FrameOp, GeometryDrawGpu, GpuClipEntry, GpuPrimitive, InstanceBuffer},
     render::{compositor::Plan, stats::RenderStats, timer::GpuTimerSample},
@@ -247,7 +247,7 @@ pub(crate) struct FrameRequest {
     pub surface: (u32, u32),
     pub scale: f32,
     #[cfg(target_os = "linux")]
-    pub surface_local: Size,
+    pub surface_local: LogicalSize,
     #[cfg(target_os = "linux")]
     pub buffer_scale: i32,
     pub published_at: Instant,
@@ -583,7 +583,7 @@ mod tests {
         InstanceMirror, LatestFrame, MAX_FRAMES_IN_FLIGHT, ResyncGate, pool_lock,
     };
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         paint::instance::InstanceEncoder,
         render::{
             compositor::{DamageRects, Plan},
@@ -641,7 +641,7 @@ mod tests {
         drop(payload);
     }
 
-    fn partial(rects: &[PhysicalRect]) -> Plan {
+    fn partial(rects: &[DeviceRect]) -> Plan {
         let mut plan = DamageRects::new();
         for rect in rects {
             assert!(plan.push(*rect));
@@ -657,7 +657,7 @@ mod tests {
             surface: (64, 64),
             scale: 1.0,
             #[cfg(target_os = "linux")]
-            surface_local: crate::math::Size::new(64.0, 64.0),
+            surface_local: crate::math::LogicalSize::new(px(64.0), px(64.0)),
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             published_at: Instant::now(),
@@ -831,8 +831,14 @@ mod tests {
     #[test]
     fn a_newer_frame_replaces_the_pending_one() {
         let mut slot = LatestFrame::new();
-        slot.publish(request(1, partial(&[PhysicalRect::new(0, 0, 8, 8)])));
-        slot.publish(request(2, partial(&[PhysicalRect::new(8, 0, 16, 8)])));
+        slot.publish(request(
+            1,
+            partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]),
+        ));
+        slot.publish(request(
+            2,
+            partial(&[DeviceRect::new(dp(8), dp(0), dp(16), dp(8))]),
+        ));
 
         let frame = slot.take().expect("latest frame");
         assert_eq!(frame.index.get(), 2, "旧序号被丢弃（它不产生 GPU 工作）");
@@ -842,8 +848,8 @@ mod tests {
     #[test]
     fn replacing_a_frame_merges_the_dropped_damage() {
         let mut slot = LatestFrame::new();
-        let first = PhysicalRect::new(0, 0, 8, 8);
-        let second = PhysicalRect::new(0, 8, 8, 16);
+        let first = DeviceRect::new(dp(0), dp(0), dp(8), dp(8));
+        let second = DeviceRect::new(dp(0), dp(8), dp(8), dp(16));
         slot.publish(request(1, partial(&[first])));
         slot.publish(request(2, partial(&[second])));
 
@@ -859,14 +865,20 @@ mod tests {
     fn replacing_a_full_frame_stays_full() {
         let mut slot = LatestFrame::new();
         slot.publish(request(1, Plan::Full));
-        slot.publish(request(2, partial(&[PhysicalRect::new(0, 0, 4, 4)])));
+        slot.publish(request(
+            2,
+            partial(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]),
+        ));
         assert_eq!(slot.take().expect("latest frame").plan, Plan::Full);
     }
 
     #[test]
     fn replacing_a_partial_frame_by_a_full_frame_is_full() {
         let mut slot = LatestFrame::new();
-        slot.publish(request(1, partial(&[PhysicalRect::new(0, 0, 4, 4)])));
+        slot.publish(request(
+            1,
+            partial(&[DeviceRect::new(dp(0), dp(0), dp(4), dp(4))]),
+        ));
         slot.publish(request(2, Plan::Full));
         assert_eq!(slot.take().expect("latest frame").plan, Plan::Full);
     }
@@ -874,20 +886,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn replacing_a_frame_keeps_surface_and_surface_local_paired() {
-        use crate::math::Size;
+        use crate::math::LogicalSize;
 
         let mut slot = LatestFrame::new();
         slot.publish(FrameRequest {
             surface: (800, 600),
             scale: 1.0,
-            surface_local: Size::new(800.0, 600.0),
+            surface_local: LogicalSize::new(px(800.0), px(600.0)),
             buffer_scale: 1,
             ..request(1, Plan::Full)
         });
         slot.publish(FrameRequest {
             surface: (876, 626),
             scale: 1.0,
-            surface_local: Size::new(701.0, 501.0),
+            surface_local: LogicalSize::new(px(701.0), px(501.0)),
             buffer_scale: 2,
             ..request(2, Plan::Full)
         });
@@ -896,7 +908,7 @@ mod tests {
         assert_eq!(frame.surface, (876, 626), "swapchain 目标来自新帧");
         assert_eq!(
             frame.surface_local,
-            Size::new(701.0, 501.0),
+            LogicalSize::new(px(701.0), px(501.0)),
             "destination 与 buffer 必须同帧成对"
         );
         assert_eq!(frame.buffer_scale, 2, "buffer scale 与 buffer 必须同帧成对");
@@ -970,7 +982,7 @@ mod tests {
         let mut first = request(1, Plan::Full);
         first.payload = manual_payload(&[(4, &[1u8; 128])], 8);
         slot.publish(first);
-        let mut second = request(2, partial(&[PhysicalRect::new(0, 0, 8, 8)]));
+        let mut second = request(2, partial(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]));
         second.payload = manual_payload(&[(0, &[2u8; 128])], 8);
         slot.publish(second);
 

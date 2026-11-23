@@ -1,11 +1,11 @@
 use super::{Window, surface::covering_surface};
-use crate::math::Scale;
+use crate::math::DevicePixelRatio;
 
-pub(crate) fn scale(window: &Window) -> Scale {
+pub(crate) fn scale(window: &Window) -> DevicePixelRatio {
     window.scale
 }
 
-pub(crate) fn set_scale(window: &mut Window, scale: Scale) {
+pub(crate) fn set_scale(window: &mut Window, scale: DevicePixelRatio) {
     window.scale = scale;
     window.scale_epoch = window.scale_epoch.wrapping_add(1);
     window.full_damage_pending = true;

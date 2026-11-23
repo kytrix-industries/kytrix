@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn staging_upload_copies_real_page_lengths_on_a_real_device() {
         use crate::{
-            math::{Rect, Transform},
+            math::{LogicalRect, Transform, px},
             paint::{
                 geometry::{
                     GEOMETRY_PAGE_BYTES, GeometryDesc, GeometryPipeline, IndexType, Topology,
@@ -476,7 +476,7 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("注册几何");

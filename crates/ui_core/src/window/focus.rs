@@ -2,7 +2,7 @@ use super::{ImeCursorRequest, Window};
 use crate::{
     error::EngineError,
     interaction::{FocusScope, scroll},
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect},
     node::id::NodeId,
 };
 
@@ -18,11 +18,11 @@ pub(crate) fn text_caret_rect(
     window: &Window,
     node: NodeId,
     byte_index: usize,
-) -> Result<Rect, EngineError> {
+) -> Result<LogicalRect, EngineError> {
     let local = window.tree.text_caret_rect(node, byte_index)?;
     let bounds = window.tree.get(node)?.layout().bounds;
     let content_offset = window.tree.content_offset(node);
-    let origin = Point::new(
+    let origin = LogicalPoint::new(
         bounds.origin.x + content_offset.x,
         bounds.origin.y + content_offset.y,
     );
@@ -36,12 +36,12 @@ pub(crate) fn text_caret_rect(
 pub(crate) fn text_byte_index_at(
     window: &Window,
     node: NodeId,
-    local_point: Point,
+    local_point: LogicalPoint,
 ) -> Result<usize, EngineError> {
     let content_offset = window.tree.content_offset(node);
     window.tree.text_byte_index_at(
         node,
-        Point::new(
+        LogicalPoint::new(
             local_point.x - content_offset.x,
             local_point.y - content_offset.y,
         ),
@@ -61,7 +61,7 @@ pub(crate) fn clear_ime_cursor_request(window: &mut Window) -> bool {
     window.ime_cursor.take().is_some()
 }
 
-pub(crate) fn ime_cursor_area(window: &Window) -> Result<Option<Rect>, EngineError> {
+pub(crate) fn ime_cursor_area(window: &Window) -> Result<Option<LogicalRect>, EngineError> {
     let Some(request) = window.ime_cursor else {
         return Ok(None);
     };

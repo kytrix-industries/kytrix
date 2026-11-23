@@ -4,7 +4,7 @@ use ui_core::{
     error::EngineError,
     event::Action,
     interaction::OverlayOptions,
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, tree::NodeKind},
     test_support::{app::TestApp, probe::Selector},
 };
@@ -71,7 +71,7 @@ fn hud_installs_as_a_top_right_non_interactive_overlay() {
     let window = test.window_id();
     let root = test.app().window(window).expect("窗口").tree().root();
     let _target = NodeBuilder::boxed()
-        .layout_override(Rect::new(700.0, 20.0, 90.0, 40.0))
+        .layout_override(LogicalRect::new(px(700.0), px(20.0), px(90.0), px(40.0)))
         .on_action(Action::custom("hud.underlay"))
         .build(
             test.app_mut().window_mut(window).expect("窗口").tree_mut(),
@@ -91,7 +91,7 @@ fn hud_installs_as_a_top_right_non_interactive_overlay() {
         .window(window)
         .expect("窗口")
         .tree()
-        .hit_test(Point::new(720.0, 30.0))
+        .hit_test(LogicalPoint::new(px(720.0), px(30.0)))
         .expect("HUD 内仍能命中下层");
     assert_ne!(hit.node, hud, "HUD 不能成为命中目标");
     assert!(!node_text(&test, Selector::Id("debug-hud.line-0")).is_empty());
@@ -170,7 +170,7 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
     test.app_mut()
         .window_mut(window)
         .expect("窗口")
-        .set_size(Size::new(1000.0, 700.0));
+        .set_size(LogicalSize::new(px(1000.0), px(700.0)));
     assert!(test.drain().expect("尺寸变化帧").rendered);
     assert!(
         line(&test, 10).starts_with("1000x700 @ 1.00x "),
@@ -181,7 +181,7 @@ fn the_size_line_follows_the_window_on_the_next_application_frame() {
     test.app_mut()
         .window_mut(window)
         .expect("窗口")
-        .set_scale(Scale::new(1.25).expect("scale"));
+        .set_scale(DevicePixelRatio::new(1.25).expect("scale"));
     assert!(test.drain().expect("DPI 变化帧").rendered);
     assert!(
         line(&test, 10).starts_with("1250x875 @ 1.25x "),

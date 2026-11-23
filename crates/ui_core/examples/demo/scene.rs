@@ -1,3 +1,4 @@
+use ui_core::math::px;
 mod a11y;
 mod card;
 #[cfg(target_os = "linux")]
@@ -18,7 +19,7 @@ use smol_str::SmolStr;
 use ui_core::{
     app::App,
     event::{Event, InputEvent, KeyCode, KeyState},
-    math::{Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         color::Color,
@@ -29,35 +30,38 @@ use ui_core::{
     window::{WindowId, WindowOptions},
 };
 
-pub const LOGICAL_WIDTH: f32 = 960.0;
-pub const LOGICAL_HEIGHT: f32 = 740.0;
+pub const LOGICAL_WIDTH: LogicalPx = px(960.0);
+pub const LOGICAL_HEIGHT: LogicalPx = px(740.0);
 
 #[cfg(target_os = "linux")]
-const WINDOW_TOP_INSET: f32 = chrome::TITLEBAR_HEIGHT;
+const WINDOW_TOP_INSET: LogicalPx = chrome::TITLEBAR_HEIGHT;
 #[cfg(target_os = "macos")]
-const WINDOW_TOP_INSET: f32 = 38.0;
+const WINDOW_TOP_INSET: LogicalPx = px(38.0);
 #[cfg(windows)]
-const WINDOW_TOP_INSET: f32 = 0.0;
+const WINDOW_TOP_INSET: LogicalPx = px(0.0);
 
 #[cfg(target_os = "macos")]
-const HEADER_LEFT_INSET: f32 = 76.0;
+const HEADER_LEFT_INSET: LogicalPx = px(76.0);
 #[cfg(not(target_os = "macos"))]
-const HEADER_LEFT_INSET: f32 = 0.0;
+const HEADER_LEFT_INSET: LogicalPx = px(0.0);
 
-const ROOT_TOP_PADDING: f32 = 14.0;
-const ROOT_SIDE_PADDING: f32 = 24.0;
-const ROOT_BOTTOM_PADDING: f32 = 14.0;
-const HEADER_HEIGHT: f32 = 56.0;
-const CONTENT_MARGIN_TOP: f32 = 10.0;
-const CONTENT_WIDTH: f32 = 912.0;
-const COLUMN_GAP: f32 = 20.0;
-const ROW_GAP: f32 = 14.0;
+const ROOT_TOP_PADDING: LogicalPx = px(14.0);
+const ROOT_SIDE_PADDING: LogicalPx = px(24.0);
+const ROOT_BOTTOM_PADDING: LogicalPx = px(14.0);
+const HEADER_HEIGHT: LogicalPx = px(56.0);
+const CONTENT_MARGIN_TOP: LogicalPx = px(10.0);
+const CONTENT_WIDTH: LogicalPx = px(912.0);
+const COLUMN_GAP: LogicalPx = px(20.0);
+const ROW_GAP: LogicalPx = px(14.0);
 
-const CONTENT_TOP: f32 = WINDOW_TOP_INSET + ROOT_TOP_PADDING + HEADER_HEIGHT + CONTENT_MARGIN_TOP;
+const CONTENT_TOP: LogicalPx = px(WINDOW_TOP_INSET.value()
+    + ROOT_TOP_PADDING.value()
+    + HEADER_HEIGHT.value()
+    + CONTENT_MARGIN_TOP.value());
 
 #[must_use]
-pub fn window_size() -> Size {
-    Size::new(LOGICAL_WIDTH, LOGICAL_HEIGHT + WINDOW_TOP_INSET)
+pub fn window_size() -> LogicalSize {
+    LogicalSize::new(LOGICAL_WIDTH, LOGICAL_HEIGHT + WINDOW_TOP_INSET)
 }
 
 pub const TITLE: &str = "Kytrix GUI · 焦点 / 中文 / 输入法 / 无障碍";
@@ -75,54 +79,72 @@ const RING_RGBA: [u8; 4] = [0x4C, 0x9A, 0xFF, 0xFF];
 const RAIL_RGBA: [u8; 4] = [0x24, 0x2E, 0x3A, 0xFF];
 const TRACK_RGBA: [u8; 4] = [0x1B, 0x22, 0x2B, 0xFF];
 
-const TITLE_HEIGHT: f32 = 34.0;
-const SUBTITLE_HEIGHT: f32 = 20.0;
-const HEADER_GAP: f32 = 2.0;
+const TITLE_HEIGHT: LogicalPx = px(34.0);
+const SUBTITLE_HEIGHT: LogicalPx = px(20.0);
+const HEADER_GAP: LogicalPx = px(2.0);
 #[cfg(feature = "hud")]
 const SUBTITLE: &str = "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 点击色块 · 在输入框中输入中文 · F12 调试 HUD · Esc 退出";
 #[cfg(not(feature = "hud"))]
 const SUBTITLE: &str =
     "Tab / Shift+Tab 切换焦点 · Enter / Space 激活 · 点击色块 · 在输入框中输入中文 · Esc 退出";
 
-pub(crate) const FOCUS_CARD: Rect = Rect::new(24.0, CONTENT_TOP, 580.0, 176.0);
-pub(crate) const FOCUS_PANEL: Rect = Rect::new(624.0, CONTENT_TOP, 312.0, 176.0);
-pub(crate) const CJK_CARD: Rect = Rect::new(
-    24.0,
-    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP,
-    580.0,
-    200.0,
+pub(crate) const FOCUS_CARD: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(px(24.0), CONTENT_TOP),
+    LogicalSize::new(px(580.0), px(176.0)),
 );
-pub(crate) const A11Y_CARD: Rect = Rect::new(
-    624.0,
-    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP,
-    312.0,
-    200.0,
+pub(crate) const FOCUS_PANEL: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(px(624.0), CONTENT_TOP),
+    LogicalSize::new(px(312.0), px(176.0)),
 );
-pub(crate) const IME_CARD: Rect = Rect::new(
-    24.0,
-    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP + CJK_CARD.size.height + ROW_GAP,
-    580.0,
-    242.0,
+pub(crate) const CJK_CARD: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(
+        px(24.0),
+        px(CONTENT_TOP.value() + FOCUS_CARD.size.height.value() + ROW_GAP.value()),
+    ),
+    LogicalSize::new(px(580.0), px(200.0)),
 );
-pub(crate) const RES_CARD: Rect = Rect::new(
-    624.0,
-    CONTENT_TOP + FOCUS_CARD.size.height + ROW_GAP + CJK_CARD.size.height + ROW_GAP,
-    312.0,
-    242.0,
+pub(crate) const A11Y_CARD: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(
+        px(624.0),
+        px(CONTENT_TOP.value() + FOCUS_CARD.size.height.value() + ROW_GAP.value()),
+    ),
+    LogicalSize::new(px(312.0), px(200.0)),
+);
+pub(crate) const IME_CARD: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(
+        px(24.0),
+        px(CONTENT_TOP.value()
+            + FOCUS_CARD.size.height.value()
+            + ROW_GAP.value()
+            + CJK_CARD.size.height.value()
+            + ROW_GAP.value()),
+    ),
+    LogicalSize::new(px(580.0), px(242.0)),
+);
+pub(crate) const RES_CARD: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(
+        px(624.0),
+        px(CONTENT_TOP.value()
+            + FOCUS_CARD.size.height.value()
+            + ROW_GAP.value()
+            + CJK_CARD.size.height.value()
+            + ROW_GAP.value()),
+    ),
+    LogicalSize::new(px(312.0), px(242.0)),
 );
 
 pub(crate) fn color(rgba: [u8; 4]) -> Color {
     Color::from_rgba8(rgba)
 }
 
-pub(crate) fn text_style(size: f32, weight: u16, rgba: [u8; 4]) -> TextStyle {
+pub(crate) fn text_style(size: LogicalPx, weight: u16, rgba: [u8; 4]) -> TextStyle {
     TextStyle::new(size)
         .with_weight(weight)
         .with_color(color(rgba))
 }
 
 pub(crate) fn ring() -> FocusRing {
-    FocusRing::new(2.0, 2.0, color(RING_RGBA))
+    FocusRing::new(px(2.0), px(2.0), color(RING_RGBA))
 }
 
 fn root_style() -> Style {
@@ -143,8 +165,8 @@ fn root_style() -> Style {
 fn background_style() -> Style {
     StyleBuilder::new()
         .absolute()
-        .left(0.0)
-        .top(0.0)
+        .left(px(0.0))
+        .top(px(0.0))
         .size_full()
         .build()
 }
@@ -158,11 +180,11 @@ fn header_style() -> Style {
     style
         .align_items(taffy::style::AlignItems::START)
         .gap_height(HEADER_GAP)
-        .padding_sides(0.0, 0.0, 0.0, HEADER_LEFT_INSET);
+        .padding_sides(px(0.0), px(0.0), px(0.0), HEADER_LEFT_INSET);
     style
 }
 
-fn text_line_style(height: f32) -> Style {
+fn text_line_style(height: LogicalPx) -> Style {
     StyleBuilder::new().width_full().height(height).build()
 }
 
@@ -171,11 +193,11 @@ fn content_style() -> Style {
     style
         .align_items(taffy::style::AlignItems::START)
         .gap_height(ROW_GAP)
-        .margin_sides(CONTENT_MARGIN_TOP, 0.0, 0.0, 0.0);
+        .margin_sides(CONTENT_MARGIN_TOP, px(0.0), px(0.0), px(0.0));
     style
 }
 
-fn row_style(height: f32) -> Style {
+fn row_style(height: LogicalPx) -> Style {
     let mut style = StyleBuilder::new()
         .width_full()
         .height(height)
@@ -209,7 +231,7 @@ impl Scene {
         let window = app.create_window(WindowOptions {
             title: TITLE.into(),
             size: window_size(),
-            scale: ui_core::math::Scale::ONE,
+            scale: ui_core::math::DevicePixelRatio::ONE,
             background: color(BG_RGBA),
             ..WindowOptions::default()
         });
@@ -242,11 +264,11 @@ impl Scene {
             .expect("背景挂载");
 
         let header = card::container(app, window, root, header_style());
-        let _ = NodeBuilder::text(TITLE, text_style(20.0, 700, TEXT_RGBA))
+        let _ = NodeBuilder::text(TITLE, text_style(px(20.0), 700, TEXT_RGBA))
             .style(text_line_style(TITLE_HEIGHT))
             .build(card::tree(app, window), header)
             .expect("标题挂载");
-        let _ = NodeBuilder::text(SUBTITLE, text_style(12.5, 400, MUTED_RGBA))
+        let _ = NodeBuilder::text(SUBTITLE, text_style(px(12.5), 400, MUTED_RGBA))
             .style(text_line_style(SUBTITLE_HEIGHT))
             .build(card::tree(app, window), header)
             .expect("副标题挂载");
@@ -518,7 +540,7 @@ pub(crate) fn ime_text(scene: &Scene, app: &App) -> SmolStr {
 mod tests {
     use ui_core::{
         a11y::A11yRole,
-        math::{Rect, Size},
+        math::{LogicalRect, LogicalSize, px},
         test_support::{probe::Selector, record::PrimitiveKind},
         text::TextDiagnostic,
     };
@@ -578,9 +600,9 @@ mod tests {
             .expect("背景节点");
         assert_eq!(
             probe.bounds(background),
-            Some(Rect::new(
-                0.0,
-                0.0,
+            Some(LogicalRect::new(
+                px(0.0),
+                px(0.0),
                 window_size().width,
                 window_size().height
             )),
@@ -616,7 +638,7 @@ mod tests {
         let (mut test, window, _scene) = setup();
         frame(&mut test);
 
-        let resized = Size::new(window_size().width + 240.0, window_size().height + 160.0);
+        let resized = LogicalSize::new(window_size().width + 240.0, window_size().height + 160.0);
         test.app_mut()
             .window_mut(window)
             .expect("窗口存在")
@@ -633,7 +655,12 @@ mod tests {
             .expect("背景节点");
         assert_eq!(
             probe.bounds(background),
-            Some(Rect::new(0.0, 0.0, resized.width, resized.height)),
+            Some(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                resized.width,
+                resized.height
+            )),
             "窗口变大后背景必须继续铺满"
         );
         for (id, expected) in [

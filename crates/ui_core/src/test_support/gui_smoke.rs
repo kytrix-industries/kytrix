@@ -8,7 +8,7 @@ use crate::{
     interaction::{
         DragPhase, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig,
     },
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         color::Color,
@@ -26,9 +26,9 @@ use crate::{
     window::WindowOptions,
 };
 
-const WINDOW: Size = Size {
-    width: 640.0,
-    height: 480.0,
+const WINDOW: LogicalSize = LogicalSize {
+    width: px(640.0),
+    height: px(480.0),
 };
 const COLOR_TOLERANCE: u8 = 2;
 
@@ -111,7 +111,7 @@ fn scenario_button_click_and_pointer_cancel() -> ScenarioReport {
     let root = scene(&mut app);
     let idle = app.app_mut().signal(color(BUTTON_IDLE));
     let clicks = app.app_mut().signal(0u32);
-    let button_rect = Rect::new(140.0, 100.0, 260.0, 72.0);
+    let button_rect = LogicalRect::new(px(140.0), px(100.0), px(260.0), px(72.0));
     let (idle_style, idle_action) = (idle, idle);
     let (clicks_action, clicks_read) = (clicks, clicks);
     let button = mount(
@@ -146,7 +146,7 @@ fn scenario_button_click_and_pointer_cancel() -> ScenarioReport {
     let window = app.window_id();
     let before = read_pixels(&app);
     assert_pixel(&before, 270, 136, BUTTON_IDLE, "初始按钮背景");
-    let center = Point::new(270.0, 136.0);
+    let center = LogicalPoint::new(px(270.0), px(136.0));
 
     app.inject(InputEvent::pointer_down(
         center,
@@ -283,7 +283,7 @@ fn scenario_text_input_keyboard_and_ime() -> ScenarioReport {
     let mut app = app();
     let root = scene(&mut app);
     let text = app.app_mut().signal(SmolStr::new_static("AB"));
-    let input_rect = Rect::new(80.0, 150.0, 320.0, 56.0);
+    let input_rect = LogicalRect::new(px(80.0), px(150.0), px(320.0), px(56.0));
     let input = mount(
         &mut app,
         root,
@@ -306,8 +306,8 @@ fn scenario_text_input_keyboard_and_ime() -> ScenarioReport {
         mount(
             &mut app,
             input,
-            NodeBuilder::text(SmolStr::new_static(""), text_style(28.0))
-                .layout_override(Rect::new(12.0, 10.0, 296.0, 36.0))
+            NodeBuilder::text(SmolStr::new_static(""), text_style(px(28.0)))
+                .layout_override(LogicalRect::new(px(12.0), px(10.0), px(296.0), px(36.0)))
                 .bind_text(move |cx| cx.read(&source).clone())
                 .id("input.text"),
         )
@@ -399,7 +399,7 @@ fn scenario_text_input_keyboard_and_ime() -> ScenarioReport {
         "IME caret 必须落在输入框内：caret={caret:?} input={input_rect:?}"
     );
     assert!(
-        caret.size.height > 0.0,
+        caret.size.height > px(0.0),
         "caret hint 必须有非零高度（否则候选窗会摆成一条线）：{caret:?}"
     );
 
@@ -439,11 +439,14 @@ fn scenario_text_input_keyboard_and_ime() -> ScenarioReport {
 fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
     let mut app = app();
     let root = scene(&mut app);
-    let viewport_rect = Rect::new(40.0, 110.0, 400.0, 120.0);
+    let viewport_rect = LogicalRect::new(px(40.0), px(110.0), px(400.0), px(120.0));
     let _header = mount(
         &mut app,
         root,
-        boxed(Rect::new(40.0, 60.0, 400.0, 36.0), HEADER),
+        boxed(
+            LogicalRect::new(px(40.0), px(60.0), px(400.0), px(36.0)),
+            HEADER,
+        ),
     );
     let viewport = container(&mut app, root, viewport_rect, Clip::Bounds);
     let rows: Vec<NodeId> = (0..6)
@@ -452,7 +455,7 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
                 &mut app,
                 viewport,
                 boxed(
-                    Rect::new(0.0, index as f32 * 40.0, 400.0, 40.0),
+                    LogicalRect::new(px(0.0), px(index as f32 * 40.0), px(400.0), px(40.0)),
                     ROW_COLORS[index],
                 ),
             )
@@ -468,12 +471,12 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
             viewport,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 40.0,
+                line_height: px(40.0),
             },
         )
         .expect("裁剪容器可以成为滚动容器");
     app.app_mut()
-        .set_scroll_content(&handle, Size::new(400.0, 240.0))
+        .set_scroll_content(&handle, LogicalSize::new(px(400.0), px(240.0)))
         .expect("内容尺寸");
     app.invalidate_all_lanes();
     frame(&mut app);
@@ -482,16 +485,16 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
     assert_pixel(&before, 240, 70, HEADER, "固定头部在视口外");
 
     let wheel = app.inject(InputEvent::scroll_lines(
-        Point::new(240.0, 130.0),
-        Point::new(0.0, -3.0),
+        LogicalPoint::new(px(240.0), px(130.0)),
+        LogicalPoint::new(px(0.0), px(-3.0)),
         Modifiers::empty(),
     ));
     assert!(wheel.hit.is_some(), "滚轮必须命中滚动容器");
 
     let mut offset_frames = 0usize;
     let mut reencoded_frames = 0usize;
-    let viewport_px = viewport_rect.to_physical_covering(Scale::ONE);
-    let viewport_allowed = crate::math::PhysicalRect::new(
+    let viewport_px = DevicePixelRatio::ONE.to_covering_device_rect(viewport_rect);
+    let viewport_allowed = crate::math::DeviceRect::new(
         viewport_px.x0 - 1,
         viewport_px.y0 - 1,
         viewport_px.x1 + 1,
@@ -513,13 +516,14 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
             }
         }
         let state = app.app().scroll_state(&handle).expect("滚动状态");
-        if state.offset.y >= 120.0 {
+        if state.offset.y >= px(120.0) {
             break;
         }
     }
     let state = app.app().scroll_state(&handle).expect("滚动状态");
     assert_eq!(
-        state.offset.y, 120.0,
+        state.offset.y,
+        px(120.0),
         "3 格滚轮 × line_height 40 必须滚满 120 px（clamp 到 max_offset 之后仍是 120）"
     );
     assert!(offset_frames >= 1, "必须至少有一帧真的携带偏移变化");
@@ -539,10 +543,14 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
 
     let slots: Vec<ScrollSlot> = vec![
         (
-            Point::ZERO,
-            Rect::new(0.0, 0.0, WINDOW.width, WINDOW.height).to_physical_covering(Scale::ONE),
+            LogicalPoint::ZERO,
+            DevicePixelRatio::ONE
+                .to_covering_device_rect(LogicalRect::from_origin_size(LogicalPoint::ZERO, WINDOW)),
         ),
-        (state.offset, viewport_rect.to_physical_covering(Scale::ONE)),
+        (
+            state.offset,
+            DevicePixelRatio::ONE.to_covering_device_rect(viewport_rect),
+        ),
     ];
     let composited = read_pixels_with_scroll(&app, &slots);
     assert_pixel(
@@ -563,7 +571,7 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
 
     let hit = app
         .probe()
-        .hit(Point::new(240.0, 130.0))
+        .hit(LogicalPoint::new(px(240.0), px(130.0)))
         .expect("视口内必须命中");
     assert_eq!(
         hit.node, rows[3],
@@ -595,8 +603,8 @@ fn scenario_scroll_wheel_composites_without_reencoding() -> ScenarioReport {
 fn scenario_drag_drop_with_pointer_capture() -> ScenarioReport {
     let mut app = app();
     let root = scene(&mut app);
-    let source_rect = Rect::new(80.0, 140.0, 140.0, 100.0);
-    let target_rect = Rect::new(380.0, 140.0, 160.0, 160.0);
+    let source_rect = LogicalRect::new(px(80.0), px(140.0), px(140.0), px(100.0));
+    let target_rect = LogicalRect::new(px(380.0), px(140.0), px(160.0), px(160.0));
     let location = app.app_mut().signal(0u8);
     let hot = app.app_mut().signal(false);
     let phases = app.app_mut().signal(Vec::<DragPhase>::new());
@@ -640,7 +648,7 @@ fn scenario_drag_drop_with_pointer_capture() -> ScenarioReport {
             &mut app,
             source,
             NodeBuilder::boxed()
-                .layout_override(Rect::new(20.0, 10.0, 100.0, 80.0))
+                .layout_override(LogicalRect::new(px(20.0), px(10.0), px(100.0), px(80.0)))
                 .paint(PaintSpec {
                     background: color(CARD),
                     ..PaintSpec::default()
@@ -659,7 +667,7 @@ fn scenario_drag_drop_with_pointer_capture() -> ScenarioReport {
             &mut app,
             target,
             NodeBuilder::boxed()
-                .layout_override(Rect::new(30.0, 40.0, 100.0, 80.0))
+                .layout_override(LogicalRect::new(px(30.0), px(40.0), px(100.0), px(80.0)))
                 .paint(PaintSpec {
                     background: color(CARD),
                     ..PaintSpec::default()
@@ -704,8 +712,8 @@ fn scenario_drag_drop_with_pointer_capture() -> ScenarioReport {
     assert_pixel(&before, 150, 190, CARD, "源槽初始有卡片");
     assert_pixel(&before, 460, 220, ZONE, "目标区初始底色");
 
-    let from = Point::new(150.0, 190.0);
-    let to = Point::new(460.0, 220.0);
+    let from = LogicalPoint::new(px(150.0), px(190.0));
+    let to = LogicalPoint::new(px(460.0), px(220.0));
     app.inject(InputEvent::pointer_down(
         from,
         PointerButton::Primary,
@@ -838,7 +846,12 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
             &mut app,
             root,
             NodeBuilder::boxed()
-                .layout_override(Rect::new(80.0 + slot as f32 * 160.0, 80.0, 140.0, 56.0))
+                .layout_override(LogicalRect::new(
+                    px(80.0 + slot as f32 * 160.0),
+                    px(80.0),
+                    px(140.0),
+                    px(56.0),
+                ))
                 .paint(PaintSpec {
                     background: color(BUTTON_IDLE),
                     ..PaintSpec::default()
@@ -870,9 +883,9 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
     frame(&mut app);
 
     let rects = [
-        Rect::new(80.0, 80.0, 140.0, 56.0),
-        Rect::new(240.0, 80.0, 140.0, 56.0),
-        Rect::new(400.0, 80.0, 140.0, 56.0),
+        LogicalRect::new(px(80.0), px(80.0), px(140.0), px(56.0)),
+        LogicalRect::new(px(240.0), px(80.0), px(140.0), px(56.0)),
+        LogicalRect::new(px(400.0), px(80.0), px(140.0), px(56.0)),
     ];
     assert_eq!(app.app().focused(window), None, "初始无焦点");
     for expected in [0usize, 1, 2, 0] {
@@ -920,7 +933,7 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(180.0, 150.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(180.0), px(150.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -932,7 +945,12 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
         &mut app,
         modal.node(),
         NodeBuilder::boxed()
-            .style(absolute_style(Rect::new(0.0, 0.0, 300.0, 180.0)))
+            .style(absolute_style(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(300.0),
+                px(180.0),
+            )))
             .paint(PaintSpec {
                 background: color(PANEL),
                 ..PaintSpec::default()
@@ -948,7 +966,7 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
             &mut app,
             panel,
             NodeBuilder::boxed()
-                .layout_override(Rect::new(x, 40.0, 120.0, 44.0))
+                .layout_override(LogicalRect::new(px(x), px(40.0), px(120.0), px(44.0)))
                 .paint(PaintSpec {
                     background: color(BUTTON_IDLE),
                     ..PaintSpec::default()
@@ -1005,7 +1023,7 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
         "被拒绝的 set_focus 不得改变焦点"
     );
 
-    let background_center = Point::new(150.0, 108.0);
+    let background_center = LogicalPoint::new(px(150.0), px(108.0));
     let before_counts = read_counts(&app, &counts);
     app.inject(InputEvent::pointer_down(
         background_center,
@@ -1046,7 +1064,10 @@ fn scenario_focus_tab_and_modal_trap() -> ScenarioReport {
         "焦点还原后 A 的焦点环必须画出来"
     );
     assert_eq!(
-        ring_pixels(&closed, Rect::new(200.0, 190.0, 120.0, 44.0)),
+        ring_pixels(
+            &closed,
+            LogicalRect::new(px(200.0), px(190.0), px(120.0), px(44.0))
+        ),
         0,
         "浮层关闭后模态按钮的焦点环必须消失"
     );
@@ -1077,8 +1098,8 @@ fn scenario_a11y_tree_with_focus() -> ScenarioReport {
     let mut app = app();
     app.enable_a11y_capture();
     let root = scene(&mut app);
-    let button_rect = Rect::new(80.0, 80.0, 200.0, 56.0);
-    let input_rect = Rect::new(80.0, 170.0, 280.0, 56.0);
+    let button_rect = LogicalRect::new(px(80.0), px(80.0), px(200.0), px(56.0));
+    let input_rect = LogicalRect::new(px(80.0), px(170.0), px(280.0), px(56.0));
     let button = mount(
         &mut app,
         root,
@@ -1116,15 +1137,15 @@ fn scenario_a11y_tree_with_focus() -> ScenarioReport {
     let _text = mount(
         &mut app,
         input,
-        NodeBuilder::text(SmolStr::new_static("牛"), text_style(24.0))
-            .layout_override(Rect::new(8.0, 10.0, 260.0, 36.0))
+        NodeBuilder::text(SmolStr::new_static("牛"), text_style(px(24.0)))
+            .layout_override(LogicalRect::new(px(8.0), px(10.0), px(260.0), px(36.0)))
             .id("a11y.input.text"),
     );
     let _title = mount(
         &mut app,
         root,
-        NodeBuilder::text(SmolStr::new_static("行情"), text_style(20.0))
-            .layout_override(Rect::new(400.0, 80.0, 180.0, 40.0))
+        NodeBuilder::text(SmolStr::new_static("行情"), text_style(px(20.0)))
+            .layout_override(LogicalRect::new(px(400.0), px(80.0), px(180.0), px(40.0)))
             .id("a11y.title"),
     );
     let window = app.window_id();
@@ -1179,7 +1200,7 @@ fn scenario_a11y_tree_with_focus() -> ScenarioReport {
     );
     assert_eq!(focused.focus_node().role, A11yRole::Button);
     assert_eq!(focused.focus_node().label_text(), Some("提交"));
-    let expected_bounds = button_rect.to_physical_covering(Scale::ONE);
+    let expected_bounds = DevicePixelRatio::ONE.to_covering_device_rect(button_rect);
     assert_eq!(
         focused.focus_node().bounds,
         expected_bounds,
@@ -1247,7 +1268,7 @@ fn app() -> TestApp {
     TestApp::with_options(WindowOptions {
         title: SmolStr::new_static("kytrix gui smoke"),
         size: WINDOW,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     })
 }
@@ -1258,7 +1279,10 @@ fn scene(app: &mut TestApp) -> NodeId {
     mount(
         app,
         root,
-        boxed(Rect::new(0.0, 0.0, WINDOW.width, WINDOW.height), BACKDROP),
+        boxed(
+            LogicalRect::new(px(0.0), px(0.0), WINDOW.width, WINDOW.height),
+            BACKDROP,
+        ),
     );
     root
 }
@@ -1273,14 +1297,14 @@ fn mount(app: &mut TestApp, parent: NodeId, builder: NodeBuilder) -> NodeId {
         .expect("挂载节点")
 }
 
-fn boxed(rect: Rect, background: [u8; 4]) -> NodeBuilder {
+fn boxed(rect: LogicalRect, background: [u8; 4]) -> NodeBuilder {
     NodeBuilder::boxed().layout_override(rect).paint(PaintSpec {
         background: color(background),
         ..PaintSpec::default()
     })
 }
 
-fn container(app: &mut TestApp, parent: NodeId, rect: Rect, clip: Clip) -> NodeId {
+fn container(app: &mut TestApp, parent: NodeId, rect: LogicalRect, clip: Clip) -> NodeId {
     mount(
         app,
         parent,
@@ -1292,7 +1316,7 @@ fn container(app: &mut TestApp, parent: NodeId, rect: Rect, clip: Clip) -> NodeI
     )
 }
 
-fn absolute_style(rect: Rect) -> Style {
+fn absolute_style(rect: LogicalRect) -> Style {
     StyleBuilder::new()
         .absolute()
         .left(rect.origin.x)
@@ -1305,7 +1329,7 @@ fn color(rgba: [u8; 4]) -> Color {
     Color::from_rgba8(rgba)
 }
 
-fn text_style(size: f32) -> TextStyle {
+fn text_style(size: LogicalPx) -> TextStyle {
     TextStyle {
         size,
         color: Color::WHITE,
@@ -1370,20 +1394,20 @@ fn bright_pixels(image: &SnapshotImage, x0: u32, y0: u32, x1: u32, y1: u32) -> u
     })
 }
 
-fn ring_pixels(image: &SnapshotImage, rect: Rect) -> u32 {
-    let outer = rect.outset(6.0).to_physical_covering(Scale::ONE);
+fn ring_pixels(image: &SnapshotImage, rect: LogicalRect) -> u32 {
+    let outer = DevicePixelRatio::ONE.to_covering_device_rect(rect.outset(px(6.0)));
     pixels::count_pixels(
         image,
-        outer.x0.max(0) as u32,
-        outer.y0.max(0) as u32,
-        outer.x1.max(0) as u32,
-        outer.y1.max(0) as u32,
+        outer.x0.max(dp(0)).value() as u32,
+        outer.y0.max(dp(0)).value() as u32,
+        outer.x1.max(dp(0)).value() as u32,
+        outer.y1.max(dp(0)).value() as u32,
         |pixel| pixels::channel_span(pixel, RING) <= 4,
     )
 }
 
 fn focus_ring() -> FocusRing {
-    FocusRing::new(2.0, 2.0, color(RING))
+    FocusRing::new(px(2.0), px(2.0), color(RING))
 }
 
 fn key(app: &mut TestApp, code: KeyCode, modifiers: Modifiers) {

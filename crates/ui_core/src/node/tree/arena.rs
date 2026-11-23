@@ -7,7 +7,7 @@ use crate::{
     event::Action,
     interaction::NodeInteraction,
     layout::{LayoutOverride, MeasureFn},
-    math::{Edges, Point, Rect, Size},
+    math::{LogicalEdges, LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
     node::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, DirtySet},
@@ -34,20 +34,20 @@ pub(crate) fn new() -> NodeTree {
         layout_override: None,
         tab_stop: true,
         paint: None,
-        content_offset: Point::ZERO,
+        content_offset: LogicalPoint::ZERO,
         text_bind: None,
-        text_measured_size: Size::ZERO,
-        text_content_width: 0.0,
+        text_measured_size: LogicalSize::ZERO,
+        text_content_width: LogicalPx::ZERO,
         layout: LayoutBox::default(),
-        local: Rect::default(),
-        local_border: Edges::ZERO,
+        local: LogicalRect::default(),
+        local_border: LogicalEdges::ZERO,
         laid_out_epoch: 0,
-        damage: Rect::default(),
+        damage: LogicalRect::default(),
         lanes: SmallVec::new(),
         deps: None,
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction: None,
-        lane_offset: Point::ZERO,
+        lane_offset: LogicalPoint::ZERO,
         paint_opacity: 1.0,
     });
     let mut dirty_layout = DirtySet::new();
@@ -67,7 +67,7 @@ pub(crate) fn new() -> NodeTree {
         text_slots: vec![None],
         debug_ids: vec![None],
         clip_keys: vec![None],
-        subtree_bounds: vec![Rect::default()],
+        subtree_bounds: vec![LogicalRect::default()],
         a11y_slots: vec![None],
         images_need_refresh: false,
         dirty_bind: DirtySet::new(),
@@ -197,20 +197,20 @@ pub(crate) fn insert_child(
         layout_override,
         tab_stop,
         paint,
-        content_offset: Point::ZERO,
+        content_offset: LogicalPoint::ZERO,
         text_bind: bind_text,
-        text_measured_size: Size::ZERO,
-        text_content_width: 0.0,
+        text_measured_size: LogicalSize::ZERO,
+        text_content_width: LogicalPx::ZERO,
         layout: LayoutBox::default(),
-        local: Rect::default(),
-        local_border: Edges::ZERO,
+        local: LogicalRect::default(),
+        local_border: LogicalEdges::ZERO,
         laid_out_epoch: 0,
-        damage: Rect::default(),
+        damage: LogicalRect::default(),
         lanes: SmallVec::new(),
         deps: None,
         dirty: DirtyFlags::LAYOUT | DirtyFlags::PAINT | DirtyFlags::A11Y,
         interaction,
-        lane_offset: Point::ZERO,
+        lane_offset: LogicalPoint::ZERO,
         paint_opacity: 1.0,
     });
     if tree
@@ -254,9 +254,10 @@ pub(crate) fn insert_child(
     }
     tree.scroll_slot_of[index] = 0;
     if tree.subtree_bounds.len() <= index {
-        tree.subtree_bounds.resize_with(index + 1, Rect::default);
+        tree.subtree_bounds
+            .resize_with(index + 1, LogicalRect::default);
     }
-    tree.subtree_bounds[index] = Rect::default();
+    tree.subtree_bounds[index] = LogicalRect::default();
     if tree.a11y_slots.len() <= index {
         tree.a11y_slots.resize_with(index + 1, || None);
     }
@@ -343,7 +344,7 @@ pub(crate) fn remove(
     }) {
         tree.geometry_damage_escalation = true;
     }
-    let mut subtree_damage = Rect::default();
+    let mut subtree_damage = LogicalRect::default();
     for id in &block {
         if let Some(target) = tree.arena.get(*id) {
             subtree_damage = subtree_damage

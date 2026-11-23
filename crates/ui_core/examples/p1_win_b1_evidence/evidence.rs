@@ -11,7 +11,7 @@ use std::{
 use ui_core::{
     app::{App, AppHandle, Application},
     event::Event,
-    math::{Rect, Size},
+    math::{LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{
         color::Color,
@@ -44,7 +44,7 @@ use windows::Win32::{
 };
 
 const TITLE: &str = "kytrix P1-B B1 modal frame evidence";
-const SIZE: Size = Size::new(420.0, 260.0);
+const SIZE: LogicalSize = LogicalSize::new(px(420.0), px(260.0));
 const DATA_PERIOD: Duration = Duration::from_millis(16);
 const DRAG_STEPS: u32 = 32;
 const SAMPLE_PERIOD: Duration = Duration::from_millis(50);
@@ -137,7 +137,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let source = app.signal(0u8);
     let root = app.window(id).expect("窗口存在").tree().root();
     let _node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, SIZE.width, SIZE.height))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), SIZE.width, SIZE.height))
         .paint(PaintSpec {
             background: Color::WHITE,
             ..PaintSpec::default()

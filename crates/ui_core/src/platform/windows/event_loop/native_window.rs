@@ -151,7 +151,10 @@ pub(super) fn apply_event(
 ) -> Result<(), EngineError> {
     let scale = stamped.scale;
     let to_logical = |x: i32, y: i32| {
-        crate::math::Point::new(scale.to_logical(x as f32), scale.to_logical(y as f32))
+        scale.to_logical_point(crate::math::DevicePoint::new(
+            crate::math::dp(x),
+            crate::math::dp(y),
+        ))
     };
     let modifiers = native.state_mut().modifiers();
     let timestamp = timestamp_from_ticks_32(now, now_ticks, stamped.ticks_ms);
@@ -194,7 +197,10 @@ pub(super) fn apply_event(
             dy_lines,
         } => Event::Input(InputEvent::Scroll {
             position: to_logical(x, y),
-            delta: crate::math::Point::new(dx_lines, dy_lines),
+            delta: crate::math::LogicalPoint::new(
+                crate::math::px(dx_lines),
+                crate::math::px(dy_lines),
+            ),
             unit: ScrollUnit::Line,
             phase: ScrollPhase::Discrete,
             modifiers,
@@ -251,10 +257,7 @@ pub(super) fn apply_event(
                 if !native.is_minimized() {
                     let client = native.client_size();
                     native.note_client_resize(scale, client);
-                    window.set_size(crate::math::Size::new(
-                        scale.to_logical(client.0 as f32),
-                        scale.to_logical(client.1 as f32),
-                    ));
+                    window.set_size(native.logical_size());
                     window.set_surface(client);
                 }
             }
@@ -282,7 +285,7 @@ mod tests {
     use crate::{
         app::App,
         event::Event,
-        math::Scale,
+        math::{DevicePixelRatio, px},
         node::builder::NodeBuilder,
         platform::{
             dispatcher::Dispatcher,
@@ -418,7 +421,7 @@ mod tests {
         let node = {
             let window = app.window_mut(id).expect("窗口存在");
             let root = window.tree().root();
-            NodeBuilder::text("abc", TextStyle::new(16.0))
+            NodeBuilder::text("abc", TextStyle::new(px(16.0)))
                 .build(window.tree_mut(), root)
                 .expect("文本节点")
         };
@@ -454,7 +457,7 @@ mod tests {
             StampedEvent {
                 event: PlatformEvent::Focus(false),
                 ticks_ms: 0,
-                scale: Scale::ONE,
+                scale: DevicePixelRatio::ONE,
             },
             std::time::Instant::now(),
             0,

@@ -9,7 +9,7 @@ use taffy::{
 };
 
 use crate::{
-    math::Point,
+    math::{LogicalPoint, LogicalPx},
     paint::{
         color::Color,
         primitive::{Border, Gradient},
@@ -108,8 +108,8 @@ impl Style {
         self
     }
 
-    pub fn gap(&mut self, px: f32) -> &mut Self {
-        let gap = LengthPercentage::length(px);
+    pub fn gap(&mut self, px: LogicalPx) -> &mut Self {
+        let gap = LengthPercentage::length(px.value());
         self.inner.gap = TaffySize {
             width: gap,
             height: gap,
@@ -117,18 +117,18 @@ impl Style {
         self
     }
 
-    pub fn gap_width(&mut self, px: f32) -> &mut Self {
-        self.inner.gap.width = LengthPercentage::length(px);
+    pub fn gap_width(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.gap.width = LengthPercentage::length(px.value());
         self
     }
 
-    pub fn gap_height(&mut self, px: f32) -> &mut Self {
-        self.inner.gap.height = LengthPercentage::length(px);
+    pub fn gap_height(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.gap.height = LengthPercentage::length(px.value());
         self
     }
 
-    pub fn padding(&mut self, px: f32) -> &mut Self {
-        let value = LengthPercentage::length(px);
+    pub fn padding(&mut self, px: LogicalPx) -> &mut Self {
+        let value = LengthPercentage::length(px.value());
         self.inner.padding = TaffyRect {
             left: value,
             right: value,
@@ -138,42 +138,54 @@ impl Style {
         self
     }
 
-    pub fn padding_x(&mut self, px: f32) -> &mut Self {
-        let value = LengthPercentage::length(px);
+    pub fn padding_x(&mut self, px: LogicalPx) -> &mut Self {
+        let value = LengthPercentage::length(px.value());
         self.inner.padding.left = value;
         self.inner.padding.right = value;
         self
     }
 
-    pub fn padding_y(&mut self, px: f32) -> &mut Self {
-        let value = LengthPercentage::length(px);
+    pub fn padding_y(&mut self, px: LogicalPx) -> &mut Self {
+        let value = LengthPercentage::length(px.value());
         self.inner.padding.top = value;
         self.inner.padding.bottom = value;
         self
     }
 
-    pub fn padding_sides(&mut self, top: f32, right: f32, bottom: f32, left: f32) -> &mut Self {
+    pub fn padding_sides(
+        &mut self,
+        top: LogicalPx,
+        right: LogicalPx,
+        bottom: LogicalPx,
+        left: LogicalPx,
+    ) -> &mut Self {
         self.inner.padding = TaffyRect {
-            left: LengthPercentage::length(left),
-            right: LengthPercentage::length(right),
-            top: LengthPercentage::length(top),
-            bottom: LengthPercentage::length(bottom),
+            left: LengthPercentage::length(left.value()),
+            right: LengthPercentage::length(right.value()),
+            top: LengthPercentage::length(top.value()),
+            bottom: LengthPercentage::length(bottom.value()),
         };
         self
     }
 
-    pub fn margin_sides(&mut self, top: f32, right: f32, bottom: f32, left: f32) -> &mut Self {
+    pub fn margin_sides(
+        &mut self,
+        top: LogicalPx,
+        right: LogicalPx,
+        bottom: LogicalPx,
+        left: LogicalPx,
+    ) -> &mut Self {
         self.inner.margin = TaffyRect {
-            left: LengthPercentageAuto::length(left),
-            right: LengthPercentageAuto::length(right),
-            top: LengthPercentageAuto::length(top),
-            bottom: LengthPercentageAuto::length(bottom),
+            left: LengthPercentageAuto::length(left.value()),
+            right: LengthPercentageAuto::length(right.value()),
+            top: LengthPercentageAuto::length(top.value()),
+            bottom: LengthPercentageAuto::length(bottom.value()),
         };
         self
     }
 
-    pub fn border(&mut self, px: f32) -> &mut Self {
-        let value = LengthPercentage::length(px);
+    pub fn border(&mut self, px: LogicalPx) -> &mut Self {
+        let value = LengthPercentage::length(px.value());
         self.inner.border = TaffyRect {
             left: value,
             right: value,
@@ -183,20 +195,26 @@ impl Style {
         self
     }
 
-    pub fn border_sides(&mut self, top: f32, right: f32, bottom: f32, left: f32) -> &mut Self {
+    pub fn border_sides(
+        &mut self,
+        top: LogicalPx,
+        right: LogicalPx,
+        bottom: LogicalPx,
+        left: LogicalPx,
+    ) -> &mut Self {
         self.inner.border = TaffyRect {
-            left: LengthPercentage::length(left),
-            right: LengthPercentage::length(right),
-            top: LengthPercentage::length(top),
-            bottom: LengthPercentage::length(bottom),
+            left: LengthPercentage::length(left.value()),
+            right: LengthPercentage::length(right.value()),
+            top: LengthPercentage::length(top.value()),
+            bottom: LengthPercentage::length(bottom.value()),
         };
         self
     }
 
-    pub fn size_length(&mut self, width: f32, height: f32) -> &mut Self {
+    pub fn size_length(&mut self, width: LogicalPx, height: LogicalPx) -> &mut Self {
         self.inner.size = TaffySize {
-            width: Dimension::length(width),
-            height: Dimension::length(height),
+            width: Dimension::length(width.value()),
+            height: Dimension::length(height.value()),
         };
         self
     }
@@ -214,8 +232,8 @@ impl Style {
         self
     }
 
-    pub fn width_length(&mut self, px: f32) -> &mut Self {
-        self.inner.size.width = Dimension::length(px);
+    pub fn width_length(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.size.width = Dimension::length(px.value());
         self
     }
 
@@ -224,8 +242,8 @@ impl Style {
         self
     }
 
-    pub fn height_length(&mut self, px: f32) -> &mut Self {
-        self.inner.size.height = Dimension::length(px);
+    pub fn height_length(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.size.height = Dimension::length(px.value());
         self
     }
 
@@ -244,8 +262,8 @@ impl Style {
         self
     }
 
-    pub fn min_height_length(&mut self, px: f32) -> &mut Self {
-        self.inner.min_size.height = LengthPercentageAuto::length(px);
+    pub fn min_height_length(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.min_size.height = LengthPercentageAuto::length(px.value());
         self
     }
 
@@ -275,37 +293,37 @@ impl Style {
         self
     }
 
-    pub fn inset_top(&mut self, px: f32) -> &mut Self {
-        self.inner.inset.top = LengthPercentageAuto::length(px);
+    pub fn inset_top(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.inset.top = LengthPercentageAuto::length(px.value());
         self
     }
 
-    pub fn inset_right(&mut self, px: f32) -> &mut Self {
-        self.inner.inset.right = LengthPercentageAuto::length(px);
+    pub fn inset_right(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.inset.right = LengthPercentageAuto::length(px.value());
         self
     }
 
-    pub fn inset_bottom(&mut self, px: f32) -> &mut Self {
-        self.inner.inset.bottom = LengthPercentageAuto::length(px);
+    pub fn inset_bottom(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.inset.bottom = LengthPercentageAuto::length(px.value());
         self
     }
 
-    pub fn inset_left(&mut self, px: f32) -> &mut Self {
-        self.inner.inset.left = LengthPercentageAuto::length(px);
+    pub fn inset_left(&mut self, px: LogicalPx) -> &mut Self {
+        self.inner.inset.left = LengthPercentageAuto::length(px.value());
         self
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FocusRing {
-    pub width: f32,
-    pub offset: f32,
+    pub width: LogicalPx,
+    pub offset: LogicalPx,
     pub color: Color,
 }
 
 impl FocusRing {
     #[must_use]
-    pub const fn new(width: f32, offset: f32, color: Color) -> Self {
+    pub const fn new(width: LogicalPx, offset: LogicalPx, color: Color) -> Self {
         Self {
             width,
             offset,
@@ -325,16 +343,16 @@ pub enum Clip {
 pub struct PaintSpec {
     pub background: Color,
     pub border: Option<Border>,
-    pub corner_radius: [f32; 4],
+    pub corner_radius: [LogicalPx; 4],
     pub shadows: Shadows,
     pub gradient: Option<Gradient>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowSpec {
-    pub offset: Point,
-    pub blur: f32,
-    pub spread: f32,
+    pub offset: LogicalPoint,
+    pub blur: LogicalPx,
+    pub spread: LogicalPx,
     pub color: Color,
 }
 
@@ -414,17 +432,20 @@ mod tests {
     };
 
     use super::{Clip, Cursor, MAX_SHADOWS, PaintSpec, ShadowSpec, Shadows, Style, StylePatch};
-    use crate::{math::Point, paint::color::Color};
+    use crate::{
+        math::{LogicalPoint, LogicalPx, px},
+        paint::color::Color,
+    };
 
     fn taffy_style() -> taffy::Style<SmolStr> {
         taffy::Style::<SmolStr>::DEFAULT
     }
 
-    fn layer(offset_y: f32) -> ShadowSpec {
+    fn layer(offset_y: LogicalPx) -> ShadowSpec {
         ShadowSpec {
-            offset: Point::new(0.0, offset_y),
-            blur: 4.0,
-            spread: 0.0,
+            offset: LogicalPoint::new(px(0.0), offset_y),
+            blur: px(4.0),
+            spread: px(0.0),
             color: Color::BLACK,
         }
     }
@@ -513,7 +534,7 @@ mod tests {
     #[test]
     fn edge_size_setters_match_direct_taffy_writes() {
         let mut style = Style::default();
-        style.size_percent(0.5, 0.5).width_length(120.0);
+        style.size_percent(0.5, 0.5).width_length(px(120.0));
         assert_eq!(
             style.inner().size,
             TaffySize {
@@ -522,7 +543,7 @@ mod tests {
             }
         );
 
-        style.height_length(40.0);
+        style.height_length(px(40.0));
         assert_eq!(
             style.inner().size,
             TaffySize {
@@ -540,7 +561,7 @@ mod tests {
             }
         );
 
-        style.min_height_length(48.0);
+        style.min_height_length(px(48.0));
         assert_eq!(
             style.inner().min_size,
             TaffySize {
@@ -569,7 +590,7 @@ mod tests {
     #[test]
     fn gap_setters_match_direct_taffy_writes() {
         let mut style = Style::default();
-        style.gap(8.0);
+        style.gap(px(8.0));
         assert_eq!(
             style.inner().gap,
             TaffySize {
@@ -578,7 +599,7 @@ mod tests {
             }
         );
 
-        style.gap(1.0).gap_width(3.0).gap_height(4.0);
+        style.gap(px(1.0)).gap_width(px(3.0)).gap_height(px(4.0));
         assert_eq!(
             style.inner().gap,
             TaffySize {
@@ -591,7 +612,7 @@ mod tests {
     #[test]
     fn partial_padding_and_gap_writes_leave_the_other_edges_alone() {
         let mut style = Style::default();
-        style.padding(16.0).padding_x(4.0);
+        style.padding(px(16.0)).padding_x(px(4.0));
         assert_eq!(
             style.inner().padding,
             TaffyRect {
@@ -602,7 +623,7 @@ mod tests {
             }
         );
 
-        style.gap(1.0).gap_width(3.0);
+        style.gap(px(1.0)).gap_width(px(3.0));
         assert_eq!(
             style.inner().gap,
             TaffySize {
@@ -615,7 +636,7 @@ mod tests {
     #[test]
     fn padding_setters_match_direct_taffy_writes() {
         let mut style = Style::default();
-        style.padding(16.0);
+        style.padding(px(16.0));
         assert_eq!(
             style.inner().padding,
             TaffyRect {
@@ -626,7 +647,7 @@ mod tests {
             }
         );
 
-        style.padding_x(12.0).padding_y(8.0);
+        style.padding_x(px(12.0)).padding_y(px(8.0));
         assert_eq!(
             style.inner().padding,
             TaffyRect {
@@ -637,7 +658,7 @@ mod tests {
             }
         );
 
-        style.padding_sides(1.0, 2.0, 3.0, 4.0);
+        style.padding_sides(px(1.0), px(2.0), px(3.0), px(4.0));
         assert_eq!(
             style.inner().padding,
             TaffyRect {
@@ -652,7 +673,7 @@ mod tests {
     #[test]
     fn margin_sides_and_border_setters_match_direct_taffy_writes() {
         let mut style = Style::default();
-        style.margin_sides(1.0, 2.0, 3.0, 4.0);
+        style.margin_sides(px(1.0), px(2.0), px(3.0), px(4.0));
         assert_eq!(
             style.inner().margin,
             TaffyRect {
@@ -663,7 +684,7 @@ mod tests {
             }
         );
 
-        style.border(2.0);
+        style.border(px(2.0));
         assert_eq!(
             style.inner().border,
             TaffyRect {
@@ -674,7 +695,7 @@ mod tests {
             }
         );
 
-        style.border_sides(3.0, 0.0, 0.0, 2.0);
+        style.border_sides(px(3.0), px(0.0), px(0.0), px(2.0));
         assert_eq!(
             style.inner().border,
             TaffyRect {
@@ -689,7 +710,7 @@ mod tests {
     #[test]
     fn size_setters_match_direct_taffy_writes() {
         let mut style = Style::default();
-        style.size_length(120.0, 40.0);
+        style.size_length(px(120.0), px(40.0));
         assert_eq!(
             style.inner().size,
             TaffySize {
@@ -762,10 +783,10 @@ mod tests {
         );
 
         style
-            .inset_top(4.0)
-            .inset_right(5.0)
-            .inset_bottom(6.0)
-            .inset_left(7.0);
+            .inset_top(px(4.0))
+            .inset_right(px(5.0))
+            .inset_bottom(px(6.0))
+            .inset_left(px(7.0));
         assert_eq!(
             style.inner().inset,
             TaffyRect {
@@ -813,19 +834,19 @@ mod tests {
 
     #[test]
     fn a_single_layer_roundtrips_through_from() {
-        let shadows = Shadows::from(layer(2.0));
+        let shadows = Shadows::from(layer(px(2.0)));
         assert_eq!(shadows.len(), 1);
         assert!(!shadows.is_empty());
         assert_eq!(
             shadows.iter().copied().collect::<Vec<_>>(),
-            vec![layer(2.0)]
+            vec![layer(px(2.0))]
         );
     }
 
     #[test]
     fn shadows_truncate_at_the_layer_cap() {
         let layers: Vec<ShadowSpec> = (0..MAX_SHADOWS as i32 + 2)
-            .map(|index| layer(index as f32))
+            .map(|index| layer(px(index as f32)))
             .collect();
         let shadows = Shadows::new(layers.clone());
         assert_eq!(shadows.len(), MAX_SHADOWS, "上限 {MAX_SHADOWS} 层");

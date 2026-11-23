@@ -10,7 +10,7 @@ use super::{
     raster::{GlyphVariation, split_subpixel_x},
 };
 use crate::{
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, physical_px, px},
     paint::{color::Color, primitive::PositionedGlyph},
 };
 
@@ -41,19 +41,19 @@ struct FastFont {
 #[derive(Clone, Copy, Debug)]
 struct FastChar {
     glyph: u32,
-    advance: f32,
+    advance: LogicalPx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FastMetrics {
-    pub baseline: f32,
-    pub line_height: f32,
+    pub baseline: LogicalPx,
+    pub line_height: LogicalPx,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SimpleShaped {
     glyphs: Vec<SimpleGlyph>,
-    width: f32,
+    width: LogicalPx,
     metrics: FastMetrics,
     font: parley::FontData,
     variation_coords: Vec<i16>,
@@ -64,7 +64,7 @@ pub(crate) struct SimpleShaped {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SimpleGlyph {
     pub glyph: u32,
-    pub x: f32,
+    pub x: LogicalPx,
 }
 
 impl SimpleShaped {
@@ -73,12 +73,12 @@ impl SimpleShaped {
     }
 
     #[cfg(test)]
-    pub(crate) fn width(&self) -> f32 {
+    pub(crate) fn width(&self) -> LogicalPx {
         self.width
     }
 
-    pub(crate) fn size(&self) -> Size {
-        Size::new(self.width, self.metrics.line_height)
+    pub(crate) fn size(&self) -> LogicalSize {
+        LogicalSize::new(self.width, self.metrics.line_height)
     }
 
     pub(crate) fn metrics(&self) -> FastMetrics {
@@ -90,15 +90,15 @@ impl SimpleShaped {
         self.glyphs.get(index).map_or(0, |glyph| glyph.glyph)
     }
 
-    pub(crate) fn x_at(&self, index: usize) -> f32 {
+    pub(crate) fn x_at(&self, index: usize) -> LogicalPx {
         self.glyphs.get(index).map_or(self.width, |glyph| glyph.x)
     }
 
-    pub(crate) fn caret_x(&self, byte_index: usize) -> f32 {
+    pub(crate) fn caret_x(&self, byte_index: usize) -> LogicalPx {
         self.x_at(byte_index.min(self.text_len))
     }
 
-    pub(crate) fn byte_index_at(&self, x: f32) -> usize {
+    pub(crate) fn byte_index_at(&self, x: LogicalPx) -> usize {
         for index in 0..self.glyphs.len() {
             let edge = self.x_at(index);
             let next = self.x_at(index + 1);
@@ -111,12 +111,12 @@ impl SimpleShaped {
 
     pub(crate) fn selection_rect(
         &self,
-        content_width: f32,
+        content_width: LogicalPx,
         alignment: TextAlign,
         direction: TextDirection,
         anchor: usize,
         focus: usize,
-    ) -> Option<Rect> {
+    ) -> Option<LogicalRect> {
         let (start, end) = if anchor <= focus {
             (anchor, focus)
         } else {
@@ -125,10 +125,15 @@ impl SimpleShaped {
         let offset = simple_alignment_offset(self.width, content_width, alignment, direction);
         let x0 = offset + self.caret_x(start);
         let x1 = offset + self.caret_x(end);
-        if (x1 - x0).abs() <= f32::EPSILON {
+        if (x1 - x0).abs().value() <= f32::EPSILON {
             return None;
         }
-        Some(Rect::new(x0, 0.0, x1 - x0, self.metrics.line_height))
+        Some(LogicalRect::new(
+            x0,
+            px(0.0),
+            x1 - x0,
+            self.metrics.line_height,
+        ))
     }
 
     pub(crate) fn rasterize(
@@ -137,15 +142,15 @@ impl SimpleShaped {
         style: &TextStyle,
         color: Color,
         ctx: &mut super::shape::RasterCtx<'_>,
-        layout_offset: f32,
+        layout_offset: LogicalPx,
     ) -> Result<ShapedLine, crate::error::EngineError> {
-        let scale = ctx.scale;
-        let ppem = (style.size * scale).clamp(1.0, 512.0);
+        let ppem = ctx.scale.to_physical(style.size).value().clamp(1.0, 512.0);
         let variation = GlyphVariation::of(&self.variation_coords, self.synthesis, ppem);
         let baseline = self.metrics.baseline;
         let mut glyphs = Vec::with_capacity(self.glyphs.len());
         for glyph in &self.glyphs {
-            let (base_x, subpixel_x) = split_subpixel_x((glyph.x + layout_offset) * scale);
+            let (base_x, subpixel_x) =
+                split_subpixel_x(ctx.scale.to_physical(glyph.x + layout_offset).value());
             let tile = ctx.glyph_atlas.ensure(
                 ctx.raster,
                 ctx.atlas,
@@ -159,11 +164,17 @@ impl SimpleShaped {
                 continue;
             };
             let origin_x = base_x + tile.left as f32;
-            let origin_y = (baseline * scale).round() - tile.top as f32;
+            let origin_y = ctx.scale.to_physical(baseline).value().round() - tile.top as f32;
             glyphs.push(PositionedGlyph {
                 tile: tile.tile,
-                position: Point::new(origin_x / scale, origin_y / scale),
-                size: Size::new(tile.width as f32 / scale, tile.height as f32 / scale),
+                position: LogicalPoint::new(
+                    ctx.scale.to_logical(physical_px(origin_x)),
+                    ctx.scale.to_logical(physical_px(origin_y)),
+                ),
+                size: LogicalSize::new(
+                    ctx.scale.to_logical(physical_px(tile.width as f32)),
+                    ctx.scale.to_logical(physical_px(tile.height as f32)),
+                ),
             });
         }
         let line = ShapedTextLine {
@@ -186,7 +197,7 @@ impl SimpleShaped {
             first_baseline: Some(baseline),
             atlas_generation: ctx.generation,
             font_stack_version: 0,
-            scale,
+            scale: ctx.scale,
         })
     }
 }
@@ -354,13 +365,13 @@ impl Default for DigitFastPath {
 }
 
 pub(crate) fn simple_alignment_offset(
-    line_advance: f32,
-    content_width: f32,
+    line_advance: LogicalPx,
+    content_width: LogicalPx,
     alignment: TextAlign,
     direction: TextDirection,
-) -> f32 {
+) -> LogicalPx {
     if !content_width.is_finite() || content_width <= line_advance {
-        return 0.0;
+        return LogicalPx::ZERO;
     }
     let extra = content_width - line_advance;
     let rtl = matches!(direction, TextDirection::Rtl);
@@ -369,24 +380,24 @@ pub(crate) fn simple_alignment_offset(
             if rtl {
                 extra
             } else {
-                0.0
+                LogicalPx::ZERO
             }
         }
         TextAlign::End => {
             if rtl {
-                0.0
+                LogicalPx::ZERO
             } else {
                 extra
             }
         }
-        TextAlign::Left => 0.0,
+        TextAlign::Left => LogicalPx::ZERO,
         TextAlign::Right => extra,
         TextAlign::Center => extra * 0.5,
         TextAlign::Justify => {
             if rtl {
                 extra
             } else {
-                0.0
+                LogicalPx::ZERO
             }
         }
     }
@@ -404,7 +415,7 @@ fn eligibility(text: &str, style: &TextStyle) -> Result<(), Ineligible> {
     if style.direction == TextDirection::Rtl {
         return Err(Ineligible::Rtl);
     }
-    if style.letter_spacing != 0.0 {
+    if style.letter_spacing != LogicalPx::ZERO {
         return Err(Ineligible::LetterSpacing);
     }
     if !text
@@ -421,7 +432,7 @@ fn eligibility(text: &str, style: &TextStyle) -> Result<(), Ineligible> {
 
 fn build_simple(font: &FastFont, text: &str) -> Option<SimpleShaped> {
     let mut glyphs = Vec::with_capacity(text.len());
-    let mut x = 0.0f32;
+    let mut x = LogicalPx::ZERO;
     for character in text.chars() {
         let slot = font.chars[alphabet_index(character)?];
         let fast_char = slot?;
@@ -476,15 +487,18 @@ fn verify(
         let line = layout.lines().next()?;
         let line_metrics = line.metrics();
         let fast_metrics = FastMetrics {
-            baseline: line_metrics.baseline,
-            line_height: line_metrics.line_height,
+            baseline: px(line_metrics.baseline),
+            line_height: px(line_metrics.line_height),
         };
         match &metrics {
             Some(existing) if existing != &fast_metrics => return None,
             Some(_) => {}
             None => metrics = Some(fast_metrics),
         }
-        chars[index] = Some(FastChar { glyph: id, advance });
+        chars[index] = Some(FastChar {
+            glyph: id,
+            advance: px(advance),
+        });
     }
     let font = font?;
     let metrics = metrics?;
@@ -596,7 +610,7 @@ fn verify_glyph_sequence(
         if glyph_ids[position] != fast_char.glyph {
             return None;
         }
-        x += fast_char.advance;
+        x += fast_char.advance.value();
     }
     Some(())
 }
@@ -611,6 +625,7 @@ mod tests {
         verify_glyph_sequence,
     };
     use crate::{
+        math::px,
         paint::color::ColorBrush,
         text::{
             FontStack, TextAlign, TextContent, TextDirection, TextFontVariation, TextStyle,
@@ -687,25 +702,26 @@ mod tests {
                 "{text}: 第 {index} 个字形 id"
             );
             assert!(
-                (x - simple.x_at(index)).abs() <= ADVANCE_TOLERANCE,
+                (*x - simple.x_at(index).value()).abs() <= ADVANCE_TOLERANCE,
                 "{text}: 第 {index} 个字形 x {x} vs 快速路径 {}",
                 simple.x_at(index)
             );
         }
         assert!(
-            (reference.width - simple.width()).abs() <= ADVANCE_TOLERANCE,
+            (reference.width - simple.width().value()).abs() <= ADVANCE_TOLERANCE,
             "{text}: 宽度 {} vs 快速路径 {}",
             reference.width,
             simple.width()
         );
         assert!(
-            (reference.baseline - simple.metrics().baseline).abs() <= ADVANCE_TOLERANCE,
+            (reference.baseline - simple.metrics().baseline.value()).abs() <= ADVANCE_TOLERANCE,
             "{text}: baseline {} vs 快速路径 {}",
             reference.baseline,
             simple.metrics().baseline
         );
         assert!(
-            (reference.line_height - simple.metrics().line_height).abs() <= ADVANCE_TOLERANCE,
+            (reference.line_height - simple.metrics().line_height.value()).abs()
+                <= ADVANCE_TOLERANCE,
             "{text}: line_height {} vs 快速路径 {}",
             reference.line_height,
             simple.metrics().line_height
@@ -767,7 +783,7 @@ mod tests {
 
     #[test]
     fn eligibility_requires_the_fast_path_alphabet() {
-        let style = TextStyle::new(12.0);
+        let style = TextStyle::new(px(12.0));
         assert_eq!(eligibility("1,234.56", &style), Ok(()));
         assert_eq!(
             eligibility("-1.50%", &style),
@@ -791,7 +807,7 @@ mod tests {
             "`.+` 在 `IS` 后、`PR` 前存在真实 UAX#14 断行机会 ⇒ 单行假设不成立"
         );
         assert_eq!(
-            eligibility("1,234.56", &style.clone().with_letter_spacing(0.5)),
+            eligibility("1,234.56", &style.clone().with_letter_spacing(px(0.5))),
             Err(Ineligible::LetterSpacing)
         );
         assert_eq!(
@@ -812,7 +828,7 @@ mod tests {
 
     #[test]
     fn eligibility_rejects_rtl_paragraphs_and_the_alphabet_has_only_ascii() {
-        let style = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let style = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         assert_eq!(
             eligibility("42150", &style.clone().with_direction(TextDirection::Rtl)),
             Err(Ineligible::Rtl),
@@ -840,7 +856,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0);
+        let style = TextStyle::new(px(12.0));
         let mut texts: Vec<String> = Vec::with_capacity(ALPHABET.len() * ALPHABET.len() + 8);
         for first in ALPHABET {
             for second in ALPHABET {
@@ -878,12 +894,12 @@ mod tests {
     #[test]
     fn ineligible_reasons_are_counted() {
         let (mut font_cx, mut layout_cx, family) = harness();
-        let style = TextStyle::new(12.0);
+        let style = TextStyle::new(px(12.0));
         let mut fast = DigitFastPath::new();
         let cases: [(&str, TextStyle); 5] = [
             ("abc", style.clone()),
             ("1 234", style.clone()),
-            ("1,234.56", style.clone().with_letter_spacing(0.5)),
+            ("1,234.56", style.clone().with_letter_spacing(px(0.5))),
             ("1.+", style.clone()),
             ("1,234.56", style.with_direction(TextDirection::Rtl)),
         ];
@@ -911,9 +927,9 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0);
-        let tnum_style =
-            TextStyle::new(12.0).with_font_features([crate::text::TextFeature::TABULAR_NUMBERS]);
+        let style = TextStyle::new(px(12.0));
+        let tnum_style = TextStyle::new(px(12.0))
+            .with_font_features([crate::text::TextFeature::TABULAR_NUMBERS]);
         let mut fast = DigitFastPath::new();
         let probes: [(&str, &TextStyle); 10] = [
             ("0", &style),
@@ -955,7 +971,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let style = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         let text = "1,234.56";
         let content = TextContent::new(text, style.clone());
 
@@ -1005,7 +1021,7 @@ mod tests {
             "行高逐位相等"
         );
         assert_eq!(
-            parley_shaped.max_content_size().width.to_bits(),
+            parley_shaped.max_content_size().width.value().to_bits(),
             reference.width.to_bits(),
             "max-content 宽度逐位相等"
         );
@@ -1027,27 +1043,27 @@ mod tests {
                 "第 {index} 个字形 id 必须与 parley 相同"
             );
             assert!(
-                (simple.x_at(index) - x).abs() <= ADVANCE_TOLERANCE,
+                (simple.x_at(index).value() - x).abs() <= ADVANCE_TOLERANCE,
                 "第 {index} 个字形 x {} vs parley {x}",
                 simple.x_at(index)
             );
         }
         let width = parley_shaped.max_content_size().width;
         assert!(
-            (fast_shaped.max_content_size().width - width).abs() <= ADVANCE_TOLERANCE,
+            (fast_shaped.max_content_size().width - width).abs() <= px(ADVANCE_TOLERANCE),
             "端到端 max-content 宽度必须一致"
         );
         for byte_index in 0..=text.len() {
             let fast_caret = fast_shaped.caret_rect(width, TextAlign::Start, byte_index);
             let parley_caret = parley_shaped.caret_rect(width, TextAlign::Start, byte_index);
             assert!(
-                (fast_caret.origin.x - parley_caret.origin.x).abs() <= ADVANCE_TOLERANCE,
+                (fast_caret.origin.x - parley_caret.origin.x).abs() <= px(ADVANCE_TOLERANCE),
                 "byte {byte_index}: caret x {} vs {}",
                 fast_caret.origin.x,
                 parley_caret.origin.x
             );
             assert!(
-                (fast_caret.size.height - parley_caret.size.height).abs() <= ADVANCE_TOLERANCE,
+                (fast_caret.size.height - parley_caret.size.height).abs() <= px(ADVANCE_TOLERANCE),
                 "byte {byte_index}: 行高 {} vs {}",
                 fast_caret.size.height,
                 parley_caret.size.height
@@ -1072,7 +1088,7 @@ mod tests {
             TextAlign::Justify,
         ];
         for direction in [TextDirection::Auto, TextDirection::Ltr, TextDirection::Rtl] {
-            let style = TextStyle::new(12.0)
+            let style = TextStyle::new(px(12.0))
                 .with_wrap(TextWrap::NoWrap)
                 .with_direction(direction);
             let content = TextContent::new(text, style);
@@ -1098,17 +1114,18 @@ mod tests {
 
             for alignment in alignments {
                 for byte_index in 0..=text.len() {
-                    let fast_caret = fast.caret_rect(content_width, alignment, byte_index);
-                    let parley_caret = parley.caret_rect(content_width, alignment, byte_index);
+                    let fast_caret = fast.caret_rect(px(content_width), alignment, byte_index);
+                    let parley_caret = parley.caret_rect(px(content_width), alignment, byte_index);
                     assert!(
-                        (fast_caret.origin.x - parley_caret.origin.x).abs() <= ADVANCE_TOLERANCE,
+                        (fast_caret.origin.x - parley_caret.origin.x).abs()
+                            <= px(ADVANCE_TOLERANCE),
                         "{direction:?} {alignment:?} byte {byte_index}: caret {} vs {}",
                         fast_caret.origin.x,
                         parley_caret.origin.x
                     );
                 }
-                let fast_selection = fast.selection_rects(content_width, alignment, 1, 5);
-                let parley_selection = parley.selection_rects(content_width, alignment, 1, 5);
+                let fast_selection = fast.selection_rects(px(content_width), alignment, 1, 5);
+                let parley_selection = parley.selection_rects(px(content_width), alignment, 1, 5);
                 assert_eq!(
                     fast_selection.len(),
                     parley_selection.len(),
@@ -1116,13 +1133,14 @@ mod tests {
                 );
                 for (fast_rect, parley_rect) in fast_selection.iter().zip(&parley_selection) {
                     assert!(
-                        (fast_rect.origin.x - parley_rect.origin.x).abs() <= ADVANCE_TOLERANCE,
+                        (fast_rect.origin.x - parley_rect.origin.x).abs() <= px(ADVANCE_TOLERANCE),
                         "{direction:?} {alignment:?}: selection x {} vs {}",
                         fast_rect.origin.x,
                         parley_rect.origin.x
                     );
                     assert!(
-                        (fast_rect.size.width - parley_rect.size.width).abs() <= ADVANCE_TOLERANCE,
+                        (fast_rect.size.width - parley_rect.size.width).abs()
+                            <= px(ADVANCE_TOLERANCE),
                         "{direction:?} {alignment:?}: selection width {} vs {}",
                         fast_rect.size.width,
                         parley_rect.size.width
@@ -1136,16 +1154,19 @@ mod tests {
     fn alignment_offset_is_bounded_for_degenerate_widths() {
         use super::simple_alignment_offset;
         for width in [f32::NAN, f32::INFINITY, -1.0, 0.0, 10.0] {
-            let offset = simple_alignment_offset(10.0, width, TextAlign::Right, TextDirection::Ltr);
+            let offset =
+                simple_alignment_offset(px(10.0), px(width), TextAlign::Right, TextDirection::Ltr);
             assert!(
-                offset.is_finite() && offset >= 0.0,
+                offset.is_finite() && offset >= px(0.0),
                 "width={width}: offset={offset}"
             );
-            assert_eq!(offset, 0.0, "width={width} must not create free space");
+            assert_eq!(offset, px(0.0), "width={width} must not create free space");
         }
         assert!(
-            (simple_alignment_offset(10.0, 20.0, TextAlign::Center, TextDirection::Ltr) - 5.0)
+            (simple_alignment_offset(px(10.0), px(20.0), TextAlign::Center, TextDirection::Ltr)
+                - 5.0)
                 .abs()
+                .value()
                 < 1e-6
         );
     }
@@ -1156,7 +1177,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0);
+        let style = TextStyle::new(px(12.0));
         let mut fast = DigitFastPath::new();
         for text in ["1 234", "abc", "数字", "1.5 USDT", "1.+"] {
             assert!(
@@ -1186,7 +1207,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0);
+        let style = TextStyle::new(px(12.0));
         let font = super::verify(&mut font_cx, &mut layout_cx, &family, &style)
             .expect("host font must pass verification for the digit alphabet");
         let text = "1,234.56-7/8";
@@ -1210,8 +1231,8 @@ mod tests {
             return;
         }
         let mut fast = DigitFastPath::new();
-        let small = TextStyle::new(10.0);
-        let large = TextStyle::new(22.0);
+        let small = TextStyle::new(px(10.0));
+        let large = TextStyle::new(px(22.0));
         let first = shape_fast(
             &mut fast,
             &mut font_cx,
@@ -1247,7 +1268,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let style = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let style = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         let mut fast = DigitFastPath::new();
         let simple = shape_fast(
             &mut fast,
@@ -1257,17 +1278,17 @@ mod tests {
             "12345",
             &style,
         );
-        assert_eq!(simple.caret_x(0), 0.0);
-        assert!((simple.caret_x(5) - simple.width()).abs() <= 1e-4);
+        assert_eq!(simple.caret_x(0), px(0.0));
+        assert!((simple.caret_x(5) - simple.width()).abs() <= px(1e-4));
         assert!(simple.caret_x(2) > simple.caret_x(1));
         let rect = simple
-            .selection_rect(200.0, TextAlign::Start, TextDirection::Ltr, 1, 3)
+            .selection_rect(px(200.0), TextAlign::Start, TextDirection::Ltr, 1, 3)
             .expect("non-empty selection");
-        assert!((rect.origin.x - simple.caret_x(1)).abs() <= 1e-4);
-        assert!((rect.size.width - (simple.caret_x(3) - simple.caret_x(1))).abs() <= 1e-4);
+        assert!((rect.origin.x - simple.caret_x(1)).abs() <= px(1e-4));
+        assert!((rect.size.width - (simple.caret_x(3) - simple.caret_x(1))).abs() <= px(1e-4));
         assert!(
             simple
-                .selection_rect(200.0, TextAlign::Start, TextDirection::Ltr, 2, 2)
+                .selection_rect(px(200.0), TextAlign::Start, TextDirection::Ltr, 2, 2)
                 .is_none(),
             "collapsed selection"
         );
@@ -1279,7 +1300,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let base = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let base = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         let doubled = base.clone().with_line_height(2.0);
         let text = "1,234.56";
         let mut fast = DigitFastPath::new();
@@ -1309,12 +1330,13 @@ mod tests {
         assert_eq!(stats.rejected, 0);
         assert_eq!(fast.fonts.len(), 2, "两种行高必须是两条验证表项");
         assert!(
-            (tall.metrics().line_height - 2.0 * base.size).abs() <= ADVANCE_TOLERANCE,
+            (tall.metrics().line_height.value() - base.size.value() * 2.0).abs()
+                <= ADVANCE_TOLERANCE,
             "line_height 必须由 parley 探针实测：{}",
             tall.metrics().line_height
         );
         assert!(
-            (normal.metrics().line_height - tall.metrics().line_height).abs() > 1.0,
+            (normal.metrics().line_height - tall.metrics().line_height).abs() > px(1.0),
             "默认行高与 2 倍行高必须不同：{} vs {}",
             normal.metrics().line_height,
             tall.metrics().line_height
@@ -1337,7 +1359,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let base = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let base = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         let condensed = base.clone().with_stretch(75);
         let text = "1,234.56";
         let mut fast = DigitFastPath::new();
@@ -1388,7 +1410,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let base = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let base = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         let heavy = base
             .clone()
             .with_font_variations([TextFontVariation::new(*b"wght", 700.0)]);
@@ -1441,7 +1463,7 @@ mod tests {
         if !has_system_fonts(&mut font_cx) {
             return;
         }
-        let base = TextStyle::new(12.0).with_wrap(TextWrap::NoWrap);
+        let base = TextStyle::new(px(12.0)).with_wrap(TextWrap::NoWrap);
         let localized = base.clone().with_locale("zh-Hans");
         let text = "1,234.56";
         let mut fast = DigitFastPath::new();

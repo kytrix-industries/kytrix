@@ -2,7 +2,7 @@ use super::App;
 use crate::{
     error::EngineError,
     interaction::{focus, overlay as overlay_util, scroll},
-    math::Rect,
+    math::LogicalRect,
     node::id::NodeId,
     window::{Window, WindowId},
 };
@@ -168,7 +168,10 @@ pub(crate) fn set_ime_enabled(app: &mut App, window: WindowId, enabled: bool) {
     }
 }
 
-pub(crate) fn ime_cursor_area(app: &App, window: WindowId) -> Result<Option<Rect>, EngineError> {
+pub(crate) fn ime_cursor_area(
+    app: &App,
+    window: WindowId,
+) -> Result<Option<LogicalRect>, EngineError> {
     app.windows
         .get(&window)
         .ok_or(EngineError::UnknownWindow { window })?

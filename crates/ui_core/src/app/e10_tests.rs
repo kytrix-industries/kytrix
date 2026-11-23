@@ -7,7 +7,7 @@ use std::{
 use crate::{
     app::{AnimationCompletion, AnimationEndKind, App, TimerId},
     interaction::{AnimatedValue, AnimationSpec, Easing},
-    math::Rect,
+    math::{LogicalRect, px},
     node::builder::NodeBuilder,
     paint::{
         color::{Color, ColorResolver},
@@ -27,7 +27,7 @@ fn painted_node(app: &mut TestApp, background: Color) -> crate::node::id::NodeId
     let window = app.window_id();
     let root = app.app().window(window).expect("window").tree().root();
     NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .paint(PaintSpec {
             background,
             ..PaintSpec::default()
@@ -250,7 +250,7 @@ fn a_completion_callback_can_recolor_the_node_in_the_same_frame() {
     let background = app.app_mut().signal(Color::from_rgba8([0, 0, 0, 255]));
     let source = background;
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .bind_style(move |cx| StylePatch {
             background: Some(*cx.read(&source)),
             ..StylePatch::default()

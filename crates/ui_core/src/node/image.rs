@@ -1,5 +1,5 @@
 use crate::{
-    math::{Rect, Size},
+    math::{LogicalRect, LogicalSize},
     paint::{atlas::AtlasTile, color::Color},
     resources::{PendingResource, ResourceId},
 };
@@ -33,7 +33,7 @@ pub struct ImageContent {
     source: ImageSource,
     fit: ImageFit,
     modulation: Color,
-    intrinsic: Option<Size>,
+    intrinsic: Option<LogicalSize>,
 }
 
 impl ImageContent {
@@ -62,7 +62,7 @@ impl ImageContent {
     }
 
     #[must_use]
-    pub const fn intrinsic(&self) -> Option<Size> {
+    pub const fn intrinsic(&self) -> Option<LogicalSize> {
         self.intrinsic
     }
 
@@ -74,12 +74,16 @@ impl ImageContent {
         self.modulation = modulation;
     }
 
-    pub(crate) fn set_intrinsic(&mut self, intrinsic: Size) {
+    pub(crate) fn set_intrinsic(&mut self, intrinsic: LogicalSize) {
         self.intrinsic = Some(intrinsic);
     }
 }
 
-pub(crate) fn fit_bounds(bounds: Rect, fit: ImageFit, image: Size) -> Option<Rect> {
+pub(crate) fn fit_bounds(
+    bounds: LogicalRect,
+    fit: ImageFit,
+    image: LogicalSize,
+) -> Option<LogicalRect> {
     if bounds.size.is_empty() || image.is_empty() {
         return None;
     }
@@ -89,7 +93,7 @@ pub(crate) fn fit_bounds(bounds: Rect, fit: ImageFit, image: Size) -> Option<Rec
             let scale = (bounds.size.width / image.width).min(bounds.size.height / image.height);
             let width = image.width * scale;
             let height = image.height * scale;
-            Some(Rect::new(
+            Some(LogicalRect::new(
                 bounds.origin.x + (bounds.size.width - width) * 0.5,
                 bounds.origin.y + (bounds.size.height - height) * 0.5,
                 width,
@@ -99,7 +103,11 @@ pub(crate) fn fit_bounds(bounds: Rect, fit: ImageFit, image: Size) -> Option<Rec
     }
 }
 
-pub(crate) fn cover_tile(bounds: Rect, image: Size, tile: AtlasTile) -> Option<AtlasTile> {
+pub(crate) fn cover_tile(
+    bounds: LogicalRect,
+    image: LogicalSize,
+    tile: AtlasTile,
+) -> Option<AtlasTile> {
     if bounds.size.is_empty() || image.is_empty() {
         return None;
     }
@@ -127,7 +135,7 @@ fn crop_axis(start: f32, end: f32, fraction: f32) -> (f32, f32) {
 mod tests {
     use super::{ImageFit, ImageSource, cover_tile, fit_bounds};
     use crate::{
-        math::{Rect, Size},
+        math::{LogicalRect, LogicalSize, px},
         paint::atlas::{AtlasKind, AtlasTile},
         resources::{PendingResource, ResourceId},
     };
@@ -148,9 +156,9 @@ mod tests {
 
     #[test]
     fn fill_stretches_to_the_node_box() {
-        let bounds = Rect::new(10.0, 20.0, 100.0, 50.0);
+        let bounds = LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0));
         assert_eq!(
-            fit_bounds(bounds, ImageFit::Fill, Size::new(10.0, 10.0)),
+            fit_bounds(bounds, ImageFit::Fill, LogicalSize::new(px(10.0), px(10.0))),
             Some(bounds),
             "Fill 不保持宽高比：直接等于节点盒"
         );
@@ -158,10 +166,14 @@ mod tests {
 
     #[test]
     fn contain_centers_a_letterboxed_rect() {
-        let bounds = Rect::new(10.0, 20.0, 100.0, 50.0);
+        let bounds = LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0));
         assert_eq!(
-            fit_bounds(bounds, ImageFit::Contain, Size::new(10.0, 10.0)),
-            Some(Rect::new(35.0, 20.0, 50.0, 50.0)),
+            fit_bounds(
+                bounds,
+                ImageFit::Contain,
+                LogicalSize::new(px(10.0), px(10.0))
+            ),
+            Some(LogicalRect::new(px(35.0), px(20.0), px(50.0), px(50.0))),
             "Contain = 等比内嵌居中"
         );
     }
@@ -169,8 +181,8 @@ mod tests {
     #[test]
     fn cover_crops_the_source_uv_centered() {
         let cropped = cover_tile(
-            Rect::new(10.0, 20.0, 100.0, 50.0),
-            Size::new(10.0, 10.0),
+            LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0)),
+            LogicalSize::new(px(10.0), px(10.0)),
             tile(),
         )
         .expect("cover tile");
@@ -193,29 +205,35 @@ mod tests {
         assert!((cropped.v1 - 0.6875).abs() < 1e-6, "v1 = {cropped:?}");
         assert_eq!(
             fit_bounds(
-                Rect::new(10.0, 20.0, 100.0, 50.0),
+                LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0)),
                 ImageFit::Cover,
-                Size::new(10.0, 10.0)
+                LogicalSize::new(px(10.0), px(10.0))
             ),
-            Some(Rect::new(10.0, 20.0, 100.0, 50.0)),
+            Some(LogicalRect::new(px(10.0), px(20.0), px(100.0), px(50.0))),
             "Cover 的图元 bounds 恒等于节点盒（源区域裁在 UV 上）"
         );
     }
 
     #[test]
     fn degenerate_sizes_produce_no_geometry() {
-        let ok = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let ok = LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0));
         for bounds in [
-            Rect::new(0.0, 0.0, 0.0, 10.0),
-            Rect::new(0.0, 0.0, 10.0, f32::NAN),
+            LogicalRect::new(px(0.0), px(0.0), px(0.0), px(10.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(f32::NAN)),
         ] {
             assert_eq!(
-                fit_bounds(bounds, ImageFit::Fill, Size::new(1.0, 1.0)),
+                fit_bounds(bounds, ImageFit::Fill, LogicalSize::new(px(1.0), px(1.0))),
                 None
             );
-            assert_eq!(cover_tile(bounds, Size::new(1.0, 1.0), tile()), None);
+            assert_eq!(
+                cover_tile(bounds, LogicalSize::new(px(1.0), px(1.0)), tile()),
+                None
+            );
         }
-        for image in [Size::ZERO, Size::new(f32::INFINITY, 1.0)] {
+        for image in [
+            LogicalSize::ZERO,
+            LogicalSize::new(px(f32::INFINITY), px(1.0)),
+        ] {
             assert_eq!(fit_bounds(ok, ImageFit::Contain, image), None);
             assert_eq!(cover_tile(ok, image, tile()), None);
         }

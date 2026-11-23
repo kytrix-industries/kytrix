@@ -1,6 +1,6 @@
 use super::{NodeKind, NodeTree};
 use crate::{
-    math::Size,
+    math::{LogicalSize, px},
     node::{
         id::NodeId,
         image::{ImageContent, ImageSource},
@@ -8,7 +8,7 @@ use crate::{
     resources::{PendingResource, ResourceCache, ResourceId, ResourceImage},
 };
 
-pub(crate) fn set_intrinsic(tree: &mut NodeTree, node: NodeId, intrinsic: Size) -> bool {
+pub(crate) fn set_intrinsic(tree: &mut NodeTree, node: NodeId, intrinsic: LogicalSize) -> bool {
     let changed = {
         let Some(target) = tree.arena.get_mut(node) else {
             return false;
@@ -37,7 +37,7 @@ pub(crate) fn refresh_intrinsics(
     scale: f32,
 ) -> usize {
     let scale = sane_scale(scale);
-    let mut updates: Vec<(NodeId, Size)> = Vec::new();
+    let mut updates: Vec<(NodeId, LogicalSize)> = Vec::new();
     tree.for_each_dfs(|node| {
         if let Ok(target) = tree.get(node)
             && let Some(content) = target.kind.image()
@@ -183,8 +183,11 @@ fn apply_ready(tree: &mut NodeTree, node: NodeId, image: ResourceImage, scale: f
     true
 }
 
-fn intrinsic_of(image: ResourceImage, scale: f32) -> Size {
-    Size::new(image.width as f32 / scale, image.height as f32 / scale)
+fn intrinsic_of(image: ResourceImage, scale: f32) -> LogicalSize {
+    LogicalSize::new(
+        px(image.width as f32 / scale),
+        px(image.height as f32 / scale),
+    )
 }
 
 fn sane_scale(scale: f32) -> f32 {

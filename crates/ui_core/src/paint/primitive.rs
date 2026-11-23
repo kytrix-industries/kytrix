@@ -1,7 +1,7 @@
 use std::{ops::Range, sync::Arc};
 
 use crate::{
-    math::{Point, Rect, Size, Transform},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform},
     paint::{
         atlas::AtlasTile,
         canvas::Canvas,
@@ -24,8 +24,8 @@ pub enum Primitive {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Quad {
-    pub bounds: Rect,
-    pub corner_radius: [f32; 4],
+    pub bounds: LogicalRect,
+    pub corner_radius: [LogicalPx; 4],
     pub paint: QuadPaint,
 }
 
@@ -37,7 +37,7 @@ pub enum QuadPaint {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Border {
-    pub width: f32,
+    pub width: LogicalPx,
     pub color: Color,
 }
 
@@ -64,31 +64,31 @@ pub struct GlyphRun {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PositionedGlyph {
     pub tile: AtlasTile,
-    pub position: Point,
-    pub size: Size,
+    pub position: LogicalPoint,
+    pub size: LogicalSize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Image {
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
     pub tile: AtlasTile,
     pub modulation: Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Path {
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
     pub geometry: GeometryId,
     pub fill: Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shadow {
-    pub rect: Rect,
-    pub offset: Point,
-    pub blur: f32,
+    pub rect: LogicalRect,
+    pub offset: LogicalPoint,
+    pub blur: LogicalPx,
     pub color: Color,
-    pub corner_radius: [f32; 4],
+    pub corner_radius: [LogicalPx; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,8 +99,8 @@ pub enum ClipOp {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipRect {
-    pub rect: Rect,
-    pub corner_radius: [f32; 4],
+    pub rect: LogicalRect,
+    pub corner_radius: [LogicalPx; 4],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +132,7 @@ mod tests {
         PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
     };
     use crate::{
-        math::{Point, Rect, Size, Transform},
+        math::{LogicalPoint, LogicalRect, LogicalSize, Transform, px},
         paint::{
             atlas::{AtlasKind, AtlasTile},
             canvas::Canvas,
@@ -141,8 +141,8 @@ mod tests {
         },
     };
 
-    fn rect() -> Rect {
-        Rect::new(0.0, 0.0, 16.0, 8.0)
+    fn rect() -> LogicalRect {
+        LogicalRect::new(px(0.0), px(0.0), px(16.0), px(8.0))
     }
 
     fn tile(atlas: AtlasKind) -> AtlasTile {
@@ -169,11 +169,11 @@ mod tests {
                 "Quad",
                 Primitive::Quad(Quad {
                     bounds: rect(),
-                    corner_radius: [1.0, 2.0, 3.0, 4.0],
+                    corner_radius: [px(1.0), px(2.0), px(3.0), px(4.0)],
                     paint: QuadPaint::Solid {
                         fill: Color::WHITE,
                         border: Some(Border {
-                            width: 1.0,
+                            width: px(1.0),
                             color: Color::BLACK,
                         }),
                     },
@@ -185,8 +185,8 @@ mod tests {
                     color: Color::BLACK,
                     glyphs: vec![PositionedGlyph {
                         tile: tile(AtlasKind::Glyph),
-                        position: Point::new(1.0, 2.0),
-                        size: Size::new(4.0, 6.0),
+                        position: LogicalPoint::new(px(1.0), px(2.0)),
+                        size: LogicalSize::new(px(4.0), px(6.0)),
                     }],
                 }),
             ),
@@ -210,17 +210,17 @@ mod tests {
                 "Shadow",
                 Primitive::Shadow(Shadow {
                     rect: rect(),
-                    offset: Point::new(0.0, 2.0),
-                    blur: 4.0,
+                    offset: LogicalPoint::new(px(0.0), px(2.0)),
+                    blur: px(4.0),
                     color: Color::BLACK,
-                    corner_radius: [1.0, 2.0, 3.0, 4.0],
+                    corner_radius: [px(1.0), px(2.0), px(3.0), px(4.0)],
                 }),
             ),
             (
                 "Clip",
                 Primitive::Clip(ClipOp::Push(ClipRect {
                     rect: rect(),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 })),
             ),
             (
@@ -248,7 +248,7 @@ mod tests {
         match &samples[0].1 {
             Primitive::Quad(quad) => {
                 let mut different = quad.clone();
-                different.corner_radius[0] = 99.0;
+                different.corner_radius[0] = px(99.0);
                 assert_ne!(&Primitive::Quad(different), &samples[0].1);
             }
             other => panic!("expected Quad, got {other:?}"),
@@ -286,7 +286,7 @@ mod tests {
         let bordered = QuadPaint::Solid {
             fill: Color::WHITE,
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: Color::BLACK,
             }),
         };
@@ -310,13 +310,13 @@ mod tests {
 
     #[test]
     fn shadow_keeps_unoffset_rect() {
-        let rect = Rect::new(4.0, 4.0, 8.0, 8.0);
+        let rect = LogicalRect::new(px(4.0), px(4.0), px(8.0), px(8.0));
         let shadow = Shadow {
             rect,
-            offset: Point::new(10.0, 20.0),
-            blur: 2.0,
+            offset: LogicalPoint::new(px(10.0), px(20.0)),
+            blur: px(2.0),
             color: Color::BLACK,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         };
         assert_eq!(shadow.rect, rect);
     }
@@ -341,13 +341,13 @@ mod tests {
     fn clip_op_push_pop_roundtrip() {
         let clip = ClipRect {
             rect: rect(),
-            corner_radius: [2.0, 0.0, 2.0, 0.0],
+            corner_radius: [px(2.0), px(0.0), px(2.0), px(0.0)],
         };
         assert_eq!(ClipOp::Push(clip), ClipOp::Push(clip));
         assert_ne!(ClipOp::Pop, ClipOp::Push(clip));
         let other = ClipRect {
             rect: rect(),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         };
         assert_ne!(ClipOp::Push(clip), ClipOp::Push(other));
         assert!(format!("{:?}", ClipOp::Push(clip)).contains("Push"));

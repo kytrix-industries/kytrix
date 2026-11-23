@@ -103,7 +103,7 @@ mod tests {
     fn overlay_slot(dismiss: OverlayDismiss) -> OverlaySlot {
         OverlaySlot {
             dismiss,
-            placement: OverlayPlacement::Point(crate::math::Point::ZERO),
+            placement: OverlayPlacement::Point(crate::math::LogicalPoint::ZERO),
             trap_focus: false,
             opener: None,
             restore_focus: false,

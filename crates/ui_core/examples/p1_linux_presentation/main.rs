@@ -11,7 +11,7 @@ use std::{
 
 use ui_core::{
     app::{App, Application},
-    math::{Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{
         color::Color,
@@ -20,7 +20,7 @@ use ui_core::{
     window::{FrameOutcome, FramePresentation, WindowId, WindowOptions},
 };
 
-const WINDOW_SIZE: Size = Size::new(960.0, 540.0);
+const WINDOW_SIZE: LogicalSize = LogicalSize::new(px(960.0), px(540.0));
 const WARMUP: Duration = Duration::from_secs(1);
 const SETTLE_GRACE: Duration = Duration::from_millis(250);
 const DRAIN: Duration = Duration::from_millis(300);
@@ -224,7 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static("kytrix A4 presented_at evidence"),
         size: WINDOW_SIZE,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         background: Color::from_rgba8([0x0B, 0x0E, 0x13, 0xFF]),
         ..WindowOptions::default()
     });
@@ -234,7 +234,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("窗口不存在")?;
     let phase = app.signal(0u32);
     let _block = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, WINDOW_SIZE.width, WINDOW_SIZE.height))
+        .layout_override(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            WINDOW_SIZE.width,
+            WINDOW_SIZE.height,
+        ))
         .paint(PaintSpec {
             background: Color::from_rgba8(phase_color(0)),
             ..PaintSpec::default()

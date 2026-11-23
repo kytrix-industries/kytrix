@@ -7,7 +7,7 @@ use std::{
 use ui_core::{
     app::{App, AppHandle, Application},
     event::Event,
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalSize, px},
     window::{WindowId, WindowOptions},
 };
 use windows::Win32::{
@@ -27,12 +27,12 @@ use windows::Win32::{
 
 const TITLE: &str = "kytrix P1-B B3 placement evidence";
 const CLAMP_TITLE: &str = "kytrix P1-B B3 clamp evidence";
-const SIZE: Size = Size::new(640.0, 480.0);
-const POSITION: Point = Point::new(120.0, 90.0);
-const MIN_SIZE: Size = Size::new(480.0, 360.0);
-const MAX_SIZE: Size = Size::new(900.0, 700.0);
+const SIZE: LogicalSize = LogicalSize::new(px(640.0), px(480.0));
+const POSITION: LogicalPoint = LogicalPoint::new(px(120.0), px(90.0));
+const MIN_SIZE: LogicalSize = LogicalSize::new(px(480.0), px(360.0));
+const MAX_SIZE: LogicalSize = LogicalSize::new(px(900.0), px(700.0));
 const MOVE_BY: (i32, i32) = (160, -60);
-const OFF_SCREEN: Point = Point::new(-5000.0, -5000.0);
+const OFF_SCREEN: LogicalPoint = LogicalPoint::new(px(-5000.0), px(-5000.0));
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
@@ -41,7 +41,7 @@ struct State {
     deadline: Option<Instant>,
     areas: Vec<(i32, i32, i32, i32)>,
     clamp_window: Option<WindowId>,
-    moved_events: Vec<Point>,
+    moved_events: Vec<LogicalPoint>,
     position_ok: bool,
     min_max_ok: bool,
     clamp_ok: bool,
@@ -107,8 +107,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|window| window.scale().factor())
                     .unwrap_or(1.0);
                 let expected = (
-                    (POSITION.x * scale).round() as i32,
-                    (POSITION.y * scale).round() as i32,
+                    (POSITION.x.value() * scale).round() as i32,
+                    (POSITION.y.value() * scale).round() as i32,
                 );
                 let actual = client_origin(hwnd);
                 let within =
@@ -186,7 +186,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let clamp_id = app.create_window(WindowOptions {
                     title: smol_str::SmolStr::new_static(CLAMP_TITLE),
-                    size: Size::new(320.0, 240.0),
+                    size: LogicalSize::new(px(320.0), px(240.0)),
                     position: Some(OFF_SCREEN),
                     ..WindowOptions::default()
                 });
@@ -265,8 +265,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 let moved_ok = match (state.moved_events.last().copied(), expected) {
                     (Some(position), Some(expected)) => {
-                        (position.x - expected.0).abs() <= 1.0
-                            && (position.y - expected.1).abs() <= 1.0
+                        (position.x - expected.0).abs() <= px(1.0)
+                            && (position.y - expected.1).abs() <= px(1.0)
                     }
                     _ => false,
                 };
@@ -362,19 +362,19 @@ unsafe extern "system" fn collect_work_area(
     windows::core::BOOL::from(true)
 }
 
-fn track_size(client: Size, dpi: u32) -> (i32, i32) {
+fn track_size(client: LogicalSize, dpi: u32) -> (i32, i32) {
     let scale = f64::from(dpi) / 96.0;
     let physical = (
-        (f64::from(client.width) * scale).round() as u32,
-        (f64::from(client.height) * scale).round() as u32,
+        (f64::from(client.width.value()) * scale).round() as u32,
+        (f64::from(client.height.value()) * scale).round() as u32,
     );
     window_size_for_client(physical, dpi)
 }
 
-fn physical_client(size: Size, scale: f64) -> (u32, u32) {
+fn physical_client(size: LogicalSize, scale: f64) -> (u32, u32) {
     (
-        (f64::from(size.width) * scale).round() as u32,
-        (f64::from(size.height) * scale).round() as u32,
+        (f64::from(size.width.value()) * scale).round() as u32,
+        (f64::from(size.height.value()) * scale).round() as u32,
     )
 }
 

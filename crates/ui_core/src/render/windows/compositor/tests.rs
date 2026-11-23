@@ -6,7 +6,9 @@ use super::{
 };
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Point, Rect, Scale, Size, Transform},
+    math::{
+        DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, Transform, dp, px,
+    },
     paint::{
         atlas::{AtlasKind, AtlasTile},
         color::{Color, ColorResolver},
@@ -63,7 +65,7 @@ fn dropping_a_renderer_releases_its_shared_device_resources() {
         let buffer = encoder
             .encode(
                 &scene,
-                Scale::ONE,
+                DevicePixelRatio::ONE,
                 resolver(),
                 &crate::paint::geometry_store::GeometryStore::new(),
             )
@@ -124,14 +126,14 @@ fn two_renderers_render_concurrently_on_one_shared_gpu() {
             renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
 
             let text_free = one_lane_scene(quad(
-                Rect::new(2.0, 2.0, 2.0, 2.0),
+                LogicalRect::new(px(2.0), px(2.0), px(2.0), px(2.0)),
                 Color::srgb(1.0, 0.0, 0.0, 1.0),
             ));
             let mut encoder = InstanceEncoder::new();
             let buffer = encoder
                 .encode(
                     &text_free,
-                    Scale::ONE,
+                    DevicePixelRatio::ONE,
                     resolver(),
                     &crate::paint::geometry_store::GeometryStore::new(),
                 )
@@ -165,13 +167,13 @@ fn full_plan(size: (u32, u32)) -> FramePlan {
                 rects: 0,
             },
             &[],
-            PhysicalRect::new(0, 0, size.0 as i32, size.1 as i32),
+            DeviceRect::new(dp(0), dp(0), dp(size.0 as i32), dp(size.1 as i32)),
         ),
         true,
     )
 }
 
-fn partial_plan(rects: &[PhysicalRect], surface: (u32, u32)) -> FramePlan {
+fn partial_plan(rects: &[DeviceRect], surface: (u32, u32)) -> FramePlan {
     FramePlan::new(
         plan(
             DamageSummary {
@@ -179,7 +181,7 @@ fn partial_plan(rects: &[PhysicalRect], surface: (u32, u32)) -> FramePlan {
                 rects: rects.len(),
             },
             rects,
-            PhysicalRect::new(0, 0, surface.0 as i32, surface.1 as i32),
+            DeviceRect::new(dp(0), dp(0), dp(surface.0 as i32), dp(surface.1 as i32)),
         ),
         false,
     )
@@ -193,10 +195,10 @@ fn one_lane_scene(primitive: Primitive) -> Scene {
     scene
 }
 
-fn quad(bounds: Rect, fill: Color) -> Primitive {
+fn quad(bounds: LogicalRect, fill: Color) -> Primitive {
     Primitive::Quad(Quad {
         bounds,
-        corner_radius: [0.0; 4],
+        corner_radius: [px(0.0); 4],
         paint: QuadPaint::Solid { fill, border: None },
     })
 }
@@ -249,7 +251,7 @@ fn test_snapshot() -> std::sync::Arc<crate::paint::geometry::GeometrySnapshot> {
         vertex_stride: 12,
         index_type: IndexType::U16,
         topology: Topology::TriangleList,
-        bounds: Rect::new(0.0, 0.0, 1.0, 1.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(1.0), px(1.0)),
         pipeline: GeometryPipeline::Ui,
     })
 }
@@ -261,7 +263,7 @@ fn geometry_root_matches_common_hlsl_layout() {
     let draw = GeometryDrawGpu {
         id: GeometryId::for_test(0, 1),
         range: 0..3,
-        transform: Transform::translate(11.0, 13.0),
+        transform: Transform::translate(px(11.0), px(13.0)),
         color: resolver().resolve(Color::WHITE).to_array(),
         snapshot: test_snapshot(),
     };
@@ -322,12 +324,15 @@ fn geometry_root_without_clip_uses_the_viewport() {
 
 #[test]
 fn instance_bytes_are_128_per_primitive() {
-    let scene = one_lane_scene(quad(Rect::new(0.0, 0.0, 8.0, 8.0), Color::WHITE));
+    let scene = one_lane_scene(quad(
+        LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
+        Color::WHITE,
+    ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -356,7 +361,7 @@ fn clear_half_encodes_once_to_srgb() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -398,14 +403,14 @@ fn quad_pixels_are_srgb_encoded_and_clipped_by_bounds() {
         return;
     };
     let scene = one_lane_scene(quad(
-        Rect::new(16.0, 16.0, 16.0, 16.0),
+        LogicalRect::new(px(16.0), px(16.0), px(16.0), px(16.0)),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -433,7 +438,7 @@ fn the_scroll_offset_reaches_the_gpu() {
     assert!(scene.push(
         lane,
         quad(
-            Rect::new(16.0, 16.0, 16.0, 16.0),
+            LogicalRect::new(px(16.0), px(16.0), px(16.0), px(16.0)),
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         )
     ));
@@ -443,7 +448,7 @@ fn the_scroll_offset_reaches_the_gpu() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -487,14 +492,14 @@ fn draw_calls_follow_full_and_partial_scissor_passes() {
         return;
     };
     let scene = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 64.0, 64.0),
+        LogicalRect::new(px(0.0), px(0.0), px(64.0), px(64.0)),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -508,8 +513,8 @@ fn draw_calls_follow_full_and_partial_scissor_passes() {
     assert_eq!(stats.draw_calls, 1, "full frame has one scissor pass");
 
     let damage = [
-        PhysicalRect::new(0, 0, 32, 64),
-        PhysicalRect::new(32, 0, 64, 64),
+        DeviceRect::new(dp(0), dp(0), dp(32), dp(64)),
+        DeviceRect::new(dp(32), dp(0), dp(64), dp(64)),
     ];
     let mut second = partial_plan(&damage, (64, 64));
     let stats = renderer
@@ -540,7 +545,7 @@ fn ops_outside_the_damage_are_skipped() {
             vertex_stride: GeometryPipeline::Ui.vertex_stride(),
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
             pipeline: GeometryPipeline::Ui,
         })
         .expect("注册几何");
@@ -550,7 +555,7 @@ fn ops_outside_the_damage_are_skipped() {
     assert!(scene.push(
         lane,
         quad(
-            Rect::new(0.0, 0.0, 32.0, 64.0),
+            LogicalRect::new(px(0.0), px(0.0), px(32.0), px(64.0)),
             Color::srgb(1.0, 0.0, 0.0, 1.0),
         )
     ));
@@ -561,14 +566,14 @@ fn ops_outside_the_damage_are_skipped() {
     assert!(scene.push(
         lane,
         quad(
-            Rect::new(40.0, 0.0, 24.0, 64.0),
+            LogicalRect::new(px(40.0), px(0.0), px(24.0), px(64.0)),
             Color::srgb(0.0, 0.0, 1.0, 1.0),
         )
     ));
     scene.set_order(&[lane]);
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(&scene, Scale::ONE, resolver(), &store)
+        .encode(&scene, DevicePixelRatio::ONE, resolver(), &store)
         .expect("encode");
     let mut timings = FrameTimings::new();
 
@@ -579,7 +584,7 @@ fn ops_outside_the_damage_are_skipped() {
     assert_eq!(stats.draw_calls, 3, "两个实例 op + 一个几何 op");
 
     let before = crate::render::windows::diagnostics::snapshot();
-    let mut second = partial_plan(&[PhysicalRect::new(0, 0, 32, 64)], (64, 64));
+    let mut second = partial_plan(&[DeviceRect::new(dp(0), dp(0), dp(32), dp(64))], (64, 64));
     let stats = renderer
         .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
         .expect("partial frame");
@@ -619,14 +624,14 @@ fn a_rendered_frame_produces_no_corruption_messages() {
     renderer.queue_atlas_upload(AtlasKind::Glyph, 0, spec(page, 1), pixels, rects);
 
     let scene = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 32.0, 32.0),
+        LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -636,7 +641,7 @@ fn a_rendered_frame_produces_no_corruption_messages() {
     renderer
         .submit_buffer(FrameIndex::from_raw(1), buffer, &mut full, &mut timings)
         .expect("full frame");
-    let mut partial = partial_plan(&[PhysicalRect::new(0, 0, 16, 16)], (64, 64));
+    let mut partial = partial_plan(&[DeviceRect::new(dp(0), dp(0), dp(16), dp(16))], (64, 64));
     renderer
         .submit_buffer(FrameIndex::from_raw(2), buffer, &mut partial, &mut timings)
         .expect("partial frame");
@@ -664,14 +669,14 @@ fn damage_isolates_pixels_across_two_real_frames() {
     let size = (64, 64);
 
     let blue = one_lane_scene(quad(
-        Rect::new(32.0, 0.0, 32.0, 64.0),
+        LogicalRect::new(px(32.0), px(0.0), px(32.0), px(64.0)),
         Color::srgb(0.0, 0.0, 1.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &blue,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -683,19 +688,19 @@ fn damage_isolates_pixels_across_two_real_frames() {
         .expect("first frame");
 
     let red = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 32.0, 64.0),
+        LogicalRect::new(px(0.0), px(0.0), px(32.0), px(64.0)),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &red,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
         .expect("encode");
-    let damage = [PhysicalRect::new(0, 0, 32, 64)];
+    let damage = [DeviceRect::new(dp(0), dp(0), dp(32), dp(64))];
     let mut second = partial_plan(&damage, size);
     assert!(matches!(second.plan(), Plan::Partial(_)));
     renderer
@@ -734,7 +739,7 @@ fn geometry_ui_triangle_renders_white() {
             vertex_stride: GeometryPipeline::Ui.vertex_stride(),
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
             pipeline: GeometryPipeline::Ui,
         })
         .expect("注册几何");
@@ -746,7 +751,7 @@ fn geometry_ui_triangle_renders_white() {
     )));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(&scene, Scale::ONE, resolver(), &store)
+        .encode(&scene, DevicePixelRatio::ONE, resolver(), &store)
         .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
@@ -791,7 +796,7 @@ fn geometry_incremental_page_upload_updates_pixels() {
             vertex_stride: GeometryPipeline::Ui.vertex_stride(),
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 64.0, 32.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(64.0), px(32.0)),
             pipeline: GeometryPipeline::Ui,
         })
         .expect("注册几何");
@@ -806,7 +811,7 @@ fn geometry_incremental_page_upload_updates_pixels() {
 
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(&scene(), Scale::ONE, resolver(), &store)
+        .encode(&scene(), DevicePixelRatio::ONE, resolver(), &store)
         .expect("encode 1");
     let mut frame = full_plan((64, 64));
     renderer
@@ -825,7 +830,7 @@ fn geometry_incremental_page_upload_updates_pixels() {
         .expect("移动三角形");
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(&scene(), Scale::ONE, resolver(), &store)
+        .encode(&scene(), DevicePixelRatio::ONE, resolver(), &store)
         .expect("encode 2");
     let mut frame = full_plan((64, 64));
     renderer
@@ -867,7 +872,7 @@ fn geometry_subrange_draws_only_the_selected_triangles() {
             vertex_stride: GeometryPipeline::Ui.vertex_stride(),
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 44.0, 44.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(44.0), px(44.0)),
             pipeline: GeometryPipeline::Ui,
         })
         .expect("注册几何");
@@ -880,7 +885,7 @@ fn geometry_subrange_draws_only_the_selected_triangles() {
     }));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
-        .encode(&scene, Scale::ONE, resolver(), &store)
+        .encode(&scene, DevicePixelRatio::ONE, resolver(), &store)
         .expect("encode");
     let mut frame = full_plan((64, 64));
     let mut timings = FrameTimings::new();
@@ -934,7 +939,7 @@ fn image_primitive_samples_the_image_atlas() {
         slot_epoch: 0,
     };
     let scene = one_lane_scene(Primitive::Image(Image {
-        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
         tile,
         modulation: Color::WHITE,
     }));
@@ -942,7 +947,7 @@ fn image_primitive_samples_the_image_atlas() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -992,7 +997,7 @@ fn image_primitive_samples_its_texture_array_layer() {
         slot_epoch: 0,
     };
     let scene = one_lane_scene(Primitive::Image(Image {
-        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
         tile,
         modulation: Color::WHITE,
     }));
@@ -1000,7 +1005,7 @@ fn image_primitive_samples_its_texture_array_layer() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1093,7 +1098,12 @@ fn growing_the_shared_image_array_in_place_uses_the_production_rebuild_path() {
 fn submit_image_layers(renderer: &mut super::GpuRenderer, layers: u16) {
     let mut encoder = InstanceEncoder::new();
     {
-        let mut canvas = crate::paint::canvas::Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0));
+        let mut canvas = crate::paint::canvas::Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(64.0),
+            px(32.0),
+        ));
         for layer in 0..layers {
             let tile = AtlasTile {
                 atlas: AtlasKind::Image,
@@ -1107,7 +1117,7 @@ fn submit_image_layers(renderer: &mut super::GpuRenderer, layers: u16) {
                 slot_epoch: 0,
             };
             canvas.push_image(Image {
-                bounds: Rect::new(f32::from(layer) * 32.0, 0.0, 32.0, 32.0),
+                bounds: LogicalRect::new(px(f32::from(layer) * 32.0), px(0.0), px(32.0), px(32.0)),
                 tile,
                 modulation: Color::WHITE,
             });
@@ -1116,7 +1126,7 @@ fn submit_image_layers(renderer: &mut super::GpuRenderer, layers: u16) {
         encoder
             .encode(
                 &scene,
-                Scale::ONE,
+                DevicePixelRatio::ONE,
                 resolver(),
                 &crate::paint::geometry_store::GeometryStore::new(),
             )
@@ -1161,15 +1171,15 @@ fn glyph_probe(page: u32) -> bool {
         color: Color::WHITE,
         glyphs: vec![PositionedGlyph {
             tile,
-            position: Point::new(16.0, 16.0),
-            size: Size::new(16.0, 16.0),
+            position: LogicalPoint::new(px(16.0), px(16.0)),
+            size: LogicalSize::new(px(16.0), px(16.0)),
         }],
     }));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1208,7 +1218,7 @@ fn odd_surface_readback_has_no_row_padding() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1233,14 +1243,14 @@ fn resize_then_submit_keeps_the_capacity_contract() {
     };
     assert_eq!(renderer.surface(), (32, 32));
     let scene = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 16.0, 16.0),
+        LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)),
         Color::srgb(0.0, 1.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1257,7 +1267,7 @@ fn resize_then_submit_keeps_the_capacity_contract() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1282,7 +1292,7 @@ fn render_snapshot_returns_the_surface_pixels() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1306,14 +1316,14 @@ fn an_offscreen_target_keeps_persist_equal_to_the_surface() {
     assert_eq!(renderer.buffer(), (32, 24), "离屏目标没有 buffer 桶");
 
     let scene = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 64.0, 64.0),
+        LogicalRect::new(px(0.0), px(0.0), px(64.0), px(64.0)),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1390,14 +1400,14 @@ fn a_background_refresh_never_touches_the_main_content_persist() {
         return;
     };
     let red = one_lane_scene(quad(
-        Rect::new(0.0, 0.0, 64.0, 64.0),
+        LogicalRect::new(px(0.0), px(0.0), px(64.0), px(64.0)),
         Color::srgb(1.0, 0.0, 0.0, 1.0),
     ));
     let mut encoder = InstanceEncoder::new();
     let buffer = encoder
         .encode(
             &red,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1447,7 +1457,7 @@ fn the_offscreen_target_alternates_between_full_and_incremental_frames() {
     let buffer = encoder
         .encode(
             &scene,
-            Scale::ONE,
+            DevicePixelRatio::ONE,
             resolver(),
             &crate::paint::geometry_store::GeometryStore::new(),
         )
@@ -1465,13 +1475,13 @@ fn the_offscreen_target_alternates_between_full_and_incremental_frames() {
     assert_eq!(
         frame_draw(
             renderer.target_state(),
-            partial_plan(&[PhysicalRect::new(0, 0, 8, 8)], (16, 16)).plan(),
+            partial_plan(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))], (16, 16)).plan(),
             false
         ),
         FrameDraw::Incremental
     );
 
-    let mut second = partial_plan(&[PhysicalRect::new(0, 0, 8, 8)], (16, 16));
+    let mut second = partial_plan(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))], (16, 16));
     renderer
         .submit_buffer(FrameIndex::from_raw(2), buffer, &mut second, &mut timings)
         .expect("partial frame");
@@ -1490,7 +1500,7 @@ fn incremental_instance_upload_matches_a_full_upload() {
     assert!(scene.push(
         red,
         quad(
-            Rect::new(8.0, 8.0, 16.0, 16.0),
+            LogicalRect::new(px(8.0), px(8.0), px(16.0), px(16.0)),
             Color::srgb(1.0, 0.0, 0.0, 1.0)
         )
     ));
@@ -1498,7 +1508,7 @@ fn incremental_instance_upload_matches_a_full_upload() {
     assert!(scene.push(
         blue,
         quad(
-            Rect::new(32.0, 8.0, 16.0, 16.0),
+            LogicalRect::new(px(32.0), px(8.0), px(16.0), px(16.0)),
             Color::srgb(0.0, 0.0, 1.0, 1.0)
         )
     ));
@@ -1506,7 +1516,7 @@ fn incremental_instance_upload_matches_a_full_upload() {
 
     let mut encoder = InstanceEncoder::new();
     encoder
-        .encode(&scene, Scale::ONE, resolver(), &store)
+        .encode(&scene, DevicePixelRatio::ONE, resolver(), &store)
         .expect("初帧");
     let mut timings = FrameTimings::new();
     let mut frame = full_plan((64, 64));
@@ -1524,12 +1534,12 @@ fn incremental_instance_upload_matches_a_full_upload() {
     assert!(scene.push(
         blue,
         quad(
-            Rect::new(32.0, 32.0, 16.0, 16.0),
+            LogicalRect::new(px(32.0), px(32.0), px(16.0), px(16.0)),
             Color::srgb(0.0, 1.0, 0.0, 1.0)
         )
     ));
     encoder
-        .encode(&scene, Scale::ONE, resolver(), &store)
+        .encode(&scene, DevicePixelRatio::ONE, resolver(), &store)
         .expect("增量帧");
     let payload = crate::render::frame::FramePayload::from_buffer_delta(
         encoder.buffer_mut(),

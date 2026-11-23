@@ -6,7 +6,7 @@ use ui_core::{
     app::App,
     event::{Action, ActionSource},
     interaction::DragPhase,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         primitive::Border,
@@ -18,19 +18,19 @@ use ui_core::{
 
 use super::{CARD_BORDER_RGBA, CARD_RGBA, MUTED_RGBA, TEXT_RGBA, TITLE, card, color, text_style};
 
-pub(crate) const TITLEBAR_HEIGHT: f32 = 36.0;
+pub(crate) const TITLEBAR_HEIGHT: LogicalPx = px(36.0);
 
-const BUTTON_WIDTH: f32 = 40.0;
+const BUTTON_WIDTH: LogicalPx = px(40.0);
 
-const BUTTON_MARGIN: f32 = 8.0;
+const BUTTON_MARGIN: LogicalPx = px(8.0);
 
-const EDGE_SIZE: f32 = 6.0;
+const EDGE_SIZE: LogicalPx = px(6.0);
 
-const CORNER_SIZE: f32 = 10.0;
+const CORNER_SIZE: LogicalPx = px(10.0);
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
-const DOUBLE_CLICK_DISTANCE: f32 = 4.0;
+const DOUBLE_CLICK_DISTANCE: LogicalPx = px(4.0);
 
 #[derive(Clone)]
 pub(crate) struct Chrome {
@@ -44,7 +44,7 @@ pub(crate) fn build(app: &mut App, window: WindowId, root: NodeId) -> Chrome {
         .paint(PaintSpec {
             background: color(CARD_RGBA),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: color(CARD_BORDER_RGBA),
             }),
             ..PaintSpec::default()
@@ -62,9 +62,9 @@ pub(crate) fn build(app: &mut App, window: WindowId, root: NodeId) -> Chrome {
         app,
         window,
         drag,
-        Rect::new(12.0, 9.0, 560.0, 18.0),
+        LogicalRect::new(px(12.0), px(9.0), px(560.0), px(18.0)),
         TITLE,
-        text_style(12.5, 600, MUTED_RGBA),
+        text_style(px(12.5), 600, MUTED_RGBA),
     );
 
     let _ = button(
@@ -136,7 +136,7 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
             .request_window_control(window, WindowControl::ToggleMaximize);
     });
 
-    let mut last_press: Option<(Instant, Point)> = None;
+    let mut last_press: Option<(Instant, LogicalPoint)> = None;
     app.on_action(Action::custom("chrome.move"), move |ctx| {
         if !matches!(
             ctx.source(),
@@ -147,7 +147,7 @@ pub(crate) fn install(app: &mut App, scene: &super::Scene) {
         ) {
             return;
         }
-        let point = ctx.hit().map_or(Point::ZERO, |hit| hit.local_point);
+        let point = ctx.hit().map_or(LogicalPoint::ZERO, |hit| hit.local_point);
         let now = Instant::now();
         let double_click = last_press.is_some_and(|(at, previous)| {
             now.duration_since(at) <= DOUBLE_CLICK
@@ -193,18 +193,18 @@ fn button(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    right: f32,
+    right: LogicalPx,
     glyph: &'static str,
     label: &'static str,
     action: Action,
 ) -> NodeId {
     let style = absolute_style(
         None,
-        Some(0.0),
+        Some(px(0.0)),
         Some(right),
         None,
-        taffy::style::Dimension::length(BUTTON_WIDTH),
-        taffy::style::Dimension::length(TITLEBAR_HEIGHT),
+        taffy::style::Dimension::length(BUTTON_WIDTH.value()),
+        taffy::style::Dimension::length(TITLEBAR_HEIGHT.value()),
     );
     let node = NodeBuilder::boxed()
         .style(style)
@@ -220,9 +220,9 @@ fn button(
         .expect("标题栏按钮挂载");
     let _ = NodeBuilder::text(
         glyph,
-        text_style(14.0, 400, TEXT_RGBA).with_alignment(TextAlign::Center),
+        text_style(px(14.0), 400, TEXT_RGBA).with_alignment(TextAlign::Center),
     )
-    .layout_override(Rect::new(0.0, 9.0, BUTTON_WIDTH, 18.0))
+    .layout_override(LogicalRect::new(px(0.0), px(9.0), BUTTON_WIDTH, px(18.0)))
     .a11y(hidden())
     .build(card::tree(app, window), node)
     .expect("标题栏按钮字形挂载");
@@ -231,19 +231,19 @@ fn button(
 
 fn titlebar_style() -> Style {
     absolute_style(
-        Some(0.0),
-        Some(0.0),
+        Some(px(0.0)),
+        Some(px(0.0)),
         None,
         None,
         taffy::style::Dimension::percent(1.0),
-        taffy::style::Dimension::length(TITLEBAR_HEIGHT),
+        taffy::style::Dimension::length(TITLEBAR_HEIGHT.value()),
     )
 }
 
 fn fill_style() -> Style {
     absolute_style(
-        Some(0.0),
-        Some(0.0),
+        Some(px(0.0)),
+        Some(px(0.0)),
         None,
         None,
         taffy::style::Dimension::percent(1.0),
@@ -252,25 +252,26 @@ fn fill_style() -> Style {
 }
 
 fn absolute_style(
-    left: Option<f32>,
-    top: Option<f32>,
-    right: Option<f32>,
-    bottom: Option<f32>,
+    left: Option<LogicalPx>,
+    top: Option<LogicalPx>,
+    right: Option<LogicalPx>,
+    bottom: Option<LogicalPx>,
     width: taffy::style::Dimension,
     height: taffy::style::Dimension,
 ) -> Style {
     use taffy::style::LengthPercentageAuto;
 
+    let length = |value: LogicalPx| LengthPercentageAuto::length(value.value());
     let mut style = Style::default();
     style
         .position(taffy::style::Position::Absolute)
         .width(width)
         .height(height)
         .inset(
-            top.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-            right.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-            bottom.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-            left.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
+            top.map_or_else(LengthPercentageAuto::auto, length),
+            right.map_or_else(LengthPercentageAuto::auto, length),
+            bottom.map_or_else(LengthPercentageAuto::auto, length),
+            left.map_or_else(LengthPercentageAuto::auto, length),
         );
     style
 }
@@ -291,17 +292,17 @@ fn edge_style(edge: Edge) -> Style {
     use taffy::style::Dimension;
 
     let full = Dimension::percent(1.0);
-    let edge_size = Dimension::length(EDGE_SIZE);
-    let corner = Dimension::length(CORNER_SIZE);
+    let edge_size = Dimension::length(EDGE_SIZE.value());
+    let corner = Dimension::length(CORNER_SIZE.value());
     let (left, top, right, bottom, width, height) = match edge {
-        Edge::Top => (Some(0.0), Some(0.0), None, None, full, edge_size),
-        Edge::Bottom => (Some(0.0), None, None, Some(0.0), full, edge_size),
-        Edge::Left => (Some(0.0), Some(0.0), None, None, edge_size, full),
-        Edge::Right => (None, Some(0.0), Some(0.0), None, edge_size, full),
-        Edge::TopLeft => (Some(0.0), Some(0.0), None, None, corner, corner),
-        Edge::TopRight => (None, Some(0.0), Some(0.0), None, corner, corner),
-        Edge::BottomLeft => (Some(0.0), None, None, Some(0.0), corner, corner),
-        Edge::BottomRight => (None, None, Some(0.0), Some(0.0), corner, corner),
+        Edge::Top => (Some(px(0.0)), Some(px(0.0)), None, None, full, edge_size),
+        Edge::Bottom => (Some(px(0.0)), None, None, Some(px(0.0)), full, edge_size),
+        Edge::Left => (Some(px(0.0)), Some(px(0.0)), None, None, edge_size, full),
+        Edge::Right => (None, Some(px(0.0)), Some(px(0.0)), None, edge_size, full),
+        Edge::TopLeft => (Some(px(0.0)), Some(px(0.0)), None, None, corner, corner),
+        Edge::TopRight => (None, Some(px(0.0)), Some(px(0.0)), None, corner, corner),
+        Edge::BottomLeft => (Some(px(0.0)), None, None, Some(px(0.0)), corner, corner),
+        Edge::BottomRight => (None, None, Some(px(0.0)), Some(px(0.0)), corner, corner),
     };
     absolute_style(left, top, right, bottom, width, height)
 }

@@ -11,28 +11,31 @@ use windows::Win32::{
 };
 
 use crate::{
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalSize, px},
     window::Decorations,
 };
 
 pub(crate) const BASE_DPI: u32 = 96;
 
-pub(crate) const MIN_SIZE_LOGICAL: Size = Size::new(320.0, 200.0);
+pub(crate) const MIN_SIZE_LOGICAL: LogicalSize = LogicalSize::new(px(320.0), px(200.0));
 
-pub(crate) fn track_size(client: Size, dpi: u32, decorations: Decorations) -> (u32, u32) {
-    let scale = scale_from_dpi(dpi).unwrap_or(Scale::ONE);
+pub(crate) fn track_size(client: LogicalSize, dpi: u32, decorations: Decorations) -> (u32, u32) {
+    let scale = scale_from_dpi(dpi).unwrap_or(DevicePixelRatio::ONE);
     let physical = scale_client(client, scale);
     let window = window_size_for_client(physical, dpi, decorations);
     (window.0.max(1) as u32, window.1.max(1) as u32)
 }
 
-pub(crate) fn scale_from_dpi(dpi: u32) -> Option<Scale> {
-    Scale::new(dpi as f32 / BASE_DPI as f32)
+pub(crate) fn scale_from_dpi(dpi: u32) -> Option<DevicePixelRatio> {
+    DevicePixelRatio::new(dpi as f32 / BASE_DPI as f32)
 }
 
-pub(crate) fn physical_origin(origin: Point, scale: Scale) -> (i32, i32) {
-    let rect = Rect::new(origin.x, origin.y, 0.0, 0.0).to_physical_rounded(scale);
-    (rect.x0, rect.y0)
+pub(crate) fn physical_origin(origin: LogicalPoint, scale: DevicePixelRatio) -> (i32, i32) {
+    if !origin.is_finite() {
+        return (0, 0);
+    }
+    let point = scale.to_device_point(origin);
+    (point.x.value(), point.y.value())
 }
 
 pub(crate) fn system_dpi() -> u32 {
@@ -110,10 +113,15 @@ pub(crate) fn resize_border(dpi: u32) -> (i32, i32) {
     }
 }
 
-fn scale_client(client: Size, scale: Scale) -> (u32, u32) {
-    let width = (client.width.max(0.0) * scale.factor()).round();
-    let height = (client.height.max(0.0) * scale.factor()).round();
-    (width.max(0.0) as u32, height.max(0.0) as u32)
+fn scale_client(client: LogicalSize, scale: DevicePixelRatio) -> (u32, u32) {
+    let size = scale.to_device_size(LogicalSize::new(
+        client.width.max(LogicalPx::ZERO),
+        client.height.max(LogicalPx::ZERO),
+    ));
+    (
+        u32::try_from(size.width.value().max(0)).unwrap_or(u32::MAX),
+        u32::try_from(size.height.value().max(0)).unwrap_or(u32::MAX),
+    )
 }
 
 #[cfg(test)]
@@ -123,7 +131,7 @@ mod tests {
         track_size, window_origin_for_client, window_size_for_client,
     };
     use crate::{
-        math::{Point, Scale, Size},
+        math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalSize, dp, px},
         window::Decorations,
     };
 
@@ -181,7 +189,7 @@ mod tests {
             let (left, top) =
                 window_origin_for_client(client_origin, client, dpi, Decorations::Native);
             let (width, height) = window_size_for_client(client, dpi, Decorations::Native);
-            let window = crate::math::PhysicalRect::new(left, top, left + width, top + height);
+            let window = DeviceRect::new(dp(left), dp(top), dp(left + width), dp(top + height));
             assert!(
                 window.x0 <= client_origin.0
                     && window.y0 <= client_origin.1
@@ -199,17 +207,20 @@ mod tests {
     #[test]
     fn logical_origins_are_rounded_to_physical_pixels() {
         assert_eq!(
-            physical_origin(Point::new(150.0, 120.0), Scale::ONE),
+            physical_origin(
+                LogicalPoint::new(px(150.0), px(120.0)),
+                DevicePixelRatio::ONE
+            ),
             (150, 120)
         );
-        let scale = Scale::new(1.25).expect("scale");
+        let scale = DevicePixelRatio::new(1.25).expect("scale");
         assert_eq!(
-            physical_origin(Point::new(150.0, 120.0), scale),
+            physical_origin(LogicalPoint::new(px(150.0), px(120.0)), scale),
             (188, 150),
             "150×1.25=187.5 round 到 188；120×1.25=150"
         );
         assert_eq!(
-            physical_origin(Point::new(-150.0, -120.0), scale),
+            physical_origin(LogicalPoint::new(px(-150.0), px(-120.0)), scale),
             (-188, -150),
             "负坐标按 half away from zero 取整"
         );
@@ -219,8 +230,8 @@ mod tests {
     fn the_track_size_is_a_window_rect_for_the_logical_client_size() {
         let at_96 = track_size(MIN_SIZE_LOGICAL, 96, Decorations::Native);
         let client_96 = (
-            MIN_SIZE_LOGICAL.width as u32,
-            MIN_SIZE_LOGICAL.height as u32,
+            MIN_SIZE_LOGICAL.width.value() as u32,
+            MIN_SIZE_LOGICAL.height.value() as u32,
         );
         assert!(
             at_96.0 >= client_96.0 && at_96.1 >= client_96.1,
@@ -231,7 +242,11 @@ mod tests {
             "96 dpi 下也必须有边框/标题栏：{at_96:?}"
         );
 
-        let at_144 = track_size(Size::new(480.0, 300.0), 144, Decorations::Native);
+        let at_144 = track_size(
+            LogicalSize::new(px(480.0), px(300.0)),
+            144,
+            Decorations::Native,
+        );
         assert!(
             at_144.0 >= (480.0f32 * 1.5) as u32 && at_144.1 >= (300.0f32 * 1.5) as u32,
             "{at_144:?}"
@@ -246,15 +261,27 @@ mod tests {
             (320, 200)
         );
         assert_eq!(
-            track_size(Size::new(480.0, 300.0), 144, Decorations::None),
+            track_size(
+                LogicalSize::new(px(480.0), px(300.0)),
+                144,
+                Decorations::None
+            ),
             (720, 450)
         );
     }
 
     #[test]
     fn the_track_size_follows_the_requested_client_size() {
-        let small = track_size(Size::new(100.0, 80.0), 96, Decorations::Native);
-        let large = track_size(Size::new(1000.0, 800.0), 96, Decorations::Native);
+        let small = track_size(
+            LogicalSize::new(px(100.0), px(80.0)),
+            96,
+            Decorations::Native,
+        );
+        let large = track_size(
+            LogicalSize::new(px(1000.0), px(800.0)),
+            96,
+            Decorations::Native,
+        );
         assert!(
             small.0 < large.0 && small.1 < large.1,
             "更小的客户区必须得到更小的外框：{small:?} vs {large:?}"

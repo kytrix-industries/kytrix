@@ -11,7 +11,7 @@ use crate::{
         AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
         OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
     },
-    math::{PhysicalRect, Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{
         color::Color,
@@ -29,8 +29,8 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let mut app = App::new(rt.handle().clone());
     let window = app.create_window(WindowOptions {
         title: "p10".into(),
-        size: Size::new(400.0, 300.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(400.0), px(300.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -49,7 +49,7 @@ fn a_deep_layout_change_does_not_damage_the_whole_window() {
     let root = tree.root();
     let outer = NodeBuilder::boxed().build(tree, root).expect("mount");
     let inner = NodeBuilder::boxed().build(tree, outer).expect("mount");
-    let label = NodeBuilder::text("100.00", crate::text::TextStyle::new(12.0))
+    let label = NodeBuilder::text("100.00", crate::text::TextStyle::new(px(12.0)))
         .build(tree, inner)
         .expect("mount");
     frame(&mut app, window);
@@ -58,7 +58,7 @@ fn a_deep_layout_change_does_not_damage_the_whole_window() {
     let tree = app.window_mut(window).expect("window").tree_mut();
     tree.set_text_content(
         label,
-        crate::text::TextContent::new("1000000.00", crate::text::TextStyle::new(12.0)),
+        crate::text::TextContent::new("1000000.00", crate::text::TextStyle::new(px(12.0))),
     );
     frame(&mut app, window);
 
@@ -86,7 +86,7 @@ fn background() -> PaintSpec {
     }
 }
 
-fn mount_override(app: &mut App, window: WindowId, parent: NodeId, rect: Rect) -> NodeId {
+fn mount_override(app: &mut App, window: WindowId, parent: NodeId, rect: LogicalRect) -> NodeId {
     NodeBuilder::boxed()
         .layout_override(rect)
         .paint(background())
@@ -95,7 +95,7 @@ fn mount_override(app: &mut App, window: WindowId, parent: NodeId, rect: Rect) -
 }
 
 fn mount_scroll_container(app: &mut App, window: WindowId, height: f32) -> NodeId {
-    let mut style = StyleBuilder::new().size(200.0, height).build();
+    let mut style = StyleBuilder::new().size(px(200.0), px(height)).build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -116,19 +116,19 @@ fn wheel_events_in_one_frame_accumulate() {
             outer,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("content");
 
     for _ in 0..2 {
         app.dispatch_input(
             window,
             InputEvent::scroll_lines(
-                Point::new(50.0, 50.0),
-                Point::new(0.0, -1.0),
+                LogicalPoint::new(px(50.0), px(50.0)),
+                LogicalPoint::new(px(0.0), px(-1.0)),
                 Modifiers::empty(),
             ),
         );
@@ -141,7 +141,7 @@ fn wheel_events_in_one_frame_accumulate() {
         .tree()
         .scroll_slot(outer)
         .map(|slot| slot.offset.y);
-    assert_eq!(offset, Some(96.0), "两次滚轮必须累加（各 48 px）");
+    assert_eq!(offset, Some(px(96.0)), "两次滚轮必须累加（各 48 px）");
 }
 
 #[test]
@@ -155,22 +155,31 @@ fn non_finite_scroll_inputs_are_rejected() {
             outer,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    assert!(app.scroll_to(&handle, Point::new(f32::NAN, 0.0)).is_err());
     assert!(
-        app.scroll_to(&handle, Point::new(0.0, f32::INFINITY))
+        app.scroll_to(&handle, LogicalPoint::new(px(f32::NAN), px(0.0)))
             .is_err()
     );
     assert!(
-        app.set_scroll_content(&handle, crate::math::Size::new(f32::NAN, 100.0))
+        app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(f32::INFINITY)))
             .is_err()
     );
     assert!(
-        app.set_scroll_content(&handle, crate::math::Size::new(100.0, f32::INFINITY))
-            .is_err()
+        app.set_scroll_content(
+            &handle,
+            crate::math::LogicalSize::new(px(f32::NAN), px(100.0))
+        )
+        .is_err()
+    );
+    assert!(
+        app.set_scroll_content(
+            &handle,
+            crate::math::LogicalSize::new(px(100.0), px(f32::INFINITY))
+        )
+        .is_err()
     );
 }
 
@@ -179,7 +188,7 @@ fn non_positive_line_height_is_rejected() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 150.0);
     frame(&mut app, window);
-    for line_height in [0.0, -48.0, f32::NAN] {
+    for line_height in [px(0.0), px(-48.0), px(f32::NAN)] {
         let result = app.make_scroll(
             window,
             outer,
@@ -201,13 +210,13 @@ fn app_registered_geometry_reaches_the_encoder() {
         vertex_stride: stride as u32,
         index_type: crate::paint::geometry::IndexType::U16,
         topology: crate::paint::geometry::Topology::TriangleList,
-        bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
         pipeline: crate::paint::geometry::GeometryPipeline::Ui,
     };
     let id = app.geometry_mut().insert(desc).expect("valid geometry");
     let root = app.window(window).expect("window").tree().root();
     NodeBuilder::geometry(id)
-        .style(StyleBuilder::new().size(100.0, 100.0).build())
+        .style(StyleBuilder::new().size(px(100.0), px(100.0)).build())
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount geometry");
     frame(&mut app, window);
@@ -221,7 +230,7 @@ fn app_registered_geometry_reaches_the_encoder() {
     );
 }
 
-fn lane_quad_bounds(app: &App, window: WindowId, node: NodeId) -> Vec<Rect> {
+fn lane_quad_bounds(app: &App, window: WindowId, node: NodeId) -> Vec<LogicalRect> {
     let window = app.window(window).expect("window");
     let Some(lane) = window.tree().lane_of(node) else {
         return Vec::new();
@@ -246,7 +255,7 @@ fn click_dispatches_the_action_and_marks_only_the_target() {
     app.on_action(Action::custom("hit"), move |_ctx| seen.set(seen.get() + 1));
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(40.0)))
         .paint(background())
         .on_click(Action::custom("hit"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -268,7 +277,7 @@ fn click_dispatches_the_action_and_marks_only_the_target() {
     let down = app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -276,7 +285,7 @@ fn click_dispatches_the_action_and_marks_only_the_target() {
     let up = app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -313,7 +322,7 @@ fn enter_activates_the_focused_node() {
     });
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 50.0, 50.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(50.0), px(50.0)))
         .on_action(Action::custom("activate"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -373,12 +382,12 @@ fn tab_moves_focus_and_marks_a11y_only() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let first = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("a"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     let second = NodeBuilder::boxed()
-        .layout_override(Rect::new(60.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(60.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("b"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -425,11 +434,11 @@ fn focus_ring_marks_paint() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("a"))
         .focus_ring(FocusRing::new(
-            2.0,
-            2.0,
+            px(2.0),
+            px(2.0),
             Color::from_rgba8([0, 120, 255, 255]),
         ))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -452,7 +461,7 @@ fn focus_ring_marks_paint() {
 fn layout_change_reclamps_the_scroll_offset() {
     let (_rt, mut app, window, container, _child) = scrollable_app();
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.scroll_to(&handle, Point::new(0.0, 50.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(50.0)))
         .expect("scroll to the bottom");
     frame(&mut app, window);
     assert_eq!(
@@ -463,11 +472,11 @@ fn layout_change_reclamps_the_scroll_offset() {
             .expect("scroll slot")
             .offset
             .y,
-        50.0,
+        px(50.0),
         "滚到内容末尾"
     );
 
-    app.set_scroll_content(&handle, Size::new(200.0, 80.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(80.0)))
         .expect("content shrink");
     frame(&mut app, window);
     assert_eq!(
@@ -478,7 +487,7 @@ fn layout_change_reclamps_the_scroll_offset() {
             .expect("scroll slot")
             .offset
             .y,
-        0.0,
+        px(0.0),
         "内容变短后偏移必须被重新夹紧（旧实现会停在 50）"
     );
 }
@@ -489,13 +498,13 @@ fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) 
         &mut app,
         window,
         container,
-        Rect::new(0.0, 0.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)),
     );
     let _second = mount_override(
         &mut app,
         window,
         container,
-        Rect::new(0.0, 100.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(100.0), px(200.0), px(100.0)),
     );
     frame(&mut app, window);
     let handle = app
@@ -504,11 +513,11 @@ fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) 
             container,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(200.0, 200.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(200.0)))
         .expect("content");
     (rt, app, window, container, child)
 }
@@ -516,8 +525,8 @@ fn scrollable_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId, NodeId) 
 #[test]
 fn text_caret_rect_follows_ancestor_scroll() {
     let (_rt, mut app, window, container, _child) = scrollable_app();
-    let text = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
-        .layout_override(Rect::new(10.0, 20.0, 100.0, 20.0))
+    let text = NodeBuilder::text("abc", crate::text::TextStyle::new(px(16.0)))
+        .layout_override(LogicalRect::new(px(10.0), px(20.0), px(100.0), px(20.0)))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
             container,
@@ -530,7 +539,7 @@ fn text_caret_rect_follows_ancestor_scroll() {
         .text_caret_rect(text, 3)
         .expect("caret");
     let handle = app.scroll_handle(window, container).expect("scroll");
-    app.scroll_to(&handle, Point::new(0.0, 50.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(50.0)))
         .expect("scroll");
     frame(&mut app, window);
     let after = app
@@ -538,8 +547,8 @@ fn text_caret_rect_follows_ancestor_scroll() {
         .expect("window")
         .text_caret_rect(text, 3)
         .expect("caret");
-    assert!((after.origin.y - before.origin.y + 50.0).abs() < 0.01);
-    assert!((after.origin.x - before.origin.x).abs() < 0.01);
+    assert!((after.origin.y - before.origin.y + 50.0).abs() < px(0.01));
+    assert!((after.origin.x - before.origin.x).abs() < px(0.01));
 }
 
 #[test]
@@ -555,7 +564,7 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
         .expect("mount");
     app.window_mut(window)
         .expect("window")
-        .set_size(crate::math::Size::new(200.0, 150.0));
+        .set_size(crate::math::LogicalSize::new(px(200.0), px(150.0)));
     frame(&mut app, window);
     let handle = app
         .make_scroll(
@@ -563,11 +572,11 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
             container,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, crate::math::Size::new(200.0, 200.0))
+    app.set_scroll_content(&handle, crate::math::LogicalSize::new(px(200.0), px(200.0)))
         .expect("content");
     frame(&mut app, window);
     let offset = |app: &App| {
@@ -579,16 +588,20 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
             .offset
             .y
     };
-    app.scroll_to(&handle, Point::new(0.0, 50.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(50.0)))
         .expect("scroll");
     frame(&mut app, window);
-    assert_eq!(offset(&app), 50.0, "前置条件：视口 150 / 内容 200 ⇒ max 50");
+    assert_eq!(
+        offset(&app),
+        px(50.0),
+        "前置条件：视口 150 / 内容 200 ⇒ max 50"
+    );
 
     app.window_mut(window)
         .expect("window")
-        .set_size(crate::math::Size::new(200.0, 400.0));
+        .set_size(crate::math::LogicalSize::new(px(200.0), px(400.0)));
     frame(&mut app, window);
-    assert_eq!(offset(&app), 0.0, "resize 那一帧就必须夹紧");
+    assert_eq!(offset(&app), px(0.0), "resize 那一帧就必须夹紧");
 }
 
 #[cfg(feature = "test-support")]
@@ -596,7 +609,12 @@ fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
 fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     let (_rt, mut app, window, container, child) = scrollable_app();
     let root = app.window(window).expect("window").tree().root();
-    let fixed = mount_override(&mut app, window, root, Rect::new(300.0, 0.0, 40.0, 40.0));
+    let fixed = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(300.0), px(0.0), px(40.0), px(40.0)),
+    );
     let _ = app
         .window_mut(window)
         .expect("window")
@@ -611,7 +629,7 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     assert!(!child_before.is_empty() && !fixed_before.is_empty());
 
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.scroll_to(&handle, Point::new(0.0, 1.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(1.0)))
         .expect("scroll 1px");
     frame(&mut app, window);
 
@@ -635,7 +653,7 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
         record.paint_log.lanes.len()
     );
     assert!(!record.damage_full, "滚动只脏视口，不该退化成整帧");
-    let padded = crate::math::PhysicalRect::new(
+    let padded = crate::math::DeviceRect::new(
         viewport.x0 - 1,
         viewport.y0 - 1,
         viewport.x1 + 1,
@@ -658,7 +676,7 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     );
     assert_eq!(
         app.window(window).expect("window").scroll_slots()[1].0,
-        Point::new(0.0, 1.0),
+        LogicalPoint::new(px(0.0), px(1.0)),
         "偏移进槽位表"
     );
     let view = app.window(window).expect("window");
@@ -672,8 +690,8 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
 
 fn mount_nested_scroll_container(app: &mut App, window: WindowId, outer: NodeId) -> NodeId {
     let mut style = StyleBuilder::new()
-        .size(200.0, 100.0)
-        .margin_sides(300.0, 0.0, 0.0, 0.0)
+        .size(px(200.0), px(100.0))
+        .margin_sides(px(300.0), px(0.0), px(0.0), px(0.0))
         .build();
     style.clip = Clip::Bounds;
     NodeBuilder::boxed()
@@ -682,7 +700,7 @@ fn mount_nested_scroll_container(app: &mut App, window: WindowId, outer: NodeId)
         .expect("mount inner")
 }
 
-fn scroll_slot_of(app: &App, window: WindowId, node: NodeId) -> Option<(Point, PhysicalRect)> {
+fn scroll_slot_of(app: &App, window: WindowId, node: NodeId) -> Option<(LogicalPoint, DeviceRect)> {
     let view = app.window(window).expect("window");
     let slot = view.tree().scroll_slot_cached(node) as usize;
     view.scroll_slots().get(slot).copied()
@@ -704,7 +722,12 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 150.0);
     let inner = mount_nested_scroll_container(&mut app, window, outer);
-    let row = mount_override(&mut app, window, inner, Rect::new(0.0, 0.0, 200.0, 40.0));
+    let row = mount_override(
+        &mut app,
+        window,
+        inner,
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(40.0)),
+    );
     frame(&mut app, window);
     let outer_handle = app
         .make_scroll(
@@ -712,11 +735,11 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
             outer,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("outer scroll");
-    app.set_scroll_content(&outer_handle, Size::new(200.0, 800.0))
+    app.set_scroll_content(&outer_handle, LogicalSize::new(px(200.0), px(800.0)))
         .expect("outer content");
     let inner_handle = app
         .make_scroll(
@@ -724,11 +747,11 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
             inner,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("inner scroll");
-    app.set_scroll_content(&inner_handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&inner_handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("inner content");
     register_slots(&mut app, window, [outer, inner]);
     assert!(
@@ -736,20 +759,24 @@ fn a_nested_scroll_container_follows_the_outer_container_scroll() {
         "前置条件：内层滚动容器必须已登记槽位"
     );
 
-    app.scroll_to(&outer_handle, Point::new(0.0, 320.0))
+    app.scroll_to(&outer_handle, LogicalPoint::new(px(0.0), px(320.0)))
         .expect("outer scroll");
     frame(&mut app, window);
 
     let (offset, viewport) = scroll_slot_of(&app, window, inner).expect("inner slot");
-    assert_eq!(offset, Point::new(0.0, 0.0), "内层自身未滚动");
+    assert_eq!(
+        offset,
+        LogicalPoint::new(px(0.0), px(0.0)),
+        "内层自身未滚动"
+    );
     assert_eq!(
         viewport,
-        PhysicalRect::new(0, 0, 200, 80),
+        DeviceRect::new(dp(0), dp(0), dp(200), dp(80)),
         "内层槽位的屏幕裁剪区必须随外层滚动重算（旧裁剪区 = 首帧的空交集）"
     );
     assert_eq!(
         lane_quad_bounds(&app, window, row),
-        vec![Rect::new(0.0, -20.0, 200.0, 40.0)],
+        vec![LogicalRect::new(px(0.0), px(-20.0), px(200.0), px(40.0))],
         "内层行的烘焙偏移必须含外层位移（否则它停在旧坐标、被旧裁剪区剪掉）"
     );
 }
@@ -781,7 +808,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
             window,
             inner,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
@@ -799,11 +826,11 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
             page,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("page scroll");
-    app.set_scroll_content(&page_handle, Size::new(200.0, 800.0))
+    app.set_scroll_content(&page_handle, LogicalSize::new(px(200.0), px(800.0)))
         .expect("page content");
     register_slots(&mut app, window, [page, inner]);
     let rows = app
@@ -816,7 +843,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
         .clone();
     assert!(!rows.is_empty(), "前置条件：虚拟列表已挂载可见行");
 
-    app.scroll_to(&page_handle, Point::new(0.0, 320.0))
+    app.scroll_to(&page_handle, LogicalPoint::new(px(0.0), px(320.0)))
         .expect("page scroll");
     frame(&mut app, window);
 
@@ -832,7 +859,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
     let (_, viewport) = scroll_slot_of(&app, window, inner).expect("inner slot");
     assert_eq!(
         viewport,
-        PhysicalRect::new(0, 0, 200, 80),
+        DeviceRect::new(dp(0), dp(0), dp(200), dp(80)),
         "虚拟列表槽位的屏幕裁剪区必须随页面滚动重算"
     );
     let first_row = rows
@@ -842,7 +869,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
         .expect("第 0 行已挂载");
     assert_eq!(
         lane_quad_bounds(&app, window, first_row)[0],
-        Rect::new(0.0, -20.0, 200.0, 25.0),
+        LogicalRect::new(px(0.0), px(-20.0), px(200.0), px(25.0)),
         "行图元的烘焙偏移必须含页面位移"
     );
 }
@@ -859,10 +886,10 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
         &mut app,
         window,
         container,
-        Rect::new(0.0, 900.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(900.0), px(200.0), px(100.0)),
     );
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(1100.0)))
         .expect("content");
     frame(&mut app, window);
 
@@ -908,7 +935,7 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
         "Idle 帧仍必须保留 SceneDelta"
     );
 
-    app.scroll_to(&handle, Point::new(0.0, 900.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(900.0)))
         .expect("scroll");
     let scroll = app
         .window_mut(window)
@@ -941,16 +968,16 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
         &mut app,
         window,
         container,
-        Rect::new(0.0, 900.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(900.0), px(200.0), px(100.0)),
     );
     let fourth = mount_override(
         &mut app,
         window,
         container,
-        Rect::new(0.0, 1000.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(1000.0), px(200.0), px(100.0)),
     );
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(1100.0)))
         .expect("content");
     frame(&mut app, window);
     app.window_mut(window).expect("window").detach_composer();
@@ -1017,7 +1044,7 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
         "同一 lane 只能出现一次"
     );
 
-    app.scroll_to(&handle, Point::new(0.0, 900.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(900.0)))
         .expect("scroll");
     let report = app
         .window_mut(window)
@@ -1054,10 +1081,10 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
         &mut app,
         window,
         container,
-        Rect::new(0.0, 900.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(900.0), px(200.0), px(100.0)),
     );
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(1100.0)))
         .expect("content");
     frame(&mut app, window);
     app.window_mut(window).expect("window").detach_composer();
@@ -1149,12 +1176,12 @@ fn an_a11y_only_frame_still_runs_after_a_retained_delta() {
         &mut app,
         window,
         container,
-        Rect::new(0.0, 900.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(900.0), px(200.0), px(100.0)),
     );
     let label_signal = app.signal(smol_str::SmolStr::new_static("旧的"));
     let source = label_signal;
     let label = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 100.0, 20.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(20.0)))
         .paint(background())
         .bind_a11y(move |cx| crate::a11y::A11yPatch {
             label: Some(cx.read(&source).clone()),
@@ -1166,7 +1193,7 @@ fn an_a11y_only_frame_still_runs_after_a_retained_delta() {
         )
         .expect("a11y label");
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(1100.0)))
         .expect("content");
     frame(&mut app, window);
     let _ = app.a11y_take(window);
@@ -1244,10 +1271,10 @@ fn an_idle_frame_keeps_its_scene_delta_for_the_next_scroll_frame() {
         &mut app,
         window,
         container,
-        Rect::new(0.0, 900.0, 200.0, 100.0),
+        LogicalRect::new(px(0.0), px(900.0), px(200.0), px(100.0)),
     );
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.set_scroll_content(&handle, Size::new(200.0, 1100.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(1100.0)))
         .expect("content");
     frame(&mut app, window);
     app.window_mut(window).expect("window").detach_composer();
@@ -1290,7 +1317,7 @@ fn an_idle_frame_keeps_its_scene_delta_for_the_next_scroll_frame() {
         "保留的 delta 必须包含第三行的新图元"
     );
 
-    app.scroll_to(&handle, Point::new(0.0, 900.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(900.0)))
         .expect("scroll");
     let report = app
         .window_mut(window)
@@ -1338,10 +1365,10 @@ fn scrolling_moves_the_offset_into_the_slot_table_without_touching_lanes() {
     assert!(!before.is_empty(), "子节点必须有背景图元");
     let slots_before = app.window(window).expect("window").scroll_slots().to_vec();
     assert_eq!(slots_before.len(), 2, "哨兵 + 一个滚动容器");
-    assert_eq!(slots_before[1].0, Point::ZERO, "初始偏移为 0");
+    assert_eq!(slots_before[1].0, LogicalPoint::ZERO, "初始偏移为 0");
 
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.scroll_to(&handle, Point::new(0.0, 50.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(50.0)))
         .expect("scroll");
     frame(&mut app, window);
 
@@ -1354,7 +1381,7 @@ fn scrolling_moves_the_offset_into_the_slot_table_without_touching_lanes() {
     assert_eq!(slots_after.len(), 2, "槽位编号逐帧稳定");
     assert_eq!(
         slots_after[1].0,
-        Point::new(0.0, 50.0),
+        LogicalPoint::new(px(0.0), px(50.0)),
         "滚动位移进槽位表（正数 = 内容向负方向移动）"
     );
     assert!(
@@ -1375,7 +1402,7 @@ fn scrolling_moves_the_offset_into_the_slot_table_without_touching_lanes() {
     );
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset,
-        Point::new(0.0, 50.0)
+        LogicalPoint::new(px(0.0), px(50.0))
     );
 }
 
@@ -1383,7 +1410,7 @@ fn scrolling_moves_the_offset_into_the_slot_table_without_touching_lanes() {
 fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 150.0);
-    let mut inner_style = StyleBuilder::new().size(200.0, 100.0).build();
+    let mut inner_style = StyleBuilder::new().size(px(200.0), px(100.0)).build();
     inner_style.clip = Clip::Bounds;
     let inner = NodeBuilder::boxed()
         .style(inner_style)
@@ -1397,11 +1424,11 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
             outer,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("outer scrollable");
-    app.set_scroll_content(&outer_handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&outer_handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("outer content");
     let inner_handle = app
         .make_scroll(
@@ -1409,19 +1436,19 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
             inner,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("inner scrollable");
-    app.set_scroll_content(&inner_handle, Size::new(200.0, 100.0))
+    app.set_scroll_content(&inner_handle, LogicalSize::new(px(200.0), px(100.0)))
         .expect("inner content");
     frame(&mut app, window);
 
     app.dispatch_input(
         window,
         InputEvent::scroll_lines(
-            Point::new(50.0, 50.0),
-            Point::new(0.0, -1.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
             Modifiers::empty(),
         ),
     );
@@ -1439,12 +1466,12 @@ fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
     let outer_offset = offset_of(&app, outer);
     assert_eq!(
         inner_offset.map(|offset| offset.y),
-        Some(0.0),
+        Some(px(0.0)),
         "内层装得下内容，不得产生偏移"
     );
     assert_eq!(
         outer_offset.map(|offset| offset.y),
-        Some(48.0),
+        Some(px(48.0)),
         "滚轮必须穿透到能滚的外层容器"
     );
 }
@@ -1454,7 +1481,7 @@ fn scroll_commits_a_frame() {
     let (_rt, mut app, window, container, _child) = scrollable_app();
     let handle = app.scroll_handle(window, container).expect("scroll handle");
     let before = app.window(window).expect("window").frame_index();
-    app.scroll_to(&handle, Point::new(0.0, 30.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(30.0)))
         .expect("scroll");
     let outcome = frame(&mut app, window);
 
@@ -1470,12 +1497,13 @@ fn scroll_commits_a_frame() {
 fn same_offset_is_a_total_noop() {
     let (_rt, mut app, window, container, _child) = scrollable_app();
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.scroll_to(&handle, Point::new(0.0, 10.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(10.0)))
         .expect("scroll");
     frame(&mut app, window);
     let _ = app.take_wake_request();
 
-    app.scroll_to(&handle, Point::new(0.0, 10.0)).expect("same");
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(10.0)))
+        .expect("same");
 
     assert!(!app.take_wake_request(), "同值滚动不得唤醒");
 }
@@ -1488,17 +1516,17 @@ fn hit_test_follows_the_scroll_offset() {
         .window(window)
         .expect("window")
         .tree()
-        .hit_test(Point::new(50.0, 120.0))
+        .hit_test(LogicalPoint::new(px(50.0), px(120.0)))
         .map(|hit| hit.local_point);
     assert!(before.is_some(), "滚动前 (50,120) 命中第二个子节点");
 
-    app.scroll_to(&handle, Point::new(0.0, 50.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(50.0)))
         .expect("scroll");
     let after = app
         .window(window)
         .expect("window")
         .tree()
-        .hit_test(Point::new(50.0, 120.0))
+        .hit_test(LogicalPoint::new(px(50.0), px(120.0)))
         .map(|hit| hit.local_point);
 
     assert!(after.is_some(), "滚动后同一点仍命中内容");
@@ -1516,7 +1544,7 @@ fn scroll_never_reevaluates_bind_style() {
     let counter = calls.clone();
     let container = mount_scroll_container(&mut app, window, 100.0);
     let _child = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 200.0, 80.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(80.0)))
         .bind_style(move |_cx| {
             counter.set(counter.get() + 1);
             StylePatch::default()
@@ -1533,9 +1561,9 @@ fn scroll_never_reevaluates_bind_style() {
     let handle = app
         .make_scroll(window, container, ScrollConfig::default())
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("content");
-    app.scroll_to(&handle, Point::new(0.0, 20.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(20.0)))
         .expect("scroll");
     frame(&mut app, window);
 
@@ -1544,7 +1572,10 @@ fn scroll_never_reevaluates_bind_style() {
 
 fn virtual_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
     let (rt, mut app, window) = setup();
-    let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
+    let mut style = StyleBuilder::new()
+        .size(px(200.0), px(100.0))
+        .relative()
+        .build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -1564,7 +1595,7 @@ fn virtual_rows_carry_their_position_in_the_set() {
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
@@ -1612,7 +1643,7 @@ fn virtual_list_mounts_the_visible_window_and_recycles() {
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
@@ -1640,7 +1671,7 @@ fn virtual_list_mounts_the_visible_window_and_recycles() {
     assert_eq!(built.get(), 4, "只挂载可见行");
 
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.scroll_to(&handle, Point::new(0.0, 250.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(250.0)))
         .expect("scroll");
     frame(&mut app, window);
     let state = app.virtual_list_state(&list).expect("state");
@@ -1654,13 +1685,18 @@ fn anchor_placement_converges_with_a_root_border() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let mut root_style = Style::default();
-    root_style.border(1.0);
+    root_style.border(px(1.0));
     app.window_mut(window)
         .expect("window")
         .tree_mut()
         .set_style(root, root_style)
         .expect("root style");
-    let anchor = mount_override(&mut app, window, root, Rect::new(100.0, 100.0, 40.0, 20.0));
+    let anchor = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(100.0), px(100.0), px(40.0), px(20.0)),
+    );
     frame(&mut app, window);
 
     let overlay = app
@@ -1678,7 +1714,10 @@ fn anchor_placement_converges_with_a_root_border() {
         )
         .expect("overlay");
     let overlay_node = overlay.node();
-    let style = StyleBuilder::new().absolute().size(60.0, 30.0).build();
+    let style = StyleBuilder::new()
+        .absolute()
+        .size(px(60.0), px(30.0))
+        .build();
     app.window_mut(window)
         .expect("window")
         .tree_mut()
@@ -1696,7 +1735,7 @@ fn anchor_placement_converges_with_a_root_border() {
         .layout()
         .bounds;
     assert!(
-        (bounds.origin.x - 100.0).abs() < 0.5 && (bounds.origin.y - 124.0).abs() < 0.5,
+        (bounds.origin.x - 100.0).abs() < px(0.5) && (bounds.origin.y - 124.0).abs() < px(0.5),
         "浮层落点必须是窗口绝对坐标（Below: y = 100+20+4）：{bounds:?}"
     );
 
@@ -1713,7 +1752,12 @@ fn anchor_placement_converges_with_a_root_border() {
 fn anchored_above_overlay_sits_above_the_anchor() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let anchor = mount_override(&mut app, window, root, Rect::new(100.0, 100.0, 40.0, 20.0));
+    let anchor = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(100.0), px(100.0), px(40.0), px(20.0)),
+    );
     frame(&mut app, window);
 
     let overlay = app
@@ -1731,7 +1775,10 @@ fn anchored_above_overlay_sits_above_the_anchor() {
         )
         .expect("overlay");
     let overlay_node = overlay.node();
-    let style = StyleBuilder::new().absolute().size(60.0, 30.0).build();
+    let style = StyleBuilder::new()
+        .absolute()
+        .size(px(60.0), px(30.0))
+        .build();
     app.window_mut(window)
         .expect("window")
         .tree_mut()
@@ -1751,7 +1798,7 @@ fn anchored_above_overlay_sits_above_the_anchor() {
         .bounds;
     assert_eq!(
         (bounds.origin.x, bounds.origin.y, bounds.size.height),
-        (100.0, 66.0, 30.0),
+        (px(100.0), px(66.0), px(30.0)),
         "Above：y = 锚点顶 - gap - 自身高度（下边缘贴锚点），实际 {bounds:?}"
     );
 }
@@ -1760,13 +1807,18 @@ fn anchored_above_overlay_sits_above_the_anchor() {
 fn overlay_is_last_and_closes_on_outside_click() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let _background = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    let _background = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
+    );
     frame(&mut app, window);
     let overlay = app
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(200.0, 10.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(10.0))),
                 dismiss: OverlayDismiss::OutsideClick,
                 ..OverlayOptions::default()
             },
@@ -1775,9 +1827,9 @@ fn overlay_is_last_and_closes_on_outside_click() {
     let overlay_node = overlay.node();
     let style = StyleBuilder::new()
         .absolute()
-        .left(200.0)
-        .top(10.0)
-        .size(80.0, 80.0)
+        .left(px(200.0))
+        .top(px(10.0))
+        .size(px(80.0), px(80.0))
         .build();
     app.window_mut(window)
         .expect("window")
@@ -1801,7 +1853,7 @@ fn overlay_is_last_and_closes_on_outside_click() {
         app.window(window)
             .expect("window")
             .tree()
-            .hit_test(Point::new(210.0, 20.0))
+            .hit_test(LogicalPoint::new(px(210.0), px(20.0)))
             .map(|hit| hit.node),
         Some(overlay_node),
         "浮层优先命中"
@@ -1810,7 +1862,7 @@ fn overlay_is_last_and_closes_on_outside_click() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -1826,7 +1878,7 @@ fn dismiss_action_closes_the_topmost_overlay_including_explicit() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::ZERO),
+                placement: OverlayPlacement::Point(LogicalPoint::ZERO),
                 dismiss: OverlayDismiss::Explicit,
                 ..OverlayOptions::default()
             },
@@ -1853,7 +1905,7 @@ fn drag_streams_deltas_and_suppresses_the_click() {
     });
     let root = root_of(&app, window);
     let grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(6.0), px(100.0)))
         .on_drag(Action::custom("split"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -1862,7 +1914,7 @@ fn drag_streams_deltas_and_suppresses_the_click() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(102.0, 50.0),
+            LogicalPoint::new(px(102.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -1872,7 +1924,7 @@ fn drag_streams_deltas_and_suppresses_the_click() {
 
     let moved = app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(122.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(122.0), px(50.0)), Modifiers::empty()),
     );
     let state = app.drag_state(window).expect("drag session");
     assert_eq!(state.node(), grip);
@@ -1882,12 +1934,15 @@ fn drag_streams_deltas_and_suppresses_the_click() {
         "拖拽成立时请求指针捕获"
     );
     assert_eq!(moved.action, Some(Action::custom("split")));
-    assert!(app.drag(&state).is_some_and(|info| info.delta.x == 20.0));
+    assert!(
+        app.drag(&state)
+            .is_some_and(|info| info.delta.x == px(20.0))
+    );
 
     let up = app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(122.0, 50.0),
+            LogicalPoint::new(px(122.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -1903,7 +1958,12 @@ fn drag_streams_deltas_and_suppresses_the_click() {
 fn animation_ticks_write_the_transient_and_end_in_idle() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let node = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 40.0, 40.0));
+    let node = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)),
+    );
     frame(&mut app, window);
     let progress = app.transient(0.0_f32);
     let id = app
@@ -1954,7 +2014,7 @@ fn closed_window_returns_unknown_window() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::ZERO),
+                placement: OverlayPlacement::Point(LogicalPoint::ZERO),
                 dismiss: OverlayDismiss::Explicit,
                 ..OverlayOptions::default()
             },
@@ -1968,7 +2028,7 @@ fn closed_window_returns_unknown_window() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::ZERO),
+                placement: OverlayPlacement::Point(LogicalPoint::ZERO),
                 dismiss: OverlayDismiss::Explicit,
                 ..OverlayOptions::default()
             },
@@ -1994,16 +2054,16 @@ fn closed_window_returns_unknown_window() {
 fn hit_after_scrolling_50_lands_on_the_second_row() {
     let (_rt, mut app, window, container, _child) = scrollable_app();
     let handle = app.scroll_handle(window, container).expect("scroll handle");
-    app.scroll_to(&handle, Point::new(0.0, 50.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(50.0)))
         .expect("scroll");
 
     let hit = app
         .window(window)
         .expect("window")
         .tree()
-        .hit_test(Point::new(50.0, 60.0))
+        .hit_test(LogicalPoint::new(px(50.0), px(60.0)))
         .expect("hit");
-    assert_eq!(hit.local_point, Point::new(50.0, 10.0));
+    assert_eq!(hit.local_point, LogicalPoint::new(px(50.0), px(10.0)));
 }
 
 #[test]
@@ -2016,7 +2076,7 @@ fn overlay_outside_click_consumes_the_whole_press() {
     });
     let root = root_of(&app, window);
     let button = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)))
         .paint(background())
         .on_click(Action::custom("under"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -2025,7 +2085,7 @@ fn overlay_outside_click_consumes_the_whole_press() {
     app.create_overlay(
         window,
         OverlayOptions {
-            placement: OverlayPlacement::Point(Point::new(200.0, 10.0)),
+            placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(10.0))),
             dismiss: OverlayDismiss::OutsideClick,
             ..OverlayOptions::default()
         },
@@ -2036,7 +2096,7 @@ fn overlay_outside_click_consumes_the_whole_press() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2044,7 +2104,7 @@ fn overlay_outside_click_consumes_the_whole_press() {
     let up = app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2062,12 +2122,12 @@ fn stale_focus_is_cleared_and_tab_recovers() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let first = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("a"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     let second = NodeBuilder::boxed()
-        .layout_override(Rect::new(60.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(60.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("b"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2091,7 +2151,10 @@ fn stale_focus_is_cleared_and_tab_recovers() {
 #[test]
 fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
     let (_rt, mut app, window) = setup();
-    let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
+    let mut style = StyleBuilder::new()
+        .size(px(200.0), px(100.0))
+        .relative()
+        .build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -2104,7 +2167,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
@@ -2124,12 +2187,15 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
 
     app.window_mut(window)
         .expect("window")
-        .set_size(Size::new(400.0, 300.0));
+        .set_size(LogicalSize::new(px(400.0), px(300.0)));
     app.window_mut(window)
         .expect("window")
         .tree_mut()
         .set_style(container, {
-            let mut style = StyleBuilder::new().size(200.0, 200.0).relative().build();
+            let mut style = StyleBuilder::new()
+                .size(px(200.0), px(200.0))
+                .relative()
+                .build();
             style.clip = Clip::Bounds;
             style
         })
@@ -2147,7 +2213,10 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
 #[test]
 fn virtual_rows_are_laid_out_with_the_configured_extent() {
     let (_rt, mut app, window) = setup();
-    let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
+    let mut style = StyleBuilder::new()
+        .size(px(200.0), px(100.0))
+        .relative()
+        .build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -2160,7 +2229,7 @@ fn virtual_rows_are_laid_out_with_the_configured_extent() {
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
@@ -2194,11 +2263,12 @@ fn virtual_rows_are_laid_out_with_the_configured_extent() {
             .layout()
             .bounds;
         assert_eq!(
-            bounds.size.height, 25.0,
+            bounds.size.height,
+            px(25.0),
             "行 {index} 的高度必须等于 extent（实际 {bounds:?}）"
         );
         assert!(
-            bounds.size.width > 0.0,
+            bounds.size.width > px(0.0),
             "行 {index} 的宽度必须 > 0（实际 {bounds:?}）"
         );
     }
@@ -2214,7 +2284,7 @@ fn key_modifiers_reach_the_handler() {
     });
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_action(Action::custom("activate"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2237,7 +2307,12 @@ fn key_modifiers_reach_the_handler() {
 fn animation_retarget_replaces_the_previous_slot() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let node = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 40.0, 40.0));
+    let node = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)),
+    );
     frame(&mut app, window);
     let value = app.transient(0.0_f32);
     let spec = AnimationSpec {
@@ -2341,7 +2416,7 @@ fn pointer_cancel_ends_the_drag_without_committing_a_click() {
     let phases = Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = phases.clone();
     let grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(6.0), px(100.0)))
         .on_drag(Action::custom("split"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2355,14 +2430,14 @@ fn pointer_cancel_ends_the_drag_without_committing_a_click() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(102.0, 50.0),
+            LogicalPoint::new(px(102.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(160.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(160.0), px(50.0)), Modifiers::empty()),
     );
     assert!(app.drag_state(window).is_some(), "拖拽应已开始");
 
@@ -2388,7 +2463,7 @@ fn second_pointer_down_during_drag_is_ignored() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 6.0, 100.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(6.0), px(100.0)))
         .on_drag(Action::custom("split"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2398,20 +2473,20 @@ fn second_pointer_down_during_drag_is_ignored() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(102.0, 50.0),
+            LogicalPoint::new(px(102.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(130.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(130.0), px(50.0)), Modifiers::empty()),
     );
     let before = app.drag_state(window).expect("drag");
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(300.0, 200.0),
+            LogicalPoint::new(px(300.0), px(200.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2429,7 +2504,7 @@ fn moving_past_the_drag_threshold_suppresses_the_click() {
     app.on_action(Action::custom("hit"), move |_ctx| seen.set(seen.get() + 1));
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 100.0, 100.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(100.0)))
         .paint(background())
         .on_click(Action::custom("hit"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -2444,7 +2519,7 @@ fn moving_past_the_drag_threshold_suppresses_the_click() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2452,7 +2527,7 @@ fn moving_past_the_drag_threshold_suppresses_the_click() {
     let up = app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(40.0, 20.0),
+            LogicalPoint::new(px(40.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2474,7 +2549,7 @@ fn stale_scroll_handle_reports_stale_node() {
         .expect("remove");
 
     let error = app
-        .scroll_to(&handle, Point::new(0.0, 10.0))
+        .scroll_to(&handle, LogicalPoint::new(px(0.0), px(10.0)))
         .expect_err("节点已卸载");
     assert!(matches!(error, EngineError::StaleNode { node } if node == container));
 }
@@ -2541,7 +2616,7 @@ fn auto_repeat_neither_fires_bindings_nor_activation() {
     });
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_action(Action::custom("activate"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2580,12 +2655,12 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
     });
     let root = root_of(&app, window);
     let other = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("other"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     let target = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 60.0, 60.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(60.0), px(60.0)))
         .paint(background())
         .on_click(Action::custom("hit"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -2596,7 +2671,7 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(120.0, 20.0),
+            LogicalPoint::new(px(120.0), px(20.0)),
             PointerButton::Secondary,
             Modifiers::empty(),
         ),
@@ -2604,7 +2679,7 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
     let up = app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(120.0, 20.0),
+            LogicalPoint::new(px(120.0), px(20.0)),
             PointerButton::Secondary,
             Modifiers::empty(),
         ),
@@ -2617,7 +2692,7 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(120.0, 20.0),
+            LogicalPoint::new(px(120.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2625,7 +2700,7 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
     let up = app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(120.0, 20.0),
+            LogicalPoint::new(px(120.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2639,14 +2714,14 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
 fn hover_transitions_are_observable_and_mark_paint() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let outer_style = StyleBuilder::new().size(100.0, 100.0).build();
+    let outer_style = StyleBuilder::new().size(px(100.0), px(100.0)).build();
     let outer = NodeBuilder::boxed()
         .style(outer_style)
         .bind_style(|_| StylePatch::default())
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     let inner = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(40.0), px(40.0)))
         .bind_style(|_| StylePatch::default())
         .build(app.window_mut(window).expect("window").tree_mut(), outer)
         .expect("mount");
@@ -2659,7 +2734,7 @@ fn hover_transitions_are_observable_and_mark_paint() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(20.0, 20.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(20.0), px(20.0)), Modifiers::empty()),
     );
     assert_eq!(app.hovered(window), Some(inner), "悬停读点必须可用");
     let (hovered, entered, left) = app
@@ -2696,7 +2771,7 @@ fn hover_transitions_are_observable_and_mark_paint() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(500.0, 500.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(500.0), px(500.0)), Modifiers::empty()),
     );
     assert_eq!(app.hovered(window), None);
     let (_, entered, left) = app
@@ -2736,7 +2811,7 @@ fn a_press_below_the_drag_threshold_is_a_click() {
     });
     let root = root_of(&app, window);
     let grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 60.0, 100.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(60.0), px(100.0)))
         .on_click(Action::custom("click"))
         .on_drag(Action::custom("split"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -2751,21 +2826,21 @@ fn a_press_below_the_drag_threshold_is_a_click() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(120.0, 50.0),
+            LogicalPoint::new(px(120.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(121.0, 51.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(121.0), px(51.0)), Modifiers::empty()),
     );
     assert!(phases.take().is_empty(), "未越阈值不得派发 Drag");
     assert_eq!(app.drag_state(window), None);
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(121.0, 51.0),
+            LogicalPoint::new(px(121.0), px(51.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2784,13 +2859,13 @@ fn the_drag_start_waits_for_the_threshold_and_carries_the_real_delta() {
             && phase == DragPhase::Start
         {
             let mut list = seen.take();
-            list.push(delta.x);
+            list.push(delta.x.value());
             seen.set(list);
         }
     });
     let root = root_of(&app, window);
     let grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(100.0, 0.0, 60.0, 100.0))
+        .layout_override(LogicalRect::new(px(100.0), px(0.0), px(60.0), px(100.0)))
         .on_drag(Action::custom("split"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2800,7 +2875,7 @@ fn the_drag_start_waits_for_the_threshold_and_carries_the_real_delta() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(120.0, 50.0),
+            LogicalPoint::new(px(120.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -2811,12 +2886,12 @@ fn the_drag_start_waits_for_the_threshold_and_carries_the_real_delta() {
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(124.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(124.0), px(50.0)), Modifiers::empty()),
     );
     assert!(starts.take().is_empty(), "4 px 恰好不越阈值");
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(140.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(140.0), px(50.0)), Modifiers::empty()),
     );
     assert_eq!(starts.take(), vec![20.0], "Start 必须带真实位移");
     assert_eq!(app.take_capture_requests(), vec![(window, true)]);
@@ -2828,13 +2903,13 @@ fn pointer_capture_api_has_an_explicit_lifecycle() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     frame(&mut app, window);
 
     let stale = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     app.window_mut(window)
@@ -2864,7 +2939,7 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
     let (_rt, mut app, window) = setup();
     let container = scrollable_container(&mut app, window);
     let button = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("row"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -2878,11 +2953,11 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
             container,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("content");
     frame(&mut app, window);
     assert!(app.set_focus(window, Some(button)));
@@ -2897,7 +2972,7 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
     );
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset.y,
-        48.0,
+        px(48.0),
         "方向键默认滚动一行"
     );
     app.dispatch_input(
@@ -2913,7 +2988,10 @@ fn key_up_lands_and_arrow_keys_scroll_the_focused_container() {
         window,
         InputEvent::key_down(KeyCode::PageDown, Modifiers::empty()),
     );
-    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, 148.0);
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        px(148.0)
+    );
 
     let intercepted = Rc::new(Cell::new(0_u32));
     let seen = intercepted.clone();
@@ -2943,12 +3021,12 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let opener = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("opener"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     let background = NodeBuilder::boxed()
-        .layout_override(Rect::new(50.0, 0.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(50.0), px(0.0), px(40.0), px(40.0)))
         .on_click(Action::custom("background"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -2960,7 +3038,7 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(100.0, 100.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(100.0), px(100.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -2969,7 +3047,7 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
         )
         .expect("overlay");
     let first = NodeBuilder::boxed()
-        .layout_override(Rect::new(110.0, 110.0, 40.0, 20.0))
+        .layout_override(LogicalRect::new(px(110.0), px(110.0), px(40.0), px(20.0)))
         .on_click(Action::custom("first"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -2977,7 +3055,7 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
         )
         .expect("mount");
     let second = NodeBuilder::boxed()
-        .layout_override(Rect::new(160.0, 110.0, 40.0, 20.0))
+        .layout_override(LogicalRect::new(px(160.0), px(110.0), px(40.0), px(20.0)))
         .on_click(Action::custom("second"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -2997,7 +3075,7 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(5.0, 5.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(5.0), px(5.0)), Modifiers::empty()),
     );
     assert_eq!(
         app.focused(window),
@@ -3045,33 +3123,33 @@ fn pixel_scroll_follows_immediately_while_line_scroll_is_animated() {
             container,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("content");
     frame(&mut app, window);
 
     app.dispatch_input(
         window,
         InputEvent::scroll_lines(
-            Point::new(50.0, 50.0),
-            Point::new(0.0, -1.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
             Modifiers::empty(),
         ),
     );
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset.y,
-        0.0,
+        px(0.0),
         "行单位走动画（同帧内还没动）"
     );
 
     app.dispatch_input(
         window,
         InputEvent::Scroll {
-            position: Point::new(50.0, 50.0),
-            delta: Point::new(0.0, -30.0),
+            position: LogicalPoint::new(px(50.0), px(50.0)),
+            delta: LogicalPoint::new(px(0.0), px(-30.0)),
             unit: ScrollUnit::Pixel,
             phase: ScrollPhase::Update,
             modifiers: Modifiers::empty(),
@@ -3080,7 +3158,7 @@ fn pixel_scroll_follows_immediately_while_line_scroll_is_animated() {
     );
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset.y,
-        30.0,
+        px(30.0),
         "像素单位必须立即到位"
     );
 }
@@ -3090,7 +3168,7 @@ fn click_count_uses_the_event_time_stamp() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)))
         .paint(background())
         .on_click(Action::custom("hit"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -3106,7 +3184,7 @@ fn click_count_uses_the_event_time_stamp() {
         app.dispatch_input(
             window,
             InputEvent::pointer_down(
-                Point::new(20.0, 20.0),
+                LogicalPoint::new(px(20.0), px(20.0)),
                 PointerButton::Primary,
                 Modifiers::empty(),
             )
@@ -3115,7 +3193,7 @@ fn click_count_uses_the_event_time_stamp() {
         app.dispatch_input(
             window,
             InputEvent::pointer_up(
-                Point::new(20.0, 20.0),
+                LogicalPoint::new(px(20.0), px(20.0)),
                 PointerButton::Primary,
                 Modifiers::empty(),
             )
@@ -3136,7 +3214,7 @@ fn click_count_uses_the_event_time_stamp() {
 }
 
 fn scrollable_container(app: &mut App, window: WindowId) -> NodeId {
-    let mut style = StyleBuilder::new().size(100.0, 100.0).build();
+    let mut style = StyleBuilder::new().size(px(100.0), px(100.0)).build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -3156,7 +3234,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
     });
     let root = root_of(&app, window);
     let background = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 400.0, 300.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(400.0), px(300.0)))
         .on_click(Action::custom("background"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -3167,7 +3245,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -3176,7 +3254,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
         )
         .expect("modal");
     let confirm = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 80.0, 24.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(24.0)))
         .on_click(Action::custom("modal.confirm"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3187,7 +3265,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(5.0, 5.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(5.0), px(5.0)), Modifiers::empty()),
     );
     assert_eq!(app.focused(window), Some(confirm), "焦点必须移入模态");
 
@@ -3195,14 +3273,14 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
                 dismiss: OverlayDismiss::OutsideClick,
                 ..OverlayOptions::default()
             },
         )
         .expect("menu");
     let item = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
         .on_click(Action::custom("menu.item"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3211,7 +3289,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
         .expect("mount");
     frame(&mut app, window);
 
-    let position = Point::new(140.0, 78.0);
+    let position = LogicalPoint::new(px(140.0), px(78.0));
     assert_eq!(
         app.hit_at(window, position).map(|hit| hit.node),
         Some(item),
@@ -3239,7 +3317,7 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
     });
     let root = root_of(&app, window);
     let background_button = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 200.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)))
         .on_click(Action::custom("background"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -3250,7 +3328,7 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -3262,14 +3340,14 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
                 dismiss: OverlayDismiss::OutsideClick,
                 ..OverlayOptions::default()
             },
         )
         .expect("menu");
     let confirm = NodeBuilder::boxed()
-        .layout_override(Rect::new(30.0, 30.0, 60.0, 24.0))
+        .layout_override(LogicalRect::new(px(30.0), px(30.0), px(60.0), px(24.0)))
         .on_click(Action::custom("modal.confirm"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3277,7 +3355,7 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
         )
         .expect("mount");
     let item = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
         .on_click(Action::custom("menu.item"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3292,7 +3370,7 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
         "模态打开后作用域外的焦点视为无焦点"
     );
 
-    let position = Point::new(140.0, 78.0);
+    let position = LogicalPoint::new(px(140.0), px(78.0));
     assert_eq!(
         app.hit_at(window, position).map(|hit| hit.node),
         Some(item),
@@ -3322,7 +3400,7 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
     });
     let root = root_of(&app, window);
     let _background = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 200.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     frame(&mut app, window);
@@ -3332,7 +3410,7 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -3344,14 +3422,14 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
                 dismiss: OverlayDismiss::OutsideClick,
                 ..OverlayOptions::default()
             },
         )
         .expect("menu");
     let _confirm = NodeBuilder::boxed()
-        .layout_override(Rect::new(30.0, 30.0, 60.0, 24.0))
+        .layout_override(LogicalRect::new(px(30.0), px(30.0), px(60.0), px(24.0)))
         .on_click(Action::custom("modal.confirm"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3359,7 +3437,7 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
         )
         .expect("mount");
     let item = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
         .on_click(Action::custom("menu.item"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3368,7 +3446,7 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
         .expect("mount");
     frame(&mut app, window);
 
-    let position = Point::new(140.0, 78.0);
+    let position = LogicalPoint::new(px(140.0), px(78.0));
     assert_eq!(app.hit_at(window, position).map(|hit| hit.node), Some(item));
     app.dispatch_input(
         window,
@@ -3392,14 +3470,14 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
     });
     let root = root_of(&app, window);
     let chart = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 200.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     frame(&mut app, window);
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -3407,7 +3485,7 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -3419,7 +3497,7 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(40.0, 40.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(40.0), px(40.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -3428,7 +3506,7 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
         )
         .expect("modal");
     let ok = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
         .on_click(Action::custom("modal.ok"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3467,7 +3545,7 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
 
     let root = root_of(&app, window);
     let background = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 100.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(40.0)))
         .on_click(Action::custom("background"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -3478,7 +3556,7 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(200.0, 100.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(100.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
@@ -3487,7 +3565,7 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
         )
         .expect("modal");
     let ok = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
         .on_click(Action::custom("modal.ok"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3539,7 +3617,7 @@ fn removing_the_captured_node_releases_the_capture() {
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
     let handle = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 20.0, 20.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(20.0), px(20.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), panel)
         .expect("mount");
     frame(&mut app, window);
@@ -3579,28 +3657,31 @@ fn programmatic_scroll_cancels_a_pending_wheel_animation() {
             container,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("scrollable");
-    app.set_scroll_content(&handle, Size::new(100.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(100.0), px(400.0)))
         .expect("content");
     frame(&mut app, window);
 
     app.dispatch_input(
         window,
         InputEvent::scroll_lines(
-            Point::new(50.0, 50.0),
-            Point::new(0.0, -1.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
+            LogicalPoint::new(px(0.0), px(-1.0)),
             Modifiers::empty(),
         ),
     );
-    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, 0.0);
+    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, px(0.0));
     assert!(app.animations_running(window), "滚轮动画已登记");
 
-    app.scroll_to(&handle, Point::new(0.0, 300.0))
+    app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(300.0)))
         .expect("scroll");
-    assert_eq!(app.scroll_state(&handle).expect("state").offset.y, 300.0);
+    assert_eq!(
+        app.scroll_state(&handle).expect("state").offset.y,
+        px(300.0)
+    );
     assert!(
         !app.animations_running(window),
         "scroll_to 必须取消同槽动画"
@@ -3610,7 +3691,7 @@ fn programmatic_scroll_cancels_a_pending_wheel_animation() {
     frame(&mut app, window);
     assert_eq!(
         app.scroll_state(&handle).expect("state").offset.y,
-        300.0,
+        px(300.0),
         "残留动画不得回弹"
     );
 }
@@ -3620,8 +3701,8 @@ fn held_keys_are_per_window_and_cleared_on_close() {
     let (_rt, mut app, window) = setup();
     let other = app.create_window(WindowOptions {
         title: "other".into(),
-        size: Size::new(200.0, 200.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(200.0), px(200.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     frame(&mut app, window);
@@ -3658,7 +3739,7 @@ fn only_the_primary_button_drives_drag_sessions() {
     });
     let root = root_of(&app, window);
     let grip = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)))
         .on_drag(Action::custom("grip"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -3667,20 +3748,20 @@ fn only_the_primary_button_drives_drag_sessions() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             PointerButton::Secondary,
             Modifiers::empty(),
         ),
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(40.0, 10.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(40.0), px(10.0)), Modifiers::empty()),
     );
     assert_eq!(app.drag_state(window), None, "次键不得启动拖拽");
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(40.0, 10.0),
+            LogicalPoint::new(px(40.0), px(10.0)),
             PointerButton::Secondary,
             Modifiers::empty(),
         ),
@@ -3689,14 +3770,14 @@ fn only_the_primary_button_drives_drag_sessions() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(10.0, 10.0),
+            LogicalPoint::new(px(10.0), px(10.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
     );
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(40.0, 10.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(40.0), px(10.0)), Modifiers::empty()),
     );
     assert_eq!(
         app.drag_state(window).map(|state| state.node()),
@@ -3707,7 +3788,7 @@ fn only_the_primary_button_drives_drag_sessions() {
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(40.0, 10.0),
+            LogicalPoint::new(px(40.0), px(10.0)),
             PointerButton::Secondary,
             Modifiers::empty(),
         ),
@@ -3721,7 +3802,7 @@ fn only_the_primary_button_drives_drag_sessions() {
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(40.0, 10.0),
+            LogicalPoint::new(px(40.0), px(10.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -3734,7 +3815,7 @@ fn only_the_primary_button_drives_drag_sessions() {
 fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 100.0);
-    let mut inner_style = StyleBuilder::new().size(100.0, 50.0).build();
+    let mut inner_style = StyleBuilder::new().size(px(100.0), px(50.0)).build();
     inner_style.clip = Clip::Bounds;
     let inner = NodeBuilder::boxed()
         .style(inner_style)
@@ -3748,11 +3829,11 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             outer,
             ScrollConfig {
                 axis: ScrollAxis::Vertical,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("outer scrollable");
-    app.set_scroll_content(&outer_handle, Size::new(200.0, 400.0))
+    app.set_scroll_content(&outer_handle, LogicalSize::new(px(200.0), px(400.0)))
         .expect("outer content");
     let inner_handle = app
         .make_scroll(
@@ -3760,19 +3841,19 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             inner,
             ScrollConfig {
                 axis: ScrollAxis::Horizontal,
-                line_height: 48.0,
+                line_height: px(48.0),
             },
         )
         .expect("inner scrollable");
-    app.set_scroll_content(&inner_handle, Size::new(400.0, 50.0))
+    app.set_scroll_content(&inner_handle, LogicalSize::new(px(400.0), px(50.0)))
         .expect("inner content");
     frame(&mut app, window);
 
     app.dispatch_input(
         window,
         InputEvent::Scroll {
-            position: Point::new(20.0, 20.0),
-            delta: Point::new(-12.0, -3.0),
+            position: LogicalPoint::new(px(20.0), px(20.0)),
+            delta: LogicalPoint::new(px(-12.0), px(-3.0)),
             unit: ScrollUnit::Pixel,
             phase: ScrollPhase::Update,
             modifiers: Modifiers::empty(),
@@ -3784,7 +3865,7 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             .expect("inner state")
             .offset
             .x,
-        12.0,
+        px(12.0),
         "内层横向容器消费 dx"
     );
     assert_eq!(
@@ -3792,7 +3873,7 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
             .expect("outer state")
             .offset
             .y,
-        3.0,
+        px(3.0),
         "纵向分量必须传给外层容器"
     );
 }
@@ -3807,7 +3888,7 @@ fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable(
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(120.0), px(60.0))),
                 dismiss: OverlayDismiss::OutsideClick,
                 a11y: crate::a11y::A11yOverride {
                     role: Some(crate::a11y::A11yRole::Menu),
@@ -3840,7 +3921,7 @@ fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable(
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(20.0), px(20.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 a11y: crate::a11y::A11yOverride {
@@ -3858,7 +3939,7 @@ fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable(
         "模态作用域根必须可查询"
     );
     let confirm = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 80.0, 24.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(24.0)))
         .on_click(Action::custom("modal.confirm"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3897,13 +3978,18 @@ fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable(
 fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let trigger = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    let trigger = mount_override(
+        &mut app,
+        window,
+        root,
+        LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)),
+    );
     frame(&mut app, window);
     let _ = app.drain_events();
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(50.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(50.0)), Modifiers::empty()),
     );
     assert_eq!(app.hovered(window), Some(trigger));
     let _ = app.drain_events();
@@ -3912,7 +3998,7 @@ fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(200.0, 0.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(200.0), px(0.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 ..OverlayOptions::default()
@@ -3920,7 +4006,7 @@ fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
         )
         .expect("modal");
     let confirm = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(40.0)))
         .on_click(Action::custom("modal.confirm"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3951,7 +4037,7 @@ fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(60.0, 60.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(60.0), px(60.0)), Modifiers::empty()),
     );
     assert_eq!(app.hovered(window), None);
     assert!(
@@ -3963,7 +4049,7 @@ fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(215.0, 15.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(215.0), px(15.0)), Modifiers::empty()),
     );
     assert_eq!(app.hovered(window), Some(confirm), "模态内部的悬停必须正常");
 
@@ -3971,14 +4057,14 @@ fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(300.0, 100.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(300.0), px(100.0))),
                 dismiss: OverlayDismiss::OutsideClick,
                 ..OverlayOptions::default()
             },
         )
         .expect("menu");
     let item = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(100.0), px(20.0)))
         .on_click(Action::custom("menu.item"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -3988,7 +4074,7 @@ fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
     frame(&mut app, window);
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(320.0, 118.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(320.0), px(118.0)), Modifiers::empty()),
     );
     assert_eq!(
         app.hovered(window),
@@ -4012,7 +4098,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     });
     let root = root_of(&app, window);
     let background = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0)))
         .on_click(Action::custom("background"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -4023,7 +4109,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
         .create_overlay(
             window,
             OverlayOptions {
-                placement: OverlayPlacement::Point(Point::new(150.0, 50.0)),
+                placement: OverlayPlacement::Point(LogicalPoint::new(px(150.0), px(50.0))),
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 ..OverlayOptions::default()
@@ -4031,7 +4117,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
         )
         .expect("modal");
     let ok = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
         .on_click(Action::custom("modal.ok"))
         .build(
             app.window_mut(window).expect("window").tree_mut(),
@@ -4057,7 +4143,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(50.0, 50.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -4065,7 +4151,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(50.0, 50.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -4075,7 +4161,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(170.0, 70.0),
+            LogicalPoint::new(px(170.0), px(70.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -4083,7 +4169,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(170.0, 70.0),
+            LogicalPoint::new(px(170.0), px(70.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -4095,13 +4181,13 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(50.0, 50.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(50.0), px(50.0)), Modifiers::empty()),
     );
     assert_eq!(app.hovered(window), Some(background));
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(50.0, 50.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -4109,7 +4195,7 @@ fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
     app.dispatch_input(
         window,
         InputEvent::pointer_up(
-            Point::new(50.0, 50.0),
+            LogicalPoint::new(px(50.0), px(50.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),

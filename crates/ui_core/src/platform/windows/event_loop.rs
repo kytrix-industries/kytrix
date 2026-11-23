@@ -4,7 +4,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Rect, Scale},
+    math::{DevicePixelRatio, DeviceRect, LogicalRect},
     platform::{
         dispatcher::Dispatcher,
         event::{MessageContext, PlatformEvent, StampedEvent, TranslateState},
@@ -40,7 +40,7 @@ pub(crate) struct WndProcState {
     min_track_size: (u32, u32),
     max_track_size: Option<(u32, u32)>,
     limits: placement::ClientLimits,
-    scale: Scale,
+    scale: DevicePixelRatio,
     decorations: crate::window::Decorations,
     resize_border: (i32, i32),
     chrome_dirty: bool,
@@ -50,7 +50,7 @@ pub(crate) struct WndProcState {
     a11y: WindowsA11y,
     suppress_capture_cancel: bool,
     cursor: crate::paint::style::Cursor,
-    drag_regions: Vec<Rect>,
+    drag_regions: Vec<LogicalRect>,
     size_move: bool,
     modal_entries: u32,
     suppress_move: bool,
@@ -117,7 +117,7 @@ impl WndProcState {
         &self.dispatcher
     }
 
-    pub(crate) fn scale(&self) -> Scale {
+    pub(crate) fn scale(&self) -> DevicePixelRatio {
         self.scale
     }
 
@@ -125,7 +125,7 @@ impl WndProcState {
         self.translate.ime().is_composing()
     }
 
-    pub(crate) fn note_dpi(&mut self, dpi: u32, scale: Scale) {
+    pub(crate) fn note_dpi(&mut self, dpi: u32, scale: DevicePixelRatio) {
         self.scale = scale;
         let (min_track_size, max_track_size) = self.limits.track_sizes(dpi, self.decorations);
         self.min_track_size = min_track_size;
@@ -234,10 +234,7 @@ impl WndProcState {
         self.translate.ime_mut().plan_enabled(enabled)
     }
 
-    pub(crate) fn plan_ime_cursor_area(
-        &mut self,
-        area: Option<PhysicalRect>,
-    ) -> Option<ImeCommand> {
+    pub(crate) fn plan_ime_cursor_area(&mut self, area: Option<DeviceRect>) -> Option<ImeCommand> {
         self.translate.ime_mut().plan_cursor_area(area)
     }
 
@@ -273,11 +270,11 @@ impl WndProcState {
         self.cursor = cursor;
     }
 
-    pub(crate) fn drag_regions(&self) -> &[Rect] {
+    pub(crate) fn drag_regions(&self) -> &[LogicalRect] {
         &self.drag_regions
     }
 
-    pub(crate) fn set_drag_regions(&mut self, regions: &[Rect]) {
+    pub(crate) fn set_drag_regions(&mut self, regions: &[LogicalRect]) {
         if self.drag_regions == regions {
             return;
         }

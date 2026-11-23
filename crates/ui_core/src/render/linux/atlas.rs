@@ -767,6 +767,7 @@ mod tests {
 
     use super::AtlasUploads;
     use crate::{
+        math::dp,
         paint::atlas::AtlasKind,
         render::{
             atlas::DirtyRects,
@@ -785,11 +786,11 @@ mod tests {
 
     fn rows(y0: u32, y1: u32) -> DirtyRects {
         let mut rects = DirtyRects::default();
-        rects.mark(crate::math::PhysicalRect::new(
-            0,
-            y0 as i32,
-            i32::MAX,
-            y1 as i32,
+        rects.mark(crate::math::DeviceRect::new(
+            dp(0),
+            dp(y0 as i32),
+            dp(i32::MAX),
+            dp(y1 as i32),
         ));
         rects
     }
@@ -1233,7 +1234,7 @@ mod tests {
         submit_and_wait(&gpu, commands[0]);
 
         let mut rects = DirtyRects::default();
-        rects.mark(crate::math::PhysicalRect::new(4, 5, 8, 6));
+        rects.mark(crate::math::DeviceRect::new(dp(4), dp(5), dp(8), dp(6)));
         assert_eq!(rects.byte_count(TEST_PAGE, 4), 16, "AOI 载荷必须只有 16 B");
         assert_eq!(TEST_PAGE as usize * 4, 64, "旧语义要传 1 整行 = 16 × 4 B");
         let mut payload = Vec::with_capacity(16);

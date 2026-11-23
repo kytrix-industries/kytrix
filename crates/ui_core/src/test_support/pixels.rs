@@ -1,7 +1,7 @@
 use crate::{
     app::App,
     error::EngineError,
-    math::{PhysicalRect, Point, Scale},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint},
     paint::atlas::AtlasKind,
     render::{
         DirtyRects,
@@ -15,13 +15,13 @@ use crate::{
     window::{FrameIndex, Window},
 };
 
-pub type ScrollSlot = (Point, PhysicalRect);
+pub type ScrollSlot = (LogicalPoint, DeviceRect);
 
 pub fn render_offscreen(
     app: &App,
     window: &Window,
     size: (u32, u32),
-    scale: Scale,
+    scale: DevicePixelRatio,
     scroll: &[ScrollSlot],
 ) -> Result<SnapshotImage, EngineError> {
     let (offsets, clip) = scroll_payload(scroll, scale);
@@ -81,7 +81,10 @@ fn offscreen_gpu(size: (u32, u32)) -> Result<GpuRenderer, EngineError> {
     }
 }
 
-fn scroll_payload(scroll: &[ScrollSlot], scale: Scale) -> (Vec<[f32; 2]>, Vec<[i32; 4]>) {
+fn scroll_payload(
+    scroll: &[ScrollSlot],
+    scale: DevicePixelRatio,
+) -> (Vec<[f32; 2]>, Vec<[i32; 4]>) {
     let mut table = ScrollTable::new();
     let deltas: Vec<ScrollDelta> = scroll
         .iter()

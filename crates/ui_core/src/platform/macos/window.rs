@@ -26,7 +26,7 @@ use crate::{
     app::App,
     error::EngineError,
     event::{Event, ImeEvent},
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     paint::style::Cursor,
     platform::{
         dispatcher::Dispatcher,
@@ -115,7 +115,7 @@ impl WindowDelegate {
     }
 }
 
-pub(crate) const MIN_SIZE_LOGICAL: (f32, f32) = (320.0, 200.0);
+pub(crate) const MIN_SIZE_LOGICAL: LogicalSize = LogicalSize::new(px(320.0), px(200.0));
 
 pub(crate) const fn unsupported_window_control(
     control: crate::window::WindowControl,
@@ -202,7 +202,7 @@ fn hand_key_to_another_modal(owner: &NSWindow, closing: &NSWindow) {
 fn cascade_content_origin(
     mtm: MainThreadMarker,
     screens: &[placement::ScreenArea],
-    size: Size,
+    size: LogicalSize,
     index: usize,
 ) -> (f64, f64) {
     let Some(desktop) = placement::Desktop::from_screens(screens) else {
@@ -230,19 +230,19 @@ pub(crate) struct NativeWindow {
     owner: Option<OwnerWindow>,
     modal: bool,
     modal_registry: Rc<RefCell<ModalOwnerChromes>>,
-    scale: Scale,
-    logical_size: Size,
+    scale: DevicePixelRatio,
+    logical_size: LogicalSize,
     seen_scale: f64,
     seen_frame_rate: f32,
     seen_size: (f64, f64),
     was_key: bool,
     visible: bool,
     destroyed: bool,
-    ime_area: Option<Rect>,
+    ime_area: Option<LogicalRect>,
     title: SmolStr,
-    traffic_light_position: Option<Point>,
+    traffic_light_position: Option<LogicalPoint>,
     fullscreen: bool,
-    traffic_light_inset_cache: Option<Point>,
+    traffic_light_inset_cache: Option<LogicalPoint>,
     traffic_light_inset_refresh: bool,
     ime_enabled: bool,
     focus_lost: bool,
@@ -264,7 +264,10 @@ impl NativeWindow {
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable
             | NSWindowStyleMask::FullSizeContentView;
-        let size = Size::new(options.size.width.max(1.0), options.size.height.max(1.0));
+        let size = LogicalSize::new(
+            options.size.width.max(px(1.0)),
+            options.size.height.max(px(1.0)),
+        );
         let screens = screen_areas(mtm);
         let (content_x, content_y) = match options.position.filter(|position| position.is_finite())
         {
@@ -273,7 +276,10 @@ impl NativeWindow {
         };
         let rect = NSRect::new(
             NSPoint::new(content_x, content_y),
-            NSSize::new(f64::from(size.width), f64::from(size.height)),
+            NSSize::new(
+                f64::from(size.width.value()),
+                f64::from(size.height.value()),
+            ),
         );
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -298,19 +304,16 @@ impl NativeWindow {
         );
         window.setBackgroundColor(Some(&background));
         window.setAcceptsMouseMovedEvents(true);
-        let (min_size, max_size) = placement::content_size_bounds(
-            options.min_size,
-            options.max_size,
-            Size::new(MIN_SIZE_LOGICAL.0, MIN_SIZE_LOGICAL.1),
-        );
+        let (min_size, max_size) =
+            placement::content_size_bounds(options.min_size, options.max_size, MIN_SIZE_LOGICAL);
         window.setContentMinSize(NSSize::new(
-            f64::from(min_size.width),
-            f64::from(min_size.height),
+            f64::from(min_size.width.value()),
+            f64::from(min_size.height.value()),
         ));
         if let Some(max_size) = max_size {
             window.setContentMaxSize(NSSize::new(
-                f64::from(max_size.width),
-                f64::from(max_size.height),
+                f64::from(max_size.width.value()),
+                f64::from(max_size.height.value()),
             ));
         }
         window.setTabbingMode(NSWindowTabbingMode::Disallowed);
@@ -377,7 +380,7 @@ impl NativeWindow {
         self.seen_scale = factor;
         let size = self.view.frame().size;
         self.seen_size = (size.width, size.height);
-        self.logical_size = Size::new(size.width as f32, size.height as f32);
+        self.logical_size = LogicalSize::new(px(size.width as f32), px(size.height as f32));
         self.seen_content = self.content_rect_in_screen();
         Ok(())
     }
@@ -498,11 +501,11 @@ impl NativeWindow {
         }
     }
 
-    pub(crate) fn scale(&self) -> Scale {
+    pub(crate) fn scale(&self) -> DevicePixelRatio {
         self.scale
     }
 
-    pub(crate) fn logical_size(&self) -> Size {
+    pub(crate) fn logical_size(&self) -> LogicalSize {
         self.logical_size
     }
 
@@ -557,7 +560,7 @@ impl NativeWindow {
             || (size.height - self.seen_size.1).abs() > 0.5
         {
             self.seen_size = (size.width, size.height);
-            let logical = Size::new(size.width as f32, size.height as f32);
+            let logical = LogicalSize::new(px(size.width as f32), px(size.height as f32));
             self.logical_size = logical;
             if let Some(window) = app.window_mut(self.id) {
                 window.set_size(logical);
@@ -716,7 +719,7 @@ impl NativeWindow {
         rects
     }
 
-    fn traffic_light_inset(&self) -> Option<Point> {
+    fn traffic_light_inset(&self) -> Option<LogicalPoint> {
         macos_chrome::traffic_light_inset(&self.traffic_light_rects())
     }
 
@@ -755,8 +758,8 @@ impl NativeWindow {
         ) else {
             return;
         };
-        let dx = f64::from(target.x) - min_x;
-        let dy = f64::from(target.y) - min_y;
+        let dx = f64::from(target.x.value()) - min_x;
+        let dy = f64::from(target.y.value()) - min_y;
         if dx.abs() <= 0.5 && dy.abs() <= 0.5 {
             return;
         }
@@ -821,7 +824,7 @@ impl NativeWindow {
         self.view.set_cursor(cursor);
     }
 
-    pub(crate) fn sync_drag_regions(&self, regions: &[Rect]) {
+    pub(crate) fn sync_drag_regions(&self, regions: &[LogicalRect]) {
         self.view.set_drag_regions(regions);
     }
 

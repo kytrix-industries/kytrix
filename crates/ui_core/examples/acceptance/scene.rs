@@ -3,7 +3,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     interaction::{ScrollConfig, ScrollHandle},
-    math::{Point, Rect, Size, Transform},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{
         color::Color,
@@ -16,9 +16,9 @@ use ui_core::{
     window::WindowId,
 };
 
-pub const WINDOW_WIDTH: f32 = 1280.0;
-pub const WINDOW_HEIGHT: f32 = 800.0;
-pub const WINDOW_SIZE: Size = Size::new(WINDOW_WIDTH, WINDOW_HEIGHT);
+pub const WINDOW_WIDTH: LogicalPx = px(1280.0);
+pub const WINDOW_HEIGHT: LogicalPx = px(800.0);
+pub const WINDOW_SIZE: LogicalSize = LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
 
 pub const BOOK_ROWS: usize = 5_000;
 pub const BOOK_COLUMNS: usize = 8;
@@ -29,26 +29,39 @@ pub const TEXT_UPDATE_ROWS: usize = 125;
 
 pub const INCREMENTAL_ROWS: usize = 5;
 
-const HEADER_HEIGHT: f32 = 44.0;
-const SIDEBAR_WIDTH: f32 = 180.0;
+const HEADER_HEIGHT: LogicalPx = px(44.0);
+const SIDEBAR_WIDTH: LogicalPx = px(180.0);
 
-const BOOK_RECT: Rect = Rect::new(SIDEBAR_WIDTH, HEADER_HEIGHT, 520.0, 756.0);
-const CHART_RECT: Rect = Rect::new(700.0, HEADER_HEIGHT, 580.0, 420.0);
-const TAPE_RECT: Rect = Rect::new(700.0, 464.0, 580.0, 336.0);
+const BOOK_RECT: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(SIDEBAR_WIDTH, HEADER_HEIGHT),
+    LogicalSize::new(px(520.0), px(756.0)),
+);
+const CHART_RECT: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(px(700.0), HEADER_HEIGHT),
+    LogicalSize::new(px(580.0), px(420.0)),
+);
+const TAPE_RECT: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(px(700.0), px(464.0)),
+    LogicalSize::new(px(580.0), px(336.0)),
+);
 
-const BOOK_HEADER_HEIGHT: f32 = 44.0;
-const TAPE_HEADER_HEIGHT: f32 = 36.0;
-const BOOK_ROW_HEIGHT: f32 = 16.0;
-const TRADE_ROW_HEIGHT: f32 = 16.0;
-const BOOK_CELL_WIDTH: f32 = 65.0;
-const TRADE_CELL_WIDTH: f32 = 145.0;
-const TEXT_SIZE: f32 = 12.0;
+const BOOK_HEADER_HEIGHT: LogicalPx = px(44.0);
+const TAPE_HEADER_HEIGHT: LogicalPx = px(36.0);
+const BOOK_ROW_HEIGHT: LogicalPx = px(16.0);
+const TRADE_ROW_HEIGHT: LogicalPx = px(16.0);
+const BOOK_CELL_WIDTH: LogicalPx = px(65.0);
+const TRADE_CELL_WIDTH: LogicalPx = px(145.0);
+const TEXT_SIZE: LogicalPx = px(12.0);
 
-const CHART_PLOT: Rect = Rect::new(
-    CHART_RECT.origin.x + 8.0,
-    CHART_RECT.origin.y + 34.0,
-    CHART_RECT.size.width - 16.0,
-    CHART_RECT.size.height - 44.0,
+const CHART_PLOT: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(
+        px(CHART_RECT.origin.x.value() + 8.0),
+        px(CHART_RECT.origin.y.value() + 34.0),
+    ),
+    LogicalSize::new(
+        px(CHART_RECT.size.width.value() - 16.0),
+        px(CHART_RECT.size.height.value() - 44.0),
+    ),
 );
 
 const BG_RGBA: [u8; 4] = [0x0B, 0x0E, 0x13, 0xFF];
@@ -89,7 +102,7 @@ pub struct Load {
     trade_rows: Vec<Signal<TradeRow>>,
     pub chart: NodeId,
     tape_scroll: ScrollHandle,
-    chart_pan: f32,
+    chart_pan: LogicalPx,
     step: u32,
     trade_seq: u32,
 }
@@ -125,18 +138,18 @@ impl Load {
             app.make_scroll(window, handles.book_viewport, ScrollConfig::default())?;
         app.set_scroll_content(
             &book_scroll,
-            Size::new(
+            LogicalSize::new(
                 BOOK_RECT.size.width - 4.0,
-                BOOK_ROWS as f32 * BOOK_ROW_HEIGHT,
+                BOOK_ROW_HEIGHT * BOOK_ROWS as f32,
             ),
         )?;
         let tape_scroll =
             app.make_scroll(window, handles.tape_viewport, ScrollConfig::default())?;
         app.set_scroll_content(
             &tape_scroll,
-            Size::new(
+            LogicalSize::new(
                 TAPE_RECT.size.width - 4.0,
-                TRADE_ROWS as f32 * TRADE_ROW_HEIGHT,
+                TRADE_ROW_HEIGHT * TRADE_ROWS as f32,
             ),
         )?;
 
@@ -146,7 +159,7 @@ impl Load {
             trade_rows,
             chart: handles.chart,
             tape_scroll,
-            chart_pan: 0.0,
+            chart_pan: LogicalPx::ZERO,
             step: 0,
             trade_seq: TRADE_ROWS as u32,
         })
@@ -209,7 +222,7 @@ impl Load {
     }
 
     #[must_use]
-    pub fn chart_pan(&self) -> f32 {
+    pub fn chart_pan(&self) -> LogicalPx {
         self.chart_pan
     }
 
@@ -227,18 +240,18 @@ impl Load {
 
     fn scroll_tape(&mut self, app: &mut App) {
         let viewport = TAPE_RECT.size.height - TAPE_HEADER_HEIGHT - 4.0;
-        let content = TRADE_ROWS as f32 * TRADE_ROW_HEIGHT;
-        let max = (content - viewport).max(1.0);
-        let offset = (self.step as f32 * TRADE_ROW_HEIGHT) % max;
-        let _ = app.scroll_to(&self.tape_scroll, Point::new(0.0, offset));
+        let content = TRADE_ROW_HEIGHT * TRADE_ROWS as f32;
+        let max = (content - viewport).max(px(1.0));
+        let offset = px((TRADE_ROW_HEIGHT.value() * self.step as f32) % max.value());
+        let _ = app.scroll_to(&self.tape_scroll, LogicalPoint::new(px(0.0), offset));
     }
 
     fn pan_chart(&mut self, app: &mut App) {
-        self.chart_pan = f32::from((self.step % 16) as u8) * 0.5;
+        self.chart_pan = px(f32::from((self.step % 16) as u8) * 0.5);
         let _ = app.set_geometry_transform(
             self.window,
             self.chart,
-            Transform::translate(-self.chart_pan, 0.0),
+            Transform::translate(-self.chart_pan, px(0.0)),
         );
     }
 }
@@ -257,7 +270,7 @@ fn build_tree(
     let accent = Color::from_rgba8(ACCENT_RGBA);
 
     let _ = NodeBuilder::boxed()
-        .style(absolute_box(0.0, 0.0, WINDOW_WIDTH, WINDOW_HEIGHT))
+        .style(absolute_box(px(0.0), px(0.0), WINDOW_WIDTH, WINDOW_HEIGHT))
         .paint(PaintSpec {
             background: Color::from_rgba8(BG_RGBA),
             ..PaintSpec::default()
@@ -266,11 +279,11 @@ fn build_tree(
         .expect("背景");
 
     let header = NodeBuilder::boxed()
-        .style(absolute_box(0.0, 0.0, WINDOW_WIDTH, HEADER_HEIGHT))
+        .style(absolute_box(px(0.0), px(0.0), WINDOW_WIDTH, HEADER_HEIGHT))
         .paint(PaintSpec {
             background: card,
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: border,
             }),
             ..PaintSpec::default()
@@ -280,16 +293,16 @@ fn build_tree(
     label(
         tree,
         header,
-        Rect::new(16.0, 6.0, 560.0, 20.0),
+        LogicalRect::new(px(16.0), px(6.0), px(560.0), px(20.0)),
         "KYTRIX · 验收负载：盘口 5000 行 + 成交 500 笔 + 20 万点折线 + 固定头部/侧栏",
-        mono_style(13.0, text_color),
+        mono_style(px(13.0), text_color),
     );
     label(
         tree,
         header,
-        Rect::new(16.0, 26.0, 560.0, 14.0),
+        LogicalRect::new(px(16.0), px(26.0), px(560.0), px(14.0)),
         "1280x800 · 增量帧：5 行盘口 + 1 笔成交 + 折线平移 0.5px",
-        mono_style(11.0, muted),
+        mono_style(px(11.0), muted),
     );
     for (index, content) in ["FPS  60.00", "FRAME  0.42ms", "UPLOAD  128B"]
         .into_iter()
@@ -298,15 +311,20 @@ fn build_tree(
         label(
             tree,
             header,
-            Rect::new(1000.0 + index as f32 * 94.0, 14.0, 92.0, 16.0),
+            LogicalRect::new(
+                px(1000.0) + px(94.0) * index as f32,
+                px(14.0),
+                px(92.0),
+                px(16.0),
+            ),
             content,
-            mono_style(11.0, accent),
+            mono_style(px(11.0), accent),
         );
     }
 
     let sidebar = NodeBuilder::boxed()
         .style(absolute_box(
-            0.0,
+            px(0.0),
             HEADER_HEIGHT,
             SIDEBAR_WIDTH,
             WINDOW_HEIGHT - HEADER_HEIGHT,
@@ -314,7 +332,7 @@ fn build_tree(
         .paint(PaintSpec {
             background: card,
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: border,
             }),
             ..PaintSpec::default()
@@ -324,17 +342,22 @@ fn build_tree(
     label(
         tree,
         sidebar,
-        Rect::new(12.0, 10.0, 150.0, 18.0),
+        LogicalRect::new(px(12.0), px(10.0), px(150.0), px(18.0)),
         "导航",
-        mono_style(12.0, text_color),
+        mono_style(px(12.0), text_color),
     );
     for index in 0..20usize {
         label(
             tree,
             sidebar,
-            Rect::new(12.0, 36.0 + index as f32 * 20.0, 150.0, 16.0),
+            LogicalRect::new(
+                px(12.0),
+                px(36.0) + px(20.0) * index as f32,
+                px(150.0),
+                px(16.0),
+            ),
             &format_smolstr!("菜单项 {:02}", index + 1),
-            mono_style(11.0, muted),
+            mono_style(px(11.0), muted),
         );
     }
 
@@ -343,19 +366,19 @@ fn build_tree(
         label(
             tree,
             book,
-            Rect::new(
-                6.0 + column as f32 * BOOK_CELL_WIDTH,
-                26.0,
+            LogicalRect::new(
+                px(6.0) + BOOK_CELL_WIDTH * column as f32,
+                px(26.0),
                 BOOK_CELL_WIDTH - 4.0,
-                15.0,
+                px(15.0),
             ),
             name,
-            mono_style(11.0, muted),
+            mono_style(px(11.0), muted),
         );
     }
     let book_viewport = NodeBuilder::boxed()
         .style(viewport_style(
-            2.0,
+            px(2.0),
             BOOK_HEADER_HEIGHT,
             BOOK_RECT.size.width - 4.0,
             BOOK_RECT.size.height - BOOK_HEADER_HEIGHT - 4.0,
@@ -367,9 +390,9 @@ fn build_tree(
             let source = *signal;
             let initial = book_text(book_value(row, column, 0), column);
             let _ = NodeBuilder::text(initial, mono_style(TEXT_SIZE, text_color))
-                .layout_override(Rect::new(
-                    column as f32 * BOOK_CELL_WIDTH,
-                    row as f32 * BOOK_ROW_HEIGHT,
+                .layout_override(LogicalRect::new(
+                    BOOK_CELL_WIDTH * column as f32,
+                    BOOK_ROW_HEIGHT * row as f32,
                     BOOK_CELL_WIDTH - 4.0,
                     BOOK_ROW_HEIGHT - 2.0,
                 ))
@@ -386,12 +409,12 @@ fn build_tree(
     label(
         tree,
         chart_panel,
-        Rect::new(10.0, 22.0, 320.0, 14.0),
+        LogicalRect::new(px(10.0), px(22.0), px(320.0), px(14.0)),
         "每帧只改 per-draw 变换，顶点字节不重建",
-        mono_style(10.0, muted),
+        mono_style(px(10.0), muted),
     );
     let chart = NodeBuilder::geometry(chart_geometry)
-        .layout_override(Rect::new(
+        .layout_override(LogicalRect::new(
             CHART_PLOT.origin.x - CHART_RECT.origin.x,
             CHART_PLOT.origin.y - CHART_RECT.origin.y,
             CHART_PLOT.size.width,
@@ -409,19 +432,19 @@ fn build_tree(
         label(
             tree,
             tape,
-            Rect::new(
-                6.0 + column as f32 * TRADE_CELL_WIDTH,
-                18.0,
+            LogicalRect::new(
+                px(6.0) + TRADE_CELL_WIDTH * column as f32,
+                px(18.0),
                 TRADE_CELL_WIDTH - 4.0,
-                14.0,
+                px(14.0),
             ),
             name,
-            mono_style(11.0, muted),
+            mono_style(px(11.0), muted),
         );
     }
     let tape_viewport = NodeBuilder::boxed()
         .style(viewport_style(
-            2.0,
+            px(2.0),
             TAPE_HEADER_HEIGHT,
             TAPE_RECT.size.width - 4.0,
             TAPE_RECT.size.height - TAPE_HEADER_HEIGHT - 4.0,
@@ -433,9 +456,9 @@ fn build_tree(
             let source = *signal;
             let initial = trade_text(row as u32, column);
             let _ = NodeBuilder::text(initial, mono_style(TEXT_SIZE, text_color))
-                .layout_override(Rect::new(
-                    column as f32 * TRADE_CELL_WIDTH,
-                    row as f32 * TRADE_ROW_HEIGHT,
+                .layout_override(LogicalRect::new(
+                    TRADE_CELL_WIDTH * column as f32,
+                    TRADE_ROW_HEIGHT * row as f32,
                     TRADE_CELL_WIDTH - 4.0,
                     TRADE_ROW_HEIGHT - 2.0,
                 ))
@@ -455,7 +478,7 @@ fn build_tree(
     }
 }
 
-fn panel(tree: &mut NodeTree, root: NodeId, rect: Rect, title: &str) -> NodeId {
+fn panel(tree: &mut NodeTree, root: NodeId, rect: LogicalRect, title: &str) -> NodeId {
     let panel = NodeBuilder::boxed()
         .style(absolute_box(
             rect.origin.x,
@@ -466,10 +489,10 @@ fn panel(tree: &mut NodeTree, root: NodeId, rect: Rect, title: &str) -> NodeId {
         .paint(PaintSpec {
             background: Color::from_rgba8(CARD_RGBA),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: Color::from_rgba8(CARD_BORDER_RGBA),
             }),
-            corner_radius: [6.0; 4],
+            corner_radius: [px(6.0); 4],
             ..PaintSpec::default()
         })
         .build(tree, root)
@@ -477,14 +500,14 @@ fn panel(tree: &mut NodeTree, root: NodeId, rect: Rect, title: &str) -> NodeId {
     label(
         tree,
         panel,
-        Rect::new(10.0, 4.0, rect.size.width - 20.0, 18.0),
+        LogicalRect::new(px(10.0), px(4.0), rect.size.width - 20.0, px(18.0)),
         title,
         mono_style(TEXT_SIZE, Color::from_rgba8(TEXT_RGBA)),
     );
     panel
 }
 
-fn label(tree: &mut NodeTree, parent: NodeId, rect: Rect, content: &str, style: TextStyle) {
+fn label(tree: &mut NodeTree, parent: NodeId, rect: LogicalRect, content: &str, style: TextStyle) {
     let _ = NodeBuilder::text(content, style)
         .layout_override(rect)
         .build(tree, parent)
@@ -529,14 +552,14 @@ pub fn trade_text(seq: u32, column: usize) -> SmolStr {
     }
 }
 
-fn mono_style(size: f32, color: Color) -> TextStyle {
+fn mono_style(size: LogicalPx, color: Color) -> TextStyle {
     TextStyle::new(size)
         .with_family(MONO_FAMILY)
         .with_color(color)
         .with_wrap(TextWrap::NoWrap)
 }
 
-fn absolute_box(left: f32, top: f32, width: f32, height: f32) -> Style {
+fn absolute_box(left: LogicalPx, top: LogicalPx, width: LogicalPx, height: LogicalPx) -> Style {
     StyleBuilder::new()
         .absolute()
         .left(left)
@@ -545,7 +568,7 @@ fn absolute_box(left: f32, top: f32, width: f32, height: f32) -> Style {
         .build()
 }
 
-fn viewport_style(left: f32, top: f32, width: f32, height: f32) -> Style {
+fn viewport_style(left: LogicalPx, top: LogicalPx, width: LogicalPx, height: LogicalPx) -> Style {
     let mut style = absolute_box(left, top, width, height);
     style.clip = Clip::Bounds;
     style
@@ -558,15 +581,16 @@ fn register_chart(app: &mut App) -> Result<GeometryId, EngineError> {
 
     let mut vertices = Vec::with_capacity(CHART_POINTS * 2 * VERTEX_BYTES);
     let mut indices = Vec::with_capacity(CHART_POINTS.saturating_sub(1) * 6 * 4);
-    let mut y = CHART_PLOT.size.height * 0.5;
-    let dx = CHART_PLOT.size.width / (CHART_POINTS - 1) as f32;
+    let height = CHART_PLOT.size.height.value();
+    let mut y = height * 0.5;
+    let dx = CHART_PLOT.size.width.value() / (CHART_POINTS - 1) as f32;
 
     for point in 0..CHART_POINTS {
         let noise = book_value(point, 3, 0);
         let delta = (noise % 2_001) as f32 / 1_000.0 - 1.0;
-        y = (y + delta * 1.8).clamp(0.0, CHART_PLOT.size.height);
-        let x = CHART_PLOT.origin.x + point as f32 * dx;
-        let center = CHART_PLOT.origin.y + y;
+        y = (y + delta * 1.8).clamp(0.0, height);
+        let x = CHART_PLOT.origin.x.value() + point as f32 * dx;
+        let center = CHART_PLOT.origin.y.value() + y;
         for offset in [-HALF_THICKNESS, HALF_THICKNESS] {
             vertices.extend_from_slice(&x.to_le_bytes());
             vertices.extend_from_slice(&(center + offset).to_le_bytes());
@@ -587,7 +611,7 @@ fn register_chart(app: &mut App) -> Result<GeometryId, EngineError> {
         vertex_stride: VERTEX_BYTES as u32,
         index_type: IndexType::U32,
         topology: Topology::TriangleList,
-        bounds: Rect::new(
+        bounds: LogicalRect::new(
             CHART_PLOT.origin.x - 16.0,
             CHART_PLOT.origin.y - 16.0,
             CHART_PLOT.size.width + 32.0,

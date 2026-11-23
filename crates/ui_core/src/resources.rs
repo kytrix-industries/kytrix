@@ -9,7 +9,7 @@ use tokio::sync::{
 
 use crate::{
     error::EngineError,
-    math::Size,
+    math::{DevicePixelRatio, LogicalPx, LogicalSize, PhysicalSize},
     node::id::{Arena, ArenaKey},
     paint::atlas::{AtlasKind, AtlasTile},
     platform::dispatcher::Dispatcher,
@@ -31,20 +31,17 @@ const DEFAULT_BYTE_BUDGET: u64 = 320 * 1024 * 1024;
 
 const MAX_CONCURRENT_DECODES: usize = 2;
 
-fn physical_target(logical: Size, scale: f32) -> Size {
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    Size::new(logical.width * scale, logical.height * scale)
+fn physical_target(logical: LogicalSize, scale: f32) -> PhysicalSize {
+    DevicePixelRatio::new(scale)
+        .unwrap_or(DevicePixelRatio::ONE)
+        .to_physical_size(logical)
 }
 
-fn sane_logical(logical: Size) -> Option<Size> {
+fn sane_logical(logical: LogicalSize) -> Option<LogicalSize> {
     (logical.width.is_finite()
-        && logical.width > 0.0
+        && logical.width > LogicalPx::ZERO
         && logical.height.is_finite()
-        && logical.height > 0.0)
+        && logical.height > LogicalPx::ZERO)
         .then_some(logical)
 }
 
@@ -55,11 +52,15 @@ fn probe_source(kind: SourceKind, bytes: &[u8]) -> Result<(u32, u32), DecodeCaus
     }
 }
 
-fn resolve_target(kind: SourceKind, target: Size, source: (u32, u32)) -> (u32, u32) {
+fn resolve_target(kind: SourceKind, target: PhysicalSize, source: (u32, u32)) -> (u32, u32) {
     match kind {
         SourceKind::Bitmap => image::resolve_target(target, source),
         SourceKind::Svg => svg::resolve_target(target, source),
     }
+}
+
+fn logical_target(target: LogicalSize) -> PhysicalSize {
+    DevicePixelRatio::ONE.to_physical_size(target)
 }
 
 fn decode_source(
@@ -355,7 +356,7 @@ struct PendingJob {
     target: (u32, u32),
     intrinsic: (u32, u32),
     kind: SourceKind,
-    logical: Option<Size>,
+    logical: Option<LogicalSize>,
 }
 
 impl ResourceCache {
@@ -429,16 +430,21 @@ impl ResourceCache {
     pub fn insert_at_size(
         &mut self,
         bytes: &[u8],
-        target: Size,
+        target: LogicalSize,
     ) -> Result<ResourceImage, EngineError> {
-        self.insert_inner(bytes, Some(target), SourceKind::Bitmap, None)
-            .map_err(|cause| EngineError::ResourceDecode { cause })
+        self.insert_inner(
+            bytes,
+            Some(logical_target(target)),
+            SourceKind::Bitmap,
+            None,
+        )
+        .map_err(|cause| EngineError::ResourceDecode { cause })
     }
 
     pub fn insert_for_display(
         &mut self,
         bytes: &[u8],
-        logical: Size,
+        logical: LogicalSize,
         scale: f32,
     ) -> Result<ResourceImage, EngineError> {
         self.insert_inner(
@@ -458,16 +464,16 @@ impl ResourceCache {
     pub fn insert_svg_at_size(
         &mut self,
         bytes: &[u8],
-        target: Size,
+        target: LogicalSize,
     ) -> Result<ResourceImage, EngineError> {
-        self.insert_inner(bytes, Some(target), SourceKind::Svg, None)
+        self.insert_inner(bytes, Some(logical_target(target)), SourceKind::Svg, None)
             .map_err(|cause| EngineError::ResourceDecode { cause })
     }
 
     pub fn insert_svg_for_display(
         &mut self,
         bytes: &[u8],
-        logical: Size,
+        logical: LogicalSize,
         scale: f32,
     ) -> Result<ResourceImage, EngineError> {
         self.insert_inner(
@@ -482,9 +488,9 @@ impl ResourceCache {
     fn insert_inner(
         &mut self,
         bytes: &[u8],
-        target: Option<Size>,
+        target: Option<PhysicalSize>,
         kind: SourceKind,
-        logical: Option<Size>,
+        logical: Option<LogicalSize>,
     ) -> Result<ResourceImage, DecodeCause> {
         let logical = logical.and_then(sane_logical);
         image::check_source_bytes(bytes.len())?;
@@ -534,7 +540,7 @@ impl ResourceCache {
         &mut self,
         owner: WindowId,
         bytes: &[u8],
-        target: Size,
+        target: LogicalSize,
     ) -> Result<ResourceImage, EngineError> {
         let image = self.insert_at_size(bytes, target)?;
         self.owners.entry(owner).or_default().push(image.id);
@@ -545,7 +551,7 @@ impl ResourceCache {
         &mut self,
         owner: WindowId,
         bytes: &[u8],
-        logical: Size,
+        logical: LogicalSize,
         scale: f32,
     ) -> Result<ResourceImage, EngineError> {
         let image = self.insert_svg_for_display(bytes, logical, scale)?;
@@ -585,20 +591,29 @@ impl ResourceCache {
         self.insert_async_inner(bytes, None, SourceKind::Bitmap, None)
     }
 
-    pub fn insert_async_at_size(&mut self, bytes: Bytes, target: Size) -> PendingResource {
-        self.insert_async_inner(bytes, Some(target), SourceKind::Bitmap, None)
+    pub fn insert_async_at_size(&mut self, bytes: Bytes, target: LogicalSize) -> PendingResource {
+        self.insert_async_inner(
+            bytes,
+            Some(logical_target(target)),
+            SourceKind::Bitmap,
+            None,
+        )
     }
 
-    pub fn insert_svg_async_at_size(&mut self, bytes: Bytes, target: Size) -> PendingResource {
-        self.insert_async_inner(bytes, Some(target), SourceKind::Svg, None)
+    pub fn insert_svg_async_at_size(
+        &mut self,
+        bytes: Bytes,
+        target: LogicalSize,
+    ) -> PendingResource {
+        self.insert_async_inner(bytes, Some(logical_target(target)), SourceKind::Svg, None)
     }
 
     fn insert_async_inner(
         &mut self,
         bytes: Bytes,
-        target: Option<Size>,
+        target: Option<PhysicalSize>,
         kind: SourceKind,
-        logical: Option<Size>,
+        logical: Option<LogicalSize>,
     ) -> PendingResource {
         if let Err(cause) = image::check_source_bytes(bytes.len()) {
             return self.push_failed(cause);
@@ -807,7 +822,7 @@ impl ResourceCache {
         target: (u32, u32),
         intrinsic: (u32, u32),
         kind: SourceKind,
-        logical: Option<Size>,
+        logical: Option<LogicalSize>,
     ) -> DecodeState {
         if let Some(image) = self.dedupe_hit(&source, target, kind) {
             return DecodeState::Ready(image);
@@ -850,7 +865,7 @@ impl ResourceCache {
         decoded: DecodedImage,
         target: (u32, u32),
         kind: SourceKind,
-        logical: Option<Size>,
+        logical: Option<LogicalSize>,
         intrinsic: (u32, u32),
     ) -> Result<ResourceImage, DecodeCause> {
         let color = decoded.color;
@@ -942,7 +957,7 @@ impl ResourceCache {
         key: ContentKey,
         target: (u32, u32),
         kind: SourceKind,
-        logical: Option<Size>,
+        logical: Option<LogicalSize>,
         intrinsic: (u32, u32),
     ) -> Result<ResourceImage, DecodeCause> {
         let (width, height) = (decoded.width, decoded.height);
@@ -1165,7 +1180,7 @@ mod tests {
     };
     use crate::{
         error::EngineError,
-        math::{PhysicalRect, Size},
+        math::{DeviceRect, LogicalSize, PhysicalSize, dp, physical_px, px},
         paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
         resources::image::{MAX_SOURCE_BYTES, MAX_SOURCE_DIM, MAX_SOURCE_PIXELS},
         window::WindowId,
@@ -1468,7 +1483,7 @@ mod tests {
             let y = (index / 3) * 600;
             cache
                 .pager
-                .mark_written(0, PhysicalRect::new(x, y, x + 34, y + 34));
+                .mark_written(0, DeviceRect::new(dp(x), dp(y), dp(x + 34), dp(y + 34)));
         }
         let rects = cache.take_dirty_rects();
         assert!(!rects.is_full(), "X4：9 块图片不得折叠成整页哨兵");
@@ -1599,7 +1614,7 @@ mod tests {
         assert_eq!(rects.rects().len(), 1);
         assert_eq!(
             rects.rects()[0],
-            PhysicalRect::new(0, 0, 16, 16),
+            DeviceRect::new(dp(0), dp(0), dp(16), dp(16)),
             "首次上传必须是整页（GPU 侧内容未定义）"
         );
         assert!(rects.covers_page(16));
@@ -1628,7 +1643,7 @@ mod tests {
         );
     }
 
-    fn image_region(cache: &ResourceCache, image: ResourceImage) -> PhysicalRect {
+    fn image_region(cache: &ResourceCache, image: ResourceImage) -> DeviceRect {
         cache.entries.get(image.id).expect("entry").padded
     }
 
@@ -1995,7 +2010,7 @@ mod tests {
         let mut cache = ResourceCache::with_page_for_test((128, 128));
         let bytes = quadrant_png(200, 100);
         let image = cache
-            .insert_at_size(&bytes, Size::new(40.0, 40.0))
+            .insert_at_size(&bytes, LogicalSize::new(px(40.0), px(40.0)))
             .expect("按目标尺寸插入 200x100 -> 40x40");
 
         assert_eq!(
@@ -2037,7 +2052,7 @@ mod tests {
         let mut cache = ResourceCache::with_page_for_test((128, 128));
         let bytes = png(40, 20, [90, 120, 150, 255]);
         let image = cache
-            .insert_at_size(&bytes, Size::new(200.0, 200.0))
+            .insert_at_size(&bytes, LogicalSize::new(px(200.0), px(200.0)))
             .expect("目标大于源");
 
         assert_eq!(
@@ -2060,10 +2075,10 @@ mod tests {
         let mut cache = ResourceCache::with_page_for_test((128, 128));
         let bytes = png(200, 100, [30, 60, 90, 255]);
         let large = cache
-            .insert_at_size(&bytes, Size::new(80.0, 80.0))
+            .insert_at_size(&bytes, LogicalSize::new(px(80.0), px(80.0)))
             .expect("大缩略图");
         let small = cache
-            .insert_at_size(&bytes, Size::new(20.0, 20.0))
+            .insert_at_size(&bytes, LogicalSize::new(px(20.0), px(20.0)))
             .expect("小缩略图");
 
         assert_ne!(large.id, small.id, "不同 target 是不同的变体");
@@ -2096,7 +2111,7 @@ mod tests {
         assert_eq!(cache.stats().used_pixels, 20 * 10);
         assert_eq!(cache.source_bytes, bytes.len() as u64, "还有变体存活");
         let small_again = cache
-            .insert_at_size(&bytes, Size::new(20.0, 20.0))
+            .insert_at_size(&bytes, LogicalSize::new(px(20.0), px(20.0)))
             .expect("小变体仍存活，命中去重");
         assert_eq!(small_again, small, "同 (bytes, target) 去重命中");
         assert_eq!(cache.len(), 1);
@@ -2119,7 +2134,7 @@ mod tests {
         let mut cache = ResourceCache::with_page_for_test((64, 64));
         let bytes = png(200, 100, [10, 20, 30, 255]);
         let image = cache
-            .insert_at_size(&bytes, Size::new(40.0, 40.0))
+            .insert_at_size(&bytes, LogicalSize::new(px(40.0), px(40.0)))
             .expect("按目标尺寸插入");
         assert_eq!(cache.source_bytes, bytes.len() as u64);
         let page_bytes = 64 * 64 * 4;
@@ -2140,25 +2155,25 @@ mod tests {
         let mut cache = ResourceCache::with_page_for_test((256, 256));
         let wide = png(200, 100, [1, 2, 3, 255]);
         let hd = cache
-            .insert_for_display(&wide, Size::new(100.0, 50.0), 1.5)
+            .insert_for_display(&wide, LogicalSize::new(px(100.0), px(50.0)), 1.5)
             .expect("1.5x");
         assert_eq!((hd.width, hd.height), (150, 75));
 
         let square = png(100, 100, [7, 8, 9, 255]);
         let rounded = cache
-            .insert_for_display(&square, Size::new(30.2, 30.2), 2.0)
+            .insert_for_display(&square, LogicalSize::new(px(30.2), px(30.2)), 2.0)
             .expect("ceil 物理像素");
         assert_eq!((rounded.width, rounded.height), (61, 61));
 
         let small = png(40, 20, [4, 5, 6, 255]);
         let at_2x = cache
-            .insert_for_display(&small, Size::new(40.0, 20.0), 2.0)
+            .insert_for_display(&small, LogicalSize::new(px(40.0), px(20.0)), 2.0)
             .expect("2x");
         assert_eq!((at_2x.width, at_2x.height), (40, 20));
 
         for scale in [0.0f32, -2.0, f32::NAN, f32::INFINITY] {
             let defensive = cache
-                .insert_for_display(&small, Size::new(40.0, 20.0), scale)
+                .insert_for_display(&small, LogicalSize::new(px(40.0), px(20.0)), scale)
                 .expect("防御 scale");
             assert_eq!(
                 (defensive.width, defensive.height),
@@ -2177,7 +2192,8 @@ mod tests {
             Some(runtime.handle().clone()),
         );
         let bytes = png(200, 100, [12, 34, 56, 255]);
-        let pending = cache.insert_async_at_size(Bytes::from(bytes), Size::new(40.0, 40.0));
+        let pending =
+            cache.insert_async_at_size(Bytes::from(bytes), LogicalSize::new(px(40.0), px(40.0)));
         assert_eq!(
             cache.state(pending),
             DecodeState::Pending,
@@ -2194,7 +2210,7 @@ mod tests {
 
         let again = cache.insert_async_at_size(
             Bytes::from(png(200, 100, [12, 34, 56, 255])),
-            Size::new(40.0, 40.0),
+            LogicalSize::new(px(40.0), px(40.0)),
         );
         assert_eq!(
             cache.state(again),
@@ -2434,16 +2450,16 @@ mod tests {
         let mut cache = svg_cache();
         let bytes = svg(16.0, 16.0);
         let small = cache
-            .insert_svg_at_size(&bytes, Size::new(16.0, 16.0))
+            .insert_svg_at_size(&bytes, LogicalSize::new(px(16.0), px(16.0)))
             .expect("16px 栅格");
         assert_eq!((small.width, small.height), (16, 16));
         let large = cache
-            .insert_svg_at_size(&bytes, Size::new(32.0, 32.0))
+            .insert_svg_at_size(&bytes, LogicalSize::new(px(32.0), px(32.0)))
             .expect("32px 栅格");
         assert_eq!((large.width, large.height), (32, 32));
         assert_ne!(small.id, large.id, "不同物理尺寸必须是不同变体");
         let again = cache
-            .insert_svg_at_size(&bytes, Size::new(16.0, 16.0))
+            .insert_svg_at_size(&bytes, LogicalSize::new(px(16.0), px(16.0)))
             .expect("去重命中");
         assert_eq!(again.id, small.id, "同内容同尺寸必须命中已有变体");
         assert_eq!(cache.stats().entries, 2, "只应有两份变体");
@@ -2453,7 +2469,7 @@ mod tests {
     fn svg_resources_upscale_above_the_intrinsic_size() {
         let mut cache = svg_cache();
         let image = cache
-            .insert_svg_at_size(&svg(16.0, 16.0), Size::new(48.0, 48.0))
+            .insert_svg_at_size(&svg(16.0, 16.0), LogicalSize::new(px(48.0), px(48.0)))
             .expect("48px 栅格");
         assert_eq!(
             (image.width, image.height),
@@ -2466,7 +2482,7 @@ mod tests {
     fn svg_targets_keep_the_intrinsic_aspect_ratio() {
         let mut cache = svg_cache();
         let image = cache
-            .insert_svg_at_size(&svg(20.0, 10.0), Size::new(40.0, 40.0))
+            .insert_svg_at_size(&svg(20.0, 10.0), LogicalSize::new(px(40.0), px(40.0)))
             .expect("fit 栅格");
         assert_eq!(
             (image.width, image.height),
@@ -2480,7 +2496,7 @@ mod tests {
         let mut cache = svg_cache();
         let bytes = svg(16.0, 16.0);
         let one_x = cache
-            .insert_svg_for_display(&bytes, Size::new(16.0, 16.0), 1.0)
+            .insert_svg_for_display(&bytes, LogicalSize::new(px(16.0), px(16.0)), 1.0)
             .expect("1× 变体");
         assert_eq!((one_x.width, one_x.height), (16, 16));
         let two_x = cache.reselect(one_x.id, 2.0).expect("2× 变体");
@@ -2495,7 +2511,7 @@ mod tests {
         let mut cache = svg_cache();
         let bytes = png(80, 40, [200, 10, 10, 255]);
         let one_x = cache
-            .insert_for_display(&bytes, Size::new(40.0, 20.0), 1.0)
+            .insert_for_display(&bytes, LogicalSize::new(px(40.0), px(20.0)), 1.0)
             .expect("1× 变体");
         assert_eq!((one_x.width, one_x.height), (40, 20));
         let two_x = cache.reselect(one_x.id, 2.0).expect("2× 变体");
@@ -2528,12 +2544,18 @@ mod tests {
             (20, 10)
         );
         assert_eq!(
-            super::svg::resolve_target(Size::new(40.0, 40.0), (20, 10)),
+            super::svg::resolve_target(
+                PhysicalSize::new(physical_px(40.0), physical_px(40.0)),
+                (20, 10),
+            ),
             (40, 20),
             "目标解析必须等比"
         );
         assert_eq!(
-            super::svg::resolve_target(Size::new(20.0, 20.0), (16, 16)),
+            super::svg::resolve_target(
+                PhysicalSize::new(physical_px(20.0), physical_px(20.0)),
+                (16, 16),
+            ),
             (20, 20),
             "SVG 允许向上栅格"
         );

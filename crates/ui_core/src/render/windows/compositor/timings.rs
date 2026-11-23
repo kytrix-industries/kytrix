@@ -154,12 +154,15 @@ pub(super) fn elapsed_ns(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{PresentRetry, invalid_call_recovery};
-    use crate::{math::PhysicalRect, render::compositor::DamageRects};
+    use crate::{
+        math::{DeviceRect, dp},
+        render::compositor::DamageRects,
+    };
 
     #[test]
     fn invalid_call_only_has_a_safe_retry_for_incremental_frames() {
         let mut damage = DamageRects::new();
-        assert!(damage.push(PhysicalRect::new(0, 0, 8, 8)));
+        assert!(damage.push(DeviceRect::new(dp(0), dp(0), dp(8), dp(8))));
         assert_eq!(
             invalid_call_recovery(Some(&damage)),
             PresentRetry::FullRerecord,

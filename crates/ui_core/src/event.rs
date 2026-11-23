@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use crate::{
     interaction::DragPhase,
     layout::hit_test::HitResult,
-    math::{Point, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalSize, px},
     node::id::NodeId,
 };
 
@@ -359,45 +359,52 @@ impl GestureFlags {
 }
 
 #[must_use]
-pub fn scroll_delta(precise: bool, delta_x: f64, delta_y: f64) -> Option<(Point, ScrollUnit)> {
+pub fn scroll_delta(
+    precise: bool,
+    delta_x: f64,
+    delta_y: f64,
+) -> Option<(LogicalPoint, ScrollUnit)> {
     if precise {
         return Some((
-            Point::new(delta_x as f32, delta_y as f32),
+            LogicalPoint::new(px(delta_x as f32), px(delta_y as f32)),
             ScrollUnit::Pixel,
         ));
     }
     if delta_x == 0.0 && delta_y == 0.0 {
         return None;
     }
-    Some((Point::new(delta_x as f32, delta_y as f32), ScrollUnit::Line))
+    Some((
+        LogicalPoint::new(px(delta_x as f32), px(delta_y as f32)),
+        ScrollUnit::Line,
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     PointerEnter {
-        position: Point,
+        position: LogicalPoint,
         modifiers: Modifiers,
         timestamp: Instant,
     },
     PointerMove {
-        position: Point,
+        position: LogicalPoint,
         modifiers: Modifiers,
         timestamp: Instant,
     },
     PointerDown {
-        position: Point,
+        position: LogicalPoint,
         button: PointerButton,
         modifiers: Modifiers,
         timestamp: Instant,
     },
     PointerUp {
-        position: Point,
+        position: LogicalPoint,
         button: PointerButton,
         modifiers: Modifiers,
         timestamp: Instant,
     },
     PointerLeave {
-        position: Point,
+        position: LogicalPoint,
         modifiers: Modifiers,
         timestamp: Instant,
     },
@@ -405,8 +412,8 @@ pub enum InputEvent {
         timestamp: Instant,
     },
     Scroll {
-        position: Point,
-        delta: Point,
+        position: LogicalPoint,
+        delta: LogicalPoint,
         unit: ScrollUnit,
         phase: ScrollPhase,
         modifiers: Modifiers,
@@ -415,7 +422,7 @@ pub enum InputEvent {
     Magnify {
         factor: f32,
         phase: GesturePhase,
-        center: Point,
+        center: LogicalPoint,
         modifiers: Modifiers,
         timestamp: Instant,
     },
@@ -426,7 +433,7 @@ pub enum InputEvent {
         timestamp: Instant,
     },
     SmartMagnify {
-        center: Point,
+        center: LogicalPoint,
         modifiers: Modifiers,
         timestamp: Instant,
     },
@@ -445,7 +452,7 @@ pub enum InputEvent {
 
 impl InputEvent {
     #[must_use]
-    pub fn position(&self) -> Option<Point> {
+    pub fn position(&self) -> Option<LogicalPoint> {
         match self {
             Self::PointerEnter { position, .. }
             | Self::PointerMove { position, .. }
@@ -616,7 +623,7 @@ impl InputEvent {
     }
 
     #[must_use]
-    pub fn pointer_move(position: Point, modifiers: Modifiers) -> Self {
+    pub fn pointer_move(position: LogicalPoint, modifiers: Modifiers) -> Self {
         Self::PointerMove {
             position,
             modifiers,
@@ -625,7 +632,11 @@ impl InputEvent {
     }
 
     #[must_use]
-    pub fn pointer_down(position: Point, button: PointerButton, modifiers: Modifiers) -> Self {
+    pub fn pointer_down(
+        position: LogicalPoint,
+        button: PointerButton,
+        modifiers: Modifiers,
+    ) -> Self {
         Self::PointerDown {
             position,
             button,
@@ -635,7 +646,7 @@ impl InputEvent {
     }
 
     #[must_use]
-    pub fn pointer_up(position: Point, button: PointerButton, modifiers: Modifiers) -> Self {
+    pub fn pointer_up(position: LogicalPoint, button: PointerButton, modifiers: Modifiers) -> Self {
         Self::PointerUp {
             position,
             button,
@@ -645,7 +656,7 @@ impl InputEvent {
     }
 
     #[must_use]
-    pub fn scroll_lines(position: Point, delta: Point, modifiers: Modifiers) -> Self {
+    pub fn scroll_lines(position: LogicalPoint, delta: LogicalPoint, modifiers: Modifiers) -> Self {
         Self::Scroll {
             position,
             delta,
@@ -730,7 +741,7 @@ pub enum Event {
     Ime(ImeEvent),
     DpiChanged {
         dpi: u32,
-        scale: Scale,
+        scale: DevicePixelRatio,
     },
     AppearanceChanged {
         dark: bool,
@@ -739,10 +750,10 @@ pub enum Event {
         focused: bool,
     },
     Resized {
-        size: Size,
+        size: LogicalSize,
     },
     Moved {
-        position: Point,
+        position: LogicalPoint,
     },
     HoverChanged {
         hovered: Option<NodeId>,
@@ -776,7 +787,7 @@ pub enum ActionSource {
     Key,
     Drag {
         phase: DragPhase,
-        delta: Point,
+        delta: LogicalPoint,
     },
     Programmatic,
 }
@@ -813,7 +824,7 @@ mod tests {
         Modifiers, PointerButton, ScrollPhase, ScrollUnit, modifier_key_transitions,
         should_emit_text, timestamp_from_ticks, timestamp_from_ticks_32,
     };
-    use crate::math::Point;
+    use crate::math::{LogicalPoint, px};
 
     fn hash_of(action: &Action) -> u64 {
         let mut hasher = DefaultHasher::new();
@@ -824,13 +835,13 @@ mod tests {
     #[test]
     fn pointer_events_expose_their_position() {
         let event = InputEvent::PointerDown {
-            position: Point::new(12.5, 8.0),
+            position: LogicalPoint::new(px(12.5), px(8.0)),
             button: PointerButton::Primary,
             modifiers: Modifiers::SHIFT,
             timestamp: Instant::now(),
         };
 
-        assert_eq!(event.position(), Some(Point::new(12.5, 8.0)));
+        assert_eq!(event.position(), Some(LogicalPoint::new(px(12.5), px(8.0))));
         assert_eq!(event.modifiers(), Modifiers::SHIFT);
     }
 
@@ -851,12 +862,12 @@ mod tests {
     #[test]
     fn pointer_leave_keeps_the_leave_point() {
         let event = InputEvent::PointerLeave {
-            position: Point::new(3.0, 4.0),
+            position: LogicalPoint::new(px(3.0), px(4.0)),
             modifiers: Modifiers::empty(),
             timestamp: Instant::now(),
         };
 
-        assert_eq!(event.position(), Some(Point::new(3.0, 4.0)));
+        assert_eq!(event.position(), Some(LogicalPoint::new(px(3.0), px(4.0))));
     }
 
     #[test]
@@ -864,7 +875,7 @@ mod tests {
         let stamp = Instant::now();
         let events = [
             InputEvent::PointerMove {
-                position: Point::ZERO,
+                position: LogicalPoint::ZERO,
                 modifiers: Modifiers::empty(),
                 timestamp: stamp,
             },
@@ -881,8 +892,8 @@ mod tests {
                 timestamp: stamp,
             },
             InputEvent::Scroll {
-                position: Point::ZERO,
-                delta: Point::new(0.0, 1.0),
+                position: LogicalPoint::ZERO,
+                delta: LogicalPoint::new(px(0.0), px(1.0)),
                 unit: ScrollUnit::Line,
                 phase: ScrollPhase::Discrete,
                 modifiers: Modifiers::empty(),
@@ -1053,13 +1064,13 @@ mod tests {
     #[test]
     fn pointer_events_carry_modifiers() {
         let event = InputEvent::pointer_down(
-            Point::new(1.0, 2.0),
+            LogicalPoint::new(px(1.0), px(2.0)),
             PointerButton::Secondary,
             Modifiers::CONTROL | Modifiers::ALT,
         );
 
         assert_eq!(event.modifiers(), Modifiers::CONTROL | Modifiers::ALT);
-        assert_eq!(event.position(), Some(Point::new(1.0, 2.0)));
+        assert_eq!(event.position(), Some(LogicalPoint::new(px(1.0), px(2.0))));
     }
 
     #[test]
@@ -1106,8 +1117,8 @@ mod tests {
     #[test]
     fn scroll_events_carry_two_dimensional_deltas() {
         let event = InputEvent::scroll_lines(
-            Point::new(5.0, 5.0),
-            Point::new(-1.0, 2.0),
+            LogicalPoint::new(px(5.0), px(5.0)),
+            LogicalPoint::new(px(-1.0), px(2.0)),
             Modifiers::empty(),
         );
 
@@ -1117,7 +1128,7 @@ mod tests {
         else {
             panic!("必须是滚动事件");
         };
-        assert_eq!(delta, Point::new(-1.0, 2.0));
+        assert_eq!(delta, LogicalPoint::new(px(-1.0), px(2.0)));
         assert_eq!(unit, ScrollUnit::Line);
         assert_eq!(phase, ScrollPhase::Discrete);
     }
@@ -1127,8 +1138,8 @@ mod tests {
 mod gesture_tests {
     use std::time::Instant;
 
-    use super::{GestureFlags, GesturePhase, InputEvent, Point, ScrollUnit, scroll_delta};
-    use crate::event::Modifiers;
+    use super::{GestureFlags, GesturePhase, InputEvent, LogicalPoint, ScrollUnit, scroll_delta};
+    use crate::{event::Modifiers, math::px};
 
     fn flags(
         may_begin: bool,
@@ -1199,25 +1210,25 @@ mod gesture_tests {
     fn precise_scrolling_is_passed_through_as_pixels() {
         let (delta, unit) = scroll_delta(true, 3.5, -12.25).expect("precise 事件总是交付");
         assert_eq!(unit, ScrollUnit::Pixel);
-        assert_eq!(delta, Point::new(3.5, -12.25));
+        assert_eq!(delta, LogicalPoint::new(px(3.5), px(-12.25)));
     }
 
     #[test]
     fn a_zero_precise_scroll_still_carries_the_phase() {
         let (delta, unit) = scroll_delta(true, 0.0, 0.0).expect("phase 载体");
         assert_eq!(unit, ScrollUnit::Pixel);
-        assert_eq!(delta, Point::ZERO);
+        assert_eq!(delta, LogicalPoint::ZERO);
     }
 
     #[test]
     fn wheel_notches_are_passed_through_as_lines() {
         let (delta, unit) = scroll_delta(false, 0.0, 1.0).expect("离散滚轮一格");
         assert_eq!(unit, ScrollUnit::Line);
-        assert_eq!(delta, Point::new(0.0, 1.0));
+        assert_eq!(delta, LogicalPoint::new(px(0.0), px(1.0)));
 
         let (delta, unit) = scroll_delta(false, -2.0, 3.0).expect("多格滚轮");
         assert_eq!(unit, ScrollUnit::Line);
-        assert_eq!(delta, Point::new(-2.0, 3.0));
+        assert_eq!(delta, LogicalPoint::new(px(-2.0), px(3.0)));
     }
 
     #[test]
@@ -1231,11 +1242,14 @@ mod gesture_tests {
         let magnify = InputEvent::Magnify {
             factor: 1.25,
             phase: GesturePhase::Update,
-            center: Point::new(40.0, 12.0),
+            center: LogicalPoint::new(px(40.0), px(12.0)),
             modifiers: Modifiers::SHIFT,
             timestamp: stamp,
         };
-        assert_eq!(magnify.position(), Some(Point::new(40.0, 12.0)));
+        assert_eq!(
+            magnify.position(),
+            Some(LogicalPoint::new(px(40.0), px(12.0)))
+        );
         assert_eq!(magnify.modifiers(), Modifiers::SHIFT);
         assert_eq!(magnify.timestamp(), stamp);
 
@@ -1249,11 +1263,11 @@ mod gesture_tests {
         assert_eq!(rotate.timestamp(), stamp);
 
         let smart = InputEvent::SmartMagnify {
-            center: Point::new(1.0, 2.0),
+            center: LogicalPoint::new(px(1.0), px(2.0)),
             modifiers: Modifiers::empty(),
             timestamp: stamp,
         };
-        assert_eq!(smart.position(), Some(Point::new(1.0, 2.0)));
+        assert_eq!(smart.position(), Some(LogicalPoint::new(px(1.0), px(2.0))));
 
         assert_eq!(magnify.with_timestamp(stamp).timestamp(), stamp);
         assert_eq!(rotate.with_timestamp(stamp).timestamp(), stamp);

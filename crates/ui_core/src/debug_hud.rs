@@ -6,7 +6,7 @@ use crate::{
     a11y::A11yOverride,
     error::EngineError,
     layout::hit_test::HitShape,
-    math::Rect,
+    math::{LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         color::Color,
@@ -18,13 +18,13 @@ use crate::{
     window::{FrameIndex, Window},
 };
 
-const WIDTH: f32 = 244.0;
-const HEIGHT: f32 = 200.0;
-const MARGIN: f32 = 12.0;
-const TEXT_X: f32 = 10.0;
-const TEXT_Y: f32 = 8.0;
-const LINE_HEIGHT: f32 = 16.0;
-const TEXT_WIDTH: f32 = 224.0;
+const WIDTH: LogicalPx = px(244.0);
+const HEIGHT: LogicalPx = px(200.0);
+const MARGIN: LogicalPx = px(12.0);
+const TEXT_X: LogicalPx = px(10.0);
+const TEXT_Y: LogicalPx = px(8.0);
+const LINE_HEIGHT: LogicalPx = px(16.0);
+const TEXT_WIDTH: LogicalPx = px(224.0);
 pub(crate) const LINES: usize = 11;
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -298,25 +298,25 @@ fn panel_paint() -> PaintSpec {
     PaintSpec {
         background: Color::from_rgba8([10, 14, 20, 220]),
         border: Some(Border {
-            width: 1.0,
+            width: px(1.0),
             color: Color::from_rgba8([55, 70, 88, 255]),
         }),
-        corner_radius: [8.0; 4],
+        corner_radius: [px(8.0); 4],
         ..PaintSpec::default()
     }
 }
 
 fn text_style() -> TextStyle {
-    TextStyle::new(11.5)
+    TextStyle::new(px(11.5))
         .with_line_height(1.3)
         .with_color(Color::from_rgba8([220, 226, 235, 255]))
         .with_wrap(TextWrap::NoWrap)
 }
 
-fn line_rect(index: usize) -> Rect {
-    Rect::new(
+fn line_rect(index: usize) -> LogicalRect {
+    LogicalRect::new(
         TEXT_X,
-        TEXT_Y + index as f32 * LINE_HEIGHT,
+        TEXT_Y + LINE_HEIGHT * (index as f32),
         TEXT_WIDTH,
         LINE_HEIGHT,
     )
@@ -435,15 +435,15 @@ mod tests {
         assert_eq!(style.inner().inset.left, LengthPercentageAuto::auto());
         assert_eq!(
             style.inner().inset.right,
-            LengthPercentageAuto::length(MARGIN)
+            LengthPercentageAuto::length(MARGIN.value())
         );
         assert_eq!(
             style.inner().inset.top,
-            LengthPercentageAuto::length(MARGIN)
+            LengthPercentageAuto::length(MARGIN.value())
         );
         assert_eq!(style.inner().inset.bottom, LengthPercentageAuto::auto());
-        assert_eq!(style.inner().size.width, Dimension::length(WIDTH));
-        assert_eq!(style.inner().size.height, Dimension::length(HEIGHT));
+        assert_eq!(style.inner().size.width, Dimension::length(WIDTH.value()));
+        assert_eq!(style.inner().size.height, Dimension::length(HEIGHT.value()));
     }
 
     #[test]

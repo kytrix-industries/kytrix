@@ -8,7 +8,7 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::A11yPatch,
     app::App,
-    math::{Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         color::{Color, ColorResolver},
@@ -18,7 +18,7 @@ use ui_core::{
     window::{WindowId, WindowOptions},
 };
 
-const VIEWPORT: Size = Size::new(800.0, 600.0);
+const VIEWPORT: LogicalSize = LogicalSize::new(px(800.0), px(600.0));
 
 const TEXT_GRID_ROWS: usize = 40;
 const TEXT_GRID_COLUMNS: usize = 8;
@@ -33,7 +33,7 @@ fn new_app(handle: &tokio::runtime::Handle) -> Fixture {
     let window = app.create_window(WindowOptions {
         title: SmolStr::new_static("bench"),
         size: VIEWPORT,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     Fixture { app, window }
@@ -47,10 +47,10 @@ fn mount_boxes(fixture: &mut Fixture, count: usize) -> Vec<NodeId> {
         let x = (index % 8) as f32 * 96.0;
         let y = (index / 8) as f32 * 32.0;
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(x, y, 90.0, 28.0))
+            .layout_override(LogicalRect::new(px(x), px(y), px(90.0), px(28.0)))
             .paint(PaintSpec {
                 background: Color::from_rgba8([0x00, 0x91, 0xFF, 0xFF]),
-                corner_radius: [4.0; 4],
+                corner_radius: [px(4.0); 4],
                 ..PaintSpec::default()
             })
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
@@ -69,8 +69,8 @@ fn mount_text(fixture: &mut Fixture, count: usize) -> Signal<SmolStr> {
     for index in 0..count {
         let y = index as f32 * 20.0;
         let source = text;
-        let _ = NodeBuilder::text("Kytrix benchmark 0123", TextStyle::new(13.0))
-            .layout_override(Rect::new(0.0, y, 400.0, 18.0))
+        let _ = NodeBuilder::text("Kytrix benchmark 0123", TextStyle::new(px(13.0)))
+            .layout_override(LogicalRect::new(px(0.0), px(y), px(400.0), px(18.0)))
             .bind_text(move |cx| (*cx.read(&source)).clone())
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
             .expect("bench text");
@@ -87,12 +87,12 @@ fn mount_text_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
             let source = text;
             let cell = format_smolstr!("{row},{column}");
             let initial = format_smolstr!("{cell} frame a");
-            let _ = NodeBuilder::text(initial, TextStyle::new(11.0))
-                .layout_override(Rect::new(
-                    column as f32 * 96.0,
-                    row as f32 * 14.0,
-                    92.0,
-                    13.0,
+            let _ = NodeBuilder::text(initial, TextStyle::new(px(11.0)))
+                .layout_override(LogicalRect::new(
+                    px(column as f32 * 96.0),
+                    px(row as f32 * 14.0),
+                    px(92.0),
+                    px(13.0),
                 ))
                 .bind_text(move |cx| format_smolstr!("{cell} {}", *cx.read(&source)))
                 .build(app.window_mut(*window).expect("window").tree_mut(), root)
@@ -110,7 +110,7 @@ fn mount_fanout(fixture: &mut Fixture, count: usize) -> Signal<u8> {
         let y = index as f32 * 12.0;
         let value = signal;
         let _ = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, y, 100.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(y), px(100.0), px(10.0)))
             .paint(PaintSpec {
                 background: Color::from_rgba8([0xFF, 0xFF, 0xFF, 0xFF]),
                 ..PaintSpec::default()
@@ -300,7 +300,7 @@ fn bench_frame_full(c: &mut Criterion) {
         .build()
         .expect("bench runtime");
     let handle = runtime.handle().clone();
-    let sizes = [VIEWPORT, Size::new(801.0, 601.0)];
+    let sizes = [VIEWPORT, LogicalSize::new(px(801.0), px(601.0))];
     let mut toggle = 0usize;
     c.bench_function("frame_full_512", |b| {
         b.iter_batched(
@@ -416,7 +416,7 @@ fn mount_a11y_label(fixture: &mut Fixture) -> Signal<SmolStr> {
     let root = app.window(*window).expect("window").tree().root();
     let source = label;
     let _ = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 160.0, 24.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(160.0), px(24.0)))
         .paint(PaintSpec {
             background: Color::from_rgba8([0x00, 0x91, 0xFF, 0xFF]),
             ..PaintSpec::default()
@@ -583,7 +583,7 @@ fn bench_frame_full_10k(c: &mut Criterion) {
         .build()
         .expect("bench runtime");
     let handle = runtime.handle().clone();
-    let sizes = [VIEWPORT, Size::new(801.0, 601.0)];
+    let sizes = [VIEWPORT, LogicalSize::new(px(801.0), px(601.0))];
     let mut toggle = 0usize;
     c.bench_function("frame_full_10k", |b| {
         b.iter_batched(
@@ -636,11 +636,11 @@ fn bench_scroll_1px(c: &mut Criterion) {
                     .expect("scroll viewport");
                 for index in 0..ROWS {
                     NodeBuilder::boxed()
-                        .layout_override(Rect::new(
-                            0.0,
-                            index as f32 * ROW_HEIGHT,
+                        .layout_override(LogicalRect::new(
+                            px(0.0),
+                            px(index as f32 * ROW_HEIGHT),
                             VIEWPORT.width,
-                            ROW_HEIGHT - 2.0,
+                            px(ROW_HEIGHT - 2.0),
                         ))
                         .paint(PaintSpec {
                             background: Color::from_rgba8([0x28, 0x2C, 0x34, 0xFF]),
@@ -657,7 +657,7 @@ fn bench_scroll_1px(c: &mut Criterion) {
                     .expect("scroll container");
                 app.set_scroll_content(
                     &scroll,
-                    Size::new(VIEWPORT.width, ROWS as f32 * ROW_HEIGHT),
+                    LogicalSize::new(VIEWPORT.width, px(ROWS as f32 * ROW_HEIGHT)),
                 )
                 .expect("scroll content");
                 let _ = app.frame(*window);
@@ -668,7 +668,7 @@ fn bench_scroll_1px(c: &mut Criterion) {
                 let y = if toggle.is_multiple_of(2) { 1.0 } else { 2.0 };
                 fixture
                     .app
-                    .scroll_to(&scroll, ui_core::math::Point::new(0.0, y))
+                    .scroll_to(&scroll, ui_core::math::LogicalPoint::new(px(0.0), px(y)))
                     .expect("scroll 1px");
                 let outcome = black_box(fixture.app.frame(fixture.window));
 
@@ -799,13 +799,13 @@ fn mount_digit_grid(fixture: &mut Fixture) -> Signal<SmolStr> {
             let source = text;
             let _ = NodeBuilder::text(
                 "1,234.56",
-                TextStyle::new(11.0).with_wrap(ui_core::text::TextWrap::NoWrap),
+                TextStyle::new(px(11.0)).with_wrap(ui_core::text::TextWrap::NoWrap),
             )
-            .layout_override(Rect::new(
-                column as f32 * 96.0,
-                row as f32 * 14.0,
-                92.0,
-                13.0,
+            .layout_override(LogicalRect::new(
+                px(column as f32 * 96.0),
+                px(row as f32 * 14.0),
+                px(92.0),
+                px(13.0),
             ))
             .bind_text(move |cx| (*cx.read(&source)).clone())
             .build(app.window_mut(*window).expect("window").tree_mut(), root)
@@ -1007,7 +1007,7 @@ fn bench_pump_composition_geometry(c: &mut Criterion) {
             });
         });
         group.bench_function(format!("cached_{windows_count}_windows"), |b| {
-            let key = (VIEWPORT, Scale::ONE);
+            let key = (VIEWPORT, DevicePixelRatio::ONE);
             let cached = key;
             b.iter(|| {
                 let mut hits = 0usize;

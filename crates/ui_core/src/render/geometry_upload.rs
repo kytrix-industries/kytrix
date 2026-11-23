@@ -258,7 +258,7 @@ mod tests {
         same_page, staging_layout,
     };
     use crate::{
-        math::{Rect, Transform},
+        math::{LogicalRect, Transform, px},
         paint::{
             geometry::{
                 GEOMETRY_PAGE_BYTES, GeometryDesc, GeometryId, GeometryPipeline, IndexType,
@@ -293,7 +293,7 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(64.0), px(100.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("注册几何");

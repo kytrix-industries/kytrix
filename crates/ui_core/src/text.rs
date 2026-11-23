@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::{
-    math::{Rect, Size},
+    math::{DevicePixelRatio, LogicalPx, LogicalRect, LogicalSize, px},
     paint::{color::Color, primitive::PositionedGlyph},
     resources::ResourceId,
 };
@@ -45,17 +45,17 @@ pub enum TextSlant {
 pub enum TextDecoration {
     Underline {
         color: Option<Color>,
-        thickness: f32,
+        thickness: LogicalPx,
     },
     Strikethrough {
         color: Option<Color>,
-        thickness: f32,
+        thickness: LogicalPx,
     },
 }
 
 impl TextDecoration {
     #[must_use]
-    pub const fn underline(thickness: f32) -> Self {
+    pub const fn underline(thickness: LogicalPx) -> Self {
         Self::Underline {
             color: None,
             thickness,
@@ -63,7 +63,7 @@ impl TextDecoration {
     }
 
     #[must_use]
-    pub const fn strikethrough(thickness: f32) -> Self {
+    pub const fn strikethrough(thickness: LogicalPx) -> Self {
         Self::Strikethrough {
             color: None,
             thickness,
@@ -86,7 +86,7 @@ impl TextDecoration {
     }
 
     #[must_use]
-    pub const fn thickness(self) -> f32 {
+    pub const fn thickness(self) -> LogicalPx {
         match self {
             Self::Underline { thickness, .. } | Self::Strikethrough { thickness, .. } => thickness,
         }
@@ -94,7 +94,8 @@ impl TextDecoration {
 
     #[must_use]
     pub fn is_visible(self) -> bool {
-        self.thickness().is_finite() && self.thickness() > 0.0
+        let thickness = self.thickness().value();
+        thickness.is_finite() && thickness > 0.0
     }
 
     pub(crate) fn hash_into(self, hasher: &mut ahash::AHasher) {
@@ -106,7 +107,7 @@ impl TextDecoration {
         };
         tag.hash(hasher);
         color.map(color_bits).hash(hasher);
-        thickness.to_bits().hash(hasher);
+        thickness.value().to_bits().hash(hasher);
     }
 }
 
@@ -142,11 +143,11 @@ pub enum TextLineBreak {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
-    pub size: f32,
+    pub size: LogicalPx,
     pub weight: u16,
     pub slant: TextSlant,
     pub line_height: Option<f32>,
-    pub letter_spacing: f32,
+    pub letter_spacing: LogicalPx,
     pub color: Color,
     pub alignment: TextAlign,
     pub wrap: TextWrap,
@@ -196,7 +197,7 @@ pub struct TextStyleExtras {
     pub locale: Option<SmolStr>,
     pub font_variations: Option<Box<FontVariationSet>>,
     pub stretch: Option<u16>,
-    pub word_spacing: Option<f32>,
+    pub word_spacing: Option<LogicalPx>,
     pub line_break: Option<TextLineBreak>,
     pub decoration: Option<TextDecoration>,
 }
@@ -246,11 +247,11 @@ impl TextFeature {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
-            size: 14.0,
+            size: px(14.0),
             weight: 400,
             slant: TextSlant::Normal,
             line_height: None,
-            letter_spacing: 0.0,
+            letter_spacing: LogicalPx::ZERO,
             color: Color::BLACK,
             alignment: TextAlign::Start,
             wrap: TextWrap::Wrap,
@@ -264,7 +265,7 @@ impl Default for TextStyle {
 
 impl TextStyle {
     #[must_use]
-    pub fn new(size: f32) -> Self {
+    pub fn new(size: LogicalPx) -> Self {
         Self {
             size,
             ..Self::default()
@@ -305,7 +306,7 @@ impl TextStyle {
     }
 
     #[must_use]
-    pub fn word_spacing(&self) -> Option<f32> {
+    pub fn word_spacing(&self) -> Option<LogicalPx> {
         self.extras.as_ref().and_then(|extras| extras.word_spacing)
     }
 
@@ -331,11 +332,11 @@ impl TextStyle {
 
     #[must_use]
     pub fn same_shaping_inputs(&self, other: &Self) -> bool {
-        self.size.to_bits() == other.size.to_bits()
+        self.size.value().to_bits() == other.size.value().to_bits()
             && self.weight == other.weight
             && self.slant == other.slant
             && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
-            && self.letter_spacing.to_bits() == other.letter_spacing.to_bits()
+            && self.letter_spacing.value().to_bits() == other.letter_spacing.value().to_bits()
             && self.wrap == other.wrap
             && self.direction == other.direction
             && self.overflow == other.overflow
@@ -362,7 +363,7 @@ impl TextStyle {
     }
 
     #[must_use]
-    pub const fn with_size(mut self, size: f32) -> Self {
+    pub const fn with_size(mut self, size: LogicalPx) -> Self {
         self.size = size;
         self
     }
@@ -392,7 +393,7 @@ impl TextStyle {
     }
 
     #[must_use]
-    pub const fn with_letter_spacing(mut self, spacing: f32) -> Self {
+    pub const fn with_letter_spacing(mut self, spacing: LogicalPx) -> Self {
         self.letter_spacing = spacing;
         self
     }
@@ -451,7 +452,7 @@ impl TextStyle {
     }
 
     #[must_use]
-    pub fn with_word_spacing(mut self, word_spacing: f32) -> Self {
+    pub fn with_word_spacing(mut self, word_spacing: LogicalPx) -> Self {
         self.extras_mut().word_spacing = Some(word_spacing);
         self
     }
@@ -472,11 +473,11 @@ impl TextStyle {
         use core::hash::Hash;
 
         self.family().hash(hasher);
-        self.size.to_bits().hash(hasher);
+        self.size.value().to_bits().hash(hasher);
         self.weight.hash(hasher);
         (self.slant as u8).hash(hasher);
         self.line_height.map(f32::to_bits).hash(hasher);
-        self.letter_spacing.to_bits().hash(hasher);
+        self.letter_spacing.value().to_bits().hash(hasher);
         (self.wrap as u8).hash(hasher);
         (self.direction as u8).hash(hasher);
         (self.overflow as u8).hash(hasher);
@@ -484,7 +485,9 @@ impl TextStyle {
         self.font_features().map(|set| set.as_slice()).hash(hasher);
         self.locale().hash(hasher);
         self.stretch().hash(hasher);
-        self.word_spacing().map(f32::to_bits).hash(hasher);
+        self.word_spacing()
+            .map(|value| value.value().to_bits())
+            .hash(hasher);
         self.line_break().map(|kind| kind as u8).hash(hasher);
         self.font_variations()
             .map(|set| {
@@ -730,7 +733,7 @@ pub enum InlineBoxPaint {
     },
     Quad {
         color: Color,
-        corner_radius: [f32; 4],
+        corner_radius: [LogicalPx; 4],
     },
 }
 
@@ -738,8 +741,8 @@ pub enum InlineBoxPaint {
 pub struct InlineBoxSpec {
     pub id: u64,
     pub index: usize,
-    pub size: Size,
-    pub baseline: Option<f32>,
+    pub size: LogicalSize,
+    pub baseline: Option<LogicalPx>,
     pub align: InlineAlign,
     pub paint: Option<InlineBoxPaint>,
 }
@@ -748,12 +751,12 @@ pub struct InlineBoxSpec {
 pub struct ShapedLine {
     pub text: SmolStr,
     pub lines: Vec<ShapedTextLine>,
-    pub width: f32,
-    pub height: f32,
-    pub first_baseline: Option<f32>,
+    pub width: LogicalPx,
+    pub height: LogicalPx,
+    pub first_baseline: Option<LogicalPx>,
     pub atlas_generation: u32,
     pub font_stack_version: u32,
-    pub scale: f32,
+    pub scale: DevicePixelRatio,
 }
 
 impl ShapedLine {
@@ -762,13 +765,13 @@ impl ShapedLine {
         text: SmolStr,
         generation: u32,
         font_stack_version: u32,
-        scale: f32,
+        scale: DevicePixelRatio,
     ) -> Self {
         Self {
             text,
             lines: Vec::new(),
-            width: 0.0,
-            height: 0.0,
+            width: LogicalPx::ZERO,
+            height: LogicalPx::ZERO,
             first_baseline: None,
             atlas_generation: generation,
             font_stack_version,
@@ -777,8 +780,8 @@ impl ShapedLine {
     }
 
     #[must_use]
-    pub fn size(&self) -> Size {
-        Size::new(self.width, self.height)
+    pub fn size(&self) -> LogicalSize {
+        LogicalSize::new(self.width, self.height)
     }
 
     pub fn glyph_runs(&self) -> impl Iterator<Item = &ShapedGlyphRun> + '_ {
@@ -794,16 +797,16 @@ impl ShapedLine {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShapedTextLine {
     pub text_range: Range<usize>,
-    pub baseline: f32,
-    pub line_height: f32,
-    pub advance: f32,
+    pub baseline: LogicalPx,
+    pub line_height: LogicalPx,
+    pub advance: LogicalPx,
     pub items: Vec<ShapedTextItem>,
     pub decorations: Vec<ShapedDecoration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapedDecoration {
-    pub rect: Rect,
+    pub rect: LogicalRect,
     pub color: Color,
 }
 
@@ -823,8 +826,8 @@ pub struct ShapedGlyphRun {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapedInlineBox {
     pub id: u64,
-    pub rect: Rect,
-    pub baseline: Option<f32>,
+    pub rect: LogicalRect,
+    pub baseline: Option<LogicalPx>,
 }
 
 #[must_use]
@@ -838,7 +841,7 @@ pub struct ShapedTextHandle {
     inline_boxes: Box<[ShapedInlineBox]>,
     generation: u32,
     eviction_epoch: u32,
-    scale: f32,
+    scale: DevicePixelRatio,
     lease: Arc<AtomicU64>,
 }
 
@@ -848,7 +851,7 @@ impl ShapedTextHandle {
         inline_boxes: Box<[ShapedInlineBox]>,
         generation: u32,
         eviction_epoch: u32,
-        scale: f32,
+        scale: DevicePixelRatio,
         lease: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -872,12 +875,12 @@ impl ShapedTextHandle {
     }
 
     #[must_use]
-    pub fn size(&self) -> Size {
+    pub fn size(&self) -> LogicalSize {
         self.line.size()
     }
 
     #[must_use]
-    pub fn scale(&self) -> f32 {
+    pub fn scale(&self) -> DevicePixelRatio {
         self.scale
     }
 
@@ -931,8 +934,8 @@ pub enum TextDiagnostic {
     },
     InlineBoxOverflow {
         id: u64,
-        width: f32,
-        available: f32,
+        width: LogicalPx,
+        available: LogicalPx,
     },
     SyntheticStyle {
         text_range: Range<usize>,
@@ -967,24 +970,27 @@ mod tests {
         FontStack, InlineAlign, InlineBoxSpec, ShapedLine, TextContent, TextDiagnostic, TextStyle,
         TextWrap,
     };
-    use crate::{math::Size, paint::color::Color};
+    use crate::{
+        math::{DevicePixelRatio, LogicalSize, px},
+        paint::color::Color,
+    };
 
     #[test]
     fn text_style_defaults_are_neutral() {
         let style = TextStyle::default();
 
-        assert_eq!(style.size, 14.0);
+        assert_eq!(style.size, px(14.0));
         assert_eq!(style.weight, 400);
         assert_eq!(style.alignment, super::TextAlign::Start);
         assert_eq!(style.wrap, TextWrap::Wrap);
         assert!(style.family().is_none());
         assert_eq!(style.color, Color::BLACK);
-        assert_eq!(style.letter_spacing, 0.0);
+        assert_eq!(style.letter_spacing, px(0.0));
     }
 
     #[test]
     fn text_style_is_value_semantics() {
-        let style = TextStyle::new(16.0).with_weight(700);
+        let style = TextStyle::new(px(16.0)).with_weight(700);
         let copy = style.clone();
         let changed = copy.with_color(Color::WHITE);
 
@@ -1021,9 +1027,9 @@ mod tests {
 
     #[test]
     fn text_content_equality_is_text_and_style() {
-        let a = TextContent::new("hi", TextStyle::new(12.0));
-        let b = TextContent::new("hi", TextStyle::new(12.0));
-        let c = TextContent::new("hi", TextStyle::new(13.0));
+        let a = TextContent::new("hi", TextStyle::new(px(12.0)));
+        let b = TextContent::new("hi", TextStyle::new(px(12.0)));
+        let c = TextContent::new("hi", TextStyle::new(px(13.0)));
 
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -1033,10 +1039,10 @@ mod tests {
     fn text_content_runs_are_ordered_and_normalized() {
         use super::TextRun;
 
-        let base = TextContent::new("a界b", TextStyle::new(16.0));
+        let base = TextContent::new("a界b", TextStyle::new(px(16.0)));
         assert!(base.runs().is_empty(), "默认无 runs");
 
-        let red = TextStyle::new(16.0).with_color(Color::WHITE);
+        let red = TextStyle::new(px(16.0)).with_color(Color::WHITE);
         let content = base.with_runs([
             TextRun::new(0..1, red.clone()),
             TextRun::new(1..2, red.clone()),
@@ -1055,7 +1061,7 @@ mod tests {
         assert_eq!(content.clone(), content, "runs 参与 TextContent 相等性");
         assert_ne!(
             content,
-            TextContent::new("a界b", TextStyle::new(16.0)),
+            TextContent::new("a界b", TextStyle::new(px(16.0))),
             "有/无 runs 必须可区分"
         );
     }
@@ -1064,9 +1070,9 @@ mod tests {
     fn text_content_clips_runs_to_the_new_text() {
         use super::TextRun;
 
-        let mut content = TextContent::new("abcdef", TextStyle::new(16.0)).with_runs([
-            TextRun::new(0..2, TextStyle::new(16.0).with_weight(700)),
-            TextRun::new(2..6, TextStyle::new(16.0).with_weight(800)),
+        let mut content = TextContent::new("abcdef", TextStyle::new(px(16.0))).with_runs([
+            TextRun::new(0..2, TextStyle::new(px(16.0)).with_weight(700)),
+            TextRun::new(2..6, TextStyle::new(px(16.0)).with_weight(800)),
         ]);
         content.text = smol_str::SmolStr::new_static("abc");
         let altered = content.clip_runs_to_text();
@@ -1079,29 +1085,29 @@ mod tests {
 
     #[test]
     fn text_decoration_helpers_resolve_color_and_visibility() {
-        let underline = super::TextDecoration::underline(1.5);
+        let underline = super::TextDecoration::underline(px(1.5));
         assert!(matches!(underline, super::TextDecoration::Underline { .. }));
-        assert_eq!(underline.thickness(), 1.5);
+        assert_eq!(underline.thickness(), px(1.5));
         assert!(underline.color().is_none());
         assert!(underline.is_visible());
         let colored = underline.with_color(Some(Color::WHITE));
         assert_eq!(colored.color(), Some(Color::WHITE));
-        let strike = super::TextDecoration::strikethrough(2.0);
+        let strike = super::TextDecoration::strikethrough(px(2.0));
         assert!(matches!(
             strike,
             super::TextDecoration::Strikethrough { .. }
         ));
-        assert!(!super::TextDecoration::underline(0.0).is_visible());
-        assert!(!super::TextDecoration::underline(f32::NAN).is_visible());
+        assert!(!super::TextDecoration::underline(px(0.0)).is_visible());
+        assert!(!super::TextDecoration::underline(px(f32::NAN)).is_visible());
     }
 
     #[test]
     fn text_decoration_lives_in_extras() {
-        let plain = TextStyle::new(16.0);
+        let plain = TextStyle::new(px(16.0));
         assert_eq!(plain.decoration(), None);
         let decorated = plain
             .clone()
-            .with_decoration(super::TextDecoration::underline(1.0));
+            .with_decoration(super::TextDecoration::underline(px(1.0)));
         assert!(decorated.decoration().is_some());
         assert_ne!(plain, decorated);
     }
@@ -1116,9 +1122,14 @@ mod tests {
 
     #[test]
     fn shaped_empty_has_zero_size_and_no_lines() {
-        let line = ShapedLine::empty(smol_str::SmolStr::new_static(""), 3, 1, 1.0);
+        let line = ShapedLine::empty(
+            smol_str::SmolStr::new_static(""),
+            3,
+            1,
+            DevicePixelRatio::ONE,
+        );
 
-        assert_eq!(line.size(), Size::ZERO);
+        assert_eq!(line.size(), LogicalSize::ZERO);
         assert!(line.lines.is_empty());
         assert!(line.first_baseline.is_none());
         assert_eq!(line.glyph_runs().count(), 0);
@@ -1131,8 +1142,8 @@ mod tests {
         let b = TextDiagnostic::InlineBoxOffBoundary { id: 7, index: 3 };
         let c = TextDiagnostic::InlineBoxOverflow {
             id: 7,
-            width: 10.0,
-            available: 4.0,
+            width: px(10.0),
+            available: px(4.0),
         };
 
         assert_eq!(a, b);
@@ -1144,9 +1155,9 @@ mod tests {
     fn text_style_hash_matches_for_equal_styles_and_differs_otherwise() {
         use std::hash::Hasher;
 
-        let a = TextStyle::new(16.0).with_weight(700);
-        let b = TextStyle::new(16.0).with_weight(700);
-        let c = TextStyle::new(16.0).with_weight(400);
+        let a = TextStyle::new(px(16.0)).with_weight(700);
+        let b = TextStyle::new(px(16.0)).with_weight(700);
+        let c = TextStyle::new(px(16.0)).with_weight(400);
 
         let mut ha = ahash::AHasher::default();
         a.hash_into(&mut ha);

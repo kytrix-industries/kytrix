@@ -10,7 +10,7 @@ use crate::{
     app::{App, AppHandle},
     error::EngineError,
     event::{Event, InputEvent, InputOutcome, Modifiers},
-    math::Point,
+    math::{LogicalPoint, dp},
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -268,15 +268,15 @@ impl TestApp {
     }
 
     #[must_use]
-    pub fn pointer_position(&self) -> Option<Point> {
+    pub fn pointer_position(&self) -> Option<LogicalPoint> {
         self.app.pointer_position(self.window)
     }
 
-    pub fn move_pointer(&mut self, position: Point) -> InputOutcome {
+    pub fn move_pointer(&mut self, position: LogicalPoint) -> InputOutcome {
         self.inject(InputEvent::pointer_move(position, Modifiers::empty()))
     }
 
-    pub fn enter_pointer(&mut self, position: Point) -> InputOutcome {
+    pub fn enter_pointer(&mut self, position: LogicalPoint) -> InputOutcome {
         self.inject(InputEvent::PointerEnter {
             position,
             modifiers: Modifiers::empty(),
@@ -284,7 +284,7 @@ impl TestApp {
         })
     }
 
-    pub fn leave_pointer(&mut self, position: Point) -> InputOutcome {
+    pub fn leave_pointer(&mut self, position: LogicalPoint) -> InputOutcome {
         self.inject(InputEvent::PointerLeave {
             position,
             modifiers: Modifiers::empty(),
@@ -343,11 +343,15 @@ impl TestApp {
         let window = self.app.window(self.window).ok_or(SnapshotError::Gpu {
             detail: smol_str::SmolStr::new_static("snapshot: window was closed"),
         })?;
-        let surface = crate::math::Rect::new(0.0, 0.0, case.size.width, case.size.height)
-            .to_physical_covering(case.scale);
+        let surface =
+            case.scale
+                .to_covering_device_rect(crate::math::LogicalRect::from_origin_size(
+                    LogicalPoint::ZERO,
+                    case.size,
+                ));
         let size = (
-            surface.width().max(1) as u32,
-            surface.height().max(1) as u32,
+            surface.width().max(dp(1)).value() as u32,
+            surface.height().max(dp(1)).value() as u32,
         );
         let (glyph_page, glyph_pixels) = self.app.glyph_page_pixels();
         let mut renderer = Self::offscreen_renderer(size).map_err(gpu_error)?;
@@ -403,19 +407,21 @@ impl TestApp {
         crate::render::backend::Renderer::new_offscreen(size)
     }
 
-    fn readback_surface(&self) -> ((u32, u32), crate::math::Scale) {
+    fn readback_surface(&self) -> ((u32, u32), crate::math::DevicePixelRatio) {
         let window = self
             .app
             .window(self.window)
             .expect("TestApp's window must exist");
         let scale = window.scale();
         let size = window.size();
-        let surface =
-            crate::math::Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
+        let surface = scale.to_covering_device_rect(crate::math::LogicalRect::from_origin_size(
+            LogicalPoint::ZERO,
+            size,
+        ));
         (
             (
-                surface.width().max(1) as u32,
-                surface.height().max(1) as u32,
+                surface.width().max(dp(1)).value() as u32,
+                surface.height().max(dp(1)).value() as u32,
             ),
             scale,
         )
@@ -494,7 +500,7 @@ mod tests {
     #[cfg(all(not(windows), not(target_os = "macos")))]
     use crate::test_support::snapshot::SnapshotError;
     use crate::{
-        math::{Point, Rect, Scale},
+        math::{DevicePixelRatio, LogicalPoint, LogicalRect, px},
         node::builder::NodeBuilder,
         paint::{
             color::{Color, ColorResolver, LinearPremulRgba},
@@ -509,7 +515,10 @@ mod tests {
         text::TextStyle,
     };
 
-    const RECT: Rect = Rect::new(4.0, 6.0, 40.0, 16.0);
+    const RECT: LogicalRect = LogicalRect::from_origin_size(
+        LogicalPoint::new(px(4.0), px(6.0)),
+        crate::math::LogicalSize::new(px(40.0), px(16.0)),
+    );
 
     fn white() -> PaintSpec {
         PaintSpec {
@@ -550,7 +559,7 @@ mod tests {
             .id("panel")
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
             .expect("挂载");
-        let _label = NodeBuilder::text("price", TextStyle::new(12.0))
+        let _label = NodeBuilder::text("price", TextStyle::new(px(12.0)))
             .layout_override(RECT)
             .id("price-label")
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), panel)
@@ -574,9 +583,11 @@ mod tests {
         let _ = app.drain().expect("帧");
         let probe = app.probe();
         assert_eq!(probe.by_selector(Selector::Id("nope")), None);
-        let hit = probe.hit(Point::new(10.0, 10.0)).expect("命中");
+        let hit = probe
+            .hit(LogicalPoint::new(px(10.0), px(10.0)))
+            .expect("命中");
         assert_eq!(hit.node, node);
-        assert!(probe.hit(Point::new(-5.0, -5.0)).is_none());
+        assert!(probe.hit(LogicalPoint::new(px(-5.0), px(-5.0))).is_none());
     }
 
     #[test]
@@ -663,8 +674,8 @@ mod tests {
         let result = app.snapshot(SnapshotCase {
             scene: crate::test_support::snapshot::SnapshotScene::Shapes,
             theme: crate::test_support::snapshot::SnapshotTheme::Light,
-            size: crate::math::Size::new(64.0, 64.0),
-            scale: Scale::new(1.0).expect("scale"),
+            size: crate::math::LogicalSize::new(px(64.0), px(64.0)),
+            scale: DevicePixelRatio::new(1.0).expect("scale"),
         });
         #[cfg(windows)]
         {
@@ -704,14 +715,14 @@ mod tests {
         let _guard = crate::render::windows::device::gpu_test_lock();
         let mut app = TestApp::with_options(crate::window::WindowOptions {
             title: "text pixels".into(),
-            size: crate::math::Size::new(200.0, 60.0),
-            scale: Scale::ONE,
+            size: crate::math::LogicalSize::new(px(200.0), px(60.0)),
+            scale: DevicePixelRatio::ONE,
             ..crate::window::WindowOptions::default()
         });
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
         let _backplate = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 200.0, 60.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(60.0)))
             .paint(PaintSpec {
                 background: Color::BLACK,
                 ..PaintSpec::default()
@@ -724,12 +735,12 @@ mod tests {
         let _text = NodeBuilder::text(
             "WWWW",
             TextStyle {
-                size: 24.0,
+                size: px(24.0),
                 color: Color::WHITE,
                 ..TextStyle::default()
             },
         )
-        .layout_override(Rect::new(10.0, 8.0, 180.0, 40.0))
+        .layout_override(LogicalRect::new(px(10.0), px(8.0), px(180.0), px(40.0)))
         .build(
             app.app_mut().window_mut(window).expect("窗口").tree_mut(),
             root,
@@ -741,8 +752,8 @@ mod tests {
             .snapshot(SnapshotCase {
                 scene: crate::test_support::snapshot::SnapshotScene::Shapes,
                 theme: crate::test_support::snapshot::SnapshotTheme::Light,
-                size: crate::math::Size::new(200.0, 60.0),
-                scale: Scale::ONE,
+                size: crate::math::LogicalSize::new(px(200.0), px(60.0)),
+                scale: DevicePixelRatio::ONE,
             })
             .expect("WARP snapshot");
         let bright = image
@@ -770,11 +781,15 @@ mod tests {
         app.app_mut()
             .window_mut(window)
             .expect("窗口")
-            .set_size(crate::math::Size::new(400.0, 300.0));
+            .set_size(crate::math::LogicalSize::new(px(400.0), px(300.0)));
         let record = app.drain().expect("resize 帧").clone();
         assert!(record.damage_full, "resize 必须退化为全帧");
-        let expected =
-            Rect::new(0.0, 0.0, 400.0, 300.0).to_physical_covering(Scale::new(1.0).expect("scale"));
+        let expected = DevicePixelRatio::ONE.to_covering_device_rect(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(400.0),
+            px(300.0),
+        ));
         assert_eq!(record.damage, vec![expected]);
     }
 
@@ -783,8 +798,11 @@ mod tests {
         let mut app = TestApp::new();
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
-        let style = StyleBuilder::new().size(80.0, 40.0).padding(4.0).build();
-        let node = NodeBuilder::text("MMM", TextStyle::new(12.0))
+        let style = StyleBuilder::new()
+            .size(px(80.0), px(40.0))
+            .padding(px(4.0))
+            .build();
+        let node = NodeBuilder::text("MMM", TextStyle::new(px(12.0)))
             .style(style)
             .id("label")
             .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
@@ -797,7 +815,7 @@ mod tests {
                 .expect("窗口")
                 .tree()
                 .content_offset(node),
-            Point::new(4.0, 4.0),
+            LogicalPoint::new(px(4.0), px(4.0)),
             "content_offset = border + padding"
         );
         let rendered = app.rendered().expect("已提交");
@@ -808,7 +826,7 @@ mod tests {
             .map(|primitive| primitive.bounds)
             .expect("必须有字形");
         assert!(
-            glyph_bounds.origin.x >= 3.0,
+            glyph_bounds.origin.x >= px(3.0),
             "字形绝对坐标必须加上 padding 偏移（实际 {:?}）",
             glyph_bounds
         );
@@ -820,7 +838,7 @@ mod p10_tests {
     use super::TestApp;
     use crate::{
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, dp, px},
         node::builder::NodeBuilder,
         paint::{
             style::{Clip, PaintSpec, StylePatch},
@@ -834,7 +852,7 @@ mod p10_tests {
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 60.0, 40.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(40.0)))
             .paint(PaintSpec {
                 background: crate::paint::color::Color::from_rgba8([10, 20, 30, 255]),
                 ..PaintSpec::default()
@@ -851,12 +869,12 @@ mod p10_tests {
     fn inject_click_reports_the_action_and_the_target() {
         let (mut app, node) = app_with_button();
         app.inject(InputEvent::pointer_down(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ));
         let outcome = app.inject(InputEvent::pointer_up(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ));
@@ -873,7 +891,7 @@ mod p10_tests {
         let window = app.window_id();
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
-        let mut style = StyleBuilder::new().size(100.0, 100.0).build();
+        let mut style = StyleBuilder::new().size(px(100.0), px(100.0)).build();
         style.clip = Clip::Bounds;
         let container = NodeBuilder::boxed()
             .style(style)
@@ -881,7 +899,12 @@ mod p10_tests {
             .expect("mount");
         for index in 0..4 {
             let _ = NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 40.0, 100.0, 40.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 40.0),
+                    px(100.0),
+                    px(40.0),
+                ))
                 .paint(PaintSpec {
                     background: crate::paint::color::Color::from_rgba8([
                         index as u8 * 10 + 1,
@@ -903,14 +926,14 @@ mod p10_tests {
             )
             .expect("scroll");
         app.app_mut()
-            .set_scroll_content(&handle, crate::math::Size::new(100.0, 160.0))
+            .set_scroll_content(&handle, crate::math::LogicalSize::new(px(100.0), px(160.0)))
             .expect("content");
         app.app_mut()
-            .scroll_to(&handle, Point::new(0.0, 40.0))
+            .scroll_to(&handle, LogicalPoint::new(px(0.0), px(40.0)))
             .expect("scroll");
         let record = app.drain().expect("scroll frame");
 
-        let allowed = crate::math::PhysicalRect::new(-1, -1, 101, 101);
+        let allowed = crate::math::DeviceRect::new(dp(-1), dp(-1), dp(101), dp(101));
         assert!(!record.damage.is_empty(), "滚动必须产生 damage");
         for rect in &record.damage {
             assert!(
@@ -925,12 +948,12 @@ mod p10_tests {
         let (mut app, node) = app_with_button();
         let click = |app: &mut TestApp| {
             app.inject(InputEvent::pointer_down(
-                Point::new(20.0, 20.0),
+                LogicalPoint::new(px(20.0), px(20.0)),
                 PointerButton::Primary,
                 Modifiers::empty(),
             ));
             app.inject(InputEvent::pointer_up(
-                Point::new(20.0, 20.0),
+                LogicalPoint::new(px(20.0), px(20.0)),
                 PointerButton::Primary,
                 Modifiers::empty(),
             ))
@@ -999,15 +1022,15 @@ mod p10_tests {
         let window = app.window_id();
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
-        let mut outer_style = StyleBuilder::new().size(200.0, 200.0).build();
+        let mut outer_style = StyleBuilder::new().size(px(200.0), px(200.0)).build();
         outer_style.clip = Clip::Bounds;
         let outer = NodeBuilder::boxed()
             .style(outer_style)
             .build(tree, root)
             .expect("outer");
         let mut inner_style = StyleBuilder::new()
-            .size(200.0, 200.0)
-            .margin_sides(100.0, 0.0, 0.0, 0.0)
+            .size(px(200.0), px(200.0))
+            .margin_sides(px(100.0), px(0.0), px(0.0), px(0.0))
             .build();
         inner_style.clip = Clip::Bounds;
         let inner = NodeBuilder::boxed()
@@ -1016,7 +1039,12 @@ mod p10_tests {
             .expect("inner");
         for index in 0..6 {
             let _ = NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 40.0, 200.0, 40.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 40.0),
+                    px(200.0),
+                    px(40.0),
+                ))
                 .paint(PaintSpec {
                     background: crate::paint::color::Color::from_rgba8([
                         index as u8 + 1,
@@ -1035,26 +1063,32 @@ mod p10_tests {
             .make_scroll(window, outer, crate::interaction::ScrollConfig::default())
             .expect("outer scroll");
         app.app_mut()
-            .set_scroll_content(&outer_handle, crate::math::Size::new(200.0, 400.0))
+            .set_scroll_content(
+                &outer_handle,
+                crate::math::LogicalSize::new(px(200.0), px(400.0)),
+            )
             .expect("outer content");
         let inner_handle = app
             .app_mut()
             .make_scroll(window, inner, crate::interaction::ScrollConfig::default())
             .expect("inner scroll");
         app.app_mut()
-            .set_scroll_content(&inner_handle, crate::math::Size::new(200.0, 240.0))
+            .set_scroll_content(
+                &inner_handle,
+                crate::math::LogicalSize::new(px(200.0), px(240.0)),
+            )
             .expect("inner content");
         app.app_mut()
-            .scroll_to(&outer_handle, Point::new(0.0, 30.0))
+            .scroll_to(&outer_handle, LogicalPoint::new(px(0.0), px(30.0)))
             .expect("outer scroll");
         let _ = app.drain().expect("outer frame");
 
         app.app_mut()
-            .scroll_to(&inner_handle, Point::new(0.0, 10.0))
+            .scroll_to(&inner_handle, LogicalPoint::new(px(0.0), px(10.0)))
             .expect("inner scroll");
         let record = app.drain().expect("inner frame");
 
-        let allowed = crate::math::PhysicalRect::new(-1, 69, 201, 271);
+        let allowed = crate::math::DeviceRect::new(dp(-1), dp(69), dp(201), dp(271));
         assert!(!record.damage.is_empty(), "内层滚动必须产生 damage");
         for rect in &record.damage {
             assert!(
@@ -1066,7 +1100,7 @@ mod p10_tests {
             record
                 .damage
                 .iter()
-                .any(|rect| (69..=71).contains(&rect.y0)),
+                .any(|rect| (69..=71).contains(&rect.y0.value())),
             "damage 顶部必须落在内层视口的屏幕位置：{:?}",
             record.damage
         );
@@ -1079,21 +1113,21 @@ mod p10_tests {
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
         let ringed = NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 40.0, 40.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(40.0), px(40.0)))
             .paint(PaintSpec {
                 background: crate::paint::color::Color::from_rgba8([9, 9, 9, 255]),
                 ..PaintSpec::default()
             })
             .on_click(Action::custom("a"))
             .focus_ring(crate::paint::style::FocusRing::new(
-                2.0,
-                2.0,
+                px(2.0),
+                px(2.0),
                 crate::paint::color::Color::from_rgba8([0, 120, 255, 255]),
             ))
             .build(tree, root)
             .expect("ringed");
         let other = NodeBuilder::boxed()
-            .layout_override(Rect::new(100.0, 10.0, 40.0, 40.0))
+            .layout_override(LogicalRect::new(px(100.0), px(10.0), px(40.0), px(40.0)))
             .on_click(Action::custom("b"))
             .build(tree, root)
             .expect("other");
@@ -1129,7 +1163,7 @@ mod p11_tests {
     use crate::{
         a11y::{A11yAction, A11yDiagnostic, A11yOverride, A11yPatch, A11yRole, A11yTreeSnapshot},
         event::Action,
-        math::{Point, Rect, Scale},
+        math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, px},
         node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
         paint::{
             canvas::Canvas,
@@ -1162,13 +1196,13 @@ mod p11_tests {
         app.a11y().expect("本帧必须有一笔 a11y 交付")
     }
 
-    fn scroll_container_style(width: f32, height: f32) -> Style {
+    fn scroll_container_style(width: LogicalPx, height: LogicalPx) -> Style {
         let mut style = StyleBuilder::new().relative().size(width, height).build();
         style.clip = Clip::Bounds;
         style
     }
 
-    fn fixed_size_style(width: f32, height: f32) -> Style {
+    fn fixed_size_style(width: LogicalPx, height: LogicalPx) -> Style {
         StyleBuilder::new().size(width, height).build()
     }
 
@@ -1195,15 +1229,15 @@ mod p11_tests {
             app.app().window(window).expect("window").tree().root()
         };
         let label = mount(&mut app, |tree, root| {
-            NodeBuilder::text("价格", TextStyle::new(12.0))
-                .layout_override(Rect::new(0.0, 0.0, 40.0, 20.0))
+            NodeBuilder::text("价格", TextStyle::new(px(12.0)))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)))
                 .id("price")
                 .build(tree, root)
                 .expect("text")
         });
         let button = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 24.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(24.0), px(60.0), px(24.0)))
                 .paint(white())
                 .on_click(Action::custom("submit"))
                 .a11y(A11yOverride {
@@ -1215,14 +1249,19 @@ mod p11_tests {
                 .expect("button")
         });
         let canvas = mount(&mut app, |tree, root| {
-            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 52.0, 60.0, 30.0)))
-                .a11y(A11yOverride {
-                    label: Some(SmolStr::new_static("K 线图")),
-                    ..A11yOverride::default()
-                })
-                .id("chart")
-                .build(tree, root)
-                .expect("canvas")
+            NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+                px(0.0),
+                px(52.0),
+                px(60.0),
+                px(30.0),
+            )))
+            .a11y(A11yOverride {
+                label: Some(SmolStr::new_static("K 线图")),
+                ..A11yOverride::default()
+            })
+            .id("chart")
+            .build(tree, root)
+            .expect("canvas")
         });
         let _ = app.drain().expect("frame");
 
@@ -1277,7 +1316,7 @@ mod p11_tests {
         let label_signal = text;
         let button = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .bind_a11y(move |cx| A11yPatch {
@@ -1290,7 +1329,7 @@ mod p11_tests {
         });
         let _ = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 30.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(30.0), px(60.0), px(24.0)))
                 .id("sibling")
                 .build(tree, root)
                 .expect("sibling")
@@ -1321,7 +1360,7 @@ mod p11_tests {
         let window = app.window_id();
         let button = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .on_click(Action::custom("press"))
                 .id("press")
                 .build(tree, root)
@@ -1355,7 +1394,7 @@ mod p11_tests {
 
         let child = mount(&mut app, |tree, _root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .id("child")
                 .build(tree, panel)
                 .expect("child")
@@ -1377,17 +1416,17 @@ mod p11_tests {
 
     #[test]
     fn a11y_bounds_equal_probe_times_scale() {
-        let scale = Scale::new(1.25).expect("scale");
+        let scale = DevicePixelRatio::new(1.25).expect("scale");
         let mut app = TestApp::with_options(WindowOptions {
             title: SmolStr::new_static("scale"),
-            size: crate::math::Size::new(400.0, 300.0),
+            size: crate::math::LogicalSize::new(px(400.0), px(300.0)),
             scale,
             ..WindowOptions::default()
         });
         app.enable_a11y_capture();
         let node = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(8.0, 12.0, 40.0, 24.0))
+                .layout_override(LogicalRect::new(px(8.0), px(12.0), px(40.0), px(24.0)))
                 .paint(white())
                 .id("box")
                 .build(tree, root)
@@ -1395,12 +1434,12 @@ mod p11_tests {
         });
         let _ = app.drain().expect("frame");
         let logical = app.probe().bounds(node).expect("bounds");
-        let expected = logical.to_physical(scale);
+        let expected = scale.to_covering_device_rect(logical);
         let snap = snapshot(&app);
         assert_eq!(
             snap.node_for(node).expect("box").bounds,
             expected,
-            "a11y bounds 必须是 逻辑 × scale 逐边 round"
+            "a11y bounds 必须是 逻辑矩形 × scale 的 floor/ceil 外扩（覆盖整块逻辑矩形）"
         );
     }
 
@@ -1413,7 +1452,7 @@ mod p11_tests {
         let signal = disabled;
         let button = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .bind_a11y(move |cx| A11yPatch {
@@ -1450,10 +1489,15 @@ mod p11_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let canvas = mount(&mut app, |tree, root| {
-            NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 60.0, 30.0)))
-                .id("chart")
-                .build(tree, root)
-                .expect("canvas")
+            NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(60.0),
+                px(30.0),
+            )))
+            .id("chart")
+            .build(tree, root)
+            .expect("canvas")
         });
         let _ = app.drain().expect("frame");
         let snap = snapshot(&app);
@@ -1480,7 +1524,7 @@ mod p11_tests {
         let window = app.window_id();
         let hidden = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .id("hidden")
                 .build(tree, root)
                 .expect("hidden")
@@ -1522,7 +1566,7 @@ mod p11_tests {
         app.enable_a11y_capture();
         let node = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .paint(white())
                 .build(tree, root)
                 .expect("box")
@@ -1534,13 +1578,15 @@ mod p11_tests {
         app.app_mut()
             .window_mut(window)
             .expect("window")
-            .set_scale(Scale::new(1.5).expect("scale"));
+            .set_scale(DevicePixelRatio::new(1.5).expect("scale"));
         let _ = app.drain().expect("second");
         let snap = snapshot(&app);
         assert!(snap.full, "DPI 变化必须整棵重发（bounds 全是物理像素）");
         assert_eq!(
             snap.node_for(node).expect("box").bounds,
-            Rect::new(0.0, 0.0, 20.0, 20.0).to_physical(Scale::new(1.5).expect("scale"))
+            DevicePixelRatio::new(1.5)
+                .expect("scale")
+                .to_device_rect(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
         );
     }
 
@@ -1549,7 +1595,10 @@ mod p11_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let mut rows_style = StyleBuilder::new().relative().size(100.0, 80.0).build();
+        let mut rows_style = StyleBuilder::new()
+            .relative()
+            .size(px(100.0), px(80.0))
+            .build();
         rows_style.clip = Clip::Bounds;
         let container = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
@@ -1564,7 +1613,7 @@ mod p11_tests {
                 window,
                 container,
                 crate::interaction::VirtualListConfig {
-                    extent: 20.0,
+                    extent: px(20.0),
                     extents: None,
                     overscan: 1,
                 },
@@ -1592,7 +1641,7 @@ mod p11_tests {
         assert_eq!(rows.len(), mounted, "a11y 只暴露已挂载的行（可见窗口）");
         assert_eq!(snap.node_for(container).expect("list").role, A11yRole::List);
         assert!(mounted < 100, "100 行的列表不得整表挂载");
-        let _ = Point::ZERO;
+        let _ = LogicalPoint::ZERO;
     }
 
     #[test]
@@ -1602,7 +1651,7 @@ mod p11_tests {
         let visible = app.app_mut().signal(false);
         let panel = mount(&mut app, move |tree, root| {
             let panel = NodeBuilder::boxed()
-                .style(fixed_size_style(120.0, 40.0))
+                .style(fixed_size_style(px(120.0), px(40.0)))
                 .bind_style(move |cx| StylePatch {
                     visible: Some(*cx.read(&visible)),
                     ..StylePatch::default()
@@ -1611,7 +1660,7 @@ mod p11_tests {
                 .build(tree, root)
                 .expect("panel");
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .tab_stop(true)
                 .on_click(Action::custom("tab"))
                 .id("tab")
@@ -1660,7 +1709,7 @@ mod p11_tests {
         let enabled = app.app_mut().signal(false);
         let panel = mount(&mut app, move |tree, root| {
             let panel = NodeBuilder::boxed()
-                .style(fixed_size_style(120.0, 40.0))
+                .style(fixed_size_style(px(120.0), px(40.0)))
                 .bind_style(move |cx| StylePatch {
                     interactive: Some(*cx.read(&enabled)),
                     ..StylePatch::default()
@@ -1669,7 +1718,7 @@ mod p11_tests {
                 .build(tree, root)
                 .expect("panel");
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .tab_stop(true)
                 .on_click(Action::custom("buy"))
                 .a11y(A11yOverride {
@@ -1721,7 +1770,7 @@ mod p11_tests {
         let active = app.app_mut().signal(0usize);
         let tabs = mount(&mut app, move |tree, root| {
             let tab_list = NodeBuilder::boxed()
-                .style(fixed_size_style(200.0, 32.0))
+                .style(fixed_size_style(px(200.0), px(32.0)))
                 .a11y(A11yOverride {
                     role: Some(A11yRole::TabList),
                     label: Some(SmolStr::new_static("页面")),
@@ -1735,7 +1784,12 @@ mod p11_tests {
             for (index, action) in actions.into_iter().enumerate() {
                 nodes.push(
                     NodeBuilder::boxed()
-                        .layout_override(Rect::new(index as f32 * 100.0, 0.0, 100.0, 32.0))
+                        .layout_override(LogicalRect::new(
+                            px(index as f32 * 100.0),
+                            px(0.0),
+                            px(100.0),
+                            px(32.0),
+                        ))
                         .tab_stop(true)
                         .on_click(action)
                         .a11y(A11yOverride {
@@ -1819,7 +1873,7 @@ mod p11_tests {
         let as_input = app.app_mut().signal(false);
         let panel = mount(&mut app, move |tree, root| {
             let panel = NodeBuilder::boxed()
-                .style(fixed_size_style(120.0, 40.0))
+                .style(fixed_size_style(px(120.0), px(40.0)))
                 .a11y(A11yOverride {
                     label: Some(SmolStr::new_static("价格")),
                     ..A11yOverride::default()
@@ -1835,7 +1889,7 @@ mod p11_tests {
                 .id("panel")
                 .build(tree, root)
                 .expect("panel");
-            NodeBuilder::text("42150", TextStyle::new(12.0))
+            NodeBuilder::text("42150", TextStyle::new(px(12.0)))
                 .id("value")
                 .build(tree, panel)
                 .expect("text");
@@ -1876,7 +1930,7 @@ mod p11_tests {
         let as_input = app.app_mut().signal(false);
         let panel = mount(&mut app, move |tree, root| {
             let panel = NodeBuilder::boxed()
-                .style(fixed_size_style(120.0, 40.0))
+                .style(fixed_size_style(px(120.0), px(40.0)))
                 .a11y(A11yOverride {
                     label: Some(SmolStr::new_static("价格")),
                     ..A11yOverride::default()
@@ -1896,7 +1950,7 @@ mod p11_tests {
                 .id("panel")
                 .build(tree, root)
                 .expect("panel");
-            NodeBuilder::text("42150", TextStyle::new(12.0))
+            NodeBuilder::text("42150", TextStyle::new(px(12.0)))
                 .id("value")
                 .build(tree, panel)
                 .expect("text");
@@ -1936,7 +1990,7 @@ mod p11_tests {
         let window = app.window_id();
         let panel = mount(&mut app, |tree, root| {
             let panel = NodeBuilder::boxed()
-                .style(fixed_size_style(120.0, 40.0))
+                .style(fixed_size_style(px(120.0), px(40.0)))
                 .a11y(A11yOverride {
                     label: Some(SmolStr::new_static("价格")),
                     ..A11yOverride::default()
@@ -1944,7 +1998,7 @@ mod p11_tests {
                 .id("panel")
                 .build(tree, root)
                 .expect("panel");
-            NodeBuilder::text("42150", TextStyle::new(12.0))
+            NodeBuilder::text("42150", TextStyle::new(px(12.0)))
                 .id("value")
                 .build(tree, panel)
                 .expect("text");
@@ -1988,7 +2042,7 @@ mod p11_tests {
         let hidden = app.app_mut().signal(false);
         let table = mount(&mut app, move |tree, root| {
             let table = NodeBuilder::boxed()
-                .style(fixed_size_style(200.0, 60.0))
+                .style(fixed_size_style(px(200.0), px(60.0)))
                 .a11y(A11yOverride {
                     role: Some(A11yRole::Table),
                     label: Some(SmolStr::new_static("行情")),
@@ -1998,7 +2052,7 @@ mod p11_tests {
                 .build(tree, root)
                 .expect("table");
             let wrapper = NodeBuilder::boxed()
-                .style(fixed_size_style(200.0, 20.0))
+                .style(fixed_size_style(px(200.0), px(20.0)))
                 .bind_a11y(move |cx| A11yPatch {
                     hidden: Some(*cx.read(&hidden)),
                     ..A11yPatch::default()
@@ -2007,7 +2061,7 @@ mod p11_tests {
                 .build(tree, table)
                 .expect("wrapper");
             NodeBuilder::boxed()
-                .style(fixed_size_style(200.0, 20.0))
+                .style(fixed_size_style(px(200.0), px(20.0)))
                 .a11y(A11yOverride {
                     role: Some(A11yRole::Row),
                     ..A11yOverride::default()
@@ -2049,7 +2103,7 @@ mod p11_tests {
         let open = app.app_mut().signal(false);
         let container = mount(&mut app, move |tree, root| {
             let panel = NodeBuilder::boxed()
-                .style(fixed_size_style(100.0, 80.0))
+                .style(fixed_size_style(px(100.0), px(80.0)))
                 .bind_style(move |cx| StylePatch {
                     visible: Some(*cx.read(&open)),
                     ..StylePatch::default()
@@ -2058,7 +2112,7 @@ mod p11_tests {
                 .build(tree, root)
                 .expect("panel");
             NodeBuilder::boxed()
-                .style(scroll_container_style(100.0, 80.0))
+                .style(scroll_container_style(px(100.0), px(80.0)))
                 .id("rows")
                 .build(tree, panel)
                 .expect("container")
@@ -2069,7 +2123,7 @@ mod p11_tests {
                 window,
                 container,
                 crate::interaction::VirtualListConfig {
-                    extent: 20.0,
+                    extent: px(20.0),
                     extents: None,
                     overscan: 0,
                 },
@@ -2147,7 +2201,7 @@ mod p11_tests {
         let active = app.app_mut().signal(0usize);
         let container = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .style(scroll_container_style(100.0, 80.0))
+                .style(scroll_container_style(px(100.0), px(80.0)))
                 .id("rows")
                 .build(tree, root)
                 .expect("container")
@@ -2158,7 +2212,7 @@ mod p11_tests {
                 window,
                 container,
                 crate::interaction::VirtualListConfig {
-                    extent: 20.0,
+                    extent: px(20.0),
                     extents: None,
                     overscan: 0,
                 },
@@ -2225,7 +2279,7 @@ mod p11_fix_tests {
         event::Action,
         interaction::ScrollConfig,
         layout::LayoutOverride,
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
         paint::{
             color::Color,
@@ -2276,7 +2330,7 @@ mod p11_fix_tests {
         app.app_mut()
             .window_mut(window)
             .expect("window")
-            .set_size(Size::new(400.0, 300.0));
+            .set_size(LogicalSize::new(px(400.0), px(300.0)));
         let _ = app.drain().expect("second");
 
         let after = app.probe().bounds(child).expect("bounds");
@@ -2286,8 +2340,12 @@ mod p11_fix_tests {
             snap.node_for(child)
                 .expect("布局盒变了的子节点必须重发")
                 .bounds,
-            after.to_physical(app.app().window(window).expect("window").scale()),
-            "a11y bounds 必须等于 逻辑 × scale"
+            app.app()
+                .window(window)
+                .expect("window")
+                .scale()
+                .to_covering_device_rect(after),
+            "a11y bounds 必须覆盖整个逻辑矩形（floor/ceil 外扩）"
         );
     }
 
@@ -2298,7 +2356,7 @@ mod p11_fix_tests {
         let window = app.window_id();
         let node = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .paint(white())
                 .id("box")
                 .build(tree, root)
@@ -2312,17 +2370,26 @@ mod p11_fix_tests {
             .tree_mut()
             .set_layout_override(
                 node,
-                Some(LayoutOverride::new(Rect::new(0.0, 0.0, 44.0, 24.0))),
+                Some(LayoutOverride::new(LogicalRect::new(
+                    px(0.0),
+                    px(0.0),
+                    px(44.0),
+                    px(24.0),
+                ))),
             )
             .expect("override");
         let _ = app.drain().expect("second");
 
         let logical = app.probe().bounds(node).expect("bounds");
-        assert_eq!(logical.size, Size::new(44.0, 24.0), "覆盖必须生效");
+        assert_eq!(
+            logical.size,
+            LogicalSize::new(px(44.0), px(24.0)),
+            "覆盖必须生效"
+        );
         let snap = app.a11y().expect("覆盖后必须有 a11y 交付");
         assert_eq!(
             snap.node_for(node).expect("必须重发").bounds,
-            logical.to_physical(Scale::ONE)
+            DevicePixelRatio::ONE.to_covering_device_rect(logical)
         );
     }
 
@@ -2331,7 +2398,10 @@ mod p11_fix_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let mut viewport_style = StyleBuilder::new().relative().size(200.0, 100.0).build();
+        let mut viewport_style = StyleBuilder::new()
+            .relative()
+            .size(px(200.0), px(100.0))
+            .build();
         viewport_style.clip = Clip::Bounds;
         let container = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
@@ -2342,7 +2412,7 @@ mod p11_fix_tests {
         });
         let row = mount(&mut app, |tree, _root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 100.0, 40.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(40.0)))
                 .paint(white())
                 .id("row")
                 .build(tree, container)
@@ -2353,7 +2423,7 @@ mod p11_fix_tests {
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scroll");
         app.app_mut()
-            .set_scroll_content(&handle, Size::new(200.0, 400.0))
+            .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(400.0)))
             .expect("content");
         let _ = app.drain().expect("first");
         let before = app
@@ -2364,7 +2434,7 @@ mod p11_fix_tests {
             .bounds;
 
         app.app_mut()
-            .scroll_by(&handle, crate::math::Point::new(0.0, 60.0))
+            .scroll_by(&handle, crate::math::LogicalPoint::new(px(0.0), px(60.0)))
             .expect("scroll");
         let _ = app.drain().expect("second");
 
@@ -2374,12 +2444,11 @@ mod p11_fix_tests {
         assert_ne!(before, after, "滚动必须改变行的 a11y 位置");
         assert_eq!(
             after,
-            crate::interaction::scroll::to_screen(
+            DevicePixelRatio::ONE.to_covering_device_rect(crate::interaction::scroll::to_screen(
                 app.app().window(window).expect("window").tree(),
                 row,
                 logical
-            )
-            .to_physical(Scale::ONE)
+            ))
         );
     }
 
@@ -2388,7 +2457,10 @@ mod p11_fix_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let mut viewport_style = StyleBuilder::new().relative().size(200.0, 100.0).build();
+        let mut viewport_style = StyleBuilder::new()
+            .relative()
+            .size(px(200.0), px(100.0))
+            .build();
         viewport_style.clip = Clip::Bounds;
         let container = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
@@ -2402,7 +2474,12 @@ mod p11_fix_tests {
             (0..3000)
                 .map(|index| {
                     NodeBuilder::boxed()
-                        .layout_override(Rect::new(0.0, index as f32, 50.0, 10.0))
+                        .layout_override(LogicalRect::new(
+                            px(0.0),
+                            px(index as f32),
+                            px(50.0),
+                            px(10.0),
+                        ))
                         .id(smol_str::format_smolstr!("row-{index}"))
                         .build(tree, container)
                         .expect("row")
@@ -2414,7 +2491,7 @@ mod p11_fix_tests {
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scroll");
         app.app_mut()
-            .set_scroll_content(&handle, Size::new(200.0, 4000.0))
+            .set_scroll_content(&handle, LogicalSize::new(px(200.0), px(4000.0)))
             .expect("content");
 
         let _ = app.drain().expect("首帧");
@@ -2423,7 +2500,7 @@ mod p11_fix_tests {
         let before = first.node_for(rows[0]).expect("行 0 必须已交付").bounds;
 
         app.app_mut()
-            .scroll_to(&handle, crate::math::Point::new(0.0, 120.0))
+            .scroll_to(&handle, crate::math::LogicalPoint::new(px(0.0), px(120.0)))
             .expect("scroll to");
         let _ = app.drain().expect("滚动帧");
         let snapshot = app.a11y().expect("滚动后必须有 a11y 交付");
@@ -2447,7 +2524,7 @@ mod p11_fix_tests {
         let signal = disabled;
         let button = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .bind_a11y(move |cx| A11yPatch {
@@ -2505,7 +2582,7 @@ mod p11_fix_tests {
         let window = app.window_id();
         let button = mount(&mut app, |tree, root| {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 60.0, 24.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(60.0), px(24.0)))
                 .paint(white())
                 .on_click(Action::custom("press"))
                 .id("press")
@@ -2555,7 +2632,7 @@ mod p11_fix_tests {
     fn text_run_fixture(app: &mut TestApp, text: &'static str, style: TextStyle) -> NodeId {
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
-        let input_style = StyleBuilder::new().size(240.0, 24.0).build();
+        let input_style = StyleBuilder::new().size(px(240.0), px(24.0)).build();
         let input = NodeBuilder::boxed()
             .style(input_style)
             .a11y(A11yOverride {
@@ -2570,7 +2647,7 @@ mod p11_fix_tests {
             )
             .expect("input");
         NodeBuilder::text(text, style)
-            .layout_override(Rect::new(0.0, 0.0, 160.0, 24.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(160.0), px(24.0)))
             .id("run")
             .build(
                 app.app_mut().window_mut(window).expect("window").tree_mut(),
@@ -2593,7 +2670,7 @@ mod p11_fix_tests {
                 text,
                 TextStyle {
                     direction: TextDirection::Ltr,
-                    ..TextStyle::new(20.0)
+                    ..TextStyle::new(px(20.0))
                 },
             );
             let _ = app.drain().expect("frame");
@@ -2658,7 +2735,7 @@ mod p11_fix_tests {
                 .expect("caret");
             let bounds = app.probe().bounds(run).expect("bounds");
             let scale = app.app().window(window).expect("window").scale().factor();
-            let expected = (caret.min().x - bounds.origin.x) * scale;
+            let expected = (caret.min().x - bounds.origin.x).value() * scale;
             let actual = record.character_positions[position_index];
             assert!(
                 (actual - expected).abs() <= 1.0,
@@ -2676,7 +2753,7 @@ mod p11_fix_tests {
             "价🌍ab\n第二行",
             TextStyle {
                 direction: TextDirection::Ltr,
-                ..TextStyle::new(20.0)
+                ..TextStyle::new(px(20.0))
             },
         );
         let _ = app.drain().expect("frame");
@@ -2712,7 +2789,7 @@ mod p11_fix_tests {
             let mut app = TestApp::new();
             app.enable_a11y_capture();
             let window = app.window_id();
-            let run = text_run_fixture(&mut app, text, TextStyle::new(20.0));
+            let run = text_run_fixture(&mut app, text, TextStyle::new(px(20.0)));
             let _ = app.drain().expect("frame");
             app.assert_a11y_contract();
 
@@ -2770,7 +2847,7 @@ mod p11_fix_tests {
                 .expect("caret");
             let bounds = app.probe().bounds(run).expect("bounds");
             let scale = app.app().window(window).expect("window").scale().factor();
-            let expected = (caret.min().x - bounds.origin.x) * scale;
+            let expected = (caret.min().x - bounds.origin.x).value() * scale;
             let actual = record.character_positions[position_index];
             assert!(
                 (actual - expected).abs() <= 1.0,
@@ -2784,7 +2861,7 @@ mod p11_fix_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let run = text_run_fixture(&mut app, "价🌍ab", TextStyle::new(20.0));
+        let run = text_run_fixture(&mut app, "价🌍ab", TextStyle::new(px(20.0)));
         let _ = app.drain().expect("frame");
         app.assert_a11y_contract();
 
@@ -2828,7 +2905,7 @@ mod p11_fix_tests {
             .expect("caret");
         let bounds = app.probe().bounds(run).expect("bounds");
         let scale = app.app().window(window).expect("window").scale().factor();
-        let expected = (caret.min().x - bounds.origin.x) * scale;
+        let expected = (caret.min().x - bounds.origin.x).value() * scale;
         assert!(
             (record.character_positions[1] - expected).abs() <= 1.0,
             "positions[1]={} 必须与真实 caret x={expected} 一致",
@@ -2840,7 +2917,7 @@ mod p11_fix_tests {
     fn auto_direction_text_run_omits_character_metrics_when_a_run_is_rtl() {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
-        let run = text_run_fixture(&mut app, "abc אבג", TextStyle::new(20.0));
+        let run = text_run_fixture(&mut app, "abc אבג", TextStyle::new(px(20.0)));
         let _ = app.drain().expect("frame");
         app.assert_a11y_contract();
         let snapshot = app.a11y().expect("a11y delivery");
@@ -2879,7 +2956,7 @@ mod p11_fix_tests {
             "אבג",
             TextStyle {
                 direction: TextDirection::Rtl,
-                ..TextStyle::new(20.0)
+                ..TextStyle::new(px(20.0))
             },
         );
         let _ = app.drain().expect("frame");
@@ -2908,7 +2985,7 @@ mod p11_fix_tests {
             "ab",
             TextStyle {
                 direction: TextDirection::Ltr,
-                ..TextStyle::new(20.0)
+                ..TextStyle::new(px(20.0))
             },
         );
         let window = app.window_id();
@@ -2968,7 +3045,7 @@ mod p11_fix_tests {
             "ab",
             TextStyle {
                 direction: TextDirection::Ltr,
-                ..TextStyle::new(20.0)
+                ..TextStyle::new(px(20.0))
             },
         );
         let window = app.window_id();
@@ -3030,7 +3107,7 @@ mod p11_fix_tests {
             TextStyle {
                 direction: TextDirection::Ltr,
                 alignment: TextAlign::End,
-                ..TextStyle::new(20.0)
+                ..TextStyle::new(px(20.0))
             },
         );
         let _ = app.drain().expect("frame");
@@ -3054,7 +3131,7 @@ mod p11_fix_tests {
     fn auto_direction_pure_rtl_text_run_omits_character_metrics() {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
-        let run = text_run_fixture(&mut app, "אבג", TextStyle::new(20.0));
+        let run = text_run_fixture(&mut app, "אבג", TextStyle::new(px(20.0)));
         let _ = app.drain().expect("frame");
         app.assert_a11y_contract();
         let snapshot = app.a11y().expect("a11y delivery");
@@ -3079,7 +3156,12 @@ mod p11_fix_tests {
         (0..count)
             .map(|index| {
                 NodeBuilder::boxed()
-                    .layout_override(Rect::new(0.0, index as f32, 10.0, 1.0))
+                    .layout_override(LogicalRect::new(
+                        px(0.0),
+                        px(index as f32),
+                        px(10.0),
+                        px(1.0),
+                    ))
                     .build(tree, root)
                     .expect("row")
             })
@@ -3140,7 +3222,7 @@ mod p11_fix_tests {
             app.assert_a11y_contract();
         }
 
-        let scale = Scale::new(2.0).expect("scale");
+        let scale = DevicePixelRatio::new(2.0).expect("scale");
         app.app_mut()
             .window_mut(window)
             .expect("window")
@@ -3156,7 +3238,7 @@ mod p11_fix_tests {
         let logical = app.probe().bounds(rows[0]).expect("logical bounds");
         assert_eq!(
             record.bounds,
-            logical.to_physical(scale),
+            scale.to_covering_device_rect(logical),
             "DPI 变化后首笔的 bounds 必须已乘新 scale（不是旧值）"
         );
 
@@ -3296,7 +3378,7 @@ mod dispatcher_tests {
 
     use super::TestApp;
     use crate::{
-        math::Rect,
+        math::{LogicalRect, px},
         node::builder::NodeBuilder,
         paint::{
             color::Color,
@@ -3336,7 +3418,7 @@ mod dispatcher_tests {
             let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
             let root = tree.root();
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
                 .paint(PaintSpec {
                     background: Color::from_rgba8([0, 0, 0, 255]),
                     ..PaintSpec::default()

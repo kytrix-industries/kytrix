@@ -6,7 +6,7 @@ use crate::{
     error::EngineError,
     event::Action,
     layout::{LayoutOverride, MeasureFn, hit_test::HitShape},
-    math::Rect,
+    math::LogicalRect,
     node::{
         dependency::ReadCtx,
         id::NodeId,
@@ -227,7 +227,7 @@ impl NodeBuilder {
     }
 
     #[must_use]
-    pub fn layout_override(mut self, rect: Rect) -> Self {
+    pub fn layout_override(mut self, rect: LogicalRect) -> Self {
         self.style.position(taffy::style::Position::Absolute);
         self.layout_override = Some(LayoutOverride::new(rect));
         self
@@ -303,7 +303,7 @@ mod tests {
     use crate::{
         error::EngineError,
         layout::{LayoutOverride, hit_test::HitShape},
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::{
             dirty::DirtyFlags,
             tree::{NodeKind, NodeTree},
@@ -338,7 +338,7 @@ mod tests {
     fn build_canvas_and_geometry_kinds() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let bounds = Rect::new(1.0, 2.0, 30.0, 40.0);
+        let bounds = LogicalRect::new(px(1.0), px(2.0), px(30.0), px(40.0));
 
         let canvas = NodeBuilder::canvas(Canvas::new(bounds))
             .build(&mut tree, root)
@@ -503,12 +503,17 @@ mod tests {
     fn layout_override_forces_absolute_and_stores_rect() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let rect = Rect::new(1.0, 2.0, 3.0, 4.0);
+        let rect = LogicalRect::new(px(1.0), px(2.0), px(3.0), px(4.0));
 
-        let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
-            .layout_override(rect)
-            .build(&mut tree, root)
-            .expect("挂载成功");
+        let node = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
+        )))
+        .layout_override(rect)
+        .build(&mut tree, root)
+        .expect("挂载成功");
 
         let node = tree.get(node).expect("存在");
         assert_eq!(
@@ -518,7 +523,7 @@ mod tests {
         );
         assert_eq!(node.layout_override(), Some(LayoutOverride::new(rect)));
         assert_eq!(node.style().clip, Clip::None);
-        let _ = Point::ZERO;
+        let _ = LogicalPoint::ZERO;
     }
 
     #[test]
@@ -533,9 +538,9 @@ mod tests {
         let node = NodeBuilder::boxed()
             .measure(Box::new(move |_known, _available| {
                 counter.set(counter.get() + 1);
-                crate::math::Size::new(10.0, 10.0)
+                crate::math::LogicalSize::new(px(10.0), px(10.0))
             }))
-            .hit_shape(HitShape::custom(|point: Point| point.x < 5.0))
+            .hit_shape(HitShape::custom(|point: LogicalPoint| point.x < px(5.0)))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -545,8 +550,8 @@ mod tests {
             .expect("存在")
             .hit_shape()
             .expect("hit_shape 必须存进节点");
-        assert!(shape.contains(Point::new(1.0, 1.0)));
-        assert!(!shape.contains(Point::new(6.0, 1.0)));
+        assert!(shape.contains(LogicalPoint::new(px(1.0), px(1.0))));
+        assert!(!shape.contains(LogicalPoint::new(px(6.0), px(1.0))));
     }
 
     #[test]
@@ -555,9 +560,14 @@ mod tests {
     fn leaf_parent_is_debug_assert() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 4.0, 4.0)))
-            .build(&mut tree, root)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(4.0),
+            px(4.0),
+        )))
+        .build(&mut tree, root)
+        .expect("挂载成功");
 
         let _ = NodeBuilder::boxed().build(&mut tree, canvas);
     }
@@ -569,7 +579,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let pane = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -580,14 +590,14 @@ mod tests {
     fn text_builder_sets_kind_content_and_no_measure() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let node = NodeBuilder::text("label", crate::text::TextStyle::new(13.0))
+        let node = NodeBuilder::text("label", crate::text::TextStyle::new(px(13.0)))
             .build(&mut tree, root)
             .expect("挂载成功");
 
         match tree.get(node).expect("存在").kind() {
             NodeKind::Text(content) => {
                 assert_eq!(content.text, "label");
-                assert_eq!(content.style.size, 13.0);
+                assert_eq!(content.style.size, px(13.0));
             }
             other => panic!("expected Text, got {other:?}"),
         }
@@ -597,7 +607,7 @@ mod tests {
         );
         assert_eq!(
             tree.text_measured_size(node),
-            Some(crate::math::Size::ZERO),
+            Some(crate::math::LogicalSize::ZERO),
             "未 shape 前的尺寸记录是 0"
         );
     }

@@ -8,7 +8,7 @@ use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
     error::EngineError,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalPx, LogicalRect, px},
     node::id::Arena,
     paint::geometry::{
         GEOMETRY_PAGE_BYTES, GeometryBuffer, GeometryChunk, GeometryDesc, GeometryId,
@@ -23,7 +23,7 @@ struct GeometryRecord {
     layout: GeometryLayout,
     vertex: Vec<u8>,
     index: Vec<u8>,
-    bounds: Rect,
+    bounds: LogicalRect,
     revision: u64,
     chunks: Vec<ChunkRecord>,
     vertex_pages: Vec<Bytes>,
@@ -37,7 +37,7 @@ struct ChunkRecord {
     index_count: u32,
     vertex_first: u32,
     vertex_end: u32,
-    bounds: Rect,
+    bounds: LogicalRect,
     revision: u64,
 }
 
@@ -45,7 +45,7 @@ struct ChunkRecord {
 struct ChunkScan {
     vertex_first: u32,
     vertex_end: u32,
-    bounds: Rect,
+    bounds: LogicalRect,
 }
 
 pub struct GeometryStore {
@@ -90,7 +90,9 @@ impl GeometryStore {
                 desc.index_bytes.len()
             )));
         }
-        if !desc.bounds.is_finite() || desc.bounds.size.width < 0.0 || desc.bounds.size.height < 0.0
+        if !desc.bounds.is_finite()
+            || desc.bounds.size.width < LogicalPx::ZERO
+            || desc.bounds.size.height < LogicalPx::ZERO
         {
             return Err(register_error(SmolStr::new_static(
                 "geometry bounds must be finite with non-negative size",
@@ -172,7 +174,7 @@ impl GeometryStore {
         if range.is_empty() {
             return Ok(GeometryUpdate {
                 revision: record.revision,
-                damaged: Rect::default(),
+                damaged: LogicalRect::default(),
             });
         }
         let stride = record.layout.vertex_stride as usize;
@@ -197,7 +199,7 @@ impl GeometryStore {
         }
         self.revision += 1;
         let revision = self.revision;
-        let mut damaged = Rect::default();
+        let mut damaged = LogicalRect::default();
         for chunk in affected {
             let (index_first, index_count) = {
                 let meta = &record.chunks[chunk];
@@ -243,7 +245,7 @@ impl GeometryStore {
         if range.is_empty() {
             return Ok(GeometryUpdate {
                 revision: record.revision,
-                damaged: Rect::default(),
+                damaged: LogicalRect::default(),
             });
         }
         if range.end as usize > record.index.len() {
@@ -263,7 +265,7 @@ impl GeometryStore {
                 index_count: 0,
                 vertex_first: 0,
                 vertex_end: 0,
-                bounds: Rect::default(),
+                bounds: LogicalRect::default(),
                 revision: 0,
             });
         }
@@ -285,7 +287,7 @@ impl GeometryStore {
         }
         self.revision += 1;
         let revision = self.revision;
-        let mut damaged = Rect::default();
+        let mut damaged = LogicalRect::default();
         for chunk in affected {
             let (index_first, count) = {
                 let total = (record.index.len() / index_size as usize) as u32;
@@ -344,7 +346,7 @@ impl GeometryStore {
         if vertices == current_vertices && indices == current_indices {
             return Ok(GeometryUpdate {
                 revision: record.revision,
-                damaged: Rect::default(),
+                damaged: LogicalRect::default(),
             });
         }
         record.vertex.truncate(vertices as usize * stride);
@@ -352,7 +354,7 @@ impl GeometryStore {
         record.index.truncate(indices as usize * index_size);
         truncate_pages(&record.index, &mut record.index_pages);
         let wanted = chunk_count(record.layout.topology, indices);
-        let mut damaged = Rect::default();
+        let mut damaged = LogicalRect::default();
         for removed in &record.chunks[wanted as usize..] {
             damaged = damaged.union(removed.bounds);
         }
@@ -467,8 +469,8 @@ fn scan_chunk(
     let position_offset = layout.pipeline.position_offset() as usize;
     let mut first = u32::MAX;
     let mut end = 0u32;
-    let mut min = Point::new(f32::INFINITY, f32::INFINITY);
-    let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut min = LogicalPoint::new(px(f32::INFINITY), px(f32::INFINITY));
+    let mut max = LogicalPoint::new(px(f32::NEG_INFINITY), px(f32::NEG_INFINITY));
     let mut has_position = false;
     for step in 0..index_count {
         let position = (index_first + step) as usize * index_size;
@@ -497,8 +499,8 @@ fn scan_chunk(
         if !x.is_finite() || !y.is_finite() {
             continue;
         }
-        min = Point::new(min.x.min(x), min.y.min(y));
-        max = Point::new(max.x.max(x), max.y.max(y));
+        min = LogicalPoint::new(min.x.min(px(x)), min.y.min(px(y)));
+        max = LogicalPoint::new(max.x.max(px(x)), max.y.max(px(y)));
         has_position = true;
     }
     if first == u32::MAX {
@@ -506,14 +508,14 @@ fn scan_chunk(
         end = 0;
     }
     let bounds = if has_position {
-        Rect::new(
+        LogicalRect::new(
             min.x,
             min.y,
-            (max.x - min.x).max(MIN_CHUNK_EXTENT),
-            (max.y - min.y).max(MIN_CHUNK_EXTENT),
+            (max.x - min.x).max(px(MIN_CHUNK_EXTENT)),
+            (max.y - min.y).max(px(MIN_CHUNK_EXTENT)),
         )
     } else {
-        Rect::default()
+        LogicalRect::default()
     };
     ChunkScan {
         vertex_first: first,
@@ -591,11 +593,11 @@ pub(crate) fn missing_snapshot() -> Arc<GeometrySnapshot> {
                 index_type: crate::paint::geometry::IndexType::U16,
                 vertex_stride: 12,
             },
-            Rect::default(),
+            LogicalRect::default(),
             Box::new([GeometryChunk {
                 index_first: 0,
                 index_count: 0,
-                bounds: Rect::default(),
+                bounds: LogicalRect::default(),
                 revision: 0,
             }]),
             Box::new([]),
@@ -620,7 +622,7 @@ mod tests {
     use super::GeometryStore;
     use crate::{
         error::EngineError,
-        math::Rect,
+        math::{LogicalRect, px},
         paint::{
             atlas::AtlasKind,
             geometry::{
@@ -644,7 +646,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 1.0, 2.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(1.0), px(2.0)),
             pipeline: GeometryPipeline::Ui,
         }
     }
@@ -689,7 +691,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, triangles as f32, 100.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(triangles as f32), px(100.0)),
             pipeline: GeometryPipeline::Ui,
         }
     }
@@ -711,11 +713,17 @@ mod tests {
         assert_eq!(snapshot.vertex_len(), 36);
         assert_eq!(snapshot.index_len(), 6);
         assert_eq!(snapshot.index_count(), 3);
-        assert_eq!(snapshot.bounds(), Rect::new(0.0, 0.0, 1.0, 2.0));
+        assert_eq!(
+            snapshot.bounds(),
+            LogicalRect::new(px(0.0), px(0.0), px(1.0), px(2.0))
+        );
         assert_eq!(snapshot.chunks().len(), 1);
         let chunk = snapshot.chunk(0).expect("chunk");
         assert_eq!((chunk.index_first, chunk.index_count), (0, 3));
-        assert_eq!(chunk.bounds, Rect::new(0.0, 0.0, 1.0, 2.0));
+        assert_eq!(
+            chunk.bounds,
+            LogicalRect::new(px(0.0), px(0.0), px(1.0), px(2.0))
+        );
     }
 
     #[test]
@@ -774,9 +782,9 @@ mod tests {
         assert!(store.insert(desc).is_err());
 
         for bounds in [
-            Rect::new(f32::NAN, 0.0, 1.0, 1.0),
-            Rect::new(0.0, 0.0, -1.0, 1.0),
-            Rect::new(0.0, 0.0, 1.0, f32::INFINITY),
+            LogicalRect::new(px(f32::NAN), px(0.0), px(1.0), px(1.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(-1.0), px(1.0)),
+            LogicalRect::new(px(0.0), px(0.0), px(1.0), px(f32::INFINITY)),
         ] {
             let mut desc = triangle_desc();
             desc.bounds = bounds;
@@ -930,24 +938,24 @@ mod tests {
         let before = snapshot(&store, id);
         assert_eq!(
             before.chunk(0).expect("chunk").bounds,
-            Rect::new(0.0, 0.0, 1.0, 2.0)
+            LogicalRect::new(px(0.0), px(0.0), px(1.0), px(2.0))
         );
         let moved = vertex_bytes(&[[100.0, 100.0], [101.0, 100.0], [100.0, 101.0]]);
         let update = store
             .update_vertices(id, 0..36, &moved)
             .expect("移动全部顶点");
         assert!(
-            update.damaged.origin.x <= 0.0
-                && update.damaged.origin.y <= 0.0
-                && update.damaged.max().x >= 101.0
-                && update.damaged.max().y >= 101.0,
+            update.damaged.origin.x <= px(0.0)
+                && update.damaged.origin.y <= px(0.0)
+                && update.damaged.max().x >= px(101.0)
+                && update.damaged.max().y >= px(101.0),
             "damage 必须是旧 ∪ 新：{:?}",
             update.damaged
         );
         let after = snapshot(&store, id);
         let bounds = after.chunk(0).expect("chunk").bounds;
         assert!(
-            bounds.origin.x >= 100.0 && bounds.origin.y >= 100.0,
+            bounds.origin.x >= px(100.0) && bounds.origin.y >= px(100.0),
             "新块 bounds 只覆盖新位置：{bounds:?}"
         );
     }
@@ -977,7 +985,7 @@ mod tests {
             "第二块必须不动"
         );
         assert!(
-            update.damaged.max().x >= 77.0,
+            update.damaged.max().x >= px(77.0),
             "第一块的 damage 必须包含新位置：{:?}",
             update.damaged
         );
@@ -1043,7 +1051,7 @@ mod tests {
             "尾块必须重建"
         );
         assert!(
-            update.damaged.max().x >= 201.0,
+            update.damaged.max().x >= px(201.0),
             "尾块的新 bounds 必须并进 damage：{:?}",
             update.damaged
         );
@@ -1078,7 +1086,7 @@ mod tests {
         assert_eq!((fresh.index_first, fresh.index_count), (12288, 3));
         assert_eq!(after.chunk(0).expect("chunk").index_count, 12288);
         assert!(
-            update.damaged.max().x >= 101.0,
+            update.damaged.max().x >= px(101.0),
             "新块的 bounds 必须并进 damage：{:?}",
             update.damaged
         );
@@ -1121,7 +1129,7 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleStrip,
-                bounds: Rect::new(0.0, 0.0, 3.0, 1.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(3.0), px(1.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("strip");
@@ -1131,7 +1139,7 @@ mod tests {
         let update = store
             .update_indices(id, 8..10, &3u16.to_le_bytes())
             .expect("strip 追加");
-        assert!(update.damaged.max().x >= 3.0);
+        assert!(update.damaged.max().x >= px(3.0));
         assert_eq!(snapshot(&store, id).chunks().len(), 1);
     }
 
@@ -1168,15 +1176,15 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: Rect::new(0.0, 5.0, 20.0, 0.0),
+                bounds: LogicalRect::new(px(0.0), px(5.0), px(20.0), px(0.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("horizontal");
         let bounds = snapshot(&store, id).chunk(0).expect("chunk").bounds;
         assert!(!bounds.is_empty(), "水平线块的 bounds 不得为空");
-        assert!(bounds.origin.x <= 0.0 && bounds.max().x >= 20.0);
-        assert!(bounds.origin.y <= 5.0 && bounds.max().y >= 5.0);
-        assert!(bounds.size.width >= 20.0);
+        assert!(bounds.origin.x <= px(0.0) && bounds.max().x >= px(20.0));
+        assert!(bounds.origin.y <= px(5.0) && bounds.max().y >= px(5.0));
+        assert!(bounds.size.width >= px(20.0));
     }
 
     #[test]
@@ -1292,7 +1300,7 @@ mod tests {
 
         let update = store.truncate(id, base_count, base_count).expect("截断");
         assert!(
-            update.damaged.max().x >= 201.0 && update.damaged.max().y >= 201.0,
+            update.damaged.max().x >= px(201.0) && update.damaged.max().y >= px(201.0),
             "被截掉三角形的新位置必须进 damage：{:?}",
             update.damaged
         );
@@ -1322,12 +1330,12 @@ mod tests {
         assert_eq!(again.chunks().len(), 2);
         assert_eq!(again.chunk(1).expect("chunk").index_count, 9);
         assert!(
-            update.damaged.max().x >= 301.0,
+            update.damaged.max().x >= px(301.0),
             "再次追加的新位置必须进 damage：{:?}",
             update.damaged
         );
         assert!(
-            again.chunk(1).expect("chunk").bounds.max().x >= 301.0,
+            again.chunk(1).expect("chunk").bounds.max().x >= px(301.0),
             "尾块 AABB 必须包含新三角形：{:?}",
             again.chunk(1).expect("chunk").bounds
         );
@@ -1368,7 +1376,7 @@ mod tests {
             (12288, 3)
         );
         assert!(
-            update.damaged.max().x >= 101.0,
+            update.damaged.max().x >= px(101.0),
             "新块的 bounds 必须进 damage：{:?}",
             update.damaged
         );

@@ -1,4 +1,4 @@
-use crate::math::{Point, Size};
+use crate::math::{LogicalPoint, LogicalSize, px};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Area {
@@ -85,44 +85,47 @@ impl Desktop {
         })
     }
 
-    fn to_appkit(self, point: Point) -> (f64, f64) {
+    fn to_appkit(self, point: LogicalPoint) -> (f64, f64) {
         (
-            self.min_x + f64::from(point.x),
-            self.max_y - f64::from(point.y),
+            self.min_x + f64::from(point.x.value()),
+            self.max_y - f64::from(point.y.value()),
         )
     }
 
-    fn to_engine(self, x: f64, top: f64) -> Point {
-        Point::new((x - self.min_x) as f32, (self.max_y - top) as f32)
+    fn to_engine(self, x: f64, top: f64) -> LogicalPoint {
+        LogicalPoint::new(px((x - self.min_x) as f32), px((self.max_y - top) as f32))
     }
 }
 
 pub(crate) fn content_origin_for_position(
-    position: Point,
-    size: Size,
+    position: LogicalPoint,
+    size: LogicalSize,
     screens: &[ScreenArea],
 ) -> (f64, f64) {
-    let width = f64::from(size.width.max(1.0));
-    let height = f64::from(size.height.max(1.0));
+    let width = f64::from(size.width.max(px(1.0)).value());
+    let height = f64::from(size.height.max(px(1.0)).value());
     let Some(desktop) = Desktop::from_screens(screens) else {
-        return (f64::from(position.x), -f64::from(position.y) - height);
+        return (
+            f64::from(position.x.value()),
+            -f64::from(position.y.value()) - height,
+        );
     };
     let (left, top) = desktop.to_appkit(position);
     clamp_origin(Area::new(left, top - height, width, height), screens)
 }
 
-pub(crate) fn position_from_content_rect(content: Area, screens: &[ScreenArea]) -> Point {
+pub(crate) fn position_from_content_rect(content: Area, screens: &[ScreenArea]) -> LogicalPoint {
     match Desktop::from_screens(screens) {
         Some(desktop) => desktop.to_engine(content.x, content.max_y()),
-        None => Point::new(content.x as f32, (-content.max_y()) as f32),
+        None => LogicalPoint::new(px(content.x as f32), px((-content.max_y()) as f32)),
     }
 }
 
-pub(crate) fn cascade_position(desktop: Desktop, main_visible: Area, index: usize) -> Point {
+pub(crate) fn cascade_position(desktop: Desktop, main_visible: Area, index: usize) -> LogicalPoint {
     let step = CASCADE_STEP * (index % CASCADE_WRAP) as f64;
     let x = main_visible.x - desktop.min_x + CASCADE_MARGIN + step;
     let y = desktop.max_y - main_visible.max_y() + CASCADE_MARGIN + step;
-    Point::new(x as f32, y as f32)
+    LogicalPoint::new(px(x as f32), px(y as f32))
 }
 
 const CASCADE_STEP: f64 = 26.0;
@@ -130,16 +133,16 @@ const CASCADE_WRAP: usize = 8;
 const CASCADE_MARGIN: f64 = 80.0;
 
 pub(crate) fn content_size_bounds(
-    min: Option<Size>,
-    max: Option<Size>,
-    platform_min: Size,
-) -> (Size, Option<Size>) {
-    let max = max.map(|size| Size::new(size.width.max(1.0), size.height.max(1.0)));
+    min: Option<LogicalSize>,
+    max: Option<LogicalSize>,
+    platform_min: LogicalSize,
+) -> (LogicalSize, Option<LogicalSize>) {
+    let max = max.map(|size| LogicalSize::new(size.width.max(px(1.0)), size.height.max(px(1.0))));
     let min = min.map_or(platform_min, |size| {
-        Size::new(size.width.max(1.0), size.height.max(1.0))
+        LogicalSize::new(size.width.max(px(1.0)), size.height.max(px(1.0)))
     });
     let min = max.map_or(min, |max| {
-        Size::new(min.width.min(max.width), min.height.min(max.height))
+        LogicalSize::new(min.width.min(max.width), min.height.min(max.height))
     });
     (min, max)
 }
@@ -184,7 +187,7 @@ mod tests {
         Area, Desktop, ScreenArea, cascade_position, content_origin_for_position,
         content_size_bounds, position_from_content_rect,
     };
-    use crate::math::{Point, Size};
+    use crate::math::{LogicalPoint, LogicalSize, px};
 
     fn main_screen() -> ScreenArea {
         ScreenArea {
@@ -215,11 +218,19 @@ mod tests {
     fn engine_position_is_flipped_into_appkit_content_origin() {
         let screens = [main_screen()];
         assert_eq!(
-            content_origin_for_position(Point::new(100.0, 50.0), Size::new(800.0, 600.0), &screens),
+            content_origin_for_position(
+                LogicalPoint::new(px(100.0), px(50.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
+                &screens
+            ),
             (100.0, 430.0)
         );
         assert_eq!(
-            content_origin_for_position(Point::new(0.0, 0.0), Size::new(800.0, 600.0), &screens),
+            content_origin_for_position(
+                LogicalPoint::new(px(0.0), px(0.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
+                &screens
+            ),
             (0.0, 455.0)
         );
     }
@@ -232,12 +243,15 @@ mod tests {
             (200.0, 200.0, 320.0, 200.0),
             (1500.0, 300.0, 400.0, 640.0),
         ] {
-            let (left, bottom) =
-                content_origin_for_position(Point::new(x, y), Size::new(w, h), &screens);
+            let (left, bottom) = content_origin_for_position(
+                LogicalPoint::new(px(x), px(y)),
+                LogicalSize::new(px(w), px(h)),
+                &screens,
+            );
             let content = Area::new(left, bottom, f64::from(w), f64::from(h));
             assert_eq!(
                 position_from_content_rect(content, &screens),
-                Point::new(x, y)
+                LogicalPoint::new(px(x), px(y))
             );
         }
     }
@@ -247,24 +261,24 @@ mod tests {
         let screens = [main_screen()];
         assert_eq!(
             content_origin_for_position(
-                Point::new(5000.0, 50.0),
-                Size::new(800.0, 600.0),
+                LogicalPoint::new(px(5000.0), px(50.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
                 &screens
             ),
             (1120.0, 430.0)
         );
         assert_eq!(
             content_origin_for_position(
-                Point::new(-50.0, -20.0),
-                Size::new(800.0, 600.0),
+                LogicalPoint::new(px(-50.0), px(-20.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
                 &screens
             ),
             (0.0, 455.0)
         );
         assert_eq!(
             content_origin_for_position(
-                Point::new(100.0, 900.0),
-                Size::new(800.0, 600.0),
+                LogicalPoint::new(px(100.0), px(900.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
                 &screens
             ),
             (100.0, 60.0)
@@ -276,8 +290,8 @@ mod tests {
         let screens = [main_screen()];
         assert_eq!(
             content_origin_for_position(
-                Point::new(100.0, 100.0),
-                Size::new(2500.0, 1500.0),
+                LogicalPoint::new(px(100.0), px(100.0)),
+                LogicalSize::new(px(2500.0), px(1500.0)),
                 &screens
             ),
             (0.0, -445.0)
@@ -291,7 +305,11 @@ mod tests {
         assert_eq!(desktop.min_x, -1280.0);
         assert_eq!(desktop.max_y, 1080.0);
         assert_eq!(
-            content_origin_for_position(Point::new(0.0, 100.0), Size::new(800.0, 600.0), &screens),
+            content_origin_for_position(
+                LogicalPoint::new(px(0.0), px(100.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
+                &screens
+            ),
             (-1280.0, 380.0)
         );
 
@@ -299,7 +317,11 @@ mod tests {
         let desktop = desktop_of(&screens);
         assert_eq!(desktop.max_y, 2280.0);
         assert_eq!(
-            content_origin_for_position(Point::new(100.0, 50.0), Size::new(800.0, 600.0), &screens),
+            content_origin_for_position(
+                LogicalPoint::new(px(100.0), px(50.0)),
+                LogicalSize::new(px(800.0), px(600.0)),
+                &screens
+            ),
             (100.0, 1630.0)
         );
     }
@@ -308,8 +330,8 @@ mod tests {
     fn clamp_picks_the_screen_with_the_largest_intersection() {
         let screens = [main_screen(), left_screen()];
         let (left, bottom) = content_origin_for_position(
-            Point::new(680.0, 100.0),
-            Size::new(800.0, 600.0),
+            LogicalPoint::new(px(680.0), px(100.0)),
+            LogicalSize::new(px(800.0), px(600.0)),
             &screens,
         );
         assert_eq!((left, bottom), (-800.0, 380.0));
@@ -319,8 +341,8 @@ mod tests {
     fn far_off_screen_position_snaps_to_the_nearest_screen() {
         let screens = [main_screen(), left_screen()];
         let (left, bottom) = content_origin_for_position(
-            Point::new(-9000.0, 300.0),
-            Size::new(800.0, 600.0),
+            LogicalPoint::new(px(-9000.0), px(300.0)),
+            LogicalSize::new(px(800.0), px(600.0)),
             &screens,
         );
         assert_eq!((left, bottom), (-1280.0, 180.0));
@@ -332,8 +354,8 @@ mod tests {
         let visible = screens[0].visible;
         for engine_y in [0.0_f32, 500.0, 1000.0] {
             let (_, bottom) = content_origin_for_position(
-                Point::new(0.0, engine_y),
-                Size::new(400.0, 300.0),
+                LogicalPoint::new(px(0.0), px(engine_y)),
+                LogicalSize::new(px(400.0), px(300.0)),
                 &screens,
             );
             assert!(
@@ -350,46 +372,64 @@ mod tests {
         let desktop = desktop_of(&screens);
         let visible = screens[0].visible;
         let first = cascade_position(desktop, visible, 0);
-        assert_eq!(first, Point::new(80.0, 105.0));
+        assert_eq!(first, LogicalPoint::new(px(80.0), px(105.0)));
         let second = cascade_position(desktop, visible, 1);
-        assert_eq!(second, Point::new(106.0, 131.0));
+        assert_eq!(second, LogicalPoint::new(px(106.0), px(131.0)));
         assert_eq!(cascade_position(desktop, visible, 8), first);
     }
 
     #[test]
     fn size_bounds_use_platform_minimum_and_clamp_min_into_max() {
-        let platform_min = Size::new(320.0, 200.0);
+        let platform_min = LogicalSize::new(px(320.0), px(200.0));
         assert_eq!(
             content_size_bounds(None, None, platform_min),
             (platform_min, None)
         );
         assert_eq!(
-            content_size_bounds(None, Some(Size::new(200.0, 100.0)), platform_min),
-            (Size::new(200.0, 100.0), Some(Size::new(200.0, 100.0)))
+            content_size_bounds(
+                None,
+                Some(LogicalSize::new(px(200.0), px(100.0))),
+                platform_min
+            ),
+            (
+                LogicalSize::new(px(200.0), px(100.0)),
+                Some(LogicalSize::new(px(200.0), px(100.0)))
+            )
         );
         assert_eq!(
             content_size_bounds(
-                Some(Size::new(900.0, 700.0)),
-                Some(Size::new(800.0, 600.0)),
+                Some(LogicalSize::new(px(900.0), px(700.0))),
+                Some(LogicalSize::new(px(800.0), px(600.0))),
                 platform_min
             ),
-            (Size::new(800.0, 600.0), Some(Size::new(800.0, 600.0)))
+            (
+                LogicalSize::new(px(800.0), px(600.0)),
+                Some(LogicalSize::new(px(800.0), px(600.0)))
+            )
         );
         assert_eq!(
-            content_size_bounds(Some(Size::new(640.0, 480.0)), None, platform_min),
-            (Size::new(640.0, 480.0), None)
+            content_size_bounds(
+                Some(LogicalSize::new(px(640.0), px(480.0))),
+                None,
+                platform_min
+            ),
+            (LogicalSize::new(px(640.0), px(480.0)), None)
         );
     }
 
     #[test]
     fn without_screens_the_mapping_only_flips_the_y_axis() {
         assert_eq!(
-            content_origin_for_position(Point::new(10.0, 20.0), Size::new(100.0, 50.0), &[]),
+            content_origin_for_position(
+                LogicalPoint::new(px(10.0), px(20.0)),
+                LogicalSize::new(px(100.0), px(50.0)),
+                &[]
+            ),
             (10.0, -70.0)
         );
         assert_eq!(
             position_from_content_rect(Area::new(10.0, -70.0, 100.0, 50.0), &[]),
-            Point::new(10.0, 20.0)
+            LogicalPoint::new(px(10.0), px(20.0))
         );
     }
 }

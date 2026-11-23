@@ -1,4 +1,4 @@
-use crate::math::{PhysicalRect, Rect, Scale};
+use crate::math::{DevicePixelRatio, DeviceRect, LogicalRect, PhysicalPx, dp};
 
 pub(crate) const MAX_DAMAGE_RECTS: usize = 16;
 
@@ -13,13 +13,13 @@ pub(crate) struct DamageSummary {
 }
 
 pub(crate) struct DamageAccumulator {
-    scale: Scale,
-    rects: Vec<PhysicalRect>,
+    scale: DevicePixelRatio,
+    rects: Vec<DeviceRect>,
     full: bool,
 }
 
 impl DamageAccumulator {
-    pub(crate) fn new(scale: Scale) -> Self {
+    pub(crate) fn new(scale: DevicePixelRatio) -> Self {
         Self {
             scale,
             rects: Vec::with_capacity(MAX_DAMAGE_RECTS),
@@ -27,7 +27,7 @@ impl DamageAccumulator {
         }
     }
 
-    pub(crate) fn reset(&mut self, scale: Scale) {
+    pub(crate) fn reset(&mut self, scale: DevicePixelRatio) {
         self.scale = scale;
         self.rects.clear();
         self.full = false;
@@ -35,18 +35,18 @@ impl DamageAccumulator {
 
     pub(crate) fn push_logical(
         &mut self,
-        bounds: Rect,
-        aa_padding: f32,
-        clip: Option<PhysicalRect>,
+        bounds: LogicalRect,
+        aa_padding: PhysicalPx,
+        clip: Option<DeviceRect>,
     ) {
-        self.push_device(bounds.to_physical_covering(self.scale), aa_padding, clip);
+        self.push_device(self.scale.to_covering_device_rect(bounds), aa_padding, clip);
     }
 
     pub(crate) fn push_device(
         &mut self,
-        rect: PhysicalRect,
-        aa_padding: f32,
-        clip: Option<PhysicalRect>,
+        rect: DeviceRect,
+        aa_padding: PhysicalPx,
+        clip: Option<DeviceRect>,
     ) {
         if self.full {
             return;
@@ -54,17 +54,8 @@ impl DamageAccumulator {
         if rect.is_empty() {
             return;
         }
-        let pad = if aa_padding.is_nan() {
-            0
-        } else {
-            aa_padding.max(0.0).ceil() as i32
-        };
-        let mut rect = PhysicalRect::new(
-            rect.x0.saturating_sub(pad),
-            rect.y0.saturating_sub(pad),
-            rect.x1.saturating_add(pad),
-            rect.y1.saturating_add(pad),
-        );
+        let pad = dp(aa_padding.max(PhysicalPx::ZERO).value().ceil() as i32);
+        let mut rect = DeviceRect::new(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad);
         if let Some(clip) = clip {
             rect = rect.intersect(clip);
             if rect.is_empty() {
@@ -93,7 +84,7 @@ impl DamageAccumulator {
         self.become_full();
     }
 
-    pub(crate) fn finish(&mut self, frame: PhysicalRect) -> DamageSummary {
+    pub(crate) fn finish(&mut self, frame: DeviceRect) -> DamageSummary {
         if self.full {
             return DamageSummary {
                 full: true,
@@ -126,7 +117,7 @@ impl DamageAccumulator {
         }
     }
 
-    pub(crate) fn rects(&self) -> &[PhysicalRect] {
+    pub(crate) fn rects(&self) -> &[DeviceRect] {
         &self.rects
     }
 
@@ -185,7 +176,7 @@ impl DamageAccumulator {
     }
 }
 
-fn bands(rects: &[PhysicalRect], limit: usize) -> Vec<PhysicalRect> {
+fn bands(rects: &[DeviceRect], limit: usize) -> Vec<DeviceRect> {
     let groups = rects.len().min(limit);
     let mut bands = Vec::with_capacity(groups);
     let mut start = 0usize;
@@ -201,11 +192,11 @@ fn bands(rects: &[PhysicalRect], limit: usize) -> Vec<PhysicalRect> {
     bands
 }
 
-fn mergeable(a: PhysicalRect, b: PhysicalRect) -> bool {
+fn mergeable(a: DeviceRect, b: DeviceRect) -> bool {
     a.union(b).area() <= a.area().saturating_add(b.area())
 }
 
-fn covers(outer: PhysicalRect, inner: PhysicalRect) -> bool {
+fn covers(outer: DeviceRect, inner: DeviceRect) -> bool {
     outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
 }
 
@@ -215,14 +206,14 @@ mod tests {
         DamageAccumulator, FULL_FRAME_AREA_RATIO, MAX_ACCUMULATED_DAMAGE_RECTS, MAX_DAMAGE_RECTS,
         mergeable,
     };
-    use crate::math::{PhysicalRect, Rect, Scale};
+    use crate::math::{DevicePixelRatio, DeviceRect, LogicalRect, PhysicalPx, dp, physical_px, px};
 
-    fn scale(factor: f32) -> Scale {
-        Scale::new(factor).expect("合法 scale")
+    fn scale(factor: f32) -> DevicePixelRatio {
+        DevicePixelRatio::new(factor).expect("合法 scale")
     }
 
-    fn frame() -> PhysicalRect {
-        PhysicalRect::new(0, 0, 1000, 1000)
+    fn frame() -> DeviceRect {
+        DeviceRect::new(dp(0), dp(0), dp(1000), dp(1000))
     }
 
     fn finish(acc: &mut DamageAccumulator) -> (bool, usize) {
@@ -230,20 +221,20 @@ mod tests {
         (summary.full, summary.rects)
     }
 
-    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
-        Rect::new(x, y, w, h)
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> LogicalRect {
+        LogicalRect::new(px(x), px(y), px(w), px(h))
     }
 
     fn coverage_area(acc: &DamageAccumulator) -> i64 {
         acc.rects().iter().map(|rect| rect.area()).sum()
     }
 
-    fn is_covered(rect: PhysicalRect, outputs: &[PhysicalRect]) -> bool {
-        (rect.y0..rect.y1).all(|y| {
-            (rect.x0..rect.x1).all(|x| {
+    fn is_covered(rect: DeviceRect, outputs: &[DeviceRect]) -> bool {
+        (rect.y0.value()..rect.y1.value()).all(|y| {
+            (rect.x0.value()..rect.x1.value()).all(|x| {
                 outputs
                     .iter()
-                    .any(|out| out.x0 <= x && x < out.x1 && out.y0 <= y && y < out.y1)
+                    .any(|out| out.x0 <= x && out.x1 > x && out.y0 <= y && out.y1 > y)
             })
         })
     }
@@ -251,13 +242,13 @@ mod tests {
     #[test]
     fn push_uses_covering_not_round() {
         let mut acc = DamageAccumulator::new(scale(2.0));
-        acc.push_logical(rect(10.5, 20.25, 0.25, 0.25), 0.0, None);
+        acc.push_logical(rect(10.5, 20.25, 0.25, 0.25), physical_px(0.0), None);
         let (full, count) = finish(&mut acc);
         assert!(!full);
         assert_eq!(count, 1);
         #[cfg(feature = "test-support")]
         {
-            let expected = PhysicalRect::new(21, 40, 22, 41);
+            let expected = DeviceRect::new(dp(21), dp(40), dp(22), dp(41));
             assert_eq!(acc.rects(), &[expected]);
         }
     }
@@ -267,21 +258,21 @@ mod tests {
         for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
             let scale = scale(factor);
             for logical in [
-                Rect::new(10.3, 4.7, 20.4, 9.6),
-                Rect::new(0.0, 0.0, 1.0, 1.0),
-                Rect::new(-3.25, 7.9, 16.75, 2.5),
+                LogicalRect::new(px(10.3), px(4.7), px(20.4), px(9.6)),
+                LogicalRect::new(px(0.0), px(0.0), px(1.0), px(1.0)),
+                LogicalRect::new(px(-3.25), px(7.9), px(16.75), px(2.5)),
             ] {
                 let mut acc = DamageAccumulator::new(scale);
-                acc.push_logical(logical, 0.0, None);
+                acc.push_logical(logical, physical_px(0.0), None);
                 let (full, count) = finish(&mut acc);
                 assert!(!full);
                 assert_eq!(count, 1);
 
                 let exact = [
-                    logical.min().x * factor,
-                    logical.min().y * factor,
-                    logical.max().x * factor,
-                    logical.max().y * factor,
+                    (logical.min().x * factor).value(),
+                    (logical.min().y * factor).value(),
+                    (logical.max().x * factor).value(),
+                    (logical.max().y * factor).value(),
                 ];
                 let rect = acc.rects()[0];
                 assert!(
@@ -299,8 +290,8 @@ mod tests {
     fn push_device_does_not_apply_the_scale() {
         for factor in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
             let mut acc = DamageAccumulator::new(scale(factor));
-            let device = PhysicalRect::new(10, 20, 40, 60);
-            acc.push_device(device, 0.0, None);
+            let device = DeviceRect::new(dp(10), dp(20), dp(40), dp(60));
+            acc.push_device(device, physical_px(0.0), None);
             let (full, count) = finish(&mut acc);
             assert!(!full);
             assert_eq!(count, 1);
@@ -315,10 +306,14 @@ mod tests {
     #[test]
     fn push_device_applies_the_physical_padding() {
         let mut acc = DamageAccumulator::new(scale(2.0));
-        acc.push_device(PhysicalRect::new(10, 20, 30, 40), 2.0, None);
+        acc.push_device(
+            DeviceRect::new(dp(10), dp(20), dp(30), dp(40)),
+            physical_px(2.0),
+            None,
+        );
         assert_eq!(
             acc.rects(),
-            &[PhysicalRect::new(8, 18, 32, 42)],
+            &[DeviceRect::new(dp(8), dp(18), dp(32), dp(42))],
             "AA pad 是物理像素，不得再乘 scale"
         );
         let _ = finish(&mut acc);
@@ -327,28 +322,34 @@ mod tests {
     #[test]
     fn push_expands_by_physical_padding() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push_logical(rect(10.0, 10.0, 2.0, 2.0), 2.0, None);
+        acc.push_logical(rect(10.0, 10.0, 2.0, 2.0), physical_px(2.0), None);
         #[cfg(feature = "test-support")]
-        assert_eq!(acc.rects(), &[PhysicalRect::new(8, 8, 14, 14)]);
+        assert_eq!(
+            acc.rects(),
+            &[DeviceRect::new(dp(8), dp(8), dp(14), dp(14))]
+        );
         let _ = finish(&mut acc);
     }
 
     #[test]
     fn push_intersects_clip() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        let clip = PhysicalRect::new(0, 0, 20, 20);
-        acc.push_logical(rect(10.0, 10.0, 40.0, 40.0), 0.0, Some(clip));
+        let clip = DeviceRect::new(dp(0), dp(0), dp(20), dp(20));
+        acc.push_logical(rect(10.0, 10.0, 40.0, 40.0), physical_px(0.0), Some(clip));
         #[cfg(feature = "test-support")]
-        assert_eq!(acc.rects(), &[PhysicalRect::new(10, 10, 20, 20)]);
+        assert_eq!(
+            acc.rects(),
+            &[DeviceRect::new(dp(10), dp(10), dp(20), dp(20))]
+        );
         let _ = finish(&mut acc);
     }
 
     #[test]
     fn push_rejects_non_finite_and_negative() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push_logical(rect(f32::NAN, 0.0, 1.0, 1.0), 0.0, None);
-        acc.push_logical(rect(0.0, 0.0, -4.0, 1.0), 0.0, None);
-        acc.push_logical(rect(f32::INFINITY, 0.0, 1.0, 1.0), 0.0, None);
+        acc.push_logical(rect(f32::NAN, 0.0, 1.0, 1.0), physical_px(0.0), None);
+        acc.push_logical(rect(0.0, 0.0, -4.0, 1.0), physical_px(0.0), None);
+        acc.push_logical(rect(f32::INFINITY, 0.0, 1.0, 1.0), physical_px(0.0), None);
         let (full, count) = finish(&mut acc);
         assert!(!full);
         assert_eq!(count, 0);
@@ -357,38 +358,38 @@ mod tests {
     #[test]
     fn merge_overlapping() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        acc.push_logical(rect(2.0, 2.0, 3.0, 3.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), physical_px(0.0), None);
+        acc.push_logical(rect(2.0, 2.0, 3.0, 3.0), physical_px(0.0), None);
         assert_eq!(finish(&mut acc), (false, 1));
     }
 
     #[test]
     fn merge_adjacent() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        acc.push_logical(rect(10.0, 0.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), physical_px(0.0), None);
+        acc.push_logical(rect(10.0, 0.0, 10.0, 10.0), physical_px(0.0), None);
         assert_eq!(finish(&mut acc), (false, 1));
     }
 
     #[test]
     fn reject_l_shaped_merge() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        acc.push_logical(rect(10.0, 10.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), physical_px(0.0), None);
+        acc.push_logical(rect(10.0, 10.0, 10.0, 10.0), physical_px(0.0), None);
         assert_eq!(finish(&mut acc), (false, 2), "只在一个角相邻 ⇒ 不合并");
     }
 
     #[test]
     fn merge_is_order_independent() {
         let mut a = DamageAccumulator::new(scale(1.0));
-        a.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        a.push_logical(rect(5.0, 5.0, 10.0, 10.0), 0.0, None);
-        a.push_logical(rect(100.0, 100.0, 5.0, 5.0), 0.0, None);
+        a.push_logical(rect(0.0, 0.0, 10.0, 10.0), physical_px(0.0), None);
+        a.push_logical(rect(5.0, 5.0, 10.0, 10.0), physical_px(0.0), None);
+        a.push_logical(rect(100.0, 100.0, 5.0, 5.0), physical_px(0.0), None);
 
         let mut b = DamageAccumulator::new(scale(1.0));
-        b.push_logical(rect(100.0, 100.0, 5.0, 5.0), 0.0, None);
-        b.push_logical(rect(5.0, 5.0, 10.0, 10.0), 0.0, None);
-        b.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
+        b.push_logical(rect(100.0, 100.0, 5.0, 5.0), physical_px(0.0), None);
+        b.push_logical(rect(5.0, 5.0, 10.0, 10.0), physical_px(0.0), None);
+        b.push_logical(rect(0.0, 0.0, 10.0, 10.0), physical_px(0.0), None);
 
         assert_eq!(finish(&mut a), finish(&mut b));
         #[cfg(feature = "test-support")]
@@ -405,13 +406,21 @@ mod tests {
     fn reset_reuses_capacity_and_is_deterministic() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         for index in 0..4 {
-            acc.push_logical(rect((index as f32) * 100.0, 0.0, 5.0, 5.0), 0.0, None);
+            acc.push_logical(
+                rect((index as f32) * 100.0, 0.0, 5.0, 5.0),
+                physical_px(0.0),
+                None,
+            );
         }
         let first = acc.rects().to_vec();
         acc.reset(scale(1.0));
         assert!(acc.rects().is_empty());
         for index in 0..4 {
-            acc.push_logical(rect((index as f32) * 100.0, 0.0, 5.0, 5.0), 0.0, None);
+            acc.push_logical(
+                rect((index as f32) * 100.0, 0.0, 5.0, 5.0),
+                physical_px(0.0),
+                None,
+            );
         }
         assert_eq!(acc.rects(), first.as_slice());
         assert_eq!(finish(&mut acc), (false, 4));
@@ -421,14 +430,14 @@ mod tests {
     fn push_after_full_is_ignored() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         acc.push_full();
-        acc.push_logical(rect(0.0, 0.0, 1.0, 1.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 1.0, 1.0), physical_px(0.0), None);
         assert_eq!(finish(&mut acc), (true, 0));
     }
 
     #[test]
     fn area_ratio_becomes_full() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push_logical(rect(0.0, 0.0, 900.0, 900.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 900.0, 900.0), physical_px(0.0), None);
         let (full, _) = finish(&mut acc);
         assert!(full, "> {FULL_FRAME_AREA_RATIO} 帧面积 ⇒ Full");
     }
@@ -436,7 +445,7 @@ mod tests {
     #[test]
     fn orderbook_full_depth_update_stays_partial() {
         let scale = scale(1.0);
-        let screen = PhysicalRect::new(0, 0, 1920, 1080);
+        let screen = DeviceRect::new(dp(0), dp(0), dp(1920), dp(1080));
         const ROWS: i32 = 40;
         const COLUMNS: i32 = 2;
         const CELL_WIDTH: f32 = 150.0;
@@ -460,10 +469,10 @@ mod tests {
         const PUSHED: usize = (ROWS as usize) * (COLUMNS as usize);
         assert_eq!(pushes.len(), PUSHED);
 
-        let mut legacy: Vec<PhysicalRect> = Vec::new();
+        let mut legacy: Vec<DeviceRect> = Vec::new();
         for bounds in &pushes {
-            let physical = bounds.to_physical_covering(scale);
-            let expanded = PhysicalRect::new(
+            let physical = scale.to_covering_device_rect(*bounds);
+            let expanded = DeviceRect::new(
                 physical.x0 - 1,
                 physical.y0 - 1,
                 physical.x1 + 1,
@@ -488,9 +497,9 @@ mod tests {
         let mut acc = DamageAccumulator::new(scale);
         let mut expected = Vec::with_capacity(PUSHED);
         for bounds in &pushes {
-            acc.push_logical(*bounds, 1.0, None);
-            let physical = bounds.to_physical_covering(scale);
-            expected.push(PhysicalRect::new(
+            acc.push_logical(*bounds, physical_px(1.0), None);
+            let physical = scale.to_covering_device_rect(*bounds);
+            expected.push(DeviceRect::new(
                 physical.x0 - 1,
                 physical.y0 - 1,
                 physical.x1 + 1,
@@ -532,27 +541,18 @@ mod tests {
     fn random_damage_is_covered_and_order_independent() {
         #[derive(Clone, Copy, Debug)]
         struct Push {
-            bounds: Rect,
-            padding: f32,
-            clip: Option<PhysicalRect>,
+            bounds: LogicalRect,
+            padding: PhysicalPx,
+            clip: Option<DeviceRect>,
         }
 
-        fn expected(push: Push) -> Option<PhysicalRect> {
-            let mut rect = push.bounds.to_physical_covering(scale(1.0));
+        fn expected(push: Push) -> Option<DeviceRect> {
+            let mut rect = scale(1.0).to_covering_device_rect(push.bounds);
             if rect.is_empty() {
                 return None;
             }
-            let pad = if push.padding.is_nan() {
-                0
-            } else {
-                push.padding.max(0.0).ceil() as i32
-            };
-            rect = PhysicalRect::new(
-                rect.x0.saturating_sub(pad),
-                rect.y0.saturating_sub(pad),
-                rect.x1.saturating_add(pad),
-                rect.y1.saturating_add(pad),
-            );
+            let pad = dp(push.padding.max(PhysicalPx::ZERO).value().ceil() as i32);
+            rect = DeviceRect::new(rect.x0 - pad, rect.y0 - pad, rect.x1 + pad, rect.y1 + pad);
             if let Some(clip) = push.clip {
                 rect = rect.intersect(clip);
                 if rect.is_empty() {
@@ -569,7 +569,7 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             ((state >> 33) as u32).wrapping_add(1)
         };
-        let screen = PhysicalRect::new(0, 0, 240, 240);
+        let screen = DeviceRect::new(dp(0), dp(0), dp(240), dp(240));
         let mut over_budget_frames = 0usize;
         for case in 0..20 {
             let count = 8 + (next() % 20) as usize;
@@ -579,15 +579,15 @@ mod tests {
                 let y = (next() % 340) as f32 - 20.0;
                 let width = 1.0 + (next() % 30) as f32;
                 let height = 1.0 + (next() % 30) as f32;
-                let padding = (next() % 3) as f32;
+                let padding = physical_px((next() % 3) as f32);
                 let clip = if next() % 3 == 0 {
                     let x0 = (next() % 140) as i32 - 10;
                     let y0 = (next() % 140) as i32 - 10;
-                    Some(PhysicalRect::new(
-                        x0,
-                        y0,
-                        x0 + 1 + (next() % 170) as i32,
-                        y0 + 1 + (next() % 170) as i32,
+                    Some(DeviceRect::new(
+                        dp(x0),
+                        dp(y0),
+                        dp(x0 + 1 + (next() % 170) as i32),
+                        dp(y0 + 1 + (next() % 170) as i32),
                     ))
                 } else {
                     None
@@ -598,7 +598,7 @@ mod tests {
                     clip,
                 });
             }
-            let expected_rects: Vec<PhysicalRect> =
+            let expected_rects: Vec<DeviceRect> =
                 pushes.iter().filter_map(|push| expected(*push)).collect();
 
             let mut first = DamageAccumulator::new(scale(1.0));
@@ -667,9 +667,13 @@ mod tests {
     fn sixteen_rects_stay_partial() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         for index in 0..MAX_DAMAGE_RECTS as i32 {
-            acc.push_logical(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
+            acc.push_logical(
+                rect((index * 59) as f32, 20.0, 58.0, 100.0),
+                physical_px(0.0),
+                None,
+            );
         }
-        let screen = PhysicalRect::new(0, 0, 1200, 1000);
+        let screen = DeviceRect::new(dp(0), dp(0), dp(1200), dp(1000));
         let summary = acc.finish(screen);
         assert!(!summary.full);
         assert_eq!(summary.rects, MAX_DAMAGE_RECTS);
@@ -681,10 +685,19 @@ mod tests {
         let mut acc = DamageAccumulator::new(scale(1.0));
         let mut expected = Vec::new();
         for index in 0..(MAX_DAMAGE_RECTS as i32 + 1) {
-            acc.push_logical(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
-            expected.push(PhysicalRect::new(index * 59, 20, index * 59 + 58, 120));
+            acc.push_logical(
+                rect((index * 59) as f32, 20.0, 58.0, 100.0),
+                physical_px(0.0),
+                None,
+            );
+            expected.push(DeviceRect::new(
+                dp(index * 59),
+                dp(20),
+                dp(index * 59 + 58),
+                dp(120),
+            ));
         }
-        let screen = PhysicalRect::new(0, 0, 1200, 1000);
+        let screen = DeviceRect::new(dp(0), dp(0), dp(1200), dp(1000));
         let summary = acc.finish(screen);
         assert!(!summary.full, "17 个矩形必须先聚合，不得直接整帧");
         assert!(summary.rects <= MAX_DAMAGE_RECTS);
@@ -703,9 +716,13 @@ mod tests {
         fn run(width: i32, height: i32) -> (bool, i64) {
             let mut acc = DamageAccumulator::new(scale(1.0));
             for index in 0..(MAX_DAMAGE_RECTS as i32 + 1) {
-                acc.push_logical(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
+                acc.push_logical(
+                    rect((index * 59) as f32, 20.0, 58.0, 100.0),
+                    physical_px(0.0),
+                    None,
+                );
             }
-            let summary = acc.finish(PhysicalRect::new(0, 0, width, height));
+            let summary = acc.finish(DeviceRect::new(dp(0), dp(0), dp(width), dp(height)));
             (summary.full, coverage_area(&acc))
         }
 
@@ -730,9 +747,9 @@ mod tests {
         for _ in 0..512 {
             let x = (next() % 1900) as f32;
             let y = (next() % 1060) as f32;
-            acc.push_logical(rect(x, y, 2.0, 2.0), 0.0, None);
+            acc.push_logical(rect(x, y, 2.0, 2.0), physical_px(0.0), None);
         }
-        let summary = acc.finish(PhysicalRect::new(0, 0, 1920, 1080));
+        let summary = acc.finish(DeviceRect::new(dp(0), dp(0), dp(1920), dp(1080)));
         assert!(summary.full, "512 个散布全帧的小矩形聚合后必然超过 50%");
         assert_eq!(summary.rects, 0, "Full 时矩形必须清空");
         assert!(acc.rects().is_empty());
@@ -744,7 +761,7 @@ mod tests {
         for index in 0..=(MAX_ACCUMULATED_DAMAGE_RECTS as i32) {
             let x = (index % 32) as f32 * 3.0;
             let y = (index / 32) as f32 * 3.0;
-            acc.push_logical(rect(x, y, 1.0, 1.0), 0.0, None);
+            acc.push_logical(rect(x, y, 1.0, 1.0), physical_px(0.0), None);
         }
         assert_eq!(
             acc.rects().len(),

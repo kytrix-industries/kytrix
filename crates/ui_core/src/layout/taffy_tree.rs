@@ -87,8 +87,8 @@ fn dispatch_child_layout(
             compute_hidden_layout(tree, taffy_node)
         } else if let Some(overridden) = tree.layout_override_of(node) {
             LayoutOutput::from_outer_size(TaffySize {
-                width: overridden.rect.size.width,
-                height: overridden.rect.size.height,
+                width: overridden.rect.size.width.value(),
+                height: overridden.rect.size.height.value(),
             })
         } else {
             match (display, has_children) {
@@ -281,7 +281,7 @@ mod tests {
 
     use crate::{
         layout::{LayoutOverride, LayoutReport},
-        math::{Rect, Size},
+        math::{LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::{canvas::Canvas, style::Style, style_builder::StyleBuilder},
     };
@@ -311,7 +311,7 @@ mod tests {
         .expect("布局成功")
     }
 
-    fn bounds(tree: &NodeTree, node: NodeId) -> Rect {
+    fn bounds(tree: &NodeTree, node: NodeId) -> LogicalRect {
         tree.get(node).expect("存在").layout().bounds
     }
 
@@ -325,9 +325,18 @@ mod tests {
 
         let report = layout(&mut tree, 200.0, 100.0);
 
-        assert_eq!(bounds(&tree, a), Rect::new(0.0, 0.0, 10.0, 10.0));
-        assert_eq!(bounds(&tree, b), Rect::new(10.0, 0.0, 20.0, 10.0));
-        assert_eq!(bounds(&tree, c), Rect::new(30.0, 0.0, 30.0, 10.0));
+        assert_eq!(
+            bounds(&tree, a),
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0))
+        );
+        assert_eq!(
+            bounds(&tree, b),
+            LogicalRect::new(px(10.0), px(0.0), px(20.0), px(10.0))
+        );
+        assert_eq!(
+            bounds(&tree, c),
+            LogicalRect::new(px(30.0), px(0.0), px(30.0), px(10.0))
+        );
         assert!(report.laid_out >= 4, "{report:?}");
     }
 
@@ -349,8 +358,8 @@ mod tests {
 
             let _ = layout(&mut tree, 100.0, 100.0);
 
-            assert_eq!(bounds(&tree, first).origin.y, 0.0);
-            assert_eq!(bounds(&tree, second).origin.y, 10.0);
+            assert_eq!(bounds(&tree, first).origin.y, px(0.0));
+            assert_eq!(bounds(&tree, second).origin.y, px(10.0));
         }
     }
 
@@ -380,8 +389,8 @@ mod tests {
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
-        assert_eq!(bounds(&tree, left).origin.x, 0.0);
-        assert_eq!(bounds(&tree, right).origin.x, 30.0, "第二列起点");
+        assert_eq!(bounds(&tree, left).origin.x, px(0.0));
+        assert_eq!(bounds(&tree, right).origin.x, px(30.0), "第二列起点");
     }
 
     #[test]
@@ -400,8 +409,8 @@ mod tests {
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
-        assert_eq!(bounds(&tree, first).origin.y, 0.0);
-        assert_eq!(bounds(&tree, second).origin.y, 10.0);
+        assert_eq!(bounds(&tree, first).origin.y, px(0.0));
+        assert_eq!(bounds(&tree, second).origin.y, px(10.0));
     }
 
     #[test]
@@ -412,7 +421,10 @@ mod tests {
 
         let _ = layout(&mut tree, 100.0, 100.0);
 
-        assert_eq!(bounds(&tree, a), Rect::new(0.0, 0.0, 10.5, 3.25));
+        assert_eq!(
+            bounds(&tree, a),
+            LogicalRect::new(px(0.0), px(0.0), px(10.5), px(3.25))
+        );
     }
 
     #[test]
@@ -422,14 +434,23 @@ mod tests {
         let outer = add(
             &mut tree,
             root,
-            StyleBuilder::new().size(100.0, 100.0).padding(4.0).build(),
+            StyleBuilder::new()
+                .size(px(100.0), px(100.0))
+                .padding(px(4.0))
+                .build(),
         );
         let inner = add(&mut tree, outer, fixed(10.0, 10.0));
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
-        assert_eq!(bounds(&tree, outer), Rect::new(0.0, 0.0, 100.0, 100.0));
-        assert_eq!(bounds(&tree, inner), Rect::new(4.0, 4.0, 10.0, 10.0));
+        assert_eq!(
+            bounds(&tree, outer),
+            LogicalRect::new(px(0.0), px(0.0), px(100.0), px(100.0))
+        );
+        assert_eq!(
+            bounds(&tree, inner),
+            LogicalRect::new(px(4.0), px(4.0), px(10.0), px(10.0))
+        );
     }
 
     #[test]
@@ -440,9 +461,9 @@ mod tests {
             &mut tree,
             root,
             StyleBuilder::new()
-                .size(100.0, 100.0)
-                .padding(3.0)
-                .border(2.0)
+                .size(px(100.0), px(100.0))
+                .padding(px(3.0))
+                .border(px(2.0))
                 .build(),
         );
         let inner = add(&mut tree, outer, fixed(10.0, 10.0));
@@ -451,16 +472,16 @@ mod tests {
 
         assert_eq!(
             bounds(&tree, inner).origin,
-            crate::math::Point::new(5.0, 5.0)
+            crate::math::LogicalPoint::new(px(5.0), px(5.0))
         );
         assert_eq!(
             tree.get(outer).expect("存在").layout().border,
-            crate::math::Edges::new(2.0, 2.0, 2.0, 2.0),
+            crate::math::LogicalEdges::new(px(2.0), px(2.0), px(2.0), px(2.0)),
             "LayoutBox.border 来自 taffy Layout.border"
         );
         assert_eq!(
             tree.get(inner).expect("存在").layout().border,
-            crate::math::Edges::ZERO
+            crate::math::LogicalEdges::ZERO
         );
     }
 
@@ -472,7 +493,9 @@ mod tests {
         style.max_width(taffy::style::LengthPercentageAuto::length(50.0));
         let node = NodeBuilder::boxed()
             .style(style)
-            .measure(Box::new(|_known, _available| Size::new(200.0, 10.0)))
+            .measure(Box::new(|_known, _available| {
+                LogicalSize::new(px(200.0), px(10.0))
+            }))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -480,7 +503,7 @@ mod tests {
 
         assert_eq!(
             bounds(&tree, node).size.width,
-            50.0,
+            px(50.0),
             "max_width 夹住 measure"
         );
     }
@@ -498,7 +521,10 @@ mod tests {
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
-        assert_eq!(bounds(&tree, child).size, Size::new(50.0, 50.0));
+        assert_eq!(
+            bounds(&tree, child).size,
+            LogicalSize::new(px(50.0), px(50.0))
+        );
     }
 
     #[test]
@@ -516,7 +542,7 @@ mod tests {
         assert!(bounds(&tree, child).is_empty(), "隐藏子树的盒也为空");
         assert_eq!(
             bounds(&tree, root).size,
-            Size::new(100.0, 100.0),
+            LogicalSize::new(px(100.0), px(100.0)),
             "根尺寸不受隐藏子树影响"
         );
     }
@@ -527,7 +553,10 @@ mod tests {
         let root = tree.root();
         let _ = layout(&mut tree, 200.0, 100.0);
 
-        assert_eq!(bounds(&tree, root), Rect::new(0.0, 0.0, 200.0, 100.0));
+        assert_eq!(
+            bounds(&tree, root),
+            LogicalRect::new(px(0.0), px(0.0), px(200.0), px(100.0))
+        );
     }
 
     #[test]
@@ -535,16 +564,21 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let pane = add(&mut tree, root, fixed(100.0, 100.0));
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
-            .layout_override(Rect::new(8.0, 16.0, 40.0, 20.0))
-            .build(&mut tree, pane)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
+        )))
+        .layout_override(LogicalRect::new(px(8.0), px(16.0), px(40.0), px(20.0)))
+        .build(&mut tree, pane)
+        .expect("挂载成功");
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
         assert_eq!(
             bounds(&tree, canvas),
-            Rect::new(8.0, 16.0, 40.0, 20.0),
+            LogicalRect::new(px(8.0), px(16.0), px(40.0), px(20.0)),
             "override 覆盖 taffy 的出流位置，相对父 border box"
         );
     }
@@ -556,22 +590,28 @@ mod tests {
         let parent = add(
             &mut tree,
             root,
-            StyleBuilder::new().relative().size(100.0, 100.0).build(),
+            StyleBuilder::new()
+                .relative()
+                .size(px(100.0), px(100.0))
+                .build(),
         );
         let child = add(
             &mut tree,
             parent,
             StyleBuilder::new()
                 .absolute()
-                .left(12.0)
-                .top(8.0)
-                .size(10.0, 10.0)
+                .left(px(12.0))
+                .top(px(8.0))
+                .size(px(10.0), px(10.0))
                 .build(),
         );
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
-        assert_eq!(bounds(&tree, child), Rect::new(12.0, 8.0, 10.0, 10.0));
+        assert_eq!(
+            bounds(&tree, child),
+            LogicalRect::new(px(12.0), px(8.0), px(10.0), px(10.0))
+        );
     }
 
     #[test]
@@ -583,8 +623,8 @@ mod tests {
             root,
             StyleBuilder::new()
                 .relative()
-                .size(100.0, 100.0)
-                .padding(10.0)
+                .size(px(100.0), px(100.0))
+                .padding(px(10.0))
                 .build(),
         );
         let static_mid = add(&mut tree, container, fixed(50.0, 50.0));
@@ -593,9 +633,9 @@ mod tests {
             static_mid,
             StyleBuilder::new()
                 .absolute()
-                .left(5.0)
-                .top(7.0)
-                .size(20.0, 20.0)
+                .left(px(5.0))
+                .top(px(7.0))
+                .size(px(20.0), px(20.0))
                 .build(),
         );
 
@@ -603,7 +643,7 @@ mod tests {
 
         assert_eq!(
             bounds(&tree, absolute),
-            Rect::new(5.0, 7.0, 20.0, 20.0),
+            LogicalRect::new(px(5.0), px(7.0), px(20.0), px(20.0)),
             "hoisted 出流盒的参照系是包含块的 border box，不是树父"
         );
     }
@@ -636,9 +676,18 @@ mod tests {
         tree.set_style(b, fixed(40.0, 10.0)).expect("节点存活");
         let report = layout(&mut tree, 100.0, 100.0);
 
-        assert_eq!(bounds(&tree, a), Rect::new(0.0, 0.0, 10.0, 10.0));
-        assert_eq!(bounds(&tree, b), Rect::new(10.0, 0.0, 40.0, 10.0));
-        assert_eq!(bounds(&tree, c), Rect::new(50.0, 0.0, 10.0, 10.0));
+        assert_eq!(
+            bounds(&tree, a),
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0))
+        );
+        assert_eq!(
+            bounds(&tree, b),
+            LogicalRect::new(px(10.0), px(0.0), px(40.0), px(10.0))
+        );
+        assert_eq!(
+            bounds(&tree, c),
+            LogicalRect::new(px(50.0), px(0.0), px(10.0), px(10.0))
+        );
         assert!(report.cache_hits > 0, "兄弟子树必须命中缓存：{report:?}");
         assert!(
             report.laid_out < 4,
@@ -662,7 +711,7 @@ mod tests {
 
         assert_eq!(
             bounds(&tree, child).size.width,
-            80.0,
+            px(80.0),
             "固定尺寸祖先下的子节点改动必须生效（清缓存不能早停）"
         );
         assert!(report.cache_hits > 0, "无关兄弟仍命中：{report:?}");
@@ -675,7 +724,9 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .measure(Box::new(|_known, _available| Size::new(f32::NAN, 10.0)))
+            .measure(Box::new(|_known, _available| {
+                LogicalSize::new(px(f32::NAN), px(10.0))
+            }))
             .build(&mut tree, root)
             .expect("挂载成功");
 
@@ -689,7 +740,7 @@ mod tests {
         assert!(matches!(
             error,
             crate::error::EngineError::InvalidMeasure { node: reported, axis: crate::layout::Axis::X, value }
-                if reported == node && value.is_nan()
+                if reported == node && value.value().is_nan()
         ));
     }
 
@@ -716,24 +767,40 @@ mod tests {
     fn set_layout_override_updates_bounds_and_damage() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
-            .build(&mut tree, root)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
+        )))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
+        .build(&mut tree, root)
+        .expect("挂载成功");
         let _ = layout(&mut tree, 100.0, 100.0);
-        assert_eq!(bounds(&tree, canvas), Rect::new(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(
+            bounds(&tree, canvas),
+            LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0))
+        );
 
         tree.set_layout_override(
             canvas,
-            Some(LayoutOverride::new(Rect::new(20.0, 20.0, 30.0, 30.0))),
+            Some(LayoutOverride::new(LogicalRect::new(
+                px(20.0),
+                px(20.0),
+                px(30.0),
+                px(30.0),
+            ))),
         )
         .expect("节点存活");
         let _ = layout(&mut tree, 100.0, 100.0);
 
-        assert_eq!(bounds(&tree, canvas), Rect::new(20.0, 20.0, 30.0, 30.0));
+        assert_eq!(
+            bounds(&tree, canvas),
+            LogicalRect::new(px(20.0), px(20.0), px(30.0), px(30.0))
+        );
         assert_eq!(
             tree.get(canvas).expect("存在").damage(),
-            Rect::new(0.0, 0.0, 50.0, 50.0),
+            LogicalRect::new(px(0.0), px(0.0), px(50.0), px(50.0)),
             "damage = 旧位置 ∪ 新位置"
         );
     }
@@ -751,7 +818,7 @@ mod tests {
                     taffy::AvailableSpace::Definite(width) => width.min(80.0),
                     _ => 80.0,
                 };
-                Size::new(width, 10.0)
+                LogicalSize::new(px(width), px(10.0))
             }))
             .build(&mut tree, root)
             .expect("挂载成功");
@@ -772,7 +839,7 @@ mod tests {
             first_calls,
             "第二轮输入不变 ⇒ measure 不再调用（taffy cache 命中）"
         );
-        assert_eq!(first.size, Size::new(80.0, 10.0));
+        assert_eq!(first.size, LogicalSize::new(px(80.0), px(10.0)));
     }
 
     #[test]
@@ -784,19 +851,24 @@ mod tests {
         tree.set_style(root, root_style).expect("root 存活");
         let spacer = add(&mut tree, root, fixed(200.0, 40.0));
         let pane = add(&mut tree, root, fixed(100.0, 100.0));
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
-            .layout_override(Rect::new(10.0, 20.0, 30.0, 30.0))
-            .build(&mut tree, pane)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
+        )))
+        .layout_override(LogicalRect::new(px(10.0), px(20.0), px(30.0), px(30.0)))
+        .build(&mut tree, pane)
+        .expect("挂载成功");
 
         let _ = layout(&mut tree, 200.0, 200.0);
         assert_eq!(
             bounds(&tree, pane).origin,
-            crate::math::Point::new(0.0, 40.0)
+            crate::math::LogicalPoint::new(px(0.0), px(40.0))
         );
         assert_eq!(
             bounds(&tree, canvas),
-            Rect::new(10.0, 60.0, 30.0, 30.0),
+            LogicalRect::new(px(10.0), px(60.0), px(30.0), px(30.0)),
             "B1：override 相对树父 border box（父在 y=40）"
         );
 
@@ -804,9 +876,12 @@ mod tests {
         let _ = layout(&mut tree, 200.0, 200.0);
         assert_eq!(
             bounds(&tree, pane).origin,
-            crate::math::Point::new(0.0, 100.0)
+            crate::math::LogicalPoint::new(px(0.0), px(100.0))
         );
-        assert_eq!(bounds(&tree, canvas), Rect::new(10.0, 120.0, 30.0, 30.0));
+        assert_eq!(
+            bounds(&tree, canvas),
+            LogicalRect::new(px(10.0), px(120.0), px(30.0), px(30.0))
+        );
     }
 
     #[test]
@@ -816,10 +891,15 @@ mod tests {
         let mut hidden = Style::default();
         hidden.display(Display::None);
         let pane = add(&mut tree, root, hidden);
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
-            .layout_override(Rect::new(10.0, 20.0, 30.0, 30.0))
-            .build(&mut tree, pane)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
+        )))
+        .layout_override(LogicalRect::new(px(10.0), px(20.0), px(30.0), px(30.0)))
+        .build(&mut tree, pane)
+        .expect("挂载成功");
 
         let _ = layout(&mut tree, 200.0, 200.0);
 
@@ -840,15 +920,15 @@ mod tests {
             pane,
             StyleBuilder::new()
                 .absolute()
-                .left(40.0)
-                .top(40.0)
-                .size(20.0, 20.0)
+                .left(px(40.0))
+                .top(px(40.0))
+                .size(px(20.0), px(20.0))
                 .build(),
         );
         let _ = layout(&mut tree, 200.0, 200.0);
         assert_eq!(
             bounds(&tree, absolute),
-            Rect::new(40.0, 40.0, 20.0, 20.0),
+            LogicalRect::new(px(40.0), px(40.0), px(20.0), px(20.0)),
             "可见时正常"
         );
 
@@ -878,13 +958,13 @@ mod tests {
 
         assert_eq!(
             bounds(&tree, first).origin.y,
-            0.0,
+            px(0.0),
             "N2：FlowRoot 走 block 排布"
         );
-        assert_eq!(bounds(&tree, second).origin.y, 10.0);
+        assert_eq!(bounds(&tree, second).origin.y, px(10.0));
     }
 
-    fn snapshot_subtree_bounds(tree: &NodeTree) -> Vec<(NodeId, Rect)> {
+    fn snapshot_subtree_bounds(tree: &NodeTree) -> Vec<(NodeId, LogicalRect)> {
         tree.dfs_ids()
             .into_iter()
             .map(|node| (node, tree.subtree_bounds(node)))
@@ -948,15 +1028,20 @@ mod tests {
             static_mid,
             StyleBuilder::new()
                 .absolute()
-                .left(5.0)
-                .top(7.0)
-                .size(20.0, 20.0)
+                .left(px(5.0))
+                .top(px(7.0))
+                .size(px(20.0), px(20.0))
                 .build(),
         );
-        let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
-            .layout_override(Rect::new(10.0, 10.0, 30.0, 30.0))
-            .build(&mut tree, container)
-            .expect("挂载成功");
+        let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(1.0),
+            px(1.0),
+        )))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(30.0), px(30.0)))
+        .build(&mut tree, container)
+        .expect("挂载成功");
 
         let verify = |tree: &mut NodeTree, label: &str| {
             let incremental = snapshot_subtree_bounds(tree);
@@ -977,13 +1062,21 @@ mod tests {
 
         tree.set_layout_override(
             canvas,
-            Some(LayoutOverride::new(Rect::new(150.0, 150.0, 40.0, 40.0))),
+            Some(LayoutOverride::new(LogicalRect::new(
+                px(150.0),
+                px(150.0),
+                px(40.0),
+                px(40.0),
+            ))),
         )
         .expect("存活");
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "override 移动后");
 
-        tree.set_absolute_inset(out_of_flow, crate::math::Point::new(40.0, 40.0));
+        tree.set_absolute_inset(
+            out_of_flow,
+            crate::math::LogicalPoint::new(px(40.0), px(40.0)),
+        );
         let _ = layout(&mut tree, 200.0, 200.0);
         verify(&mut tree, "出流盒移动后");
 
@@ -1001,7 +1094,10 @@ mod tests {
             let child = add(&mut tree, root, fixed(10.0, 10.0));
             tree.set_absolute_inset(
                 child,
-                crate::math::Point::new((index % 20) as f32 * 10.0, (index / 20) as f32 * 10.0),
+                crate::math::LogicalPoint::new(
+                    px((index % 20) as f32 * 10.0),
+                    px((index / 20) as f32 * 10.0),
+                ),
             );
             children.push(child);
         }
@@ -1038,7 +1134,7 @@ mod tests {
             let x = (index % 8) as f32 * 96.0;
             let y = (index / 8) as f32 * 32.0;
             let child = NodeBuilder::boxed()
-                .layout_override(Rect::new(x, y, 90.0, 28.0))
+                .layout_override(LogicalRect::new(px(x), px(y), px(90.0), px(28.0)))
                 .build(&mut tree, root)
                 .expect("挂载成功");
             children.push(child);
@@ -1048,14 +1144,17 @@ mod tests {
             report.bounds_updated, 513,
             "根 + 512 个 override 各写一次包络；override 不得触发祖先修正"
         );
-        assert_eq!(bounds(&tree, children[0]), Rect::new(0.0, 0.0, 90.0, 28.0));
+        assert_eq!(
+            bounds(&tree, children[0]),
+            LogicalRect::new(px(0.0), px(0.0), px(90.0), px(28.0))
+        );
         assert_eq!(
             bounds(&tree, children[511]),
-            Rect::new(7.0 * 96.0, 63.0 * 32.0, 90.0, 28.0)
+            LogicalRect::new(px(7.0 * 96.0), px(63.0 * 32.0), px(90.0), px(28.0))
         );
         assert_eq!(
             tree.subtree_bounds(root),
-            Rect::new(0.0, 0.0, 800.0, 2016.0 + 28.0)
+            LogicalRect::new(px(0.0), px(0.0), px(800.0), px(2016.0 + 28.0))
         );
     }
 
@@ -1074,9 +1173,9 @@ mod tests {
                 let turn = counter.get();
                 counter.set(turn + 1);
                 if turn == 0 {
-                    Size::new(f32::NAN, 10.0)
+                    LogicalSize::new(px(f32::NAN), px(10.0))
                 } else {
-                    Size::new(10.0, 10.0)
+                    LogicalSize::new(px(10.0), px(10.0))
                 }
             }))
             .build(&mut tree, root)
@@ -1108,7 +1207,7 @@ mod tests {
             })
             .expect("第二轮必须自愈");
         let committed = bounds(&tree, node);
-        assert_eq!(committed.size.width, 10.0, "第二轮必须重跑 measure");
+        assert_eq!(committed.size.width, px(10.0), "第二轮必须重跑 measure");
         assert!(report.laid_out > 0, "{report:?}");
         assert!(calls.get() > 1, "measure 必须被重新调用：{}", calls.get());
         assert!(!tree.has_layout_work(), "布局成功后脏集合必须清空");

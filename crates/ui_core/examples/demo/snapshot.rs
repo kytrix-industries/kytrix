@@ -2,7 +2,7 @@ pub mod scene;
 
 use scene::{Scene, TITLE, window_size};
 use ui_core::{
-    math::Scale,
+    math::DevicePixelRatio,
     test_support::{
         app::TestApp,
         snapshot::{SnapshotCase, SnapshotScene, SnapshotTheme},
@@ -27,7 +27,7 @@ fn capture(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut test = TestApp::with_options(WindowOptions {
         title: TITLE.into(),
         size,
-        scale: Scale::ONE,
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let window = test.window_id();
@@ -40,7 +40,7 @@ fn capture(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             scene: SnapshotScene::Colors,
             theme: SnapshotTheme::Dark,
             size,
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
         })
         .map_err(|error| format!("snapshot failed: {error:?}"))?;
     let buffer = image::RgbaImage::from_raw(image.width, image.height, image.rgba8)

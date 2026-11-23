@@ -1,7 +1,7 @@
 use etagere::{AllocId, AtlasAllocator as EtagereAllocator, size2};
 
 use crate::{
-    math::PhysicalRect,
+    math::{DeviceRect, dp},
     paint::atlas::{AtlasKind, AtlasTile, MAX_IMAGE_PAGES},
 };
 
@@ -147,8 +147,8 @@ pub(crate) struct AtlasAllocator {
 pub(crate) struct Allocation {
     pub id: AllocId,
     pub tile: AtlasTile,
-    pub content: PhysicalRect,
-    pub padded: PhysicalRect,
+    pub content: DeviceRect,
+    pub padded: DeviceRect,
 }
 
 impl AtlasAllocator {
@@ -235,17 +235,17 @@ impl AtlasAllocator {
             slot: slot as u32,
             slot_epoch,
         };
-        let content_rect = PhysicalRect::new(
-            origin_x,
-            origin_y,
-            origin_x + width as i32,
-            origin_y + height as i32,
+        let content_rect = DeviceRect::new(
+            dp(origin_x),
+            dp(origin_y),
+            dp(origin_x + width as i32),
+            dp(origin_y + height as i32),
         );
-        let padded_rect = PhysicalRect::new(
-            rectangle.min.x,
-            rectangle.min.y,
-            rectangle.max.x,
-            rectangle.max.y,
+        let padded_rect = DeviceRect::new(
+            dp(rectangle.min.x),
+            dp(rectangle.min.y),
+            dp(rectangle.max.x),
+            dp(rectangle.max.y),
         );
         debug_assert_eq!(tile.atlas, self.kind(), "tile must carry its atlas kind");
         self.mark_written(content_rect);
@@ -321,7 +321,7 @@ impl AtlasAllocator {
         true
     }
 
-    pub(crate) fn mark_written(&mut self, rect: PhysicalRect) {
+    pub(crate) fn mark_written(&mut self, rect: DeviceRect) {
         self.dirty.mark(rect);
     }
 
@@ -483,7 +483,7 @@ impl ImageAtlasPager {
         }
     }
 
-    pub(crate) fn mark_written(&mut self, page: u16, rect: PhysicalRect) {
+    pub(crate) fn mark_written(&mut self, page: u16, rect: DeviceRect) {
         if let Some(slot) = self.pages.get_mut(usize::from(page)) {
             slot.allocator.mark_written(rect);
         }
@@ -509,21 +509,21 @@ impl Default for ImageAtlasPager {
     }
 }
 
-const FULL_RECT: PhysicalRect = PhysicalRect {
-    x0: 0,
-    y0: 0,
-    x1: i32::MAX,
-    y1: i32::MAX,
+const FULL_RECT: DeviceRect = DeviceRect {
+    x0: dp(0),
+    y0: dp(0),
+    x1: dp(i32::MAX),
+    y1: dp(i32::MAX),
 };
 
 #[cfg(test)]
-fn full_page(page: u32) -> PhysicalRect {
-    PhysicalRect::new(0, 0, page as i32, page as i32)
+fn full_page(page: u32) -> DeviceRect {
+    DeviceRect::new(dp(0), dp(0), dp(page as i32), dp(page as i32))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DirtyRects {
-    rects: Vec<PhysicalRect>,
+    rects: Vec<DeviceRect>,
 }
 
 impl DirtyRects {
@@ -535,7 +535,7 @@ impl DirtyRects {
         }
     }
 
-    pub(crate) fn mark(&mut self, rect: PhysicalRect) {
+    pub(crate) fn mark(&mut self, rect: DeviceRect) {
         if rect.is_empty() || self.is_full() {
             return;
         }
@@ -571,7 +571,7 @@ impl DirtyRects {
         }
     }
 
-    pub(crate) fn rects(&self) -> &[PhysicalRect] {
+    pub(crate) fn rects(&self) -> &[DeviceRect] {
         &self.rects
     }
 
@@ -579,10 +579,10 @@ impl DirtyRects {
         let limit = page.min(i32::MAX as u32) as i32;
         let mut offset = 0usize;
         self.rects.iter().filter_map(move |rect| {
-            let x0 = rect.x0.clamp(0, limit) as u32;
-            let y0 = rect.y0.clamp(0, limit) as u32;
-            let x1 = rect.x1.clamp(0, limit) as u32;
-            let y1 = rect.y1.clamp(0, limit) as u32;
+            let x0 = rect.x0.clamp(dp(0), dp(limit)).value() as u32;
+            let y0 = rect.y0.clamp(dp(0), dp(limit)).value() as u32;
+            let x1 = rect.x1.clamp(dp(0), dp(limit)).value() as u32;
+            let y1 = rect.y1.clamp(dp(0), dp(limit)).value() as u32;
             if x0 >= x1 || y0 >= y1 {
                 return None;
             }
@@ -642,11 +642,11 @@ impl DirtyRects {
     }
 }
 
-fn contains(outer: PhysicalRect, inner: PhysicalRect) -> bool {
+fn contains(outer: DeviceRect, inner: DeviceRect) -> bool {
     outer.x0 <= inner.x0 && outer.y0 <= inner.y0 && outer.x1 >= inner.x1 && outer.y1 >= inner.y1
 }
 
-fn touches(a: PhysicalRect, b: PhysicalRect) -> bool {
+fn touches(a: DeviceRect, b: DeviceRect) -> bool {
     a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
 }
 
@@ -657,7 +657,7 @@ mod tests {
         MIN_ATLAS_PAGE, RectChunk, pack_rects,
     };
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         paint::atlas::{AtlasKind, MAX_IMAGE_PAGES},
     };
 
@@ -675,12 +675,12 @@ mod tests {
         assert!(
             allocation.padded.width() >= 8,
             "padded width {} must cover content + 2",
-            allocation.padded.width()
+            allocation.padded.width().value()
         );
         assert!(
             allocation.padded.height() >= 11,
             "padded height {} must cover content + 2",
-            allocation.padded.height()
+            allocation.padded.height().value()
         );
         assert_eq!(
             allocation.content.x0,
@@ -867,22 +867,31 @@ mod tests {
     #[test]
     fn dirty_rects_merge_adjacent_and_ignore_contained_rects() {
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(0, 10, 8, 20));
-        rects.mark(PhysicalRect::new(8, 10, 16, 20));
-        rects.mark(PhysicalRect::new(0, 10, 16, 20));
-        rects.mark(PhysicalRect::new(100, 200, 108, 211));
+        rects.mark(DeviceRect::new(dp(0), dp(10), dp(8), dp(20)));
+        rects.mark(DeviceRect::new(dp(8), dp(10), dp(16), dp(20)));
+        rects.mark(DeviceRect::new(dp(0), dp(10), dp(16), dp(20)));
+        rects.mark(DeviceRect::new(dp(100), dp(200), dp(108), dp(211)));
         assert_eq!(rects.rects().len(), 2);
-        assert_eq!(rects.rects()[0], PhysicalRect::new(0, 10, 16, 20));
-        assert_eq!(rects.rects()[1], PhysicalRect::new(100, 200, 108, 211));
+        assert_eq!(
+            rects.rects()[0],
+            DeviceRect::new(dp(0), dp(10), dp(16), dp(20))
+        );
+        assert_eq!(
+            rects.rects()[1],
+            DeviceRect::new(dp(100), dp(200), dp(108), dp(211))
+        );
         assert!(!rects.is_full());
 
-        rects.mark(PhysicalRect::new(2, 12, 6, 18));
+        rects.mark(DeviceRect::new(dp(2), dp(12), dp(6), dp(18)));
         assert_eq!(rects.rects().len(), 2);
         assert_eq!(rects.byte_count(512, 1), 16 * 10 + 8 * 11);
 
-        rects.mark(PhysicalRect::new(-4, 8, 4, 12));
+        rects.mark(DeviceRect::new(dp(-4), dp(8), dp(4), dp(12)));
         assert_eq!(rects.rects().len(), 2);
-        assert_eq!(rects.rects()[0], PhysicalRect::new(-4, 8, 16, 20));
+        assert_eq!(
+            rects.rects()[0],
+            DeviceRect::new(dp(-4), dp(8), dp(16), dp(20))
+        );
     }
 
     #[test]
@@ -890,13 +899,16 @@ mod tests {
         let mut rects = DirtyRects::default();
         for index in 0..DirtyRects::MAX_RECTS {
             let y = index as i32 * 16;
-            rects.mark(PhysicalRect::new(0, y, 4, y + 4));
+            rects.mark(DeviceRect::new(dp(0), dp(y), dp(4), dp(y + 4)));
             assert_eq!(rects.rects().len(), index + 1, "第 {index} 块必须保留");
         }
         assert!(!rects.is_full());
-        rects.mark(PhysicalRect::new(0, 4096, 4, 4100));
+        rects.mark(DeviceRect::new(dp(0), dp(4096), dp(4), dp(4100)));
         assert!(!rects.is_full(), "折叠后不得退化为整页哨兵");
-        assert_eq!(rects.rects(), &[PhysicalRect::new(0, 0, 4, 4100)]);
+        assert_eq!(
+            rects.rects(),
+            &[DeviceRect::new(dp(0), dp(0), dp(4), dp(4100))]
+        );
         assert_eq!(rects.byte_count(512, 1), 4 * 512);
 
         rects.clear();
@@ -909,11 +921,11 @@ mod tests {
         const PAGE: u32 = 2048;
         const TEXEL: u32 = 4;
         let mut rects = DirtyRects::default();
-        let mut expected: Option<PhysicalRect> = None;
+        let mut expected: Option<DeviceRect> = None;
         for index in 0..9i32 {
             let x = (index % 3) * 600;
             let y = (index / 3) * 600;
-            let rect = PhysicalRect::new(x, y, x + 34, y + 34);
+            let rect = DeviceRect::new(dp(x), dp(y), dp(x + 34), dp(y + 34));
             rects.mark(rect);
             expected = Some(match expected {
                 Some(union) => union.union(rect),
@@ -940,8 +952,8 @@ mod tests {
     #[test]
     fn empty_rects_are_ignored_and_an_empty_set_uploads_nothing() {
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(10, 10, 10, 20));
-        rects.mark(PhysicalRect::new(10, 20, 20, 20));
+        rects.mark(DeviceRect::new(dp(10), dp(10), dp(10), dp(20)));
+        rects.mark(DeviceRect::new(dp(10), dp(20), dp(20), dp(20)));
         assert!(rects.is_empty());
         assert_eq!(rects.byte_count(512, 1), 0);
         assert_eq!(rects.chunks(512, 1).count(), 0);
@@ -955,7 +967,7 @@ mod tests {
     #[test]
     fn merge_from_keeps_the_source_rects() {
         let mut source = DirtyRects::default();
-        source.mark(PhysicalRect::new(0, 4, 8, 8));
+        source.mark(DeviceRect::new(dp(0), dp(4), dp(8), dp(8)));
         let mut first = DirtyRects::default();
         let mut second = DirtyRects::default();
         first.merge_from(&source);
@@ -990,7 +1002,7 @@ mod tests {
     fn an_eight_by_eleven_glyph_uploads_88_bytes_instead_of_5632() {
         const PAGE: u32 = 512;
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(100, 200, 108, 211));
+        rects.mark(DeviceRect::new(dp(100), dp(200), dp(108), dp(211)));
         assert_eq!(rects.byte_count(PAGE, 1), 88, "AOI 字节数");
         let legacy = 11 * PAGE as usize;
         assert_eq!(legacy, 5632, "旧语义的行区间字节数");
@@ -1027,7 +1039,7 @@ mod tests {
         const PAGE: u32 = 512;
         const TEXEL: u32 = 4;
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(64, 128, 80, 144));
+        rects.mark(DeviceRect::new(dp(64), dp(128), dp(80), dp(144)));
         let bytes = rects.byte_count(PAGE, TEXEL);
         assert_eq!(bytes, 16 * 16 * 4);
         let legacy = 16 * PAGE as usize * TEXEL as usize;
@@ -1051,9 +1063,9 @@ mod tests {
     #[test]
     fn multi_rect_packing_matches_the_chunk_offsets() {
         const PAGE: u32 = 64;
-        let first = PhysicalRect::new(0, 10, 8, 12);
-        let second = PhysicalRect::new(20, 10, 24, 13);
-        let third = PhysicalRect::new(40, 40, 48, 41);
+        let first = DeviceRect::new(dp(0), dp(10), dp(8), dp(12));
+        let second = DeviceRect::new(dp(20), dp(10), dp(24), dp(13));
+        let third = DeviceRect::new(dp(40), dp(40), dp(48), dp(41));
         let mut rects = DirtyRects::default();
         rects.mark(first);
         rects.mark(second);
@@ -1071,10 +1083,11 @@ mod tests {
             vec![0, 16, 28]
         );
 
-        let expected_block = |rect: PhysicalRect| -> Vec<u8> {
-            let mut block = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
-            for y in rect.y0..rect.y1 {
-                for x in rect.x0..rect.x1 {
+        let expected_block = |rect: DeviceRect| -> Vec<u8> {
+            let mut block =
+                Vec::with_capacity(rect.width().value() as usize * rect.height().value() as usize);
+            for y in rect.y0.value()..rect.y1.value() {
+                for x in rect.x0.value()..rect.x1.value() {
                     block.push(page[y as usize * PAGE as usize + x as usize]);
                 }
             }
@@ -1117,7 +1130,7 @@ mod tests {
     #[test]
     fn chunks_clamp_rects_to_the_page() {
         let mut rects = DirtyRects::default();
-        rects.mark(PhysicalRect::new(-4, -4, 6, 6));
+        rects.mark(DeviceRect::new(dp(-4), dp(-4), dp(6), dp(6)));
         assert_eq!(
             rects.chunks(512, 1).collect::<Vec<_>>(),
             vec![RectChunk {
@@ -1131,12 +1144,12 @@ mod tests {
         assert_eq!(rects.byte_count(512, 1), 36);
 
         let mut off_page = DirtyRects::default();
-        off_page.mark(PhysicalRect::new(600, 600, 700, 700));
+        off_page.mark(DeviceRect::new(dp(600), dp(600), dp(700), dp(700)));
         assert_eq!(off_page.byte_count(512, 1), 0, "页外矩形不上传");
         assert_eq!(off_page.chunks(512, 1).count(), 0);
 
         let mut crossing = DirtyRects::default();
-        crossing.mark(PhysicalRect::new(500, 500, 700, 700));
+        crossing.mark(DeviceRect::new(dp(500), dp(500), dp(700), dp(700)));
         assert_eq!(
             crossing.chunks(512, 1).collect::<Vec<_>>(),
             vec![RectChunk {
@@ -1161,7 +1174,7 @@ mod tests {
         assert!(out.iter().all(|byte| *byte == 0xA5));
 
         let mut right_edge = DirtyRects::default();
-        right_edge.mark(PhysicalRect::new(500, 10, 700, 14));
+        right_edge.mark(DeviceRect::new(dp(500), dp(10), dp(700), dp(14)));
         assert_eq!(
             right_edge.chunks(512, 1).collect::<Vec<_>>(),
             vec![RectChunk {
@@ -1175,7 +1188,7 @@ mod tests {
         assert_eq!(right_edge.byte_count(512, 1), 48);
 
         let mut bottom_edge = DirtyRects::default();
-        bottom_edge.mark(PhysicalRect::new(10, 500, 14, 700));
+        bottom_edge.mark(DeviceRect::new(dp(10), dp(500), dp(14), dp(700)));
         assert_eq!(
             bottom_edge.chunks(512, 1).collect::<Vec<_>>(),
             vec![RectChunk {
@@ -1371,7 +1384,7 @@ mod tests {
     #[test]
     fn covers_page_accepts_a_page_sized_rect_without_the_full_sentinel() {
         let page_sized = DirtyRects {
-            rects: vec![PhysicalRect::new(0, 0, 64, 64)],
+            rects: vec![DeviceRect::new(dp(0), dp(0), dp(64), dp(64))],
         };
         assert!(
             page_sized.covers_page(64),

@@ -16,7 +16,7 @@ use super::{
     recovery,
 };
 use crate::{
-    math::Point,
+    math::{DevicePoint, dp},
     platform::{
         dispatcher::{WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::{PlatformEvent, StampedEvent, hiword_signed, loword_signed, translate},
@@ -78,10 +78,7 @@ pub(crate) extern "system" fn wndproc(
                     }
                 }
                 let scale = (*state).scale();
-                let logical = Point::new(
-                    scale.to_logical(point.x as f32),
-                    scale.to_logical(point.y as f32),
-                );
+                let logical = scale.to_logical_point(DevicePoint::new(dp(point.x), dp(point.y)));
                 if (*state)
                     .drag_regions()
                     .iter()

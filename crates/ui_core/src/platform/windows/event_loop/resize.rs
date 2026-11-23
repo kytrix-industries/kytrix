@@ -7,7 +7,7 @@ use std::{
 use crate::{
     app::App,
     error::EngineError,
-    math::{Scale, Size},
+    math::{DevicePixelRatio, DeviceSize, dp},
     platform::{
         dispatcher::Dispatcher,
         windows::composition::{self, Composition},
@@ -17,12 +17,16 @@ use crate::{
 
 pub(crate) struct ResizeStep {
     driver: Rc<ResizeFrameDriver>,
-    scale: Scale,
+    scale: DevicePixelRatio,
     client: (u32, u32),
 }
 
 impl ResizeStep {
-    pub(crate) fn new(driver: Rc<ResizeFrameDriver>, scale: Scale, client: (u32, u32)) -> Self {
+    pub(crate) fn new(
+        driver: Rc<ResizeFrameDriver>,
+        scale: DevicePixelRatio,
+        client: (u32, u32),
+    ) -> Self {
         Self {
             driver,
             scale,
@@ -69,7 +73,7 @@ impl ResizeFrameDriver {
         }
     }
 
-    pub(crate) fn frame(&self, scale: Scale, client: (u32, u32)) -> Option<EngineError> {
+    pub(crate) fn frame(&self, scale: DevicePixelRatio, client: (u32, u32)) -> Option<EngineError> {
         let app = self.app.upgrade()?;
         let mut app = app.try_borrow_mut().ok()?;
         if let Err(error) = app.poll_renderers() {
@@ -82,10 +86,9 @@ impl ResizeFrameDriver {
         if window.scale() != scale {
             window.set_scale(scale);
         }
-        window.set_size(Size::new(
-            scale.to_logical(client.0 as f32),
-            scale.to_logical(client.1 as f32),
-        ));
+        window.set_size(
+            scale.to_logical_size(DeviceSize::new(dp(client.0 as i32), dp(client.1 as i32))),
+        );
         window.set_surface(client);
         let presented = app
             .window(self.window)

@@ -590,7 +590,7 @@ mod tests {
         use crate::{
             a11y::A11yOverride,
             interaction::ScrollConfig,
-            math::Rect,
+            math::{LogicalRect, px},
             node::builder::NodeBuilder,
             paint::style::{Clip, Style},
             test_support::app::TestApp,
@@ -604,7 +604,7 @@ mod tests {
         container_style.clip = Clip::Bounds;
         let container = NodeBuilder::boxed()
             .style(container_style)
-            .layout_override(Rect::new(0.0, 0.0, 100.0, 80.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(80.0)))
             .a11y(A11yOverride {
                 label: Some(smol_str::SmolStr::new_static("盘口")),
                 ..A11yOverride::default()
@@ -620,10 +620,10 @@ mod tests {
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scroll");
         app.app_mut()
-            .set_scroll_content(&handle, crate::math::Size::new(100.0, 800.0))
+            .set_scroll_content(&handle, crate::math::LogicalSize::new(px(100.0), px(800.0)))
             .expect("content");
         app.app_mut()
-            .scroll_to(&handle, crate::math::Point::new(0.0, 120.0))
+            .scroll_to(&handle, crate::math::LogicalPoint::new(px(0.0), px(120.0)))
             .expect("scroll to");
         let _ = app.drain().expect("滚动帧");
 
@@ -640,7 +640,7 @@ mod tests {
         use crate::{
             a11y::{A11yOverride, A11yRole},
             interaction::{OverlayDismiss, OverlayOptions, OverlayPlacement},
-            math::{Point, Rect},
+            math::{LogicalPoint, LogicalRect, px},
             node::builder::NodeBuilder,
             test_support::app::TestApp,
         };
@@ -650,7 +650,7 @@ mod tests {
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
         let background = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 100.0, 40.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(100.0), px(40.0)))
             .a11y(A11yOverride {
                 role: Some(A11yRole::Button),
                 label: Some(smol_str::SmolStr::new_static("下单")),
@@ -673,7 +673,7 @@ mod tests {
             .create_overlay(
                 window,
                 OverlayOptions {
-                    placement: OverlayPlacement::Point(Point::new(150.0, 50.0)),
+                    placement: OverlayPlacement::Point(LogicalPoint::new(px(150.0), px(50.0))),
                     dismiss: OverlayDismiss::Explicit,
                     trap_focus: true,
                     a11y: A11yOverride {
@@ -686,7 +686,7 @@ mod tests {
             )
             .expect("modal");
         NodeBuilder::boxed()
-            .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(60.0), px(24.0)))
             .on_click(crate::event::Action::custom("modal.ok"))
             .build(
                 app.app_mut().window_mut(window).expect("窗口").tree_mut(),

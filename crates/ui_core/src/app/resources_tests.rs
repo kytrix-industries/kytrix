@@ -2,7 +2,7 @@ use super::App;
 #[cfg(windows)]
 use crate::render::AtlasArraySpec;
 use crate::{
-    math::{Rect, Size},
+    math::{LogicalRect, LogicalSize, dp, px},
     node::{builder::NodeBuilder, dirty::DirtyFlags},
     paint::{
         atlas::{AtlasKind, AtlasTile},
@@ -22,8 +22,8 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let mut app = App::new(rt.handle().clone());
     let window = app.create_window(WindowOptions {
         title: "resources".into(),
-        size: Size::new(200.0, 120.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(200.0), px(120.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -70,8 +70,8 @@ fn resources_are_process_level() {
     );
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     assert_ne!(second, window);
@@ -90,7 +90,7 @@ fn insert_does_not_touch_node_dirty_flags() {
     let (_rt, mut app, window) = setup();
     let root = app.window(window).expect("window").tree().root();
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 20.0, 20.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(20.0), px(20.0)))
         .paint(PaintSpec {
             background: crate::paint::color::Color::WHITE,
             ..PaintSpec::default()
@@ -136,8 +136,8 @@ fn atlas_upload_marks_only_windows_with_a_renderer() {
     let (_rt, mut app, first) = setup();
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.upload_atlas_pages();
@@ -163,8 +163,8 @@ fn atlas_pages_are_broadcast_to_every_window() {
         .expect("offscreen renderer");
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -190,14 +190,14 @@ fn atlas_pages_are_broadcast_to_every_window() {
 #[cfg(windows)]
 #[test]
 fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
-    use crate::{math::PhysicalRect, paint::atlas::AtlasKind, render::DirtyRects};
+    use crate::{math::DeviceRect, paint::atlas::AtlasKind, render::DirtyRects};
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, first) = setup();
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     for window in [first, second] {
@@ -232,7 +232,7 @@ fn a_busy_window_queues_its_rects_without_blocking_idle_windows() {
         "入队之后、录制之前必须是忙的"
     );
 
-    let frame_dirty = PhysicalRect::new(0, 0, i32::MAX, 4);
+    let frame_dirty = DeviceRect::new(dp(0), dp(0), dp(i32::MAX), dp(4));
     app.pending_dirty.mark(frame_dirty);
     app.upload_atlas_pages();
 
@@ -279,7 +279,7 @@ fn a_page_change_rebuilds_the_glyph_page_buffer_from_zero() {
 #[cfg(windows)]
 #[test]
 fn a_deferred_atlas_frame_requests_a_follow_up() {
-    use crate::{math::PhysicalRect, paint::atlas::AtlasKind, render::DirtyRects};
+    use crate::{math::DeviceRect, paint::atlas::AtlasKind, render::DirtyRects};
 
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
@@ -302,7 +302,8 @@ fn a_deferred_atlas_frame_requests_a_follow_up() {
         full,
     ));
     app.window_mut(window).expect("window").request_repaint();
-    app.pending_dirty.mark(PhysicalRect::new(0, 0, i32::MAX, 4));
+    app.pending_dirty
+        .mark(DeviceRect::new(dp(0), dp(0), dp(i32::MAX), dp(4)));
 
     let _ = app.frame(window).expect("frame").expect("ok");
     assert!(
@@ -327,8 +328,8 @@ fn a_late_renderer_receives_the_current_glyph_page() {
     let _guard = crate::render::windows::device::gpu_test_lock();
     let (_rt, mut app, window) = setup();
     let root = app.window(window).expect("window").tree().root();
-    let _text = NodeBuilder::text("Ag", crate::text::TextStyle::new(14.0))
-        .layout_override(Rect::new(0.0, 0.0, 120.0, 40.0))
+    let _text = NodeBuilder::text("Ag", crate::text::TextStyle::new(px(14.0)))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(120.0), px(40.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("text");
     let _ = app.frame(window).expect("frame").expect("headless frame");
@@ -533,10 +534,15 @@ fn growing_the_image_array_reuploads_every_open_layer() {
 fn images_on_layers_without_an_established_array_are_not_drawn() {
     let (_rt, mut app, window) = setup();
     let root = app.window(window).expect("窗口存在").tree().root();
-    let canvas_node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0)))
-        .layout_override(Rect::new(0.0, 0.0, 64.0, 32.0))
-        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
-        .expect("canvas 节点");
+    let canvas_node = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+        px(0.0),
+        px(0.0),
+        px(64.0),
+        px(32.0),
+    )))
+    .layout_override(LogicalRect::new(px(0.0), px(0.0), px(64.0), px(32.0)))
+    .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+    .expect("canvas 节点");
     let tile = |page: u16| AtlasTile {
         atlas: AtlasKind::Image,
         page,
@@ -548,14 +554,14 @@ fn images_on_layers_without_an_established_array_are_not_drawn() {
         slot: 0,
         slot_epoch: 0,
     };
-    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 64.0, 32.0));
+    let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(64.0), px(32.0)));
     canvas.push_image(Image {
-        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
         tile: tile(0),
         modulation: Color::WHITE,
     });
     canvas.push_image(Image {
-        bounds: Rect::new(32.0, 0.0, 32.0, 32.0),
+        bounds: LogicalRect::new(px(32.0), px(0.0), px(32.0), px(32.0)),
         tile: tile(1),
         modulation: Color::WHITE,
     });
@@ -727,8 +733,8 @@ fn growing_the_image_array_waits_until_every_window_can_take_the_whole_array() {
 
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -935,8 +941,8 @@ fn a_new_window_without_an_array_gets_zero_drawable_layers_while_growth_is_block
 
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1060,8 +1066,8 @@ fn an_occluded_window_does_not_block_growth_and_resyncs_when_it_returns() {
     app.upload_atlas_pages();
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1155,8 +1161,8 @@ fn growth_degrades_after_a_window_stops_consuming_uploads() {
     app.upload_atlas_pages();
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1237,8 +1243,8 @@ fn a_new_window_receives_every_open_image_layer() {
 
     let second = app.create_window(WindowOptions {
         title: "second".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     app.window_mut(second)
@@ -1271,8 +1277,8 @@ fn closing_a_window_releases_its_owned_resources() {
     let (_rt, mut app, left) = setup();
     let right = app.create_window(WindowOptions {
         title: "right".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let bytes = png();
@@ -1318,8 +1324,8 @@ fn closing_a_window_is_idempotent_with_resources() {
     let (_rt, mut app, left) = setup();
     let right = app.create_window(WindowOptions {
         title: "right".into(),
-        size: Size::new(64.0, 64.0),
-        scale: crate::math::Scale::ONE,
+        size: LogicalSize::new(px(64.0), px(64.0)),
+        scale: crate::math::DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     let left_bytes = png_rgba([1, 2, 3, 255]);
@@ -1437,10 +1443,15 @@ fn async_decode_wakes_the_pump() {
 fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
     let (_rt, mut app, window) = setup();
     let root = app.window(window).expect("窗口存在").tree().root();
-    let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0)))
-        .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
-        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
-        .expect("canvas 节点");
+    let node = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+        px(0.0),
+        px(0.0),
+        px(32.0),
+        px(32.0),
+    )))
+    .layout_override(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)))
+    .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+    .expect("canvas 节点");
     let _ = app.frame(window).expect("帧").expect("首帧不报错");
 
     let tile = AtlasTile {
@@ -1454,9 +1465,9 @@ fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
         slot: 0,
         slot_epoch: 0,
     };
-    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0));
+    let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)));
     canvas.push_image(Image {
-        bounds: Rect::new(0.0, 0.0, 32.0, 32.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)),
         tile,
         modulation: Color::WHITE,
     });
@@ -1502,21 +1513,29 @@ fn set_canvas_replaces_canvas_content_and_marks_subtree_paint() {
 fn set_canvas_rejects_non_canvas_nodes_and_stale_handles() {
     let (_rt, mut app, window) = setup();
     let root = app.window(window).expect("窗口存在").tree().root();
-    let text = NodeBuilder::text("not a canvas", crate::text::TextStyle::new(16.0))
+    let text = NodeBuilder::text("not a canvas", crate::text::TextStyle::new(px(16.0)))
         .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
         .expect("text 节点");
     assert!(
         !app.window_mut(window)
             .expect("窗口存在")
-            .set_canvas(text, Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0)))
+            .set_canvas(
+                text,
+                Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)))
+            )
             .expect("节点存活"),
         "非 Canvas 节点必须返回 Ok(false) 且不改状态"
     );
 
-    let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 16.0, 16.0)))
-        .layout_override(Rect::new(0.0, 0.0, 16.0, 16.0))
-        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
-        .expect("canvas 节点");
+    let canvas = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+        px(0.0),
+        px(0.0),
+        px(16.0),
+        px(16.0),
+    )))
+    .layout_override(LogicalRect::new(px(0.0), px(0.0), px(16.0), px(16.0)))
+    .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+    .expect("canvas 节点");
     app.window_mut(window)
         .expect("窗口存在")
         .tree_mut()
@@ -1525,7 +1544,10 @@ fn set_canvas_rejects_non_canvas_nodes_and_stale_handles() {
     let error = app
         .window_mut(window)
         .expect("窗口存在")
-        .set_canvas(canvas, Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0)))
+        .set_canvas(
+            canvas,
+            Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0))),
+        )
         .expect_err("陈旧节点必须报错");
     assert!(
         matches!(error, crate::error::EngineError::StaleNode { .. }),
@@ -1539,10 +1561,15 @@ fn async_ready_tile_can_be_applied_to_an_existing_node() {
     let mut app = App::new(rt.handle().clone());
     let window = app.create_window(WindowOptions::default());
     let root = app.window(window).expect("窗口存在").tree().root();
-    let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0)))
-        .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
-        .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
-        .expect("canvas 节点");
+    let node = NodeBuilder::canvas(Canvas::new(LogicalRect::new(
+        px(0.0),
+        px(0.0),
+        px(32.0),
+        px(32.0),
+    )))
+    .layout_override(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)))
+    .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
+    .expect("canvas 节点");
     let _ = app.frame(window).expect("帧").expect("首帧不报错");
 
     let _pending = app
@@ -1561,9 +1588,9 @@ fn async_ready_tile_can_be_applied_to_an_existing_node() {
     let image = image.expect("必须交付 Ready");
     assert_eq!((image.width, image.height), (4, 4));
 
-    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 32.0, 32.0));
+    let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)));
     canvas.push_image(Image {
-        bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
         tile: image.tile,
         modulation: Color::WHITE,
     });

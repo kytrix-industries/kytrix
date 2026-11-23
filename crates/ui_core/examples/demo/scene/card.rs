@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
-    math::{Rect, Size},
+    math::{LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
     paint::{
         primitive::Border,
@@ -14,14 +14,14 @@ use ui_core::{
 
 use super::{CARD_BORDER_RGBA, CARD_RGBA, MUTED_RGBA, color};
 
-const HEADING_SIZE: f32 = 13.5;
+const HEADING_SIZE: LogicalPx = px(13.5);
 const HEADING_WEIGHT: u16 = 700;
 
 pub(crate) fn tree(app: &mut App, window: WindowId) -> &mut NodeTree {
     app.window_mut(window).expect("场景窗口必须存在").tree_mut()
 }
 
-pub(crate) fn absolute_style(rect: Rect) -> Style {
+pub(crate) fn absolute_style(rect: LogicalRect) -> Style {
     StyleBuilder::new()
         .absolute()
         .left(rect.origin.x)
@@ -30,7 +30,7 @@ pub(crate) fn absolute_style(rect: Rect) -> Style {
         .build()
 }
 
-pub(crate) fn flow_style(size: Size) -> Style {
+pub(crate) fn flow_style(size: LogicalSize) -> Style {
     StyleBuilder::new()
         .relative()
         .size(size.width, size.height)
@@ -48,7 +48,7 @@ pub(crate) fn card(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    size: Size,
+    size: LogicalSize,
     heading: &str,
     id: &'static str,
 ) -> NodeId {
@@ -58,10 +58,10 @@ pub(crate) fn card(
         .paint(PaintSpec {
             background: color(CARD_RGBA),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: color(CARD_BORDER_RGBA),
             }),
-            corner_radius: [14.0; 4],
+            corner_radius: [px(14.0); 4],
             ..PaintSpec::default()
         })
         .build(tree(app, window), parent)
@@ -73,7 +73,7 @@ pub(crate) fn card(
         app,
         window,
         node,
-        Rect::new(18.0, 12.0, size.width - 36.0, 20.0),
+        LogicalRect::new(px(18.0), px(12.0), size.width - 36.0, px(20.0)),
         heading,
         heading_style,
     );
@@ -84,7 +84,7 @@ pub(crate) fn label(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    rect: Rect,
+    rect: LogicalRect,
     text: impl Into<SmolStr>,
     style: TextStyle,
 ) -> NodeId {
@@ -98,7 +98,7 @@ pub(crate) fn bound_label(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    rect: Rect,
+    rect: LogicalRect,
     style: TextStyle,
     bind: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static,
 ) -> NodeId {
@@ -113,7 +113,7 @@ pub(crate) fn hidden_label(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    rect: Rect,
+    rect: LogicalRect,
     text: impl Into<SmolStr>,
     style: TextStyle,
 ) -> NodeId {
@@ -131,7 +131,7 @@ pub(crate) fn bound_hidden_label(
     app: &mut App,
     window: WindowId,
     parent: NodeId,
-    rect: Rect,
+    rect: LogicalRect,
     style: TextStyle,
     bind: impl Fn(&mut ReadCtx<'_>) -> SmolStr + 'static,
 ) -> NodeId {

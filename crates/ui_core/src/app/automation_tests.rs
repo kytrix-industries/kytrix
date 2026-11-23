@@ -3,7 +3,7 @@ use std::{cell::Cell, rc::Rc};
 use super::App;
 use crate::{
     event::{Action, InputEvent, Modifiers, PointerButton},
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{
         color::Color,
@@ -19,8 +19,8 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     let mut app = App::new(runtime.handle().clone());
     let window = app.create_window(WindowOptions {
         title: "automation".into(),
-        size: Size::new(400.0, 300.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(400.0), px(300.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (runtime, app, window)
@@ -49,7 +49,7 @@ fn injected_input_should_take_the_platform_path() {
     });
     let root = app.window(window).expect("window").tree().root();
     let node = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(40.0)))
         .paint(background())
         .on_click(Action::custom("automation.hit"))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -73,7 +73,7 @@ fn injected_input_should_take_the_platform_path() {
     let down = app.inject_input(
         window,
         InputEvent::pointer_down(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -81,7 +81,7 @@ fn injected_input_should_take_the_platform_path() {
     let up = app.inject_input(
         window,
         InputEvent::pointer_up(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -150,7 +150,7 @@ fn the_painted_primitive_count_should_follow_the_scene() {
 
     let root = app.window(window).expect("window").tree().root();
     NodeBuilder::boxed()
-        .layout_override(Rect::new(4.0, 4.0, 60.0, 20.0))
+        .layout_override(LogicalRect::new(px(4.0), px(4.0), px(60.0), px(20.0)))
         .paint(background())
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
@@ -171,7 +171,7 @@ fn the_text_read_should_report_the_tree_in_order() {
     let (_runtime, mut app, window) = setup();
     let root = app.window(window).expect("window").tree().root();
     for text in ["first", "second", "third"] {
-        NodeBuilder::text(text, crate::text::TextStyle::new(12.0))
+        NodeBuilder::text(text, crate::text::TextStyle::new(px(12.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
     }
@@ -197,14 +197,14 @@ fn an_unknown_window_should_read_as_empty_and_ignore_injection() {
     assert!(app.texts(window).is_empty());
     let outcome = app.inject_input(
         window,
-        InputEvent::pointer_move(Point::new(1.0, 2.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(1.0), px(2.0)), Modifiers::empty()),
     );
     assert_eq!(outcome, crate::event::InputOutcome::default());
 }
 
 fn root_text(app: &mut App, window: WindowId, text: &'static str) {
     let root = app.window(window).expect("window").tree().root();
-    NodeBuilder::text(text, crate::text::TextStyle::new(12.0))
+    NodeBuilder::text(text, crate::text::TextStyle::new(px(12.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount");
 }

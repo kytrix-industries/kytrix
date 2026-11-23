@@ -11,7 +11,7 @@ use windows::Win32::{
 use super::super::native_window::collect_events;
 use crate::{
     app::App,
-    math::{Point, Size},
+    math::{DevicePoint, LogicalPoint, LogicalSize, dp, px},
     platform::{dispatcher::Dispatcher, windows::window::NativeWindow},
     window::{WindowId, WindowOptions},
 };
@@ -52,7 +52,7 @@ fn setup() -> (
     let runtime = runtime();
     let mut app = App::new(runtime.handle().clone());
     let options = WindowOptions {
-        size: Size::new(320.0, 240.0),
+        size: LogicalSize::new(px(320.0), px(240.0)),
         ..WindowOptions::default()
     };
     let id = app.create_window(options.clone());
@@ -81,7 +81,7 @@ fn wm_mousemove_stores_the_logical_position_and_leave_keeps_it() {
 
     send_mouse(hwnd, WM_MOUSEMOVE, 300, 150);
     collect_events(&mut app, &mut windows, &dispatcher).expect("collect_events");
-    let first = Point::new(scale.to_logical(300.0), scale.to_logical(150.0));
+    let first = scale.to_logical_point(DevicePoint::new(dp(300), dp(150)));
     assert_eq!(
         app.pointer_position(id),
         Some(first),
@@ -90,7 +90,7 @@ fn wm_mousemove_stores_the_logical_position_and_leave_keeps_it() {
     if scale.factor() != 1.0 {
         assert_ne!(
             app.pointer_position(id),
-            Some(Point::new(300.0, 150.0)),
+            Some(LogicalPoint::new(px(300.0), px(150.0))),
             "非 100% DPI 下不得把物理坐标直接当逻辑坐标"
         );
     }
@@ -98,7 +98,7 @@ fn wm_mousemove_stores_the_logical_position_and_leave_keeps_it() {
     let requests = app.frame_requests();
     send_mouse(hwnd, WM_MOUSEMOVE, 320, 160);
     collect_events(&mut app, &mut windows, &dispatcher).expect("collect_events");
-    let moved = Point::new(scale.to_logical(320.0), scale.to_logical(160.0));
+    let moved = scale.to_logical_point(DevicePoint::new(dp(320), dp(160)));
     assert_eq!(app.pointer_position(id), Some(moved));
     assert_eq!(
         app.frame_requests(),
@@ -130,10 +130,7 @@ fn a_move_outside_the_client_area_still_updates_the_position() {
     let outside = (-48, -20);
     send_mouse(hwnd, WM_MOUSEMOVE, outside.0, outside.1);
     collect_events(&mut app, &mut windows, &dispatcher).expect("collect_events");
-    let expected = Point::new(
-        scale.to_logical(outside.0 as f32),
-        scale.to_logical(outside.1 as f32),
-    );
+    let expected = scale.to_logical_point(DevicePoint::new(dp(outside.0), dp(outside.1)));
     assert_eq!(
         app.pointer_position(id),
         Some(expected),

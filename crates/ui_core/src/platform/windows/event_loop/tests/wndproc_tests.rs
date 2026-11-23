@@ -37,7 +37,7 @@ use super::super::{WndProcState, pump::A11Y_TIMER_ID, wndproc};
 use crate::{
     app::App,
     event::ImeEvent,
-    math::{Rect, Scale, Size},
+    math::{DevicePixelRatio, DeviceSize, LogicalRect, LogicalSize, dp, px},
     platform::{
         dispatcher::{Dispatcher, UserTask, WM_APP_COMPOSITION_WAKE, WM_APP_FRAME_WAKE},
         event::PlatformEvent,
@@ -162,7 +162,7 @@ fn encoded_point(x: i32, y: i32) -> isize {
     ((((y as u32) << 16) | (x as u32 & 0xFFFF)) as i32) as isize
 }
 
-fn hit_test(hwnd: HWND, scale: Scale, client_origin: POINT, x: f32, y: f32) -> u32 {
+fn hit_test(hwnd: HWND, scale: DevicePixelRatio, client_origin: POINT, x: f32, y: f32) -> u32 {
     let point = POINT {
         x: client_origin.x + (x * scale.factor()).round() as i32,
         y: client_origin.y + (y * scale.factor()).round() as i32,
@@ -651,8 +651,8 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
     let _runtime = runtime();
     let dispatcher = Dispatcher::new();
     let options = WindowOptions {
-        min_size: Some(Size::new(500.0, 300.0)),
-        max_size: Some(Size::new(1200.0, 900.0)),
+        min_size: Some(LogicalSize::new(px(500.0), px(300.0))),
+        max_size: Some(LogicalSize::new(px(1200.0), px(900.0))),
         ..WindowOptions::default()
     };
     let limits = placement::ClientLimits::from_options(&options);
@@ -676,8 +676,16 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
         );
     }
 
-    let min = dpi::track_size(Size::new(500.0, 300.0), dpi, Decorations::Native);
-    let max = dpi::track_size(Size::new(1200.0, 900.0), dpi, Decorations::Native);
+    let min = dpi::track_size(
+        LogicalSize::new(px(500.0), px(300.0)),
+        dpi,
+        Decorations::Native,
+    );
+    let max = dpi::track_size(
+        LogicalSize::new(px(1200.0), px(900.0)),
+        dpi,
+        Decorations::Native,
+    );
     assert_eq!(
         (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
         (min.0 as i32, min.1 as i32),
@@ -693,8 +701,8 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
 
     let dispatcher = Dispatcher::new();
     let options = WindowOptions {
-        min_size: Some(Size::new(900.0, 700.0)),
-        max_size: Some(Size::new(600.0, 500.0)),
+        min_size: Some(LogicalSize::new(px(900.0), px(700.0))),
+        max_size: Some(LogicalSize::new(px(600.0), px(500.0))),
         ..WindowOptions::default()
     };
     let limits = placement::ClientLimits::from_options(&options);
@@ -717,7 +725,11 @@ fn wm_getminmaxinfo_applies_the_configured_client_limits() {
             Some(LPARAM((&raw mut info) as isize)),
         );
     }
-    let clamped = dpi::track_size(Size::new(600.0, 500.0), dpi, Decorations::Native);
+    let clamped = dpi::track_size(
+        LogicalSize::new(px(600.0), px(500.0)),
+        dpi,
+        Decorations::Native,
+    );
     assert_eq!(
         (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
         (clamped.0 as i32, clamped.1 as i32),
@@ -802,7 +814,7 @@ fn drag_regions_hit_test_as_caption_and_clear_back_to_the_system() {
         unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool(),
         "ClientToScreen"
     );
-    raw.set_drag_regions(&[Rect::new(0.0, 0.0, 200.0, 24.0)]);
+    raw.set_drag_regions(&[LogicalRect::new(px(0.0), px(0.0), px(200.0), px(24.0))]);
 
     assert_eq!(
         hit_test(hwnd, scale, client_origin, 10.0, 10.0),
@@ -853,7 +865,7 @@ fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
         "ClientToScreen"
     );
 
-    let first = [Rect::new(0.0, 0.0, 320.0, 32.0)];
+    let first = [LogicalRect::new(px(0.0), px(0.0), px(320.0), px(32.0))];
     app.set_drag_regions(id, &first);
     native.sync_drag_regions(&app);
     assert_eq!(native.state_mut().drag_regions(), &first);
@@ -863,7 +875,7 @@ fn the_pump_sync_copies_drag_regions_into_the_wndproc_state() {
         "同步后的区域必须命中 HTCAPTION"
     );
 
-    let second = [Rect::new(0.0, 0.0, 120.0, 16.0)];
+    let second = [LogicalRect::new(px(0.0), px(0.0), px(120.0), px(16.0))];
     app.set_drag_regions(id, &second);
     native.sync_drag_regions(&app);
     assert_eq!(native.state_mut().drag_regions(), &second);
@@ -1193,10 +1205,9 @@ fn a_size_move_resize_drives_a_real_frame() {
     let window = window.window(id).expect("window");
     assert_eq!(
         window.size(),
-        crate::math::Size::new(
-            window.scale().to_logical(800.0),
-            window.scale().to_logical(600.0)
-        ),
+        window
+            .scale()
+            .to_logical_size(DeviceSize::new(dp(800), dp(600))),
         "WM_SIZE 必须把客户区写进窗口（逻辑尺寸 = 物理客户区 / scale）"
     );
     assert!(
@@ -1651,66 +1662,66 @@ fn frameless_hit_test_returns_resize_codes_caption_and_client() {
     let bottom_y = f32::from(i16::try_from(height - 2).expect("height"));
 
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, 1.0, 1.0),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, 1.0, 1.0),
         HTTOPLEFT,
         "左上角必须是 HTTOPLEFT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, right_x, 1.0),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, right_x, 1.0),
         HTTOPRIGHT,
         "右上角必须是 HTTOPRIGHT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, 1.0, bottom_y),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, 1.0, bottom_y),
         HTBOTTOMLEFT,
         "左下角必须是 HTBOTTOMLEFT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, right_x, bottom_y),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, right_x, bottom_y),
         HTBOTTOMRIGHT,
         "右下角必须是 HTBOTTOMRIGHT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, 1.0, center_y),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, 1.0, center_y),
         HTLEFT,
         "左边必须是 HTLEFT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, right_x, center_y),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, right_x, center_y),
         HTRIGHT,
         "右边必须是 HTRIGHT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, center_x, 1.0),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, center_x, 1.0),
         HTTOP,
         "上边必须是 HTTOP"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, center_x, bottom_y),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, center_x, bottom_y),
         HTBOTTOM,
         "下边必须是 HTBOTTOM"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, center_x, center_y),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, center_x, center_y),
         HTCLIENT,
         "客户区内部必须是 HTCLIENT"
     );
 
     unsafe {
-        (*state).set_drag_regions(&[Rect::new(0.0, 0.0, 200.0, 24.0)]);
+        (*state).set_drag_regions(&[LogicalRect::new(px(0.0), px(0.0), px(200.0), px(24.0))]);
     }
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, 100.0, 12.0),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, 100.0, 12.0),
         HTCAPTION,
         "拖动区命中必须返回 HTCAPTION"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, 100.0, 100.0),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, 100.0, 100.0),
         HTCLIENT,
         "拖动区之外仍是 HTCLIENT"
     );
     assert_eq!(
-        hit_test(hwnd, Scale::ONE, origin, 2.0, 2.0),
+        hit_test(hwnd, DevicePixelRatio::ONE, origin, 2.0, 2.0),
         HTTOPLEFT,
         "resize 带优先于拖动区"
     );
@@ -1723,8 +1734,16 @@ fn frameless_track_size_is_the_client_size_without_the_non_client_area() {
     let _runtime = runtime();
     let limits = placement::ClientLimits::default();
     let dpi = crate::platform::windows::dpi::system_dpi();
-    let frameless = dpi::track_size(Size::new(400.0, 300.0), dpi, Decorations::None);
-    let native = dpi::track_size(Size::new(400.0, 300.0), dpi, Decorations::Native);
+    let frameless = dpi::track_size(
+        LogicalSize::new(px(400.0), px(300.0)),
+        dpi,
+        Decorations::None,
+    );
+    let native = dpi::track_size(
+        LogicalSize::new(px(400.0), px(300.0)),
+        dpi,
+        Decorations::Native,
+    );
     assert!(
         native.0 > frameless.0 && native.1 > frameless.1,
         "Native 的跟踪尺寸必须多一圈非客户区：frameless={frameless:?} native={native:?}"

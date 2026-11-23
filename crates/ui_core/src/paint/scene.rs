@@ -1,4 +1,5 @@
 use crate::{
+    math::LogicalPx,
     node::id::{Arena, ArenaKey},
     paint::primitive::{ClipOp, Primitive},
 };
@@ -68,7 +69,11 @@ impl Lane {
                 Primitive::Clip(ClipOp::Push(clip)) => {
                     if open > 0 {
                         open -= 1;
-                    } else if clip.corner_radius.iter().any(|radius| *radius > 0.0) {
+                    } else if clip
+                        .corner_radius
+                        .iter()
+                        .any(|radius| *radius > LogicalPx::ZERO)
+                    {
                         rounded += 1;
                     }
                 }
@@ -291,7 +296,7 @@ impl Scene {
 mod tests {
     use super::{Lane, LaneId, MAX_CLIP_DEPTH, Scene};
     use crate::{
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         paint::{
             atlas::{AtlasKind, AtlasTile},
             color::Color,
@@ -301,15 +306,15 @@ mod tests {
 
     fn clip() -> ClipRect {
         ClipRect {
-            rect: Rect::new(0.0, 0.0, 8.0, 8.0),
-            corner_radius: [0.0; 4],
+            rect: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
+            corner_radius: [px(0.0); 4],
         }
     }
 
     fn quad() -> Primitive {
         Primitive::Quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
@@ -319,7 +324,7 @@ mod tests {
 
     fn image() -> Primitive {
         Primitive::Image(Image {
-            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
             tile: AtlasTile {
                 atlas: AtlasKind::Image,
                 page: 0,
@@ -337,11 +342,11 @@ mod tests {
 
     fn shadow() -> Primitive {
         Primitive::Shadow(Shadow {
-            rect: Rect::new(0.0, 0.0, 4.0, 4.0),
-            offset: Point::new(0.0, 1.0),
-            blur: 2.0,
+            rect: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
+            offset: LogicalPoint::new(px(0.0), px(1.0)),
+            blur: px(2.0),
             color: Color::BLACK,
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         })
     }
 

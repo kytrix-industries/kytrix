@@ -4,7 +4,7 @@ use ahash::AHasher;
 use bytes::Bytes;
 
 use crate::{
-    math::{PhysicalRect, Size},
+    math::{DevicePx, DeviceRect, LogicalSize, dp},
     resources::{DecodeCause, ResourceId, ResourceImage, image::SourceKind},
 };
 
@@ -39,14 +39,14 @@ pub(crate) struct VariantEntry {
 pub(crate) struct Entry {
     pub image: ResourceImage,
     pub alloc: etagere::AllocId,
-    pub padded: PhysicalRect,
+    pub padded: DeviceRect,
     pub refcount: u32,
     pub last_used: u64,
     pub key: ContentKey,
     pub target: (u32, u32),
     pub intrinsic: (u32, u32),
     pub kind: SourceKind,
-    pub logical: Option<Size>,
+    pub logical: Option<LogicalSize>,
 }
 
 pub(crate) struct Page {
@@ -81,15 +81,15 @@ impl Page {
         &self.bytes
     }
 
-    pub(crate) fn write(&mut self, rect: PhysicalRect, src: &[u8], stride: usize) {
+    pub(crate) fn write(&mut self, rect: DeviceRect, src: &[u8], stride: usize) {
         let Some(bounds) = self.clip(rect) else {
             return;
         };
-        let copy_width = (bounds.x1 - bounds.x0) as usize * 4;
-        let source_x = (bounds.x0 - rect.x0) as usize * 4;
+        let copy_width = (bounds.x1 - bounds.x0).value() as usize * 4;
+        let source_x = (bounds.x0 - rect.x0).value() as usize * 4;
         let page_width = self.width as usize;
-        for y in bounds.y0..bounds.y1 {
-            let source_row = (y - rect.y0) as usize;
+        for y in bounds.y0.value()..bounds.y1.value() {
+            let source_row = (y - rect.y0.value()) as usize;
             let Some(source_start) = source_row
                 .checked_mul(stride)
                 .and_then(|row| row.checked_add(source_x))
@@ -99,32 +99,32 @@ impl Page {
             let Some(source) = src.get(source_start..source_start + copy_width) else {
                 return;
             };
-            let destination = y as usize * page_width * 4 + bounds.x0 as usize * 4;
+            let destination = y as usize * page_width * 4 + bounds.x0.value() as usize * 4;
             self.bytes[destination..destination + copy_width].copy_from_slice(source);
         }
     }
 
-    pub(crate) fn clear_rect(&mut self, rect: PhysicalRect) {
+    pub(crate) fn clear_rect(&mut self, rect: DeviceRect) {
         let Some(bounds) = self.clip(rect) else {
             return;
         };
-        let row_bytes = (bounds.x1 - bounds.x0) as usize * 4;
+        let row_bytes = (bounds.x1 - bounds.x0).value() as usize * 4;
         let page_width = self.width as usize;
-        for y in bounds.y0..bounds.y1 {
-            let start = y as usize * page_width * 4 + bounds.x0 as usize * 4;
+        for y in bounds.y0.value()..bounds.y1.value() {
+            let start = y as usize * page_width * 4 + bounds.x0.value() as usize * 4;
             self.bytes[start..start + row_bytes].fill(0);
         }
     }
 
-    fn clip(&self, rect: PhysicalRect) -> Option<PhysicalRect> {
-        let x0 = rect.x0.max(0).min(self.width as i32);
-        let x1 = rect.x1.max(0).min(self.width as i32);
-        let y0 = rect.y0.max(0).min(self.height as i32);
-        let y1 = rect.y1.max(0).min(self.height as i32);
+    fn clip(&self, rect: DeviceRect) -> Option<DeviceRect> {
+        let x0 = rect.x0.max(DevicePx::ZERO).value().min(self.width as i32);
+        let x1 = rect.x1.max(DevicePx::ZERO).value().min(self.width as i32);
+        let y0 = rect.y0.max(DevicePx::ZERO).value().min(self.height as i32);
+        let y1 = rect.y1.max(DevicePx::ZERO).value().min(self.height as i32);
         if x0 >= x1 || y0 >= y1 {
             return None;
         }
-        Some(PhysicalRect::new(x0, y0, x1, y1))
+        Some(DeviceRect::new(dp(x0), dp(y0), dp(x1), dp(y1)))
     }
 }
 
@@ -132,7 +132,7 @@ impl Page {
 mod tests {
     use super::{ContentKey, Page};
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         resources::{DecodeCause, image::SourceKind},
     };
 
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn write_then_read_back_the_same_rows() {
         let mut page = page(4, 2);
-        let rect = PhysicalRect::new(1, 0, 3, 2);
+        let rect = DeviceRect::new(dp(1), dp(0), dp(3), dp(2));
         let source = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         page.write(rect, &source, 8);
 
@@ -182,26 +182,34 @@ mod tests {
     fn write_respects_a_padded_stride() {
         let mut page = page(2, 2);
         let source = [9u8; 32];
-        page.write(PhysicalRect::new(0, 0, 2, 2), &source, 16);
+        page.write(DeviceRect::new(dp(0), dp(0), dp(2), dp(2)), &source, 16);
         assert_eq!(page.bytes(), &[9u8; 16]);
     }
 
     #[test]
     fn write_clips_out_of_bounds_rects() {
         let mut page = page(2, 2);
-        page.write(PhysicalRect::new(1, 1, 3, 3), &[7u8, 7, 7, 7], 4);
+        page.write(
+            DeviceRect::new(dp(1), dp(1), dp(3), dp(3)),
+            &[7u8, 7, 7, 7],
+            4,
+        );
         let bytes = page.bytes();
         assert_eq!(&bytes[12..16], &[7; 4]);
         assert_eq!(&bytes[..12], &[0; 12]);
 
-        page.write(PhysicalRect::new(-8, -8, -2, -2), &[1u8; 16], 8);
+        page.write(
+            DeviceRect::new(dp(-8), dp(-8), dp(-2), dp(-2)),
+            &[1u8; 16],
+            8,
+        );
         assert_eq!(&page.bytes()[..12], &[0; 12]);
     }
 
     #[test]
     fn write_truncated_source_is_a_no_op_for_the_missing_rows() {
         let mut page = page(2, 2);
-        page.write(PhysicalRect::new(0, 0, 2, 2), &[3u8; 8], 8);
+        page.write(DeviceRect::new(dp(0), dp(0), dp(2), dp(2)), &[3u8; 8], 8);
         assert_eq!(&page.bytes()[..8], &[3u8; 8]);
         assert_eq!(&page.bytes()[8..], &[0u8; 8]);
     }
@@ -209,8 +217,8 @@ mod tests {
     #[test]
     fn clear_rect_zeroes_only_that_rect() {
         let mut page = page(2, 2);
-        page.write(PhysicalRect::new(0, 0, 2, 2), &[5u8; 16], 8);
-        page.clear_rect(PhysicalRect::new(1, 0, 2, 1));
+        page.write(DeviceRect::new(dp(0), dp(0), dp(2), dp(2)), &[5u8; 16], 8);
+        page.clear_rect(DeviceRect::new(dp(1), dp(0), dp(2), dp(1)));
         assert_eq!(&page.bytes()[..4], &[5u8; 4]);
         assert_eq!(&page.bytes()[4..8], &[0u8; 4]);
         assert_eq!(&page.bytes()[8..], &[5u8; 8]);
@@ -219,8 +227,8 @@ mod tests {
     #[test]
     fn clear_rect_ignores_empty_rects() {
         let mut page = page(2, 2);
-        page.write(PhysicalRect::new(0, 0, 2, 2), &[6u8; 16], 8);
-        page.clear_rect(PhysicalRect::new(1, 1, 1, 1));
+        page.write(DeviceRect::new(dp(0), dp(0), dp(2), dp(2)), &[6u8; 16], 8);
+        page.clear_rect(DeviceRect::new(dp(1), dp(1), dp(1), dp(1)));
         assert_eq!(page.bytes(), &[6u8; 16]);
     }
 

@@ -11,7 +11,7 @@ use std::{
 use ui_core::{
     app::{App, AppHandle, Application},
     event::Event,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalRect, LogicalSize, px},
     window::{WindowId, WindowOptions},
 };
 use windows::Win32::{
@@ -34,9 +34,12 @@ use windows::Win32::{
 };
 
 const TITLE: &str = "kytrix P1-B X2 drag evidence";
-const SIZE: Size = Size::new(480.0, 320.0);
-const DRAG_REGION: Rect = Rect::new(0.0, 0.0, 480.0, 40.0);
-const GRAB_POINT: Point = Point::new(120.0, 20.0);
+const SIZE: LogicalSize = LogicalSize::new(px(480.0), px(320.0));
+const DRAG_REGION: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(px(0.0), px(0.0)),
+    LogicalSize::new(px(480.0), px(40.0)),
+);
+const GRAB_POINT: LogicalPoint = LogicalPoint::new(px(120.0), px(20.0));
 const DRAG_STEP: (i32, i32) = (8, 4);
 const DRAG_STEPS: i32 = 20;
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -59,7 +62,7 @@ struct State {
     drag_ok: bool,
     drag: Arc<Mutex<DragOutcome>>,
     drag_done: Arc<AtomicBool>,
-    moved_events: Vec<Point>,
+    moved_events: Vec<LogicalPoint>,
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -114,7 +117,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     origin.x, origin.y
                 );
                 let inside = hit_test(hwnd, scale, origin, GRAB_POINT);
-                let outside = hit_test(hwnd, scale, origin, Point::new(120.0, 200.0));
+                let outside = hit_test(hwnd, scale, origin, LogicalPoint::new(px(120.0), px(200.0)));
                 let hit_ok = inside == HTCAPTION && outside == HTCLIENT;
                 println!(
                     "WM_NCHITTEST：拖动区内（逻辑 (120,20)）={inside}（期望 HTCAPTION={HTCAPTION}）；\
@@ -226,8 +229,8 @@ fn drag_with_mouse(hwnd: HWND, scale: f64, origin: POINT, outcome: &Mutex<DragOu
     }
     std::thread::sleep(Duration::from_millis(500));
     let grab = (
-        origin.x + (GRAB_POINT.x * scale as f32).round() as i32,
-        origin.y + (GRAB_POINT.y * scale as f32).round() as i32,
+        origin.x + (GRAB_POINT.x.value() * scale as f32).round() as i32,
+        origin.y + (GRAB_POINT.y.value() * scale as f32).round() as i32,
     );
     println!(
         "真实拖动：在屏幕物理点 {:?}（拖动区内）按下，2 s 内分 {DRAG_STEPS} 步位移 ({}, {})",
@@ -309,10 +312,10 @@ fn send_mouse(flags: MOUSE_EVENT_FLAGS, position: Option<(i32, i32)>) {
     }
 }
 
-fn hit_test(hwnd: HWND, scale: f64, origin: POINT, logical: Point) -> u32 {
+fn hit_test(hwnd: HWND, scale: f64, origin: POINT, logical: LogicalPoint) -> u32 {
     let point = POINT {
-        x: origin.x + (logical.x * scale as f32).round() as i32,
-        y: origin.y + (logical.y * scale as f32).round() as i32,
+        x: origin.x + (logical.x.value() * scale as f32).round() as i32,
+        y: origin.y + (logical.y.value() * scale as f32).round() as i32,
     };
     let encoded = ((((point.y as u32) << 16) | (point.x as u32 & 0xFFFF)) as i32) as isize;
     let result = unsafe { SendMessageW(hwnd, WM_NCHITTEST, None, Some(LPARAM(encoded))) };

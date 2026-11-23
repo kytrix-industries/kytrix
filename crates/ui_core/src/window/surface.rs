@@ -1,7 +1,7 @@
 use super::{FramePresentation, Window, WindowOptions};
 use crate::{
     error::EngineError,
-    math::{PhysicalRect, Rect, Scale, Size},
+    math::{DevicePixelRatio, DeviceRect, LogicalRect, LogicalSize, dp, px},
     paint::{atlas::AtlasKind, color::Color},
     render::backend::Renderer,
 };
@@ -26,11 +26,11 @@ pub(crate) fn set_background_color(window: &mut Window, color: Color) {
     }
 }
 
-pub(crate) fn size(window: &Window) -> Size {
+pub(crate) fn size(window: &Window) -> LogicalSize {
     window.options.size
 }
 
-pub(crate) fn set_size(window: &mut Window, size: Size) {
+pub(crate) fn set_size(window: &mut Window, size: LogicalSize) {
     if window.size() == size {
         return;
     }
@@ -353,13 +353,22 @@ pub(crate) fn take_composition_pending(window: &Window) -> bool {
         .is_some_and(Renderer::take_composition_pending)
 }
 
-pub(crate) fn frame_rect(window: &Window) -> PhysicalRect {
-    PhysicalRect::new(0, 0, window.surface.0 as i32, window.surface.1 as i32)
+pub(crate) fn frame_rect(window: &Window) -> DeviceRect {
+    DeviceRect::new(
+        dp(0),
+        dp(0),
+        dp(window.surface.0 as i32),
+        dp(window.surface.1 as i32),
+    )
 }
 
-pub(crate) fn covering_surface(size: Size, scale: Scale) -> (u32, u32) {
-    let rect = Rect::new(0.0, 0.0, size.width, size.height).to_physical_covering(scale);
-    (rect.width().max(1) as u32, rect.height().max(1) as u32)
+pub(crate) fn covering_surface(size: LogicalSize, scale: DevicePixelRatio) -> (u32, u32) {
+    let rect =
+        scale.to_covering_device_rect(LogicalRect::new(px(0.0), px(0.0), size.width, size.height));
+    (
+        rect.width().value().max(1) as u32,
+        rect.height().value().max(1) as u32,
+    )
 }
 
 #[cfg(test)]
@@ -373,7 +382,7 @@ mod tests {
 
     fn one_rect() -> crate::render::DirtyRects {
         let mut rects = crate::render::DirtyRects::default();
-        rects.mark(PhysicalRect::new(1, 2, 3, 4));
+        rects.mark(DeviceRect::new(dp(1), dp(2), dp(3), dp(4)));
         rects
     }
 

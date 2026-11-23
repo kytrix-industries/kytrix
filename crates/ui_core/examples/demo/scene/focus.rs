@@ -1,7 +1,7 @@
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
-    math::Rect,
+    math::{LogicalRect, px},
     node::{id::NodeId, signal::Signal},
     window::WindowId,
 };
@@ -62,16 +62,16 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, view: Signal
         app,
         window,
         panel,
-        Rect::new(18.0, 42.0, 276.0, 22.0),
-        text_style(13.5, 400, TEXT_RGBA),
+        LogicalRect::new(px(18.0), px(42.0), px(276.0), px(22.0)),
+        text_style(px(13.5), 400, TEXT_RGBA),
         move |cx| cx.read(&view).line(),
     );
     let _ = card::bound_label(
         app,
         window,
         panel,
-        Rect::new(18.0, 70.0, 276.0, 20.0),
-        text_style(12.5, 400, MUTED_RGBA),
+        LogicalRect::new(px(18.0), px(70.0), px(276.0), px(20.0)),
+        text_style(px(12.5), 400, MUTED_RGBA),
         move |cx| cx.read(&view).position(),
     );
     for (index, hint) in [
@@ -86,9 +86,14 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, view: Signal
             app,
             window,
             panel,
-            Rect::new(18.0, 96.0 + index as f32 * 22.0, 276.0, 18.0),
+            LogicalRect::new(
+                px(18.0),
+                px(96.0) + px(22.0) * index as f32,
+                px(276.0),
+                px(18.0),
+            ),
             *hint,
-            text_style(11.5, 400, DIM_RGBA),
+            text_style(px(11.5), 400, DIM_RGBA),
         );
     }
 }

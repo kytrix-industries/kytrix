@@ -396,9 +396,9 @@ mod tests {
 
     use super::{CompositorHandle, CompositorInbox, FrameRequest, FrameSink, compositor};
     #[cfg(target_os = "linux")]
-    use crate::math::Size;
+    use crate::math::LogicalSize;
     use crate::{
-        math::{PhysicalRect, Scale},
+        math::{DevicePixelRatio, DeviceRect, dp, px},
         render::{
             compositor::{DamageRects, Plan},
             delta::{FrameHeader, SceneDelta},
@@ -412,9 +412,9 @@ mod tests {
             index: FrameIndex::from_raw(index),
             plan: Plan::Partial(DamageRects::new()),
             surface: (8, 8),
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
             #[cfg(target_os = "linux")]
-            surface_local: Size::new(8.0, 8.0),
+            surface_local: LogicalSize::new(px(8.0), px(8.0)),
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             published_at: std::time::Instant::now(),
@@ -447,8 +447,8 @@ mod tests {
             let mut delta = delta(index);
             delta.scroll.push(crate::render::delta::ScrollDelta {
                 slot: 0,
-                offset: crate::math::Point::new(0.0, y),
-                viewport: PhysicalRect::new(0, 0, 8, 8),
+                offset: crate::math::LogicalPoint::new(px(0.0), px(y)),
+                viewport: DeviceRect::new(dp(0), dp(0), dp(8), dp(8)),
             });
             delta
         };
@@ -468,7 +468,8 @@ mod tests {
         let merged = &batch[0].1;
         assert_eq!(merged.scroll.len(), 1, "同槽只留一条");
         assert_eq!(
-            merged.scroll[0].offset.y, -30.0,
+            merged.scroll[0].offset.y,
+            px(-30.0),
             "同槽偏移必须是最新值（旧实现冻结在 −10）"
         );
     }
@@ -697,8 +698,8 @@ mod tests {
         scrolled.header.window = WindowId::from_raw(5);
         scrolled.scroll.push(crate::render::delta::ScrollDelta {
             slot: 0,
-            offset: crate::math::Point::new(0.0, -8.0),
-            viewport: PhysicalRect::new(0, 0, 8, 8),
+            offset: crate::math::LogicalPoint::new(px(0.0), px(-8.0)),
+            viewport: DeviceRect::new(dp(0), dp(0), dp(8), dp(8)),
         });
         handle.publish(scrolled).expect("publish");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

@@ -1,4 +1,10 @@
-use ui_core::{app::App, math::Rect, node::id::NodeId, text::TextStyle, window::WindowId};
+use ui_core::{
+    app::App,
+    math::{LogicalRect, px},
+    node::id::NodeId,
+    text::TextStyle,
+    window::WindowId,
+};
 
 use super::{MUTED_RGBA, TEXT_RGBA, card, color, text_style};
 
@@ -13,23 +19,23 @@ const MIXED: &str = "混排断行：Kytrix GUI 用 Parley 的 Unicode 断行，�
 
 pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId) {
     for (index, sample) in SAMPLES.iter().enumerate() {
-        let y = 40.0 + index as f32 * 26.0;
+        let y = px(40.0) + px(26.0) * index as f32;
         let _ = card::label(
             app,
             window,
             panel,
-            Rect::new(18.0, y, 544.0, 22.0),
+            LogicalRect::new(px(18.0), y, px(544.0), px(22.0)),
             *sample,
-            text_style(13.5, 400, TEXT_RGBA),
+            text_style(px(13.5), 400, TEXT_RGBA),
         );
     }
     let _ = card::label(
         app,
         window,
         panel,
-        Rect::new(18.0, 142.0, 544.0, 44.0),
+        LogicalRect::new(px(18.0), px(142.0), px(544.0), px(44.0)),
         MIXED,
-        TextStyle::new(13.0)
+        TextStyle::new(px(13.0))
             .with_color(color(MUTED_RGBA))
             .with_line_height(1.45),
     );
@@ -78,7 +84,7 @@ mod tests {
 
 #[cfg(all(test, feature = "test-support"))]
 mod showcase_tests {
-    use ui_core::test_support::record::PrimitiveKind;
+    use ui_core::{math::px, test_support::record::PrimitiveKind};
 
     use crate::scene::test_support::{frame, setup};
 
@@ -103,7 +109,7 @@ mod showcase_tests {
                     && primitive.bounds.min().x < card.origin.x + card.size.width
                     && primitive.bounds.min().y >= lower
                     && primitive.bounds.max().y <= upper
-                    && primitive.bounds.size.width > 40.0
+                    && primitive.bounds.size.width > px(40.0)
             })
             .count();
         assert!(

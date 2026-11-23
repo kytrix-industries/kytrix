@@ -1,9 +1,9 @@
 use std::{sync::Arc, time::Instant};
 
 #[cfg(target_os = "linux")]
-use crate::math::Size;
+use crate::math::LogicalSize;
 use crate::{
-    math::{PhysicalRect, Point, Scale},
+    math::{DevicePixelRatio, DeviceRect, LogicalPoint, dp, px},
     paint::{
         geometry::GeometryId,
         geometry_store::GeometryStore,
@@ -27,8 +27,8 @@ pub(crate) struct LaneDelta {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollDelta {
     pub slot: u32,
-    pub offset: Point,
-    pub viewport: PhysicalRect,
+    pub offset: LogicalPoint,
+    pub viewport: DeviceRect,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,9 +37,9 @@ pub(crate) struct FrameHeader {
     pub index: FrameIndex,
     pub plan: Plan,
     pub surface: (u32, u32),
-    pub scale: Scale,
+    pub scale: DevicePixelRatio,
     #[cfg(target_os = "linux")]
-    pub surface_local: Size,
+    pub surface_local: LogicalSize,
     #[cfg(target_os = "linux")]
     pub buffer_scale: i32,
     pub published_at: Instant,
@@ -136,10 +136,10 @@ pub(crate) fn absorb(old: SceneDelta, new: &mut SceneDelta) {
 pub(crate) struct DeltaBuilder {
     versions: Vec<(u32, u32)>,
     order: Arc<[LaneId]>,
-    scroll: Vec<Point>,
-    scroll_viewports: Vec<PhysicalRect>,
+    scroll: Vec<LogicalPoint>,
+    scroll_viewports: Vec<DeviceRect>,
     geometries: ahash::HashMap<GeometryId, Arc<crate::paint::geometry::GeometrySnapshot>>,
-    scale: Option<Scale>,
+    scale: Option<DevicePixelRatio>,
     force_full: bool,
     dirty: Vec<LaneId>,
     #[cfg(test)]
@@ -176,7 +176,7 @@ impl DeltaBuilder {
         self.visited_lanes
     }
 
-    pub(crate) fn full_for(&mut self, scale: Scale) -> bool {
+    pub(crate) fn full_for(&mut self, scale: DevicePixelRatio) -> bool {
         let forced = std::mem::take(&mut self.force_full);
         let full = forced || self.scale != Some(scale);
         self.scale = Some(scale);
@@ -196,7 +196,7 @@ impl DeltaBuilder {
         &mut self,
         scene: &mut Scene,
         store: &GeometryStore,
-        scroll: &[(Point, PhysicalRect)],
+        scroll: &[(LogicalPoint, DeviceRect)],
         full: bool,
         delta: &mut SceneDelta,
     ) {
@@ -238,10 +238,10 @@ impl DeltaBuilder {
         self.dirty = dirty;
         if self.scroll.len() < scroll.len() {
             self.scroll
-                .resize(scroll.len(), Point::new(f32::NAN, f32::NAN));
+                .resize(scroll.len(), LogicalPoint::new(px(f32::NAN), px(f32::NAN)));
             self.scroll_viewports.resize(
                 scroll.len(),
-                PhysicalRect::new(i32::MIN, i32::MIN, i32::MIN, i32::MIN),
+                DeviceRect::new(dp(i32::MIN), dp(i32::MIN), dp(i32::MIN), dp(i32::MIN)),
             );
         }
         for (slot, (offset, viewport)) in scroll.iter().enumerate() {
@@ -518,8 +518,8 @@ impl GeometryLookup for GeometryCatalog {
 
 #[derive(Default)]
 pub(crate) struct ScrollTable {
-    offsets: Vec<Point>,
-    viewports: Vec<PhysicalRect>,
+    offsets: Vec<LogicalPoint>,
+    viewports: Vec<DeviceRect>,
     changed: Vec<u32>,
 }
 
@@ -532,14 +532,15 @@ impl ScrollTable {
         }
     }
 
-    pub(crate) fn apply(&mut self, deltas: &[ScrollDelta], scale: Scale) -> &[u32] {
+    pub(crate) fn apply(&mut self, deltas: &[ScrollDelta], scale: DevicePixelRatio) -> &[u32] {
         self.changed.clear();
         for delta in deltas {
             let slot = delta.slot as usize;
             if self.offsets.len() <= slot {
-                self.offsets.resize(slot + 1, Point::new(0.0, 0.0));
+                self.offsets
+                    .resize(slot + 1, LogicalPoint::new(px(0.0), px(0.0)));
                 self.viewports
-                    .resize(slot + 1, PhysicalRect::new(0, 0, 0, 0));
+                    .resize(slot + 1, DeviceRect::new(dp(0), dp(0), dp(0), dp(0)));
             }
             if self.offsets[slot] != delta.offset {
                 self.offsets[slot] = delta.offset;
@@ -551,38 +552,41 @@ impl ScrollTable {
         &self.changed
     }
 
-    pub(crate) fn physical_offset(&self, slot: u32, scale: Scale) -> [f32; 2] {
+    pub(crate) fn physical_offset(&self, slot: u32, scale: DevicePixelRatio) -> [f32; 2] {
         let offset = self
             .offsets
             .get(slot as usize)
             .copied()
-            .unwrap_or_else(|| Point::new(0.0, 0.0));
+            .unwrap_or_else(|| LogicalPoint::new(px(0.0), px(0.0)));
         let factor = scale.factor();
-        [-offset.x * factor, -offset.y * factor]
+        [(-offset.x * factor).value(), (-offset.y * factor).value()]
     }
 
-    pub(crate) fn to_payload(&self, scale: Scale, out: &mut Vec<[f32; 2]>) {
+    pub(crate) fn to_payload(&self, scale: DevicePixelRatio, out: &mut Vec<[f32; 2]>) {
         out.clear();
         out.extend((0..self.offsets.len() as u32).map(|slot| self.physical_offset(slot, scale)));
     }
 
     pub(crate) fn viewports_to_payload(&self, out: &mut Vec<[i32; 4]>) {
         out.clear();
-        out.extend(
-            self.viewports
-                .iter()
-                .map(|viewport| [viewport.x0, viewport.y0, viewport.x1, viewport.y1]),
-        );
+        out.extend(self.viewports.iter().map(|viewport| {
+            [
+                viewport.x0.value(),
+                viewport.y0.value(),
+                viewport.x1.value(),
+                viewport.y1.value(),
+            ]
+        }));
     }
 }
 
-pub(crate) fn scroll_damage(viewport: PhysicalRect) -> Option<PhysicalRect> {
-    let width = viewport.x1.saturating_sub(viewport.x0);
-    let height = viewport.y1.saturating_sub(viewport.y0);
+pub(crate) fn scroll_damage(viewport: DeviceRect) -> Option<DeviceRect> {
+    let width = viewport.x1 - viewport.x0;
+    let height = viewport.y1 - viewport.y0;
     (width > 0 && height > 0).then_some(viewport)
 }
 
-pub(crate) fn push_scroll_damage(plan: Plan, viewports: &[PhysicalRect]) -> Plan {
+pub(crate) fn push_scroll_damage(plan: Plan, viewports: &[DeviceRect]) -> Plan {
     if viewports.is_empty() {
         return plan;
     }
@@ -611,9 +615,9 @@ mod tests {
         ScrollTable, absorb, push_scroll_damage, scroll_damage,
     };
     #[cfg(target_os = "linux")]
-    use crate::math::Size;
+    use crate::math::LogicalSize;
     use crate::{
-        math::{PhysicalRect, Point, Rect, Scale},
+        math::{DevicePixelRatio, DeviceRect, LogicalPoint, LogicalRect, dp, px},
         paint::{
             color::Color,
             instance::{GeometryLookup, LaneSource},
@@ -630,9 +634,9 @@ mod tests {
             index: FrameIndex::from_raw(index),
             plan,
             surface: (64, 64),
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
             #[cfg(target_os = "linux")]
-            surface_local: Size::new(64.0, 64.0),
+            surface_local: LogicalSize::new(px(64.0), px(64.0)),
             #[cfg(target_os = "linux")]
             buffer_scale: 1,
             published_at: std::time::Instant::now(),
@@ -641,8 +645,8 @@ mod tests {
 
     fn quad() -> Primitive {
         Primitive::Quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
@@ -675,7 +679,7 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("注册几何")
@@ -711,12 +715,12 @@ mod tests {
         scene.set_order(&[lane]);
         let geometry = store();
         let mut builder = DeltaBuilder::new();
-        let viewport = PhysicalRect::new(0, 0, 64, 64);
+        let viewport = DeviceRect::new(dp(0), dp(0), dp(64), dp(64));
         let mut first = SceneDelta::empty(header(1, Plan::Full));
         builder.collect(
             &mut scene,
             &geometry,
-            &[(Point::new(0.0, 0.0), viewport)],
+            &[(LogicalPoint::new(px(0.0), px(0.0)), viewport)],
             true,
             &mut first,
         );
@@ -724,14 +728,14 @@ mod tests {
         builder.collect(
             &mut scene,
             &geometry,
-            &[(Point::new(0.0, -12.0), viewport)],
+            &[(LogicalPoint::new(px(0.0), px(-12.0)), viewport)],
             false,
             &mut scrolled,
         );
         assert!(scrolled.lanes.is_empty(), "滚动帧不得重编码任何 lane");
         assert!(scrolled.order.is_none());
         assert_eq!(scrolled.scroll.len(), 1);
-        assert_eq!(scrolled.scroll[0].offset.y, -12.0);
+        assert_eq!(scrolled.scroll[0].offset.y, px(-12.0));
         assert!(scrolled.lanes.is_empty() && scrolled.order.is_none());
     }
 
@@ -820,7 +824,7 @@ mod tests {
             1,
             Plan::Partial({
                 let mut rects = DamageRects::new();
-                assert!(rects.push(PhysicalRect::new(0, 0, 8, 8)));
+                assert!(rects.push(DeviceRect::new(dp(0), dp(0), dp(8), dp(8))));
                 rects
             }),
         ));
@@ -829,7 +833,7 @@ mod tests {
             2,
             Plan::Partial({
                 let mut rects = DamageRects::new();
-                assert!(rects.push(PhysicalRect::new(8, 8, 16, 16)));
+                assert!(rects.push(DeviceRect::new(dp(8), dp(8), dp(16), dp(16))));
                 rects
             }),
         ));
@@ -884,8 +888,8 @@ mod tests {
     fn scroll_delta(slot: u32, y: f32) -> ScrollDelta {
         ScrollDelta {
             slot,
-            offset: Point::new(0.0, y),
-            viewport: PhysicalRect::new(0, 0, 64, 64),
+            offset: LogicalPoint::new(px(0.0), px(y)),
+            viewport: DeviceRect::new(dp(0), dp(0), dp(64), dp(64)),
         }
     }
 
@@ -897,19 +901,19 @@ mod tests {
         newer.scroll.push(scroll_delta(0, -20.0));
         absorb(older, &mut newer);
         assert_eq!(newer.scroll.len(), 1, "同槽只能留一条");
-        assert_eq!(newer.scroll[0].offset.y, -20.0, "同槽以新为准");
+        assert_eq!(newer.scroll[0].offset.y, px(-20.0), "同槽以新为准");
     }
 
     #[test]
     fn absorbing_a_covered_scroll_delta_matches_sequential_application() {
-        let scale = Scale::ONE;
-        let viewport = PhysicalRect::new(0, 0, 64, 64);
+        let scale = DevicePixelRatio::ONE;
+        let viewport = DeviceRect::new(dp(0), dp(0), dp(64), dp(64));
         let mut sequential = ScrollTable::new();
         for y in [-10.0f32, -20.0, -30.0] {
             let _ = sequential.apply(
                 &[ScrollDelta {
                     slot: 0,
-                    offset: Point::new(0.0, y),
+                    offset: LogicalPoint::new(px(0.0), px(y)),
                     viewport,
                 }],
                 scale,
@@ -944,8 +948,8 @@ mod tests {
         absorb(older, &mut newer);
         let slots: Vec<u32> = newer.scroll.iter().map(|scroll| scroll.slot).collect();
         assert_eq!(slots, vec![0, 3], "新槽在前、旧的不同槽在后");
-        assert_eq!(newer.scroll[0].offset.y, -20.0);
-        assert_eq!(newer.scroll[1].offset.y, -7.0);
+        assert_eq!(newer.scroll[0].offset.y, px(-20.0));
+        assert_eq!(newer.scroll[1].offset.y, px(-7.0));
     }
 
     #[test]
@@ -1017,7 +1021,7 @@ mod tests {
             vertex_stride: 12,
             index_type: IndexType::U16,
             topology: Topology::TriangleList,
-            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
             pipeline: GeometryPipeline::Ui,
         };
         let mut store = store();
@@ -1070,14 +1074,14 @@ mod tests {
         let mut builder = DeltaBuilder::new();
         let geometry = store();
         let mut delta = SceneDelta::empty(header(1, Plan::Full));
-        let full = builder.full_for(Scale::ONE);
+        let full = builder.full_for(DevicePixelRatio::ONE);
         builder.collect(&mut scene, &geometry, &[], full, &mut delta);
         assert!(delta.full, "首帧必须 full");
         assert_eq!(delta.lanes.len(), 2);
 
         assert!(scene.push(first, quad()));
         let mut delta = SceneDelta::empty(header(2, Plan::Idle));
-        let full = builder.full_for(Scale::ONE);
+        let full = builder.full_for(DevicePixelRatio::ONE);
         builder.collect(&mut scene, &geometry, &[], full, &mut delta);
         assert!(!delta.full);
         assert_eq!(delta.lanes.len(), 1, "只有变化的 lane");
@@ -1085,13 +1089,13 @@ mod tests {
         builder.force_full();
         assert!(builder.forced_full());
         let mut delta = SceneDelta::empty(header(3, Plan::Full));
-        let full = builder.full_for(Scale::ONE);
+        let full = builder.full_for(DevicePixelRatio::ONE);
         assert!(full, "force_full 必须让 full_for 返回 true");
         builder.collect(&mut scene, &geometry, &[], full, &mut delta);
         assert!(delta.full, "重置后的第一帧必须是 full");
         assert_eq!(delta.lanes.len(), 2, "full 帧必须带全部 lane 内容");
         let mut delta = SceneDelta::empty(header(4, Plan::Idle));
-        let full = builder.full_for(Scale::ONE);
+        let full = builder.full_for(DevicePixelRatio::ONE);
         builder.collect(&mut scene, &geometry, &[], full, &mut delta);
         assert!(!delta.full);
         assert!(delta.lanes.is_empty(), "无变化帧不带 lane");
@@ -1120,11 +1124,11 @@ mod tests {
     #[test]
     fn the_scroll_table_converts_to_physical_offsets() {
         let mut table = ScrollTable::new();
-        let scale = Scale::new(2.0).expect("scale");
+        let scale = DevicePixelRatio::new(2.0).expect("scale");
         let deltas = [ScrollDelta {
             slot: 0,
-            offset: Point::new(0.0, -10.0),
-            viewport: PhysicalRect::new(0, 0, 100, 100),
+            offset: LogicalPoint::new(px(0.0), px(-10.0)),
+            viewport: DeviceRect::new(dp(0), dp(0), dp(100), dp(100)),
         }];
         assert_eq!(table.apply(&deltas, scale), &[0]);
         assert_eq!(
@@ -1141,14 +1145,14 @@ mod tests {
     #[test]
     fn the_scroll_table_carries_the_screen_clip_of_every_slot() {
         let mut table = ScrollTable::new();
-        let viewport = PhysicalRect::new(10, 20, 110, 220);
+        let viewport = DeviceRect::new(dp(10), dp(20), dp(110), dp(220));
         let _ = table.apply(
             &[ScrollDelta {
                 slot: 1,
-                offset: Point::new(0.0, 5.0),
+                offset: LogicalPoint::new(px(0.0), px(5.0)),
                 viewport,
             }],
-            Scale::ONE,
+            DevicePixelRatio::ONE,
         );
         let mut out = Vec::new();
         table.viewports_to_payload(&mut out);
@@ -1167,21 +1171,21 @@ mod tests {
         scene.set_order(&[lane]);
         let geometry = store();
         let mut builder = DeltaBuilder::new();
-        let first_viewport = PhysicalRect::new(0, 0, 64, 64);
+        let first_viewport = DeviceRect::new(dp(0), dp(0), dp(64), dp(64));
         let mut delta = SceneDelta::empty(header(1, Plan::Full));
         builder.collect(
             &mut scene,
             &geometry,
-            &[(Point::new(0.0, 0.0), first_viewport)],
+            &[(LogicalPoint::new(px(0.0), px(0.0)), first_viewport)],
             true,
             &mut delta,
         );
-        let resized = PhysicalRect::new(0, 0, 64, 40);
+        let resized = DeviceRect::new(dp(0), dp(0), dp(64), dp(40));
         let mut delta = SceneDelta::empty(header(2, Plan::Idle));
         builder.collect(
             &mut scene,
             &geometry,
-            &[(Point::new(0.0, 0.0), resized)],
+            &[(LogicalPoint::new(px(0.0), px(0.0)), resized)],
             false,
             &mut delta,
         );
@@ -1192,12 +1196,12 @@ mod tests {
     #[test]
     fn scrolling_down_moves_baked_content_up() {
         let mut table = ScrollTable::new();
-        let scale = Scale::new(1.5).expect("scale");
+        let scale = DevicePixelRatio::new(1.5).expect("scale");
         let _ = table.apply(
             &[ScrollDelta {
                 slot: 1,
-                offset: Point::new(0.0, 1.0),
-                viewport: PhysicalRect::new(0, 0, 10, 10),
+                offset: LogicalPoint::new(px(0.0), px(1.0)),
+                viewport: DeviceRect::new(dp(0), dp(0), dp(10), dp(10)),
             }],
             scale,
         );
@@ -1207,14 +1211,17 @@ mod tests {
 
     #[test]
     fn scroll_damage_is_the_viewport() {
-        let viewport = PhysicalRect::new(4, 5, 60, 65);
+        let viewport = DeviceRect::new(dp(4), dp(5), dp(60), dp(65));
         assert_eq!(scroll_damage(viewport), Some(viewport));
-        assert_eq!(scroll_damage(PhysicalRect::new(4, 5, 4, 65)), None);
+        assert_eq!(
+            scroll_damage(DeviceRect::new(dp(4), dp(5), dp(4), dp(65))),
+            None
+        );
     }
 
     #[test]
     fn scroll_damage_is_merged_into_the_plan() {
-        let viewport = PhysicalRect::new(0, 0, 32, 32);
+        let viewport = DeviceRect::new(dp(0), dp(0), dp(32), dp(32));
         assert_eq!(
             push_scroll_damage(Plan::Idle, &[viewport]),
             Plan::Partial({
@@ -1246,7 +1253,7 @@ mod tests {
                 vertex_stride: 12,
                 index_type: IndexType::U16,
                 topology: Topology::TriangleList,
-                bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
                 pipeline: GeometryPipeline::Ui,
             })
             .expect("注册几何");
@@ -1284,14 +1291,14 @@ mod tests {
         let mut geometry = store();
         let through_geometry = register(&mut geometry);
         let through_path = register(&mut geometry);
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)));
         canvas.push_geometry(GeometryDraw::full(
             through_geometry,
             Transform::IDENTITY,
             Color::WHITE,
         ));
         canvas.push_path(Path {
-            bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
             geometry: through_path,
             fill: Color::WHITE,
         });
@@ -1330,7 +1337,7 @@ mod tests {
         assert!(scene.push(
             lane,
             Primitive::Path(Path {
-                bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)),
                 geometry: id,
                 fill: Color::WHITE,
             })
@@ -1359,7 +1366,7 @@ mod tests {
         let mut geometry = store();
         let first = register(&mut geometry);
         let second = register(&mut geometry);
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(8.0), px(8.0)));
         canvas.push_geometry(GeometryDraw::full(first, Transform::IDENTITY, Color::WHITE));
         canvas.push_geometry(GeometryDraw::full(
             second,
@@ -1377,7 +1384,12 @@ mod tests {
         assert!(scene.clear_lane(lane));
         assert!(scene.push(
             lane,
-            Primitive::Canvas(Arc::new(Canvas::new(Rect::new(0.0, 0.0, 8.0, 8.0))))
+            Primitive::Canvas(Arc::new(Canvas::new(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(8.0),
+                px(8.0)
+            ))))
         ));
         let mut changed = SceneDelta::empty(header(2, Plan::Partial(DamageRects::new())));
         builder.collect(&mut scene, &geometry, &[], false, &mut changed);

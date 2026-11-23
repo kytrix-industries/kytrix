@@ -321,6 +321,7 @@ mod tests {
 
     use super::{App, refresh_styles};
     use crate::{
+        math::px,
         node::builder::NodeBuilder,
         text::{InlineAlign, InlineBoxSpec, TextRun, TextStyle},
         window::WindowOptions,
@@ -341,12 +342,12 @@ mod tests {
         let (_runtime, mut app) = new_app();
         let window = app.create_window(WindowOptions::default());
         let signal = app.signal(SmolStr::new_static("abcdef"));
-        let bold = TextStyle::new(16.0).with_weight(700);
-        let red = TextStyle::new(16.0).with_color(Color::WHITE);
+        let bold = TextStyle::new(px(16.0)).with_weight(700);
+        let red = TextStyle::new(px(16.0)).with_color(Color::WHITE);
         let node = {
             let w = app.window_mut(window).expect("window");
             let root = w.tree().root();
-            NodeBuilder::text("abcdef", TextStyle::new(16.0))
+            NodeBuilder::text("abcdef", TextStyle::new(px(16.0)))
                 .runs([
                     TextRun::new(0..2, bold.clone()),
                     TextRun::new(2..6, red.clone()),
@@ -375,11 +376,11 @@ mod tests {
         let (_runtime, mut app) = new_app();
         let window = app.create_window(WindowOptions::default());
         let signal = app.signal(SmolStr::new_static("abcdef"));
-        let bold = TextStyle::new(16.0).with_weight(700);
+        let bold = TextStyle::new(px(16.0)).with_weight(700);
         let node = {
             let w = app.window_mut(window).expect("window");
             let root = w.tree().root();
-            NodeBuilder::text("abcdef", TextStyle::new(16.0))
+            NodeBuilder::text("abcdef", TextStyle::new(px(16.0)))
                 .runs([TextRun::new(0..2, bold.clone()), TextRun::new(2..6, bold)])
                 .bind_text(move |cx| cx.read(&signal).clone())
                 .build(w.tree_mut(), root)
@@ -416,7 +417,7 @@ mod tests {
         let spec = InlineBoxSpec {
             id: 9,
             index: 2,
-            size: crate::math::Size::new(8.0, 8.0),
+            size: crate::math::LogicalSize::new(px(8.0), px(8.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint: None,
@@ -424,8 +425,11 @@ mod tests {
         let node = {
             let w = app.window_mut(window).expect("window");
             let root = w.tree().root();
-            NodeBuilder::text("a b", TextStyle::new(16.0))
-                .runs([TextRun::new(0..1, TextStyle::new(16.0).with_weight(700))])
+            NodeBuilder::text("a b", TextStyle::new(px(16.0)))
+                .runs([TextRun::new(
+                    0..1,
+                    TextStyle::new(px(16.0)).with_weight(700),
+                )])
                 .inline_boxes([spec])
                 .bind_text(move |cx| cx.read(&signal).clone())
                 .build(w.tree_mut(), root)

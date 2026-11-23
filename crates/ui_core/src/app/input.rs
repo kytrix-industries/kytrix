@@ -13,7 +13,7 @@ use crate::{
         PressRecord, ScrollHandle, drag as drag_util, focus, overlay as overlay_util, scroll,
     },
     layout::hit_test::HitResult,
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::id::NodeId,
     paint::style::Cursor,
     window::{Window, WindowId},
@@ -177,7 +177,7 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
     outcome
 }
 
-pub(crate) fn hit_at(app: &App, window: WindowId, position: Point) -> Option<HitResult> {
+pub(crate) fn hit_at(app: &App, window: WindowId, position: LogicalPoint) -> Option<HitResult> {
     app.windows
         .get(&window)
         .and_then(|target| target.tree().hit_test(position))
@@ -186,7 +186,7 @@ pub(crate) fn hit_at(app: &App, window: WindowId, position: Point) -> Option<Hit
 pub(crate) fn on_pointer_down(
     app: &mut App,
     window: WindowId,
-    position: Point,
+    position: LogicalPoint,
     button: PointerButton,
     modifiers: Modifiers,
     timestamp: Instant,
@@ -260,15 +260,15 @@ pub(crate) fn on_pointer_down(
 pub(crate) fn on_pointer_move(
     app: &mut App,
     window: WindowId,
-    position: Point,
+    position: LogicalPoint,
     modifiers: Modifiers,
     outcome: &mut InputOutcome,
 ) {
     let hit = app.hit_at(window, position);
     outcome.hit = hit;
     let thresholds = app.thresholds;
-    let mut promote: Option<(NodeId, Action, Point)> = None;
-    let mut moved: Option<(NodeId, Action, Point)> = None;
+    let mut promote: Option<(NodeId, Action, LogicalPoint)> = None;
+    let mut moved: Option<(NodeId, Action, LogicalPoint)> = None;
     if let Some(target) = app.windows.get_mut(&window) {
         let pointer = target.pointer_mut();
         pointer.modifiers = modifiers;
@@ -280,7 +280,7 @@ pub(crate) fn on_pointer_move(
         } else if let Some(pending) = pointer.pending_drag.as_ref() {
             let dx = position.x - pending.origin.x;
             let dy = position.y - pending.origin.y;
-            if drag_util::crosses_threshold(Point::new(dx, dy), thresholds.drag_distance) {
+            if drag_util::crosses_threshold(LogicalPoint::new(dx, dy), thresholds.drag_distance) {
                 let pending = pointer.pending_drag.take().expect("刚检查过");
                 pointer.drag = Some(DragSession {
                     node: pending.node,
@@ -290,7 +290,7 @@ pub(crate) fn on_pointer_move(
                     phase: DragPhase::Start,
                 });
                 pointer.capture = Some(pending.node);
-                promote = Some((pending.node, pending.action, Point::new(dx, dy)));
+                promote = Some((pending.node, pending.action, LogicalPoint::new(dx, dy)));
             }
         }
     }
@@ -335,7 +335,7 @@ pub(crate) fn on_pointer_move(
 pub(crate) fn on_pointer_up(
     app: &mut App,
     window: WindowId,
-    position: Point,
+    position: LogicalPoint,
     button: PointerButton,
     modifiers: Modifiers,
     timestamp: Instant,
@@ -393,7 +393,7 @@ pub(crate) fn on_pointer_up(
     let Some(press_node) = press.node else {
         return;
     };
-    let moved = Point::new(position.x - press.position.x, position.y - press.position.y);
+    let moved = LogicalPoint::new(position.x - press.position.x, position.y - press.position.y);
     if drag_util::crosses_threshold(moved, app.thresholds.drag_distance) {
         return;
     }
@@ -449,8 +449,8 @@ pub(crate) fn on_pointer_leave(app: &mut App, window: WindowId, modifiers: Modif
 pub(crate) fn on_scroll(
     app: &mut App,
     window: WindowId,
-    position: Point,
-    delta: Point,
+    position: LogicalPoint,
+    delta: LogicalPoint,
     unit: ScrollUnit,
     phase: ScrollPhase,
     modifiers: Modifiers,
@@ -474,15 +474,20 @@ pub(crate) fn on_scroll(
     } else {
         (delta.x, delta.y)
     };
-    if delta_x == 0.0 && delta_y == 0.0 {
+    if delta_x == LogicalPx::ZERO && delta_y == LogicalPx::ZERO {
         return;
     }
     let direct = unit == ScrollUnit::Pixel || phase.is_continuous();
     let Some(target) = app.windows.get(&window) else {
         return;
     };
-    let mut chain: SmallVec<[(NodeId, crate::interaction::ScrollSlot, crate::math::Size); 8]> =
-        SmallVec::new();
+    let mut chain: SmallVec<
+        [(
+            NodeId,
+            crate::interaction::ScrollSlot,
+            crate::math::LogicalSize,
+        ); 8],
+    > = SmallVec::new();
     let mut cursor = Some(result.node);
     while let Some(current) = cursor {
         if let Some(slot) = target.tree().scroll_slot(current) {
@@ -502,7 +507,7 @@ pub(crate) fn on_scroll(
             crate::interaction::ScrollAxis::Vertical => dy,
             crate::interaction::ScrollAxis::Horizontal => dx,
         };
-        if drives == 0.0 {
+        if drives == LogicalPx::ZERO {
             continue;
         }
         let max = scroll::max_offset(&slot, size);
@@ -518,19 +523,21 @@ pub(crate) fn on_scroll(
             crate::interaction::ScrollAxis::Vertical => (pending.y, max.y),
             crate::interaction::ScrollAxis::Horizontal => (pending.x, max.x),
         };
-        let before = before.clamp(0.0, limit);
+        let before = px(before.value().clamp(0.0, limit.value()));
         let step = if unit == ScrollUnit::Line {
             slot.line_height
         } else {
-            1.0
+            px(1.0)
         };
-        let after = (before - drives * step).clamp(0.0, limit);
-        let consumed = (before - after) / step;
-        if consumed == 0.0 {
+        let after = px((before - step * drives.value())
+            .value()
+            .clamp(0.0, limit.value()));
+        let consumed = px((before - after) / step);
+        if consumed == LogicalPx::ZERO {
             continue;
         }
         let handle = ScrollHandle::new(window, node);
-        let mut goal = Point::new(0.0, 0.0);
+        let mut goal = LogicalPoint::new(px(0.0), px(0.0));
         match slot.axis {
             crate::interaction::ScrollAxis::Vertical => goal.y = after,
             crate::interaction::ScrollAxis::Horizontal => goal.x = after,
@@ -544,7 +551,7 @@ pub(crate) fn on_scroll(
             crate::interaction::ScrollAxis::Vertical => dy -= consumed,
             crate::interaction::ScrollAxis::Horizontal => dx -= consumed,
         }
-        if dx == 0.0 && dy == 0.0 {
+        if dx == LogicalPx::ZERO && dy == LogicalPx::ZERO {
             break;
         }
     }
@@ -707,7 +714,7 @@ fn default_key_scroll(app: &mut App, window: WindowId, code: KeyCode) -> bool {
         return false;
     };
     let handle = ScrollHandle::new(window, node);
-    let mut movement = Point::new(0.0, 0.0);
+    let mut movement = LogicalPoint::new(px(0.0), px(0.0));
     match slot.axis {
         ScrollAxis::Vertical => movement.y = delta,
         ScrollAxis::Horizontal => movement.x = delta,
@@ -719,7 +726,7 @@ pub(crate) fn click_count(
     app: &mut App,
     window: WindowId,
     node: NodeId,
-    position: Point,
+    position: LogicalPoint,
     button: PointerButton,
     timestamp: Instant,
 ) -> u8 {

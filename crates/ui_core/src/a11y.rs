@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 
 use crate::{
-    math::{PhysicalRect, Point},
+    math::{DeviceRect, LogicalPoint, LogicalPx},
     node::id::NodeId,
     window::WindowId,
 };
@@ -134,10 +134,10 @@ pub struct A11yCustomAction {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct A11yScroll {
-    pub x: f32,
-    pub y: f32,
-    pub x_max: f32,
-    pub y_max: f32,
+    pub x: LogicalPx,
+    pub y: LogicalPx,
+    pub x_max: LogicalPx,
+    pub y_max: LogicalPx,
     pub vertical: bool,
 }
 
@@ -299,7 +299,7 @@ pub struct A11yNode {
     pub label: Option<A11yLabel>,
     pub value: Option<SmolStr>,
     pub description: Option<SmolStr>,
-    pub bounds: PhysicalRect,
+    pub bounds: DeviceRect,
     pub actions: Vec<A11yAction>,
     pub hidden: bool,
     pub disabled: bool,
@@ -492,7 +492,7 @@ pub enum A11yActionData<'a> {
         anchor: A11yTextPosition,
         focus: A11yTextPosition,
     },
-    ScrollOffset(Point),
+    ScrollOffset(LogicalPoint),
     NumericValue(f64),
     Custom(i32),
 }

@@ -6,7 +6,7 @@ use windows::Win32::UI::{
 
 use crate::{
     event::{ImeEvent, KeyCode, KeyState, Modifiers, PointerButton},
-    math::Scale,
+    math::DevicePixelRatio,
     platform::windows::ime::ImeState,
 };
 
@@ -60,14 +60,14 @@ pub(crate) enum PlatformEvent {
 pub(crate) struct StampedEvent {
     pub event: PlatformEvent,
     pub ticks_ms: u32,
-    pub scale: Scale,
+    pub scale: DevicePixelRatio,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MessageContext {
     pub ticks_ms: u32,
     pub wheel_lines: f32,
-    pub scale: Scale,
+    pub scale: DevicePixelRatio,
 }
 
 #[derive(Debug, Default)]
@@ -520,7 +520,7 @@ mod tests {
     };
     use crate::{
         event::{KeyCode, KeyState, Modifiers, PointerButton},
-        math::Scale,
+        math::DevicePixelRatio,
     };
 
     fn key_lparam(scancode: u16, extended: bool, previous_down: bool) -> isize {
@@ -542,7 +542,7 @@ mod tests {
         MessageContext {
             ticks_ms: 1_000,
             wheel_lines: 3.0,
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
         }
     }
 
@@ -561,7 +561,7 @@ mod tests {
             MessageContext {
                 ticks_ms: 4_321,
                 wheel_lines: 3.0,
-                scale: Scale::ONE,
+                scale: DevicePixelRatio::ONE,
             },
             &mut state,
         )

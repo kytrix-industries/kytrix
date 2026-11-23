@@ -2,7 +2,7 @@ pub mod hit_test;
 pub(crate) mod measure;
 pub(crate) mod taffy_tree;
 
-use crate::math::{Rect, Size};
+use crate::math::{LogicalRect, LogicalSize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Axis {
@@ -11,16 +11,16 @@ pub enum Axis {
 }
 
 pub type MeasureFn =
-    Box<dyn Fn(taffy::Size<Option<f32>>, taffy::Size<taffy::AvailableSpace>) -> Size>;
+    Box<dyn Fn(taffy::Size<Option<f32>>, taffy::Size<taffy::AvailableSpace>) -> LogicalSize>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LayoutOverride {
-    pub rect: Rect,
+    pub rect: LogicalRect,
 }
 
 impl LayoutOverride {
     #[must_use]
-    pub const fn new(rect: Rect) -> Self {
+    pub const fn new(rect: LogicalRect) -> Self {
         Self { rect }
     }
 }

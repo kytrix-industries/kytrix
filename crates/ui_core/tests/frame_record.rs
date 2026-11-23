@@ -1,5 +1,5 @@
 use ui_core::{
-    math::{Rect, Scale},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{
         canvas::Canvas,
@@ -18,14 +18,17 @@ use ui_core::{
     window::FrameOutcome,
 };
 
-const LABEL: Rect = Rect::new(10.0, 10.0, 40.0, 16.0);
+const LABEL: LogicalRect = LogicalRect::from_origin_size(
+    LogicalPoint::new(px(10.0), px(10.0)),
+    LogicalSize::new(px(40.0), px(16.0)),
+);
 
 #[test]
 fn text_frame_records_glyph_run_instances() {
     let mut app = TestApp::new();
     let window = app.window_id();
     let root = app.app().window(window).expect("窗口存在").tree().root();
-    let _text = NodeBuilder::text("Kytrix", TextStyle::new(12.0))
+    let _text = NodeBuilder::text("Kytrix", TextStyle::new(px(12.0)))
         .layout_override(LABEL)
         .id("label")
         .build(app.app_mut().window_mut(window).unwrap().tree_mut(), root)
@@ -56,10 +59,10 @@ fn canvas_frame_flattens_primitives() {
     let window = app.window_id();
     let root = app.app().window(window).expect("窗口存在").tree().root();
 
-    let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 20.0));
+    let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
     canvas.push_quad(Quad {
-        bounds: Rect::new(0.0, 0.0, 20.0, 10.0),
-        corner_radius: [0.0; 4],
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(20.0), px(10.0)),
+        corner_radius: [px(0.0); 4],
         paint: QuadPaint::Solid {
             fill: Color::WHITE,
             border: None,
@@ -124,7 +127,7 @@ fn damage_is_local_and_idle_is_zero_frame() {
             .paint(PaintSpec {
                 background: Color::WHITE,
                 border: Some(Border {
-                    width: 1.0,
+                    width: px(1.0),
                     color: Color::BLACK,
                 }),
                 ..PaintSpec::default()
@@ -139,7 +142,7 @@ fn damage_is_local_and_idle_is_zero_frame() {
     };
 
     let static_node = NodeBuilder::boxed()
-        .layout_override(Rect::new(200.0, 10.0, 40.0, 16.0))
+        .layout_override(LogicalRect::new(px(200.0), px(10.0), px(40.0), px(16.0)))
         .paint(PaintSpec {
             background: Color::WHITE,
             ..PaintSpec::default()
@@ -164,9 +167,9 @@ fn damage_is_local_and_idle_is_zero_frame() {
     let first_index = report.frame(0).record.frame_index;
 
     report.assert_rendered(1);
-    let frame_area = Rect::new(0.0, 0.0, 800.0, 600.0)
-        .to_physical_covering(Scale::new(1.0).expect("scale"))
-        .area();
+    let scale = DevicePixelRatio::new(1.0).expect("scale");
+    let window_rect = LogicalRect::new(px(0.0), px(0.0), px(800.0), px(600.0));
+    let frame_area = scale.to_covering_device_rect(window_rect).area();
     let damage = &report.frame(1).record.damage;
     assert!(
         damage.iter().all(|rect| rect.area() < frame_area / 50),
@@ -265,11 +268,11 @@ fn incremental_frame_keeps_the_delta_order_fast_path() {
     for index in 0..64 {
         static_nodes.push(
             NodeBuilder::boxed()
-                .layout_override(Rect::new(
-                    (index % 8) as f32 * 40.0,
-                    (index / 8) as f32 * 20.0 + 40.0,
-                    32.0,
-                    16.0,
+                .layout_override(LogicalRect::new(
+                    px((index % 8) as f32 * 40.0),
+                    px((index / 8) as f32 * 20.0 + 40.0),
+                    px(32.0),
+                    px(16.0),
                 ))
                 .paint(PaintSpec {
                     background: Color::WHITE,

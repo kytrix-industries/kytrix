@@ -1,6 +1,7 @@
 use super::raster::{FontKey, GlyphRasterizer};
 use crate::{
     error::EngineError,
+    math::DevicePx,
     paint::atlas::{AtlasKind, AtlasTile},
     render::{Allocation, AtlasAllocator},
 };
@@ -172,8 +173,8 @@ impl GlyphAtlas {
             return Ok(None);
         };
         debug_assert_eq!(allocation.tile.atlas, AtlasKind::Glyph);
-        debug_assert_eq!(allocation.content.width() as u32, width);
-        debug_assert_eq!(allocation.content.height() as u32, height);
+        debug_assert_eq!(allocation.content.width().value() as u32, width);
+        debug_assert_eq!(allocation.content.height().value() as u32, height);
         debug_assert!(allocation.padded.width() >= allocation.content.width());
         let record = GlyphRecord {
             tile: allocation.tile,
@@ -182,8 +183,8 @@ impl GlyphAtlas {
             width,
             height,
             origin: (
-                allocation.content.x0.max(0) as u32,
-                allocation.content.y0.max(0) as u32,
+                allocation.content.x0.max(DevicePx::ZERO).value() as u32,
+                allocation.content.y0.max(DevicePx::ZERO).value() as u32,
             ),
             data: image.data.into_boxed_slice(),
             color: image.color,
@@ -280,8 +281,16 @@ impl GlyphAtlas {
             let record_y0 = record.origin.1;
             let record_y1 = record_y0 + record.height;
             for rect in rects.rects() {
-                let start = rect.y0.max(record_y0 as i32).min(record_y1 as i32);
-                let end = rect.y1.max(record_y0 as i32).min(record_y1 as i32);
+                let start = rect
+                    .y0
+                    .max(DevicePx::new(record_y0 as i32))
+                    .value()
+                    .min(record_y1 as i32);
+                let end = rect
+                    .y1
+                    .max(DevicePx::new(record_y0 as i32))
+                    .value()
+                    .min(record_y1 as i32);
                 if start < end {
                     write_record_rows(
                         page,

@@ -516,12 +516,12 @@ fn present_rects(dirty: &DamageRects) -> Vec<vk::RectLayerKHR> {
         .iter()
         .map(|rect| vk::RectLayerKHR {
             offset: vk::Offset2D {
-                x: rect.x0.max(0),
-                y: rect.y0.max(0),
+                x: rect.x0.value().max(0),
+                y: rect.y0.value().max(0),
             },
             extent: vk::Extent2D {
-                width: rect.width().max(0) as u32,
-                height: rect.height().max(0) as u32,
+                width: rect.width().value().max(0) as u32,
+                height: rect.height().value().max(0) as u32,
             },
             layer: 0,
         })
@@ -533,7 +533,10 @@ mod tests {
     use ash::vk;
 
     use super::{CreateFailure, LiveSwapchains, recoverable_create_failure};
-    use crate::{math::PhysicalRect, render::compositor::DamageRects};
+    use crate::{
+        math::{DeviceRect, dp},
+        render::compositor::DamageRects,
+    };
 
     #[test]
     fn create_failures_classify_recoverable_wsi_state_and_leave_the_rest_to_the_shared_gpu() {
@@ -589,8 +592,8 @@ mod tests {
     #[test]
     fn present_rects_mirror_the_copied_rectangles() {
         let mut dirty = DamageRects::new();
-        assert!(dirty.push(PhysicalRect::new(4, 8, 12, 16)));
-        assert!(dirty.push(PhysicalRect::new(0, 0, 1, 1)));
+        assert!(dirty.push(DeviceRect::new(dp(4), dp(8), dp(12), dp(16))));
+        assert!(dirty.push(DeviceRect::new(dp(0), dp(0), dp(1), dp(1))));
         let rects = super::present_rects(&dirty);
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[0].offset, ash::vk::Offset2D { x: 4, y: 8 });
@@ -610,7 +613,7 @@ mod tests {
             }
         );
         let mut out_of_bounds = DamageRects::new();
-        assert!(out_of_bounds.push(PhysicalRect::new(-3, -2, 1, 1)));
+        assert!(out_of_bounds.push(DeviceRect::new(dp(-3), dp(-2), dp(1), dp(1))));
         let clamped = out_of_bounds.clamped(64, 64);
         let rects = super::present_rects(&clamped);
         assert_eq!(rects.len(), 1);

@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{
     error::EngineError,
-    math::Size,
+    math::{DevicePoint, DeviceRect, LogicalSize, dp},
     paint::{atlas::AtlasKind, instance::FrameOp},
     platform::linux::dpi,
     render::{
@@ -1208,12 +1208,12 @@ impl GpuRenderer {
                     for rect in clamped.as_slice() {
                         let scissor = vk::Rect2D {
                             offset: vk::Offset2D {
-                                x: rect.x0,
-                                y: rect.y0,
+                                x: rect.x0.value(),
+                                y: rect.y0.value(),
                             },
                             extent: vk::Extent2D {
-                                width: rect.width() as u32,
-                                height: rect.height() as u32,
+                                width: rect.width().value() as u32,
+                                height: rect.height().value() as u32,
                             },
                         };
                         unsafe {
@@ -1226,7 +1226,12 @@ impl GpuRenderer {
                             &mut self.geometry,
                             payload,
                             root,
-                            [rect.x0, rect.y0, rect.x1, rect.y1],
+                            [
+                                rect.x0.value(),
+                                rect.y0.value(),
+                                rect.x1.value(),
+                                rect.y1.value(),
+                            ],
                         )?);
                     }
                 }
@@ -1267,10 +1272,10 @@ impl GpuRenderer {
                 .iter()
                 .map(|rect| {
                     image_copy(
-                        rect.x0 as u32,
-                        rect.y0 as u32,
-                        rect.width() as u32,
-                        rect.height() as u32,
+                        rect.x0.value() as u32,
+                        rect.y0.value() as u32,
+                        rect.width().value() as u32,
+                        rect.height().value() as u32,
                     )
                 })
                 .collect(),
@@ -1751,6 +1756,14 @@ fn scissor_rect(rect: [i32; 4]) -> vk::Rect2D {
     }
 }
 
+fn scrolled_bounds(op: FrameOp, scroll: &[[f32; 2]]) -> DeviceRect {
+    let offset = crate::paint::instance::scroll_offset(scroll, op);
+    op.bounds().translate(DevicePoint::new(
+        dp(offset[0].round() as i32),
+        dp(offset[1].round() as i32),
+    ))
+}
+
 fn draw_ops(
     shared: &SharedGpu,
     command: vk::CommandBuffer,
@@ -1761,12 +1774,14 @@ fn draw_ops(
     scissor: [i32; 4],
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
+    let scissor_bounds = DeviceRect::from_edges(
+        dp(scissor[0]),
+        dp(scissor[1]),
+        dp(scissor[2]),
+        dp(scissor[3]),
+    );
     for op in payload.ops() {
-        if !op
-            .bounds()
-            .translated(crate::paint::instance::scroll_offset(payload.scroll(), *op))
-            .intersects(scissor)
-        {
+        if !scrolled_bounds(*op, payload.scroll()).overlaps_inclusive(scissor_bounds) {
             continue;
         }
         match *op {
@@ -1998,7 +2013,7 @@ fn image_copy(x: u32, y: u32, width: u32, height: u32) -> vk::ImageCopy {
         })
 }
 
-fn destination_update(last: Option<(i32, i32)>, surface_local: Size) -> Option<(i32, i32)> {
+fn destination_update(last: Option<(i32, i32)>, surface_local: LogicalSize) -> Option<(i32, i32)> {
     let destination = dpi::viewport_destination(surface_local);
     (last != Some(destination)).then_some(destination)
 }
@@ -2015,7 +2030,7 @@ mod tests {
         plan_swapchain_copy,
     };
     use crate::{
-        math::{PhysicalRect, Size},
+        math::{DeviceRect, LogicalSize},
         paint::atlas::AtlasKind,
         render::{
             DirtyRects,
@@ -2027,7 +2042,7 @@ mod tests {
         window::FrameIndex,
     };
 
-    fn rects(list: &[PhysicalRect]) -> DamageRects {
+    fn rects(list: &[DeviceRect]) -> DamageRects {
         let mut rects = DamageRects::new();
         for rect in list {
             assert!(rects.push(*rect));
@@ -2041,7 +2056,7 @@ mod tests {
             width: 64,
             height: 64,
         };
-        let region = rects(&[PhysicalRect::new(4, 8, 12, 16)]);
+        let region = rects(&[DeviceRect::new(dp(4), dp(8), dp(12), dp(16))]);
         let full = plan_swapchain_copy(CopyPlan::Full, extent, Some(region));
         assert_eq!(full.step, ImageSyncStep::Full);
         assert_eq!(full.hint, None, "整面拷贝不挂 region（整面语义）");
@@ -2060,8 +2075,8 @@ mod tests {
             width: 32,
             height: 32,
         };
-        let outside = rects(&[PhysicalRect::new(40, 0, 60, 20)]);
-        let previous = rects(&[PhysicalRect::new(0, 0, 8, 8)]);
+        let outside = rects(&[DeviceRect::new(dp(40), dp(0), dp(60), dp(20))]);
+        let previous = rects(&[DeviceRect::new(dp(0), dp(0), dp(8), dp(8))]);
         let step = plan_swapchain_copy(CopyPlan::Regions(outside), extent, Some(previous));
         assert_eq!(step.step, ImageSyncStep::Nothing, "没有像素要搬，不碰布局");
         assert_eq!(
@@ -2072,8 +2087,8 @@ mod tests {
         let step = plan_swapchain_copy(CopyPlan::Regions(outside), extent, None);
         assert_eq!(step.step, ImageSyncStep::Nothing);
         assert_eq!(step.hint, None);
-        let straddling = rects(&[PhysicalRect::new(28, 0, 40, 8)]);
-        let clamped = rects(&[PhysicalRect::new(28, 0, 32, 8)]);
+        let straddling = rects(&[DeviceRect::new(dp(28), dp(0), dp(40), dp(8))]);
+        let clamped = rects(&[DeviceRect::new(dp(28), dp(0), dp(32), dp(8))]);
         let step = plan_swapchain_copy(CopyPlan::Regions(straddling), extent, None);
         assert_eq!(step.step, ImageSyncStep::Rects(clamped));
         assert_eq!(step.hint, Some(clamped));
@@ -2476,16 +2491,16 @@ mod tests {
     #[test]
     fn a_destination_is_written_only_when_it_changes() {
         assert_eq!(
-            destination_update(None, Size::new(800.0, 600.0)),
+            destination_update(None, LogicalSize::new(px(800.0), px(600.0))),
             Some((800, 600))
         );
         assert_eq!(
-            destination_update(Some((800, 600)), Size::new(800.0, 600.0)),
+            destination_update(Some((800, 600)), LogicalSize::new(px(800.0), px(600.0))),
             None,
             "逻辑尺寸没变就不下发"
         );
         assert_eq!(
-            destination_update(Some((800, 600)), Size::new(701.0, 501.0)),
+            destination_update(Some((800, 600)), LogicalSize::new(px(701.0), px(501.0))),
             Some((701, 501))
         );
     }
@@ -2493,16 +2508,16 @@ mod tests {
     #[test]
     fn the_destination_is_the_logical_size_rounded_up() {
         assert_eq!(
-            destination_update(None, Size::new(701.0, 501.0)),
+            destination_update(None, LogicalSize::new(px(701.0), px(501.0))),
             Some((701, 501))
         );
         assert_eq!(
-            destination_update(None, Size::new(700.2, 500.8)),
+            destination_update(None, LogicalSize::new(px(700.2), px(500.8))),
             Some((701, 501)),
             "小数逻辑尺寸向上取整，否则最右 / 最下 1 px 被裁掉"
         );
         assert_eq!(
-            destination_update(None, Size::new(0.0, 0.0)),
+            destination_update(None, LogicalSize::new(px(0.0), px(0.0))),
             Some((1, 1)),
             "退化尺寸至少 1 px"
         );
@@ -2577,7 +2592,7 @@ mod tests {
     #[test]
     fn two_renderers_render_concurrently_on_one_shared_gpu() {
         use crate::{
-            math::{Rect, Scale},
+            math::{DevicePixelRatio, LogicalRect, px},
             paint::{
                 color::{Color, ColorResolver},
                 instance::InstanceEncoder,
@@ -2592,8 +2607,8 @@ mod tests {
             assert!(scene.push(
                 lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::new(2.0, 2.0, 2.0, 2.0),
-                    corner_radius: [0.0; 4],
+                    bounds: LogicalRect::new(px(2.0), px(2.0), px(2.0), px(2.0)),
+                    corner_radius: [px(0.0); 4],
                     paint: QuadPaint::Solid {
                         fill: Color::srgb(1.0, 0.0, 0.0, 1.0),
                         border: None,
@@ -2637,7 +2652,7 @@ mod tests {
                 let buffer = encoder
                     .encode(
                         &scene,
-                        Scale::ONE,
+                        DevicePixelRatio::ONE,
                         ColorResolver,
                         &crate::paint::geometry_store::GeometryStore::new(),
                     )

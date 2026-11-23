@@ -2,7 +2,7 @@ use crate::{
     app::App,
     error::EngineError,
     interaction::{ScrollConfig, ScrollHandle},
-    math::{Point, Rect, Size, Transform},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         atlas::AtlasKind,
@@ -98,10 +98,10 @@ impl Load {
                 .tree_mut();
             let book_viewport = NodeBuilder::boxed()
                 .style(viewport_style(
-                    0.0,
-                    0.0,
-                    scale.book_rows as f32 * Scale::CELL_WIDTH,
-                    Scale::BOOK_VIEWPORT_HEIGHT,
+                    px(0.0),
+                    px(0.0),
+                    px(scale.book_rows as f32 * Scale::CELL_WIDTH),
+                    px(Scale::BOOK_VIEWPORT_HEIGHT),
                 ))
                 .build(tree, root)
                 .expect("盘口视口");
@@ -109,11 +109,11 @@ impl Load {
                 for column in 0..Scale::COLUMNS {
                     let source = *signal;
                     let _ = NodeBuilder::text(text(value(row, column, 0), column), cell_style())
-                        .layout_override(Rect::new(
-                            column as f32 * Scale::CELL_WIDTH,
-                            row as f32 * Scale::ROW_HEIGHT,
-                            Scale::CELL_WIDTH - 2.0,
-                            Scale::ROW_HEIGHT - 1.0,
+                        .layout_override(LogicalRect::new(
+                            px(column as f32 * Scale::CELL_WIDTH),
+                            px(row as f32 * Scale::ROW_HEIGHT),
+                            px(Scale::CELL_WIDTH - 2.0),
+                            px(Scale::ROW_HEIGHT - 1.0),
                         ))
                         .bind_text(move |cx| {
                             let row = cx.read(&source);
@@ -125,10 +125,10 @@ impl Load {
             }
             let tape_viewport = NodeBuilder::boxed()
                 .style(viewport_style(
-                    0.0,
-                    Scale::BOOK_VIEWPORT_HEIGHT + 8.0,
-                    scale.trade_rows as f32 * Scale::CELL_WIDTH,
-                    Scale::TAPE_VIEWPORT_HEIGHT,
+                    px(0.0),
+                    px(Scale::BOOK_VIEWPORT_HEIGHT + 8.0),
+                    px(scale.trade_rows as f32 * Scale::CELL_WIDTH),
+                    px(Scale::TAPE_VIEWPORT_HEIGHT),
                 ))
                 .build(tree, root)
                 .expect("成交视口");
@@ -136,11 +136,11 @@ impl Load {
                 for column in 0..Scale::TRADE_COLUMNS {
                     let source = *signal;
                     let _ = NodeBuilder::text(trade_text(row as u32, column), cell_style())
-                        .layout_override(Rect::new(
-                            column as f32 * Scale::CELL_WIDTH,
-                            row as f32 * Scale::ROW_HEIGHT,
-                            Scale::CELL_WIDTH - 2.0,
-                            Scale::ROW_HEIGHT - 1.0,
+                        .layout_override(LogicalRect::new(
+                            px(column as f32 * Scale::CELL_WIDTH),
+                            px(row as f32 * Scale::ROW_HEIGHT),
+                            px(Scale::CELL_WIDTH - 2.0),
+                            px(Scale::ROW_HEIGHT - 1.0),
                         ))
                         .bind_text(move |cx| trade_text(*cx.read(&source), column))
                         .build(tree, tape_viewport)
@@ -148,15 +148,15 @@ impl Load {
                 }
             }
             let _ = NodeBuilder::text("acceptance", cell_style())
-                .layout_override(Rect::new(0.0, 0.0, 200.0, 20.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(200.0), px(20.0)))
                 .build(tree, root)
                 .expect("固定头部");
             let chart = NodeBuilder::geometry(geometry)
-                .layout_override(Rect::new(0.0, 0.0, 320.0, 200.0))
+                .layout_override(LogicalRect::new(px(0.0), px(0.0), px(320.0), px(200.0)))
                 .build(tree, root)
                 .expect("折线节点");
             let heatmap = NodeBuilder::geometry(heatmap_geometry)
-                .layout_override(Rect::new(328.0, 0.0, 256.0, 256.0))
+                .layout_override(LogicalRect::new(px(328.0), px(0.0), px(256.0), px(256.0)))
                 .build(tree, root)
                 .expect("热力图节点");
             (book_viewport, tape_viewport, chart, heatmap)
@@ -165,17 +165,17 @@ impl Load {
         let book_scroll = app.make_scroll(window, book_viewport, ScrollConfig::default())?;
         app.set_scroll_content(
             &book_scroll,
-            Size::new(
-                scale.book_rows as f32 * Scale::CELL_WIDTH,
-                scale.book_rows as f32 * Scale::ROW_HEIGHT,
+            LogicalSize::new(
+                px(scale.book_rows as f32 * Scale::CELL_WIDTH),
+                px(scale.book_rows as f32 * Scale::ROW_HEIGHT),
             ),
         )?;
         let tape_scroll = app.make_scroll(window, tape_viewport, ScrollConfig::default())?;
         app.set_scroll_content(
             &tape_scroll,
-            Size::new(
-                scale.trade_rows as f32 * Scale::CELL_WIDTH,
-                scale.trade_rows as f32 * Scale::ROW_HEIGHT,
+            LogicalSize::new(
+                px(scale.trade_rows as f32 * Scale::CELL_WIDTH),
+                px(scale.trade_rows as f32 * Scale::ROW_HEIGHT),
             ),
         )?;
 
@@ -295,13 +295,16 @@ impl Load {
         let content = self.trade_rows.len() as f32 * Scale::ROW_HEIGHT;
         let max = (content - Scale::TAPE_VIEWPORT_HEIGHT).max(Scale::ROW_HEIGHT);
         let offset = (self.step as f32 * Scale::ROW_HEIGHT) % max;
-        let _ = app.scroll_to(&self.tape_scroll, Point::new(0.0, offset));
+        let _ = app.scroll_to(&self.tape_scroll, LogicalPoint::new(px(0.0), px(offset)));
     }
 
     fn pan_chart(&mut self, app: &mut App) {
         let pan = (self.step % 16) as f32 * 0.5;
-        let _ =
-            app.set_geometry_transform(self.window, self.chart, Transform::translate(-pan, 0.0));
+        let _ = app.set_geometry_transform(
+            self.window,
+            self.chart,
+            Transform::translate(px(-pan), px(0.0)),
+        );
     }
 }
 
@@ -353,13 +356,13 @@ fn cell_style() -> TextStyle {
     const FAMILY: &str = "Menlo";
     #[cfg(target_os = "linux")]
     const FAMILY: &str = "DejaVu Sans Mono";
-    TextStyle::new(11.0)
+    TextStyle::new(px(11.0))
         .with_family(FAMILY)
         .with_color(Color::WHITE)
         .with_wrap(TextWrap::NoWrap)
 }
 
-fn viewport_style(left: f32, top: f32, width: f32, height: f32) -> Style {
+fn viewport_style(left: LogicalPx, top: LogicalPx, width: LogicalPx, height: LogicalPx) -> Style {
     let mut style = StyleBuilder::new()
         .absolute()
         .left(left)
@@ -396,7 +399,7 @@ fn register_chart(app: &mut App, points: usize) -> Result<GeometryId, EngineErro
         vertex_stride: CHART_VERTEX_BYTES as u32,
         index_type: IndexType::U32,
         topology: Topology::TriangleList,
-        bounds: Rect::new(0.0, 0.0, 320.0, 200.0),
+        bounds: LogicalRect::new(px(0.0), px(0.0), px(320.0), px(200.0)),
         pipeline: GeometryPipeline::Ui,
     })
 }
@@ -430,7 +433,7 @@ fn register_heatmap(app: &mut App) -> Result<GeometryId, EngineError> {
         vertex_stride: HEATMAP_VERTEX_BYTES as u32,
         index_type: IndexType::U16,
         topology: Topology::TriangleList,
-        bounds: Rect::new(328.0, 0.0, 256.0, 256.0),
+        bounds: LogicalRect::new(px(328.0), px(0.0), px(256.0), px(256.0)),
         pipeline: GeometryPipeline::Textured {
             atlas: AtlasKind::Image,
         },
@@ -442,7 +445,7 @@ mod tests {
     use super::{Load, Scale, chart_chunk_lanes};
     use crate::{
         app::App,
-        math::{Scale as DpiScale, Size},
+        math::{DevicePixelRatio, LogicalSize, px},
         test_support::record::FrameStats,
         window::{FrameOutcome, WindowOptions},
     };
@@ -455,8 +458,8 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("acceptance-fixture"),
-            size: Size::new(640.0, 480.0),
-            scale: DpiScale::ONE,
+            size: LogicalSize::new(px(640.0), px(480.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let load = Load::build(&mut app, window, Scale::MINI).expect("缩比负载");

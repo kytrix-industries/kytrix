@@ -9,7 +9,7 @@ use crate::paint::style::Style;
 use crate::{
     error::EngineError,
     interaction::{NodeInteraction, OverlaySlot, ScrollSlot, VirtualSlot},
-    math::{PhysicalRect, Point, Rect, Size, Transform},
+    math::{DeviceRect, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, Transform, px},
     node::{dependency::ReadCtx, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::{geometry::GeometryId, scene::LaneId, style::StylePatch},
     text::{ShapedLine, TextContent, shape::ShapedText},
@@ -151,7 +151,7 @@ pub(crate) fn set_text_shaped(
     shaped: Rc<crate::text::shape::ShapedText>,
     key: crate::text::cache::ShapeKey,
     scale_epoch: u32,
-    measured: Size,
+    measured: LogicalSize,
     size_changed: bool,
 ) -> bool {
     let Some(target) = tree.arena.get_mut(node) else {
@@ -205,14 +205,14 @@ pub(crate) fn install_text_line_for_test(
     node: NodeId,
     content: &TextContent,
     line: Rc<ShapedLine>,
-    width: f32,
+    width: LogicalPx,
 ) -> bool {
     let shaped = Rc::new(crate::text::shape::ShapedText::blank_for_text_test(
         content.text.clone(),
         content.style.clone(),
     ));
     let key = crate::text::cache::ShapeKey::new(content, 1);
-    let _ = set_text_shaped(tree, node, shaped, key, 1, Size::ZERO, false);
+    let _ = set_text_shaped(tree, node, shaped, key, 1, LogicalSize::ZERO, false);
     set_text_line(tree, node, line, width, 0)
 }
 
@@ -220,7 +220,7 @@ pub(crate) fn set_text_line(
     tree: &mut NodeTree,
     node: NodeId,
     line: Rc<ShapedLine>,
-    width: f32,
+    width: LogicalPx,
     generation: u32,
 ) -> bool {
     let index = node.index() as usize;
@@ -228,16 +228,16 @@ pub(crate) fn set_text_line(
         return false;
     };
     slot.line = Some(line);
-    slot.laid_width_bits = width.to_bits();
+    slot.laid_width_bits = width.value().to_bits();
     slot.laid_generation = generation;
     tree.mark_paint(node);
     true
 }
 
-pub(crate) fn text_content_width(tree: &NodeTree, node: NodeId) -> f32 {
+pub(crate) fn text_content_width(tree: &NodeTree, node: NodeId) -> LogicalPx {
     tree.arena
         .get(node)
-        .map_or(0.0, |target| target.text_content_width)
+        .map_or(LogicalPx::ZERO, |target| target.text_content_width)
 }
 
 pub(crate) fn text_line(tree: &NodeTree, node: NodeId) -> Option<&Rc<ShapedLine>> {
@@ -247,7 +247,7 @@ pub(crate) fn text_line(tree: &NodeTree, node: NodeId) -> Option<&Rc<ShapedLine>
         .and_then(TextSlot::line)
 }
 
-pub(crate) fn text_measured_size(tree: &NodeTree, node: NodeId) -> Option<Size> {
+pub(crate) fn text_measured_size(tree: &NodeTree, node: NodeId) -> Option<LogicalSize> {
     tree.arena.get(node).map(|target| target.text_measured_size)
 }
 
@@ -262,7 +262,7 @@ pub(crate) fn text_selection_rects(
     node: NodeId,
     anchor: usize,
     focus: usize,
-) -> Result<Vec<Rect>, EngineError> {
+) -> Result<Vec<LogicalRect>, EngineError> {
     let Some(target) = tree.arena.get(node) else {
         return Err(EngineError::StaleNode { node });
     };
@@ -290,7 +290,7 @@ pub(crate) fn text_caret_rect(
     tree: &NodeTree,
     node: NodeId,
     byte_index: usize,
-) -> Result<Rect, EngineError> {
+) -> Result<LogicalRect, EngineError> {
     let Some(target) = tree.arena.get(node) else {
         return Err(EngineError::StaleNode { node });
     };
@@ -335,7 +335,7 @@ pub(crate) fn text_caret_rect(
         });
     }
     let expected_width = expected_layout_width(tree, shaped, node);
-    if slot.laid_width_bits() != expected_width.to_bits() {
+    if slot.laid_width_bits() != expected_width.value().to_bits() {
         return Err(EngineError::TextShape {
             node,
             detail: SmolStr::new_static(
@@ -345,20 +345,20 @@ pub(crate) fn text_caret_rect(
     }
 
     let mut rect = shaped.caret_rect(expected_width, content.style.alignment, byte_index);
-    if rect.size.width <= 0.0 {
-        rect.size.width = 1.0;
+    if rect.size.width <= LogicalPx::ZERO {
+        rect.size.width = px(1.0);
     }
-    if rect.size.height <= 0.0 {
-        let style_size = content.style.size.max(1.0);
+    if rect.size.height <= LogicalPx::ZERO {
+        let style_size = content.style.size.max(px(1.0));
         let line_height = content.style.line_height.unwrap_or(1.0).max(0.0);
-        rect.size.height = (style_size * line_height).max(1.0);
+        rect.size.height = (style_size * line_height).max(px(1.0));
     }
     Ok(rect)
 }
 
-fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> f32 {
+fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> LogicalPx {
     let width = tree.text_content_width(node);
-    if width > 0.0 {
+    if width > LogicalPx::ZERO {
         width
     } else {
         shaped.max_content_size().width
@@ -368,7 +368,7 @@ fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> 
 pub(crate) fn text_byte_index_at(
     tree: &NodeTree,
     node: NodeId,
-    local_point: Point,
+    local_point: LogicalPoint,
 ) -> Result<usize, EngineError> {
     let Some(target) = tree.arena.get(node) else {
         return Err(EngineError::StaleNode { node });
@@ -391,7 +391,7 @@ pub(crate) fn text_byte_index_at(
         return Err(EngineError::StaleNode { node });
     }
     let width = expected_layout_width(tree, shaped, node);
-    if slot.laid_width_bits() != width.to_bits() {
+    if slot.laid_width_bits() != width.value().to_bits() {
         return Err(EngineError::StaleNode { node });
     }
     Ok(shaped.byte_index_at(width, content.style.alignment, local_point))
@@ -473,7 +473,7 @@ pub(crate) fn set_geometry_transform(
     tree: &mut NodeTree,
     node: NodeId,
     transform: Transform,
-    extra_damage: Rect,
+    extra_damage: LogicalRect,
 ) -> Result<(), EngineError> {
     match tree.arena.get(node).map(|target| target.kind()) {
         Some(NodeKind::Geometry(_)) => {}
@@ -491,10 +491,10 @@ pub(crate) fn set_geometry_transform(
     Ok(())
 }
 
-pub(crate) fn content_offset(tree: &NodeTree, node: NodeId) -> Point {
+pub(crate) fn content_offset(tree: &NodeTree, node: NodeId) -> LogicalPoint {
     tree.arena
         .get(node)
-        .map_or(Point::ZERO, |target| target.content_offset)
+        .map_or(LogicalPoint::ZERO, |target| target.content_offset)
 }
 
 pub(crate) fn lane_of(tree: &NodeTree, node: NodeId) -> Option<LaneId> {
@@ -552,7 +552,7 @@ pub(crate) fn resize_baked_geometry_chunks(tree: &mut NodeTree, node: NodeId, le
         len,
         BakedGeometryChunk {
             revision: 0,
-            bounds: Rect::default(),
+            bounds: LogicalRect::default(),
         },
     );
 }
@@ -608,13 +608,13 @@ pub(crate) fn unbind_geometry_node(tree: &mut NodeTree, geometry: GeometryId, no
     }
 }
 
-pub(crate) fn lane_offset(tree: &NodeTree, node: NodeId) -> Point {
+pub(crate) fn lane_offset(tree: &NodeTree, node: NodeId) -> LogicalPoint {
     tree.arena
         .get(node)
-        .map_or(Point::ZERO, |target| target.lane_offset)
+        .map_or(LogicalPoint::ZERO, |target| target.lane_offset)
 }
 
-pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) {
+pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: LogicalPoint) {
     if let Some(target) = tree.arena.get_mut(node) {
         target.lane_offset = offset;
     }
@@ -623,9 +623,9 @@ pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) 
 pub(crate) fn paint_state(
     tree: &NodeTree,
     node: NodeId,
-    screen_offset: Point,
-    bake_offset: Point,
-    clip_key: (u8, Option<PhysicalRect>),
+    screen_offset: LogicalPoint,
+    bake_offset: LogicalPoint,
+    clip_key: (u8, Option<DeviceRect>),
     inherited_opacity: f32,
 ) -> Option<super::PaintNodeState> {
     let target = tree.arena.get(node)?;
@@ -654,7 +654,7 @@ pub(crate) fn paint_state(
         target
             .layout
             .bounds
-            .translate(Point::new(-screen_offset.x, -screen_offset.y))
+            .translate(LogicalPoint::new(-screen_offset.x, -screen_offset.y))
             .inset(target.layout.border)
     });
     let scroll = target
@@ -685,11 +685,11 @@ pub(crate) fn set_paint_opacity(tree: &mut NodeTree, node: NodeId, opacity: f32)
     }
 }
 
-pub(crate) fn clip_key(tree: &NodeTree, node: NodeId) -> Option<(u8, Option<PhysicalRect>)> {
+pub(crate) fn clip_key(tree: &NodeTree, node: NodeId) -> Option<(u8, Option<DeviceRect>)> {
     tree.clip_keys.get(node.index() as usize).copied().flatten()
 }
 
-pub(crate) fn set_clip_key(tree: &mut NodeTree, node: NodeId, key: (u8, Option<PhysicalRect>)) {
+pub(crate) fn set_clip_key(tree: &mut NodeTree, node: NodeId, key: (u8, Option<DeviceRect>)) {
     let index = node.index() as usize;
     if tree.clip_keys.len() <= index {
         tree.clip_keys.resize_with(index + 1, || None);
@@ -1031,6 +1031,7 @@ impl TextSlot {
 mod tests {
     use super::TextDirtyQueue;
     use crate::{
+        math::px,
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         text::{TextContent, TextStyle},
     };
@@ -1040,7 +1041,7 @@ mod tests {
         let root = tree.root();
         let mut nodes = Vec::with_capacity(count);
         for index in 0..count {
-            let node = NodeBuilder::text(format!("t{index}"), TextStyle::new(12.0))
+            let node = NodeBuilder::text(format!("t{index}"), TextStyle::new(px(12.0)))
                 .build(&mut tree, root)
                 .expect("text node");
             nodes.push(node);
@@ -1074,7 +1075,7 @@ mod tests {
         assert_eq!(tree.text_layout_dirty_len(), 0);
 
         let node = nodes[0];
-        let content = TextContent::new("changed", TextStyle::new(12.0));
+        let content = TextContent::new("changed", TextStyle::new(px(12.0)));
         assert!(tree.set_text_content(node, content));
         assert_eq!(
             tree.text_dirty_len(),

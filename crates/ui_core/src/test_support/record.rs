@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    math::{PhysicalRect, Rect},
+    math::{DeviceRect, LogicalPx, LogicalRect},
     node::{id::NodeId, tree::NodeTree},
     paint::{
         canvas::Canvas,
@@ -28,7 +28,7 @@ pub struct FrameRecord {
     pub rendered: bool,
     pub frame: Option<RenderedFrame>,
     pub stats: FrameStats,
-    pub damage: Vec<PhysicalRect>,
+    pub damage: Vec<DeviceRect>,
     pub damage_full: bool,
     pub delta: DeltaRecord,
     pub dirty_nodes: Vec<NodeId>,
@@ -60,10 +60,10 @@ pub struct CanvasRecord {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QuadRecord {
     pub node: NodeId,
-    pub bounds: Rect,
-    pub corner_radius: [f32; 4],
+    pub bounds: LogicalRect,
+    pub corner_radius: [LogicalPx; 4],
     pub fill: LinearPremulRgba,
-    pub border: Option<(f32, LinearPremulRgba)>,
+    pub border: Option<(LogicalPx, LinearPremulRgba)>,
     pub gradient: Option<crate::paint::primitive::GradientKind>,
 }
 
@@ -71,7 +71,7 @@ pub struct QuadRecord {
 pub struct PrimitiveRecord {
     pub node: NodeId,
     pub kind: PrimitiveKind,
-    pub bounds: Rect,
+    pub bounds: LogicalRect,
     pub image_modulation: Option<LinearPremulRgba>,
     pub image_uv: Option<[f32; 4]>,
 }
@@ -160,8 +160,8 @@ pub(crate) fn capture(
     tree: &NodeTree,
     resolver: &ColorResolver,
     report: PaintReport,
-    damage_rects: &[PhysicalRect],
-    frame_rect: PhysicalRect,
+    damage_rects: &[DeviceRect],
+    frame_rect: DeviceRect,
     frame_index: FrameIndex,
     stats: FrameStats,
     scanned_nodes: usize,
@@ -199,7 +199,7 @@ pub(crate) fn capture(
         };
         let node_bounds = tree
             .get(node)
-            .map_or(Rect::default(), |target| target.layout().bounds);
+            .map_or(LogicalRect::default(), |target| target.layout().bounds);
         for primitive in scene.lane_primitives(*lane).unwrap_or(&[]) {
             let (kind, bounds) = primitive_kind(primitive, node_bounds);
             let (image_modulation, image_uv) = match primitive {
@@ -259,13 +259,13 @@ pub(crate) fn capture(
     }
 }
 
-fn primitive_kind(primitive: &Primitive, node_bounds: Rect) -> (PrimitiveKind, Rect) {
+fn primitive_kind(primitive: &Primitive, node_bounds: LogicalRect) -> (PrimitiveKind, LogicalRect) {
     match primitive {
         Primitive::Quad(quad) => (PrimitiveKind::Quad, quad.bounds),
         Primitive::GlyphRun(run) => {
-            let mut bounds = Rect::default();
+            let mut bounds = LogicalRect::default();
             for glyph in &run.glyphs {
-                bounds = bounds.union(Rect::from_origin_size(glyph.position, glyph.size));
+                bounds = bounds.union(LogicalRect::from_origin_size(glyph.position, glyph.size));
             }
             (PrimitiveKind::GlyphRun, bounds)
         }
@@ -312,7 +312,7 @@ mod tests {
     use super::FrameRecord;
     use crate::{
         app::App,
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         paint::{
             canvas::Canvas,
@@ -331,21 +331,26 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("scan"),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();
         for index in 0..200 {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 12.0, 100.0, 10.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 12.0),
+                    px(100.0),
+                    px(10.0),
+                ))
                 .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
                 .expect("静态 box");
         }
         let value = app.signal(0u8);
         let source = value;
         let bound = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .bind_style(move |cx| StylePatch {
                 opacity: Some(f32::from(*cx.read(&source)) / 255.0),
                 ..StylePatch::default()
@@ -389,14 +394,19 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("encode"),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();
         for index in 0..64 {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 4.0, 80.0, 3.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 4.0),
+                    px(80.0),
+                    px(3.0),
+                ))
                 .paint(crate::paint::style::PaintSpec {
                     background: crate::paint::color::Color::WHITE,
                     ..crate::paint::style::PaintSpec::default()
@@ -407,7 +417,7 @@ mod tests {
         let value = app.signal(0u8);
         let source = value;
         let _bound = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .paint(crate::paint::style::PaintSpec {
                 background: crate::paint::color::Color::WHITE,
                 ..crate::paint::style::PaintSpec::default()
@@ -468,22 +478,22 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("canvas"),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("窗口存在").tree().root();
-        let mut canvas = Canvas::new(Rect::new(0.0, 0.0, 40.0, 20.0));
+        let mut canvas = Canvas::new(LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0)));
         canvas.push_quad(Quad {
-            bounds: Rect::new(0.0, 0.0, 20.0, 10.0),
-            corner_radius: [0.0; 4],
+            bounds: LogicalRect::new(px(0.0), px(0.0), px(20.0), px(10.0)),
+            corner_radius: [px(0.0); 4],
             paint: QuadPaint::Solid {
                 fill: Color::WHITE,
                 border: None,
             },
         });
         let node = NodeBuilder::canvas(canvas)
-            .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+            .layout_override(LogicalRect::new(px(10.0), px(10.0), px(80.0), px(40.0)))
             .id("chart")
             .build(app.window_mut(window).expect("窗口存在").tree_mut(), root)
             .expect("canvas 节点");
@@ -504,7 +514,10 @@ mod tests {
             .iter()
             .find(|entry| entry.node == node)
             .expect("画布内容必须挂在产生它的节点上");
-        assert_eq!(entry.canvas.bounds(), Rect::new(0.0, 0.0, 40.0, 20.0));
+        assert_eq!(
+            entry.canvas.bounds(),
+            LogicalRect::new(px(0.0), px(0.0), px(40.0), px(20.0))
+        );
         assert_eq!(entry.canvas.primitives().len(), 1, "内层图元可下钻");
         let crate::node::tree::NodeKind::Canvas(node_canvas) = app
             .window(window)

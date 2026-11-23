@@ -8,7 +8,7 @@ use crate::{
         Axis, LayoutOverride, LayoutReport, MeasureFn,
         hit_test::{HitResult, hit_test as hit_test_layout},
     },
-    math::{Edges, Point, Rect},
+    math::{LogicalEdges, LogicalPoint, LogicalPx, LogicalRect, px},
     node::{
         dirty::{DirtyFlags, affects_parent, depends_on_children},
         id::NodeId,
@@ -75,7 +75,12 @@ pub(crate) fn set_layout_override(
     Ok(())
 }
 
-pub(crate) fn set_virtual_row(tree: &mut NodeTree, node: NodeId, top: f32, height: f32) -> bool {
+pub(crate) fn set_virtual_row(
+    tree: &mut NodeTree,
+    node: NodeId,
+    top: LogicalPx,
+    height: LogicalPx,
+) -> bool {
     let Some(target) = tree.arena.get_mut(node) else {
         return false;
     };
@@ -83,17 +88,17 @@ pub(crate) fn set_virtual_row(tree: &mut NodeTree, node: NodeId, top: f32, heigh
         .style
         .position(taffy::style::Position::Absolute)
         .inset(
-            taffy::style::LengthPercentageAuto::length(top),
+            taffy::style::LengthPercentageAuto::length(top.value()),
             taffy::style::LengthPercentageAuto::length(0.0),
             taffy::style::LengthPercentageAuto::auto(),
             taffy::style::LengthPercentageAuto::length(0.0),
         )
         .width(taffy::style::Dimension::auto())
-        .height(taffy::style::Dimension::length(height));
+        .height(taffy::style::Dimension::length(height.value()));
     tree.invalidate_layout(node)
 }
 
-pub(crate) fn set_absolute_inset(tree: &mut NodeTree, node: NodeId, origin: Point) -> bool {
+pub(crate) fn set_absolute_inset(tree: &mut NodeTree, node: NodeId, origin: LogicalPoint) -> bool {
     let Some(target) = tree.arena.get_mut(node) else {
         return false;
     };
@@ -101,10 +106,10 @@ pub(crate) fn set_absolute_inset(tree: &mut NodeTree, node: NodeId, origin: Poin
         .style
         .position(taffy::style::Position::Absolute)
         .inset(
-            taffy::style::LengthPercentageAuto::length(origin.y),
+            taffy::style::LengthPercentageAuto::length(origin.y.value()),
             taffy::style::LengthPercentageAuto::auto(),
             taffy::style::LengthPercentageAuto::auto(),
-            taffy::style::LengthPercentageAuto::length(origin.x),
+            taffy::style::LengthPercentageAuto::length(origin.x.value()),
         );
     tree.invalidate_layout(node)
 }
@@ -140,34 +145,34 @@ pub(crate) fn layout_cache(tree: &NodeTree, node: NodeId) -> Option<&taffy::Cach
 
 pub(crate) fn set_local_layout(tree: &mut NodeTree, node: NodeId, layout: &taffy::Layout) {
     let epoch = tree.layout_epoch;
-    let local = Rect::new(
-        layout.location.x,
-        layout.location.y,
-        layout.size.width,
-        layout.size.height,
+    let local = LogicalRect::new(
+        px(layout.location.x),
+        px(layout.location.y),
+        px(layout.size.width),
+        px(layout.size.height),
     );
-    let border = Edges::new(
-        layout.border.top,
-        layout.border.right,
-        layout.border.bottom,
-        layout.border.left,
+    let border = LogicalEdges::new(
+        px(layout.border.top),
+        px(layout.border.right),
+        px(layout.border.bottom),
+        px(layout.border.left),
     );
-    let content_width = (layout.size.width
+    let content_width = px((layout.size.width
         - layout.border.left
         - layout.border.right
         - layout.padding.left
         - layout.padding.right)
-        .max(0.0);
+        .max(0.0));
     let mut width_changed = false;
     if let Some(target) = tree.arena.get_mut(node) {
         width_changed = target.kind.text().is_some()
-            && target.text_content_width.to_bits() != content_width.to_bits();
+            && target.text_content_width.value().to_bits() != content_width.value().to_bits();
         target.local = local;
         target.local_border = border;
         target.text_content_width = content_width;
-        target.content_offset = Point::new(
-            layout.border.left + layout.padding.left,
-            layout.border.top + layout.padding.top,
+        target.content_offset = LogicalPoint::new(
+            px(layout.border.left + layout.padding.left),
+            px(layout.border.top + layout.padding.top),
         );
         target.laid_out_epoch = epoch;
         target.dirty.remove(DirtyFlags::LAYOUT);
@@ -210,7 +215,12 @@ pub(crate) fn stats_mut(tree: &mut NodeTree) -> &mut LayoutStats {
     &mut tree.layout_stats
 }
 
-pub(crate) fn note_invalid_measure(tree: &mut NodeTree, node: NodeId, axis: Axis, value: f32) {
+pub(crate) fn note_invalid_measure(
+    tree: &mut NodeTree,
+    node: NodeId,
+    axis: Axis,
+    value: LogicalPx,
+) {
     if tree.invalid_measure.is_none() {
         tree.invalid_measure = Some(EngineError::InvalidMeasure { node, axis, value });
     }
@@ -222,14 +232,14 @@ pub(crate) fn take_invalid_measure(tree: &mut NodeTree) -> Option<EngineError> {
 
 pub(crate) fn absolutize(tree: &mut NodeTree) {
     let epoch = tree.layout_epoch;
-    tree.place_subtree(tree.root, Point::ZERO, epoch, true, false);
+    tree.place_subtree(tree.root, LogicalPoint::ZERO, epoch, true, false);
     expand_hoisted_ancestors(tree);
 }
 
 pub(crate) fn place_subtree(
     tree: &mut NodeTree,
     node: NodeId,
-    reference: Point,
+    reference: LogicalPoint,
     epoch: u32,
     force: bool,
     parent_hidden: bool,
@@ -242,13 +252,13 @@ pub(crate) fn place_subtree(
     let layout_leaf = target.layout_override.is_some() || target.kind.is_leaf();
     let children_hidden = hidden || layout_leaf;
     let local = if hidden {
-        Rect::default()
+        LogicalRect::default()
     } else {
         target
             .layout_override
             .map_or(target.local, |over| over.rect)
     };
-    let abs = Rect::from_origin_size(reference + local.origin, local.size);
+    let abs = LogicalRect::from_origin_size(reference + local.origin, local.size);
     let old = target.layout;
     let children = target.children.clone();
     let changed = abs != old.bounds;
@@ -317,10 +327,11 @@ pub(crate) fn place_subtree(
     store_subtree_bounds(tree, node, union);
 }
 
-fn store_subtree_bounds(tree: &mut NodeTree, node: NodeId, bounds: Rect) {
+fn store_subtree_bounds(tree: &mut NodeTree, node: NodeId, bounds: LogicalRect) {
     let index = node.index() as usize;
     if tree.subtree_bounds.len() <= index {
-        tree.subtree_bounds.resize_with(index + 1, Rect::default);
+        tree.subtree_bounds
+            .resize_with(index + 1, LogicalRect::default);
     }
     tree.subtree_bounds[index] = bounds;
     tree.layout_stats.bounds_updated += 1;
@@ -397,7 +408,7 @@ pub(crate) fn recompute_bounds_upwards(tree: &mut NodeTree, from: NodeId) {
     }
 }
 
-fn hit_envelope(tree: &NodeTree, node: NodeId, bounds: Rect) -> Rect {
+fn hit_envelope(tree: &NodeTree, node: NodeId, bounds: LogicalRect) -> LogicalRect {
     let Some(target) = tree.arena.get(node) else {
         return bounds;
     };
@@ -408,7 +419,10 @@ fn hit_envelope(tree: &NodeTree, node: NodeId, bounds: Rect) -> Rect {
         return bounds;
     };
     let origin = target.layout.bounds.origin;
-    bounds.union(Rect::from_origin_size(origin + local.origin, local.size))
+    bounds.union(LogicalRect::from_origin_size(
+        origin + local.origin,
+        local.size,
+    ))
 }
 
 #[cfg(test)]
@@ -429,7 +443,7 @@ pub(crate) fn recompute_subtree_bounds(tree: &mut NodeTree) {
         let mut union = tree
             .arena
             .get(node)
-            .map_or(Rect::default(), |target| target.layout.bounds);
+            .map_or(LogicalRect::default(), |target| target.layout.bounds);
         let children = tree.arena.get(node).map(|target| target.children());
         for child in children.unwrap_or_default() {
             let index = child.index() as usize;
@@ -440,13 +454,14 @@ pub(crate) fn recompute_subtree_bounds(tree: &mut NodeTree) {
         let union = hit_envelope(tree, node, union);
         let index = node.index() as usize;
         if tree.subtree_bounds.len() <= index {
-            tree.subtree_bounds.resize_with(index + 1, Rect::default);
+            tree.subtree_bounds
+                .resize_with(index + 1, LogicalRect::default);
         }
         tree.subtree_bounds[index] = union;
     }
 }
 
-pub(crate) fn subtree_bounds(tree: &NodeTree, node: NodeId) -> Rect {
+pub(crate) fn subtree_bounds(tree: &NodeTree, node: NodeId) -> LogicalRect {
     tree.subtree_bounds
         .get(node.index() as usize)
         .copied()
@@ -467,7 +482,7 @@ pub(crate) fn settle_frame(tree: &mut NodeTree) {
     let ids = tree.take_settle();
     for id in &ids {
         if let Some(target) = tree.arena.get_mut(*id) {
-            target.damage = Rect::default();
+            target.damage = LogicalRect::default();
             target.dirty.insert(DirtyFlags::REUSABLE);
         }
     }
@@ -504,7 +519,7 @@ pub(crate) fn bubble_layout(tree: &mut NodeTree, from: NodeId) {
     }
 }
 
-pub(crate) fn hit_test(tree: &NodeTree, point: Point) -> Option<HitResult> {
+pub(crate) fn hit_test(tree: &NodeTree, point: LogicalPoint) -> Option<HitResult> {
     hit_test_layout(tree, point)
 }
 
@@ -556,13 +571,13 @@ impl LayoutStats {
 mod tests {
     use crate::{
         layout::LayoutOverride,
-        math::Rect,
+        math::{LogicalRect, px},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
         paint::{style::Style, style_builder::StyleBuilder},
     };
 
     fn fixed(width: f32, height: f32) -> Style {
-        StyleBuilder::new().size(width, height).build()
+        StyleBuilder::new().size(px(width), px(height)).build()
     }
 
     fn add(tree: &mut NodeTree, parent: NodeId, style: Style) -> NodeId {
@@ -581,7 +596,7 @@ mod tests {
         assert!(!tree.has_layout_work(), "布局后脏集合必须清空");
     }
 
-    fn bounds(tree: &NodeTree, node: NodeId) -> Rect {
+    fn bounds(tree: &NodeTree, node: NodeId) -> LogicalRect {
         tree.get(node).expect("存在").layout().bounds
     }
 
@@ -599,12 +614,20 @@ mod tests {
 
         tree.set_layout_override(
             parent,
-            Some(LayoutOverride::new(Rect::new(0.0, 0.0, 50.0, 50.0))),
+            Some(LayoutOverride::new(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(50.0),
+                px(50.0),
+            ))),
         )
         .expect("节点存活");
         layout(&mut tree);
 
-        assert_eq!(bounds(&tree, parent), Rect::new(0.0, 0.0, 50.0, 50.0));
+        assert_eq!(
+            bounds(&tree, parent),
+            LogicalRect::new(px(0.0), px(0.0), px(50.0), px(50.0))
+        );
         assert!(
             bounds(&tree, child).is_empty(),
             "布局叶子的子节点必须零盒（不得冻结在上一轮的 local）：{:?}",
@@ -622,7 +645,12 @@ mod tests {
 
         tree.set_layout_override(
             parent,
-            Some(LayoutOverride::new(Rect::new(0.0, 0.0, 50.0, 50.0))),
+            Some(LayoutOverride::new(LogicalRect::new(
+                px(0.0),
+                px(0.0),
+                px(50.0),
+                px(50.0),
+            ))),
         )
         .expect("节点存活");
         layout(&mut tree);
@@ -662,7 +690,7 @@ mod tests {
         tree.set_layout_override(node, None).expect("节点存活");
         assert!(!tree.has_layout_work(), "等值写入不得请求布局");
 
-        let over = LayoutOverride::new(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let over = LayoutOverride::new(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)));
         tree.set_layout_override(node, Some(over))
             .expect("节点存活");
         assert!(tree.has_layout_work(), "真正的变更必须请求布局");

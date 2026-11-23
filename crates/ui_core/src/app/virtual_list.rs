@@ -5,7 +5,7 @@ use crate::{
         ItemAlign, ScrollAxis, ScrollConfig, ScrollHandle, ScrollSlot, VirtualList,
         VirtualListConfig, VirtualListState, VirtualSlot, scroll, virtual_list,
     },
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalPx, LogicalSize, px},
     node::{builder::NodeBuilder, dependency::Owner, id::NodeId, tree::NodeTree},
     paint::style::Clip,
     window::WindowId,
@@ -34,12 +34,12 @@ pub(crate) fn make_virtual_list(
         return Err(EngineError::StaleNode { node: container });
     };
     slot.scroll = Some(ScrollSlot {
-        offset: Point::ZERO,
+        offset: LogicalPoint::ZERO,
         content: viewport,
         axis: ScrollAxis::Vertical,
         line_height: ScrollConfig::default().line_height,
     });
-    let mut virtual_slot = VirtualSlot::new(config.extent.max(1.0), config.overscan);
+    let mut virtual_slot = VirtualSlot::new(config.extent.max(px(1.0)), config.overscan);
     if let Some(extents) = config.extents {
         virtual_slot.set_extents(extents);
     }
@@ -105,7 +105,7 @@ pub(crate) fn set_virtual_items(
         if anchored.is_some()
             && let Some(scroll) = target.tree_mut().scroll_slot_mut(node)
         {
-            scroll.content = Size::new(viewport_width, content);
+            scroll.content = LogicalSize::new(viewport_width, content);
         }
         (anchored, extents_dropped)
     };
@@ -115,7 +115,7 @@ pub(crate) fn set_virtual_items(
         {
             app.scroll_to(
                 &ScrollHandle::new(window, node),
-                Point::new(0.0, target_offset),
+                LogicalPoint::new(px(0.0), target_offset),
             )?;
         }
         app.rewindow_virtual(window, node);
@@ -178,7 +178,7 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
     }) else {
         return;
     };
-    let mut missing: Vec<(usize, f32, f32)> = Vec::new();
+    let mut missing: Vec<(usize, LogicalPx, LogicalPx)> = Vec::new();
     if let Some(slot) = target.tree().virtual_slot(node) {
         for index in range.clone() {
             if slot.mounted.iter().any(|(mounted, _)| *mounted == index) {
@@ -245,7 +245,7 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
         changed = true;
     }
     if let Some(slot) = target.tree_mut().scroll_slot_mut(node) {
-        slot.content = Size::new(viewport.width, content);
+        slot.content = LogicalSize::new(viewport.width, content);
     }
     if changed {
         target.tree_mut().mark_structure(node);
@@ -259,7 +259,7 @@ pub(crate) fn rewindow_virtual(app: &mut App, window: WindowId, node: NodeId) {
 pub(crate) fn set_virtual_extents(
     app: &mut App,
     list: &VirtualList,
-    extents: &[f32],
+    extents: &[LogicalPx],
 ) -> Result<(), EngineError> {
     let window = list.window();
     let node = list.node();
@@ -286,7 +286,7 @@ fn apply_virtual_extents(
     app: &mut App,
     window: WindowId,
     node: NodeId,
-    extents: &[f32],
+    extents: &[LogicalPx],
 ) -> Result<(), EngineError> {
     let Some((anchor, current_offset, viewport)) = app.windows.get(&window).and_then(|target| {
         let slot = target.tree().virtual_slot(node)?;
@@ -308,20 +308,20 @@ fn apply_virtual_extents(
         };
         slot.set_extents(extents.to_vec().into_boxed_slice());
         let content = virtual_list::content_height(slot);
-        let max = (content - viewport.height).max(0.0);
+        let max = (content - viewport.height).max(LogicalPx::ZERO);
         let target_offset = scroll::clamp(
             virtual_list::offset_for_anchor(slot, anchor.0, anchor.1),
             max,
         );
         if let Some(scroll) = target.tree_mut().scroll_slot_mut(node) {
-            scroll.content = Size::new(viewport.width, content);
+            scroll.content = LogicalSize::new(viewport.width, content);
         }
         (target_offset, target_offset != current_offset)
     };
     if offset_changed {
         app.scroll_to(
             &ScrollHandle::new(window, node),
-            Point::new(0.0, target_offset),
+            LogicalPoint::new(px(0.0), target_offset),
         )?;
     }
     app.rewindow_virtual(window, node);
@@ -330,7 +330,7 @@ fn apply_virtual_extents(
 }
 
 fn reposition_mounted_rows(app: &mut App, window: WindowId, node: NodeId) {
-    let rows: Vec<(NodeId, f32, f32)> = {
+    let rows: Vec<(NodeId, LogicalPx, LogicalPx)> = {
         let Some(target) = app.windows.get(&window) else {
             return;
         };
@@ -401,7 +401,7 @@ pub(crate) fn scroll_to_item(
             }
         }
     };
-    let max = (content - viewport.height).max(0.0);
+    let max = (content - viewport.height).max(LogicalPx::ZERO);
     let target_offset = scroll::clamp(proposed, max);
     if target_offset == current {
         return Ok(());
@@ -409,15 +409,15 @@ pub(crate) fn scroll_to_item(
     app.batch(|app| {
         app.scroll_to(
             &ScrollHandle::new(window, node),
-            Point::new(0.0, target_offset),
+            LogicalPoint::new(px(0.0), target_offset),
         )
     })
 }
 
-fn validate_extents(extents: &[f32]) -> Result<(), EngineError> {
-    let mut total = 0.0_f32;
+fn validate_extents(extents: &[LogicalPx]) -> Result<(), EngineError> {
+    let mut total = LogicalPx::ZERO;
     for (index, value) in extents.iter().copied().enumerate() {
-        if !value.is_finite() || value < 0.0 {
+        if !value.is_finite() || value < LogicalPx::ZERO {
             return Err(EngineError::InvalidVirtualExtent { index, value });
         }
         total += value;
@@ -428,12 +428,12 @@ fn validate_extents(extents: &[f32]) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn row_matches(tree: &NodeTree, row: NodeId, top: f32, height: f32) -> bool {
+fn row_matches(tree: &NodeTree, row: NodeId, top: LogicalPx, height: LogicalPx) -> bool {
     tree.get(row).is_ok_and(|node| {
         let style = node.style().inner();
         style.position == taffy::style::Position::Absolute
-            && style.inset.top == taffy::style::LengthPercentageAuto::length(top)
-            && style.size.height == taffy::style::Dimension::length(height)
+            && style.inset.top == taffy::style::LengthPercentageAuto::length(top.value())
+            && style.size.height == taffy::style::Dimension::length(height.value())
     })
 }
 
@@ -441,7 +441,7 @@ fn row_matches(tree: &NodeTree, row: NodeId, top: f32, height: f32) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        math::{Rect, Scale},
+        math::{DevicePixelRatio, LogicalPx, LogicalRect},
         paint::style_builder::StyleBuilder,
         window::WindowOptions,
     };
@@ -459,11 +459,14 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: "e3".into(),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
-        let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
+        let mut style = StyleBuilder::new()
+            .size(px(200.0), px(100.0))
+            .relative()
+            .build();
         style.clip = Clip::Bounds;
         let tree = app.window_mut(window).expect("window").tree_mut();
         let root = tree.root();
@@ -475,7 +478,7 @@ mod tests {
         (runtime, app, window, container)
     }
 
-    fn fixture(extent: f32, overscan: usize, extents: Option<Vec<f32>>) -> Fixture {
+    fn fixture(extent: LogicalPx, overscan: usize, extents: Option<Vec<LogicalPx>>) -> Fixture {
         let (runtime, mut app, window, container) = app_with_container();
         let list = app
             .make_virtual_list(
@@ -498,14 +501,14 @@ mod tests {
         .expect("items");
     }
 
-    fn scroll_offset(app: &App, window: WindowId, container: NodeId) -> f32 {
+    fn scroll_offset(app: &App, window: WindowId, container: NodeId) -> LogicalPx {
         app.scroll_state(&app.scroll_handle(window, container).expect("scroll handle"))
             .expect("scroll state")
             .offset
             .y
     }
 
-    fn content_height(app: &App, window: WindowId, container: NodeId) -> f32 {
+    fn content_height(app: &App, window: WindowId, container: NodeId) -> LogicalPx {
         app.scroll_state(&app.scroll_handle(window, container).expect("scroll handle"))
             .expect("scroll state")
             .content
@@ -522,7 +525,7 @@ mod tests {
             .clone()
     }
 
-    fn row_bounds(app: &App, window: WindowId, container: NodeId, row: NodeId) -> Rect {
+    fn row_bounds(app: &App, window: WindowId, container: NodeId, row: NodeId) -> LogicalRect {
         let tree = app.window(window).expect("window").tree();
         let origin = tree
             .get(container)
@@ -531,7 +534,7 @@ mod tests {
             .bounds
             .origin;
         let bounds = tree.get(row).expect("row").layout().bounds;
-        Rect::new(
+        LogicalRect::new(
             bounds.origin.x - origin.x,
             bounds.origin.y - origin.y,
             bounds.size.width,
@@ -541,12 +544,12 @@ mod tests {
 
     #[test]
     fn variable_extents_position_rows_by_the_prefix() {
-        let (_rt, mut app, window, container, list) = fixture(100.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(100.0), 0, None);
         set_items(&mut app, &list, 100);
         frame(&mut app, window);
 
-        let mut extents = vec![100.0_f32; 100];
-        extents[..4].copy_from_slice(&[30.0, 40.0, 50.0, 60.0]);
+        let mut extents = vec![px(100.0_f32); 100];
+        extents[..4].copy_from_slice(&[px(30.0), px(40.0), px(50.0), px(60.0)]);
         app.set_virtual_extents(&list, &extents).expect("extents");
         frame(&mut app, window);
 
@@ -559,42 +562,42 @@ mod tests {
         );
         for (index, row) in mounted {
             let bounds = row_bounds(&app, window, container, row);
-            assert_eq!(bounds.origin.y, prefix[index], "row {index} top");
+            assert_eq!(bounds.origin.y, px(prefix[index]), "row {index} top");
             assert_eq!(bounds.size.height, extents[index], "row {index} height");
         }
         let state = app.virtual_list_state(&list).expect("state");
         assert_eq!((state.first, state.last), (0, 3));
         assert_eq!(
             content_height(&app, window, container),
-            extents.iter().sum::<f32>()
+            px(extents.iter().map(|extent| extent.value()).sum::<f32>())
         );
 
         app.scroll_to_item(&list, 3, ItemAlign::Start)
             .expect("start");
-        assert_eq!(scroll_offset(&app, window, container), 120.0);
+        assert_eq!(scroll_offset(&app, window, container), px(120.0));
         app.scroll_to_item(&list, 3, ItemAlign::End).expect("end");
-        assert_eq!(scroll_offset(&app, window, container), 80.0);
+        assert_eq!(scroll_offset(&app, window, container), px(80.0));
         app.scroll_to_item(&list, 3, ItemAlign::Center)
             .expect("center");
-        assert_eq!(scroll_offset(&app, window, container), 100.0);
+        assert_eq!(scroll_offset(&app, window, container), px(100.0));
     }
 
     #[test]
     fn replacing_extents_preserves_the_visible_anchor() {
-        let (_rt, mut app, window, container, list) = fixture(100.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(100.0), 0, None);
         set_items(&mut app, &list, 100);
         frame(&mut app, window);
         let handle = app.scroll_handle(window, container).expect("handle");
-        app.scroll_to(&handle, Point::new(0.0, 150.0))
+        app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(150.0)))
             .expect("scroll");
         frame(&mut app, window);
         let before = app.virtual_list_state(&list).expect("state");
         assert_eq!(before.first, 1);
         let inner_before = before.offset.y - 100.0;
-        assert_eq!(inner_before, 50.0);
+        assert_eq!(inner_before, px(50.0));
 
-        let mut extents = vec![100.0_f32; 100];
-        extents[0] = 200.0;
+        let mut extents = vec![px(100.0_f32); 100];
+        extents[0] = px(200.0);
         let requests = app.frame_requests();
         app.set_virtual_extents(&list, &extents).expect("extents");
         assert_eq!(
@@ -605,7 +608,7 @@ mod tests {
         frame(&mut app, window);
 
         let after = app.virtual_list_state(&list).expect("state");
-        assert_eq!(after.offset.y, 250.0, "prefix'[1] + 50");
+        assert_eq!(after.offset.y, px(250.0), "prefix'[1] + 50");
         assert_eq!(after.first, 1, "首个可见 index 不变");
         assert_eq!(after.offset.y - 200.0, inner_before, "行内偏移不变");
         let prefix = [0.0_f32, 200.0, 300.0, 400.0];
@@ -618,7 +621,7 @@ mod tests {
         for (index, row) in mounted {
             assert_eq!(
                 row_bounds(&app, window, container, row).origin.y,
-                prefix[index],
+                px(prefix[index]),
                 "row {index} 已按新 prefix 重排"
             );
         }
@@ -627,11 +630,11 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn replacing_extents_paints_one_partial_frame() {
-        let (_rt, mut app, window, _container, list) = fixture(25.0, 0, None);
+        let (_rt, mut app, window, _container, list) = fixture(px(25.0), 0, None);
         set_items(&mut app, &list, 100);
         frame(&mut app, window);
-        let mut extents = vec![25.0_f32; 100];
-        extents[0] = 50.0;
+        let mut extents = vec![px(25.0_f32); 100];
+        extents[0] = px(50.0);
         app.set_virtual_extents(&list, &extents).expect("extents");
         frame(&mut app, window);
         let record = app
@@ -647,45 +650,45 @@ mod tests {
 
     #[test]
     fn scroll_to_item_follows_the_four_alignments() {
-        let (_rt, mut app, window, container, list) = fixture(20.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(20.0), 0, None);
         set_items(&mut app, &list, 100);
         frame(&mut app, window);
 
         app.scroll_to_item(&list, 10, ItemAlign::Start)
             .expect("start");
-        assert_eq!(scroll_offset(&app, window, container), 200.0);
+        assert_eq!(scroll_offset(&app, window, container), px(200.0));
         app.scroll_to_item(&list, 10, ItemAlign::Center)
             .expect("center");
-        assert_eq!(scroll_offset(&app, window, container), 160.0);
+        assert_eq!(scroll_offset(&app, window, container), px(160.0));
         app.scroll_to_item(&list, 10, ItemAlign::End).expect("end");
-        assert_eq!(scroll_offset(&app, window, container), 120.0);
+        assert_eq!(scroll_offset(&app, window, container), px(120.0));
 
         let requests = app.frame_requests();
         app.scroll_to_item(&list, 10, ItemAlign::Nearest)
             .expect("nearest");
-        assert_eq!(scroll_offset(&app, window, container), 120.0);
+        assert_eq!(scroll_offset(&app, window, container), px(120.0));
         assert_eq!(app.frame_requests(), requests, "已可见 ⇒ 无帧");
         app.scroll_to(
             &app.scroll_handle(window, container).expect("handle"),
-            Point::new(0.0, 130.0),
+            LogicalPoint::new(px(0.0), px(130.0)),
         )
         .expect("scroll");
         app.scroll_to_item(&list, 0, ItemAlign::Nearest)
             .expect("nearest up");
-        assert_eq!(scroll_offset(&app, window, container), 0.0);
+        assert_eq!(scroll_offset(&app, window, container), px(0.0));
         app.scroll_to_item(&list, 99, ItemAlign::Nearest)
             .expect("nearest down");
-        assert_eq!(scroll_offset(&app, window, container), 1_900.0);
+        assert_eq!(scroll_offset(&app, window, container), px(1_900.0));
         app.scroll_to_item(&list, 99, ItemAlign::End).expect("end");
-        assert_eq!(scroll_offset(&app, window, container), 1_900.0);
+        assert_eq!(scroll_offset(&app, window, container), px(1_900.0));
     }
 
     #[test]
     fn an_identical_extents_replacement_never_requests_a_frame() {
-        let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(25.0), 0, None);
         set_items(&mut app, &list, 100);
         frame(&mut app, window);
-        let extents = vec![25.0_f32; 100];
+        let extents = vec![px(25.0_f32); 100];
         let requests = app.frame_requests();
         app.set_virtual_extents(&list, &extents).expect("extents");
         assert_eq!(
@@ -695,29 +698,29 @@ mod tests {
         );
         app.set_virtual_extents(&list, &extents).expect("extents");
         assert_eq!(app.frame_requests(), requests, "同值替换是 no-op");
-        assert_eq!(content_height(&app, window, container), 2_500.0);
+        assert_eq!(content_height(&app, window, container), px(2_500.0));
     }
 
     #[test]
     fn offscreen_extents_changes_do_not_force_a_frame() {
-        let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(25.0), 0, None);
         set_items(&mut app, &list, 100);
         frame(&mut app, window);
-        let mut extents = vec![25.0_f32; 100];
-        extents[99] = 100.0;
+        let mut extents = vec![px(25.0_f32); 100];
+        extents[99] = px(100.0);
         let requests = app.frame_requests();
         app.set_virtual_extents(&list, &extents).expect("extents");
         assert_eq!(app.frame_requests(), requests, "可见行未移动 ⇒ 不请求帧");
-        assert_eq!(content_height(&app, window, container), 2_575.0);
+        assert_eq!(content_height(&app, window, container), px(2_575.0));
     }
 
     #[test]
     fn extents_and_item_index_errors_are_typed() {
-        let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(25.0), 0, None);
         set_items(&mut app, &list, 10);
         frame(&mut app, window);
 
-        match app.set_virtual_extents(&list, &[25.0; 9]) {
+        match app.set_virtual_extents(&list, &[px(25.0); 9]) {
             Err(EngineError::VirtualListExtents {
                 expected: 10,
                 actual: 9,
@@ -731,23 +734,23 @@ mod tests {
             }) => {}
             other => panic!("空 extents 但 count > 0 必须是 VirtualListExtents：{other:?}"),
         }
-        let mut nan = vec![25.0_f32; 10];
-        nan[3] = f32::NAN;
+        let mut nan = vec![px(25.0_f32); 10];
+        nan[3] = px(f32::NAN);
         match app.set_virtual_extents(&list, &nan) {
             Err(EngineError::InvalidVirtualExtent { index: 3, value }) => {
-                assert!(value.is_nan());
+                assert!(value.value().is_nan());
             }
             other => panic!("NaN 必须是 InvalidVirtualExtent：{other:?}"),
         }
-        let mut negative = vec![25.0_f32; 10];
-        negative[0] = -1.0;
+        let mut negative = vec![px(25.0_f32); 10];
+        negative[0] = px(-1.0);
         match app.set_virtual_extents(&list, &negative) {
             Err(EngineError::InvalidVirtualExtent { index: 0, value }) => {
-                assert_eq!(value, -1.0);
+                assert_eq!(value, px(-1.0));
             }
             other => panic!("负值必须是 InvalidVirtualExtent：{other:?}"),
         }
-        match app.set_virtual_extents(&list, &[f32::INFINITY; 10]) {
+        match app.set_virtual_extents(&list, &[px(f32::INFINITY); 10]) {
             Err(EngineError::InvalidVirtualExtent { index: 0, .. }) => {}
             other => panic!("非有限值必须是 InvalidVirtualExtent：{other:?}"),
         }
@@ -758,10 +761,10 @@ mod tests {
             }) => {}
             other => panic!("index 越界必须是 VirtualListExtents：{other:?}"),
         }
-        app.set_virtual_extents(&list, &[0.0; 10])
+        app.set_virtual_extents(&list, &[px(0.0); 10])
             .expect("zero heights");
         frame(&mut app, window);
-        assert_eq!(content_height(&app, window, container), 0.0);
+        assert_eq!(content_height(&app, window, container), px(0.0));
         let state = app.virtual_list_state(&list).expect("state");
         assert_eq!((state.first, state.last, state.mounted), (0, 0, 0));
 
@@ -770,7 +773,7 @@ mod tests {
             .tree_mut()
             .remove(container)
             .expect("remove");
-        match app.set_virtual_extents(&list, &[25.0; 10]) {
+        match app.set_virtual_extents(&list, &[px(25.0); 10]) {
             Err(EngineError::NotVirtualList { node }) => assert_eq!(node, container),
             other => panic!("失效 list 必须是 NotVirtualList：{other:?}"),
         }
@@ -782,48 +785,48 @@ mod tests {
 
     #[test]
     fn zero_heights_then_real_heights_keep_the_visible_anchor_at_the_top() {
-        let (_rt, mut app, window, container, list) = fixture(100.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(100.0), 0, None);
         set_items(&mut app, &list, 10);
         frame(&mut app, window);
-        app.set_virtual_extents(&list, &[0.0; 10])
+        app.set_virtual_extents(&list, &[px(0.0); 10])
             .expect("zero heights");
         frame(&mut app, window);
-        assert_eq!(content_height(&app, window, container), 0.0);
+        assert_eq!(content_height(&app, window, container), px(0.0));
         let folded = app.virtual_list_state(&list).expect("state");
         assert_eq!(
             (folded.offset.y, folded.first, folded.mounted),
-            (0.0, 0, 0),
+            (px(0.0), 0, 0),
             "零内容：无可见行、偏移 0"
         );
 
-        app.set_virtual_extents(&list, &[100.0; 10])
+        app.set_virtual_extents(&list, &[px(100.0); 10])
             .expect("measured heights");
         frame(&mut app, window);
         let measured = app.virtual_list_state(&list).expect("state");
         assert_eq!(
             (measured.offset.y, measured.first),
-            (0.0, 0),
+            (px(0.0), 0),
             "零高 → 真实高度不得跳底"
         );
-        assert_eq!(content_height(&app, window, container), 1_000.0);
+        assert_eq!(content_height(&app, window, container), px(1_000.0));
     }
 
     #[test]
     fn overflowing_extent_totals_are_rejected_before_any_state_change() {
-        let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(25.0), 0, None);
         set_items(&mut app, &list, 3);
         frame(&mut app, window);
         let before = app.virtual_list_state(&list).expect("state");
         let requests = app.frame_requests();
-        match app.set_virtual_extents(&list, &[3e38, 3e38, 1.0]) {
+        match app.set_virtual_extents(&list, &[px(3e38), px(3e38), px(1.0)]) {
             Err(EngineError::InvalidVirtualExtent { index: 1, value }) => {
-                assert_eq!(value, 3e38);
+                assert_eq!(value, px(3e38));
             }
             other => panic!("累计溢出必须是 InvalidVirtualExtent：{other:?}"),
         }
         assert_eq!(
             content_height(&app, window, container),
-            75.0,
+            px(75.0),
             "错误路径不得半写 content"
         );
         assert_eq!(
@@ -832,15 +835,15 @@ mod tests {
             "错误路径不改状态（先校验、后写入）"
         );
         assert_eq!(app.frame_requests(), requests, "错误路径不请求帧");
-        validate_extents(&[3e38, 1.0, 1.0]).expect("finite total");
+        validate_extents(&[px(3e38), px(1.0), px(1.0)]).expect("finite total");
 
         let (_runtime, mut app, window, container) = app_with_container();
         match app.make_virtual_list(
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
-                extents: Some(vec![3e38, 3e38].into_boxed_slice()),
+                extent: px(25.0),
+                extents: Some(vec![px(3e38), px(3e38)].into_boxed_slice()),
                 overscan: 0,
             },
         ) {
@@ -860,7 +863,7 @@ mod tests {
 
     #[test]
     fn an_empty_list_accepts_empty_extents_and_rejects_any_index() {
-        let (_rt, mut app, window, container, list) = fixture(25.0, 0, None);
+        let (_rt, mut app, window, container, list) = fixture(px(25.0), 0, None);
         set_items(&mut app, &list, 0);
         frame(&mut app, window);
         app.set_virtual_extents(&list, &[]).expect("empty extents");
@@ -877,17 +880,18 @@ mod tests {
             }) => {}
             other => panic!("空列表任意 index 都越界：{other:?}"),
         }
-        assert_eq!(content_height(&app, window, container), 0.0);
+        assert_eq!(content_height(&app, window, container), px(0.0));
     }
 
     #[test]
     fn config_extents_are_adopted_and_stale_heights_are_dropped() {
-        let (_rt, mut app, window, container, list) = fixture(200.0, 0, Some(vec![100.0; 10]));
+        let (_rt, mut app, window, container, list) =
+            fixture(px(200.0), 0, Some(vec![px(100.0); 10]));
         set_items(&mut app, &list, 10);
         frame(&mut app, window);
-        assert_eq!(content_height(&app, window, container), 1_000.0);
+        assert_eq!(content_height(&app, window, container), px(1_000.0));
         let handle = app.scroll_handle(window, container).expect("handle");
-        app.scroll_to(&handle, Point::new(0.0, 350.0))
+        app.scroll_to(&handle, LogicalPoint::new(px(0.0), px(350.0)))
             .expect("scroll");
         frame(&mut app, window);
         let state = app.virtual_list_state(&list).expect("state");
@@ -900,9 +904,13 @@ mod tests {
             1,
             "条目数变化 + 锚点补偿也只唤醒一帧（I3）"
         );
-        assert_eq!(scroll_offset(&app, window, container), 650.0, "3*200 + 50");
+        assert_eq!(
+            scroll_offset(&app, window, container),
+            px(650.0),
+            "3*200 + 50"
+        );
         frame(&mut app, window);
-        assert_eq!(content_height(&app, window, container), 1_000.0);
+        assert_eq!(content_height(&app, window, container), px(1_000.0));
         let mounted = mounted_rows(&app, window, &list);
         assert_eq!(
             mounted.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
@@ -913,24 +921,24 @@ mod tests {
             let bounds = row_bounds(&app, window, container, row);
             assert_eq!(
                 bounds.origin.y,
-                index as f32 * 200.0,
+                px(index as f32 * 200.0),
                 "row {index} 回落到单一 extent 的 top"
             );
-            assert_eq!(bounds.size.height, 200.0, "row {index} 回落 height");
+            assert_eq!(bounds.size.height, px(200.0), "row {index} 回落 height");
         }
 
-        app.set_virtual_extents(&list, &[100.0; 5])
+        app.set_virtual_extents(&list, &[px(100.0); 5])
             .expect("extents");
-        assert_eq!(scroll_offset(&app, window, container), 350.0);
-        assert_eq!(content_height(&app, window, container), 500.0);
+        assert_eq!(scroll_offset(&app, window, container), px(350.0));
+        assert_eq!(content_height(&app, window, container), px(500.0));
 
         let (_runtime, mut app, window, container) = app_with_container();
         match app.make_virtual_list(
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
-                extents: Some(vec![25.0, f32::NAN].into_boxed_slice()),
+                extent: px(25.0),
+                extents: Some(vec![px(25.0), px(f32::NAN)].into_boxed_slice()),
                 overscan: 0,
             },
         ) {
@@ -957,7 +965,7 @@ mod tests {
         use crate::a11y::{A11yOverride, A11yRole};
 
         fn fixed_style(width: f32, height: f32) -> crate::paint::style::Style {
-            StyleBuilder::new().size(width, height).build()
+            StyleBuilder::new().size(px(width), px(height)).build()
         }
         fn role(role: A11yRole) -> A11yOverride {
             A11yOverride {
@@ -972,8 +980,8 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: "e9c".into(),
-            size: Size::new(400.0, 300.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(400.0), px(300.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
@@ -1014,7 +1022,12 @@ mod tests {
             let fillers = (0..20)
                 .map(|index| {
                     NodeBuilder::boxed()
-                        .layout_override(Rect::new(0.0, 240.0 + index as f32 * 2.0, 10.0, 2.0))
+                        .layout_override(LogicalRect::new(
+                            px(0.0),
+                            px(240.0 + index as f32 * 2.0),
+                            px(10.0),
+                            px(2.0),
+                        ))
                         .build(tree, root)
                         .expect("filler")
                 })
@@ -1027,7 +1040,7 @@ mod tests {
                 window,
                 viewport,
                 VirtualListConfig {
-                    extent: 20.0,
+                    extent: px(20.0),
                     overscan: 0,
                     extents: None,
                 },
@@ -1236,7 +1249,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[test]
     fn count_change_without_a_collection_root_does_not_dirty_the_whole_tree() {
-        let (_runtime, mut app, window, _container, list) = fixture(20.0, 0, None);
+        let (_runtime, mut app, window, _container, list) = fixture(px(20.0), 0, None);
         set_items(&mut app, &list, 2);
         frame(&mut app, window);
         let _ = take_a11y(&mut app, window);

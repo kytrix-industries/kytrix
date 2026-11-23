@@ -16,6 +16,7 @@ use crate::paint::instance::InstanceBuffer;
 use crate::render::macos::readback::{Readback, ReadbackImage};
 use crate::{
     error::EngineError,
+    math::{DevicePoint, DeviceRect, dp},
     paint::{atlas::AtlasKind, instance::FrameOp},
     render::{
         compositor::{DamageRects, FramePlan, MAX_DRAW_PASSES, Plan},
@@ -462,7 +463,12 @@ impl GpuRenderer {
                                 &instances,
                                 payload,
                                 instance_count,
-                                [rect.x0, rect.y0, rect.x1, rect.y1],
+                                [
+                                    rect.x0.value(),
+                                    rect.y0.value(),
+                                    rect.x1.value(),
+                                    rect.y1.value(),
+                                ],
                                 root,
                                 pipeline,
                                 &mut self.geometry,
@@ -902,6 +908,14 @@ fn root_uniform(surface: (u32, u32), scale: f32) -> RootUniform {
     RootUniform::frame(surface.0 as f32, surface.1 as f32, scale)
 }
 
+fn scrolled_bounds(op: FrameOp, scroll: &[[f32; 2]]) -> DeviceRect {
+    let offset = crate::paint::instance::scroll_offset(scroll, op);
+    op.bounds().translate(DevicePoint::new(
+        dp(offset[0].round() as i32),
+        dp(offset[1].round() as i32),
+    ))
+}
+
 fn draw_ops(
     encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
     instances: &Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -913,12 +927,14 @@ fn draw_ops(
     geometry: &mut GeometryRegistry,
 ) -> Result<u32, EngineError> {
     let mut draw_calls = 0u32;
+    let scissor_bounds = DeviceRect::from_edges(
+        dp(scissor[0]),
+        dp(scissor[1]),
+        dp(scissor[2]),
+        dp(scissor[3]),
+    );
     for op in payload.ops() {
-        if !op
-            .bounds()
-            .translated(crate::paint::instance::scroll_offset(payload.scroll(), *op))
-            .intersects(scissor)
-        {
+        if !scrolled_bounds(*op, payload.scroll()).overlaps_inclusive(scissor_bounds) {
             continue;
         }
         match *op {
@@ -1077,13 +1093,13 @@ fn whole_scissor(surface: (u32, u32)) -> MTLScissorRect {
     }
 }
 
-fn clipped_rect(rect: &crate::math::PhysicalRect, surface: (u32, u32)) -> Option<MTLScissorRect> {
+fn clipped_rect(rect: &crate::math::DeviceRect, surface: (u32, u32)) -> Option<MTLScissorRect> {
     let limit_x = surface.0.min(i32::MAX as u32) as i32;
     let limit_y = surface.1.min(i32::MAX as u32) as i32;
-    let x0 = rect.x0.clamp(0, limit_x);
-    let y0 = rect.y0.clamp(0, limit_y);
-    let x1 = rect.x1.clamp(0, limit_x);
-    let y1 = rect.y1.clamp(0, limit_y);
+    let x0 = rect.x0.value().clamp(0, limit_x);
+    let y0 = rect.y0.value().clamp(0, limit_y);
+    let x1 = rect.x1.value().clamp(0, limit_x);
+    let y1 = rect.y1.value().clamp(0, limit_y);
     let width = x1.saturating_sub(x0) as u32;
     let height = y1.saturating_sub(y0) as u32;
     if width == 0 || height == 0 {
@@ -1108,7 +1124,7 @@ mod tests {
         clipped_rect, merge_damage, whole_scissor,
     };
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         render::{
             compositor::{DamageRects, MAX_DRAW_PASSES},
             damage::MAX_DAMAGE_RECTS,
@@ -1118,7 +1134,7 @@ mod tests {
     fn damage(rects: &[(i32, i32, i32, i32)]) -> DamageRects {
         let mut set = DamageRects::new();
         for &(x0, y0, x1, y1) in rects {
-            assert!(set.push(PhysicalRect::new(x0, y0, x1, y1)));
+            assert!(set.push(DeviceRect::new(dp(x0), dp(y0), dp(x1), dp(y1))));
         }
         set
     }
@@ -1140,7 +1156,8 @@ mod tests {
 
     #[test]
     fn damage_inside_the_surface_is_preserved() {
-        let rect = clipped_rect(&PhysicalRect::new(4, 6, 40, 60), (100, 80)).expect("rect");
+        let rect =
+            clipped_rect(&DeviceRect::new(dp(4), dp(6), dp(40), dp(60)), (100, 80)).expect("rect");
         assert_eq!(rect.x, 4);
         assert_eq!(rect.y, 6);
         assert_eq!(rect.width, 36);
@@ -1149,8 +1166,11 @@ mod tests {
 
     #[test]
     fn one_pixel_dpi_rounding_clips_damage_to_the_drawable() {
-        let rect =
-            clipped_rect(&PhysicalRect::new(1398, 10, 1401, 20), (1399, 1040)).expect("rect");
+        let rect = clipped_rect(
+            &DeviceRect::new(dp(1398), dp(10), dp(1401), dp(20)),
+            (1399, 1040),
+        )
+        .expect("rect");
         assert_eq!(rect.x, 1398);
         assert_eq!(rect.y, 10);
         assert_eq!(rect.width, 1, "只保留落在 drawable 内的 1 px");
@@ -1161,10 +1181,18 @@ mod tests {
     fn a_partial_damage_rect_past_the_edge_is_skipped_not_left_empty() {
         let surface = (1399, 1040);
         assert!(
-            clipped_rect(&PhysicalRect::new(1399, 0, 1400, 1040), surface).is_none(),
+            clipped_rect(
+                &DeviceRect::new(dp(1399), dp(0), dp(1400), dp(1040)),
+                surface
+            )
+            .is_none(),
             "整列都在 drawable 之外"
         );
-        let rect = clipped_rect(&PhysicalRect::new(1398, 0, 1400, 1040), surface).expect("rect");
+        let rect = clipped_rect(
+            &DeviceRect::new(dp(1398), dp(0), dp(1400), dp(1040)),
+            surface,
+        )
+        .expect("rect");
         assert_eq!((rect.x, rect.width), (1398, 1));
     }
 
@@ -1172,11 +1200,11 @@ mod tests {
     fn a_damage_rect_entirely_outside_the_surface_has_no_region() {
         let surface = (1400, 1040);
         for rect in [
-            PhysicalRect::new(1400, 0, 1420, 10),
-            PhysicalRect::new(-20, 0, 0, 10),
-            PhysicalRect::new(0, 1040, 10, 1060),
-            PhysicalRect::new(0, -20, 10, 0),
-            PhysicalRect::new(2000, 2000, 2010, 2010),
+            DeviceRect::new(dp(1400), dp(0), dp(1420), dp(10)),
+            DeviceRect::new(dp(-20), dp(0), dp(0), dp(10)),
+            DeviceRect::new(dp(0), dp(1040), dp(10), dp(1060)),
+            DeviceRect::new(dp(0), dp(-20), dp(10), dp(0)),
+            DeviceRect::new(dp(2000), dp(2000), dp(2010), dp(2010)),
         ] {
             assert!(
                 clipped_rect(&rect, surface).is_none(),
@@ -1187,7 +1215,8 @@ mod tests {
 
     #[test]
     fn damage_straddling_the_origin_is_clamped_to_zero() {
-        let rect = clipped_rect(&PhysicalRect::new(-8, -4, 6, 10), (100, 50)).expect("rect");
+        let rect =
+            clipped_rect(&DeviceRect::new(dp(-8), dp(-4), dp(6), dp(10)), (100, 50)).expect("rect");
         assert_eq!((rect.x, rect.y), (0, 0));
         assert_eq!((rect.width, rect.height), (6, 10));
     }
@@ -1323,7 +1352,7 @@ mod tests {
             let mut frame_damage = DamageRects::new();
             for pass in 0..MAX_DRAW_PASSES {
                 let x = ((frame * MAX_DRAW_PASSES + pass) * 2) as i32;
-                assert!(frame_damage.push(PhysicalRect::new(x, 0, x + 1, 1)));
+                assert!(frame_damage.push(DeviceRect::new(dp(x), dp(0), dp(x + 1), dp(1))));
             }
             state.record_missed(FrameDamage::Partial(frame_damage));
             assert!(
@@ -1440,7 +1469,7 @@ mod tests {
         let mut originals = Vec::with_capacity(MAX_DAMAGE_RECTS + 2);
         for index in 0..MAX_DAMAGE_RECTS {
             let x = index as i32 * 2;
-            let rect = PhysicalRect::new(x, 0, x + 1, 1);
+            let rect = DeviceRect::new(dp(x), dp(0), dp(x + 1), dp(1));
             assert!(pending.push(rect));
             originals.push(rect);
         }

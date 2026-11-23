@@ -7,7 +7,7 @@ use std::{
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-    math::{Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -24,8 +24,8 @@ use crate::{
 pub struct SnapshotCase {
     pub scene: SnapshotScene,
     pub theme: SnapshotTheme,
-    pub size: Size,
-    pub scale: Scale,
+    pub size: LogicalSize,
+    pub scale: DevicePixelRatio,
 }
 
 impl Default for SnapshotCase {
@@ -33,8 +33,8 @@ impl Default for SnapshotCase {
         Self {
             scene: SnapshotScene::Shapes,
             theme: SnapshotTheme::Light,
-            size: Size::new(800.0, 600.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(800.0), px(600.0)),
+            scale: DevicePixelRatio::ONE,
         }
     }
 }
@@ -111,12 +111,12 @@ impl SnapshotScene {
     }
 
     #[must_use]
-    pub fn size(self) -> Size {
+    pub fn size(self) -> LogicalSize {
         match self {
             Self::Shapes | Self::Shadow | Self::Gradient | Self::Clip | Self::ClipSubpixel => {
-                Size::new(240.0, 160.0)
+                LogicalSize::new(px(240.0), px(160.0))
             }
-            Self::Colors | Self::Image => Size::new(160.0, 120.0),
+            Self::Colors | Self::Image => LogicalSize::new(px(160.0), px(120.0)),
         }
     }
 
@@ -566,7 +566,7 @@ fn root_of(app: &TestApp) -> NodeId {
         .root()
 }
 
-fn box_node(app: &mut TestApp, parent: NodeId, id: &str, rect: Rect, paint: PaintSpec) {
+fn box_node(app: &mut TestApp, parent: NodeId, id: &str, rect: LogicalRect, paint: PaintSpec) {
     let window = app.window_id();
     let _ = NodeBuilder::boxed()
         .layout_override(rect)
@@ -598,7 +598,7 @@ fn style_node(
         .expect("scene container")
 }
 
-fn abs_style(rect: Rect, clip: Clip) -> Style {
+fn abs_style(rect: LogicalRect, clip: Clip) -> Style {
     let mut style = StyleBuilder::new()
         .absolute()
         .left(rect.origin.x)
@@ -614,7 +614,7 @@ fn build_backdrop(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "scene.backdrop",
-        Rect::new(0.0, 0.0, 240.0, 160.0),
+        LogicalRect::new(px(0.0), px(0.0), px(240.0), px(160.0)),
         PaintSpec {
             background: palette.backdrop,
             ..PaintSpec::default()
@@ -628,7 +628,7 @@ fn build_shapes(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "shapes.rect",
-        Rect::new(8.0, 8.0, 100.0, 60.0),
+        LogicalRect::new(px(8.0), px(8.0), px(100.0), px(60.0)),
         PaintSpec {
             background: palette.accent,
             ..PaintSpec::default()
@@ -638,10 +638,10 @@ fn build_shapes(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "shapes.radii",
-        Rect::new(120.0, 8.0, 100.0, 60.0),
+        LogicalRect::new(px(120.0), px(8.0), px(100.0), px(60.0)),
         PaintSpec {
             background: palette.surface,
-            corner_radius: [0.0, 4.0, 12.0, 24.0],
+            corner_radius: [px(0.0), px(4.0), px(12.0), px(24.0)],
             ..PaintSpec::default()
         },
     );
@@ -649,11 +649,11 @@ fn build_shapes(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "shapes.hairline",
-        Rect::new(8.0, 78.0, 100.0, 60.0),
+        LogicalRect::new(px(8.0), px(78.0), px(100.0), px(60.0)),
         PaintSpec {
             background: palette.surface,
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: palette.accent,
             }),
             ..PaintSpec::default()
@@ -663,12 +663,12 @@ fn build_shapes(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "shapes.rounded_border",
-        Rect::new(120.0, 78.0, 100.0, 60.0),
+        LogicalRect::new(px(120.0), px(78.0), px(100.0), px(60.0)),
         PaintSpec {
             background: palette.surface,
-            corner_radius: [12.0; 4],
+            corner_radius: [px(12.0); 4],
             border: Some(Border {
-                width: 2.0,
+                width: px(2.0),
                 color: palette.ink,
             }),
             ..PaintSpec::default()
@@ -682,13 +682,13 @@ fn build_shadow(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "shadow.tight",
-        Rect::new(40.0, 30.0, 120.0, 50.0),
+        LogicalRect::new(px(40.0), px(30.0), px(120.0), px(50.0)),
         PaintSpec {
             background: palette.surface,
             shadows: Shadows::from(ShadowSpec {
-                offset: crate::math::Point::new(2.0, 4.0),
-                blur: 4.0,
-                spread: 0.0,
+                offset: crate::math::LogicalPoint::new(px(2.0), px(4.0)),
+                blur: px(4.0),
+                spread: px(0.0),
                 color: palette.ink,
             }),
             ..PaintSpec::default()
@@ -698,14 +698,14 @@ fn build_shadow(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "shadow.wide",
-        Rect::new(70.0, 95.0, 120.0, 40.0),
+        LogicalRect::new(px(70.0), px(95.0), px(120.0), px(40.0)),
         PaintSpec {
             background: palette.surface,
-            corner_radius: [8.0; 4],
+            corner_radius: [px(8.0); 4],
             shadows: Shadows::from(ShadowSpec {
-                offset: crate::math::Point::new(0.0, 6.0),
-                blur: 16.0,
-                spread: 0.0,
+                offset: crate::math::LogicalPoint::new(px(0.0), px(6.0)),
+                blur: px(16.0),
+                spread: px(0.0),
                 color: palette.muted,
             }),
             ..PaintSpec::default()
@@ -716,9 +716,18 @@ fn build_shadow(app: &mut TestApp, root: NodeId, palette: &Palette) {
 fn build_gradient(app: &mut TestApp, root: NodeId, palette: &Palette) {
     build_backdrop(app, root, palette);
     let stops = [
-        (GradientKind::Horizontal, Rect::new(8.0, 8.0, 224.0, 42.0)),
-        (GradientKind::Vertical, Rect::new(8.0, 58.0, 224.0, 42.0)),
-        (GradientKind::Radial, Rect::new(8.0, 108.0, 224.0, 44.0)),
+        (
+            GradientKind::Horizontal,
+            LogicalRect::new(px(8.0), px(8.0), px(224.0), px(42.0)),
+        ),
+        (
+            GradientKind::Vertical,
+            LogicalRect::new(px(8.0), px(58.0), px(224.0), px(42.0)),
+        ),
+        (
+            GradientKind::Radial,
+            LogicalRect::new(px(8.0), px(108.0), px(224.0), px(44.0)),
+        ),
     ];
     for (index, (kind, rect)) in stops.into_iter().enumerate() {
         box_node(
@@ -755,7 +764,7 @@ fn build_gradient(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "gradient.flat",
-        Rect::new(8.0, 8.0, 8.0, 8.0),
+        LogicalRect::new(px(8.0), px(8.0), px(8.0), px(8.0)),
         PaintSpec {
             background: palette.accent,
             ..PaintSpec::default()
@@ -768,7 +777,7 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "colors.backdrop",
-        Rect::new(0.0, 0.0, 160.0, 120.0),
+        LogicalRect::new(px(0.0), px(0.0), px(160.0), px(120.0)),
         PaintSpec {
             background: palette.backdrop,
             ..PaintSpec::default()
@@ -778,7 +787,7 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "colors.stack.red",
-        Rect::new(12.0, 12.0, 60.0, 60.0),
+        LogicalRect::new(px(12.0), px(12.0), px(60.0), px(60.0)),
         PaintSpec {
             background: Color::Srgb {
                 r: 0.95,
@@ -793,7 +802,7 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "colors.stack.blue",
-        Rect::new(42.0, 32.0, 60.0, 60.0),
+        LogicalRect::new(px(42.0), px(32.0), px(60.0), px(60.0)),
         PaintSpec {
             background: Color::Srgb {
                 r: 0.1,
@@ -808,7 +817,7 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "colors.stack.white",
-        Rect::new(72.0, 52.0, 60.0, 60.0),
+        LogicalRect::new(px(72.0), px(52.0), px(60.0), px(60.0)),
         PaintSpec {
             background: Color::Srgb {
                 r: 1.0,
@@ -823,7 +832,7 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "colors.oklch",
-        Rect::new(12.0, 84.0, 60.0, 24.0),
+        LogicalRect::new(px(12.0), px(84.0), px(60.0), px(24.0)),
         PaintSpec {
             background: Color::Oklch {
                 l: 0.6,
@@ -838,7 +847,7 @@ fn build_colors(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "colors.oklch_edge",
-        Rect::new(88.0, 84.0, 60.0, 24.0),
+        LogicalRect::new(px(88.0), px(84.0), px(60.0), px(24.0)),
         PaintSpec {
             background: Color::Oklch {
                 l: 0.9,
@@ -856,7 +865,7 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "image.backdrop",
-        Rect::new(0.0, 0.0, 160.0, 120.0),
+        LogicalRect::new(px(0.0), px(0.0), px(160.0), px(120.0)),
         PaintSpec {
             background: palette.backdrop,
             ..PaintSpec::default()
@@ -868,9 +877,9 @@ fn build_image(app: &mut TestApp, root: NodeId, palette: &Palette) {
         .insert(&snapshot_png())
         .expect("the synthetic 16x16 png must decode");
     let slots = [
-        Rect::new(16.0, 16.0, 16.0, 16.0),
-        Rect::new(48.0, 16.0, 32.0, 32.0),
-        Rect::new(16.0, 56.0, 16.0, 16.0),
+        LogicalRect::new(px(16.0), px(16.0), px(16.0), px(16.0)),
+        LogicalRect::new(px(48.0), px(16.0), px(32.0), px(32.0)),
+        LogicalRect::new(px(16.0), px(56.0), px(16.0), px(16.0)),
     ];
     let modulations = [
         Color::WHITE,
@@ -911,7 +920,10 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "clip.outer",
-        abs_style(Rect::new(8.0, 8.0, 140.0, 90.0), Clip::Bounds),
+        abs_style(
+            LogicalRect::new(px(8.0), px(8.0), px(140.0), px(90.0)),
+            Clip::Bounds,
+        ),
         PaintSpec {
             background: palette.surface,
             ..PaintSpec::default()
@@ -921,7 +933,7 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         outer,
         "clip.outer.overflow",
-        Rect::new(100.0, 50.0, 100.0, 80.0),
+        LogicalRect::new(px(100.0), px(50.0), px(100.0), px(80.0)),
         PaintSpec {
             background: palette.accent,
             ..PaintSpec::default()
@@ -931,7 +943,10 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         outer,
         "clip.inner",
-        abs_style(Rect::new(16.0, 16.0, 80.0, 50.0), Clip::Bounds),
+        abs_style(
+            LogicalRect::new(px(16.0), px(16.0), px(80.0), px(50.0)),
+            Clip::Bounds,
+        ),
         PaintSpec {
             background: palette.muted,
             ..PaintSpec::default()
@@ -941,7 +956,7 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         inner,
         "clip.inner.overflow",
-        Rect::new(24.0, 24.0, 120.0, 70.0),
+        LogicalRect::new(px(24.0), px(24.0), px(120.0), px(70.0)),
         PaintSpec {
             background: palette.ink,
             ..PaintSpec::default()
@@ -951,7 +966,7 @@ fn build_clip(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         outer,
         "clip.outer.free",
-        Rect::new(130.0, 10.0, 40.0, 20.0),
+        LogicalRect::new(px(130.0), px(10.0), px(40.0), px(20.0)),
         PaintSpec {
             background: palette.ink,
             ..PaintSpec::default()
@@ -965,14 +980,17 @@ fn build_clip_subpixel(app: &mut TestApp, root: NodeId, palette: &Palette) {
         app,
         root,
         "clip.subpixel.outer",
-        abs_style(Rect::new(24.25, 20.5, 132.25, 76.25), Clip::Bounds),
+        abs_style(
+            LogicalRect::new(px(24.25), px(20.5), px(132.25), px(76.25)),
+            Clip::Bounds,
+        ),
         PaintSpec::default(),
     );
     box_node(
         app,
         outer,
         "clip.subpixel.overflow",
-        Rect::new(-40.0, -30.0, 400.0, 300.0),
+        LogicalRect::new(px(-40.0), px(-30.0), px(400.0), px(300.0)),
         PaintSpec {
             background: palette.ink,
             ..PaintSpec::default()
@@ -1011,7 +1029,7 @@ mod tests {
         GoldenError, SnapshotCase, SnapshotDiff, SnapshotImage, SnapshotScene, SnapshotTheme,
         Tolerance, compare, scale_token,
     };
-    use crate::math::{Scale, Size};
+    use crate::math::{DevicePixelRatio, LogicalSize, px};
 
     fn image(width: u32, height: u32, fill: [u8; 4]) -> SnapshotImage {
         SnapshotImage {
@@ -1025,8 +1043,8 @@ mod tests {
         SnapshotCase {
             scene,
             theme,
-            size: Size::new(10.0, 10.0),
-            scale: Scale::new(scale).expect("scale"),
+            size: LogicalSize::new(px(10.0), px(10.0)),
+            scale: DevicePixelRatio::new(scale).expect("scale"),
         }
     }
 

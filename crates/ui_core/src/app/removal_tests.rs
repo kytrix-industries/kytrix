@@ -12,7 +12,7 @@ use crate::{
     interaction::{
         AnimatedValue, AnimationSpec, Easing, ScrollConfig, ScrollHandle, VirtualListConfig,
     },
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     node::{
         builder::NodeBuilder,
         dirty::DirtyFlags,
@@ -34,8 +34,8 @@ fn setup() -> (tokio::runtime::Runtime, App, WindowId) {
     app.use_engine_clock();
     let window = app.create_window(WindowOptions {
         title: "e16".into(),
-        size: Size::new(400.0, 300.0),
-        scale: Scale::ONE,
+        size: LogicalSize::new(px(400.0), px(300.0)),
+        scale: DevicePixelRatio::ONE,
         ..WindowOptions::default()
     });
     (rt, app, window)
@@ -46,7 +46,7 @@ fn root(app: &App, window: WindowId) -> NodeId {
 }
 
 fn boxed_style(width: f32, height: f32) -> Style {
-    StyleBuilder::new().size(width, height).build()
+    StyleBuilder::new().size(px(width), px(height)).build()
 }
 
 fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
@@ -292,9 +292,9 @@ fn scroll_animations_are_cancelled_with_their_container() {
     let handle = app
         .make_scroll(window, container, ScrollConfig::default())
         .expect("scroll container");
-    app.set_scroll_content(&handle, Size::new(100.0, 400.0))
+    app.set_scroll_content(&handle, LogicalSize::new(px(100.0), px(400.0)))
         .expect("content");
-    app.scroll_to_animated(&handle, Point::new(0.0, 120.0))
+    app.scroll_to_animated(&handle, LogicalPoint::new(px(0.0), px(120.0)))
         .expect("animated scroll");
     assert_eq!(animation_count(&app), 1);
     assert!(app.needs_continuous_frames(), "滚动动画需要帧");
@@ -331,14 +331,19 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
         )
         .expect("virtual list");
     app.set_virtual_items(&list, 100, |_index| {
-        NodeBuilder::boxed().layout_override(Rect::new(0.0, 0.0, 200.0, 25.0))
+        NodeBuilder::boxed().layout_override(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(200.0),
+            px(25.0),
+        ))
     })
     .expect("items");
     settle(&mut app, window);
@@ -379,7 +384,7 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
 
     app.scroll_to(
         &ScrollHandle::new(window, container),
-        Point::new(0.0, 2000.0),
+        LogicalPoint::new(px(0.0), px(2000.0)),
     )
     .expect("scroll far");
     assert_eq!(
@@ -842,7 +847,7 @@ fn removing_a_hovered_subtree_derives_a_leave_event() {
         .expect("mount keep");
     let outer = mount_box(&mut app, window, keep);
     let inner = NodeBuilder::boxed()
-        .layout_override(Rect::new(10.0, 10.0, 20.0, 20.0))
+        .layout_override(LogicalRect::new(px(10.0), px(10.0), px(20.0), px(20.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), outer)
         .expect("mount inner");
     settle(&mut app, window);
@@ -850,12 +855,12 @@ fn removing_a_hovered_subtree_derives_a_leave_event() {
 
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(20.0, 20.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(20.0), px(20.0)), Modifiers::empty()),
     );
     app.dispatch_input(
         window,
         InputEvent::pointer_down(
-            Point::new(20.0, 20.0),
+            LogicalPoint::new(px(20.0), px(20.0)),
             PointerButton::Primary,
             Modifiers::empty(),
         ),
@@ -918,14 +923,14 @@ fn removing_a_hovered_subtree_derives_a_leave_event() {
     );
 
     let other = NodeBuilder::boxed()
-        .layout_override(Rect::new(250.0, 10.0, 40.0, 40.0))
+        .layout_override(LogicalRect::new(px(250.0), px(10.0), px(40.0), px(40.0)))
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount other");
     settle(&mut app, window);
     let _ = app.drain_events();
     app.dispatch_input(
         window,
-        InputEvent::pointer_move(Point::new(260.0, 20.0), Modifiers::empty()),
+        InputEvent::pointer_move(LogicalPoint::new(px(260.0), px(20.0)), Modifiers::empty()),
     );
     let _ = app.drain_events();
     assert_eq!(app.hovered(window), Some(other), "前置条件：other 被悬停");
@@ -955,14 +960,19 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
             window,
             container,
             VirtualListConfig {
-                extent: 25.0,
+                extent: px(25.0),
                 extents: None,
                 overscan: 0,
             },
         )
         .expect("virtual list");
     app.set_virtual_items(&list, 100, |_index| {
-        NodeBuilder::boxed().layout_override(Rect::new(0.0, 0.0, 200.0, 25.0))
+        NodeBuilder::boxed().layout_override(LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(200.0),
+            px(25.0),
+        ))
     })
     .expect("items");
     settle(&mut app, window);

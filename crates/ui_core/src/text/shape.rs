@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     error::EngineError,
-    math::{Point, Rect, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalPx, LogicalRect, LogicalSize, physical_px, px},
     paint::{
         color::{Color, ColorBrush},
         primitive::PositionedGlyph,
@@ -33,11 +33,11 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub(crate) struct EllipsisGlyphs {
-    pub glyphs: Vec<(u32, f32)>,
+    pub glyphs: Vec<(u32, LogicalPx)>,
     pub font: parley::FontData,
     pub variation_coords: Vec<i16>,
     pub synthesis: fontique::Synthesis,
-    pub advance: f32,
+    pub advance: LogicalPx,
 }
 
 impl EllipsisGlyphs {
@@ -51,7 +51,7 @@ pub(crate) struct RasterCtx<'a> {
     pub glyph_atlas: &'a mut GlyphAtlas,
     pub atlas: &'a mut AtlasAllocator,
     pub generation: u32,
-    pub scale: f32,
+    pub scale: DevicePixelRatio,
 }
 
 pub(crate) struct ShapedText {
@@ -63,7 +63,7 @@ pub(crate) struct ShapedText {
     kind: ShapedKind,
     inline_diagnostics: Vec<TextDiagnostic>,
     inline_boxes: Box<[InlineBoxSpec]>,
-    measure_memo: RefCell<Option<(u32, Size)>>,
+    measure_memo: RefCell<Option<(u32, LogicalSize)>>,
     measure_breaks: Cell<u32>,
 }
 
@@ -74,8 +74,8 @@ enum ShapedKind {
 
 struct ParleySnapshot {
     layout: parley::Layout<ColorBrush>,
-    min_size: Size,
-    max_size: Size,
+    min_size: LogicalSize,
+    max_size: LogicalSize,
     broken_at: Option<u32>,
     aligned_at: Option<u8>,
 }
@@ -83,10 +83,10 @@ struct ParleySnapshot {
 impl ParleySnapshot {
     fn new(mut layout: parley::Layout<ColorBrush>, max_lines: Option<u16>) -> Self {
         layout.break_all_lines(None);
-        let max_size = Size::new(layout.width(), visible_height(&layout, max_lines));
+        let max_size = LogicalSize::new(px(layout.width()), visible_height(&layout, max_lines));
         let widths = layout.calculate_content_widths();
         layout.break_all_lines(Some(widths.min));
-        let min_size = Size::new(layout.width(), visible_height(&layout, max_lines));
+        let min_size = LogicalSize::new(px(layout.width()), visible_height(&layout, max_lines));
         layout.break_all_lines(None);
         Self {
             layout,
@@ -97,10 +97,10 @@ impl ParleySnapshot {
         }
     }
 
-    fn break_and_align(&mut self, width: Option<f32>, alignment: Alignment) -> f32 {
-        let key = width.map(f32::to_bits);
+    fn break_and_align(&mut self, width: Option<LogicalPx>, alignment: Alignment) -> LogicalPx {
+        let key = width.map(|width| width.value().to_bits());
         if self.broken_at != key {
-            self.layout.break_all_lines(width);
+            self.layout.break_all_lines(width.map(LogicalPx::value));
             self.broken_at = key;
             self.aligned_at = None;
         }
@@ -109,26 +109,26 @@ impl ParleySnapshot {
             self.layout.align(alignment, AlignmentOptions::default());
             self.aligned_at = Some(align_key);
         }
-        self.layout.width()
+        px(self.layout.width())
     }
 
-    fn visible_height(&self, max_lines: Option<u16>) -> f32 {
+    fn visible_height(&self, max_lines: Option<u16>) -> LogicalPx {
         visible_height(&self.layout, max_lines)
     }
 }
 
-fn visible_height(layout: &parley::Layout<ColorBrush>, max_lines: Option<u16>) -> f32 {
+fn visible_height(layout: &parley::Layout<ColorBrush>, max_lines: Option<u16>) -> LogicalPx {
     let Some(max_lines) = max_lines else {
-        return layout.height();
+        return px(layout.height());
     };
     let lines = layout.lines();
     if lines.len() <= usize::from(max_lines) {
-        return layout.height();
+        return px(layout.height());
     }
-    lines
+    px(lines
         .take(usize::from(max_lines))
         .map(|line| line.metrics().line_height)
-        .sum()
+        .sum())
 }
 
 impl ShapedText {
@@ -268,7 +268,7 @@ impl ShapedText {
         }
     }
 
-    pub(crate) fn max_content_size(&self) -> Size {
+    pub(crate) fn max_content_size(&self) -> LogicalSize {
         match &self.kind {
             ShapedKind::Parley(snapshot) => snapshot.borrow().max_size,
             ShapedKind::Simple(simple) => simple.size(),
@@ -279,9 +279,9 @@ impl ShapedText {
         &self,
         _known: taffy::Size<Option<f32>>,
         available: taffy::Size<AvailableSpace>,
-    ) -> Size {
+    ) -> LogicalSize {
         if self.text.is_empty() {
-            return Size::ZERO;
+            return LogicalSize::ZERO;
         }
         let max_lines = self.style.max_lines();
         match &self.kind {
@@ -290,8 +290,8 @@ impl ShapedText {
                 AvailableSpace::MinContent => snapshot.borrow().min_size,
                 AvailableSpace::MaxContent => snapshot.borrow().max_size,
                 AvailableSpace::Definite(width) => {
-                    let width = width.max(0.0);
-                    let bits = width.to_bits();
+                    let width = px(width.max(0.0));
+                    let bits = width.value().to_bits();
                     if let Some((cached, size)) = *self.measure_memo.borrow()
                         && cached == bits
                     {
@@ -306,7 +306,7 @@ impl ShapedText {
                         self.measure_breaks.set(self.measure_breaks.get() + 1);
                         let measured_width =
                             snapshot.break_and_align(Some(width), Alignment::Start);
-                        Size::new(measured_width, snapshot.visible_height(max_lines))
+                        LogicalSize::new(measured_width, snapshot.visible_height(max_lines))
                     };
                     *self.measure_memo.borrow_mut() = Some((bits, size));
                     size
@@ -364,7 +364,7 @@ impl ShapedText {
 
     pub(crate) fn rasterize(
         &self,
-        content_width: f32,
+        content_width: LogicalPx,
         alignment: TextAlign,
         color: Color,
         ctx: &mut RasterCtx<'_>,
@@ -390,7 +390,7 @@ impl ShapedText {
                 self.style.direction,
             )
         } else {
-            0.0
+            LogicalPx::ZERO
         };
         let (mut shaped, diagnostics, line_offset) = match &self.kind {
             ShapedKind::Simple(simple) => {
@@ -400,18 +400,20 @@ impl ShapedText {
             }
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
-                let width =
-                    snapshot.break_and_align(Some(content_width.max(0.0)), align_of(alignment));
+                let width = snapshot.break_and_align(
+                    Some(content_width.max(LogicalPx::ZERO)),
+                    align_of(alignment),
+                );
                 let line_count = snapshot.layout.lines().len();
                 let visible_last = max_visible_lines(&self.style, line_count);
                 let line_offset = if visible_last == 0 {
-                    0.0
+                    LogicalPx::ZERO
                 } else {
                     snapshot
                         .layout
                         .lines()
                         .nth(visible_last - 1)
-                        .map_or(0.0, |line| line.metrics().offset)
+                        .map_or(LogicalPx::ZERO, |line| px(line.metrics().offset))
                 };
                 let (shaped, diagnostics) = rasterize_parley(
                     &snapshot.layout,
@@ -440,14 +442,14 @@ impl ShapedText {
 
     fn with_broken_layout<R>(
         &self,
-        width: f32,
+        width: LogicalPx,
         alignment: TextAlign,
         body: impl FnOnce(&parley::Layout<ColorBrush>) -> R,
     ) -> Option<R> {
         match &self.kind {
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
-                snapshot.break_and_align(Some(width.max(0.0)), align_of(alignment));
+                snapshot.break_and_align(Some(width.max(LogicalPx::ZERO)), align_of(alignment));
                 Some(body(&snapshot.layout))
             }
             ShapedKind::Simple(_) => None,
@@ -456,11 +458,11 @@ impl ShapedText {
 
     pub(crate) fn selection_rects(
         &self,
-        width: f32,
+        width: LogicalPx,
         alignment: TextAlign,
         anchor: usize,
         focus: usize,
-    ) -> Vec<Rect> {
+    ) -> Vec<LogicalRect> {
         if let ShapedKind::Simple(simple) = &self.kind {
             return simple
                 .selection_rect(width, alignment, self.style.direction, anchor, focus)
@@ -473,7 +475,12 @@ impl ShapedText {
         .unwrap_or_default()
     }
 
-    pub(crate) fn caret_rect(&self, width: f32, alignment: TextAlign, byte_index: usize) -> Rect {
+    pub(crate) fn caret_rect(
+        &self,
+        width: LogicalPx,
+        alignment: TextAlign,
+        byte_index: usize,
+    ) -> LogicalRect {
         if let ShapedKind::Simple(simple) = &self.kind {
             let metrics = simple.metrics();
             let offset = super::fast_path::simple_alignment_offset(
@@ -482,10 +489,10 @@ impl ShapedText {
                 alignment,
                 self.style.direction,
             );
-            return Rect::new(
+            return LogicalRect::new(
                 offset + simple.caret_x(byte_index),
-                0.0,
-                1.0,
+                px(0.0),
+                px(1.0),
                 metrics.line_height,
             );
         }
@@ -495,9 +502,14 @@ impl ShapedText {
         .unwrap_or_default()
     }
 
-    pub(crate) fn byte_index_at(&self, width: f32, alignment: TextAlign, point: Point) -> usize {
+    pub(crate) fn byte_index_at(
+        &self,
+        width: LogicalPx,
+        alignment: TextAlign,
+        point: LogicalPoint,
+    ) -> usize {
         if let ShapedKind::Simple(simple) = &self.kind {
-            if point.y < 0.0 {
+            if point.y < LogicalPx::ZERO {
                 return 0;
             }
             let metrics = simple.metrics();
@@ -530,11 +542,11 @@ impl ShapedText {
     }
 
     #[cfg(test)]
-    pub(crate) fn layout_at(&self, width: f32) -> parley::Layout<ColorBrush> {
+    pub(crate) fn layout_at(&self, width: LogicalPx) -> parley::Layout<ColorBrush> {
         match &self.kind {
             ShapedKind::Parley(snapshot) => {
                 let mut snapshot = snapshot.borrow_mut();
-                snapshot.break_and_align(Some(width.max(0.0)), Alignment::Start);
+                snapshot.break_and_align(Some(width.max(LogicalPx::ZERO)), Alignment::Start);
                 snapshot.layout.clone()
             }
             ShapedKind::Simple(_) => panic!("simple fast-path snapshots have no parley layout"),
@@ -547,10 +559,10 @@ impl ShapedText {
     }
 
     #[cfg(test)]
-    pub(crate) fn first_glyph_x_at(&self, width: f32) -> f32 {
+    pub(crate) fn first_glyph_x_at(&self, width: LogicalPx) -> LogicalPx {
         let mut layout = self.layout_at(width);
         layout.align(align_of(self.style.alignment), AlignmentOptions::default());
-        layout
+        px(layout
             .lines()
             .next()
             .and_then(|line| line.items().next())
@@ -560,7 +572,7 @@ impl ShapedText {
                 }
                 PositionedLayoutItem::InlineBox(_) => None,
             })
-            .unwrap_or(0.0)
+            .unwrap_or(0.0))
     }
 }
 
@@ -569,7 +581,7 @@ pub(super) fn push_shaping_defaults<'a>(
     style: &TextStyle,
 ) {
     builder.push_default(StyleProperty::Brush(ColorBrush { color: style.color }));
-    builder.push_default(StyleProperty::FontSize(style.size));
+    builder.push_default(StyleProperty::FontSize(style.size.value()));
     builder.push_default(StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(
         style.weight,
     ))));
@@ -578,7 +590,7 @@ pub(super) fn push_shaping_defaults<'a>(
         TextSlant::Italic => ParleyFontStyle::Italic,
         TextSlant::Oblique => ParleyFontStyle::Oblique(None),
     }));
-    builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
+    builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing.value()));
     builder.push_default(StyleProperty::LineHeight(match style.line_height {
         None => ParleyLineHeight::NORMAL,
         Some(factor) => ParleyLineHeight::FontSizeRelative(factor),
@@ -603,7 +615,7 @@ pub(super) fn push_shaping_defaults<'a>(
         ));
     }
     if let Some(word_spacing) = style.word_spacing() {
-        builder.push_default(StyleProperty::WordSpacing(word_spacing));
+        builder.push_default(StyleProperty::WordSpacing(word_spacing.value()));
     }
     if let Some(locale) = style.locale()
         && let Ok(language) = parley::Language::parse(locale)
@@ -651,7 +663,7 @@ fn push_run_style<'a>(
         StyleProperty::Brush(ColorBrush { color: style.color }),
         range.clone(),
     );
-    builder.push(StyleProperty::FontSize(style.size), range.clone());
+    builder.push(StyleProperty::FontSize(style.size.value()), range.clone());
     builder.push(
         StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(style.weight))),
         range.clone(),
@@ -665,7 +677,7 @@ fn push_run_style<'a>(
         range.clone(),
     );
     builder.push(
-        StyleProperty::LetterSpacing(style.letter_spacing),
+        StyleProperty::LetterSpacing(style.letter_spacing.value()),
         range.clone(),
     );
     builder.push(
@@ -697,7 +709,10 @@ fn push_run_style<'a>(
         );
     }
     if let Some(word_spacing) = style.word_spacing() {
-        builder.push(StyleProperty::WordSpacing(word_spacing), range.clone());
+        builder.push(
+            StyleProperty::WordSpacing(word_spacing.value()),
+            range.clone(),
+        );
     }
     if let Some(locale) = style.locale()
         && let Ok(language) = parley::Language::parse(locale)
@@ -757,7 +772,7 @@ pub(crate) fn measure_ellipsis(
         push_shaping_defaults(&mut builder, style);
         let mut layout = builder.build(text);
         layout.break_all_lines(None);
-        let mut glyphs: Vec<(u32, f32)> = Vec::new();
+        let mut glyphs: Vec<(u32, LogicalPx)> = Vec::new();
         let mut font: Option<parley::FontData> = None;
         let mut variation_coords: Vec<i16> = Vec::new();
         let mut synthesis = fontique::Synthesis::default();
@@ -783,7 +798,7 @@ pub(crate) fn measure_ellipsis(
                         missing = true;
                         break;
                     }
-                    glyphs.push((glyph.id, glyph.advance));
+                    glyphs.push((glyph.id, px(glyph.advance)));
                     advance += glyph.advance;
                 }
             }
@@ -797,7 +812,7 @@ pub(crate) fn measure_ellipsis(
                 font: font?,
                 variation_coords,
                 synthesis,
-                advance,
+                advance: px(advance),
             });
         }
     }
@@ -826,7 +841,7 @@ fn line_content_end(text: &str, line_range: &core::ops::Range<usize>) -> usize {
 
 fn decoration_segments(
     line: &parley::Line<'_, ColorBrush>,
-    baseline: f32,
+    baseline: LogicalPx,
     text: &str,
     runs: &[TextRun],
     base_style: &TextStyle,
@@ -834,7 +849,7 @@ fn decoration_segments(
 ) -> Vec<ShapedDecoration> {
     let line_range = line.text_range();
     let line_end = line_content_end(text, &line_range);
-    let decorated: Vec<(core::ops::Range<usize>, TextDecoration, f32, Color)> = runs
+    let decorated: Vec<(core::ops::Range<usize>, TextDecoration, LogicalPx, Color)> = runs
         .iter()
         .filter_map(|run| {
             let decoration = run.style.decoration()?;
@@ -847,7 +862,7 @@ fn decoration_segments(
         })
         .collect();
 
-    let mut segments: Vec<(core::ops::Range<usize>, TextDecoration, f32, Color)> = Vec::new();
+    let mut segments: Vec<(core::ops::Range<usize>, TextDecoration, LogicalPx, Color)> = Vec::new();
     if let Some(decoration) = base_style.decoration()
         && decoration.is_visible()
     {
@@ -881,7 +896,7 @@ fn decoration_segments(
             ),
         };
         out.push(ShapedDecoration {
-            rect: Rect::new(left, top - thickness * 0.5, width, thickness),
+            rect: LogicalRect::new(left, top - thickness * 0.5, width, thickness),
             color,
         });
     }
@@ -892,7 +907,7 @@ fn decoration_span(
     line: &parley::Line<'_, ColorBrush>,
     text: &str,
     range: core::ops::Range<usize>,
-) -> Option<(f32, f32)> {
+) -> Option<(LogicalPx, LogicalPx)> {
     let start = range.start.min(text.len());
     let end = range.end.min(text.len());
     if start >= end {
@@ -916,7 +931,7 @@ fn decoration_span(
     let x1 = last.visual_offset()? + last.advance();
     let left = x0.min(x1);
     let width = (x1 - x0).abs();
-    (width > 0.0 && left.is_finite() && width.is_finite()).then_some((left, width))
+    (width > 0.0 && left.is_finite() && width.is_finite()).then_some((px(left), px(width)))
 }
 
 fn current_run_color(
@@ -937,7 +952,7 @@ fn current_run_color(
 
 fn rasterize_parley(
     layout: &parley::Layout<ColorBrush>,
-    content_width: f32,
+    content_width: LogicalPx,
     text: &SmolStr,
     color: Color,
     runs: &[TextRun],
@@ -945,7 +960,6 @@ fn rasterize_parley(
     ctx: &mut RasterCtx<'_>,
     inline_diagnostics: &[TextDiagnostic],
 ) -> Result<(ShapedLine, Vec<TextDiagnostic>), EngineError> {
-    let scale = ctx.scale;
     let mut diagnostics: Vec<TextDiagnostic> = inline_diagnostics.to_vec();
     let mut lines = Vec::with_capacity(layout.lines().len());
     for line in layout.lines() {
@@ -1001,7 +1015,11 @@ fn rasterize_parley(
                     cluster_cursor = Some((run_text_range, cursor));
                     let item_color =
                         current_run_color(runs, &item_range, run.style().brush.color, color);
-                    let ppem = (parley_run.font_size() * scale).clamp(1.0, 512.0);
+                    let ppem = ctx
+                        .scale
+                        .to_physical(px(parley_run.font_size()))
+                        .value()
+                        .clamp(1.0, 512.0);
                     if parley_run.synthesis().any() {
                         diagnostics.push(TextDiagnostic::SyntheticStyle {
                             text_range: item_range.clone(),
@@ -1023,8 +1041,15 @@ fn rasterize_parley(
                                 text_range: item_range.clone(),
                             });
                         }
-                        let Some((positioned, color_glyph)) =
-                            emit_glyph(ctx, &font, glyph.id, ppem, &variation, glyph.x, glyph.y)?
+                        let Some((positioned, color_glyph)) = emit_glyph(
+                            ctx,
+                            &font,
+                            glyph.id,
+                            ppem,
+                            &variation,
+                            px(glyph.x),
+                            px(glyph.y),
+                        )?
                         else {
                             continue;
                         };
@@ -1044,8 +1069,9 @@ fn rasterize_parley(
                     }));
                 }
                 PositionedLayoutItem::InlineBox(box_) => {
-                    let rect = Rect::new(box_.x, box_.y, box_.width, box_.height);
-                    if rect.size.width > content_width && content_width > 0.0 {
+                    let rect =
+                        LogicalRect::new(px(box_.x), px(box_.y), px(box_.width), px(box_.height));
+                    if rect.size.width > content_width && content_width > LogicalPx::ZERO {
                         diagnostics.push(TextDiagnostic::InlineBoxOverflow {
                             id: box_.id,
                             width: rect.size.width,
@@ -1055,18 +1081,18 @@ fn rasterize_parley(
                     items.push(ShapedTextItem::InlineBox(ShapedInlineBox {
                         id: box_.id,
                         rect,
-                        baseline: box_.baseline,
+                        baseline: box_.baseline.map(px),
                     }));
                 }
             }
         }
         let decorations =
-            decoration_segments(&line, metrics.baseline, text, runs, base_style, color);
+            decoration_segments(&line, px(metrics.baseline), text, runs, base_style, color);
         lines.push(ShapedTextLine {
             text_range: line.text_range(),
-            baseline: metrics.baseline,
-            line_height: metrics.line_height,
-            advance: metrics.advance,
+            baseline: px(metrics.baseline),
+            line_height: px(metrics.line_height),
+            advance: px(metrics.advance),
             items,
             decorations,
         });
@@ -1074,12 +1100,12 @@ fn rasterize_parley(
     let shaped = ShapedLine {
         text: text.clone(),
         lines,
-        width: layout.width(),
-        height: layout.height(),
-        first_baseline: layout.first_baseline(),
+        width: px(layout.width()),
+        height: px(layout.height()),
+        first_baseline: layout.first_baseline().map(px),
         atlas_generation: ctx.generation,
         font_stack_version: 0,
-        scale,
+        scale: ctx.scale,
     };
     Ok((shaped, diagnostics))
 }
@@ -1090,11 +1116,10 @@ fn emit_glyph(
     glyph_id: u32,
     ppem: f32,
     variation: &GlyphVariation,
-    logical_x: f32,
-    logical_y: f32,
+    logical_x: LogicalPx,
+    logical_y: LogicalPx,
 ) -> Result<Option<(PositionedGlyph, bool)>, EngineError> {
-    let scale = ctx.scale;
-    let (base_x, subpixel_x) = split_subpixel_x(logical_x * scale);
+    let (base_x, subpixel_x) = split_subpixel_x(ctx.scale.to_physical(logical_x).value());
     let tile = ctx.glyph_atlas.ensure(
         ctx.raster,
         ctx.atlas,
@@ -1108,12 +1133,18 @@ fn emit_glyph(
         return Ok(None);
     };
     let origin_x = base_x + tile.left as f32;
-    let origin_y = (logical_y * scale).round() - tile.top as f32;
+    let origin_y = ctx.scale.to_physical(logical_y).value().round() - tile.top as f32;
     Ok(Some((
         PositionedGlyph {
             tile: tile.tile,
-            position: Point::new(origin_x / scale, origin_y / scale),
-            size: Size::new(tile.width as f32 / scale, tile.height as f32 / scale),
+            position: LogicalPoint::new(
+                ctx.scale.to_logical(physical_px(origin_x)),
+                ctx.scale.to_logical(physical_px(origin_y)),
+            ),
+            size: LogicalSize::new(
+                ctx.scale.to_logical(physical_px(tile.width as f32)),
+                ctx.scale.to_logical(physical_px(tile.height as f32)),
+            ),
         },
         tile.color,
     )))
@@ -1122,11 +1153,11 @@ fn emit_glyph(
 fn apply_overflow(
     shaped: &mut ShapedLine,
     style: &TextStyle,
-    content_width: f32,
+    content_width: LogicalPx,
     color: Color,
     ctx: &mut RasterCtx<'_>,
     ellipsis: Option<&EllipsisGlyphs>,
-    line_offset: f32,
+    line_offset: LogicalPx,
 ) -> Result<(), EngineError> {
     if shaped.lines.is_empty() {
         return Ok(());
@@ -1137,7 +1168,7 @@ fn apply_overflow(
         shaped.lines.truncate(max_lines);
     }
     let mut overflowing = truncated;
-    if content_width > 0.0 {
+    if content_width > LogicalPx::ZERO {
         overflowing |= shaped.width > content_width + 1e-3;
     }
     if overflowing
@@ -1162,12 +1193,15 @@ fn apply_overflow(
         .lines
         .iter()
         .map(|line| line.advance)
-        .fold(0.0f32, f32::max);
-    shaped.height = shaped.lines.iter().map(|line| line.line_height).sum();
+        .fold(LogicalPx::ZERO, LogicalPx::max);
+    shaped.height = shaped
+        .lines
+        .iter()
+        .fold(LogicalPx::ZERO, |total, line| total + line.line_height);
     Ok(())
 }
 
-fn clamp_line_decorations(line: &mut ShapedTextLine, line_offset: f32) {
+fn clamp_line_decorations(line: &mut ShapedTextLine, line_offset: LogicalPx) {
     let min = line_offset;
     let max = line_offset + line.advance;
     for decoration in &mut line.decorations {
@@ -1177,11 +1211,11 @@ fn clamp_line_decorations(line: &mut ShapedTextLine, line_offset: f32) {
             decoration.rect.origin.x = left;
             decoration.rect.size.width = right - left;
         } else {
-            decoration.rect.size.width = 0.0;
+            decoration.rect.size.width = LogicalPx::ZERO;
         }
     }
     line.decorations
-        .retain(|decoration| decoration.rect.size.width > 0.0);
+        .retain(|decoration| decoration.rect.size.width > LogicalPx::ZERO);
 }
 
 fn max_visible_lines(style: &TextStyle, line_count: usize) -> usize {
@@ -1193,16 +1227,16 @@ fn max_visible_lines(style: &TextStyle, line_count: usize) -> usize {
 fn clip_with_ellipsis(
     shaped: &mut ShapedLine,
     ellipsis: &EllipsisGlyphs,
-    content_width: f32,
+    content_width: LogicalPx,
     color: Color,
     style: &TextStyle,
     ctx: &mut RasterCtx<'_>,
-    line_offset: f32,
+    line_offset: LogicalPx,
 ) -> Result<(), EngineError> {
     let Some(last) = shaped.lines.last_mut() else {
         return Ok(());
     };
-    let ppem = (style.size * ctx.scale).clamp(1.0, 512.0);
+    let ppem = ctx.scale.to_physical(style.size).value().clamp(1.0, 512.0);
     let variation = GlyphVariation::of(&ellipsis.variation_coords, ellipsis.synthesis, ppem);
     let baseline = last.baseline;
 
@@ -1214,7 +1248,7 @@ fn clip_with_ellipsis(
             ShapedTextItem::InlineBox(_) => 0,
         })
         .sum();
-    let mut starts: Vec<f32> = Vec::with_capacity(glyph_count);
+    let mut starts: Vec<LogicalPx> = Vec::with_capacity(glyph_count);
     for item in &last.items {
         if let ShapedTextItem::GlyphRun(run) = item {
             starts.extend(
@@ -1226,10 +1260,12 @@ fn clip_with_ellipsis(
     }
 
     let mut prefix_len = 0usize;
-    let mut prefix_end = 0.0f32;
+    let mut prefix_end = LogicalPx::ZERO;
     for (index, _) in starts.iter().enumerate() {
         let end = starts.get(index + 1).copied().unwrap_or(last.advance);
-        if content_width > 0.0 && end + line_offset + ellipsis.advance > content_width + 1e-3 {
+        if content_width > LogicalPx::ZERO
+            && end + line_offset + ellipsis.advance > content_width + 1e-3
+        {
             break;
         }
         prefix_len = index + 1;
@@ -1260,7 +1296,7 @@ fn clip_with_ellipsis(
         )? {
             rasterized.push(positioned);
         }
-        x += advance;
+        x += *advance;
     }
     if prefix_len == 0 {
         if !matches!(last.items.first(), Some(ShapedTextItem::GlyphRun(_))) {
@@ -1338,9 +1374,12 @@ mod tests {
     use taffy::AvailableSpace;
 
     use super::family_list;
-    use crate::text::{
-        FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent,
-        TextDecoration, TextDiagnostic, TextDirection, TextRun, TextStyle, TextWrap,
+    use crate::{
+        math::{DevicePixelRatio, LogicalPx, px},
+        text::{
+            FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent,
+            TextDecoration, TextDiagnostic, TextDirection, TextRun, TextStyle, TextWrap,
+        },
     };
 
     struct Harness {
@@ -1423,8 +1462,8 @@ mod tests {
 
     fn rasterize_line(
         shaped: &super::ShapedText,
-        width: f32,
-        scale: f32,
+        width: LogicalPx,
+        scale: DevicePixelRatio,
         raster: &mut crate::text::raster::GlyphRasterizer,
         glyph_atlas: &mut crate::text::atlas::GlyphAtlas,
         atlas: &mut crate::render::atlas::AtlasAllocator,
@@ -1438,8 +1477,8 @@ mod tests {
 
     fn rasterize_line_with_ellipsis(
         shaped: &super::ShapedText,
-        width: f32,
-        scale: f32,
+        width: LogicalPx,
+        scale: DevicePixelRatio,
         raster: &mut crate::text::raster::GlyphRasterizer,
         glyph_atlas: &mut crate::text::atlas::GlyphAtlas,
         atlas: &mut crate::render::atlas::AtlasAllocator,
@@ -1500,7 +1539,7 @@ mod tests {
         rendered: &crate::text::ShapedTextLine,
         reference: &crate::text::ShapedTextLine,
         ellipsis: &super::EllipsisGlyphs,
-        content_width: f32,
+        content_width: LogicalPx,
     ) -> usize {
         let glyphs = line_glyphs(rendered);
         let reference_glyphs = line_glyphs(reference);
@@ -1527,13 +1566,13 @@ mod tests {
             reference_glyphs[prefix_len].position.x
         };
         assert!(
-            (rendered.advance - (prefix_end + ellipsis.advance)).abs() < 1e-2,
+            (rendered.advance - (prefix_end + ellipsis.advance)).abs() < px(1e-2),
             "行推进必须 == 前缀终点 + 省略号推进：{} vs {} + {}",
             rendered.advance,
             prefix_end,
             ellipsis.advance
         );
-        if content_width > 0.0 {
+        if content_width > px(0.0) {
             assert!(
                 rendered.advance <= content_width + 1e-2,
                 "前缀 + 省略号必须放得进内容宽：{} vs {content_width}",
@@ -1546,7 +1585,7 @@ mod tests {
     #[test]
     fn shape_latin_single_line_has_positive_metrics() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("Hello", TextStyle::new(16.0));
+        let shaped = harness.shape("Hello", TextStyle::new(px(16.0)));
         let size = shaped.measure(
             none_known(),
             taffy::Size {
@@ -1555,8 +1594,8 @@ mod tests {
             },
         );
 
-        assert!(size.width > 0.0, "width {}", size.width);
-        assert!(size.height > 0.0, "height {}", size.height);
+        assert!(size.width > px(0.0), "width {}", size.width);
+        assert!(size.height > px(0.0), "height {}", size.height);
         assert_eq!(shaped.layout().lines().count(), 1);
         assert_eq!(shaped.layout().text_len(), 5);
     }
@@ -1564,10 +1603,13 @@ mod tests {
     #[test]
     fn shape_cjk_breaks_only_at_character_boundaries() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("世界世界世界世界", TextStyle::new(16.0));
+        let shaped = harness.shape("世界世界世界世界", TextStyle::new(px(16.0)));
         let size = shaped.measure(none_known(), definite(60.0));
 
-        assert!(size.height > 30.0, "narrow CJK text must wrap: {size:?}");
+        assert!(
+            size.height > px(30.0),
+            "narrow CJK text must wrap: {size:?}"
+        );
         for line in shaped.layout().lines() {
             let range = line.text_range();
             assert!(
@@ -1580,7 +1622,7 @@ mod tests {
     #[test]
     fn shape_mixed_scripts_produce_glyphs() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("A中🌍한", TextStyle::new(16.0));
+        let shaped = harness.shape("A中🌍한", TextStyle::new(px(16.0)));
         let glyphs: usize = shaped
             .layout()
             .lines()
@@ -1599,7 +1641,7 @@ mod tests {
     #[test]
     fn rebreak_changes_line_count_without_a_new_layout() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("alpha beta gamma delta", TextStyle::new(16.0));
+        let shaped = harness.shape("alpha beta gamma delta", TextStyle::new(px(16.0)));
         let wide = shaped.measure(none_known(), definite(1000.0));
         let narrow = shaped.measure(none_known(), definite(60.0));
 
@@ -1610,24 +1652,24 @@ mod tests {
     #[test]
     fn align_center_moves_the_first_glyph_right() {
         let mut harness = Harness::new();
-        let start = harness.shape("abc", TextStyle::new(16.0));
-        let mut style = TextStyle::new(16.0);
+        let start = harness.shape("abc", TextStyle::new(px(16.0)));
+        let mut style = TextStyle::new(px(16.0));
         style.alignment = crate::text::TextAlign::Center;
         let centered = harness.shape("abc", style);
 
         assert!(
-            centered.first_glyph_x_at(200.0) > start.first_glyph_x_at(200.0),
+            centered.first_glyph_x_at(px(200.0)) > start.first_glyph_x_at(px(200.0)),
             "centering inside a 200px line box must shift the glyph right: {} vs {}",
-            centered.first_glyph_x_at(200.0),
-            start.first_glyph_x_at(200.0)
+            centered.first_glyph_x_at(px(200.0)),
+            start.first_glyph_x_at(px(200.0))
         );
     }
 
     fn rasterize_at(
         shaped: &super::ShapedText,
-        width: f32,
+        width: LogicalPx,
         alignment: TextAlign,
-        scale: f32,
+        scale: DevicePixelRatio,
     ) -> crate::text::ShapedLine {
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let generation = atlas.generation();
@@ -1652,7 +1694,7 @@ mod tests {
 
     fn rasterize_line_in_color(
         shaped: &super::ShapedText,
-        width: f32,
+        width: LogicalPx,
         color: crate::paint::color::Color,
     ) -> crate::text::ShapedLine {
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
@@ -1662,7 +1704,7 @@ mod tests {
             glyph_atlas: &mut glyphs,
             atlas: &mut atlas,
             generation,
-            scale: 1.0,
+            scale: DevicePixelRatio::ONE,
         };
         shaped
             .rasterize(width, shaped.style().alignment, color, &mut ctx, None)
@@ -1673,7 +1715,7 @@ mod tests {
     fn all_glyph_positions(line: &crate::text::ShapedLine) -> Vec<(f32, f32)> {
         line.glyph_runs()
             .flat_map(|run| run.glyphs.iter())
-            .map(|glyph| (glyph.position.x, glyph.position.y))
+            .map(|glyph| (glyph.position.x.value(), glyph.position.y.value()))
             .collect()
     }
 
@@ -1690,7 +1732,7 @@ mod tests {
     #[test]
     fn fast_path_raster_alignment_matches_parley_physical_positions() {
         let mut enabled = crate::text::context::TextContext::new();
-        let style = TextStyle::new(16.0).with_wrap(TextWrap::NoWrap);
+        let style = TextStyle::new(px(16.0)).with_wrap(TextWrap::NoWrap);
         let content = TextContent::new("1,234.56", style);
         let fast = enabled.shape_cached(&content).0;
         let stats = enabled.take_fast_path_stats();
@@ -1703,13 +1745,16 @@ mod tests {
         disabled.set_digit_fast_path(false);
         let parley = disabled.shape_cached(&content).0;
 
-        for scale in [1.0f32, 1.25] {
+        for scale in [
+            DevicePixelRatio::ONE,
+            DevicePixelRatio::new(1.25).expect("scale"),
+        ] {
             for alignment in [TextAlign::Right, TextAlign::Center] {
-                let fast_line = rasterize_at(&fast, 200.0, alignment, scale);
-                let parley_line = rasterize_at(&parley, 200.0, alignment, scale);
+                let fast_line = rasterize_at(&fast, px(200.0), alignment, scale);
+                let parley_line = rasterize_at(&parley, px(200.0), alignment, scale);
                 assert!(
-                    (fast_line.width - parley_line.width).abs() <= 0.01,
-                    "{alignment:?} scale={scale}: fast width {} vs parley {}",
+                    (fast_line.width - parley_line.width).abs() <= px(0.01),
+                    "{alignment:?} scale={scale:?}: fast width {} vs parley {}",
                     fast_line.width,
                     parley_line.width
                 );
@@ -1718,21 +1763,22 @@ mod tests {
                 assert_eq!(
                     fast_positions.len(),
                     parley_positions.len(),
-                    "{alignment:?} scale={scale}: glyph count"
+                    "{alignment:?} scale={scale:?}: glyph count"
                 );
                 for (index, (fast_pos, parley_pos)) in
                     fast_positions.iter().zip(&parley_positions).enumerate()
                 {
                     assert!(
                         (fast_pos.0 - parley_pos.0).abs() <= 0.01,
-                        "{alignment:?} scale={scale} glyph {index}: fast x {} vs parley {}",
+                        "{alignment:?} scale={scale:?} glyph {index}: fast x {} vs parley {}",
                         fast_pos.0,
                         parley_pos.0
                     );
                     assert!(
-                        (fast_pos.0 * scale - (fast_pos.0 * scale).round()).abs() <= 1e-4,
-                        "{alignment:?} scale={scale} glyph {index}: physical x {} is not an integer",
-                        fast_pos.0 * scale
+                        (fast_pos.0 * scale.factor() - (fast_pos.0 * scale.factor()).round()).abs()
+                            <= 1e-4,
+                        "{alignment:?} scale={scale:?} glyph {index}: physical x {} is not an integer",
+                        fast_pos.0 * scale.factor()
                     );
                 }
             }
@@ -1742,7 +1788,7 @@ mod tests {
     #[test]
     fn fast_path_alignment_after_ellipsis_uses_the_full_advance() {
         let mut text_cx = crate::text::context::TextContext::new();
-        let style = TextStyle::new(16.0)
+        let style = TextStyle::new(px(16.0))
             .with_wrap(TextWrap::NoWrap)
             .with_overflow(crate::text::TextOverflow::Ellipsis, 1);
         let content = TextContent::new("1234567890", style.clone());
@@ -1762,11 +1808,11 @@ mod tests {
                 glyph_atlas: &mut glyphs,
                 atlas: &mut atlas,
                 generation,
-                scale: 1.0,
+                scale: DevicePixelRatio::ONE,
             };
             shaped
                 .rasterize(
-                    width,
+                    px(width),
                     TextAlign::Left,
                     crate::paint::color::Color::BLACK,
                     &mut ctx,
@@ -1783,11 +1829,11 @@ mod tests {
                 glyph_atlas: &mut glyphs,
                 atlas: &mut atlas,
                 generation,
-                scale: 1.0,
+                scale: DevicePixelRatio::ONE,
             };
             shaped
                 .rasterize(
-                    width,
+                    px(width),
                     TextAlign::Right,
                     crate::paint::color::Color::BLACK,
                     &mut ctx,
@@ -1810,11 +1856,11 @@ mod tests {
                 glyph_atlas: &mut glyphs,
                 atlas: &mut atlas,
                 generation,
-                scale: 1.0,
+                scale: DevicePixelRatio::ONE,
             };
             parley_shaped
                 .rasterize(
-                    width,
+                    px(width),
                     TextAlign::Right,
                     crate::paint::color::Color::BLACK,
                     &mut ctx,
@@ -1830,7 +1876,7 @@ mod tests {
             left.width
         );
         assert!(
-            (left.width - parley_right.width).abs() <= 0.01,
+            (left.width - parley_right.width).abs() <= px(0.01),
             "fast/parley ellipsis 宽度必须一致：{} vs {}",
             left.width,
             parley_right.width
@@ -1853,7 +1899,7 @@ mod tests {
     #[test]
     fn one_snapshot_serves_multiple_alignments() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("abc", TextStyle::new(16.0));
+        let shaped = harness.shape("abc", TextStyle::new(px(16.0)));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let generation = atlas.generation();
         let mut render = |alignment: crate::text::TextAlign| {
@@ -1862,11 +1908,11 @@ mod tests {
                 glyph_atlas: &mut glyphs,
                 atlas: &mut atlas,
                 generation,
-                scale: 1.0,
+                scale: DevicePixelRatio::ONE,
             };
             shaped
                 .rasterize(
-                    100.0,
+                    px(100.0),
                     alignment,
                     crate::paint::color::Color::BLACK,
                     &mut ctx,
@@ -1889,7 +1935,7 @@ mod tests {
     #[test]
     fn content_widths_match_forced_breaks() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("The quick brown fox", TextStyle::new(16.0));
+        let shaped = harness.shape("The quick brown fox", TextStyle::new(px(16.0)));
         let widths = shaped.layout().calculate_content_widths();
         let broken = shaped.measure(none_known(), definite(1.0));
         let single = shaped.measure(
@@ -1901,11 +1947,11 @@ mod tests {
         );
 
         assert!(
-            (broken.width - widths.min).abs() < 0.01,
+            (broken.width - widths.min).abs() < px(0.01),
             "{broken:?} vs {widths:?}"
         );
         assert!(
-            (single.width - widths.max).abs() < 0.01,
+            (single.width - widths.max).abs() < px(0.01),
             "{single:?} vs {widths:?}"
         );
     }
@@ -1913,11 +1959,11 @@ mod tests {
     #[test]
     fn empty_text_measures_zero() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("", TextStyle::new(16.0));
+        let shaped = harness.shape("", TextStyle::new(px(16.0)));
 
         assert_eq!(
             shaped.measure(none_known(), definite(100.0)),
-            crate::math::Size::ZERO
+            crate::math::LogicalSize::ZERO
         );
         assert_eq!(
             shaped.measure(
@@ -1927,20 +1973,20 @@ mod tests {
                     height: AvailableSpace::MaxContent,
                 }
             ),
-            crate::math::Size::ZERO
+            crate::math::LogicalSize::ZERO
         );
     }
 
     #[test]
     fn measure_definite_width_wraps_and_grows_height() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("one two three four five", TextStyle::new(16.0));
+        let shaped = harness.shape("one two three four five", TextStyle::new(px(16.0)));
         let wide = shaped.measure(none_known(), definite(400.0));
         let narrow = shaped.measure(none_known(), definite(40.0));
 
         assert!(narrow.height > wide.height);
         assert!(
-            narrow.width <= 40.5,
+            narrow.width <= px(40.5),
             "wrapped width {} exceeds the constraint",
             narrow.width
         );
@@ -1949,7 +1995,7 @@ mod tests {
     #[test]
     fn measure_min_content_is_the_longest_word() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("one two three", TextStyle::new(16.0));
+        let shaped = harness.shape("one two three", TextStyle::new(px(16.0)));
         let min = shaped.measure(
             none_known(),
             taffy::Size {
@@ -1958,13 +2004,13 @@ mod tests {
             },
         );
 
-        assert!((min.width - shaped.layout().calculate_content_widths().min).abs() < 0.01);
+        assert!((min.width - shaped.layout().calculate_content_widths().min).abs() < px(0.01));
     }
 
     #[test]
     fn measure_max_content_is_one_line() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("one two three", TextStyle::new(16.0));
+        let shaped = harness.shape("one two three", TextStyle::new(px(16.0)));
         let single = shaped.measure(
             none_known(),
             taffy::Size {
@@ -1980,7 +2026,7 @@ mod tests {
             .unwrap_or(0.0);
 
         assert!(
-            (single.height - line_height).abs() < 0.5,
+            (single.height - line_height).abs() < px(0.5),
             "{single:?} vs {line_height}"
         );
     }
@@ -1988,21 +2034,21 @@ mod tests {
     #[test]
     fn measure_is_deterministic() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("determinism 一致性", TextStyle::new(15.0));
+        let shaped = harness.shape("determinism 一致性", TextStyle::new(px(15.0)));
         let a = shaped.measure(none_known(), definite(120.0));
         let b = shaped.measure(none_known(), definite(120.0));
 
-        assert_eq!(a.width.to_bits(), b.width.to_bits());
-        assert_eq!(a.height.to_bits(), b.height.to_bits());
+        assert_eq!(a.width.value().to_bits(), b.width.value().to_bits());
+        assert_eq!(a.height.value().to_bits(), b.height.value().to_bits());
     }
 
     #[test]
     fn wrap_change_keeps_max_width_but_changes_height() {
         let mut harness = Harness::new();
-        let wrap = harness.shape("aaaa aaaa aaaa", TextStyle::new(16.0));
+        let wrap = harness.shape("aaaa aaaa aaaa", TextStyle::new(px(16.0)));
         let anywhere = harness.shape(
             "aaaa aaaa aaaa",
-            TextStyle::new(16.0).with_wrap(TextWrap::Anywhere),
+            TextStyle::new(px(16.0)).with_wrap(TextWrap::Anywhere),
         );
         let max = |shaped: &super::ShapedText| shaped.layout().calculate_content_widths().max;
 
@@ -2022,11 +2068,11 @@ mod tests {
     #[test]
     fn approx_bytes_counts_inline_boxes() {
         let mut harness = Harness::new();
-        let plain = harness.shape("abcd", TextStyle::new(16.0));
+        let plain = harness.shape("abcd", TextStyle::new(px(16.0)));
         let spec = InlineBoxSpec {
             id: 9,
             index: 2,
-            size: crate::math::Size::new(20.0, 18.0),
+            size: crate::math::LogicalSize::new(px(20.0), px(18.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint: None,
@@ -2034,7 +2080,7 @@ mod tests {
         let boxes: Vec<InlineBoxSpec> = (0..8)
             .map(|index| InlineBoxSpec { index, ..spec })
             .collect();
-        let with_boxes = harness.shape_with("abcd", TextStyle::new(16.0), &boxes);
+        let with_boxes = harness.shape_with("abcd", TextStyle::new(px(16.0)), &boxes);
         let extra = with_boxes.approx_bytes() - plain.approx_bytes();
         assert!(
             extra >= boxes.len() * core::mem::size_of::<InlineBoxSpec>(),
@@ -2049,12 +2095,12 @@ mod tests {
         let spec = InlineBoxSpec {
             id: 9,
             index: 2,
-            size: crate::math::Size::new(20.0, 18.0),
+            size: crate::math::LogicalSize::new(px(20.0), px(18.0)),
             baseline: None,
             align: InlineAlign::Baseline,
             paint: None,
         };
-        let shaped = harness.shape_with("abcd", TextStyle::new(16.0), &[spec]);
+        let shaped = harness.shape_with("abcd", TextStyle::new(px(16.0)), &[spec]);
 
         let boxes = shaped
             .layout()
@@ -2082,9 +2128,9 @@ mod tests {
             alpha: 1.0,
         };
         let mut harness = Harness::new();
-        let content = TextContent::new("abcdef", TextStyle::new(16.0)).with_runs([
-            TextRun::new(0..3, TextStyle::new(16.0).with_color(red)),
-            TextRun::new(3..6, TextStyle::new(16.0).with_color(blue)),
+        let content = TextContent::new("abcdef", TextStyle::new(px(16.0))).with_runs([
+            TextRun::new(0..3, TextStyle::new(px(16.0)).with_color(red)),
+            TextRun::new(3..6, TextStyle::new(px(16.0)).with_color(blue)),
         ]);
         let shaped = harness.shape_content(&content);
         assert_eq!(shaped.runs().len(), 2, "快照必须保存 runs（缓存命中判据）");
@@ -2093,7 +2139,7 @@ mod tests {
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2133,8 +2179,8 @@ mod tests {
             alpha: 1.0,
         };
         let mut harness = Harness::new();
-        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_color(green))
-            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_color(red))]);
+        let content = TextContent::new("abcdef", TextStyle::new(px(16.0)).with_color(green))
+            .with_runs([TextRun::new(0..3, TextStyle::new(px(16.0)).with_color(red))]);
         let shaped = harness.shape_content(&content);
         let width = shaped.max_content_size().width;
 
@@ -2180,26 +2226,27 @@ mod tests {
             alpha: 1.0,
         };
         let mut harness = Harness::new();
-        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_color(ink)).with_runs([
-            TextRun::new(
-                0..3,
-                TextStyle::new(16.0)
-                    .with_color(ink)
-                    .with_decoration(TextDecoration::underline(1.0)),
-            ),
-            TextRun::new(
-                3..6,
-                TextStyle::new(16.0)
-                    .with_color(ink)
-                    .with_decoration(TextDecoration::strikethrough(2.0).with_color(Some(explicit))),
-            ),
-        ]);
+        let content = TextContent::new("abcdef", TextStyle::new(px(16.0)).with_color(ink))
+            .with_runs([
+                TextRun::new(
+                    0..3,
+                    TextStyle::new(px(16.0))
+                        .with_color(ink)
+                        .with_decoration(TextDecoration::underline(px(1.0))),
+                ),
+                TextRun::new(
+                    3..6,
+                    TextStyle::new(px(16.0)).with_color(ink).with_decoration(
+                        TextDecoration::strikethrough(px(2.0)).with_color(Some(explicit)),
+                    ),
+                ),
+            ]);
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2225,21 +2272,21 @@ mod tests {
             strike.rect.origin.y,
             shaped_line.baseline
         );
-        assert!((underline.rect.size.height - 1.0).abs() < 1e-4);
-        assert!((strike.rect.size.height - 2.0).abs() < 1e-4);
+        assert!((underline.rect.size.height - 1.0).abs() < px(1e-4));
+        assert!((strike.rect.size.height - 2.0).abs() < px(1e-4));
         assert_eq!(underline.color, ink, "默认线色跟随 run 文本色");
         assert_eq!(strike.color, explicit, "显式线色优先");
-        assert!(underline.rect.size.width > 0.0 && strike.rect.size.width > 0.0);
+        assert!(underline.rect.size.width > px(0.0) && strike.rect.size.width > px(0.0));
         assert!(
             underline.rect.origin.x < strike.rect.origin.x,
             "LTR 下前一个 run 的装饰在左：{:?}",
             shaped_line.decorations
         );
-        let plain = harness.shape("abcdef", TextStyle::new(16.0));
+        let plain = harness.shape("abcdef", TextStyle::new(px(16.0)));
         let (plain_line, _, _) = rasterize_line(
             &plain,
             plain.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2249,20 +2296,23 @@ mod tests {
 
     #[test]
     fn base_style_decoration_covers_uncovered_text_only() {
-        let underline = TextDecoration::underline(1.0);
-        let strike = TextDecoration::strikethrough(2.0);
+        let underline = TextDecoration::underline(px(1.0));
+        let strike = TextDecoration::strikethrough(px(2.0));
         let mut harness = Harness::new();
-        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_decoration(underline))
-            .with_runs([TextRun::new(
-                0..3,
-                TextStyle::new(16.0).with_decoration(strike),
-            )]);
+        let content = TextContent::new(
+            "abcdef",
+            TextStyle::new(px(16.0)).with_decoration(underline),
+        )
+        .with_runs([TextRun::new(
+            0..3,
+            TextStyle::new(px(16.0)).with_decoration(strike),
+        )]);
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2292,13 +2342,13 @@ mod tests {
     #[test]
     fn cjk_and_emoji_mixed_runs_keep_boundaries() {
         let mut harness = Harness::new();
-        let content = TextContent::new("价格🌍ab", TextStyle::new(16.0)).with_runs([
+        let content = TextContent::new("价格🌍ab", TextStyle::new(px(16.0))).with_runs([
             TextRun::new(
                 0..6,
-                TextStyle::new(16.0).with_decoration(TextDecoration::underline(1.0)),
+                TextStyle::new(px(16.0)).with_decoration(TextDecoration::underline(px(1.0))),
             ),
-            TextRun::new(6..10, TextStyle::new(18.0)),
-            TextRun::new(10..12, TextStyle::new(16.0).with_weight(700)),
+            TextRun::new(6..10, TextStyle::new(px(18.0))),
+            TextRun::new(10..12, TextStyle::new(px(16.0)).with_weight(700)),
         ]);
         let shaped = harness.shape_content(&content);
         assert_eq!(shaped.runs().len(), 3);
@@ -2306,7 +2356,7 @@ mod tests {
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2317,7 +2367,7 @@ mod tests {
             "CJK/emoji/ASCII 至少两个 run"
         );
         assert_eq!(line.lines[0].decorations.len(), 1, "只有第一个 run 有装饰");
-        assert!(line.lines[0].decorations[0].rect.size.width > 0.0);
+        assert!(line.lines[0].decorations[0].rect.size.width > px(0.0));
         for run in line.glyph_runs() {
             assert!(
                 "价格🌍ab".is_char_boundary(run.text_range.start)
@@ -2333,13 +2383,19 @@ mod tests {
         let mut harness = Harness::new();
         let content = TextContent::new(
             "alpha beta gamma",
-            TextStyle::new(16.0).with_decoration(TextDecoration::underline(1.0)),
+            TextStyle::new(px(16.0)).with_decoration(TextDecoration::underline(px(1.0))),
         );
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let width = 40.0;
-        let (line, _diagnostics, _stats) =
-            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            px(width),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
         assert!(
             line.lines.len() > 1,
             "40 px 内容宽必须换行：{:?}",
@@ -2357,7 +2413,7 @@ mod tests {
         for shaped_line in &line.lines {
             for decoration in &shaped_line.decorations {
                 assert!(
-                    decoration.rect.origin.x >= -1e-3
+                    decoration.rect.origin.x >= px(-1e-3)
                         && decoration.rect.origin.x + decoration.rect.size.width
                             <= shaped_line.advance + 1e-3,
                     "装饰不得超出该行推进：{decoration:?} / advance {}",
@@ -2369,7 +2425,7 @@ mod tests {
 
     #[test]
     fn decoration_survives_hard_line_breaks() {
-        let underline = TextDecoration::underline(1.0);
+        let underline = TextDecoration::underline(px(1.0));
         let mut harness = Harness::new();
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         for (text, expected) in [
@@ -2378,12 +2434,13 @@ mod tests {
             ("ab\n\ncd", vec![1, 0, 1]),
             ("ab\n", vec![1, 0]),
         ] {
-            let content = TextContent::new(text, TextStyle::new(16.0).with_decoration(underline));
+            let content =
+                TextContent::new(text, TextStyle::new(px(16.0)).with_decoration(underline));
             let shaped = harness.shape_content(&content);
             let (line, _diagnostics, _stats) = rasterize_line(
                 &shaped,
                 shaped.max_content_size().width,
-                1.0,
+                DevicePixelRatio::ONE,
                 &mut raster,
                 &mut glyphs,
                 &mut atlas,
@@ -2400,11 +2457,11 @@ mod tests {
             for shaped_line in &line.lines {
                 for decoration in &shaped_line.decorations {
                     assert!(
-                        decoration.rect.size.width > 0.0,
+                        decoration.rect.size.width > px(0.0),
                         "装饰必须有正宽度：{decoration:?}"
                     );
                     assert!(
-                        decoration.rect.origin.x >= -1e-3
+                        decoration.rect.origin.x >= px(-1e-3)
                             && decoration.rect.origin.x + decoration.rect.size.width
                                 <= shaped_line.advance + 1e-3,
                         "装饰不得超出该行内容推进：{decoration:?} / advance {}",
@@ -2439,18 +2496,19 @@ mod tests {
 
     #[test]
     fn run_decoration_clipped_at_hard_line_break() {
-        let underline = TextDecoration::underline(1.0);
+        let underline = TextDecoration::underline(px(1.0));
         let mut harness = Harness::new();
-        let content = TextContent::new("ab\ncd", TextStyle::new(16.0)).with_runs([TextRun::new(
-            0..5,
-            TextStyle::new(16.0).with_decoration(underline),
-        )]);
+        let content =
+            TextContent::new("ab\ncd", TextStyle::new(px(16.0))).with_runs([TextRun::new(
+                0..5,
+                TextStyle::new(px(16.0)).with_decoration(underline),
+            )]);
         let shaped = harness.shape_content(&content);
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2468,8 +2526,8 @@ mod tests {
         let second = &line.lines[1];
         let decoration = second.decorations[0];
         assert!(
-            decoration.rect.origin.x.abs() < 1e-2
-                && (decoration.rect.size.width - second.advance).abs() < 1e-2,
+            decoration.rect.origin.x.abs() < px(1e-2)
+                && (decoration.rect.size.width - second.advance).abs() < px(1e-2),
             "第二行装饰跨度 = 内容区间（不含行尾换行）：{decoration:?} / advance {}",
             second.advance
         );
@@ -2477,8 +2535,8 @@ mod tests {
 
     #[test]
     fn rtl_decoration_covers_the_full_visual_span() {
-        let underline = TextDecoration::underline(1.0);
-        let rtl = TextStyle::new(16.0).with_direction(TextDirection::Rtl);
+        let underline = TextDecoration::underline(px(1.0));
+        let rtl = TextStyle::new(px(16.0)).with_direction(TextDirection::Rtl);
         let mut harness = Harness::new();
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
 
@@ -2487,7 +2545,7 @@ mod tests {
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2503,11 +2561,11 @@ mod tests {
         let decoration = shaped_line.decorations[0];
         let right = decoration.rect.origin.x + decoration.rect.size.width;
         assert!(
-            decoration.rect.origin.x <= 1.0,
+            decoration.rect.origin.x <= px(1.0),
             "RTL 装饰必须从行左边缘开始（旧实现从中间开始）：{decoration:?}"
         );
         assert!(
-            (right - shaped_line.advance).abs() <= 1.0,
+            (right - shaped_line.advance.value()).abs() <= px(1.0),
             "RTL 装饰必须覆盖到行推进末端：{decoration:?} / advance {}",
             shaped_line.advance
         );
@@ -2520,7 +2578,7 @@ mod tests {
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2535,18 +2593,18 @@ mod tests {
         let left = shaped_line
             .decorations
             .iter()
-            .map(|decoration| decoration.rect.origin.x)
+            .map(|decoration| decoration.rect.origin.x.value())
             .fold(f32::INFINITY, f32::min);
         let right = shaped_line
             .decorations
             .iter()
-            .map(|decoration| decoration.rect.origin.x + decoration.rect.size.width)
+            .map(|decoration| (decoration.rect.origin.x + decoration.rect.size.width).value())
             .fold(f32::NEG_INFINITY, f32::max);
         assert!(
             shaped_line
                 .decorations
                 .iter()
-                .all(|decoration| decoration.rect.size.width > 10.0),
+                .all(|decoration| decoration.rect.size.width > px(10.0)),
             "每个 RTL run 的装饰必须覆盖整段视觉宽度（旧实现只剩中间）：{:?}",
             shaped_line.decorations
         );
@@ -2555,20 +2613,20 @@ mod tests {
             "跨 run 的 RTL 装饰必须覆盖到词左端：{shaped_line:?}"
         );
         assert!(
-            (right - shaped_line.advance).abs() <= 1.0,
+            (right - shaped_line.advance.value()).abs() <= 1.0,
             "跨 run 的 RTL 装饰必须覆盖到行推进末端：{shaped_line:?}"
         );
 
         let content =
-            TextContent::new("abc שלום def", TextStyle::new(16.0)).with_runs([TextRun::new(
+            TextContent::new("abc שלום def", TextStyle::new(px(16.0))).with_runs([TextRun::new(
                 4..12,
-                TextStyle::new(16.0).with_decoration(underline),
+                TextStyle::new(px(16.0)).with_decoration(underline),
             )]);
         let shaped = harness.shape_content(&content);
         let (line, _diagnostics, _stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2584,12 +2642,12 @@ mod tests {
                     let left = run
                         .glyphs
                         .iter()
-                        .map(|glyph| glyph.position.x)
+                        .map(|glyph| glyph.position.x.value())
                         .fold(f32::INFINITY, f32::min);
                     let right = run
                         .glyphs
                         .iter()
-                        .map(|glyph| glyph.position.x + glyph.size.width)
+                        .map(|glyph| (glyph.position.x + glyph.size.width).value())
                         .fold(f32::NEG_INFINITY, f32::max);
                     Some((left, right))
                 }
@@ -2597,11 +2655,11 @@ mod tests {
             })
             .expect("RTL run 必须存在");
         assert!(
-            decoration.rect.origin.x <= run_left + 1.5,
+            decoration.rect.origin.x <= px(run_left + 1.5),
             "LTR 段落里的 RTL run：装饰左端不得从 run 内部开始：{decoration:?} vs run {run_left}..{run_right}"
         );
         assert!(
-            decoration.rect.origin.x + decoration.rect.size.width >= run_right - 1.5,
+            decoration.rect.origin.x + decoration.rect.size.width >= px(run_right - 1.5),
             "LTR 段落里的 RTL run：装饰右端不得止于 run 内部：{decoration:?} vs run {run_left}..{run_right}"
         );
     }
@@ -2609,27 +2667,33 @@ mod tests {
     #[test]
     fn rasterize_of_empty_text_yields_empty_snapshot() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("", TextStyle::new(16.0));
+        let shaped = harness.shape("", TextStyle::new(px(16.0)));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
 
-        let (line, diagnostics, _stats) =
-            rasterize_line(&shaped, 0.0, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line, diagnostics, _stats) = rasterize_line(
+            &shaped,
+            px(0.0),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert!(line.lines.is_empty());
-        assert_eq!(line.width, 0.0);
+        assert_eq!(line.width, px(0.0));
         assert!(diagnostics.is_empty());
     }
 
     #[test]
     fn rasterize_positions_glyphs_and_sets_tiles() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("Ab", TextStyle::new(16.0));
+        let shaped = harness.shape("Ab", TextStyle::new(px(16.0)));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
 
         let (line, _diagnostics, stats) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2644,13 +2708,13 @@ mod tests {
         assert!(!run.glyphs.is_empty(), "both glyphs have coverage");
         for glyph in &run.glyphs {
             assert!(!glyph.tile.is_stale(atlas.generation()));
-            assert!(glyph.size.width > 0.0 && glyph.size.height > 0.0);
-            let physical = glyph.size.width * line.scale;
+            assert!(glyph.size.width > px(0.0) && glyph.size.height > px(0.0));
+            let physical = glyph.size.width.value() * line.scale.factor();
             assert!(
                 (physical - physical.round()).abs() < 1e-3,
                 "scale * size must be integral, got {physical}"
             );
-            let physical_x = glyph.position.x * line.scale;
+            let physical_x = glyph.position.x.value() * line.scale.factor();
             assert!(
                 (physical_x - physical_x.round()).abs() < 1e-3,
                 "亚像素相位必须烘进位图，落点仍是整数物理像素（否则会被 to_physical 二次取整）：{physical_x}"
@@ -2666,35 +2730,35 @@ mod tests {
             return;
         }
         let mut harness = Harness::new();
-        let centered = TextStyle::new(16.0).with_alignment(crate::text::TextAlign::Center);
+        let centered = TextStyle::new(px(16.0)).with_alignment(crate::text::TextAlign::Center);
         let shaped = harness.shape("R", centered);
 
         let (left_width, right_width) = (200.0f32, 200.8f32);
-        let left_x = shaped.first_glyph_x_at(left_width);
-        let right_x = shaped.first_glyph_x_at(right_width);
+        let left_x = shaped.first_glyph_x_at(px(left_width));
+        let right_x = shaped.first_glyph_x_at(px(right_width));
         assert!(
-            (right_x - left_x - 0.4).abs() < 0.01,
+            (right_x - left_x - 0.4).abs() < px(0.01),
             "precondition: 居中偏移必须线性移动 0.4 px（{left_x} → {right_x}）"
         );
         assert_ne!(
-            crate::text::raster::split_subpixel_x(left_x).1,
-            crate::text::raster::split_subpixel_x(right_x).1,
+            crate::text::raster::split_subpixel_x(left_x.value()).1,
+            crate::text::raster::split_subpixel_x(right_x.value()).1,
             "precondition: 0.4 px 的位移必须换到不同相位桶"
         );
 
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (left, _, _) = rasterize_line(
             &shaped,
-            left_width,
-            1.0,
+            px(left_width),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
         );
         let (right, _, _) = rasterize_line(
             &shaped,
-            right_width,
-            1.0,
+            px(right_width),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2716,39 +2780,39 @@ mod tests {
         let mut harness = Harness::new();
         let shaped = harness.shape(
             "R",
-            TextStyle::new(16.0).with_alignment(crate::text::TextAlign::Center),
+            TextStyle::new(px(16.0)).with_alignment(crate::text::TextAlign::Center),
         );
 
         let (left_width, right_width) = (200.0f32, 200.64f32);
-        let left_logical = shaped.first_glyph_x_at(left_width);
-        let right_logical = shaped.first_glyph_x_at(right_width);
+        let left_logical = shaped.first_glyph_x_at(px(left_width));
+        let right_logical = shaped.first_glyph_x_at(px(right_width));
         assert!(
-            (right_logical - left_logical - 0.32).abs() < 0.01,
+            (right_logical - left_logical - 0.32).abs() < px(0.01),
             "precondition: 逻辑落点移动 0.32 px（{left_logical} → {right_logical}）"
         );
         assert!(
-            (right_logical - left_logical) * 1.25 - 0.4 < 0.01,
+            (right_logical - left_logical) * 1.25 - 0.4 < px(0.01),
             "precondition: 物理落点移动 0.4 px"
         );
         assert_ne!(
-            crate::text::raster::split_subpixel_x(left_logical * 1.25).1,
-            crate::text::raster::split_subpixel_x(right_logical * 1.25).1,
+            crate::text::raster::split_subpixel_x((left_logical * 1.25).value()).1,
+            crate::text::raster::split_subpixel_x((right_logical * 1.25).value()).1,
             "precondition: 0.4 物理像素必须换到不同相位桶"
         );
 
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (left, _, _) = rasterize_line(
             &shaped,
-            left_width,
-            1.25,
+            px(left_width),
+            DevicePixelRatio::new(1.25).expect("scale"),
             &mut raster,
             &mut glyphs,
             &mut atlas,
         );
         let (right, _, _) = rasterize_line(
             &shaped,
-            right_width,
-            1.25,
+            px(right_width),
+            DevicePixelRatio::new(1.25).expect("scale"),
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2763,12 +2827,12 @@ mod tests {
             let glyphs = all_glyphs(line);
             assert_eq!(glyphs.len(), 1, "'R' must have coverage");
             for glyph in glyphs {
-                let physical_x = glyph.position.x * line.scale;
+                let physical_x = glyph.position.x.value() * line.scale.factor();
                 assert!(
                     (physical_x - physical_x.round()).abs() < 1e-3,
                     "落点必须是整数物理像素（相位已烘进位图）：{physical_x}"
                 );
-                let physical_width = glyph.size.width * line.scale;
+                let physical_width = glyph.size.width.value() * line.scale.factor();
                 assert!(
                     (physical_width - physical_width.round()).abs() < 1e-3,
                     "位图物理宽度必须是整数：{physical_width}"
@@ -2785,13 +2849,13 @@ mod tests {
         }
         let mut harness = Harness::new();
         let centered =
-            |size: f32| TextStyle::new(size).with_alignment(crate::text::TextAlign::Center);
+            |size: f32| TextStyle::new(px(size)).with_alignment(crate::text::TextAlign::Center);
         let fractional = harness.shape("R", centered(16.0));
         let integer = harness.shape("R", centered(20.0));
-        let fractional_logical = fractional.first_glyph_x_at(200.0);
-        let integer_logical = integer.first_glyph_x_at(250.0);
+        let fractional_logical = fractional.first_glyph_x_at(px(200.0));
+        let integer_logical = integer.first_glyph_x_at(px(250.0));
         assert!(
-            (fractional_logical * 1.25 - integer_logical).abs() < 1e-2,
+            (fractional_logical * 1.25 - integer_logical).abs() < px(1e-2),
             "precondition: 物理落点必须一致（{} → {integer_logical}）",
             fractional_logical * 1.25
         );
@@ -2799,14 +2863,20 @@ mod tests {
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (fractional_line, _, fractional_stats) = rasterize_line(
             &fractional,
-            200.0,
-            1.25,
+            px(200.0),
+            DevicePixelRatio::new(1.25).expect("scale"),
             &mut raster,
             &mut glyphs,
             &mut atlas,
         );
-        let (integer_line, _, integer_stats) =
-            rasterize_line(&integer, 250.0, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (integer_line, _, integer_stats) = rasterize_line(
+            &integer,
+            px(250.0),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert_eq!(
             fractional_stats.rasters, 1,
@@ -2835,7 +2905,7 @@ mod tests {
             return;
         }
         let mut harness = Harness::new();
-        let shaped = harness.shape("0123456789", TextStyle::new(14.0));
+        let shaped = harness.shape("0123456789", TextStyle::new(px(14.0)));
         let layout_width = {
             let layout = shaped.layout();
             layout.width()
@@ -2851,8 +2921,8 @@ mod tests {
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (line, diagnostics, _) = rasterize_line(
             &shaped,
-            layout_width,
-            1.25,
+            px(layout_width),
+            DevicePixelRatio::new(1.25).expect("scale"),
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2864,16 +2934,18 @@ mod tests {
         );
         assert!(!all_glyphs(&line).is_empty(), "digits must rasterize");
         assert_eq!(
-            line.width, layout_width,
+            line.width,
+            px(layout_width),
             "内容宽 = 逻辑布局宽（不再除 scale）"
         );
         assert_eq!(
-            line.lines[0].advance, layout_advance,
+            line.lines[0].advance,
+            px(layout_advance),
             "行 advance 必须来自 parley，不受小数 ppem 影响"
         );
-        let total_advance: f32 = line.lines.iter().map(|line| line.advance).sum();
+        let total_advance: f32 = line.lines.iter().map(|line| line.advance.value()).sum();
         assert!(
-            (total_advance - line.width).abs() < 1e-3,
+            (total_advance - line.width.value()).abs() < 1e-3,
             "advance 总和必须等于内容宽：{total_advance} vs {}",
             line.width
         );
@@ -2886,7 +2958,7 @@ mod tests {
             return;
         }
         let mut harness = Harness::new();
-        let shaped = harness.shape("HHHH", TextStyle::new(16.0));
+        let shaped = harness.shape("HHHH", TextStyle::new(px(16.0)));
         let width = shaped.max_content_size().width;
 
         let mut raster = crate::text::raster::GlyphRasterizer::new();
@@ -2895,10 +2967,22 @@ mod tests {
             crate::paint::atlas::AtlasKind::Glyph,
             (2048, 2048),
         );
-        let (line_1x, _, _) =
-            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
-        let (line_125, _, _) =
-            rasterize_line(&shaped, width, 1.25, &mut raster, &mut glyphs, &mut atlas);
+        let (line_1x, _, _) = rasterize_line(
+            &shaped,
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (line_125, _, _) = rasterize_line(
+            &shaped,
+            width,
+            DevicePixelRatio::new(1.25).expect("scale"),
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         let glyphs_1x = all_glyphs(&line_1x);
         let glyphs_125 = all_glyphs(&line_125);
@@ -2912,7 +2996,10 @@ mod tests {
 
         let physical_width_sum =
             |glyphs: &[crate::paint::primitive::PositionedGlyph], scale: f32| -> f32 {
-                glyphs.iter().map(|glyph| glyph.size.width * scale).sum()
+                glyphs
+                    .iter()
+                    .map(|glyph| glyph.size.width.value() * scale)
+                    .sum()
             };
         let width_1x = physical_width_sum(&glyphs_1x, 1.0);
         let width_125 = physical_width_sum(&glyphs_125, 1.25);
@@ -2926,7 +3013,7 @@ mod tests {
     #[test]
     fn subpixel_positioning_does_not_change_advances() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("0123456789", TextStyle::new(16.0));
+        let shaped = harness.shape("0123456789", TextStyle::new(px(16.0)));
         let (layout_width, layout_advance) = {
             let layout = shaped.layout();
             let advance = layout
@@ -2941,8 +3028,8 @@ mod tests {
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (line, diagnostics, _) = rasterize_line(
             &shaped,
-            layout_width,
-            1.0,
+            px(layout_width),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -2952,16 +3039,16 @@ mod tests {
             "digits must not produce diagnostics"
         );
 
-        assert_eq!(line.width, layout_width, "内容宽必须等于 parley 布局宽");
+        assert_eq!(line.width, px(layout_width), "内容宽必须等于 parley 布局宽");
         assert_eq!(line.lines.len(), 1);
-        assert_eq!(line.lines[0].advance, layout_advance);
-        let total_advance: f32 = line.lines.iter().map(|line| line.advance).sum();
+        assert_eq!(line.lines[0].advance, px(layout_advance));
+        let total_advance: f32 = line.lines.iter().map(|line| line.advance.value()).sum();
         assert!(
             (total_advance - layout_width).abs() < 1e-3,
             "亚像素定位不得改变 advance 总和：{total_advance} vs {layout_width}"
         );
         assert!(
-            (shaped.max_content_size().width - layout_width).abs() < 1e-3,
+            (shaped.max_content_size().width - layout_width).abs() < px(1e-3),
             "形状快照的内容宽也必须与布局宽一致"
         );
     }
@@ -2969,7 +3056,7 @@ mod tests {
     #[test]
     fn measure_is_o1_for_min_max_content() {
         let mut harness = Harness::new();
-        let shaped = harness.shape("one two three four five", TextStyle::new(16.0));
+        let shaped = harness.shape("one two three four five", TextStyle::new(px(16.0)));
         for _ in 0..32 {
             let _ = shaped.measure(
                 none_known(),
@@ -2994,14 +3081,14 @@ mod tests {
 
         let width = shaped.max_content_size().width * 0.5;
         for _ in 0..16 {
-            let _ = shaped.measure(none_known(), definite(width));
+            let _ = shaped.measure(none_known(), definite(width.value()));
         }
         assert_eq!(
             shaped.measure_breaks(),
             1,
             "同一宽度的重复探测必须命中 memo"
         );
-        let _ = shaped.measure(none_known(), definite(width * 0.5));
+        let _ = shaped.measure(none_known(), definite((width * 0.5).value()));
         assert_eq!(shaped.measure_breaks(), 2, "换宽度才允许再次断行");
     }
 
@@ -3009,11 +3096,17 @@ mod tests {
     fn missing_glyph_draws_notdef_instead_of_vanishing() {
         const RARE: &str = "\u{10FFFD}";
         let mut harness = Harness::new();
-        let shaped = harness.shape(RARE, TextStyle::new(16.0));
-        let width = shaped.max_content_size().width.max(32.0);
+        let shaped = harness.shape(RARE, TextStyle::new(px(16.0)));
+        let width = shaped.max_content_size().width.max(px(32.0));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
-        let (line, diagnostics, stats) =
-            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line, diagnostics, stats) = rasterize_line(
+            &shaped,
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         let missing = diagnostics
             .iter()
@@ -3041,7 +3134,7 @@ mod tests {
         );
         let placeholder = rendered[0];
         assert!(
-            placeholder.size.width > 0.0 && placeholder.size.height > 0.0,
+            placeholder.size.width > px(0.0) && placeholder.size.height > px(0.0),
             "`.notdef` 占位必须有正尺寸：{:?}",
             placeholder.size
         );
@@ -3050,7 +3143,7 @@ mod tests {
     #[test]
     fn ellipsis_clips_the_line_and_appends_glyphs() {
         let mut harness = Harness::new();
-        let style = TextStyle::new(16.0)
+        let style = TextStyle::new(px(16.0))
             .with_wrap(TextWrap::NoWrap)
             .with_overflow(crate::text::TextOverflow::Ellipsis, 0);
         let shaped = harness.shape("abcdefghijklmnopqrstuvwxyz", style);
@@ -3071,7 +3164,7 @@ mod tests {
             glyph_atlas: &mut glyphs,
             atlas: &mut atlas,
             generation,
-            scale: 1.0,
+            scale: DevicePixelRatio::ONE,
         };
         let (line, _diagnostics, _stats) = shaped
             .rasterize(
@@ -3112,22 +3205,34 @@ mod tests {
         let mut harness = Harness::new();
         let shaped = harness.shape(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Clip, 2),
         );
-        let full = harness.shape(TEXT, TextStyle::new(16.0));
+        let full = harness.shape(TEXT, TextStyle::new(px(16.0)));
         let narrow = min_max_widths(&full).0 + 1.0;
         assert!(
-            narrow < full.max_content_size().width,
+            narrow < full.max_content_size().width.value(),
             "precondition: 必须落在真正的折行区间"
         );
 
         let size = shaped.measure(none_known(), definite(narrow));
         let full_size = full.measure(none_known(), definite(narrow));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
-        let (line, _, _) =
-            rasterize_line(&shaped, narrow, 1.0, &mut raster, &mut glyphs, &mut atlas);
-        let (full_line, _, _) =
-            rasterize_line(&full, narrow, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line, _, _) = rasterize_line(
+            &shaped,
+            px(narrow),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (full_line, _, _) = rasterize_line(
+            &full,
+            px(narrow),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert!(
             full_line.lines.len() > 2,
@@ -3136,13 +3241,13 @@ mod tests {
         );
         assert_eq!(line.lines.len(), 2, "max_lines = 2");
         assert!(
-            (size.height - line.height).abs() < 1e-3,
+            (size.height - line.height).abs() < px(1e-3),
             "measure 高度必须等于 rasterize 高度：{} vs {}",
             size.height,
             line.height
         );
         assert!(
-            (full_size.height - full_line.height).abs() < 1e-3,
+            (full_size.height - full_line.height).abs() < px(1e-3),
             "对照：无 max_lines 时两者也必须一致：{} vs {}",
             full_size.height,
             full_line.height
@@ -3161,19 +3266,31 @@ mod tests {
         let mut harness = Harness::new();
         let clamped = harness.shape(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Clip, 2),
         );
-        let full = harness.shape(TEXT, TextStyle::new(16.0));
+        let full = harness.shape(TEXT, TextStyle::new(px(16.0)));
         let (min_width, max_width) = min_max_widths(&full);
         let width = min_width + (max_width - min_width) * 0.25;
 
         let size = clamped.measure(none_known(), definite(width));
         let full_size = full.measure(none_known(), definite(width));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
-        let (line, _, _) =
-            rasterize_line(&clamped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
-        let (full_line, _, _) =
-            rasterize_line(&full, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line, _, _) = rasterize_line(
+            &clamped,
+            px(width),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (full_line, _, _) = rasterize_line(
+            &full,
+            px(width),
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert!(
             full_line.lines.len() > 2,
@@ -3182,14 +3299,14 @@ mod tests {
         );
         assert_eq!(line.lines.len(), 2, "max_lines = 2");
         assert!(
-            (size.height - line.height).abs() < 1e-3,
+            (size.height - line.height).abs() < px(1e-3),
             "measure 高度必须等于 rasterize 高度：{} vs {}",
             size.height,
             line.height
         );
         let expected = full_line.lines[0].line_height + full_line.lines[1].line_height;
         assert!(
-            (size.height - expected).abs() < 1e-3,
+            (size.height - expected).abs() < px(1e-3),
             "钳制高度必须是前两行的真实行高之和：{} vs {expected}",
             size.height
         );
@@ -3200,7 +3317,7 @@ mod tests {
             full_size.height
         );
         assert!(
-            (full_size.height - full_line.height).abs() < 1e-3,
+            (full_size.height - full_line.height).abs() < px(1e-3),
             "max_lines = None 时 measure 必须等于 rasterize：{} vs {}",
             full_size.height,
             full_line.height
@@ -3213,9 +3330,9 @@ mod tests {
         let mut harness = Harness::new();
         let shaped = harness.shape(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Clip, 2),
         );
-        let full = harness.shape(TEXT, TextStyle::new(16.0));
+        let full = harness.shape(TEXT, TextStyle::new(px(16.0)));
 
         let max = shaped.measure(
             none_known(),
@@ -3266,18 +3383,18 @@ mod tests {
             (first + second, layout.height())
         };
         assert!(
-            (max.height - expected).abs() < 1e-3,
+            (max.height - expected).abs() < px(1e-3),
             "MaxContent 高度必须钳到前两行：{} vs {expected}",
             max.height
         );
         assert!(
-            (min.height - max.height).abs() < 1e-3,
+            (min.height - max.height).abs() < px(1e-3),
             "MinContent 高度同样钳制（纯文本行行高相同）：{} vs {}",
             min.height,
             max.height
         );
         assert!(
-            max.height < full_height - 1.0,
+            max.height < px(full_height - 1.0),
             "钳制后必须严格矮于全文：{} vs {full_height}",
             max.height
         );
@@ -3291,14 +3408,14 @@ mod tests {
         let (line, _, _) = rasterize_line(
             &shaped,
             shaped.max_content_size().width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
         );
         assert_eq!(line.lines.len(), 2, "max_lines = 2");
         assert!(
-            (line.height - max.height).abs() < 1e-3,
+            (line.height - max.height).abs() < px(1e-3),
             "MaxContent 的 measure 高度必须等于 rasterize 高度：{} vs {}",
             max.height,
             line.height
@@ -3312,7 +3429,7 @@ mod tests {
             },
         );
         assert!(
-            (full_size.height - full_height).abs() < 1e-3,
+            (full_size.height - full_height).abs() < px(1e-3),
             "全文高度回归：{} vs {full_height}",
             full_size.height
         );
@@ -3325,39 +3442,39 @@ mod tests {
         let mut harness = Harness::new();
         let ellipsis_shaped = harness.shape(
             TEXT,
-            TextStyle::new(16.0)
+            TextStyle::new(px(16.0))
                 .with_wrap(TextWrap::NoWrap)
                 .with_overflow(crate::text::TextOverflow::Ellipsis, 0),
         );
         let clip_shaped = harness.shape(
             TEXT,
-            TextStyle::new(16.0)
+            TextStyle::new(px(16.0))
                 .with_wrap(TextWrap::NoWrap)
                 .with_overflow(crate::text::TextOverflow::Clip, 0),
         );
         let full_width = ellipsis_shaped.max_content_size().width;
         let content_width = full_width * 0.5;
         assert!(
-            content_width > 0.0 && content_width < full_width,
+            content_width > px(0.0) && content_width < full_width,
             "precondition: 内容宽必须真的裁剪"
         );
 
-        let ellipsis_size = ellipsis_shaped.measure(none_known(), definite(content_width));
-        let clip_size = clip_shaped.measure(none_known(), definite(content_width));
+        let ellipsis_size = ellipsis_shaped.measure(none_known(), definite(content_width.value()));
+        let clip_size = clip_shaped.measure(none_known(), definite(content_width.value()));
         assert_eq!(
-            ellipsis_size.width.to_bits(),
-            clip_size.width.to_bits(),
+            ellipsis_size.width.value().to_bits(),
+            clip_size.width.value().to_bits(),
             "省略号不得改变宽度上界：{} vs {}",
             ellipsis_size.width,
             clip_size.width
         );
         assert_eq!(
-            ellipsis_size.height.to_bits(),
-            clip_size.height.to_bits(),
+            ellipsis_size.height.value().to_bits(),
+            clip_size.height.value().to_bits(),
             "省略号不得改变高度"
         );
         assert!(
-            (ellipsis_size.width - full_width).abs() < 1e-3,
+            (ellipsis_size.width - full_width).abs() < px(1e-3),
             "NoWrap 的宽度上界是全文宽（内容宽只做绘制期裁剪）：{} vs {full_width}",
             ellipsis_size.width
         );
@@ -3373,7 +3490,7 @@ mod tests {
         let (line, _, _) = rasterize_line_with_ellipsis(
             &ellipsis_shaped,
             content_width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -3390,7 +3507,7 @@ mod tests {
             line.width
         );
         assert!(
-            (line.height - ellipsis_size.height).abs() < 1e-3,
+            (line.height - ellipsis_size.height).abs() < px(1e-3),
             "ellipsis 单行高度必须等于 measure：{} vs {}",
             line.height,
             ellipsis_size.height
@@ -3402,24 +3519,24 @@ mod tests {
 
         let multiline_ellipsis = harness.shape(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Ellipsis, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Ellipsis, 2),
         );
-        let multiline_full = harness.shape(TEXT, TextStyle::new(16.0));
+        let multiline_full = harness.shape(TEXT, TextStyle::new(px(16.0)));
         let (min_width, max_width) = min_max_widths(&multiline_full);
         let wrap_width = min_width + (max_width - min_width) * 0.25;
         let multiline_size = multiline_ellipsis.measure(none_known(), definite(wrap_width));
         let (full_line, _, _) = rasterize_line(
             &multiline_full,
-            wrap_width,
-            1.0,
+            px(wrap_width),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
         );
         let (line, _, _) = rasterize_line_with_ellipsis(
             &multiline_ellipsis,
-            wrap_width,
-            1.0,
+            px(wrap_width),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -3432,7 +3549,7 @@ mod tests {
         );
         assert_eq!(line.lines.len(), 2, "max_lines = 2");
         assert!(
-            (line.height - multiline_size.height).abs() < 1e-3,
+            (line.height - multiline_size.height).abs() < px(1e-3),
             "ellipsis + max_lines 的高度必须等于 measure：{} vs {}",
             line.height,
             multiline_size.height
@@ -3452,11 +3569,11 @@ mod tests {
         let mut harness = Harness::new();
         let ellipsis_shaped = harness.shape(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Ellipsis, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Ellipsis, 2),
         );
         let clip_shaped = harness.shape(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Clip, 2),
         );
         let (_, max_width) = min_max_widths(&ellipsis_shaped);
         assert!(
@@ -3474,16 +3591,16 @@ mod tests {
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
         let (clip_line, _, _) = rasterize_line(
             &clip_shaped,
-            CONTENT_WIDTH,
-            1.0,
+            px(CONTENT_WIDTH),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
         );
         let (line, _, _) = rasterize_line_with_ellipsis(
             &ellipsis_shaped,
-            CONTENT_WIDTH,
-            1.0,
+            px(CONTENT_WIDTH),
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -3494,7 +3611,7 @@ mod tests {
         assert_eq!(line.lines.len(), 2, "Ellipsis + max_lines = 2");
         let clip_last = clip_line.lines.last().expect("clip last line");
         let last = line.lines.last().expect("ellipsis last line");
-        let prefix_len = assert_ellipsis_prefix(last, clip_last, &ellipsis, CONTENT_WIDTH);
+        let prefix_len = assert_ellipsis_prefix(last, clip_last, &ellipsis, px(CONTENT_WIDTH));
 
         let clip_glyphs = line_glyphs(clip_last);
         assert_eq!(
@@ -3518,7 +3635,7 @@ mod tests {
                 glyph_atlas: &mut glyphs,
                 atlas: &mut atlas,
                 generation,
-                scale: 1.0,
+                scale: DevicePixelRatio::ONE,
             };
             let ppem = (16.0f32 * 1.0).clamp(1.0, 512.0);
             let variation =
@@ -3539,7 +3656,7 @@ mod tests {
                 {
                     positioned.push(glyph);
                 }
-                x += advance;
+                x += *advance;
             }
             positioned
         };
@@ -3555,14 +3672,17 @@ mod tests {
         const TEXT: &str = "abcdef中文中文";
         let mut harness = Harness::new();
         let style = |overflow| {
-            TextStyle::new(16.0)
+            TextStyle::new(px(16.0))
                 .with_wrap(TextWrap::NoWrap)
                 .with_overflow(overflow, 1)
         };
         let ellipsis_shaped = harness.shape(TEXT, style(crate::text::TextOverflow::Ellipsis));
         let clip_shaped = harness.shape(TEXT, style(crate::text::TextOverflow::Clip));
         let latin_width = harness
-            .shape("abcdef", TextStyle::new(16.0).with_wrap(TextWrap::NoWrap))
+            .shape(
+                "abcdef",
+                TextStyle::new(px(16.0)).with_wrap(TextWrap::NoWrap),
+            )
             .max_content_size()
             .width;
         let width = latin_width - 2.0;
@@ -3578,7 +3698,7 @@ mod tests {
         let (clip_line, _, _) = rasterize_line(
             &clip_shaped,
             width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -3586,7 +3706,7 @@ mod tests {
         let (line, _, _) = rasterize_line_with_ellipsis(
             &ellipsis_shaped,
             width,
-            1.0,
+            DevicePixelRatio::ONE,
             &mut raster,
             &mut glyphs,
             &mut atlas,
@@ -3628,7 +3748,7 @@ mod tests {
         const TEXT: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
         let mut harness = Harness::new();
         let style = |overflow| {
-            TextStyle::new(16.0)
+            TextStyle::new(px(16.0))
                 .with_wrap(TextWrap::NoWrap)
                 .with_overflow(overflow, 0)
         };
@@ -3657,7 +3777,7 @@ mod tests {
             let (clip_line, _, _) = rasterize_line(
                 &clip_shaped,
                 width,
-                1.0,
+                DevicePixelRatio::ONE,
                 &mut raster,
                 &mut glyphs,
                 &mut atlas,
@@ -3665,7 +3785,7 @@ mod tests {
             let (line, _, _) = rasterize_line_with_ellipsis(
                 &ellipsis_shaped,
                 width,
-                1.0,
+                DevicePixelRatio::ONE,
                 &mut raster,
                 &mut glyphs,
                 &mut atlas,
@@ -3694,7 +3814,7 @@ mod tests {
             InlineBoxSpec {
                 id: 1,
                 index: 1,
-                size: crate::math::Size::new(30.0, 40.0),
+                size: crate::math::LogicalSize::new(px(30.0), px(40.0)),
                 baseline: None,
                 align: InlineAlign::Baseline,
                 paint: None,
@@ -3702,7 +3822,7 @@ mod tests {
             InlineBoxSpec {
                 id: 2,
                 index: 4,
-                size: crate::math::Size::new(30.0, 60.0),
+                size: crate::math::LogicalSize::new(px(30.0), px(60.0)),
                 baseline: None,
                 align: InlineAlign::Baseline,
                 paint: None,
@@ -3710,18 +3830,30 @@ mod tests {
         ];
         let shaped = harness.shape_with(
             TEXT,
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 2),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Clip, 2),
             &boxes,
         );
-        let full = harness.shape_with(TEXT, TextStyle::new(16.0), &boxes);
+        let full = harness.shape_with(TEXT, TextStyle::new(px(16.0)), &boxes);
         let width = shaped.max_content_size().width;
 
-        let size = shaped.measure(none_known(), definite(width));
+        let size = shaped.measure(none_known(), definite(width.value()));
         let (mut raster, mut glyphs, mut atlas) = glyph_runner();
-        let (line, _, _) =
-            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
-        let (full_line, _, _) =
-            rasterize_line(&full, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        let (line, _, _) = rasterize_line(
+            &shaped,
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let (full_line, _, _) = rasterize_line(
+            &full,
+            width,
+            DevicePixelRatio::ONE,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
 
         assert_eq!(line.lines.len(), 2, "max_lines = 2");
         assert_eq!(full_line.lines.len(), 4, "硬换行 ⇒ 全文四行");
@@ -3736,19 +3868,19 @@ mod tests {
 
         let expected = line.lines[0].line_height + line.lines[1].line_height;
         assert!(
-            (size.height - expected).abs() < 1e-3,
+            (size.height - expected).abs() < px(1e-3),
             "measure 必须是前两行真实行高之和：{} vs {expected}",
             size.height
         );
         assert!(
-            (size.height - line.height).abs() < 1e-3,
+            (size.height - line.height).abs() < px(1e-3),
             "measure 高度必须等于 rasterize 高度：{} vs {}",
             size.height,
             line.height
         );
-        let uniform = 2.0 * plain_line_height;
+        let uniform = plain_line_height * 2.0;
         assert!(
-            (size.height - uniform).abs() > 1.0,
+            (size.height - uniform).abs() > px(1.0),
             "不得用「可见行数 × 单一 line_height」：{} vs {uniform}",
             size.height
         );
@@ -3765,9 +3897,9 @@ mod tests {
         let mut harness = Harness::new();
         let clamped = harness.shape(
             "Hello",
-            TextStyle::new(16.0).with_overflow(crate::text::TextOverflow::Clip, 1),
+            TextStyle::new(px(16.0)).with_overflow(crate::text::TextOverflow::Clip, 1),
         );
-        let plain = harness.shape("Hello", TextStyle::new(16.0));
+        let plain = harness.shape("Hello", TextStyle::new(px(16.0)));
         let size = clamped.measure(none_known(), definite(100.0));
         let plain_size = plain.measure(none_known(), definite(100.0));
         let line_height = {
@@ -3780,15 +3912,15 @@ mod tests {
                 .line_height
         };
 
-        assert!(size.height > 0.0, "单行不得被钳成 0：{:?}", size);
+        assert!(size.height > px(0.0), "单行不得被钳成 0：{:?}", size);
         assert!(
-            (size.height - line_height).abs() < 1e-3,
+            (size.height - line_height).abs() < px(1e-3),
             "单行高度必须等于真实行高：{} vs {line_height}",
             size.height
         );
         assert_eq!(
-            size.height.to_bits(),
-            plain_size.height.to_bits(),
+            size.height.value().to_bits(),
+            plain_size.height.value().to_bits(),
             "max_lines = 1 与不设上限在单行文本上必须逐位相同"
         );
     }
@@ -3799,10 +3931,14 @@ mod tests {
         if crate::text::raster::probe_font().is_none() {
             return;
         }
-        let shaped = harness.shape("H", TextStyle::new(16.0));
+        let shaped = harness.shape("H", TextStyle::new(px(16.0)));
         let logical_width = shaped.max_content_size().width;
         let mut physical = Vec::new();
-        for scale in [1.0f32, 1.25, 2.0] {
+        for scale in [
+            DevicePixelRatio::ONE,
+            DevicePixelRatio::new(1.25).expect("scale"),
+            DevicePixelRatio::new(2.0).expect("scale"),
+        ] {
             let (mut raster, mut glyphs, mut atlas) = glyph_runner();
             let (line, _, stats) = rasterize_line(
                 &shaped,
@@ -3815,7 +3951,7 @@ mod tests {
             assert_eq!(stats.rasters, 1, "unique ppem ⇒ one raster");
             assert_eq!(line.width, logical_width, "逻辑宽度与 scale 无关");
             let glyph = all_glyphs(&line).pop().expect("glyph");
-            physical.push(glyph.size.height * scale);
+            physical.push(glyph.size.height * scale.factor());
         }
         assert!(
             physical[1] > physical[0],
@@ -3884,12 +4020,12 @@ mod tests {
         let mut widths = Vec::new();
         for family in candidates {
             harness.family = family_list(&FontStack::new([family]), None);
-            let shaped = harness.shape("Hamburgefonstiv", TextStyle::new(16.0));
+            let shaped = harness.shape("Hamburgefonstiv", TextStyle::new(px(16.0)));
             widths.push((family, shaped.max_content_size().width));
         }
         let distinct = widths
             .iter()
-            .map(|(_, width)| width.to_bits())
+            .map(|(_, width)| width.value().to_bits())
             .collect::<std::collections::HashSet<_>>();
         if distinct.len() < 2 {
             eprintln!("skip: host resolves every candidate family to the same font: {widths:?}");
@@ -3905,22 +4041,22 @@ mod tests {
     fn has_only_ltr_runs_follows_the_resolved_bidi_levels() {
         let mut harness = Harness::new();
         for (text, style, expected) in [
-            ("Hello", TextStyle::new(16.0), true),
-            ("价🌍ab", TextStyle::new(16.0), true),
-            ("abc אבג", TextStyle::new(16.0), false),
+            ("Hello", TextStyle::new(px(16.0)), true),
+            ("价🌍ab", TextStyle::new(px(16.0)), true),
+            ("abc אבג", TextStyle::new(px(16.0)), false),
             (
                 "abc",
-                TextStyle::new(16.0).with_direction(TextDirection::Ltr),
+                TextStyle::new(px(16.0)).with_direction(TextDirection::Ltr),
                 true,
             ),
             (
                 "אבג",
-                TextStyle::new(16.0).with_direction(TextDirection::Ltr),
+                TextStyle::new(px(16.0)).with_direction(TextDirection::Ltr),
                 false,
             ),
             (
                 "abc",
-                TextStyle::new(16.0).with_direction(TextDirection::Rtl),
+                TextStyle::new(px(16.0)).with_direction(TextDirection::Rtl),
                 true,
             ),
         ] {
@@ -3938,7 +4074,8 @@ mod tests {
     fn numeric_text_never_has_rtl_runs() {
         let mut text_cx = crate::text::context::TextContext::new();
         for text in ["42150", "-1.50%", "1,234.56", "12/34:56"] {
-            let content = TextContent::new(text, TextStyle::new(16.0).with_wrap(TextWrap::NoWrap));
+            let content =
+                TextContent::new(text, TextStyle::new(px(16.0)).with_wrap(TextWrap::NoWrap));
             let shaped = text_cx.shape_cached(&content).0;
             assert!(
                 shaped.has_only_ltr_runs(),

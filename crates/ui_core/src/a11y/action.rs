@@ -10,7 +10,7 @@ use crate::{
     app::App,
     event::ActionSource,
     interaction::focus::{action_target, focusable, in_scope},
-    math::Point,
+    math::{LogicalPoint, LogicalPx, px},
     node::{
         id::NodeId,
         tree::{Node, NodeKind, NodeTree},
@@ -220,7 +220,7 @@ fn payload_of(data: Option<&ActionData>, action: A11yAction) -> A11yActionData<'
         (_, Some(ActionData::Value(value))) => A11yActionData::Value(value),
         (_, Some(ActionData::NumericValue(value))) => A11yActionData::NumericValue(*value),
         (_, Some(ActionData::SetScrollOffset(point))) => {
-            A11yActionData::ScrollOffset(Point::new(point.x as f32, point.y as f32))
+            A11yActionData::ScrollOffset(LogicalPoint::new(px(point.x as f32), px(point.y as f32)))
         }
         _ => A11yActionData::None,
     }
@@ -396,15 +396,15 @@ fn scroll_by(
         container,
     );
     let step = match data {
-        Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)) => slot.line_height.max(1.0),
-        _ => viewport.size.height.max(slot.line_height).max(1.0),
+        Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)) => slot.line_height.max(px(1.0)),
+        _ => viewport.size.height.max(slot.line_height).max(px(1.0)),
     };
     let delta = match action {
-        A11yAction::ScrollUp => Point::new(0.0, -step),
-        A11yAction::ScrollDown => Point::new(0.0, step),
-        A11yAction::ScrollLeft => Point::new(-step, 0.0),
-        A11yAction::ScrollRight => Point::new(step, 0.0),
-        _ => Point::ZERO,
+        A11yAction::ScrollUp => LogicalPoint::new(px(0.0), -step),
+        A11yAction::ScrollDown => LogicalPoint::new(px(0.0), step),
+        A11yAction::ScrollLeft => LogicalPoint::new(-step, px(0.0)),
+        A11yAction::ScrollRight => LogicalPoint::new(step, px(0.0)),
+        _ => LogicalPoint::ZERO,
     };
     apply_scroll(app, window, container, delta)
 }
@@ -420,10 +420,12 @@ fn scroll_into_view(app: &mut App, window: WindowId, node: crate::node::id::Node
         tree,
         node,
         tree.get(node)
-            .map_or(crate::math::Rect::default(), |state| state.layout().bounds),
+            .map_or(crate::math::LogicalRect::default(), |state| {
+                state.layout().bounds
+            }),
     );
     let view = crate::interaction::scroll::viewport(tree, container);
-    let mut delta = Point::ZERO;
+    let mut delta = LogicalPoint::ZERO;
     if target.min().y < view.min().y {
         delta.y = target.min().y - view.min().y;
     } else if target.max().y > view.max().y {
@@ -441,7 +443,7 @@ fn scroll_to(
     app: &mut App,
     window: WindowId,
     node: crate::node::id::NodeId,
-    offset: Point,
+    offset: LogicalPoint,
 ) -> bool {
     let Some(container) = scroll_container(app, window, node) else {
         return false;
@@ -456,9 +458,9 @@ fn apply_scroll(
     app: &mut App,
     window: WindowId,
     container: crate::node::id::NodeId,
-    delta: Point,
+    delta: LogicalPoint,
 ) -> bool {
-    if delta.x == 0.0 && delta.y == 0.0 {
+    if delta.x == LogicalPx::ZERO && delta.y == LogicalPx::ZERO {
         return true;
     }
     let Some(handle) = app.scroll_handle(window, container) else {
@@ -486,7 +488,7 @@ mod tests {
         app::App,
         event::Action,
         interaction::ScrollConfig,
-        math::{Point, Rect},
+        math::{LogicalPoint, LogicalRect, px},
         node::builder::NodeBuilder,
         paint::style::StylePatch,
         window::WindowOptions,
@@ -607,7 +609,7 @@ mod tests {
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 10.0, 10.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(10.0), px(10.0)))
             .on_click(Action::custom("press"))
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
@@ -673,7 +675,7 @@ mod tests {
             .expect("mount");
         let mut style = crate::paint::style_builder::StyleBuilder::new()
             .relative()
-            .size(100.0, 80.0)
+            .size(px(100.0), px(80.0))
             .build();
         style.clip = crate::paint::style::Clip::Bounds;
         let container = NodeBuilder::boxed()
@@ -683,7 +685,7 @@ mod tests {
         let handle = app
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scroll");
-        app.set_scroll_content(&handle, crate::math::Size::new(100.0, 400.0))
+        app.set_scroll_content(&handle, crate::math::LogicalSize::new(px(100.0), px(400.0)))
             .expect("content");
 
         let set_value_hits = Rc::new(Cell::new(0_u32));
@@ -737,7 +739,7 @@ mod tests {
         assert_eq!(increment_hits.get(), 0, "模态外的 Increment 不得生效");
         assert_eq!(
             app.scroll_state(&handle).expect("state").offset.y,
-            0.0,
+            px(0.0),
             "模态外的容器不得被 AT 滚动"
         );
         assert!(
@@ -880,7 +882,7 @@ mod tests {
             })
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("input");
-        let text = NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(12.0))
+        let text = NodeBuilder::text("价🌍ab", crate::text::TextStyle::new(px(12.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), input)
             .expect("text run");
         let _ = app
@@ -1044,10 +1046,10 @@ mod tests {
             })
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("input");
-        let first = NodeBuilder::text("价格", crate::text::TextStyle::new(12.0))
+        let first = NodeBuilder::text("价格", crate::text::TextStyle::new(px(12.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), input)
             .expect("first run");
-        let second = NodeBuilder::text("42", crate::text::TextStyle::new(12.0))
+        let second = NodeBuilder::text("42", crate::text::TextStyle::new(px(12.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), input)
             .expect("second run");
         let _ = app
@@ -1167,7 +1169,7 @@ mod tests {
         let root = app.window(window).expect("window").tree().root();
         let mut style = crate::paint::style_builder::StyleBuilder::new()
             .relative()
-            .size(100.0, 80.0)
+            .size(px(100.0), px(80.0))
             .build();
         style.clip = crate::paint::style::Clip::Bounds;
         let container = NodeBuilder::boxed()
@@ -1177,7 +1179,7 @@ mod tests {
         let handle = app
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scroll");
-        app.set_scroll_content(&handle, crate::math::Size::new(100.0, 400.0))
+        app.set_scroll_content(&handle, crate::math::LogicalSize::new(px(100.0), px(400.0)))
             .expect("content");
 
         dispatch_request(
@@ -1188,7 +1190,7 @@ mod tests {
             Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
         );
         let state = app.scroll_state(&handle).expect("state");
-        assert!(state.offset.y > 0.0, "ScrollDown 必须下移偏移");
+        assert!(state.offset.y > px(0.0), "ScrollDown 必须下移偏移");
         assert!(app.a11y_diagnostics().is_empty(), "滚动必须被处理");
     }
 
@@ -1208,7 +1210,7 @@ mod tests {
             A11yPatch::default(),
             StylePatch::default(),
             ScrollConfig::default(),
-            Point::ZERO,
+            LogicalPoint::ZERO,
         );
     }
 
@@ -1470,7 +1472,7 @@ mod tests {
                     ..A11yPatch::default()
                 },
             );
-        let text = NodeBuilder::text("搜索框", crate::text::TextStyle::new(12.0))
+        let text = NodeBuilder::text("搜索框", crate::text::TextStyle::new(px(12.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), node)
             .expect("text run");
         let _ = app
@@ -1545,7 +1547,7 @@ mod tests {
         let root = app.window(window).expect("window").tree().root();
         let mut style = crate::paint::style_builder::StyleBuilder::new()
             .relative()
-            .size(100.0, 80.0)
+            .size(px(100.0), px(80.0))
             .build();
         style.clip = crate::paint::style::Clip::Bounds;
         let container = NodeBuilder::boxed()
@@ -1566,7 +1568,7 @@ mod tests {
         let handle = app
             .make_scroll(window, container, ScrollConfig::default())
             .expect("scroll");
-        app.set_scroll_content(&handle, crate::math::Size::new(100.0, 400.0))
+        app.set_scroll_content(&handle, crate::math::LogicalSize::new(px(100.0), px(400.0)))
             .expect("content");
 
         dispatch_request(
@@ -1577,7 +1579,7 @@ mod tests {
             Some(ActionData::ScrollUnit(accesskit::ScrollUnit::Item)),
         );
         assert!(
-            app.scroll_state(&handle).expect("state").offset.y > 0.0,
+            app.scroll_state(&handle).expect("state").offset.y > px(0.0),
             "AT 对行发 ScrollDown 必须滚动其容器"
         );
         assert_no_action_diagnostics(&app, "滚动容器收敛后不得记能力拒绝");

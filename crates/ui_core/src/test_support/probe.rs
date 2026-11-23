@@ -1,6 +1,6 @@
 use crate::{
     layout::hit_test::HitResult,
-    math::{Point, Rect},
+    math::{LogicalPoint, LogicalRect},
     node::{
         id::NodeId,
         tree::{NodeKind, NodeTree},
@@ -84,7 +84,7 @@ impl<'a> Probe<'a> {
     }
 
     #[must_use]
-    pub fn bounds(&self, node: NodeId) -> Option<Rect> {
+    pub fn bounds(&self, node: NodeId) -> Option<LogicalRect> {
         self.tree
             .get(node)
             .ok()
@@ -92,7 +92,7 @@ impl<'a> Probe<'a> {
     }
 
     #[must_use]
-    pub fn hit(&self, point: Point) -> Option<HitResult> {
+    pub fn hit(&self, point: LogicalPoint) -> Option<HitResult> {
         self.tree.hit_test(point)
     }
 

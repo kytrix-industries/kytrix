@@ -7,7 +7,7 @@ use crate::paint::instance::InstanceBuffer;
 use crate::test_support::record::{DeltaRecord, PaintLog};
 use crate::{
     error::EngineError,
-    math::Rect,
+    math::{LogicalRect, physical_px},
     node::id::NodeId,
     paint::{
         pass::{PaintPass, PaintReport},
@@ -46,7 +46,7 @@ pub(crate) fn paint_frame(
         window.full_damage_pending = false;
     }
     if let Some(pending) = window.pending_damage.take() {
-        window.damage.push_logical(pending, 1.0, None);
+        window.damage.push_logical(pending, physical_px(1.0), None);
     }
     if !has_damage && !window.needs_node_repaint() && removed.is_empty() {
         return Ok(PaintReport {
@@ -332,7 +332,7 @@ pub(crate) fn encoded_geometry(window: &Window) -> &[crate::paint::instance::Geo
         .map_or(&[], |composer| composer.buffer().geometry())
 }
 
-pub(crate) fn request_damage(window: &mut Window, rect: Rect) {
+pub(crate) fn request_damage(window: &mut Window, rect: LogicalRect) {
     window.pending_damage = Some(match window.pending_damage {
         Some(existing) => existing.union(rect),
         None => rect,
@@ -347,7 +347,7 @@ pub(crate) fn request_repaint(window: &mut Window) {
 mod tests {
     use crate::{
         app::App,
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId},
         paint::{color::Color, style::PaintSpec},
         window::{FrameOutcome, WindowId, WindowOptions},
@@ -363,8 +363,8 @@ mod tests {
     fn headless_window(app: &mut App) -> WindowId {
         app.create_window(WindowOptions {
             title: smol_str::SmolStr::new_static("paint-prune"),
-            size: Size::new(1280.0, 800.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(1280.0), px(800.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         })
     }
@@ -392,11 +392,11 @@ mod tests {
             let tree = app.window_mut(window).expect("窗口").tree_mut();
             for index in 0..LEAVES {
                 let node = NodeBuilder::boxed()
-                    .layout_override(Rect::new(
-                        (index % 40) as f32 * 32.0,
-                        (index / 40) as f32 * 8.0,
-                        24.0,
-                        6.0,
+                    .layout_override(LogicalRect::new(
+                        px((index % 40) as f32 * 32.0),
+                        px((index / 40) as f32 * 8.0),
+                        px(24.0),
+                        px(6.0),
                     ))
                     .paint(PaintSpec {
                         background: Color::WHITE,
@@ -460,7 +460,7 @@ mod tests {
         use crate::{
             interaction::ScrollConfig,
             layout::LayoutOverride,
-            math::{PhysicalRect, Point, Rect, Size},
+            math::{DeviceRect, LogicalPoint, LogicalPx, LogicalRect, LogicalSize},
             node::{builder::NodeBuilder, id::NodeId, signal::Signal},
             paint::{
                 color::Color,
@@ -488,7 +488,12 @@ mod tests {
             appended: Vec<NodeId>,
         }
 
-        fn absolute_style(left: f32, top: f32, width: f32, height: f32) -> Style {
+        fn absolute_style(
+            left: LogicalPx,
+            top: LogicalPx,
+            width: LogicalPx,
+            height: LogicalPx,
+        ) -> Style {
             StyleBuilder::new()
                 .absolute()
                 .left(left)
@@ -497,7 +502,7 @@ mod tests {
                 .build()
         }
 
-        fn tile(rect: Rect, color: Color) -> NodeBuilder {
+        fn tile(rect: LogicalRect, color: Color) -> NodeBuilder {
             NodeBuilder::boxed().layout_override(rect).paint(PaintSpec {
                 background: color,
                 ..PaintSpec::default()
@@ -510,13 +515,18 @@ mod tests {
                 let tree = app.window_mut(window).expect("窗口").tree_mut();
                 let root = tree.root();
                 let panel = NodeBuilder::boxed()
-                    .style(absolute_style(0.0, 0.0, 400.0, 240.0))
+                    .style(absolute_style(px(0.0), px(0.0), px(400.0), px(240.0)))
                     .build(tree, root)
                     .expect("panel");
                 for row in 0..6u32 {
                     for column in 0..6u32 {
                         let _ = tile(
-                            Rect::new(column as f32 * 40.0, row as f32 * 30.0, 36.0, 26.0),
+                            LogicalRect::new(
+                                px(column as f32 * 40.0),
+                                px(row as f32 * 30.0),
+                                px(36.0),
+                                px(26.0),
+                            ),
                             Color::WHITE,
                         )
                         .build(tree, panel)
@@ -526,7 +536,12 @@ mod tests {
                 let source = signals.color;
                 for index in 0..3u32 {
                     let _ = NodeBuilder::boxed()
-                        .layout_override(Rect::new(index as f32 * 60.0 + 420.0, 0.0, 50.0, 40.0))
+                        .layout_override(LogicalRect::new(
+                            px(index as f32 * 60.0 + 420.0),
+                            px(0.0),
+                            px(50.0),
+                            px(40.0),
+                        ))
                         .paint(PaintSpec {
                             background: Color::WHITE,
                             ..PaintSpec::default()
@@ -540,7 +555,7 @@ mod tests {
                 }
                 let opacity = signals.opacity;
                 let _ = NodeBuilder::boxed()
-                    .layout_override(Rect::new(700.0, 0.0, 80.0, 40.0))
+                    .layout_override(LogicalRect::new(px(700.0), px(0.0), px(80.0), px(40.0)))
                     .paint(PaintSpec {
                         background: Color::WHITE,
                         ..PaintSpec::default()
@@ -555,16 +570,21 @@ mod tests {
                 for index in 0..3u32 {
                     let _ = NodeBuilder::text(
                         smol_str::SmolStr::new_static("0"),
-                        crate::text::TextStyle::new(12.0),
+                        crate::text::TextStyle::new(px(12.0)),
                     )
-                    .layout_override(Rect::new(index as f32 * 80.0, 60.0, 72.0, 18.0))
+                    .layout_override(LogicalRect::new(
+                        px(index as f32 * 80.0),
+                        px(60.0),
+                        px(72.0),
+                        px(18.0),
+                    ))
                     .bind_text(move |cx| smol_str::SmolStr::new(format!("v{}", *cx.read(&source))))
                     .build(tree, root)
                     .expect("label");
                 }
                 let visible = signals.visible;
                 let _hider = NodeBuilder::boxed()
-                    .layout_override(Rect::new(0.0, 300.0, 120.0, 60.0))
+                    .layout_override(LogicalRect::new(px(0.0), px(300.0), px(120.0), px(60.0)))
                     .paint(PaintSpec {
                         background: Color::WHITE,
                         ..PaintSpec::default()
@@ -576,17 +596,20 @@ mod tests {
                     .build(tree, root)
                     .expect("hider");
                 let grow = NodeBuilder::boxed()
-                    .style(absolute_style(140.0, 300.0, 400.0, 200.0))
+                    .style(absolute_style(px(140.0), px(300.0), px(400.0), px(200.0)))
                     .paint(PaintSpec {
                         background: Color::WHITE,
                         ..PaintSpec::default()
                     })
                     .build(tree, root)
                     .expect("grow");
-                let movable = tile(Rect::new(600.0, 300.0, 80.0, 40.0), Color::WHITE)
-                    .build(tree, root)
-                    .expect("movable");
-                let mut scroll_style = absolute_style(0.0, 400.0, 300.0, 120.0);
+                let movable = tile(
+                    LogicalRect::new(px(600.0), px(300.0), px(80.0), px(40.0)),
+                    Color::WHITE,
+                )
+                .build(tree, root)
+                .expect("movable");
+                let mut scroll_style = absolute_style(px(0.0), px(400.0), px(300.0), px(120.0));
                 scroll_style.clip = Clip::Bounds;
                 let scroll_container = NodeBuilder::boxed()
                     .style(scroll_style)
@@ -598,7 +621,7 @@ mod tests {
                     .expect("scroll container");
                 for index in 0..12u32 {
                     let _ = tile(
-                        Rect::new(0.0, index as f32 * 20.0, 280.0, 18.0),
+                        LogicalRect::new(px(0.0), px(index as f32 * 20.0), px(280.0), px(18.0)),
                         Color::WHITE,
                     )
                     .build(tree, scroll_container)
@@ -609,7 +632,7 @@ mod tests {
             let scroll = app
                 .make_scroll(window, scroll_container, ScrollConfig::default())
                 .expect("滚动容器");
-            app.set_scroll_content(&scroll, Size::new(280.0, 12.0 * 20.0))
+            app.set_scroll_content(&scroll, LogicalSize::new(px(280.0), px(12.0 * 20.0)))
                 .expect("滚动内容");
             Fixture {
                 window,
@@ -624,8 +647,8 @@ mod tests {
         struct View {
             lanes: Vec<(usize, Vec<Primitive>, u32)>,
             drawn: Vec<usize>,
-            scroll: Vec<(Point, PhysicalRect)>,
-            damage: Vec<PhysicalRect>,
+            scroll: Vec<(LogicalPoint, DeviceRect)>,
+            damage: Vec<DeviceRect>,
             damage_full: bool,
             delta: DeltaRecord,
         }
@@ -746,7 +769,8 @@ mod tests {
                         app.write(&signals.text, step);
                     }
                     3 => {
-                        let offset = Point::new(0.0, ((step as f32 * 13.0) % 120.0).max(1.0));
+                        let offset =
+                            LogicalPoint::new(px(0.0), px(((step as f32 * 13.0) % 120.0).max(1.0)));
                         for fixture in &fixtures {
                             app.scroll_to(&fixture.scroll, offset).expect("滚动");
                         }
@@ -773,11 +797,11 @@ mod tests {
                         }
                     }
                     5 => {
-                        let rect = Rect::new(
-                            600.0 + (step as f32) * 3.0,
-                            300.0 + (step % 2) as f32 * 5.0,
-                            80.0,
-                            40.0,
+                        let rect = LogicalRect::new(
+                            px(600.0 + (step as f32) * 3.0),
+                            px(300.0 + (step % 2) as f32 * 5.0),
+                            px(80.0),
+                            px(40.0),
                         );
                         for fixture in &fixtures {
                             app.window_mut(fixture.window)
@@ -794,11 +818,11 @@ mod tests {
                         for fixture in &mut fixtures {
                             let tree = app.window_mut(fixture.window).expect("窗口").tree_mut();
                             let node = tile(
-                                Rect::new(
-                                    160.0 + (fixture.appended.len() as f32) * 30.0,
-                                    420.0,
-                                    24.0,
-                                    24.0,
+                                LogicalRect::new(
+                                    px(160.0 + (fixture.appended.len() as f32) * 30.0),
+                                    px(420.0),
+                                    px(24.0),
+                                    px(24.0),
                                 ),
                                 Color::WHITE,
                             )

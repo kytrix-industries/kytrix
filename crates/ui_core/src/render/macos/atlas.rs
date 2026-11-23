@@ -481,6 +481,7 @@ mod tests {
 
     use super::AtlasTextures;
     use crate::{
+        math::dp,
         paint::atlas::AtlasKind,
         render::{
             atlas::DirtyRects,
@@ -525,11 +526,11 @@ mod tests {
 
     fn rows(y0: u32, y1: u32) -> DirtyRects {
         let mut rects = DirtyRects::default();
-        rects.mark(crate::math::PhysicalRect::new(
-            0,
-            y0 as i32,
-            i32::MAX,
-            y1 as i32,
+        rects.mark(crate::math::DeviceRect::new(
+            dp(0),
+            dp(y0 as i32),
+            dp(i32::MAX),
+            dp(y1 as i32),
         ));
         rects
     }

@@ -2,7 +2,10 @@ use smallvec::SmallVec;
 
 use crate::{
     error::EngineError,
-    math::{Point, Rect, Scale, Transform},
+    math::{
+        DevicePixelRatio, DeviceRect, LogicalPoint, LogicalPx, LogicalRect, PhysicalPx, Transform,
+        dp, px,
+    },
     paint::{
         atlas::MAX_IMAGE_PAGES,
         color::{ColorResolver, LinearPremulRgba},
@@ -99,35 +102,6 @@ pub(crate) const CLIP_KIND_ROUNDED: f32 = 2.0;
 #[cfg(any(debug_assertions, test))]
 pub(crate) const MAX_CLIP_ITEMS: f32 = 9.0;
 
-pub(crate) fn normalize_corner_radius(radii: [f32; 4], width: f32, height: f32) -> [f32; 4] {
-    if width.is_nan() || height.is_nan() || !width.is_finite() || !height.is_finite() {
-        return [0.0; 4];
-    }
-    if width <= 0.0 || height <= 0.0 {
-        return [0.0; 4];
-    }
-    let sanitized = radii.map(|radius| {
-        if radius.is_nan() {
-            0.0
-        } else {
-            radius.max(0.0)
-        }
-    });
-    let mut scale = 1.0f32;
-    for (side, sum) in [
-        (width, sanitized[0] + sanitized[1]),
-        (width, sanitized[3] + sanitized[2]),
-        (height, sanitized[0] + sanitized[3]),
-        (height, sanitized[1] + sanitized[2]),
-    ] {
-        if sum > side {
-            scale = scale.min(side / sum);
-        }
-    }
-    let half_min = 0.5 * width.min(height);
-    sanitized.map(|radius| (radius * scale).min(half_min))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClipChainId(u32);
 
@@ -195,19 +169,19 @@ pub(crate) enum FrameOp {
     Instances {
         start: u32,
         len: u32,
-        bounds: PhysicalBounds,
+        bounds: DeviceRect,
         scroll: u32,
     },
     Geometry {
         index: u32,
         clip_index: u32,
         clip_rect: [u32; 4],
-        bounds: PhysicalBounds,
+        bounds: DeviceRect,
     },
 }
 
 impl FrameOp {
-    pub(crate) fn bounds(self) -> PhysicalBounds {
+    pub(crate) fn bounds(self) -> DeviceRect {
         match self {
             Self::Instances { bounds, .. } | Self::Geometry { bounds, .. } => bounds,
         }
@@ -245,86 +219,41 @@ pub(crate) fn scrolled_scissor(
     ])
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PhysicalBounds {
-    pub x0: i32,
-    pub y0: i32,
-    pub x1: i32,
-    pub y1: i32,
+fn run_bounds(instances: &[GpuPrimitive]) -> DeviceRect {
+    instances
+        .iter()
+        .filter_map(instance_bounds)
+        .reduce(DeviceRect::union)
+        .unwrap_or_default()
 }
 
-impl PhysicalBounds {
-    pub(crate) const EMPTY: Self = Self {
-        x0: i32::MAX,
-        y0: i32::MAX,
-        x1: i32::MIN,
-        y1: i32::MIN,
+fn instance_bounds(primitive: &GpuPrimitive) -> Option<DeviceRect> {
+    let (Some(extent), Some(clip)) = (instance_extent(primitive), clip_extent(primitive)) else {
+        return None;
     };
-
-    pub(crate) fn intersects(self, other: [i32; 4]) -> bool {
-        self.x0 <= other[2] && other[0] <= self.x1 && self.y0 <= other[3] && other[1] <= self.y1
+    let x0 = extent[0].max(clip[0]);
+    let y0 = extent[1].max(clip[1]);
+    let x1 = extent[2].min(clip[2]);
+    let y1 = extent[3].min(clip[3]);
+    if x0 > x1 || y0 > y1 {
+        return None;
     }
-
-    pub(crate) fn translated(self, offset: [f32; 2]) -> Self {
-        let dx = offset[0].round() as i32;
-        let dy = offset[1].round() as i32;
-        Self {
-            x0: self.x0.saturating_add(dx),
-            y0: self.y0.saturating_add(dy),
-            x1: self.x1.saturating_add(dx),
-            y1: self.y1.saturating_add(dy),
-        }
-    }
-
-    fn union(self, other: Self) -> Self {
-        Self {
-            x0: self.x0.min(other.x0),
-            y0: self.y0.min(other.y0),
-            x1: self.x1.max(other.x1),
-            y1: self.y1.max(other.y1),
-        }
-    }
-
-    fn union_instance(&mut self, primitive: &GpuPrimitive) {
-        let (Some(extent), Some(clip)) = (instance_extent(primitive), clip_extent(primitive))
-        else {
-            return;
-        };
-        let x0 = extent[0].max(clip[0]);
-        let y0 = extent[1].max(clip[1]);
-        let x1 = extent[2].min(clip[2]);
-        let y1 = extent[3].min(clip[3]);
-        if x0 > x1 || y0 > y1 {
-            return;
-        }
-        self.x0 = self.x0.min(x0);
-        self.y0 = self.y0.min(y0);
-        self.x1 = self.x1.max(x1);
-        self.y1 = self.y1.max(y1);
-    }
+    Some(DeviceRect::new(dp(x0), dp(y0), dp(x1), dp(y1)))
 }
 
-fn run_bounds(instances: &[GpuPrimitive]) -> PhysicalBounds {
-    let mut bounds = PhysicalBounds::EMPTY;
-    for primitive in instances {
-        bounds.union_instance(primitive);
-    }
-    bounds
-}
-
-fn bounds_of_aabb(aabb: [f32; 4]) -> PhysicalBounds {
+fn bounds_of_aabb(aabb: [f32; 4]) -> DeviceRect {
     if aabb.iter().any(|value| value.is_nan()) {
-        return PhysicalBounds::EMPTY;
+        return DeviceRect::default();
     }
     let [x0, y0, x1, y1] = aabb;
     if x1 < x0 || y1 < y0 {
-        return PhysicalBounds::EMPTY;
+        return DeviceRect::default();
     }
-    PhysicalBounds {
-        x0: (x0.floor() as i32).saturating_sub(1),
-        y0: (y0.floor() as i32).saturating_sub(1),
-        x1: (x1.ceil() as i32).saturating_add(1),
-        y1: (y1.ceil() as i32).saturating_add(1),
+    DeviceRect {
+        x0: dp((x0.floor() as i32).saturating_sub(1)),
+        y0: dp((y0.floor() as i32).saturating_sub(1)),
+        x1: dp((x1.ceil() as i32).saturating_add(1)),
+        y1: dp((y1.ceil() as i32).saturating_add(1)),
     }
 }
 
@@ -397,7 +326,7 @@ impl LaneSegment {
 }
 
 enum LanePart {
-    Instances { len: u32, bounds: PhysicalBounds },
+    Instances { len: u32, bounds: DeviceRect },
     Geometry(Box<LaneGeometry>),
 }
 
@@ -405,7 +334,7 @@ struct LaneGeometry {
     draw: GeometryDrawGpu,
     clip_index: u32,
     clip_rect: [u32; 4],
-    bounds: PhysicalBounds,
+    bounds: DeviceRect,
 }
 
 #[derive(Default)]
@@ -766,15 +695,15 @@ fn aabb_to_rect(aabb: [f32; 4]) -> [f32; 4] {
     [aabb[0], aabb[1], aabb[2] - aabb[0], aabb[3] - aabb[1]]
 }
 
-fn transformed_aabb(transform: Transform, rect: Rect) -> [f32; 4] {
-    let far = Point::new(
+fn transformed_aabb(transform: Transform, rect: LogicalRect) -> [f32; 4] {
+    let far = LogicalPoint::new(
         rect.origin.x + rect.size.width,
         rect.origin.y + rect.size.height,
     );
     let corners = [
         transform.apply(rect.origin),
-        transform.apply(Point::new(far.x, rect.origin.y)),
-        transform.apply(Point::new(rect.origin.x, far.y)),
+        transform.apply(LogicalPoint::new(far.x, rect.origin.y)),
+        transform.apply(LogicalPoint::new(rect.origin.x, far.y)),
         transform.apply(far),
     ];
     if !corners
@@ -791,16 +720,16 @@ fn transformed_aabb(transform: Transform, rect: Rect) -> [f32; 4] {
     ];
     for point in corners {
         aabb = [
-            aabb[0].min(point.x),
-            aabb[1].min(point.y),
-            aabb[2].max(point.x),
-            aabb[3].max(point.y),
+            aabb[0].min(point.x.value()),
+            aabb[1].min(point.y.value()),
+            aabb[2].max(point.x.value()),
+            aabb[3].max(point.y.value()),
         ];
     }
     aabb
 }
 
-fn visible_aabb(logical_aabb: [f32; 4], scale: Scale, clip_aabb: [f32; 4]) -> [f32; 4] {
+fn visible_aabb(logical_aabb: [f32; 4], scale: DevicePixelRatio, clip_aabb: [f32; 4]) -> [f32; 4] {
     let factor = scale.factor();
     let scaled = [
         logical_aabb[0] * factor,
@@ -824,7 +753,7 @@ pub(crate) struct InstanceEncoder {
     saved: SmallVec<[ClipState; 8]>,
     chains: ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
     colors: crate::paint::color::ResolveCache,
-    scale: Option<Scale>,
+    scale: Option<DevicePixelRatio>,
     scratch: Vec<GpuPrimitive>,
     scratch_parts: SmallVec<[LanePart; 2]>,
     encoded_lanes: usize,
@@ -866,7 +795,7 @@ impl InstanceEncoder {
     pub(crate) fn encode<S: LaneSource>(
         &mut self,
         source: &S,
-        scale: Scale,
+        scale: DevicePixelRatio,
         resolver: ColorResolver,
         geometry: &dyn GeometryLookup,
     ) -> Result<&InstanceBuffer, EngineError> {
@@ -905,7 +834,7 @@ impl InstanceEncoder {
         &mut self,
         source: &S,
         order: &[crate::paint::scene::LaneId],
-        scale: Scale,
+        scale: DevicePixelRatio,
         resolver: ColorResolver,
         geometry: &dyn GeometryLookup,
     ) -> Result<(), EngineError> {
@@ -1039,7 +968,7 @@ impl InstanceEncoder {
         source: &S,
         changed: &[crate::paint::scene::LaneId],
         order: &[crate::paint::scene::LaneId],
-        scale: Scale,
+        scale: DevicePixelRatio,
         resolver: ColorResolver,
         geometry: &dyn GeometryLookup,
     ) -> Result<(), EngineError> {
@@ -1214,7 +1143,7 @@ impl InstanceEncoder {
         self.reused_segments
     }
 
-    pub(crate) fn needs_reset(&self, scale: Scale) -> bool {
+    pub(crate) fn needs_reset(&self, scale: DevicePixelRatio) -> bool {
         self.scale != Some(scale) || self.buffer.clips.len() > CLIP_TABLE_LIMIT
     }
 
@@ -1401,7 +1330,7 @@ struct OpGroup {
     start: u32,
     len: u32,
     lanes: u32,
-    bounds: PhysicalBounds,
+    bounds: DeviceRect,
     scroll: u32,
 }
 
@@ -1412,7 +1341,7 @@ impl OpGroup {
             start: 0,
             len: 0,
             lanes: 0,
-            bounds: PhysicalBounds::EMPTY,
+            bounds: DeviceRect::default(),
             scroll: 0,
         }
     }
@@ -1574,7 +1503,7 @@ struct LaneEncoder<'a> {
     state: &'a mut ClipState,
     saved: &'a mut SmallVec<[ClipState; 8]>,
     chains: &'a mut ahash::HashMap<(u32, u32, [u32; 4], [u32; 4]), ClipChainId>,
-    scale: Scale,
+    scale: DevicePixelRatio,
     resolver: ColorResolver,
     colors: &'a mut crate::paint::color::ResolveCache,
     geometry: &'a dyn GeometryLookup,
@@ -1668,26 +1597,31 @@ impl LaneEncoder<'_> {
         self.saved.push(self.state.clone());
         let factor = self.scale.factor();
         let logical = clip.rect;
-        let rect = if logical.is_finite() && logical.size.width > 0.0 && logical.size.height > 0.0 {
-            physical_to_bounds(logical.to_physical_covering(self.scale))
+        let rect = if logical.is_finite()
+            && logical.size.width > LogicalPx::ZERO
+            && logical.size.height > LogicalPx::ZERO
+        {
+            device_bounds(self.scale.to_covering_device_rect(logical))
         } else {
             let x = if logical.origin.x.is_finite() {
-                (logical.origin.x * factor).floor()
+                (logical.origin.x.value() * factor).floor()
             } else {
                 0.0
             };
             let y = if logical.origin.y.is_finite() {
-                (logical.origin.y * factor).floor()
+                (logical.origin.y.value() * factor).floor()
             } else {
                 0.0
             };
             [x, y, 0.0, 0.0]
         };
-        let radii = normalize_corner_radius(
-            clip.corner_radius.map(|radius| radius * factor),
-            rect[2],
-            rect[3],
-        );
+        let radii = crate::math::normalize_physical_corner_radius(
+            clip.corner_radius
+                .map(|radius| self.scale.to_physical(radius)),
+            PhysicalPx::new(rect[2]),
+            PhysicalPx::new(rect[3]),
+        )
+        .map(f32::from);
         if radii.iter().all(|radius| *radius == 0.0) {
             let aabb = rect_to_aabb(rect);
             self.state.rect_aabb = if self.state.has_rect {
@@ -1819,7 +1753,7 @@ impl LaneEncoder<'_> {
         transform: Transform,
         color: [f32; 4],
         range: std::ops::Range<u32>,
-        op_bounds: Option<Rect>,
+        op_bounds: Option<LogicalRect>,
     ) {
         let registered = self.geometry_snapshot(id);
         let clip_aabb = self.clip_aabb();
@@ -1829,7 +1763,7 @@ impl LaneEncoder<'_> {
         let mut emitted = 0usize;
         let mut push_part = |emitted: &mut usize,
                              clipped: std::ops::Range<u32>,
-                             bounds: Rect,
+                             bounds: LogicalRect,
                              snapshot: std::sync::Arc<_>| {
             let visible = visible_aabb(transformed_aabb(transform, bounds), self.scale, clip_aabb);
             self.parts.push(LanePart::Geometry(Box::new(LaneGeometry {
@@ -1896,11 +1830,11 @@ impl LaneEncoder<'_> {
                 &mut emitted,
                 0..0,
                 op_bounds.unwrap_or_else(|| {
-                    Rect::new(
-                        clip_aabb[0],
-                        clip_aabb[1],
-                        (clip_aabb[2] - clip_aabb[0]).max(0.0),
-                        (clip_aabb[3] - clip_aabb[1]).max(0.0),
+                    LogicalRect::new(
+                        px(clip_aabb[0]),
+                        px(clip_aabb[1]),
+                        px((clip_aabb[2] - clip_aabb[0]).max(0.0)),
+                        px((clip_aabb[3] - clip_aabb[1]).max(0.0)),
                     )
                 }),
                 crate::paint::geometry_store::missing_snapshot(),
@@ -1910,22 +1844,22 @@ impl LaneEncoder<'_> {
     }
 
     fn emit_quad(&mut self, quad: &crate::paint::primitive::Quad) {
-        let bounds = physical_to_bounds(quad.bounds.to_physical(self.scale));
+        let bounds = device_bounds(self.scale.to_device_rect(quad.bounds));
         if bounds[2] <= 0.0 || bounds[3] <= 0.0 {
             return;
         }
-        let factor = self.scale.factor();
-        let radii = normalize_corner_radius(
-            quad.corner_radius.map(|radius| radius * factor),
-            bounds[2],
-            bounds[3],
-        );
+        let radii = crate::math::normalize_physical_corner_radius(
+            quad.corner_radius
+                .map(|radius| self.scale.to_physical(radius)),
+            PhysicalPx::new(bounds[2]),
+            PhysicalPx::new(bounds[3]),
+        )
+        .map(f32::from);
         let short_side = bounds[2].min(bounds[3]);
         let (color0, color1, border_width, gradient) = match &quad.paint {
             QuadPaint::Solid { fill, border } => {
-                let width = border.map_or(0.0, |border| {
-                    crate::math::snap_stroke_width(border.width, factor)
-                });
+                let width =
+                    border.map_or(0.0, |border| self.scale.stroke_width(border.width).value());
                 (
                     self.colors.resolve(&self.resolver, *fill),
                     border.map_or(LinearPremulRgba::TRANSPARENT, |border| {
@@ -1960,25 +1894,27 @@ impl LaneEncoder<'_> {
     }
 
     fn emit_shadow(&mut self, shadow: &crate::paint::primitive::Shadow) {
-        let factor = self.scale.factor();
-        let bounds = shadow
-            .rect
-            .translate(shadow.offset)
-            .to_physical_f32(self.scale);
-        let blur = shadow.blur.max(0.0) * factor;
-        let radii = normalize_corner_radius(
-            shadow.corner_radius.map(|radius| radius * factor),
-            bounds[2],
-            bounds[3],
-        );
-        let sigma = (blur * SHADOW_SIGMA_SCALE).max(SHADOW_SIGMA_MIN);
+        let bounds = self
+            .scale
+            .to_physical_rect(shadow.rect.translate(shadow.offset))
+            .to_aabb();
+        let blur = self.scale.to_physical(shadow.blur.max(LogicalPx::ZERO));
+        let radii = crate::math::normalize_physical_corner_radius(
+            shadow
+                .corner_radius
+                .map(|radius| self.scale.to_physical(radius)),
+            PhysicalPx::new(bounds[2]),
+            PhysicalPx::new(bounds[3]),
+        )
+        .map(f32::from);
+        let sigma = (blur.value() * SHADOW_SIGMA_SCALE).max(SHADOW_SIGMA_MIN);
         let pad = SHADOW_PAD_SIGMAS * sigma + 1.0;
         let instance = GpuPrimitive {
             bounds,
             corner_radius: radii,
             color0: self.colors.resolve(&self.resolver, shadow.color).to_array(),
             color1: [0.0; 4],
-            params0: [0.0, blur, GRADIENT_NONE, pad],
+            params0: [0.0, blur.value(), GRADIENT_NONE, pad],
             params1: [self.clip_index(), 0.0, KIND_SHADOW, self.clip_depth()],
             uv: [0.0; 4],
             clip_rect: self.clip_rect(),
@@ -1987,6 +1923,9 @@ impl LaneEncoder<'_> {
     }
 
     fn emit_image(&mut self, image: &crate::paint::primitive::Image) {
+        if image.bounds.is_empty() {
+            return;
+        }
         debug_assert!(
             image.tile.page < MAX_IMAGE_PAGES,
             "image tile page {} out of range (MAX_IMAGE_PAGES={MAX_IMAGE_PAGES})",
@@ -1996,9 +1935,8 @@ impl LaneEncoder<'_> {
             return;
         }
         let page = image.tile.page.min(MAX_IMAGE_PAGES - 1);
-        let physical = image.bounds.to_physical(self.scale);
+        let bounds = device_bounds(self.scale.to_device_rect(image.bounds));
         let color0 = self.colors.resolve(&self.resolver, image.modulation);
-        let bounds = physical_to_bounds(physical);
         let instance = GpuPrimitive {
             bounds,
             corner_radius: [0.0; 4],
@@ -2026,8 +1964,13 @@ impl LaneEncoder<'_> {
             glyph.tile.page, 0,
             "glyph atlas tile must live in texture array layer 0"
         );
-        let physical = Rect::from_origin_size(glyph.position, glyph.size).to_physical(self.scale);
-        let bounds = physical_to_bounds(physical);
+        if glyph.size.is_empty() {
+            return;
+        }
+        let bounds = device_bounds(
+            self.scale
+                .to_device_rect(LogicalRect::from_origin_size(glyph.position, glyph.size)),
+        );
         let instance = GpuPrimitive {
             bounds,
             corner_radius: [0.0; 4],
@@ -2042,12 +1985,12 @@ impl LaneEncoder<'_> {
     }
 }
 
-fn physical_to_bounds(rect: crate::math::PhysicalRect) -> [f32; 4] {
+fn device_bounds(rect: crate::math::DeviceRect) -> [f32; 4] {
     [
-        rect.x0 as f32,
-        rect.y0 as f32,
-        rect.width() as f32,
-        rect.height() as f32,
+        f32::from(rect.x0),
+        f32::from(rect.y0),
+        f32::from(rect.width()),
+        f32::from(rect.height()),
     ]
 }
 
@@ -2073,11 +2016,13 @@ mod tests {
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
         DrawIndexedArgs, GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive,
         InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN,
-        SHADOW_SIGMA_SCALE, draw_indexed_params, normalize_corner_radius,
+        SHADOW_SIGMA_SCALE, draw_indexed_params,
     };
     use crate::{
         error::EngineError,
-        math::{Point, Rect, Scale, Size, Transform},
+        math::{
+            DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, PhysicalPx, Transform, dp, px,
+        },
         paint::{
             atlas::{AtlasKind, AtlasTile},
             canvas::Canvas,
@@ -2091,8 +2036,8 @@ mod tests {
         },
     };
 
-    fn scale() -> Scale {
-        Scale::new(2.0).expect("合法 scale")
+    fn scale() -> DevicePixelRatio {
+        DevicePixelRatio::new(2.0).expect("合法 scale")
     }
 
     #[test]
@@ -2124,14 +2069,14 @@ mod tests {
         ColorResolver
     }
 
-    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
-        Rect::new(x, y, w, h)
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> LogicalRect {
+        LogicalRect::new(px(x), px(y), px(w), px(h))
     }
 
     fn quad_primitive(paint: QuadPaint) -> Primitive {
         Primitive::Quad(Quad {
             bounds: rect(1.0, 2.0, 10.0, 20.0),
-            corner_radius: [1.0, 2.0, 3.0, 4.0],
+            corner_radius: [px(1.0), px(2.0), px(3.0), px(4.0)],
             paint,
         })
     }
@@ -2162,7 +2107,7 @@ mod tests {
 
     fn encode_at(scene: &Scene, factor: f32) -> Encoded {
         let mut encoder = InstanceEncoder::new();
-        let scale = Scale::new(factor).expect("合法 scale");
+        let scale = DevicePixelRatio::new(factor).expect("合法 scale");
         let buffer = encoder
             .encode(
                 scene,
@@ -2306,28 +2251,33 @@ mod tests {
 
     #[test]
     fn corner_radius_applies_css_proportional_scaling_then_the_sdf_domain_clamp() {
-        assert_eq!(normalize_corner_radius([4.0; 4], 100.0, 2.0), [1.0; 4]);
-        assert_eq!(normalize_corner_radius([8.0; 4], 4.0, 8.0), [2.0; 4]);
+        let normalize = |radii: [f32; 4], width: f32, height: f32| {
+            crate::math::normalize_physical_corner_radius(
+                radii.map(PhysicalPx::new),
+                PhysicalPx::new(width),
+                PhysicalPx::new(height),
+            )
+            .map(f32::from)
+        };
+        assert_eq!(normalize([4.0; 4], 100.0, 2.0), [1.0; 4]);
+        assert_eq!(normalize([8.0; 4], 4.0, 8.0), [2.0; 4]);
         assert_eq!(
-            normalize_corner_radius([20.0, 20.0, 0.0, 0.0], 30.0, 100.0),
+            normalize([20.0, 20.0, 0.0, 0.0], 30.0, 100.0),
             [15.0, 15.0, 0.0, 0.0]
         );
         assert_eq!(
-            normalize_corner_radius([10.0, 30.0, 0.0, 0.0], 20.0, 100.0),
+            normalize([10.0, 30.0, 0.0, 0.0], 20.0, 100.0),
             [5.0, 10.0, 0.0, 0.0]
         );
-        let scaled = normalize_corner_radius([1.0, 0.0, 0.0, 40.0], 100.0, 20.0);
+        let scaled = normalize([1.0, 0.0, 0.0, 40.0], 100.0, 20.0);
         assert!((scaled[0] - 20.0 / 41.0).abs() < 1e-5, "{scaled:?}");
         assert_eq!(scaled[3], 10.0);
         assert_eq!((scaled[1], scaled[2]), (0.0, 0.0));
-        assert_eq!(normalize_corner_radius([-3.0; 4], 10.0, 10.0), [0.0; 4]);
-        assert_eq!(normalize_corner_radius([f32::NAN; 4], 10.0, 10.0), [0.0; 4]);
-        assert_eq!(normalize_corner_radius([2.0; 4], 0.0, 10.0), [0.0; 4]);
-        assert_eq!(normalize_corner_radius([2.0; 4], 10.0, f32::NAN), [0.0; 4]);
-        assert_eq!(
-            normalize_corner_radius([2.0; 4], f32::INFINITY, 10.0),
-            [0.0; 4]
-        );
+        assert_eq!(normalize([-3.0; 4], 10.0, 10.0), [0.0; 4]);
+        assert_eq!(normalize([f32::NAN; 4], 10.0, 10.0), [0.0; 4]);
+        assert_eq!(normalize([2.0; 4], 0.0, 10.0), [0.0; 4]);
+        assert_eq!(normalize([2.0; 4], 10.0, f32::NAN), [0.0; 4]);
+        assert_eq!(normalize([2.0; 4], f32::INFINITY, 10.0), [0.0; 4]);
 
         let mut scene = Scene::empty();
         let lane = scene.new_lane();
@@ -2335,7 +2285,7 @@ mod tests {
             lane,
             Primitive::Quad(Quad {
                 bounds: rect(0.0, 0.0, 10.0, 2.0),
-                corner_radius: [3.0; 4],
+                corner_radius: [px(3.0); 4],
                 paint: solid(),
             }),
         ));
@@ -2349,7 +2299,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 2.0, 2.0),
-                    corner_radius: [8.0; 4],
+                    corner_radius: [px(8.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2367,11 +2317,11 @@ mod tests {
         let mut canvas = crate::paint::canvas::Canvas::new(rect(0.0, 0.0, 2000.0, 2000.0));
         assert!(canvas.push_clip(ClipRect {
             rect: rect(100.0, 50.0, 800.0, 600.0),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         }));
         canvas.push_quad(Quad {
             bounds: rect(0.0, 0.0, 2000.0, 2000.0),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: solid(),
         });
         assert!(canvas.pop_clip());
@@ -2390,17 +2340,20 @@ mod tests {
         let bounds = super::bounds_of_aabb([100.0, 50.0, 900.0, 650.0]);
         assert_eq!(
             (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
-            (99, 49, 901, 651)
+            (dp(99), dp(49), dp(901), dp(651))
         );
-        let empty = super::PhysicalBounds::EMPTY;
+        let empty = crate::math::DeviceRect::default();
         assert_eq!(super::bounds_of_aabb([f32::NAN, 0.0, 1.0, 1.0]), empty);
         assert_eq!(super::bounds_of_aabb([10.0, 10.0, 5.0, 5.0]), empty);
         let dot = super::bounds_of_aabb([7.0, 7.0, 7.0, 7.0]);
-        assert_eq!((dot.x0, dot.y0, dot.x1, dot.y1), (6, 6, 8, 8));
+        assert_eq!(
+            (dot.x0, dot.y0, dot.x1, dot.y1),
+            (dp(6), dp(6), dp(8), dp(8))
+        );
         let all = super::bounds_of_aabb([f32::MIN, f32::MIN, f32::MAX, f32::MAX]);
         assert_eq!(
             (all.x0, all.y0, all.x1, all.y1),
-            (i32::MIN, i32::MIN, i32::MAX, i32::MAX)
+            (dp(i32::MIN), dp(i32::MIN), dp(i32::MAX), dp(i32::MAX))
         );
     }
 
@@ -2409,11 +2362,11 @@ mod tests {
         let mut canvas = crate::paint::canvas::Canvas::new(rect(0.0, 0.0, 100.0, 100.0));
         assert!(canvas.push_clip(ClipRect {
             rect: rect(-10.0, -5.0, 20.0, 20.0),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         }));
         canvas.push_quad(Quad {
             bounds: rect(0.0, 0.0, 30.0, 30.0),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: solid(),
         });
         assert!(canvas.pop_clip());
@@ -2434,7 +2387,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 30.0, 30.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             push_clip(
@@ -2442,7 +2395,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 30.0, 30.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             push_clip(
@@ -2450,7 +2403,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(5.0, 5.0, 10.0, 10.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2477,7 +2430,7 @@ mod tests {
     fn nested_identical_rounded_clips_keep_a_single_chain_entry() {
         let rounded = ClipRect {
             rect: rect(0.0, 0.0, 30.0, 30.0),
-            corner_radius: [2.0; 4],
+            corner_radius: [px(2.0); 4],
         };
         let scene = scene_with(|scene, lane| {
             push_clip(scene, lane, rounded);
@@ -2509,7 +2462,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 30.0, 30.0),
-                    corner_radius: [2.0; 4],
+                    corner_radius: [px(2.0); 4],
                 },
             );
             push_clip(
@@ -2517,7 +2470,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(2.0, 2.0, 26.0, 26.0),
-                    corner_radius: [2.0; 4],
+                    corner_radius: [px(2.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2543,7 +2496,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 29.75, 29.75),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2555,7 +2508,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 29.75, 29.75),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             push_clip(
@@ -2563,7 +2516,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 29.75, 29.75),
-                    corner_radius: [2.0; 4],
+                    corner_radius: [px(2.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2624,7 +2577,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 30.3, 30.7),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2670,7 +2623,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: logical,
-                        corner_radius: [0.0; 4],
+                        corner_radius: [px(0.0); 4],
                     },
                 );
                 assert!(scene.push(lane, quad_primitive(solid())));
@@ -2694,7 +2647,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(1.3, 2.7, 30.35, 20.15),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             push_clip(
@@ -2702,7 +2655,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(3.45, 4.55, 17.85, 9.25),
-                    corner_radius: [2.5; 4],
+                    corner_radius: [px(2.5); 4],
                 },
             );
             push_clip(
@@ -2710,7 +2663,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(5.7, 6.1, 40.05, 30.95),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2760,7 +2713,7 @@ mod tests {
                         lane,
                         ClipRect {
                             rect: logical,
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                         },
                     );
                     assert!(scene.push(lane, quad_primitive(solid())));
@@ -2802,7 +2755,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: logical,
-                        corner_radius: [2.0; 4],
+                        corner_radius: [px(2.0); 4],
                     },
                 );
                 assert!(scene.push(lane, quad_primitive(solid())));
@@ -2840,7 +2793,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 30.0, 30.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             push_clip(
@@ -2848,7 +2801,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(2.0, 2.0, 26.0, 26.0),
-                    corner_radius: [3.0; 4],
+                    corner_radius: [px(3.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2890,7 +2843,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(4.0, 4.0, 0.0, 10.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -2922,7 +2875,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: rect(index as f32, index as f32, 100.0, 100.0),
-                        corner_radius: [0.0; 4],
+                        corner_radius: [px(0.0); 4],
                     },
                 );
             }
@@ -2941,7 +2894,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: rect(index as f32, 0.0, 100.0, 100.0),
-                        corner_radius: [2.0; 4],
+                        corner_radius: [px(2.0); 4],
                     },
                 );
             }
@@ -2968,7 +2921,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: rect(index as f32, 0.0, 100.0, 100.0),
-                        corner_radius: [2.0; 4],
+                        corner_radius: [px(2.0); 4],
                     },
                 );
             }
@@ -2986,7 +2939,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(-10.0, -10.0, 200.0, 200.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             for index in 0..8 {
@@ -2995,7 +2948,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: rect(index as f32, 0.0, 100.0, 100.0),
-                        corner_radius: [2.0; 4],
+                        corner_radius: [px(2.0); 4],
                     },
                 );
             }
@@ -3020,7 +2973,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(-10.0, -10.0, 200.0, 200.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             for index in 0..9 {
@@ -3029,7 +2982,7 @@ mod tests {
                     lane,
                     ClipRect {
                         rect: rect(index as f32, 0.0, 100.0, 100.0),
-                        corner_radius: [2.0; 4],
+                        corner_radius: [px(2.0); 4],
                     },
                 );
             }
@@ -3051,14 +3004,14 @@ mod tests {
             assert!(
                 canvas.push_clip(ClipRect {
                     rect: rect(index as f32, 0.0, 30.0, 30.0),
-                    corner_radius: [2.0; 4],
+                    corner_radius: [px(2.0); 4],
                 }),
                 "Canvas 门限只数圆角层：第 8 层圆角必须允许"
             );
         }
         canvas.push_quad(Quad {
             bounds: rect(1.0, 2.0, 10.0, 20.0),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
             paint: solid(),
         });
         for _ in 0..usize::from(MAX_CLIP_DEPTH) {
@@ -3071,7 +3024,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(-10.0, -10.0, 200.0, 200.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 },
             );
             assert!(scene.push(lane, Primitive::Canvas(Arc::new(canvas))));
@@ -3092,7 +3045,7 @@ mod tests {
                 lane,
                 ClipRect {
                     rect: rect(0.0, 0.0, 30.0, 30.0),
-                    corner_radius: [1.0; 4],
+                    corner_radius: [px(1.0); 4],
                 },
             );
             assert!(scene.push(lane, quad_primitive(solid())));
@@ -3110,7 +3063,7 @@ mod tests {
     #[test]
     fn quad_border_uses_color1() {
         let border = Border {
-            width: 2.0,
+            width: px(2.0),
             color: Color::BLACK,
         };
         let scene = scene_with(|scene, lane| {
@@ -3145,11 +3098,11 @@ mod tests {
                         lane,
                         Primitive::Quad(Quad {
                             bounds: rect(offset, offset, 20.0, 10.0),
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::WHITE,
                                 border: Some(Border {
-                                    width: 1.0,
+                                    width: px(1.0),
                                     color: Color::BLACK,
                                 }),
                             },
@@ -3178,11 +3131,11 @@ mod tests {
                 lane,
                 Primitive::Quad(Quad {
                     bounds: rect(10.0, 10.0, 20.0, 10.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                     paint: QuadPaint::Solid {
                         fill: Color::TRANSPARENT,
                         border: Some(Border {
-                            width: 0.25,
+                            width: px(0.25),
                             color: Color::BLACK,
                         }),
                     },
@@ -3211,7 +3164,7 @@ mod tests {
                         lane,
                         Primitive::Quad(Quad {
                             bounds: logical,
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::WHITE,
                                 border: None,
@@ -3274,7 +3227,7 @@ mod tests {
                         lane,
                         Primitive::Quad(Quad {
                             bounds: logical,
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::WHITE,
                                 border: None,
@@ -3311,11 +3264,11 @@ mod tests {
                         lane,
                         Primitive::Quad(Quad {
                             bounds: rect(offset, offset, 20.0, 10.0),
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::TRANSPARENT,
                                 border: Some(Border {
-                                    width: 1.0,
+                                    width: px(1.0),
                                     color: Color::BLACK,
                                 }),
                             },
@@ -3356,11 +3309,11 @@ mod tests {
                         lane,
                         Primitive::Quad(Quad {
                             bounds: rect(offset + 10.0, offset + 10.0, 20.0, logical_height),
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::TRANSPARENT,
                                 border: Some(Border {
-                                    width: 1.0,
+                                    width: px(1.0),
                                     color: Color::BLACK,
                                 }),
                             },
@@ -3393,11 +3346,11 @@ mod tests {
                         lane,
                         Primitive::Quad(Quad {
                             bounds: rect(offset, offset, 20.0, 10.0),
-                            corner_radius: [0.0; 4],
+                            corner_radius: [px(0.0); 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::TRANSPARENT,
                                 border: Some(Border {
-                                    width: 1.0,
+                                    width: px(1.0),
                                     color: Color::BLACK,
                                 }),
                             },
@@ -3489,8 +3442,8 @@ mod tests {
                     color: Color::WHITE,
                     glyphs: vec![PositionedGlyph {
                         tile,
-                        position: Point::new(1.0, 2.0),
-                        size: Size::new(3.0, 4.0),
+                        position: LogicalPoint::new(px(1.0), px(2.0)),
+                        size: LogicalSize::new(px(3.0), px(4.0)),
                     }],
                 }),
             ));
@@ -3522,18 +3475,18 @@ mod tests {
                     glyphs: vec![
                         PositionedGlyph {
                             tile: tile(0.0),
-                            position: Point::new(0.0, 0.0),
-                            size: Size::new(2.0, 2.0),
+                            position: LogicalPoint::new(px(0.0), px(0.0)),
+                            size: LogicalSize::new(px(2.0), px(2.0)),
                         },
                         PositionedGlyph {
                             tile: tile(0.1),
-                            position: Point::new(2.0, 0.0),
-                            size: Size::new(2.0, 2.0),
+                            position: LogicalPoint::new(px(2.0), px(0.0)),
+                            size: LogicalSize::new(px(2.0), px(2.0)),
                         },
                         PositionedGlyph {
                             tile: tile(0.2),
-                            position: Point::new(4.0, 0.0),
-                            size: Size::new(2.0, 2.0),
+                            position: LogicalPoint::new(px(4.0), px(0.0)),
+                            size: LogicalSize::new(px(2.0), px(2.0)),
                         },
                     ],
                 }),
@@ -3559,10 +3512,10 @@ mod tests {
                 lane,
                 Primitive::Shadow(Shadow {
                     rect: rect(0.0, 0.0, 10.0, 10.0),
-                    offset: Point::new(2.0, 3.0),
-                    blur: 4.0,
+                    offset: LogicalPoint::new(px(2.0), px(3.0)),
+                    blur: px(4.0),
                     color: Color::BLACK,
-                    corner_radius: [2.0; 4],
+                    corner_radius: [px(2.0); 4],
                 }),
             ));
         });
@@ -3582,10 +3535,10 @@ mod tests {
                 lane,
                 Primitive::Shadow(Shadow {
                     rect: rect(0.0, 0.0, 4.0, 8.0),
-                    offset: Point::ZERO,
-                    blur: 0.0,
+                    offset: LogicalPoint::ZERO,
+                    blur: px(0.0),
                     color: Color::BLACK,
-                    corner_radius: [100.0; 4],
+                    corner_radius: [px(100.0); 4],
                 }),
             ));
         });
@@ -3601,10 +3554,10 @@ mod tests {
                 lane,
                 Primitive::Shadow(Shadow {
                     rect: rect(10.0, 10.0, 20.0, 20.0),
-                    offset: Point::ZERO,
-                    blur: 8.0,
+                    offset: LogicalPoint::ZERO,
+                    blur: px(8.0),
                     color: Color::BLACK,
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                 }),
             ));
         });
@@ -3614,7 +3567,7 @@ mod tests {
         };
         assert_eq!(
             (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
-            (-6, -6, 86, 86),
+            (dp(-6), dp(-6), dp(86), dp(86)),
             "op 包围盒必须覆盖阴影的模糊环（3σ + 1 的顶点外扩）"
         );
     }
@@ -3626,7 +3579,7 @@ mod tests {
                 lane,
                 Primitive::Quad(Quad {
                     bounds: rect(0.0, 0.0, 10.0, 10.0),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                     paint: QuadPaint::Solid {
                         fill: Color::TRANSPARENT,
                         border: None,
@@ -3636,8 +3589,8 @@ mod tests {
             assert!(scene.push(
                 lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::default(),
-                    corner_radius: [0.0; 4],
+                    bounds: LogicalRect::default(),
+                    corner_radius: [px(0.0); 4],
                     paint: solid(),
                 }),
             ));
@@ -3657,7 +3610,7 @@ mod tests {
     fn clip_chain_dedup() {
         let clip = ClipRect {
             rect: rect(0.0, 0.0, 30.0, 30.0),
-            corner_radius: [0.0; 4],
+            corner_radius: [px(0.0); 4],
         };
         let mut scene = Scene::empty();
         let a = scene.new_lane();
@@ -3687,7 +3640,7 @@ mod tests {
             lane,
             Primitive::Clip(ClipOp::Push(ClipRect {
                 rect: rect(100.0, 50.0, 800.0, 600.0),
-                corner_radius: [0.0; 4],
+                corner_radius: [px(0.0); 4],
             }))
         ));
         assert!(scene.push(
@@ -3743,7 +3696,7 @@ mod tests {
             lane,
             Primitive::Geometry(GeometryDraw::full(
                 id,
-                Transform::translate(5.0, 5.0),
+                Transform::translate(px(5.0), px(5.0)),
                 crate::paint::color::Color::WHITE,
             )),
         ));
@@ -3762,7 +3715,7 @@ mod tests {
         };
         assert_eq!(
             (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
-            (9, 9, 31, 31),
+            (dp(9), dp(9), dp(31), dp(31)),
             "几何 op 的可见范围必须用 transform 后的 AABB"
         );
     }
@@ -3834,7 +3787,7 @@ mod tests {
                 vertex_stride: crate::paint::geometry::GeometryPipeline::Ui.vertex_stride(),
                 index_type: crate::paint::geometry::IndexType::U16,
                 topology: crate::paint::geometry::Topology::TriangleList,
-                bounds: Rect::new(0.0, 0.0, 64.0, 100.0),
+                bounds: LogicalRect::new(px(0.0), px(0.0), px(64.0), px(100.0)),
                 pipeline: crate::paint::geometry::GeometryPipeline::Ui,
             })
             .expect("注册几何");
@@ -4244,13 +4197,13 @@ mod tests {
             assert!(scene.push(
                 lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::new(
-                        (index % 8) as f32 * 16.0,
-                        (index / 8) as f32 * 24.0,
-                        10.0,
-                        20.0
+                    bounds: LogicalRect::new(
+                        px((index % 8) as f32 * 16.0),
+                        px((index / 8) as f32 * 24.0),
+                        px(10.0),
+                        px(20.0)
                     ),
-                    corner_radius: [0.0; 4],
+                    corner_radius: [px(0.0); 4],
                     paint: solid(),
                 })
             ));
@@ -4320,8 +4273,8 @@ mod tests {
         assert!(scene.push(
             lane,
             Primitive::Quad(Quad {
-                bounds: Rect::new(1.0, 2.0, 10.0, 20.0),
-                corner_radius: [0.0; 4],
+                bounds: LogicalRect::new(px(1.0), px(2.0), px(10.0), px(20.0)),
+                corner_radius: [px(0.0); 4],
                 paint: solid(),
             })
         ));
@@ -4356,8 +4309,8 @@ mod tests {
             assert!(scene.push(
                 lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::new(1.0 + round as f32, 2.0, 10.0, 20.0),
-                    corner_radius: [1.0; 4],
+                    bounds: LogicalRect::new(px(1.0 + round as f32), px(2.0), px(10.0), px(20.0)),
+                    corner_radius: [px(1.0); 4],
                     paint: solid(),
                 })
             ));
@@ -4403,8 +4356,8 @@ mod tests {
             assert!(scene.push(
                 lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::new(index as f32, 0.0, 4.0, 4.0),
-                    corner_radius: [0.0; 4],
+                    bounds: LogicalRect::new(px(index as f32), px(0.0), px(4.0), px(4.0)),
+                    corner_radius: [px(0.0); 4],
                     paint: solid(),
                 })
             ));
@@ -4462,7 +4415,7 @@ mod tests {
         let mut encoder = InstanceEncoder::new();
         let store = empty_store();
         encoder
-            .encode(&scene, Scale::ONE, resolver(), &store)
+            .encode(&scene, DevicePixelRatio::ONE, resolver(), &store)
             .expect("1× 帧");
         let lane = lanes[2];
         assert!(scene.clear_lane(lane));
@@ -4485,8 +4438,8 @@ mod tests {
             assert!(scene.push(
                 *lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::new(8.0, 0.0, 4.0, 4.0),
-                    corner_radius: [0.0; 4],
+                    bounds: LogicalRect::new(px(8.0), px(0.0), px(4.0), px(4.0)),
+                    corner_radius: [px(0.0); 4],
                     paint: solid(),
                 })
             ));
@@ -4499,8 +4452,8 @@ mod tests {
             assert!(scene.push(
                 *lane,
                 Primitive::Quad(Quad {
-                    bounds: Rect::new(0.0, 0.0, 4.0, 4.0),
-                    corner_radius: [0.0; 4],
+                    bounds: LogicalRect::new(px(0.0), px(0.0), px(4.0), px(4.0)),
+                    corner_radius: [px(0.0); 4],
                     paint: solid(),
                 })
             ));
@@ -4538,7 +4491,7 @@ mod tests {
     fn op_bounds_are_local_and_ops_are_coalesced() {
         let (scene, _lanes) = grid_scene(200);
         let buffer = encode(&scene);
-        let instances_ops: Vec<super::PhysicalBounds> = buffer
+        let instances_ops: Vec<crate::math::DeviceRect> = buffer
             .ops
             .iter()
             .filter_map(|op| match op {
@@ -4553,7 +4506,7 @@ mod tests {
         );
         let first = instances_ops[0];
         assert_eq!(
-            (first.x0, first.y0),
+            (first.x0.value(), first.y0.value()),
             (-2, -2),
             "包围盒含 AA 外扩 1 px + 取整余量 1 px"
         );
@@ -4562,9 +4515,9 @@ mod tests {
             "op bounds 不得扩散到整屏：{first:?}"
         );
         let bottom = instances_ops.last().expect("至少一条 op");
-        let damage = [bottom.x0, bottom.y0, bottom.x1, bottom.y1];
+        let damage = crate::math::DeviceRect::new(bottom.x0, bottom.y0, bottom.x1, bottom.y1);
         assert!(
-            !first.intersects(damage),
+            !first.overlaps_inclusive(damage),
             "顶部 op 与底部 damage 不相交（op 级跳过生效）"
         );
     }

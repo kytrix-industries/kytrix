@@ -6,13 +6,17 @@ use super::{AnimationCompletion, AnimationEndKind, AnimationSlot, AnimationTarge
 use crate::{
     error::EngineError,
     interaction::{AnimatedValue, AnimationId, AnimationSpec, animation as anim},
-    math::Point,
+    math::LogicalPoint,
     node::{id::NodeId, signal::SignalId},
     paint::color::Color,
     window::WindowId,
 };
 
-pub(crate) fn scroll_animation_target(app: &App, node: NodeId, window: WindowId) -> Option<Point> {
+pub(crate) fn scroll_animation_target(
+    app: &App,
+    node: NodeId,
+    window: WindowId,
+) -> Option<LogicalPoint> {
     app.animations.iter().rev().find_map(|slot| {
         if slot.window != window {
             return None;
@@ -340,7 +344,7 @@ mod tests {
     use crate::{
         app::App,
         interaction::{AnimatedValue, AnimationSpec, Easing},
-        math::{Rect, Size},
+        math::{LogicalRect, LogicalSize, px},
         node::builder::NodeBuilder,
         window::WindowOptions,
     };
@@ -353,12 +357,12 @@ mod tests {
             .expect("runtime");
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
-            size: Size::new(320.0, 240.0),
+            size: LogicalSize::new(px(320.0), px(240.0)),
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
         let node = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 0.0, 32.0, 32.0))
+            .layout_override(LogicalRect::new(px(0.0), px(0.0), px(32.0), px(32.0)))
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("node");
 

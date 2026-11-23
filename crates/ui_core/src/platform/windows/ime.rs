@@ -18,7 +18,7 @@ use windows::Win32::{
 
 use crate::{
     event::ImeEvent,
-    math::PhysicalRect,
+    math::{DeviceRect, dp},
     platform::ime::{ClauseRanges, preedit_clauses},
 };
 
@@ -32,7 +32,7 @@ pub(crate) struct ImeOutcome {
 pub(crate) enum ImeCommand {
     Associate(Option<HIMC>),
     AssociateDefault,
-    SetCaret(PhysicalRect),
+    SetCaret(DeviceRect),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +46,7 @@ pub(crate) enum ImeApplied {
 pub(crate) struct ImeState {
     enabled: bool,
     saved_context: Option<HIMC>,
-    cursor_area: Option<PhysicalRect>,
+    cursor_area: Option<DeviceRect>,
     pending_chars: VecDeque<u16>,
     pending_batch: Option<u64>,
     pending_ticks: u32,
@@ -219,7 +219,7 @@ impl ImeState {
             .map(|context| ImeCommand::Associate(Some(context)))
     }
 
-    pub(crate) fn plan_cursor_area(&mut self, area: Option<PhysicalRect>) -> Option<ImeCommand> {
+    pub(crate) fn plan_cursor_area(&mut self, area: Option<DeviceRect>) -> Option<ImeCommand> {
         self.cursor_area = area;
         area.map(ImeCommand::SetCaret)
     }
@@ -452,7 +452,7 @@ fn composition_dwords(
     }
 }
 
-fn set_caret_forms(hwnd: HWND, area: PhysicalRect) {
+fn set_caret_forms(hwnd: HWND, area: DeviceRect) {
     let (composition, candidate) = caret_forms(area);
     unsafe {
         let himc: HIMC = ImmGetContext(hwnd);
@@ -465,21 +465,21 @@ fn set_caret_forms(hwnd: HWND, area: PhysicalRect) {
     }
 }
 
-fn caret_forms(area: PhysicalRect) -> (COMPOSITIONFORM, CANDIDATEFORM) {
-    let width = area.width().max(1);
-    let height = area.height().max(1);
+fn caret_forms(area: DeviceRect) -> (COMPOSITIONFORM, CANDIDATEFORM) {
+    let width = area.width().max(dp(1));
+    let height = area.height().max(dp(1));
     let rc_area = RECT {
-        left: area.x0,
-        top: area.y0,
-        right: area.x0 + width,
-        bottom: area.y0 + height,
+        left: area.x0.value(),
+        top: area.y0.value(),
+        right: (area.x0 + width).value(),
+        bottom: (area.y0 + height).value(),
     };
     (
         COMPOSITIONFORM {
             dwStyle: CFS_POINT,
             ptCurrentPos: POINT {
-                x: area.x0,
-                y: area.y0 + height,
+                x: area.x0.value(),
+                y: (area.y0 + height).value(),
             },
             rcArea: rc_area,
         },
@@ -487,8 +487,8 @@ fn caret_forms(area: PhysicalRect) -> (COMPOSITIONFORM, CANDIDATEFORM) {
             dwIndex: 0,
             dwStyle: CFS_EXCLUDE,
             ptCurrentPos: POINT {
-                x: area.x0,
-                y: area.y0,
+                x: area.x0.value(),
+                y: area.y0.value(),
             },
             rcArea: rc_area,
         },
@@ -518,7 +518,11 @@ mod tests {
         CompositionRead, ImeApplied, ImeCommand, ImeState, PENDING_COMMIT_WINDOW_MS, caret_forms,
         clamp_caret, composition_events, execute, mask_setcontext,
     };
-    use crate::{event::ImeEvent, math::PhysicalRect, platform::ime::ClauseRanges};
+    use crate::{
+        event::ImeEvent,
+        math::{DeviceRect, dp, px},
+        platform::ime::ClauseRanges,
+    };
 
     unsafe extern "system" fn wndproc(
         hwnd: HWND,
@@ -580,7 +584,7 @@ mod tests {
 
     #[test]
     fn caret_forms_map_to_composition_and_candidate_windows() {
-        let area = PhysicalRect::new(100, 200, 101, 220);
+        let area = DeviceRect::new(dp(100), dp(200), dp(101), dp(220));
 
         let (composition, candidate) = caret_forms(area);
 
@@ -599,8 +603,10 @@ mod tests {
 
     #[test]
     fn caret_forms_follow_physical_scale() {
-        let logical = crate::math::Rect::new(100.0, 200.0, 1.0, 18.0);
-        let physical = logical.to_physical(crate::math::Scale::new(1.25).expect("scale"));
+        let logical = crate::math::LogicalRect::new(px(100.0), px(200.0), px(1.0), px(18.0));
+        let physical = crate::math::DevicePixelRatio::new(1.25)
+            .expect("scale")
+            .to_device_rect(logical);
 
         let (composition, candidate) = caret_forms(physical);
 
@@ -876,7 +882,8 @@ mod tests {
     fn hidden_window_can_read_back_caret_forms() {
         let (hwnd, _class) = hidden_window("KytrixP16ImeForms");
         let mut state = ImeState::default();
-        let command = state.plan_cursor_area(Some(PhysicalRect::new(100, 200, 101, 220)));
+        let command =
+            state.plan_cursor_area(Some(DeviceRect::new(dp(100), dp(200), dp(101), dp(220))));
         drive(&mut state, hwnd, command);
         unsafe {
             let himc = ImmGetContext(hwnd);
@@ -996,7 +1003,12 @@ mod tests {
         takes(ImeCommand::Associate(Some(HIMC::default())));
         takes(ImeCommand::Associate(None));
         takes(ImeCommand::AssociateDefault);
-        takes(ImeCommand::SetCaret(PhysicalRect::new(0, 0, 1, 1)));
+        takes(ImeCommand::SetCaret(DeviceRect::new(
+            dp(0),
+            dp(0),
+            dp(1),
+            dp(1),
+        )));
     }
 
     #[test]

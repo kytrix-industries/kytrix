@@ -835,6 +835,7 @@ mod tests {
     };
     use crate::{
         error::EngineError,
+        math::dp,
         paint::atlas::AtlasKind,
         render::{DirtyRects, RenderStats, compositor::Plan, frame::LatestFrame},
         window::FrameIndex,
@@ -842,11 +843,11 @@ mod tests {
 
     fn dirty_rects(y0: u32, y1: u32) -> DirtyRects {
         let mut rects = DirtyRects::default();
-        rects.mark(crate::math::PhysicalRect::new(
-            0,
-            y0 as i32,
-            i32::MAX,
-            y1 as i32,
+        rects.mark(crate::math::DeviceRect::new(
+            dp(0),
+            dp(y0 as i32),
+            dp(i32::MAX),
+            dp(y1 as i32),
         ));
         rects
     }
@@ -1042,7 +1043,7 @@ mod tests {
             plan,
             surface: (1, 1),
             scale: 1.0,
-            surface_local: crate::math::Size::new(1.0, 1.0),
+            surface_local: crate::math::LogicalSize::new(px(1.0), px(1.0)),
             buffer_scale: 1,
             published_at: std::time::Instant::now(),
         };

@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 
 use crate::{
-    math::Size,
+    math::PhysicalSize,
     resources::{
         DecodeCause,
         image::{DecodedImage, MAX_TILE_DIM, SourceColor, check_source_size},
@@ -19,14 +19,14 @@ pub(crate) fn probe_dimensions(bytes: &[u8]) -> Result<(u32, u32), DecodeCause> 
     Ok((width, height))
 }
 
-pub(crate) fn resolve_target(target: Size, intrinsic: (u32, u32)) -> (u32, u32) {
-    let width = if target.width.is_finite() && target.width > 0.0 {
-        target.width
+pub(crate) fn resolve_target(target: PhysicalSize, intrinsic: (u32, u32)) -> (u32, u32) {
+    let width = if target.width.is_finite() && target.width.value() > 0.0 {
+        target.width.value()
     } else {
         intrinsic.0 as f32
     };
-    let height = if target.height.is_finite() && target.height > 0.0 {
-        target.height
+    let height = if target.height.is_finite() && target.height.value() > 0.0 {
+        target.height.value()
     } else {
         intrinsic.1 as f32
     };

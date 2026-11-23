@@ -381,7 +381,9 @@ mod tests {
         tree.ensure_interaction(panel).expect("exists").overlay =
             Some(crate::interaction::OverlaySlot {
                 dismiss: crate::interaction::OverlayDismiss::Explicit,
-                placement: crate::interaction::OverlayPlacement::Point(crate::math::Point::ZERO),
+                placement: crate::interaction::OverlayPlacement::Point(
+                    crate::math::LogicalPoint::ZERO,
+                ),
                 trap_focus: true,
                 opener: None,
                 restore_focus: false,

@@ -6,7 +6,7 @@ use std::{
 use smol_str::SmolStr;
 use ui_core::{
     app::{App, Application},
-    math::Size,
+    math::{LogicalSize, px},
     paint::color::Color,
     window::WindowOptions,
 };
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(runtime.handle().clone());
     let window = app.create_window(WindowOptions {
         title: SmolStr::new_static("Kytrix · E10 timer smoke"),
-        size: Size::new(480.0, 320.0),
+        size: LogicalSize::new(px(480.0), px(320.0)),
         background: Color::from_rgba8([0x14, 0x18, 0x1F, 0xFF]),
         ..WindowOptions::default()
     });

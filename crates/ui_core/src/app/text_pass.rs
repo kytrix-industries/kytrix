@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 use super::App;
 use crate::{
     error::EngineError,
-    math::Size,
+    math::{LogicalPx, LogicalSize},
     text::{FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport},
     window::WindowId,
 };
@@ -489,13 +489,13 @@ pub(crate) fn refresh_text(
         }
 
         let measured = shaped.measure(known, available);
-        let previous = tree.text_measured_size(node).unwrap_or(Size::ZERO);
+        let previous = tree.text_measured_size(node).unwrap_or(LogicalSize::ZERO);
         let fixed_layout = tree
             .get(node)
             .is_ok_and(|target| target.layout_override().is_some());
         let size_changed = !fixed_layout
-            && (previous.width.to_bits() != measured.width.to_bits()
-                || previous.height.to_bits() != measured.height.to_bits());
+            && (previous.width.value().to_bits() != measured.width.value().to_bits()
+                || previous.height.value().to_bits() != measured.height.value().to_bits());
         tree.set_text_shaped(
             node,
             Rc::clone(&shaped),
@@ -528,7 +528,7 @@ pub(crate) fn layout_text(
         ..
     } = app;
     let window_id = window;
-    let scale = windows.get(&window_id)?.scale().factor();
+    let scale = windows.get(&window_id)?.scale();
     let mut report = TextLayoutReport::default();
     let mut any_eviction = false;
     let mut scratch = Vec::new();
@@ -566,7 +566,7 @@ pub(crate) fn layout_text(
             };
             let width = {
                 let width = tree.text_content_width(node);
-                if width > 0.0 {
+                if width > LogicalPx::ZERO {
                     width
                 } else {
                     shaped.max_content_size().width
@@ -575,7 +575,9 @@ pub(crate) fn layout_text(
             let current = tree
                 .text_slot(node)
                 .map(|slot| (slot.laid_width_bits(), slot.laid_generation()));
-            if current == Some((width.to_bits(), generation)) && tree.text_line(node).is_some() {
+            if current == Some((width.value().to_bits(), generation))
+                && tree.text_line(node).is_some()
+            {
                 reused += 1;
                 continue;
             }
@@ -746,6 +748,7 @@ mod tests {
     use crate::{
         app::App,
         error::EngineError,
+        math::px,
         node::{builder::NodeBuilder, id::NodeId},
         paint::{atlas::AtlasKind, primitive::Primitive},
         render::AtlasAllocator,
@@ -780,7 +783,7 @@ mod tests {
         let window = app.create_window(WindowOptions::default());
         let w = app.window_mut(window).expect("窗口存在");
         let root = w.tree().root();
-        let node = NodeBuilder::text(text, TextStyle::new(16.0))
+        let node = NodeBuilder::text(text, TextStyle::new(px(16.0)))
             .style(text_style(width))
             .build(w.tree_mut(), root)
             .expect("挂载成功");
@@ -912,16 +915,16 @@ mod tests {
     fn normalized_runs_emit_one_invalid_text_run_diagnostic() {
         let (_rt, mut app) = new_app();
         let window = app.create_window(WindowOptions::default());
-        let content = TextContent::new("a界b", TextStyle::new(16.0)).with_runs([
-            TextRun::new(0..1, TextStyle::new(16.0)),
-            TextRun::new(1..2, TextStyle::new(16.0)),
-            TextRun::new(4..6, TextStyle::new(16.0)),
+        let content = TextContent::new("a界b", TextStyle::new(px(16.0))).with_runs([
+            TextRun::new(0..1, TextStyle::new(px(16.0))),
+            TextRun::new(1..2, TextStyle::new(px(16.0))),
+            TextRun::new(4..6, TextStyle::new(px(16.0))),
         ]);
         assert_eq!(content.normalized_runs(), 2, "构造期两个 run 被改动");
         let node = {
             let w = app.window_mut(window).expect("窗口存在");
             let root = w.tree().root();
-            let node = NodeBuilder::text("", TextStyle::new(16.0))
+            let node = NodeBuilder::text("", TextStyle::new(px(16.0)))
                 .style(text_style(Some(200.0)))
                 .build(w.tree_mut(), root)
                 .expect("挂载成功");

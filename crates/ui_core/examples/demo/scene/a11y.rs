@@ -3,7 +3,7 @@ use ui_core::{
     a11y::{A11yAction, A11yActionData, A11yOverride, A11yPatch, A11yRole},
     app::App,
     event::Action,
-    math::Rect,
+    math::{LogicalPx, LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         primitive::Border,
@@ -22,9 +22,9 @@ const RADIO_ACTIONS: [&str; 2] = ["a11y.radio.a", "a11y.radio.b"];
 
 const SLIDER_SEGMENTS: u8 = 10;
 
-const SEGMENT_WIDTH: f32 = 24.0;
-const SEGMENT_GAP: f32 = 3.0;
-const SEGMENT_HEIGHT: f32 = 16.0;
+const SEGMENT_WIDTH: LogicalPx = px(24.0);
+const SEGMENT_GAP: LogicalPx = px(3.0);
+const SEGMENT_HEIGHT: LogicalPx = px(16.0);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct A11yState {
@@ -99,25 +99,25 @@ pub(crate) fn build(
     state: Signal<A11yState>,
 ) -> Controls {
     let radios = [
-        radio_row(app, window, panel, 40.0, 0, state),
-        radio_row(app, window, panel, 70.0, 1, state),
+        radio_row(app, window, panel, px(40.0), 0, state),
+        radio_row(app, window, panel, px(70.0), 1, state),
     ];
     let slider = slider(app, window, panel, state);
     let _ = card::bound_label(
         app,
         window,
         panel,
-        Rect::new(18.0, 146.0, 276.0, 18.0),
-        text_style(11.5, 400, MUTED_RGBA),
+        LogicalRect::new(px(18.0), px(146.0), px(276.0), px(18.0)),
+        text_style(px(11.5), 400, MUTED_RGBA),
         move |cx| cx.read(&state).status_line(),
     );
     let _ = card::label(
         app,
         window,
         panel,
-        Rect::new(18.0, 166.0, 276.0, 16.0),
+        LogicalRect::new(px(18.0), px(166.0), px(276.0), px(16.0)),
         "角色 / 名称 / 选中态 / 数值可被 UIA 读取",
-        text_style(11.0, 400, DIM_RGBA),
+        text_style(px(11.0), 400, DIM_RGBA),
     );
     Controls { radios, slider }
 }
@@ -126,13 +126,18 @@ fn radio_row(
     app: &mut App,
     window: WindowId,
     panel: NodeId,
-    y: f32,
+    y: LogicalPx,
     index: u8,
     state: Signal<A11yState>,
 ) -> NodeId {
     let label = RADIOS[usize::from(index)];
     let row = NodeBuilder::boxed()
-        .style(card::absolute_style(Rect::new(18.0, y, 276.0, 24.0)))
+        .style(card::absolute_style(LogicalRect::new(
+            px(18.0),
+            y,
+            px(276.0),
+            px(24.0),
+        )))
         .on_click(Action::custom(RADIO_ACTIONS[usize::from(index)]))
         .focus_ring(ring())
         .a11y(A11yOverride {
@@ -153,23 +158,23 @@ fn radio_row(
         .expect("单选行挂载");
 
     let _ = NodeBuilder::boxed()
-        .layout_override(Rect::new(2.0, 5.0, 14.0, 14.0))
+        .layout_override(LogicalRect::new(px(2.0), px(5.0), px(14.0), px(14.0)))
         .paint(PaintSpec {
             border: Some(Border {
-                width: 1.5,
+                width: px(1.5),
                 color: color(RAIL_RGBA),
             }),
-            corner_radius: [7.0; 4],
+            corner_radius: [px(7.0); 4],
             ..PaintSpec::default()
         })
         .build(card::tree(app, window), row)
         .expect("单选圆环挂载");
 
     let _ = NodeBuilder::boxed()
-        .layout_override(Rect::new(5.0, 8.0, 8.0, 8.0))
+        .layout_override(LogicalRect::new(px(5.0), px(8.0), px(8.0), px(8.0)))
         .paint(PaintSpec {
             background: color(ACCENT_RGBA),
-            corner_radius: [4.0; 4],
+            corner_radius: [px(4.0); 4],
             ..PaintSpec::default()
         })
         .bind_style(move |cx| StylePatch {
@@ -183,16 +188,21 @@ fn radio_row(
         app,
         window,
         row,
-        Rect::new(26.0, 2.0, 236.0, 20.0),
+        LogicalRect::new(px(26.0), px(2.0), px(236.0), px(20.0)),
         label,
-        text_style(13.0, 400, TEXT_RGBA),
+        text_style(px(13.0), 400, TEXT_RGBA),
     );
     row
 }
 
 fn slider(app: &mut App, window: WindowId, panel: NodeId, state: Signal<A11yState>) -> NodeId {
     let slider = NodeBuilder::boxed()
-        .style(card::absolute_style(Rect::new(18.0, 98.0, 276.0, 42.0)))
+        .style(card::absolute_style(LogicalRect::new(
+            px(18.0),
+            px(98.0),
+            px(276.0),
+            px(42.0),
+        )))
         .on_click(Action::custom("a11y.slider.next"))
         .focus_ring(ring())
         .a11y(A11yOverride {
@@ -217,22 +227,22 @@ fn slider(app: &mut App, window: WindowId, panel: NodeId, state: Signal<A11yStat
         app,
         window,
         slider,
-        Rect::new(0.0, 0.0, 200.0, 18.0),
-        text_style(12.5, 400, MUTED_RGBA),
+        LogicalRect::new(px(0.0), px(0.0), px(200.0), px(18.0)),
+        text_style(px(12.5), 400, MUTED_RGBA),
         move |cx| cx.read(&state).scale_line(),
     );
 
     for index in 0..SLIDER_SEGMENTS {
         let _ = NodeBuilder::boxed()
-            .layout_override(Rect::new(
-                f32::from(index) * (SEGMENT_WIDTH + SEGMENT_GAP),
-                22.0,
+            .layout_override(LogicalRect::new(
+                (SEGMENT_WIDTH + SEGMENT_GAP) * f32::from(index),
+                px(22.0),
                 SEGMENT_WIDTH,
                 SEGMENT_HEIGHT,
             ))
             .paint(PaintSpec {
                 background: color(RAIL_RGBA),
-                corner_radius: [3.0; 4],
+                corner_radius: [px(3.0); 4],
                 ..PaintSpec::default()
             })
             .bind_style(move |cx| {

@@ -205,7 +205,7 @@ pub(crate) fn window_mut(app: &mut App, id: WindowId) -> Option<&mut Window> {
     app.windows.get_mut(&id)
 }
 
-pub(crate) fn set_drag_regions(app: &mut App, id: WindowId, regions: &[crate::math::Rect]) {
+pub(crate) fn set_drag_regions(app: &mut App, id: WindowId, regions: &[crate::math::LogicalRect]) {
     let Some(target) = app.windows.get_mut(&id) else {
         return;
     };
@@ -391,7 +391,7 @@ pub(crate) fn set_title(
 pub(crate) fn set_traffic_light_position(
     app: &mut App,
     window: WindowId,
-    inset: crate::math::Point,
+    inset: crate::math::LogicalPoint,
 ) -> Result<(), EngineError> {
     let Some(target) = app.windows.get_mut(&window) else {
         return Err(EngineError::UnknownWindow { window });
@@ -408,7 +408,7 @@ pub(crate) fn set_traffic_light_position(
 pub(crate) fn set_traffic_light_position(
     app: &mut App,
     window: WindowId,
-    _inset: crate::math::Point,
+    _inset: crate::math::LogicalPoint,
 ) -> Result<(), EngineError> {
     if !app.windows.contains_key(&window) {
         return Err(EngineError::UnknownWindow { window });
@@ -420,12 +420,18 @@ pub(crate) fn set_traffic_light_position(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn traffic_light_inset(app: &App, window: WindowId) -> Option<crate::math::Point> {
+pub(crate) fn traffic_light_inset(
+    app: &App,
+    window: WindowId,
+) -> Option<crate::math::LogicalPoint> {
     app.windows.get(&window)?.traffic_light_inset()
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn traffic_light_inset(_app: &App, _window: WindowId) -> Option<crate::math::Point> {
+pub(crate) fn traffic_light_inset(
+    _app: &App,
+    _window: WindowId,
+) -> Option<crate::math::LogicalPoint> {
     None
 }
 

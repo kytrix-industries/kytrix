@@ -1,4 +1,4 @@
-use crate::math::Size;
+use crate::math::{LogicalPx, LogicalSize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DecorationMode {
@@ -78,12 +78,12 @@ fn shadow_margin(shadow: f32) -> i32 {
 }
 
 #[must_use]
-pub(crate) fn window_geometry(size: Size, shadow: f32) -> WindowGeometry {
+pub(crate) fn window_geometry(size: LogicalSize, shadow: f32) -> WindowGeometry {
     let margin = shadow_margin(shadow);
-    let width = (size.width.round() as i32)
+    let width = (size.width.value().round() as i32)
         .saturating_sub(margin * 2)
         .max(1);
-    let height = (size.height.round() as i32)
+    let height = (size.height.value().round() as i32)
         .saturating_sub(margin * 2)
         .max(1);
     WindowGeometry {
@@ -101,9 +101,9 @@ pub(crate) struct SizeLimits {
 }
 
 impl SizeLimits {
-    fn from_logical(min: Size, max: Option<Size>, shadow: f32) -> Self {
+    fn from_logical(min: LogicalSize, max: Option<LogicalSize>, shadow: f32) -> Self {
         let margin = shadow_margin(shadow).saturating_mul(2);
-        let units = |value: f32| (value.round() as i32).saturating_add(margin).max(1);
+        let units = |value: LogicalPx| (value.value().round() as i32).saturating_add(margin).max(1);
         let mut min_width = units(min.width);
         let mut min_height = units(min.height);
         let max = max.map(|max| {
@@ -121,14 +121,14 @@ impl SizeLimits {
 }
 
 pub(crate) struct SizeConstraintState {
-    min: Size,
-    max: Option<Size>,
-    bounds: Option<Size>,
+    min: LogicalSize,
+    max: Option<LogicalSize>,
+    bounds: Option<LogicalSize>,
     applied: Option<SizeLimits>,
 }
 
 impl SizeConstraintState {
-    pub(crate) fn new(min: Size, max: Option<Size>) -> Self {
+    pub(crate) fn new(min: LogicalSize, max: Option<LogicalSize>) -> Self {
         Self {
             min,
             max,
@@ -137,13 +137,13 @@ impl SizeConstraintState {
         }
     }
 
-    pub(crate) fn set_bounds(&mut self, bounds: Option<Size>) {
+    pub(crate) fn set_bounds(&mut self, bounds: Option<LogicalSize>) {
         self.bounds = bounds;
     }
 
     pub(crate) fn take_pending(&mut self, shadow: f32) -> Option<SizeLimits> {
         let effective_max = match (self.max, self.bounds) {
-            (Some(app), Some(bounds)) => Some(Size::new(
+            (Some(app), Some(bounds)) => Some(LogicalSize::new(
                 app.width.min(bounds.width),
                 app.height.min(bounds.height),
             )),
@@ -199,7 +199,7 @@ mod tests {
         DecorationMode, SizeConstraintState, SizeLimits, ToplevelStates, Visibility,
         WmCapabilities, is_visible, window_geometry,
     };
-    use crate::math::Size;
+    use crate::math::{LogicalSize, px};
 
     fn states(values: &[u32]) -> Vec<u8> {
         values
@@ -308,33 +308,35 @@ mod tests {
 
     #[test]
     fn window_geometry_without_shadow_covers_the_whole_surface() {
-        let geometry = window_geometry(Size::new(800.0, 600.0), 0.0);
+        let geometry = window_geometry(LogicalSize::new(px(800.0), px(600.0)), 0.0);
         assert_eq!((geometry.x, geometry.y), (0, 0));
         assert_eq!((geometry.width, geometry.height), (800, 600));
     }
 
     #[test]
     fn window_geometry_subtracts_the_shadow_margin_on_every_side() {
-        let geometry = window_geometry(Size::new(800.0, 600.0), 8.0);
+        let geometry = window_geometry(LogicalSize::new(px(800.0), px(600.0)), 8.0);
         assert_eq!((geometry.x, geometry.y), (8, 8));
         assert_eq!((geometry.width, geometry.height), (784, 584));
     }
 
     #[test]
     fn window_geometry_never_collapses_to_zero() {
-        let geometry = window_geometry(Size::new(4.0, 4.0), 8.0);
+        let geometry = window_geometry(LogicalSize::new(px(4.0), px(4.0)), 8.0);
         assert_eq!((geometry.width, geometry.height), (1, 1));
-        let geometry = window_geometry(Size::new(f32::NAN, f32::INFINITY), 2.0);
+        let geometry = window_geometry(LogicalSize::new(px(f32::NAN), px(f32::INFINITY)), 2.0);
         assert!(geometry.width >= 1 && geometry.height >= 1);
         assert_eq!((geometry.x, geometry.y), (2, 2));
-        let geometry = window_geometry(Size::new(100.0, 100.0), f32::NAN);
+        let geometry = window_geometry(LogicalSize::new(px(100.0), px(100.0)), f32::NAN);
         assert_eq!((geometry.x, geometry.y), (0, 0), "非法边距按 0 处理");
     }
 
     #[test]
     fn size_limits_include_the_shadow_margin_on_both_bounds() {
-        let mut state =
-            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1280.0, 720.0)));
+        let mut state = SizeConstraintState::new(
+            LogicalSize::new(px(320.0), px(200.0)),
+            Some(LogicalSize::new(px(1280.0), px(720.0))),
+        );
         assert_eq!(
             state.take_pending(0.0),
             Some(SizeLimits {
@@ -344,8 +346,10 @@ mod tests {
         );
         assert_eq!(state.take_pending(0.0), None, "同值不得重复下发");
 
-        let mut with_shadow =
-            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1280.0, 720.0)));
+        let mut with_shadow = SizeConstraintState::new(
+            LogicalSize::new(px(320.0), px(200.0)),
+            Some(LogicalSize::new(px(1280.0), px(720.0))),
+        );
         assert_eq!(
             with_shadow.take_pending(8.0),
             Some(SizeLimits {
@@ -355,7 +359,7 @@ mod tests {
             "阴影边距对 min 与 max 一视同仁（协议约束的是 window geometry）"
         );
 
-        let mut degenerate = SizeConstraintState::new(Size::new(0.0, -5.0), None);
+        let mut degenerate = SizeConstraintState::new(LogicalSize::new(px(0.0), px(-5.0)), None);
         assert_eq!(
             degenerate.take_pending(0.0),
             Some(SizeLimits {
@@ -368,12 +372,14 @@ mod tests {
 
     #[test]
     fn configure_bounds_are_intersected_with_the_app_maximum() {
-        let mut state =
-            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1000.0, 800.0)));
+        let mut state = SizeConstraintState::new(
+            LogicalSize::new(px(320.0), px(200.0)),
+            Some(LogicalSize::new(px(1000.0), px(800.0))),
+        );
         let initial = state.take_pending(0.0).expect("建窗时要下发一次约束");
         assert_eq!(initial.max, Some((1000, 800)));
 
-        state.set_bounds(Some(Size::new(900.0, 900.0)));
+        state.set_bounds(Some(LogicalSize::new(px(900.0), px(900.0))));
         assert_eq!(
             state.take_pending(0.0).expect("bounds 变化必须重新下发"),
             SizeLimits {
@@ -383,7 +389,7 @@ mod tests {
         );
         assert_eq!(state.take_pending(0.0), None, "同值 bounds 不重复下发");
 
-        state.set_bounds(Some(Size::new(1600.0, 1200.0)));
+        state.set_bounds(Some(LogicalSize::new(px(1600.0), px(1200.0))));
         assert_eq!(
             state
                 .take_pending(0.0)
@@ -395,10 +401,10 @@ mod tests {
 
     #[test]
     fn configure_bounds_without_an_app_maximum_become_the_limit() {
-        let mut state = SizeConstraintState::new(Size::new(320.0, 200.0), None);
+        let mut state = SizeConstraintState::new(LogicalSize::new(px(320.0), px(200.0)), None);
         assert_eq!(state.take_pending(0.0).expect("建窗下发").max, None);
 
-        state.set_bounds(Some(Size::new(1280.0, 720.0)));
+        state.set_bounds(Some(LogicalSize::new(px(1280.0), px(720.0))));
         assert_eq!(
             state.take_pending(0.0).expect("bounds 必须成为上限").max,
             Some((1280, 720))
@@ -407,10 +413,12 @@ mod tests {
 
     #[test]
     fn removing_the_bounds_restores_or_clears_the_maximum() {
-        let mut with_app_max =
-            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1000.0, 800.0)));
+        let mut with_app_max = SizeConstraintState::new(
+            LogicalSize::new(px(320.0), px(200.0)),
+            Some(LogicalSize::new(px(1000.0), px(800.0))),
+        );
         assert!(with_app_max.take_pending(0.0).is_some());
-        with_app_max.set_bounds(Some(Size::new(640.0, 480.0)));
+        with_app_max.set_bounds(Some(LogicalSize::new(px(640.0), px(480.0))));
         assert_eq!(
             with_app_max.take_pending(0.0).expect("bounds 生效").max,
             Some((640, 480))
@@ -424,9 +432,10 @@ mod tests {
             Some((1000, 800))
         );
 
-        let mut without_app_max = SizeConstraintState::new(Size::new(320.0, 200.0), None);
+        let mut without_app_max =
+            SizeConstraintState::new(LogicalSize::new(px(320.0), px(200.0)), None);
         assert!(without_app_max.take_pending(0.0).is_some());
-        without_app_max.set_bounds(Some(Size::new(640.0, 480.0)));
+        without_app_max.set_bounds(Some(LogicalSize::new(px(640.0), px(480.0))));
         assert!(without_app_max.take_pending(0.0).is_some());
         without_app_max.set_bounds(None);
         assert_eq!(
@@ -441,8 +450,10 @@ mod tests {
 
     #[test]
     fn a_contradictory_minimum_is_clamped_to_the_maximum() {
-        let mut state =
-            SizeConstraintState::new(Size::new(800.0, 600.0), Some(Size::new(400.0, 300.0)));
+        let mut state = SizeConstraintState::new(
+            LogicalSize::new(px(800.0), px(600.0)),
+            Some(LogicalSize::new(px(400.0), px(300.0))),
+        );
         assert_eq!(
             state.take_pending(0.0),
             Some(SizeLimits {
@@ -452,8 +463,10 @@ mod tests {
             "min > max 先钳成 min = max（与 WindowOptions 公共文档一致）"
         );
 
-        let mut mixed =
-            SizeConstraintState::new(Size::new(800.0, 600.0), Some(Size::new(1000.0, 500.0)));
+        let mut mixed = SizeConstraintState::new(
+            LogicalSize::new(px(800.0), px(600.0)),
+            Some(LogicalSize::new(px(1000.0), px(500.0))),
+        );
         assert_eq!(
             mixed.take_pending(0.0),
             Some(SizeLimits {
@@ -465,8 +478,10 @@ mod tests {
 
     #[test]
     fn the_platform_default_minimum_is_used_when_the_app_does_not_set_one() {
-        let mut state =
-            SizeConstraintState::new(Size::new(320.0, 200.0), Some(Size::new(1024.0, 768.0)));
+        let mut state = SizeConstraintState::new(
+            LogicalSize::new(px(320.0), px(200.0)),
+            Some(LogicalSize::new(px(1024.0), px(768.0))),
+        );
         let limits = state.take_pending(0.0).expect("建窗下发");
         assert_eq!(limits.min, (320, 200), "平台默认最小客户区");
         assert_eq!(limits.max, Some((1024, 768)));

@@ -7,7 +7,7 @@ use std::{
 
 use ui_core::{
     app::{App, AppHandle, Application},
-    math::{Point, Size},
+    math::{LogicalPoint, LogicalSize, px},
     paint::color::Color,
     window::{WindowId, WindowOptions},
 };
@@ -27,7 +27,7 @@ const OWNER_TITLE: &str = "kytrix P1-B X1 evidence owner";
 const OWNED_TITLE: &str = "kytrix P1-B X1 evidence owned";
 const MODAL_TITLE: &str = "kytrix P1-B X1 evidence modal";
 const TOPMOST_TITLE: &str = "kytrix P1-B X1 evidence topmost";
-const SIZE: Size = Size::new(380.0, 220.0);
+const SIZE: LogicalSize = LogicalSize::new(px(380.0), px(220.0));
 const FIND_TIMEOUT: Duration = Duration::from_secs(10);
 const MODAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const SETTLE: Duration = Duration::from_millis(450);
@@ -72,7 +72,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let owner = app.create_window(WindowOptions {
         title: smol_str::SmolStr::new_static(OWNER_TITLE),
         size: SIZE,
-        position: Some(Point::new(60.0, 60.0)),
+        position: Some(LogicalPoint::new(px(60.0), px(60.0))),
         background: Color::WHITE,
         ..WindowOptions::default()
     });
@@ -80,7 +80,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         title: smol_str::SmolStr::new_static(OWNED_TITLE),
         owner: Some(owner),
         size: SIZE,
-        position: Some(Point::new(130.0, 110.0)),
+        position: Some(LogicalPoint::new(px(130.0), px(110.0))),
         background: Color::BLACK,
         ..WindowOptions::default()
     });
@@ -89,7 +89,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         owner: Some(owner),
         modal: true,
         size: SIZE,
-        position: Some(Point::new(200.0, 160.0)),
+        position: Some(LogicalPoint::new(px(200.0), px(160.0))),
         background: Color::WHITE,
         ..WindowOptions::default()
     });
@@ -97,7 +97,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         title: smol_str::SmolStr::new_static(TOPMOST_TITLE),
         always_on_top: true,
         size: SIZE,
-        position: Some(Point::new(270.0, 210.0)),
+        position: Some(LogicalPoint::new(px(270.0), px(210.0))),
         background: Color::BLACK,
         ..WindowOptions::default()
     });

@@ -283,10 +283,10 @@ fn fill_rects(damage: &DamageRects, out: &mut [RECT; MAX_DAMAGE_RECTS]) -> u32 {
     let mut count = 0;
     for rect in damage.as_slice() {
         out[count] = RECT {
-            left: rect.x0,
-            top: rect.y0,
-            right: rect.x1,
-            bottom: rect.y1,
+            left: rect.x0.value(),
+            top: rect.y0.value(),
+            right: rect.x1.value(),
+            bottom: rect.y1.value(),
         };
         count += 1;
     }
@@ -303,7 +303,7 @@ mod tests {
 
     use super::{BUFFER_COUNT, composition_desc, fill_rects};
     use crate::{
-        math::PhysicalRect,
+        math::{DeviceRect, dp},
         render::{compositor::DamageRects, damage::MAX_DAMAGE_RECTS},
     };
 
@@ -346,8 +346,8 @@ mod tests {
     #[test]
     fn dirty_rects_map_to_win32_rects_in_order() {
         let mut damage = DamageRects::new();
-        assert!(damage.push(PhysicalRect::new(0, 0, 32, 16)));
-        assert!(damage.push(PhysicalRect::new(32, 16, 64, 32)));
+        assert!(damage.push(DeviceRect::new(dp(0), dp(0), dp(32), dp(16))));
+        assert!(damage.push(DeviceRect::new(dp(32), dp(16), dp(64), dp(32))));
         let mut out = rects();
         assert_eq!(fill_rects(&damage, &mut out), 2);
         assert_eq!(

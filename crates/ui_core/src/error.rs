@@ -4,6 +4,7 @@ use smol_str::SmolStr;
 
 use crate::{
     layout::Axis,
+    math::LogicalPx,
     node::{
         id::NodeId,
         signal::{DerivedId, SignalScope},
@@ -130,7 +131,7 @@ pub enum EngineError {
     InvalidMeasure {
         node: NodeId,
         axis: Axis,
-        value: f32,
+        value: LogicalPx,
     },
 
     #[error("text shaping failed for {node:?}: {detail}")]
@@ -228,7 +229,7 @@ pub enum EngineError {
         "virtual list extent at index {index} is invalid: {value} \
          (each extent must be finite and non-negative and their total must be finite)"
     )]
-    InvalidVirtualExtent { index: usize, value: f32 },
+    InvalidVirtualExtent { index: usize, value: LogicalPx },
     #[error("unknown window: {window:?}")]
     UnknownWindow { window: WindowId },
     #[error("accessibility adapter initialization failed: {detail}")]
@@ -276,7 +277,7 @@ impl std::fmt::Display for WindowIconCause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paint::atlas::AtlasKind;
+    use crate::{math::px, paint::atlas::AtlasKind};
 
     fn unsupported_gpu() -> EngineError {
         EngineError::UnsupportedGpu {
@@ -322,7 +323,7 @@ mod tests {
             EngineError::InvalidMeasure {
                 node: NodeId::for_test(4, 1),
                 axis: Axis::X,
-                value: f32::NAN,
+                value: px(f32::NAN),
             },
             EngineError::TextShape {
                 node: NodeId::for_test(5, 1),
@@ -451,7 +452,7 @@ mod tests {
         let text = EngineError::InvalidMeasure {
             node: NodeId::for_test(2, 1),
             axis: Axis::Y,
-            value: -1.5,
+            value: crate::math::px(-1.5),
         }
         .to_string();
 

@@ -4,7 +4,7 @@ use crate::{
     a11y::{A11yAction, A11yLabelSource, A11yOverride, A11yPatch, A11yRole},
     interaction::focus::focusable,
     layout::hit_test::HitShape,
-    math::{PhysicalRect, Scale},
+    math::{DevicePixelRatio, DeviceRect},
     node::{
         id::NodeId,
         tree::{Node, NodeKind, NodeTree},
@@ -140,13 +140,13 @@ pub(crate) const fn orientation_to_accesskit(
     }
 }
 
-pub(crate) fn bounds_of(tree: &NodeTree, node: NodeId, scale: Scale) -> PhysicalRect {
+pub(crate) fn bounds_of(tree: &NodeTree, node: NodeId, scale: DevicePixelRatio) -> DeviceRect {
     let content = tree
         .get(node)
-        .map_or(crate::math::Rect::default(), |target| {
+        .map_or(crate::math::LogicalRect::default(), |target| {
             let bounds = target.layout().bounds;
             match target.hit_shape().and_then(HitShape::bounds) {
-                Some(local) => bounds.union(crate::math::Rect::from_origin_size(
+                Some(local) => bounds.union(crate::math::LogicalRect::from_origin_size(
                     bounds.origin + local.origin,
                     local.size,
                 )),
@@ -154,7 +154,7 @@ pub(crate) fn bounds_of(tree: &NodeTree, node: NodeId, scale: Scale) -> Physical
             }
         });
     let screen = crate::interaction::scroll::to_screen(tree, node, content);
-    screen.to_physical(scale)
+    scale.to_covering_device_rect(screen)
 }
 
 pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
@@ -558,7 +558,7 @@ mod tests {
             A11yRole, A11ySort,
         },
         layout::hit_test::HitShape,
-        math::{PhysicalRect, Scale},
+        math::{DevicePixelRatio, DeviceRect, dp, px},
         node::{builder::NodeBuilder, tree::NodeTree},
         paint::{
             canvas::Canvas,
@@ -930,9 +930,14 @@ mod tests {
     fn canvas_without_alt_text_is_hidden() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let canvas = NodeBuilder::canvas(Canvas::new(crate::math::Rect::new(0.0, 0.0, 4.0, 4.0)))
-            .build(&mut tree, root)
-            .expect("mount");
+        let canvas = NodeBuilder::canvas(Canvas::new(crate::math::LogicalRect::new(
+            px(0.0),
+            px(0.0),
+            px(4.0),
+            px(4.0),
+        )))
+        .build(&mut tree, root)
+        .expect("mount");
         let target = tree.get(canvas).expect("exists");
         assert!(
             is_hidden(target, A11yRole::Image, None, None, None),
@@ -1087,10 +1092,10 @@ mod tests {
             })
             .build(&mut tree, root)
             .expect("input");
-        let inner = NodeBuilder::text("42150", TextStyle::new(12.0))
+        let inner = NodeBuilder::text("42150", TextStyle::new(px(12.0)))
             .build(&mut tree, input)
             .expect("text");
-        let label = NodeBuilder::text("最新价", TextStyle::new(12.0))
+        let label = NodeBuilder::text("最新价", TextStyle::new(px(12.0)))
             .build(&mut tree, root)
             .expect("label");
         assert_eq!(
@@ -1103,7 +1108,7 @@ mod tests {
             A11yRole::Label,
             "普通文本仍是 Label"
         );
-        let _ = TextContent::new("x", TextStyle::new(12.0));
+        let _ = TextContent::new("x", TextStyle::new(px(12.0)));
     }
 
     #[test]
@@ -1111,9 +1116,17 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let node = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(10.0, 20.0, 40.0, 30.0))
-            .hit_shape(HitShape::Rect(crate::math::Rect::new(
-                -5.0, -5.0, 60.0, 50.0,
+            .layout_override(crate::math::LogicalRect::new(
+                px(10.0),
+                px(20.0),
+                px(40.0),
+                px(30.0),
+            ))
+            .hit_shape(HitShape::Rect(crate::math::LogicalRect::new(
+                px(-5.0),
+                px(-5.0),
+                px(60.0),
+                px(50.0),
             )))
             .build(&mut tree, root)
             .expect("mount");
@@ -1122,16 +1135,21 @@ mod tests {
             height: Some(200.0),
         })
         .expect("layout");
-        let scale = Scale::new(1.0).expect("scale");
+        let scale = DevicePixelRatio::new(1.0).expect("scale");
 
         assert_eq!(
             bounds_of(&tree, node, scale),
-            PhysicalRect::new(5, 15, 65, 65),
+            DeviceRect::new(dp(5), dp(15), dp(65), dp(65)),
             "a11y bounds = 布局盒 (10,20,40,30) ∪ 形状局部 AABB (-5,-5,60,50)"
         );
 
         let plain = NodeBuilder::boxed()
-            .layout_override(crate::math::Rect::new(10.0, 20.0, 40.0, 30.0))
+            .layout_override(crate::math::LogicalRect::new(
+                px(10.0),
+                px(20.0),
+                px(40.0),
+                px(30.0),
+            ))
             .build(&mut tree, root)
             .expect("mount");
         tree.compute_layout(taffy::geometry::Size {
@@ -1141,8 +1159,45 @@ mod tests {
         .expect("layout");
         assert_eq!(
             bounds_of(&tree, plain, scale),
-            PhysicalRect::new(10, 20, 50, 50),
+            DeviceRect::new(dp(10), dp(20), dp(50), dp(50)),
             "未设置 HitShape ⇒ 仍用布局盒（旧行为）"
+        );
+    }
+
+    #[test]
+    fn a11y_bounds_cover_the_full_logical_rect() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let node = NodeBuilder::boxed()
+            .layout_override(crate::math::LogicalRect::new(
+                px(1.3),
+                px(0.0),
+                px(0.4),
+                px(1.0),
+            ))
+            .build(&mut tree, root)
+            .expect("mount");
+        tree.compute_layout(taffy::geometry::Size {
+            width: Some(200.0),
+            height: Some(200.0),
+        })
+        .expect("layout");
+
+        let covering = DevicePixelRatio::new(2.0).expect("scale");
+        assert_eq!(
+            bounds_of(&tree, node, covering),
+            DeviceRect::new(dp(2), dp(0), dp(4), dp(2)),
+            "a11y bounds 用 floor/ceil 外扩，覆盖整个逻辑矩形"
+        );
+        assert_eq!(
+            covering.to_device_rect(crate::math::LogicalRect::new(
+                px(1.3),
+                px(0.0),
+                px(0.4),
+                px(1.0)
+            )),
+            DeviceRect::new(dp(3), dp(0), dp(3), dp(2)),
+            "逐边 round 只保留 0 宽，不能用于 a11y"
         );
     }
 
@@ -1272,7 +1327,7 @@ mod tests {
             !action_allowed(&tree, input, A11yAction::SetTextSelection),
             "没有 TextRun 子节点的输入框不默认宣告 SetTextSelection"
         );
-        let run = NodeBuilder::text("42150", TextStyle::new(12.0))
+        let run = NodeBuilder::text("42150", TextStyle::new(px(12.0)))
             .build(&mut tree, input)
             .expect("text run");
         assert!(

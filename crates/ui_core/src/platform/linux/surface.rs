@@ -44,7 +44,7 @@ use crate::{
         Event, ImeEvent, InputEvent, KeyCode, KeyState, Modifiers, ScrollPhase, ScrollUnit,
         should_emit_text,
     },
-    math::{Point, Rect, Scale, Size},
+    math::{DevicePixelRatio, LogicalPoint, LogicalRect, LogicalSize, px},
     paint::style::Cursor,
     platform::{
         linux::{
@@ -137,7 +137,7 @@ struct WindowSurface {
     xdg_surface: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
     configure: ConfigureLatch,
-    ime_cursor_area: Option<Rect>,
+    ime_cursor_area: Option<LogicalRect>,
     text_target: bool,
     ime_applied: Option<ImeStateSnapshot>,
     ime_content: crate::window::ImeContentType,
@@ -147,8 +147,8 @@ struct WindowSurface {
     uses_viewport: bool,
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     decoration_mode: Option<DecorationMode>,
-    size: Size,
-    scale: Scale,
+    size: LogicalSize,
+    scale: DevicePixelRatio,
     surface_outputs: Vec<ObjectId>,
     preferred_buffer_scale: Option<i32>,
     fractional_scale_120: Option<u32>,
@@ -221,7 +221,7 @@ pub(crate) struct WaylandState {
     held_keys: Vec<HeldKey>,
     scroll: PointerScroll,
     parent_hints: ParentHints,
-    pointer_pos: Point,
+    pointer_pos: LogicalPoint,
     redraw: bool,
 }
 
@@ -311,7 +311,7 @@ impl WaylandState {
             held_keys: Vec::new(),
             scroll: PointerScroll::default(),
             parent_hints: ParentHints::default(),
-            pointer_pos: Point::new(0.0, 0.0),
+            pointer_pos: LogicalPoint::new(px(0.0), px(0.0)),
             redraw: false,
         };
         state.bind_existing_outputs(&globals);
@@ -349,9 +349,9 @@ impl WaylandState {
                  xdg_toplevel.set_parent skipped (the owned window has no transient hint)"
             ),
         }
-        let size = Size::new(
-            options.size.width.round().max(1.0),
-            options.size.height.round().max(1.0),
+        let size = LogicalSize::new(
+            px(options.size.width.value().round().max(1.0)),
+            px(options.size.height.value().round().max(1.0)),
         );
 
         let decoration = self.decoration_manager.as_ref().map(|manager| {
@@ -391,7 +391,7 @@ impl WaylandState {
             decoration,
             decoration_mode: None,
             size,
-            scale: Scale::ONE,
+            scale: DevicePixelRatio::ONE,
             surface_outputs: Vec::with_capacity(2),
             preferred_buffer_scale: None,
             fractional_scale_120: None,
@@ -580,7 +580,7 @@ impl WaylandState {
         })
     }
 
-    fn effective_scale(&self, index: usize) -> Scale {
+    fn effective_scale(&self, index: usize) -> DevicePixelRatio {
         let fractional = if self.windows[index].uses_viewport {
             self.windows[index]
                 .fractional_scale_120
@@ -589,7 +589,7 @@ impl WaylandState {
             None
         };
         fractional.unwrap_or_else(|| {
-            Scale::new(self.windows[index].integer_scale as f32).expect("positive")
+            DevicePixelRatio::new(self.windows[index].integer_scale as f32).expect("positive")
         })
     }
 
@@ -671,11 +671,11 @@ impl WaylandState {
         )
     }
 
-    pub(crate) fn size(&self, index: usize) -> Size {
+    pub(crate) fn size(&self, index: usize) -> LogicalSize {
         self.windows[index].size
     }
 
-    pub(crate) fn scale(&self, index: usize) -> Scale {
+    pub(crate) fn scale(&self, index: usize) -> DevicePixelRatio {
         self.windows[index].scale
     }
 
@@ -1020,7 +1020,7 @@ impl WaylandState {
     fn note_ime_state(
         &mut self,
         index: usize,
-        area: Option<Rect>,
+        area: Option<LogicalRect>,
         content: crate::window::ImeContentType,
     ) -> bool {
         let window = &mut self.windows[index];
@@ -1579,7 +1579,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
                 let previous = state.windows[index].size;
                 let previous_states = state.windows[index].states;
                 if width > 0 && height > 0 {
-                    state.windows[index].size = Size::new(width as f32, height as f32);
+                    state.windows[index].size =
+                        LogicalSize::new(px(width as f32), px(height as f32));
                 }
                 state.windows[index].states = ToplevelStates::parse(&states);
                 let was_configured = state.windows[index].configured;
@@ -1608,7 +1609,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
             }
             xdg_toplevel::Event::ConfigureBounds { width, height } => {
                 state.windows[index].size_constraints.set_bounds(
-                    (width > 0 && height > 0).then(|| Size::new(width as f32, height as f32)),
+                    (width > 0 && height > 0)
+                        .then(|| LogicalSize::new(px(width as f32), px(height as f32))),
                 );
                 state.apply_size_limits(index);
             }
@@ -1786,7 +1788,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 };
                 state.pointer_focus = Some(index);
                 state.pointer_enter_serial = Some(serial);
-                state.pointer_pos = Point::new(surface_x as f32, surface_y as f32);
+                state.pointer_pos = LogicalPoint::new(px(surface_x as f32), px(surface_y as f32));
                 let window = state.windows[index].id;
                 state.apply_cursor(index);
                 state.events.push((
@@ -1803,7 +1805,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 surface_y,
                 ..
             } => {
-                state.pointer_pos = Point::new(surface_x as f32, surface_y as f32);
+                state.pointer_pos = LogicalPoint::new(px(surface_x as f32), px(surface_y as f32));
                 if let Some(window) = state.pointer_window() {
                     state.events.push((
                         window,
@@ -2077,7 +2079,7 @@ pub(crate) fn create_devices(state: &mut WaylandState) -> Result<(), EngineError
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn scroll_event(
-    position: Point,
+    position: LogicalPoint,
     delta: (f32, f32),
     finger: bool,
     phase: ScrollPhase,
@@ -2085,7 +2087,7 @@ fn scroll_event(
 ) -> InputEvent {
     InputEvent::Scroll {
         position,
-        delta: Point::new(delta.0, delta.1),
+        delta: LogicalPoint::new(px(delta.0), px(delta.1)),
         unit: if finger {
             ScrollUnit::Pixel
         } else {
@@ -2296,7 +2298,7 @@ mod tests {
     };
     use crate::{
         event::{KeyCode, Modifiers, ScrollPhase, ScrollUnit},
-        math::Point,
+        math::{LogicalPoint, px},
     };
 
     #[test]
@@ -2412,14 +2414,14 @@ mod tests {
     #[test]
     fn scroll_events_carry_the_unit_and_the_phase() {
         let wheel = scroll_event(
-            Point::ZERO,
+            LogicalPoint::ZERO,
             (0.0, -1.0),
             false,
             ScrollPhase::Discrete,
             Modifiers::empty(),
         );
         let finger = scroll_event(
-            Point::ZERO,
+            LogicalPoint::ZERO,
             (0.0, -10.0),
             true,
             ScrollPhase::Update,
@@ -2432,7 +2434,7 @@ mod tests {
         else {
             panic!("必须是滚动事件");
         };
-        assert_eq!(delta, Point::new(0.0, -1.0));
+        assert_eq!(delta, LogicalPoint::new(px(0.0), px(-1.0)));
         assert_eq!(unit, ScrollUnit::Line);
         assert_eq!(phase, ScrollPhase::Discrete);
 

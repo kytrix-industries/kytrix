@@ -3,7 +3,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yRole},
     app::App,
     interaction::ScrollConfig,
-    math::{Point, Rect, Size},
+    math::{LogicalPoint, LogicalPx, LogicalRect, LogicalSize, px},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{
         canvas::Canvas,
@@ -31,23 +31,27 @@ const ICON_PNG: [u8; 189] = [
     0xFE, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
-const ICON_SLOTS: [(f32, f32, f32); 2] = [(18.0, 40.0, 16.0), (44.0, 40.0, 32.0)];
+const ICON_SLOTS: [(LogicalPx, LogicalPx, LogicalPx); 2] = [
+    (px(18.0), px(40.0), px(16.0)),
+    (px(44.0), px(40.0), px(32.0)),
+];
 
 const ICON_LABELS: [&str; 2] = ["Kytrix 图标（16×16，1:1）", "Kytrix 图标（2× 放大）"];
 
-const SCROLL_RECT: (f32, f32, f32, f32) = (18.0, 82.0, 276.0, 126.0);
+const SCROLL_RECT: (LogicalPx, LogicalPx, LogicalPx, LogicalPx) =
+    (px(18.0), px(82.0), px(276.0), px(126.0));
 
 const ROW_COUNT: usize = 20;
 
-const ROW_HEIGHT: f32 = 24.0;
+const ROW_HEIGHT: LogicalPx = px(24.0);
 
-pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: Point) {
+pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: LogicalPoint) {
     let icon = app
         .resources_mut()
         .insert(&ICON_PNG)
         .expect("内嵌 16x16 PNG 必须可解码");
     for (index, slot) in ICON_SLOTS.iter().enumerate() {
-        let local = Rect::new(slot.0, slot.1, slot.2, slot.2);
+        let local = LogicalRect::new(slot.0, slot.1, slot.2, slot.2);
         let absolute = local.translate(origin);
         let mut canvas = Canvas::new(absolute);
         canvas.push_image(Image {
@@ -69,19 +73,19 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: Poin
         app,
         window,
         panel,
-        Rect::new(86.0, 46.0, 208.0, 18.0),
+        LogicalRect::new(px(86.0), px(46.0), px(208.0), px(18.0)),
         "内嵌 PNG → 图集 tile（1:1 / 2×）",
-        text_style(11.5, 400, DIM_RGBA),
+        text_style(px(11.5), 400, DIM_RGBA),
     );
 
     let (x, y, width, height) = SCROLL_RECT;
-    let mut style = card::absolute_style(Rect::new(x, y, width, height));
+    let mut style = card::absolute_style(LogicalRect::new(x, y, width, height));
     style.clip = Clip::Bounds;
     let scroll = NodeBuilder::boxed()
         .style(style)
         .paint(PaintSpec {
             background: color(TRACK_RGBA),
-            corner_radius: [8.0; 4],
+            corner_radius: [px(8.0); 4],
             ..PaintSpec::default()
         })
         .build(card::tree(app, window), panel)
@@ -89,9 +93,9 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: Poin
     for index in 0..ROW_COUNT {
         let shade = 0x1F + (index as u8 % 8) * 7;
         let _ = NodeBuilder::boxed()
-            .layout_override(Rect::new(
-                0.0,
-                index as f32 * ROW_HEIGHT,
+            .layout_override(LogicalRect::new(
+                px(0.0),
+                ROW_HEIGHT * index as f32,
                 width,
                 ROW_HEIGHT - 1.0,
             ))
@@ -103,14 +107,17 @@ pub(crate) fn build(app: &mut App, window: WindowId, panel: NodeId, origin: Poin
             .expect("滚动行挂载");
     }
     if let Ok(handle) = app.make_scroll(window, scroll, ScrollConfig::default()) {
-        let _ = app.set_scroll_content(&handle, Size::new(width, ROW_COUNT as f32 * ROW_HEIGHT));
+        let _ = app.set_scroll_content(
+            &handle,
+            LogicalSize::new(width, ROW_HEIGHT * ROW_COUNT as f32),
+        );
     }
     let _ = card::label(
         app,
         window,
         panel,
-        Rect::new(18.0, 212.0, 276.0, 16.0),
+        LogicalRect::new(px(18.0), px(212.0), px(276.0), px(16.0)),
         "滚轮滚动（20 行，276×126 视口）",
-        text_style(11.0, 400, DIM_RGBA),
+        text_style(px(11.0), 400, DIM_RGBA),
     );
 }

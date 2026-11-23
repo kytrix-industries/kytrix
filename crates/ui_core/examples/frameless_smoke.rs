@@ -7,7 +7,7 @@ use std::{
 use smol_str::SmolStr;
 use ui_core::{
     app::{App, Application},
-    math::{Rect, Size},
+    math::{LogicalRect, LogicalSize, px},
     node::builder::NodeBuilder,
     paint::{color::Color, style::PaintSpec, style_builder::StyleBuilder},
     window::{Decorations, WindowControl, WindowId, WindowOptions},
@@ -24,9 +24,9 @@ const IDLE_CHECK_MIN_BUDGET: f32 = 3.6;
 struct SmokeReport {
     frames: u32,
     first_presented_at: Option<Instant>,
-    initial_size: Option<Size>,
-    expected_maximized: Option<Size>,
-    maximized_size: Option<Size>,
+    initial_size: Option<LogicalSize>,
+    expected_maximized: Option<LogicalSize>,
+    maximized_size: Option<LogicalSize>,
     checks: u32,
     saw_maximized: bool,
     saw_restored: bool,
@@ -37,7 +37,7 @@ struct SmokeReport {
 }
 
 #[cfg(windows)]
-fn expected_maximized_size(scale: f32) -> Option<Size> {
+fn expected_maximized_size(scale: f32) -> Option<LogicalSize> {
     use windows::Win32::{
         Foundation::POINT,
         Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
@@ -51,14 +51,14 @@ fn expected_maximized_size(scale: f32) -> Option<Size> {
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         return None;
     }
-    Some(Size::new(
-        (info.rcWork.right - info.rcWork.left) as f32 / scale,
-        (info.rcWork.bottom - info.rcWork.top) as f32 / scale,
+    Some(LogicalSize::new(
+        px((info.rcWork.right - info.rcWork.left) as f32 / scale),
+        px((info.rcWork.bottom - info.rcWork.top) as f32 / scale),
     ))
 }
 
 #[cfg(not(windows))]
-fn expected_maximized_size(_scale: f32) -> Option<Size> {
+fn expected_maximized_size(_scale: f32) -> Option<LogicalSize> {
     None
 }
 
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(runtime.handle().clone());
     let window = app.create_window(WindowOptions {
         title: SmolStr::new_static("Kytrix · E6 frameless smoke"),
-        size: Size::new(960.0, 640.0),
+        size: LogicalSize::new(px(960.0), px(640.0)),
         decorations: Decorations::None,
         icon: Some(bytes::Bytes::from_static(include_bytes!(
             "frameless_smoke_icon.png"
@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut maximize_requested = false;
     let mut restore_requested = false;
     let mut last_maximized: Option<bool> = None;
-    let mut last_logical_size: Option<Size> = None;
+    let mut last_logical_size: Option<LogicalSize> = None;
     app.on_frame(move |app| {
         let wall = started.elapsed().as_secs_f32();
         let mut report = report_hook.borrow_mut();
@@ -146,8 +146,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (report.initial_size, report.expected_maximized)
             {
                 let expected = if state.maximized { expected } else { initial };
-                if (size.width - expected.width).abs() > 1.0
-                    || (size.height - expected.height).abs() > 1.0
+                if (size.width - expected.width).abs() > px(1.0)
+                    || (size.height - expected.height).abs() > px(1.0)
                 {
                     report.failures.push(format!(
                         "t={wall:.2}s frame#{frames} maximized={} client={:.0}x{:.0} 期望 \
@@ -160,8 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match report.maximized_size {
                     None => report.maximized_size = Some(size),
                     Some(previous)
-                        if (previous.width - size.width).abs() > 1.0
-                            || (previous.height - size.height).abs() > 1.0 =>
+                        if (previous.width - size.width).abs() > px(1.0)
+                            || (previous.height - size.height).abs() > px(1.0) =>
                     {
                         report.failures.push(format!(
                             "t={wall:.2}s frame#{frames} 最大化阶段出现两个客户区尺寸 \
@@ -324,7 +324,7 @@ fn build_scene(app: &mut App, window: WindowId) {
     let root_style = StyleBuilder::new().size_full().build();
     tree.set_style(root, root_style).expect("根样式");
     let _ = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 960.0, 640.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(960.0), px(640.0)))
         .paint(PaintSpec {
             background: Color::from_rgba8([0x1E, 0x24, 0x2E, 0xFF]),
             ..PaintSpec::default()
@@ -332,7 +332,7 @@ fn build_scene(app: &mut App, window: WindowId) {
         .build(tree, root)
         .expect("背景");
     let _ = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.0, 960.0, 40.0))
+        .layout_override(LogicalRect::new(px(0.0), px(0.0), px(960.0), px(40.0)))
         .paint(PaintSpec {
             background: Color::from_rgba8([0x2A, 0x32, 0x40, 0xFF]),
             ..PaintSpec::default()
@@ -340,5 +340,8 @@ fn build_scene(app: &mut App, window: WindowId) {
         .build(tree, root)
         .expect("自绘 header");
 
-    app.set_drag_regions(window, &[Rect::new(0.0, 0.0, 960.0, 40.0)]);
+    app.set_drag_regions(
+        window,
+        &[LogicalRect::new(px(0.0), px(0.0), px(960.0), px(40.0))],
+    );
 }

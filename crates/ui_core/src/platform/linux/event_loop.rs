@@ -8,7 +8,7 @@ use calloop::{EventLoop, ping::make_ping};
 use crate::{
     app::App,
     error::{EngineError, WaylandErrorKind},
-    math::{Scale, Size},
+    math::{DevicePixelRatio, LogicalSize},
     platform::{
         dispatcher::Dispatcher,
         linux::{
@@ -33,8 +33,8 @@ struct WindowA11y {
 
 struct WindowMirror {
     id: WindowId,
-    scale: Scale,
-    size: Size,
+    scale: DevicePixelRatio,
+    size: LogicalSize,
     title: smol_str::SmolStr,
 }
 
@@ -252,7 +252,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     continue;
                 };
                 window_a11y.adapter.set_bounds(
-                    crate::math::Point::ZERO,
+                    crate::math::LogicalPoint::ZERO,
                     state.size(index),
                     state.scale(index),
                 );

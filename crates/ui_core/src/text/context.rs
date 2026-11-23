@@ -342,10 +342,13 @@ impl Default for TextContext {
 #[cfg(test)]
 mod tests {
     use super::TextContext;
-    use crate::text::{FontStack, FontStackStatus, TextContent, TextDiagnostic, TextStyle};
+    use crate::{
+        math::px,
+        text::{FontStack, FontStackStatus, TextContent, TextDiagnostic, TextStyle},
+    };
 
     fn content(text: &str) -> TextContent {
-        TextContent::new(text, TextStyle::new(16.0))
+        TextContent::new(text, TextStyle::new(px(16.0)))
     }
 
     #[test]
@@ -424,7 +427,7 @@ mod tests {
         }
         let red = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_color(Color::Srgb {
+            TextStyle::new(px(13.0)).with_color(Color::Srgb {
                 r: 1.0,
                 g: 0.0,
                 b: 0.0,
@@ -433,7 +436,7 @@ mod tests {
         );
         let green = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_color(Color::Srgb {
+            TextStyle::new(px(13.0)).with_color(Color::Srgb {
                 r: 0.0,
                 g: 1.0,
                 b: 0.0,
@@ -442,7 +445,7 @@ mod tests {
         );
         let centered = TextContent::new(
             "1,234.56",
-            TextStyle::new(13.0).with_alignment(TextAlign::Center),
+            TextStyle::new(px(13.0)).with_alignment(TextAlign::Center),
         );
         let (first, _) = context.shape_cached(&red);
         let (second, second_hit) = context.shape_cached(&green);

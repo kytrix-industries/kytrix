@@ -5,7 +5,7 @@ use ui_core::{
     a11y::{A11yAction, A11yOverride, A11yPatch, A11yRole},
     app::App,
     event::ImeEvent,
-    math::Rect,
+    math::{LogicalRect, px},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::{
         primitive::Border,
@@ -195,14 +195,19 @@ pub(crate) fn build(
     focused: Signal<bool>,
 ) -> (NodeId, NodeId) {
     let field_node = NodeBuilder::boxed()
-        .style(card::absolute_style(Rect::new(18.0, 40.0, 544.0, 54.0)))
+        .style(card::absolute_style(LogicalRect::new(
+            px(18.0),
+            px(40.0),
+            px(544.0),
+            px(54.0),
+        )))
         .paint(PaintSpec {
             background: color(FIELD_RGBA),
             border: Some(Border {
-                width: 1.0,
+                width: px(1.0),
                 color: color(FIELD_BORDER_RGBA),
             }),
-            corner_radius: [10.0; 4],
+            corner_radius: [px(10.0); 4],
             ..PaintSpec::default()
         })
         .focus_ring(ring())
@@ -231,8 +236,8 @@ pub(crate) fn build(
         app,
         window,
         field_node,
-        Rect::new(14.0, 12.0, 516.0, 30.0),
-        text_style(17.0, 400, TEXT_RGBA),
+        LogicalRect::new(px(14.0), px(12.0), px(516.0), px(30.0)),
+        text_style(px(17.0), 400, TEXT_RGBA),
         move |cx| {
             let value = cx.read(&field);
             value.display(*cx.read(&focused))
@@ -242,41 +247,41 @@ pub(crate) fn build(
         app,
         window,
         panel,
-        Rect::new(18.0, 102.0, 544.0, 20.0),
-        text_style(13.0, 400, MUTED_RGBA),
+        LogicalRect::new(px(18.0), px(102.0), px(544.0), px(20.0)),
+        text_style(px(13.0), 400, MUTED_RGBA),
         move |cx| cx.read(&field).preedit_line(),
     );
     let _ = card::bound_label(
         app,
         window,
         panel,
-        Rect::new(18.0, 126.0, 544.0, 18.0),
-        text_style(11.5, 400, DIM_RGBA),
+        LogicalRect::new(px(18.0), px(126.0), px(544.0), px(18.0)),
+        text_style(px(11.5), 400, DIM_RGBA),
         move |cx| cx.read(&field).event_line(),
     );
     let _ = card::bound_label(
         app,
         window,
         panel,
-        Rect::new(18.0, 148.0, 544.0, 18.0),
-        text_style(11.5, 400, DIM_RGBA),
+        LogicalRect::new(px(18.0), px(148.0), px(544.0), px(18.0)),
+        text_style(px(11.5), 400, DIM_RGBA),
         move |cx| cx.read(&field).submitted_line(),
     );
     let _ = card::label(
         app,
         window,
         panel,
-        Rect::new(18.0, 176.0, 544.0, 18.0),
+        LogicalRect::new(px(18.0), px(176.0), px(544.0), px(18.0)),
         "点击输入框后用系统输入法输入拼音：组合串由系统 IME 窗口显示，上屏后追加到正文。",
-        text_style(11.5, 400, DIM_RGBA),
+        text_style(px(11.5), 400, DIM_RGBA),
     );
     let _ = card::label(
         app,
         window,
         panel,
-        Rect::new(18.0, 198.0, 544.0, 18.0),
+        LogicalRect::new(px(18.0), px(198.0), px(544.0), px(18.0)),
         "Enter 提交 / Backspace 删除 / Esc 退出（IME 组合由系统处理）。",
-        text_style(11.0, 400, DIM_RGBA),
+        text_style(px(11.0), 400, DIM_RGBA),
     );
     (field_node, text_node)
 }

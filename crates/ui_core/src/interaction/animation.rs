@@ -1,5 +1,5 @@
 use crate::{
-    math::Point,
+    math::{LogicalPoint, LogicalPx},
     paint::color::{Color, ColorResolver},
 };
 
@@ -21,8 +21,11 @@ pub(crate) fn lerp(from: f32, to: f32, t: f32) -> f32 {
 }
 
 #[must_use]
-pub(crate) fn lerp_point(from: Point, to: Point, t: f32) -> Point {
-    Point::new(lerp(from.x, to.x, t), lerp(from.y, to.y, t))
+pub(crate) fn lerp_point(from: LogicalPoint, to: LogicalPoint, t: f32) -> LogicalPoint {
+    LogicalPoint::new(
+        LogicalPx::new(lerp(from.x.value(), to.x.value(), t)),
+        LogicalPx::new(lerp(from.y.value(), to.y.value(), t)),
+    )
 }
 
 #[must_use]
@@ -41,7 +44,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{lerp, lerp_color, lerp_point, progress};
-    use crate::{math::Point, paint::color::Color};
+    use crate::{
+        math::{LogicalPoint, px},
+        paint::color::Color,
+    };
 
     #[test]
     fn progress_clamps_and_handles_zero_duration() {
@@ -63,8 +69,12 @@ mod tests {
         assert_eq!(lerp(10.0, 20.0, 1.0), 20.0);
         assert_eq!(lerp(10.0, 20.0, 0.5), 15.0);
         assert_eq!(
-            lerp_point(Point::new(0.0, 0.0), Point::new(10.0, 20.0), 0.5),
-            Point::new(5.0, 10.0)
+            lerp_point(
+                LogicalPoint::new(px(0.0), px(0.0)),
+                LogicalPoint::new(px(10.0), px(20.0)),
+                0.5
+            ),
+            LogicalPoint::new(px(5.0), px(10.0))
         );
     }
 

@@ -218,7 +218,7 @@ mod tests {
     use crate::{
         a11y::{A11yDiagnostic, A11yOverride, A11yPatch, A11yRole},
         app::App,
-        math::{Rect, Scale, Size},
+        math::{DevicePixelRatio, LogicalRect, LogicalSize, px},
         node::{builder::NodeBuilder, id::NodeId, signal::Signal},
         paint::{
             color::Color,
@@ -248,14 +248,19 @@ mod tests {
         let mut app = App::new(runtime.handle().clone());
         let window = app.create_window(WindowOptions {
             title: SmolStr::new_static("a11y-only-cost"),
-            size: Size::new(320.0, 240.0),
-            scale: Scale::ONE,
+            size: LogicalSize::new(px(320.0), px(240.0)),
+            scale: DevicePixelRatio::ONE,
             ..WindowOptions::default()
         });
         let root = app.window(window).expect("window").tree().root();
         for index in 0..10 {
             NodeBuilder::boxed()
-                .layout_override(Rect::new(0.0, index as f32 * 6.0, 40.0, 5.0))
+                .layout_override(LogicalRect::new(
+                    px(0.0),
+                    px(index as f32 * 6.0),
+                    px(40.0),
+                    px(5.0),
+                ))
                 .paint(white())
                 .build(app.window_mut(window).expect("window").tree_mut(), root)
                 .expect("static box");
@@ -263,7 +268,7 @@ mod tests {
         let label_signal = app.signal(SmolStr::new_static("旧的"));
         let source = label_signal;
         let label = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 80.0, 120.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(80.0), px(120.0), px(20.0)))
             .paint(white())
             .bind_a11y(move |cx| A11yPatch {
                 label: Some(cx.read(&source).clone()),
@@ -346,7 +351,7 @@ mod tests {
         let root = app.window(window).expect("window").tree().root();
         let shared = label_signal;
         let styled = NodeBuilder::boxed()
-            .layout_override(Rect::new(0.0, 110.0, 40.0, 20.0))
+            .layout_override(LogicalRect::new(px(0.0), px(110.0), px(40.0), px(20.0)))
             .paint(white())
             .bind_style(move |cx| StylePatch {
                 opacity: Some(if cx.read(&shared).as_str() == "新的" {
