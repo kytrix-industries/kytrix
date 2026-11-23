@@ -1,7 +1,24 @@
 # Kytrix 定制化跨平台 GUI 引擎 · 系统设计文档
 
 > **文档类型**：系统设计规格 —— 只描述最终架构、接口、实现与约束
-> **版本**：v2.13（2026-11-22）
+> **版本**：v2.14（2026-11-23）· **状态：迁移完成（P0–P6 全部完成）**
+>
+> **v2.14 变更摘要（2026-11-23）**：**迁移完成归档**。`gui-engine-migration` 分支 HEAD `752d653`（P0–P6 全部完成；
+> 最终三端验收 P6-2/P6-3/P6-4 见 `.docs/gui-migration/final-report.md`）。本版做四件事：
+> ① **版本头与代码状态改为「迁移完成」**：全仓单一自研引擎（`ui_core` 引擎 + `base_ui`（`theme/` + `kit/` +
+> `style_builder.rs`）+ `widget` 契约层 + `widget_registry`/`widget_gallery_ui` + 六个 `*_ui` + `kytrix` 外壳）；
+> 依赖树 **零 `gpui`**（`Cargo.lock` 1,136→**760** 包；`gpui*`/`wgpu`/`x11rb`/`winit` 全 0），迁移期过渡开关
+> `KYTRIX_UI_CORE_MANIFEST` **已删除**（P5-3 `f1ff4944`）、`widget_tokio_runtime` **整 crate 删除**（P5-1 `61c08fb`）、
+> 旧 `base_ui` 顶层模块 **37 个模块/目录 25,471 行已删除**（P5-2 `6239b84`）。
+> ② **§12 按最终实现回写**：除 P2 的 `base_ui`/kit 形态外，补 **kytrix 组合根 / 外壳 / 页面接线**（§12.11）与
+> **验收构建 feature 形状 + 引擎 `automation` 面（E25）+ `--acceptance` 自检**（§12.12）；§12.1/§12.5/§12.6/§12.7/§12.10
+> 的迁移期表述改为终态事实（旧模块已删、不再需要环境变量、旧依赖已去）。
+> ③ **新增 §14「迁移收口」**：依赖树零 gpui、分层与依赖方向、三端验收方式与结论、验收构建 feature 形状、质量数据、
+> 已知限制与 backlog、证据索引。
+> ④ **E24 落盘**（§4.5 形状缓存键前提 / §11.1 `shape_text` 换色语义）：`ShapeKey` 仍不含 color，但光栅期按**本次**
+> `style.color` 重写未被 `TextRun` 覆盖的 run（`text/shape.rs::current_run_color`）；同文本换色命中布局缓存、不重复 shape。
+> ⑤ 清理文中「迁移期 / P5 后 / 过渡」等已过时措辞（共 26 处，逐条见 `.docs/gui-migration/design-changes.md` §23）。
+> 本版**不改任何生产代码**：只改本文与 `.docs/gui-migration/**`（文档批 P6-5）。
 >
 > **v2.13 变更摘要（2026-11-22）**：**P3-1j（canvas/图元测试读点）完成**。W4a/W4b/W5a 三批审查的共同缺口是
 > 「canvas 行为在 widget 测试里不可见」：引擎把自绘画布作为**一条不透明图元**记录进 `RenderedFrame.primitives`，
@@ -118,17 +135,22 @@
 > **上游关系**：技术路线论证见 `custom-gui-engine-technical-research.md`；本文是其定案（D1–D25）的实现规格，不重复论证
 > **工程约束**：`AGENTS.md`（模块化、`lib.rs` 只做模块声明、强类型错误、不做预防性抽象、单测与生产代码同模块；验收
 > `cargo test` + `cargo +nightly clippy -- -D warnings` + `cargo +nightly fmt`）
-> **代码状态**（v2.3 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
-> **引擎侧 E1–E15 全部已实现**（§11.1–§11.15）；**应用层 `base_ui`（`theme/` + `kit/`）已实现**（§12）。
-> 尚未迁移的只有：widgets（P3）、`*_ui` 与 `kytrix` 外壳（P4）、旧 `base_ui` 模块与 gpui 系依赖的删除（**P5**）。
+> **代码状态**（v2.14 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
+> **引擎侧 E1–E21、E23–E25 全部已实现**（§11.1–§11.15；E21 `signal_slot_stats`、E23 canvas 读点、E24 文本换色、
+> E25 `automation` 面分别见 §13.8/§13.9、§6.3/§13.2、§4.5/§11.1、§12.12；**E22 仅登记、未实现**，见 §14.6）；
+> **应用层全部已实现并接线**：`base_ui`（`theme/` + `kit/` + `style_builder.rs`，§12.1–§12.5）、`widget` 契约层（§13）、
+> 20 个 widget crate + `widget_registry` / `widget_gallery_ui`、六个 `*_ui` 与 `kytrix` 外壳（§12.11、§14.2）。
+> **迁移已完成**（P0–P6，`gui-engine-migration@752d653`）：gpui 全家桶已从 workspace 与 `Cargo.lock` 彻底删除（§14.1）。
 > Rust 片段分三类，各自必须显式标注：
 >
 > 1. **已实现契约**——与源码一致，片段只是摘要；
 > 2. **E2b 候选 / 已接受残余**——明确标注为**未实现候选或受限项**（§11.2 / §11.8），应用不得依赖；
 > 3. **接口草图**——固定语义与形状、非可编译实现。
 >
-> **与 P2 现实对齐的两条口径**：① `base_ui` 迁移采取**模块级增量**（新 `theme/` / `kit/` 与旧模块并存，旧模块 **P5 删除**，
-> §12.1）；② 迁移期 `ui_core` 的进程清单与 `gpui-pre` 冲突，用 `KYTRIX_UI_CORE_MANIFEST=0` 过渡（§12.6，P5 移除）。
+> **P2 迁移口径（历史，P5 已闭合）**：① `base_ui` 当时采取**模块级增量**（新 `theme/` / `kit/` 与旧模块并存）；旧模块已于
+> **P5-2**（`6239b84`）删除，`src/` 只剩 `kit/`、`theme/`、`style_builder.rs`、`lib.rs`（§12.1）；② 迁移期 `ui_core` 的进程清单与
+> `gpui-pre` 冲突，曾用 `KYTRIX_UI_CORE_MANIFEST=0` 过渡（§12.6），该开关已由 **P5-3**（`f1ff4944`）删除 —— 终态**不存在**该环境变量，
+> `ui_core` 始终编译并链接本仓 PerMonitorV2 清单。
 >
 > 任何未标「E2b 候选 / 已接受残余」的条目都视为「现在就可依赖的能力」；若与源码冲突，**以源码为准并回写本文**。
 
@@ -165,7 +187,7 @@
 | #   | 不变量                                                                                                                                                        | 违反后果                                            |
 |-----|---------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------|
 | I1  | **编译期单一后端**：`render/` 与 `platform/` 三平台子模块按 `#[cfg(target_os)]` 选择，运行时不存在后端枚举、不存在可插拔 `Renderer` / 事件循环 trait          | 退化为通用框架抽象，违反 D2                         |
-| I2  | **一套数据契约**：`Scene` / `#[repr(C)] GpuPrimitive` / `PhysicalRect`（damage）/ `AtlasTile` / `GeometryDesc` / `Color` 只有一份定义，三套 renderer 只消费不重定义；迁移期的引擎扩展只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力，唯一例外是 E4（`GeometryDraw.range`），已按「三端 encoder 共享参数纯函数 + `contract.md` + 参数单测/WARP 子区间像素测试」同批落地（§11.4）      | 三份代码语义漂移                                    |
+| I2  | **一套数据契约**：`Scene` / `#[repr(C)] GpuPrimitive` / `PhysicalRect`（damage）/ `AtlasTile` / `GeometryDesc` / `Color` 只有一份定义，三套 renderer 只消费不重定义；迁移期（P1–P2）的引擎扩展只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力，唯一例外是 E4（`GeometryDraw.range`），已按「三端 encoder 共享参数纯函数 + `contract.md` + 参数单测/WARP 子区间像素测试」同批落地（§11.4）      | 三份代码语义漂移                                    |
 | I3  | **空闲不提交帧**：无任何 dirty 标记时，帧调度器停在 `Idle`，不录制命令、不 present。**受管动画是唯一「自动」连续帧入口**（`App::animate(window, AnimatedValue, &[NodeId], AnimationSpec)`；`needs_continuous_frames` 的判据来自「有活跃动画」）；应用自驱的逐帧路径（`on_frame` + `set_canvas` 等）必须自带收敛条件并在收敛后停止请求，不得无条件 `request_repaint`（§8.4 / §11.7）。**v2.3 拆分口径（E10/E10c）**：本条约束的是「**应用级**零唤醒」——等待期不产生应用轮次、不跑 `on_frame`、不提交帧（已达成，三端可达）；**OS 级**仍有平台唤醒源（macOS display link 的 vsync tick，`IDLE_GRACE = 250 ms` 滞回），它们**不再**驱动应用轮次（§11.12）。**合法的一次性唤醒源**除「有动画」外还有：一次性定时器到期、动画完成事件回投（`Dispatcher::wake`）、`AppHandle::wake`、输入/DPI/外观事件；这些唤醒不产生连续帧 | 空闲 GPU 占用与功耗 |
 | I4  | **GPU 资源只经延迟销毁**：任何释放请求按 `FrameIndex` 入队，fence / semaphore / command buffer 完成后才真正释放                                               | GPU 端 use-after-free、驱动相关花屏                 |
 | I5  | **节点树与布局树同一份存储**：引擎节点实现 taffy `LayoutPartialTree`，不维护第二棵布局树                                                                      | 双树同步错误、命中盒与布局不一致                    |
@@ -175,11 +197,11 @@
 | I9  | **应用层不接触平台 API**：`base_ui` / widgets 只见引擎类型，不见 `HWND` / `MTLDevice` / `VkDevice` / `wl_surface`。自绘标题栏、窗口按钮（最小化/最大化/关闭）、任务栏图标、运行时改标题等**平台能力必须由引擎提供**（§8.6 契约、§11.6 E6 规格）；**不允许**给应用层开平台口子（那会同时违反 I9 与 D15）                                             | 平台差异泄漏到业务 crate                            |
 | I10 | **不做静默降级**：D8 检测失败即给出可读错误并退出；不做兼容层、不做 migration、不做软件渲染回退                                                               | 与 D3 / D8 冲突                                     |
 | I11 | **所有几何以逻辑像素存储、以物理像素绘制**：只在 paint / present 边界做一次缩放与舍入                                                                         | 高分屏 1px 缝、AA 抖动                              |
-| I12 | **绘制指令与像素结果分别验证**：CPU 帧记录断言「发了什么」，像素快照断言「画成什么样」。**已知限制**：L3 的 14 个 case（42 张 golden）**不含文字像素**（`test_support/snapshot.rs` 的 `SnapshotScene` 没有 `Glyphs` 变体），因此迁移期文本正确性由 L2 帧记录（`FrameRecord`/`RenderedFrame`）+ 结构度量断言保证，像素 golden 只作辅助（§6.10） | D11 三套独立源无 oracle |
+| I12 | **绘制指令与像素结果分别验证**：CPU 帧记录断言「发了什么」，像素快照断言「画成什么样」。**已知限制**：L3 的 14 个 case（42 张 golden）**不含文字像素**（`test_support/snapshot.rs` 的 `SnapshotScene` 没有 `Glyphs` 变体），因此迁移期（P1–P5）文本正确性由 L2 帧记录（`FrameRecord`/`RenderedFrame`）+ 结构度量断言保证，像素 golden 只作辅助（§6.10）；终态另有三端真机验收复核文本节点数与绘制（`--acceptance` 的 `painted` / `language` 两步，§14.4） | D11 三套独立源无 oracle |
 | I13 | **全仓单一 tokio runtime**（D21）：无第二套 executor、无 GPUI `PlatformDispatcher`、无双运行时桥接；主线程通过显式 `Handle` 提交任务                          | 退回双 executor 分裂与「无 runtime 上下文」panic    |
 | I14 | **窗口 / 事件循环由引擎自有**（D22）：平台层按 `#[cfg(target_os)]` 编译期确定单一实现，不依赖 winit / `accesskit_winit`，不存在可插拔事件循环 trait           | 平台能力受第三方 WndProc / NSTextInputClient 约束   |
 | I15 | **颜色只有引擎一份 `Color` 语义**（D23）：调色板与语义角色留应用层，但解析 / 插值 / 色域 / 到 GPU 的转换只在引擎实现。**现状**：`ColorResolver` 是**零大小（ZST）无状态**类型，只有 `resolve` / `lerp` / `lerp_color` 三个方法，插值空间固定为**线性预乘**（没有可配置的插值空间 / gamut / 版本），返回 `LinearPremulRgba`；base_ui 的 `.hsla`（586 处）与 OKLab 渐变假设**在实现上不成立**，迁移期一律 OKLCH→`Color` 静态解析 + 线性预乘插值                                          | 三套 shader 与文本 / SDF 收到不同空间的值           |
-| I16 | **Linux 仅 Wayland**（D25）：`platform/linux/`、`render/linux/`、依赖清单、门禁矩阵中不存在 X11 / XIM / XRandR / `x11rb` / X11 selection 路径。**作用域（v2.1 澄清）**：本条当前成立的范围是「`ui_core` 依赖闭包」（实测 0 X11）；**workspace 级**的 `x11rb` 来自 `gpui-pre-linux` / `gpui-fast-linux` / `zed-xim`，随 P5-2 删除 gpui 系后消失 —— 因此「零 `x11rb`」是 **P5-2 的判据**，不是今天的全仓事实                  | 违反项目支持范围，产生不受测的第三套输入 / 窗口实现 |
+| I16 | **Linux 仅 Wayland**（D25）：`platform/linux/`、`render/linux/`、依赖清单、门禁矩阵中不存在 X11 / XIM / XRandR / `x11rb` / X11 selection 路径。**作用域（v2.14 收口）**：本条在「`ui_core` 依赖闭包」成立（实测 0 X11）；迁移期 **workspace 级**的 `x11rb` 来自 `gpui-pre-linux` / `gpui-fast-linux` / `zed-xim`，已随 **P5-2**（`6239b84`）删除 gpui 系而消失 —— **全仓零 `x11rb` / `winit` / `wgpu` / `gpui` 已由 P5-3 兑现**（`Cargo.lock` 1,136→760 包，§14.1）                  | 违反项目支持范围，产生不受测的第三套输入 / 窗口实现 |
 | I17 | **样式静态结构与动态属性分离**（D24）：静态结构挂载时一次写入 `Style`；动态属性只能经 `Signal` + `bind_style` / `StylePatch` 重算；DSL 只在应用层且保持「薄」。**组件 API 形态（v2.1 口径）**：`base_ui` 组件只允许 ①接受 `Style` / `PaintSpec` 整值（挂载时一次）或 ②接受 `impl FnOnce(&mut StyleBuilder) -> Style` 的**挂载期**闭包；运行期变体必须声明为 `bind_style` + `StylePatch` 闭包；**不复活** `Styled` / `refine_style` / `.when()` 形态（§4.9） | 把 GPUI「每帧重建整棵 Element 树」的缺陷带进新引擎  |
 
 ### 0.3 术语与符号
@@ -396,7 +418,7 @@ pub(crate) use windows as backend;
 > **P2 已落地的应用层部分**（v2.3，§12）：`base_ui` 的 `theme/`（`Palette` 61 → `RoleColors` **64 角色** → `ComponentTokens` →
 > `Theme` → `ThemeHandle`）与 `kit/`（33 个组件模块）已在 `ui_core` 之上实现；**薄 builder 的方法面已定稿为
 > `StyleBuilder` 35 个 + `PaintBuilder` 6 个**（§12.3）。旧 `base_ui` 模块（`style/`、顶层组件文件、旧 `markdown/`）仍在，
-> **P2-5 不删、推迟到 P5**（消费方 P3/P4 迁完之后，§12.7）。
+> **P2-5 当时不删（旧模块推迟到 P5）**；旧模块已由 **P5-2**（`6239b84`）删除，只留 `theme/` / `kit/` / `style_builder.rs`（§12.1 / §12.7）。
 
 > **`base_ui::StyleBuilder` 的落点（v2.1 新增要求；v2.3 已兑现）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
 > `base_ui` 必须自己新建。**P2-1a 已交付**：`crates/base_ui/Cargo.toml` 已含 `ui_core = { workspace = true }` 与
@@ -1220,6 +1242,11 @@ line_break / font_variations / decoration；**不含 color / alignment**）+ **�
 （`GlyphKey` 的量化 ppem），不进缓存键；节点文本的光栅 scale 取窗口 `Scale`。bidi / 字素簇边界由 parley 决定，引擎不假设单 run 或 LTR
 （文本命中语义见 §11.5）。
 
+**颜色不在缓存键里，但在光栅期生效（E24）**：`ShapeKey` 不含 `color`（R12-11）⇒ 同文本换色命中布局缓存、不重复 shape；颜色由
+**光栅期**按本次 `TextStyle.color` 重写每个 style run 的取色（`TextRun` 覆盖的区间用 run 颜色，未被覆盖的区间用本次基础色，
+部分相交保留 shape 期画刷）。这是「Canvas 多色文本」成立的前提（同一字符串以不同颜色塑形、多句柄并存），节点文本首次光栅输出
+不变。精确语义与测试见 §11.1 第 11 项。
+
 ### 4.6 字体策略（D17）
 
 | 项           | 设计                                                                                                                                                                           |
@@ -1275,8 +1302,8 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 | **引擎** | 三个样式类型 + `bind_style` 依赖追踪入口 + `Color` / `ColorResolver`；**不做** DSL、不持有主题语义 |
 | **应用层 `base_ui`** | ① 薄 `StyleBuilder`（只覆盖高频组合：间距 / 尺寸 / 颜色 / flex 常用组合）② 主题语义色 / 调色板 / 深浅色映射 ③ `typography_*` 之类的 `TextStyle` 预设 |
 
-**薄 builder 的硬边界**（写进 code review 约定，防止长成通用 DSL；迁移期还有 13 处 `impl Styled`、14 处 `refine_style`、
-30 处 `.when(` 要按此重写 —— 见 §6.10「禁止为过测试留兼容层」）：
+**薄 builder 的硬边界**（写进 code review 约定，防止长成通用 DSL；迁移期（P2）曾有 13 处 `impl Styled`、14 处 `refine_style`、
+30 处 `.when(` 需按此重写，P5-2 删除旧模块后归零 —— 见 §6.10「禁止为过测试留兼容层」）：
 
 1. 只允许「字段直写 + 少量命名组合」，方法集合固定且设上限（**`StyleBuilder` 35 + `PaintBuilder` 6**，清单见 §12.3；旧文写的「约 26 个」已废止）。
 2. 不引入宏、字符串选择器、嵌套闭包 DSL、可插拔扩展 trait。
@@ -1749,7 +1776,7 @@ L1 / L2 完全不依赖 GPU（I7）：`TestApp::new()` 默认**无 renderer**，
 **L3 现状（v2.1 校准）**：**GPUI 侧**没有任何像素 / 帧缓冲 / `render_to_image` 断言；但 `ui_core` **已建成 L3**：
 `crates/ui_core/tests/snapshot.rs` 的 14 个 case × 3 个设备目录（`warp` / `lavapipe` / `metal-real`）= **42 张 golden**，
 容差「逐通道 2 + 不匹配 ≤ 0.1%」。**文字像素不在其中**（`SnapshotScene` 没有 `Glyphs` 变体）—— 文本正确性靠结构与度量
-断言（§4.5「为什么没有文本像素 golden」），迁移期的等价性折算见 §6.10。
+断言（§4.5「为什么没有文本像素 golden」），迁移期的等价性折算见 §6.10（P5-3 后已闭合：`cargo test --workspace` 恢复为合入门）。
 
 现有 `#[gpui_kit::test]` 全部是纯 CPU 布局 / 绘制记录断言（`debug_bounds` 读 `Frame` 中的 `selector → Bounds` 映射，
 `painted_quads()` 不做光栅化）。迁移时保留的是**CPU 帧记录契约**（`selector → bounds`、`painted_quads` / `Scene`、`PaintLog`、
@@ -1970,7 +1997,7 @@ state、颜色空间标记与插值空间 —— **零容差**，可在 CPU 侧�
 | `run_until_parked`（**573 / 78**） | **循环** `TestApp::drain()` 直到 `frame_record().repainted == false`；或 `TestApp::advance(dt)` / `FrameScript` | L1 | `drain()` **只推进一帧**；573 处里约 266 个函数同时用 `advance_clock` / `simulate_next_frame`，必须逐处改写 |
 | `advance_clock` / `simulate_next_frame` | `TestApp::advance(Duration)` / `FrameScript::push(ScriptFrame::advance(dt))` | L1 | 多帧序列用 `FrameScript` + `ScriptReport::assert_*` |
 | `Runtime::for_test`（**125–127 / 35**） | `#[tokio::test]` 自带 runtime，或显式 `Handle` 注入 | L0 | `widget_tokio_runtime` 整体删除（§9.2） |
-| `current_test_handle`（**154 / 23**）/ `test_handle`（**159 / 23**） | `App::runtime_handle()`（`&Handle`）/ `App::handle()`（`AppHandle`） | L0 | 逃逸口随 P5-2 删除 |
+| `current_test_handle`（**154 / 23**）/ `test_handle`（**159 / 23**） | `App::runtime_handle()`（`&Handle`）/ `App::handle()`（`AppHandle`） | L0 | 逃逸口已随 P5-2 删除（`6239b84`） |
 | 无（新增） | `FrameScript` + `ScriptReport`（多帧脚本 + 逐帧断言） | L2.5 | `test_support::script` |
 | 无（新增） | `TestApp::{assert_oracle, oracle_diff, assert_a11y_oracle}` | L2 | full-refresh oracle / a11y oracle |
 | 无（新增） | `SnapshotCase` + `SnapshotScene` / `SnapshotTheme` + `Tolerance` + golden | L3 | 14 case × 3 设备 = 42 张 golden；**不含文字像素** |
@@ -2034,12 +2061,13 @@ P0-2 的 `065ae66` / `80637ab` 合入 `ee2a80f`；退出码由 `xtask/tests/gate
 2. L3 三端 golden 入口（按设备目录、跨设备不互比）由 `--step layer` 的 snapshot 套件承担；`gui_smoke --ignored` 也在 layer；
 3. `release` / `bench`（只 build 不跑）/ `accept` 三个补充步骤已实现（`release` 构建、`bench` 编译 perf、`accept` 跑 CPU 验收 example）；
 4. 「测试-only 软件设备」边界仍由 §6.4 的 golden 目录与产品 `cfg` 约束表达；三端任一端不可用时 `layer` **失败**而不是静默跳过；
-5. 迁移期增量门禁：`cargo test -p ui_core` + `cargo test -p <正在迁移的 crate>`；`cargo test --workspace` 在
-   「迁移期旧 crate 必红」的现实下**不能**作为合入门（§10.2 的迁移期验证门据此改写）。
+5. **增量门禁（迁移期规则，P5-3 已退役）**：迁移期用 `cargo test -p ui_core` + `cargo test -p <正在迁移的 crate>`；
+   `cargo test --workspace` 在「旧 crate 必红」的现实中当时不能作为合入门（§10.2 的迁移期验证门据此改写）。
+   **终态**：P5-3 起 `cargo test --workspace` 恢复为合入门（8,556 passed；P6-1 后 **8,581 passed / 0 failed / 36 ignored**）。
 
 **按 D19，本节不设任何帧时间 / 内存数值门槛。**
 
-### 6.10 迁移期测试等价性契约（v2.1 新增）
+### 6.10 迁移期测试等价性契约（v2.1 新增；P1–P5 生效，迁移完成后转为历史判据）
 
 迁移不是「把 GPUI 测试逐个翻译」，而是**证明迁移后测试覆盖的语义没有变少**。本节是执行代理与审查代理的**共同判据**；
 每条删除/改写都必须能在 `.docs/gui-migration/` 的台账里逐条对上。
@@ -2129,8 +2157,8 @@ pub struct TreeUpdate {
 | 按钮（`A11yOverride`） | `Button`                              | `label`、`add_action(Click)`            | 应用层声明 override                          |
 | 输入框                 | `TextInput` / `MultilineTextInput`    | `value`、`SetValue`、`SetTextSelection` | 选区见 §4.7                                  |
 | 列表 / 表格 / 虚拟列表 | `List` / `Grid` / `Table` / `ListBoxOption` | `children` 仅暴露可见窗口；集合字段 `row_index`/`row_count`/`pos_in_set`/`size_of_set` | 虚拟列表按可见范围生成子节点（§11.11） |
-| 表格结构               | `Row` / `Cell` / `ColumnHeader` / `RowHeader` | 逻辑父 = 最近声明 `Table|Grid` / `Row` | 逻辑父子只在 **a11y 树**表达，物理树不动（§11.11） |
-| 树                     | `Tree` / `TreeItem`                   | 逻辑父 = 最近声明 `Tree|TreeItem`；`expanded` | E9 新增两角色                                |
+| 表格结构               | `Row` / `Cell` / `ColumnHeader` / `RowHeader` | 逻辑父 = 最近声明 `Table\|Grid` / `Row` | 逻辑父子只在 **a11y 树**表达，物理树不动（§11.11） |
+| 树                     | `Tree` / `TreeItem`                   | 逻辑父 = 最近声明 `Tree\|TreeItem`；`expanded` | E9 新增两角色                                |
 | 滚动容器               | `ScrollView` + `ScrollBar`            | `ScrollUp/Down/Left/Right` / `SetScrollOffset` | 与 `ScrollHandle` 联动（**不是** `ScrollArea`） |
 | `Canvas` / `Geometry` / `Image` | `Image` + 替代文本            | `label`（**应用层必须提供**）           | 无替代文本时标 `hidden` 并写诊断，不静默丢弃（没有 `GraphicsObject`）；**显式 `A11yOverride{hidden:true}` = 装饰声明 ⇒ 免 `MissingAltText`**（E7） |
 | 浮层 / 菜单            | **应用显式声明**（无声明 = `GenericContainer`） | `children`、`Dialog`/`AlertDialog`/`Menu`/`MenuItem`/`TabList`/`Tab` 等由 `OverlayOptions::a11y` 给 | v2.3 更正：浮层包装**不再**自动 `Dialog`（E12）；`aria-modal` 跟 `trap_focus` |
@@ -2532,14 +2560,15 @@ main()
 | `clippy.toml` 的 `disallowed-methods`（禁用 `spawn_blocking` / `Handle::current`） | 改为一条新约定：主线程只经 `AppHandle::spawn` / `app.handle().spawn(...)`，禁止裸 `tokio::spawn`；用编译期 lint 与 code review 约束 |
 | `runtime.rs` 的 workspace 遍历测试（硬编码「恰好 42 crate」；`crates/` 下实测 **43** 个 `Cargo.toml` ⇒ 判据与现实不一致，随本项一并删除或改判据） | 删除                                                                                                                        |
 | `Runtime::for_test()`（**127 处 / 35 文件**）/ `current_test_handle()`（**154 / 23**）/ `test_handle()`（**159 / 23**）逃逸 | `#[tokio::test]` 自带 runtime，或显式 `Handle` 注入                                                                         |
-| `gpui-*` 全族带来的 `gpui-pre-scheduler` / `async-task` / `pollster` / `smol` 系   | 随 P5-2 一并清理                                                                                                              |
+| `gpui-*` 全族带来的 `gpui-pre-scheduler` / `async-task` / `pollster` / `smol` 系   | 已随 P5-2 / P5-3 清理（`Cargo.lock` 1,136→760 包）                                                                            |
 
 **不移除项**：
 
 - `kytrix_service_provider/src/auth/session.rs` 的专用 `new_current_thread` runtime（业务自身的线程隔离设计，不是双
-  executor 桥接）；P5 阶段复核是否合并进共享 runtime。
+  executor 桥接）；P5 阶段已复核：保留（不与共享 runtime 合并）。
 - `accesskit_unix` / `zbus` 内部拉入的 `async-executor` 是库内部实现，不属于应用级 executor，D21 不要求移除。
-- `tokio 1.54.1` + `features = ["full"]` 保持不变；各 crate 的细粒度 features 可在 P5 收敛。
+- `tokio 1.54.1` + `features = ["full"]` 保持不变；各 crate 的细粒度 features 已在 P5-1 收敛（`widget_tokio_runtime` 删除后
+  服务层统一收 `tokio::runtime::Handle`）。
 
 ### 9.3 资源预算与内存策略
 
@@ -2622,7 +2651,7 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | E12 | 浮层 a11y 角色 + 模态作用域（§11.13） | a11y oracle + 输入过滤测试 | ✅ 已完成（merge `f76d75d`） |
 | | E13 | 组不透明度 + 多层阴影（§11.14） | golden 零 diff + damage 残影回归 | ✅ 已完成（merge `07f319d`，含 E13b） |
 | | E15 | a11y 角色补齐 + 容器角色 + 集合根语义上提（§11.15） | a11y oracle + 变异 | ✅ 已完成（merge `7ad630f`，含 E15b） |
-| **P2 base_ui** | P2-0 | 迁移期 manifest 过渡开关（`KYTRIX_UI_CORE_MANIFEST`，`xtask gates` **按命令**注入；§12.6） | `cargo test -p base_ui` + `xtask gates` 全绿 | ✅ 已完成（`3adc5d7` / `e0d3f7b` → merge `3ed24a7`） |
+| **P2 base_ui** | P2-0 | 迁移期 manifest 过渡开关（`KYTRIX_UI_CORE_MANIFEST`，`xtask gates` **按命令**注入；§12.6） | `cargo test -p base_ui` + `xtask gates` 全绿 | ✅ 已完成（`3adc5d7` / `e0d3f7b` → merge `3ed24a7`；开关已由 P5-3 删除） |
 | | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（**35**）/`PaintBuilder`（**6**，§12.3）+ `.hsla` 全删 + 64 角色×2 外观基线（§12.2） | `cargo test -p base_ui` + gallery 出帧 | ✅ 已完成（`05f52e0` / `6e4d413` → merge `828bf53`） |
 | | P2-1b / 1b2 | 资产与基础件（icon/assets/brand/size/format/motion/animation/join + `test_support`；旧 M4 遗留的「图标构建期转换」用 resvg 0.46 落地，§12.5） | 同上 | ✅ 已完成（`eb464f6` / `e9aeda4` → merge `8ed4714`；white matte 修复 + 110 PNG 全像素校验） |
 | | P2-1b3 / 1b3b | E7 采用：删 `kit/image_node.rs` 绕行，Icon/Brand/Assets 改用 `NodeKind::Image`（§11.9） | 同上 | ✅ 已完成（`3b3b752` / `fc4fd14` → merge `bbd75e4`；含装饰图免诊断判据） |
@@ -2634,19 +2663,25 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | P2-4c / 4c2 / 4c3 | 菜单/下拉/选择/上下文菜单（共享条目面板、`PanelWidth::Exact`、行命中壳焦点） | 同上 | ✅ 已完成（`95dc808` / `1f34ea6` → merge `3ce9593`） |
 | | P2-4d1 / 4d1b | 对话框（`Dialog` / `DialogBuilder`；焦点/模态/Esc 走引擎，`OverlaySurface::dialog()`） | 同上 | ✅ 已完成（`252384e` / `9094b1c` → merge `cda7d09`） |
 | | P2-4d2 / 4d2b | 颜色选择器（144 色板 + HSLA 滑条走 `Canvas`；双层阴影回填） | 同上 | ✅ 已完成（`25f0d8b` / `58eddec` → merge `b855b21`） |
-| | P2-5 | base_ui 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | ✅ 已合入（`cd607d0` → merge `1b65c9d`；`M3` 达成）；真实窗口缺陷修复由 **P2-6**（`mig/p2-6a` / `p2-6b`，在途）跟进 |
-| **P3 widget 契约 + 20 widgets** | P3-1 | 契约层搬运 + `view`/`any`/`status` 重写 + `WidgetCx`/`AnyWidget` 定稿 | 契约测试 + 签名冻结评审 | ⬜ 待做 |
-| | P3-2 | `surface` / `ui/placeholder` / `binding` + `empty` 标杆 + 运行时 Handle 接线 | 同上 | ⬜ 待做 |
-| | P3-3 | `widget_registry` + `widget_gallery_ui`（24 条注册表遍历） | 同上 | ⬜ 待做 |
-| | P3-W1…W9 | 20 个 widget（K 线 / 地图优先；W1 news∥force_order … W9 hyperliquid∥watch_list∥x） | 每 crate 全绿 + full-refresh oracle + L2 | ⬜ 待做 |
-| **P4 `*_ui` 与 kytrix 外壳** | P4-1 | `market_participants_ui` ∥ `profile_ui` ∥ `updater_ui` | 每 crate 全绿 + 页面级 L1/L2 | ⬜ 待做 |
-| | P4-2 | `instrument_selector_ui` ∥ `settings_ui` | 同上 | ⬜ 待做 |
-| | P4-3 | kytrix 外壳：`main` 启动链（runtime → App → 首窗 → 首帧树 → `on_frame` → `run`）、`windows/root/window.rs` 拆分、`components/{sidebar,workspace,system_button,pages}`、**自绘标题栏（接线 P1-E6 的引擎能力）**、服务注入、i18n | 最小窗口 example 作活体证据（P2–P4 期间 `cargo build -p kytrix` 必红，不能作为门） | ⬜ 待做 |
-| **P5 收口与删除 GPUI** | P5-1 | 删除 `widget_tokio_runtime`（crate + 30 manifest + 全部调用点 → `App` 持有 Handle / `#[tokio::test]`）；workspace 遍历测试与 `clippy.toml` 相关规则清理 | 相关 crate 全绿 + 零 `widget_tokio_runtime` | ⬜ 待做 |
-| | P5-2 | 删除 `gpui-kit`（36 crate×2 行 + workspace + dev-deps）；`Cargo.lock` 零 `gpui-*`/`wgpu`；`AGENTS.md` GPUI 约定；`Packager.toml` deb 去 `libxcb1`；`app.rc`/图标；examples 与资源收尾；**「零 `x11rb`」判据在此兑现** | 零 `gpui-*`（36）/ 零 `wgpu*`（9）/ 零 `widget_tokio_runtime` / 零 `x11rb` / 零 `winit`（现状已 0，维持） | ⬜ 待做 |
-| **P6 三端验收** | P6-1 | Windows 本机真机验收：点击/拖拽/键盘/IME/widget 画布绘图/presented 统计；截图/录屏 | plan §2.4 accept | ⬜ 待做 |
-| | P6-2 | macOS（用户配置后远程）+ Linux（Wayland）同上 | accept | ⬜ 待做 |
-| | P6-3 | 验收报告 + 台账收口 + 合并 `main` | accept + 用户可见报告 | ⬜ 待做 |
+| | P2-5 | base_ui 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | ✅ 已合入（`cd607d0` → merge `1b65c9d`；`M3` 达成）；旧模块已由 **P5-2**（`6239b84`）删除；真实窗口缺陷由 **P2-6** 修复批跟进后关闭 |
+| **P3 widget 契约 + 20 widgets** | P3-1 | 契约层搬运 + `view`/`any`/`status` 重写 + `WidgetCx`/`AnyWidget` 定稿 | 契约测试 + 签名冻结评审 | ✅ 已完成（§13 冻结；P3-1b…P3-1j 逐批补缝，契约测试 131→**183**） |
+| | P3-2 | `surface` / `ui/placeholder` / `binding` + `empty` 标杆 + 运行时 Handle 接线 | 同上 | ✅ 已完成（`974c8f2`，`empty` 8 测试；surface/binding 随 P3-1） |
+| | P3-3 | `widget_registry` + `widget_gallery_ui`（24 条注册表遍历） | 同上 | ✅ 已完成（`e6696b1` registry **28** / `a151ef0` gallery **33**） |
+| | P3-W1…W9 | 20 个 widget（K 线 / 地图优先；W1 news∥force_order … W9 hyperliquid∥watch_list∥x） | 每 crate 全绿 + full-refresh oracle + L2 | ✅ 已完成（20 crate 84–**353** 测试；W1…W9 各审查+修复批，见 `ledger.md` §4） |
+| **P4 `*_ui` 与 kytrix 外壳** | P4-1 | `market_participants_ui` ∥ `profile_ui` ∥ `updater_ui` | 每 crate 全绿 + 页面级 L1/L2 | ✅ 已完成（`777cb82` 22+88 / `afc2efc` 73） |
+| | P4-2 | `instrument_selector_ui` ∥ `settings_ui` | 同上 | ✅ 已完成（`ba60949` settings **233**；selector `86`） |
+| | P4-3 | kytrix 外壳：`main` 启动链、`windows/root/window.rs` 拆分、`components/*`、**自绘标题栏（E6）**、服务注入、i18n | 最小窗口 example 作活体证据（P2–P4 期间 `cargo build -p kytrix` 必红） | ✅ 已完成（`21030cc` → merge `9d92252`；P4-3b `aca1557`、P4-5 接线 `74e8a05` → merge `266f952`；§12.11） |
+| **P5 收口与删除 GPUI** | P5-1 | 删除 `widget_tokio_runtime`（crate + 30 manifest + 全部调用点 → `App` 持有 Handle / `#[tokio::test]`）；workspace 遍历测试与 `clippy.toml` 相关规则清理 | 相关 crate 全绿 + 零 `widget_tokio_runtime` | ✅ 已完成（`61c08fb`：整 crate 删除、6 crate gpui=0、`Runtime::for_test` 105 处/.with_runtime 18/39 引用改 `Handle`） |
+| | P5-2 | 删除 `gpui-kit`（36 crate×2 行 + workspace + dev-deps）；`Cargo.lock` 零 `gpui-*`/`wgpu`；`AGENTS.md` GPUI 约定；`Packager.toml` deb 去 `libxcb1`；examples 与资源收尾；**「零 `x11rb`」判据在此兑现** | 零 `gpui-*`（36）/ 零 `wgpu*`（9）/ 零 `widget_tokio_runtime` / 零 `x11rb` / 零 `winit` | ✅ 已完成（`6239b84`：37 个旧模块/目录 25,471 行删除；`cargo tree -p base_ui \| grep gpui` = 0） |
+| | **P5-3（新增）** | 移除 gpui 全家桶与 `KYTRIX_UI_CORE_MANIFEST` 过渡开关；全仓门禁恢复绿 | `Cargo.lock` 零 `gpui*`；`cargo test --workspace` 全绿 | ✅ 已完成（`f1ff4944`：lock 1,136→**760** 包、gpui 36→0、wgpu/x11rb/winit 清零；8,556 passed） |
+| **P6 三端验收** | P6-1 | **验收构建**（`ai`/`audio` 可选）+ 引擎 `automation` 面（E25）+ `kytrix --acceptance` 7 步自检 | Windows 真实窗口自检 + 两种构建 + 依赖树判据 | ✅ 已完成（`174ea807` → merge `1324430c`；Windows 7/7 PASS，§12.12） |
+| | P6-2 | Windows 真窗口验收：全量/验收两种二进制的启动、自检、截图、存活/关闭 | accept（截图 + 报告 + 退出码） | ✅ 已完成（`14 frames / 193 primitives / 4 texts`；两张 1600×1200 截图，§14.4） |
+| | P6-3 | macOS 真窗口验收（用户级 cmake，`launchctl asuser`） | accept（报告 + 窗口登记） | ✅ 已完成（10/10 exit 0、7/7 PASS；CGWindowList `id=283 1280×960 layer 0`；TCC 限制见 §14.4） |
+| | P6-4 | Linux 真窗口验收（Ubuntu Wayland + llvmpipe） | accept（报告 + 交换链日志） | ✅ 已完成（4/4 exit 0、7/7 PASS；Vulkan 交换链 1280×960 MAILBOX 实证） |
+| | P6-5 | **文档收口**：设计 v2.14、计划 v1.6、最终报告与三端证据索引 | 文档 diff + `design-changes.md` §23 | ✅ 已完成（本文 v2.14、`final-report.md`、`acceptance-evidence.md`） |
+
+> **P6 的 main 合并不在上述批次内**：`gui-engine-migration → main` 由 Lead 按 D-04 执行（附本报告与三端证据），本表只覆盖到
+> 「迁移分支上的验收与归档完成」（`752d653`）。
 
 > **依赖与顺序（以 plan §3 为准）**：P0 → P1 → P2 → P3（契约先于 widgets）→ P4 → P5 → P6；P1 内 E2/E4/E6 的合并点追加
 > 三端 layer 门禁；P2 与 P3.1 可部分并行，P3 的 widget 批次之间完全并行。
@@ -2694,10 +2729,11 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 > 注：表中「plan 未列」= `.docs/gui-migration/plan.md` 没有对应批次；执行前由 Lead 决定并入就近批次或新增 P0-4（当前不存在），
 > 不得自行扩批。其余所有 `P*-*` 批次 ID 均存在于 plan.md。
-**迁移期验证门（plan P2–P5 各批次）**：`#[gpui_kit::test]` **1,652** 个 + 迁移面 **5,443** 个（可机械 3,610 / 必须重写
-1,711 / 删 9 / 未解析 122），以「**crate 全绿 + 台账逐条对账**」为验收，不按 API 批量。`cargo test --workspace` 在迁移期
+**迁移期验证门（plan P2–P5 各批次；P5-3 后退役）**：`#[gpui_kit::test]` **1,652** 个 + 迁移面 **5,443** 个（可机械 3,610 / 必须重写
+1,711 / 删 9 / 未解析 122），以「**crate 全绿 + 台账逐条对账**」为验收，不按 API 批量。迁移期 `cargo test --workspace`
 不可作为合并门（旧 crate 必红）；门禁按 plan §2.4 的 fast/quick/layer 三级执行，执行体是 `cargo xtask gates`（P0-2），
-**不恢复 CI**。
+**不恢复 CI**。**终态**：P5-3（`f1ff4944`）起 `cargo test --workspace` 恢复为合入门（8,556 passed），P6-1 后为
+**8,581 passed / 0 failed / 36 ignored**（§14.5）。
 
 ### 10.3 可移植 / 必须重写判定
 
@@ -2802,7 +2838,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 > 与 **E16**（`node_screen_rect` / `anchor_rect` 公开面）**未实现**，仅登记（E16 在 `kit-overlay.md` 原稿中误用 E15 编号，
 > P2-4c3 已改号，§11.16）；**不得**把 E15 用于指 a11y 之外的缺口。
 
-**引擎扩展准入规则（v2.1 起生效，迁移期全程适用；E1–E15 均按此验收）**：
+**引擎扩展准入规则（v2.1 起生效，迁移周期 P1–P5 全程适用，已完成；E1–E15 均按此验收）**：
 
 1. 只允许「**不改** `GpuPrimitive` 字节布局、不改 `render/shaders/contract.md`」的能力扩展；**E4 是唯一例外**，已按此交付：三端
    encoder（Windows `render/windows/compositor.rs` 的 `GeometryRegistry`；macOS `render/macos/geometry.rs`；Linux
@@ -2894,6 +2930,14 @@ impl Canvas {
     代际一致 + 槽位仍被占用且纪元相同」。字段**不进** `GpuPrimitive` 128 B 布局、不进 uniform / 顶点布局 / 三端 shader；
     `AtlasTile` 24 → 32 B（`PositionedGlyph` 40 → 48 B，单字形 +8 B）。`push` 期不逐 tile 扫描：句柄租约已等价且更早覆盖逐 tile
     失效，`AtlasAllocator` 是 crate 私有、不能进公开签名。
+11. **颜色与缓存键（E24，P6 前修复）**：`ShapeKey` **仍不含 color**（R12-11 不变）⇒ 同一文本换色**命中 shaping 缓存、不重复 shape**；
+    但**光栅期**按**本次**请求的 `style.color` 现场重算每个 style run 的颜色（`text/shape.rs::current_run_color`）：被 `TextRun`
+    完全覆盖的 run 用 run 自己的颜色（E2 具体值）；与所有 run 不相交的区间用**本次基础色**（E24 修复点 —— 此前 `rasterize_parley`
+    取 layout brush，导致 Canvas 同一文本第二次以不同颜色塑形仍画首色，W6b F22「halo 环视觉上不存在」）；部分相交（parley 合并
+    同色 run）保留 shape 期画刷。首次光栅三条分支都等价于旧输出 ⇒ 节点文本快照**零 diff**。`ShapedText::rasterize` 的 `color`
+    参数语义 = **本次基础文本色**，不是「仅省略号 / 装饰色」。测试观测面：`App::shape_count_for_test()`（`#[cfg(test)]` 真实
+    parley 塑形计数，生产零符号；配 `repeated_shape_reuses_the_cached_snapshot`、`canvas_text_recolors_on_a_shaping_cache_hit`、
+    `base_color_recolor_keeps_explicit_run_colors`）。
 
 **错误**：
 
@@ -3320,7 +3364,7 @@ macOS 纯函数 `traffic_light_position_applies_once_and_never_rolls_back` / 安
 |---|---|---|---|
 | R-11 | `AtlasTile.slot_epoch` wrap | `slot_epoch` / `eviction_epoch` 是 `u32`；wrap 后理论上可能与 2^32 次分配前的身份相撞（实际不可达）。 | 接受；不修 |
 | R-12 | 图片图集未接编码期判活 | 编码期安全网只对 `GlyphRun` 逐 tile 判活；图片 tile 走 `ResourceImage.tile` 的「恒有效直到 unload」契约、图片页只回收空页 ⇒ Canvas 内 `Image` 不参与 `is_alive`。若未来图片 tile 改为可淘汰，必须同批接编码期判活。 | 接受；契约不变 |
-| R-13 | 真机 DPI 覆盖仅 125% | E6 只在 125% 真机做过带回读的冒烟；100% / 150% / 200% 与混合 DPI 跨屏由纯函数（96/120/144/192）覆盖。mac / Linux 仍只有编译门禁 + 平台无关纯函数单测（交通灯 AppKit 行为、Wayland 标题生效时点建议 P5 前各跑一次真机回读）。 | 接受；后续补真机矩阵 |
+| R-13 | 真机 DPI 覆盖仅 125% | E6 只在 125% 真机做过带回读的冒烟；100% / 150% / 200% 与混合 DPI 跨屏由纯函数（96/120/144/192）覆盖。**P6 三端验收已在 macOS / Linux 真机启动验收构建并跑 7 步自检**（§14.4），但都是默认 DPI、且不读回仪表；交通灯 AppKit 行为与 Wayland 标题生效时点仍只有平台无关纯函数单测。 | 接受；后续补真机 DPI 矩阵 |
 | R-14 | Win11 Snap Layouts `HTMAXBUTTON` 未实现 | 自绘最大化按钮无法触发系统 Snap Layouts 悬停浮层；`WM_NCHITTEST` 只返回八向 `HT*` / `HTCAPTION` / `HTCLIENT`。Aero Snap（拖边）/ 双击最大化 / `Alt+Space` / 右键系统菜单仍由系统提供。 | 接受；后续增强批次 |
 | R-15 | Windows 全屏不支持 | `ToggleFullscreen` ⇒ `UnsupportedWindowCapability { capability: "fullscreen window control" }`；`WindowState.can_fullscreen == false` 初值。理由：kytrix 现有 UI 只有最小化/最大化/关闭（A4 证据）；`WS_POPUP` 独占全屏会改 Snap / DWM / 任务栏 / Alt+Tab 语义，需重新整轮真机验收。 | 用户裁决接受（Lead task-11）；后续如需独占全屏单独立批 |
 | R-16 | E2b 候选两项 | ① Canvas / standalone shaping 不绘制装饰与行内盒；② 节点文本路径的 InlineBox 命中只读访问面不存在（仅 standalone handle 路径可读落点）。 | 未实现，登记于 §11.2 |
@@ -3641,7 +3685,7 @@ impl App {
 | I10 不静默降级 | 否 | P2 **未新增** `EngineError` 变体（仍 35）；E13 的 >4 层阴影截断是**构造期**的显式上限（R-24），不是降级 |
 | I11 逻辑像素存储 / 物理绘制 | 是（沿用） | 图片内在尺寸按 scale 换算（§11.9 语义 1/5） |
 | **I12 指令与像素分别验证** | 是（沿用） | E13 新增像素读回用例，但文本仍不进 golden（`SnapshotScene` 无 `Glyphs`）；E7 的 Cover 只有 L2 数值断言（无 L3 裁剪用例，记为可选增强） |
-| I13–I17 | 否 | 未触及；I16 的「零 `x11rb`」仍是 **P5-2 判据**（不变） |
+| I13–I17 | 否 | 未触及；I16 的「零 `x11rb`」**已由 P5-2 / P5-3 兑现**（gpui 系删除后全仓 `Cargo.lock` 760 包、无 `x11rb` / `winit` / `wgpu`，见 §14.1） |
 
 **错误面**：P2 全程**未新增** `EngineError` 顶层变体（仍 **35**，§2.9）；新路径全部复用既有强类型：
 `UnknownWindow`（`bind_key_scoped` / `after`）、`StaleNode`（scope / 节点失效）、`InvalidVirtualExtent` / `VirtualListExtents`
@@ -3653,23 +3697,26 @@ impl App {
 
 ---
 
-## 12. P2 应用层实现规格（`base_ui` / kit，已实现）
+## 12. 应用层实现规格（`base_ui` / kit / kytrix 外壳 / 页面接线，已实现）
 
-> **状态**：P2（`base_ui` 迁移）**主体完成** —— P2-0…P2-4d2 全部合入迁移分支（`7ad630f` 时点 22 个批次 merge），
-> P2-5 `gallery` + 三端真实验收已合入（`merge(p2-5)` = `1b65c9d`，合计 **23 个 P2 merge**，`M3` 达成）；
-> 真实窗口缺陷修复批次 **P2-6**（`mig/p2-6a` / `mig/p2-6b`）在途，收口后再升「P2 完成」。
-> 本章是**应用层的实现后规格**：模块形态 / 主题基座 / 薄 builder / kit 组件契约 / 构建期资产 / 过渡开关 / 计划修正。
-> 引擎侧规格见 §11；应用层与引擎的边界仍由 §1.3 白名单约束 —— `base_ui` **只见引擎类型**（I9）。
+> **状态：应用层全部完成并接线**（P2 `base_ui` → P3 契约层 + 20 widgets → P4 六个 `*_ui` + kytrix 外壳 → P5 删除旧引擎 →
+> P6 三端验收）。`base_ui` 只剩 `theme/` + `kit/` + `style_builder.rs`（P5-2 `6239b84` 删除 37 个旧模块/目录共 25,471 行）；
+> `gpui-kit` 与 gpui 全族已从 workspace / `Cargo.lock` 删除（P5-3 `f1ff4944`）；`KYTRIX_UI_CORE_MANIFEST` 过渡开关已删除
+> （§12.6 只作历史记录，终态不存在该变量）。
+> 本章是**应用层的实现后规格**：模块形态 / 主题基座 / 薄 builder / kit 组件契约 / 构建期资产 / 计划修正 /
+> **kytrix 组合根与外壳接线（§12.11）** / **验收构建与 `--acceptance` 自检（§12.12）**。
+> 引擎侧规格见 §11、widget 契约层见 §13、迁移收口与三端验收结论见 §14；应用层与引擎的边界仍由 §1.3 白名单约束 ——
+> `base_ui` **只见引擎类型**（I9）。
 
 ### 12.1 模块级增量迁移形态（不是兼容层）
 
 | 项 | 事实 |
 |---|---|
 | 新模块 | `crates/base_ui/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/base_ui/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown/` 6 个模块 + `parse_tests`） |
-| 旧模块 | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/` **仍在**（迁移期并存），**P5 删除**（§12.7） |
+| 旧模块（已删除） | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/`（9 文件）共 **37 个模块/目录、25,471 行**，已由 **P5-2**（`6239b84`）删除；`src/` 只剩 `kit/`、`theme/`、`style_builder.rs`、`lib.rs`（§12.7） |
 | 迁移形态裁决 | **模块级增量**：新模块用新路径与新 API，旧模块不改造、不桥接、不 re-export；**不是**公开 API 兼容层（AGENTS §1.1） |
-| 依赖 | `crates/base_ui/Cargo.toml` 运行时仍含 `gpui-kit`（旧模块需要），故旧模块的 gpui 文本引用 ≈304 处；新 `theme/` / `kit/` **零 `gpui`** |
-| 测试事实标准 | `cargo test -p base_ui --lib`（迁移期须带 `KYTRIX_UI_CORE_MANIFEST=0`，否则 Windows 清单冲突，§12.6） |
+| 依赖 | `crates/base_ui/Cargo.toml` 运行时只依赖 `ui_core`（构建期 `resvg`/`usvg`/`image`）；`gpui-kit` 已随 P5-2 删除，`grep -r gpui crates/base_ui` = **0**（`cargo tree -p base_ui \| grep gpui` 亦 0） |
+| 测试事实标准 | `cargo test -p base_ui --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **772 passed**（P5-2 后；P2 时点 1,139） |
 
 ### 12.2 主题基座（`theme/`）
 
@@ -3721,27 +3768,32 @@ impl App {
 
 | 项 | 规格 |
 |---|---|
-| 依赖 | `crates/base_ui/Cargo.toml` 的 **build-dependencies**：`image` / `resvg` / `usvg`；workspace 钉 **0.46.0**（与 `gpui-pre` 在 `Cargo.lock` 的版本一致，`default-features = false`） |
+| 依赖 | `crates/base_ui/Cargo.toml` 的 **build-dependencies**：`image` / `resvg` / `usvg`；workspace 钉 **0.46.0**（`default-features = false`；P5 前选此版本是为与 `gpui-pre` 的锁版本一致，gpui 删除后该钉版保持不变） |
 | 产物 | `OUT_DIR/icons/<stem>-48.png` / `-96.png`（两档覆盖 1×/2×，3× 有 48→96 的余量）+ `OUT_DIR/icons/built.rs`（`IconKind → 路径` 表） |
 | 图标数 | **55**（`kit::icon::IconKind::COUNT = 55`，`ALL: [IconKind; COUNT]` 穷举；枚举文档明写「设计文档写 54，实际 55」） |
 | 确定性 | 固定缩放算法（resvg 解析 AA）+ 固定档位 + 无时间戳；`white matte`：透明像素 RGB **= 255**（否则引擎「先 resize 后预乘」产生最坏 96/255 暗边；110 PNG 全像素校验 + 暗边探针 0/255） |
 | 文字/品牌 | `Brand` 显式尺寸 = **Contain 等比内嵌 + 居中**（旧文档写「拉伸」是事实错误）；品牌 PNG 走 `image 0.25` + 图集 |
 | 引擎边界 | 引擎**不**依赖 `usvg` / `resvg` / `tiny-skia`；`ResourceCache` 只收 PNG / JPEG / WebP（§8.5） |
 
-### 12.6 `KYTRIX_UI_CORE_MANIFEST` 过渡开关（P5 移除）
+### 12.6 `KYTRIX_UI_CORE_MANIFEST` 过渡开关（历史记录；P5-3 `f1ff4944` 已删除）
 
-| 项 | 规格 |
+> **终态（v2.14）**：该环境变量**不存在**。`ui_core/build.rs` 始终编译并链接本仓 PerMonitorV2 清单；`xtask/src/gates.rs` 的注入机制
+> （`links_gpui_pre` / `injects_manifest_switch` / 13 个构造点 / 2 条注入单测）与 `spec-deltas/build-transition.md` 均已删除。
+> 手工跑测试**不再需要**清 env。以下三行是迁移期事实，保留供读历史日志。
+
+| 项 | 规格（迁移期） |
 |---|---|
 | 现象 | 迁移期 `base_ui` / `widgets/*_ui` 仍依赖 `gpui-pre`，其 `gpui.lib` 也带 `RT_MANIFEST` ID 1 ⇒ 同一 exe 两份清单 ⇒ `link.exe CVT1100: duplicate resource. type:MANIFEST, name:1` |
 | 开关 | `crates/ui_core/build.rs` 读环境变量 `KYTRIX_UI_CORE_MANIFEST`：`"0"` ⇒ **只跳过**进程清单的 rc 编译与链接（其他值/未设置 = 不启用）；清单存在性、DPI 锚点、MSVC 与 rerun 校验**一律照旧**；跳过时打 warning |
 | xtask 注入 | `xtask/src/gates.rs` **按命令**注入（不是按 scope）：按 scope 注入会让 `ui_core` 自己丢清单、125% DPI 用例回归（P2-0b 修复 F0） |
-| 移除计划（**P5**） | 删 `ui_core/build.rs` 的开关分支、`xtask/src/gates.rs` 的 `links_gpui_pre` / `injects_manifest_switch` / `stream_command_with_env`，删 `spec-deltas/build-transition.md`，并用 4 条验证命令确认「默认清单链接存在 + 锚点校验通过」 |
-| 契约 | 这是**迁移期过渡开关**，不是产品能力：终态（P5-2 删除 gpui 系后）**不存在**该环境变量 |
+| 移除（**已执行**） | **P5-3**（`f1ff4944`）：删 `ui_core/build.rs` 的开关分支、`xtask/src/gates.rs` 的注入机制、`spec-deltas/build-transition.md`；4 条验证命令确认「默认清单链接存在 + 锚点校验通过」。变异 M2 复现：env=0 时 frameless DPI 用例红 `(464,281) vs (480,320)`，反向证明清单现在恒在 |
+| 契约 | 这是**迁移期过渡开关**，不是产品能力：终态**不存在**该环境变量（`grep -r KYTRIX_UI_CORE_MANIFEST crates xtask` = 0） |
 
-### 12.7 计划修正（P2 期间裁决；权威版本见 `.docs/gui-migration/plan.md` v1.2）
+### 12.7 计划修正（P2 期间裁决；权威版本见 `.docs/gui-migration/plan.md` v1.6）
 
-1. **旧 `base_ui` 模块删除 / `gpui-kit` 移除从 P2-5 推迟到 P5**：旧模块仍被 P3/P4 的消费方（`widgets/*`、`*_ui`、`kytrix`）在
-   迁移期引用，**只有等 P3/P4 迁完才能删**。P2-5 不再承担删除，只做 `gallery` 收尾。
+1. **旧 `base_ui` 模块删除 / `gpui-kit` 移除从 P2-5 推迟到 P5（已执行）**：旧模块在 P3/P4 期间仍被消费方（`widgets/*`、`*_ui`、
+   `kytrix`）引用，**只有等 P3/P4 迁完才能删**；P2-5 因此只做 `gallery` 收尾。删除由 **P5-2**（`6239b84`，37 个模块/目录、
+   25,471 行）与 **P5-3**（`f1ff4944`，`gpui-kit` / `rust-embed` 出 workspace 与 `Cargo.lock`）完成。
 2. **P2-5 = `gallery` + 三端真实验收**：`crates/base_ui/examples/gallery`（ui_core 之上的主题 + 全部组件）作活体证据；
    Windows 真窗口出帧 + Probe 断言，mac/Linux 离屏；`M3` 随该批达成。
 3. **P2 实际批次比 plan v1.1 多**：新增 `P2-0` / `P2-1b3` / `P2-2e` / `P2-4a3` / `P2-4c2` / `P2-4c3` / `P2-4d1b` / `P2-4d2b`
@@ -3781,14 +3833,114 @@ impl App {
 | 三端 | Windows 本机 fast/层末；macOS / Linux 远端 quick + 层末 layer；`timer_smoke` 三端 PASS（Win +415.79 / mac +404.63 / Linux +400.79 ms） |
 | 里程碑 | **M2（base_ui 地基）达成** = P2-1a + P2-1b；**M3** 随 P2-5 `gallery` 合入（`1b65c9d`）达成；真实窗口缺陷修复由 **P2-6**（在途）跟进 |
 
-### 12.10 残余与 P3 入口
+### 12.10 残余与后续入口（迁移后）
 
-- **应用层残余**（除 §11.8 的引擎残余外）：`kit` 侧的 DPI 换档接线（`IconSpec::reselect` / `set_image_resource` 机制已在，事件接线在 P2-4/P2-5）、
-  图标旋转未迁移、`AssetImages` 单消费者契约、`StyleBuilder`/`PaintBuilder` 的圆角·线宽·字体像素阶梯待视觉基线、
-  `kit` 的 `TAB_MAX_WIDTH` / alert 排版 / join 接缝等 9 条 P3 级项（`.review/mig-p2-4a-review.md` §9.5）。
-- **P3 入口**：见 `.docs/gui-migration/plan.md` v1.3 §3 的 P3 表（P3-1 契约层引擎化冻结（本章） → P3-2 `empty` 标杆 + registry 挂载 →
-  P3-3 `widget_registry` + `widget_gallery_ui` → P3-W1…W9 二十个 widget）；规格基线 = 本文 §11（引擎）+ 本章（应用层组件形态与测试装置约定）。
-- **P3 开工前置**：`base_ui` 的 `gallery` 可运行（M3，✅ `1b65c9d` 已达成）、`widget` 契约层的 `WidgetCx` / `AnyWidget` 形状定稿、`on_frame` 单槽的使用约定（§11.12）。
+- **仍存的应用层残余**（除 §11.8 的引擎残余外，全部登记为 P6 后 backlog，不阻断迁移收口）：`kit` 静态文案绑定面
+  （`SelectOptions::label` / `placeholder` / `SelectItem.label`、`Badge` / `Button` label、`Table::set_header_texts`）仍按
+  「删节点 → release → 重建」处理（§13.10、`crates/widgets/AGENTS.md` §15.1/§15.2）；`kit` 层序 `Alert < Popup` 由
+  `market_participants_ui` 本地以 `Band::Dialog` 规避；`kit::list` 无 separator / 无像素 overscan（行数口径）；
+  `kit` dialog 标题与按钮文案是打开期常量；`kit::tooltip` 宽度是构建期选项（P2-10 已补 `max_width`，默认 320）。
+- **已闭合的迁移前置**：`gallery` 可运行（M3，`1b65c9d`）、`widget` 契约层定稿（§13）、`on_frame` 单槽约定（§11.12）；
+  P3/P4/P5/P6 均已按此完成，后续工作见 §14.6 的 backlog 与 `.docs/gui-migration/plan.md` §10。
+- **P3 入口（历史，已执行）**：P3-1 契约层引擎化冻结 → P3-2 `empty` 标杆 + registry 挂载 → P3-3 `widget_registry` +
+  `widget_gallery_ui` → P3-W1…W9 二十个 widget；规格基线 = 本文 §11（引擎）+ §13（契约）+ 本章（应用层组件形态）。
+
+### 12.11 kytrix 应用外壳：组合根、启动时序与页面接线（P4-3 / P4-5 实现后规格）
+
+**落点**：`crates/kytrix/src/**`（21 文件 / 6,224 行 / 80 测试；P4-3 提交 `21030cc`，P4-5 接线 `74e8a05`，P4-3b 修复 `aca1557`）。
+外壳**不持有**引擎能力：所有绘制、布局、输入、a11y、定时器、帧路由都来自 `ui_core` + `base_ui::kit` + `widget` 契约层。
+
+**组合根（`composition.rs`，全进程唯一一次装配）**：
+
+| 装配项 | 终态形状 |
+|---|---|
+| 配置 | `ConfigStore::load_default()` → `ConfigHub`（`Signal<Config>` + commit seam：**persist → publish → 语言投影（`Translate.set_language` + `Signal<LanguageCode>`）→ 外观投影（`ThemeHandle`）→ 全窗口 repaint**；`commits` 计数可观测） |
+| 翻译 / 主题 | `i18n::global::embedded::load()` + `Translate`；`ThemeHandle`（浅/深各一份 64 角色） |
+| 引擎单例 | `Rc<Layer>` + `Rc<FrameRouter>`（**唯一** `App::on_frame` 注册者）+ `Rc<AnimationRouter>`（**唯一** `App::on_animation_complete` 注册者） |
+| 服务聚合 | `WidgetServices::builder(...)`：四个信号（language / config / catalog_generation / reduce_motion）由 builder 铸在同一 scope；`market_participants`、`kytrix_service = Some(spawn(runtime, network, transport))`、`open_url`、`sound` |
+| 注册表 | `catalogue::registry() -> Rc<WidgetRegistry>`（24 条注册，§13.1） |
+| 设置 / 下载 / 更新 | `SettingsStore::new(app, config, commit seam)`；`download_provider::Provider` + `kytrix::downloads::Downloads`（`Signal<Vec<DownloadTask>>`，每帧 `sync`）；`Updater::install` + `UpdateIndicator::mount`（释放顺序 **indicator → updater**） |
+| 账户 | `account::StoredAccounts` 实现 `profile_ui::host::AccountSettings`；标题栏右控制组挂 `ProfileMenu`（每帧 `sync`） |
+| 日志 | `main::install_logging`（`env_logger`，`RUST_LOG` 默认 `info`，stderr + 毫秒时间戳），在 runtime / 组合根之前 |
+
+**启动时序（`main.rs`）**：解析参数（`--acceptance` / `--acceptance-report=` 只在 `feature = "acceptance"` 下存在）→ 安装日志 →
+tokio multi-thread runtime → `App::new(handle)` → `Composition` → `Shell::open`（建窗）→ `Shell::install`（注册**一条**外壳帧路由 +
+启动恢复弹窗）→ `Application::new().run(app)`；启动失败走 stderr + `exit 1`。
+
+**窗口与自绘标题栏（E6 接线）**：`WindowOptions { size 1280×960, min_size 800×600, decorations: Windows = frameless / 其它 Native,
+background = canvas }`；40 px 标题栏 = 左控制组（侧栏 toggle + market participants 菜单宿主）+ **flex 拖拽条** + 右控制组
+（min / max / close + `ProfileMenu` + updater indicator）；每帧由左右控制组实测 bounds 计算并 `Window::set_drag_regions`（变化才写；
+Windows 走 `WM_NCHITTEST → HTCAPTION`，保 Aero Snap / 双击最大化）；最大化图标随 `Window::state().maximized` 重建；macOS 不画按钮、
+由系统交通灯承担（`traffic_light_inset` 78/12）。关闭 → 释放各区 + `unregister(route)` + `close_window`。
+
+**页面接线**：
+
+| 区域 | 形态 |
+|---|---|
+| 侧栏 | 三态（hidden 0 px / icon-only 40 px / full 220 px）+ 行（图标 / 名称 / 活动行改名 + 删除）+ 新增按钮 + 设置入口；模式经 `ConfigHub` 写回 `ui.sidebar`；语言变化按 §13.10 重建 |
+| 页面区 | 工作区 stage ↔ 设置页（`SettingsHost::new(services_rc, SettingsStore)` + `SettingsPage::{mount, sync, dispatch, release}` 每帧 `sync`、`take_write_failure` 上报为 kit alert）；工作区只隐藏不释放（`StylePatch.visible` 信号），离开时释放画廊页 |
+| pane 树 | `PaneTree` 纯拓扑 + 纯几何（分裂分数、min/compact 宽夹紧、分隔条 4 px、每帧只读 stage 实测尺寸）；`Pane` = absolute frame + header slot + body |
+| widget 挂载 | `registry.mount(..., WidgetConfigChange)` 挂 body；`AnyWidget::header(app, Left/Right, ..)` 填两组；快照 `widget.config()`；**换 widget / 关 pane 先 `AnyWidget::release` 再移除**；split/close 只增删自己的 pane（存活 pane 的状态不动）；分隔条拖拽走 `on_drag` + `ActionSource::Drag` → intent → 分数写回 |
+| 画廊页 | `WidgetGallery::mount` + `RegistryCatalogue` 适配器（15 行，`WidgetConfigChange::default()`）；`take_event` → Confirm 应用到 pane 后 release / Cancel 直接 release |
+
+**每帧（外壳路由，单槽）**：`drain_events` 分区 dispatch → intent 队列（控件 / 对话框的唯一写入口）→ 目录世代镜像 →
+titlebar / sidebar / pages / dialogs `sync` → 写失败上报 → dirty 持久化。**外壳与任何组件都不再自注册
+`App::on_frame` / `App::on_animation_complete`**。
+
+**测试装置**：`test_support::Harness` = `ui_core::test_support::TestApp` 真窗口 + 真实 `Composition`（in-memory `ConfigStore`）+
+`Shell::install` 的路由 + `Harness::click`（wrapper → interactive 后代 → `inject(PointerDown/Up)` → `tick` = `router.tick` + `drain`）。
+终态 **80 passed**（P4-3 时点 54 → P4-3b 64 → P4-5 61 → 合并 71 → P6-1 +9 验收用例 = 80）。
+
+### 12.12 验收构建 feature 形状与 `--acceptance` 自检（P6-1 / E25 实现后规格）
+
+**背景（用户裁决 2026-11-23）**：远端 macOS 缺 `libomp`、Linux 缺 `libasound2-dev`（第三方 build script 依赖），全量二进制的
+三端验收不可行 ⇒ 验收改用**验收构建**（关闭 AI / 音频）+ **脚本化自检**（真实窗口跑 `kytrix --acceptance`），不引入运行时开关、
+不改发布形态。规格差异清单 `.docs/gui-migration/spec-deltas/E25.md`。
+
+**kytrix feature 形状（`crates/kytrix/Cargo.toml`，冻结）**：
+
+```toml
+[features]
+default = ["ai", "audio"]
+ai = ["dep:ai_translator"]              # llama.cpp（llama_sys / OpenMP）
+audio = ["widget_registry/audio"]       # rodio -> cpal -> ALSA
+acceptance = ["ui_core/automation", "kytrix_service_provider/test-support"]
+```
+
+- `ai_translation` 是 **build script cfg**（`crates/kytrix/build.rs`）：`ai` feature ∧ ¬Windows ARM64；`translation` / `AiTranslation` /
+  `prediction_translator` / `translation_unload` 两版本按它切换（无引擎 = 明确的 no-op 路径 + 一条 WARN 日志）。
+- **`--acceptance` 不属于发布应用**：参数解析与 `host::start` 都在 `cfg(feature = "acceptance")` 下。**全量二进制传 `--acceptance`
+  会被静默忽略并按普通应用运行**（P6-2 实测 180 s 不退出、无报告）—— 验收命令必须固定成
+  `cargo build -p kytrix --no-default-features --features acceptance` + `kytrix --acceptance`。
+- 依赖树判据（两种构建都验过，Windows 1858 行 / Linux 2048 行树）：`cargo tree -p kytrix --no-default-features --features acceptance`
+  上按词边界 `\b(llama|rodio|alsa|cpal)\b` = **0 命中**；对照全量树命中 `llama_sys` / `rodio` / `cpal`。注意 `aws-lc-sys`（rustls）
+  仍在树内 ⇒ 三端首次构建都需要 **cmake + perl + C 编译器**（mac `~/bin/cmake` 3.31.7 / Linux `~/bin/cmake` 3.31.6，用户级安装）。
+
+**引擎 `automation` feature（E25，**生产可见**，与 `test-support` 无关）**：`crates/ui_core/src/app/automation.rs` + 4 个 `App` 方法
+（`#[cfg(feature = "automation")]`，薄委托）：
+
+```rust
+pub fn inject_input(&mut self, window: WindowId, event: InputEvent) -> InputOutcome;  // 与平台泵同一条 dispatch_input 路径
+pub fn frame_index(&self, window: WindowId) -> Option<FrameIndex>;                   // 最近一次**提交**的帧；None = 窗口不存在
+pub fn painted_primitives(&self, window: WindowId) -> usize;                         // 场景图元数（最近一帧画了什么；跨帧保留）
+pub fn texts(&self, window: WindowId) -> Vec<SmolStr>;                               // 树序文本载荷快照
+```
+
+语义边界：注入**可能**请求帧（指针改 hover / 焦点、按键触发动作，属输入路径本身语义）；三个读取面**都不请求帧**（I3）；
+不新增 `Primitive` 变体、不新增失效边、不参与布局 / 绘制。6 条引擎用例（`automation_tests`）钉住：注入走平台路径且只命中一次、
+读取不改 `frame_requests`、`frame_index` = 提交游标、图元计数 = `Scene::primitive_count`、`texts` 树序、已关窗口读空且注入空回执。
+
+**脚本（`crates/kytrix/src/acceptance/`：`mod/options/script/report/host/tests`）**：7 步 = `startup.frames`（等 3 帧提交）→
+`painted`（图元数 ≥ 地板 + 文本数）→ `pointer.move` → `language`（`ZhCn → En`，文本节点数与 `Settings` 绘制）→ `theme`
+（dark → light：quad fill 变化 + 偏好落 Light）→ `scroll` → `pointer.click`（侧栏 Full → Hidden，2 帧内生效）。
+- **驱动**：由 E10 定时器链（`App::after(4ms)`）逐 tick 驱动，**不是**帧 route（帧请求的唤醒会被发起请求的同一轮消费 ⇒ 帧 route 实测
+  卡在 frame 2/3）；tick 内按已提交帧节流请求重绘。
+- **报告**：`kytrix acceptance (P6-1)` / `window <id>: <N> committed frame(s), <s> s` / 每步 `PASS|FAIL <name>: <detail>` /
+  `RESULT: ...`；**失败不 panic**（步骤名 + 观测值），`Application::run` 后写报告并返回退出码 0/1；预算 20,000 泵轮次 / 90 s。
+- **验收组合根**：`Composition::for_acceptance` = 内存设置 + signed-out 会话（不落盘、不碰 keyring）；`acceptance` feature 因此打开
+  `kytrix_service_provider/test-support`（signed-out 构造器），只存在于验收 binary。
+- **headless rehearsal**：`acceptance::tests` 与真实窗口**共用同一个 `Script::tick`**（9 条测试：7 步全过、写入经 commit seam 落盘、
+  先关窗即失败、报告路径、参数解析、报告渲染）。
 
 ---
 
@@ -4328,10 +4480,11 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 - **断言面**：`Probe`（存在/布局盒/命中）+ `FrameRecord`（帧/图元/画布内容，§6.3）+ `WidgetTestApp`（状态/可见性/文本/内联盒/节点数/
   `a11y_hidden`/`frame_index`/`frame_requests`/`rendered`/`paint_entries`/`canvas_primitives`/`canvas_handle`）。
   `TestApp::drain` 返回的 `&FrameRecord` 需 clone 或先作用域化再用。
-- **复跑前提**：`cargo test -p widget` 必须带 `KYTRIX_UI_CORE_MANIFEST=0`（过渡开关，`spec-deltas/build-transition.md`；
-  P5 删除）。不带时本机稳定 `CVT1100 / LNK1123` 链接失败：`gpui` 自带 `RT_MANIFEST`，`ui_core/build.rs` 也链一份。
-- 旧 GPUI 测试的去向逐条登记在 `.docs/gui-migration/test-ledger/p3-1.md`。
-- **契约层单测覆盖**（P3-1i 实测 **177 passed**；逐项给测试名，不再按模块笼统声明）：
+- **复跑前提（终态）**：`cargo test -p widget` **不需要任何环境变量**（终态 **183 passed**）。迁移期曾必须带
+  `KYTRIX_UI_CORE_MANIFEST=0`，否则本机稳定 `CVT1100 / LNK1123` 链接失败（`gpui` 自带 `RT_MANIFEST`、`ui_core/build.rs` 也链一份）；
+  该开关与 gpui 全族已由 **P5-3**（`f1ff4944`）删除（§12.6）；旧 GPUI 测试的去向逐条登记在
+  `.docs/gui-migration/test-ledger/p3-1.md`。
+- **契约层单测覆盖**（P3-1i 实测 **177 passed**，P3-1j 后 **183 passed**；逐项给测试名，不再按模块笼统声明）：
   - **状态**：5 变体与六行真值表 6 case（`the_six_rows_of_the_presentation_table`）；去重 = `App::write` 等值短路
     （`repeating_a_state_should_not_be_a_write`）；**状态写入 → 出帧**（`reporting_a_state_requests_the_presenting_frame`）；
     **富文本判定按解析后的目录值**（P3-1d：`a_notice_is_rich_exactly_when_its_catalogue_value_carries_markup`）。
@@ -4415,10 +4568,10 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 
 | # | 项 | 说明 |
 |---|---|---|
-| R-1 | `WidgetServices::{market_participants, kytrix_service}` 为 `Option` | 两者都是 application-shell 对象：`MarketParticipantsConnector` 的构造需 `widget_tokio_runtime::Runtime`，`KytrixServiceConnector::install` 需工具包 `App` + `ConfigNotification`，两个 crate 都仍依赖 `gpui-kit`，契约层测试无法在零工具包上下文构造。组合根永远给 `Some`；读市场的 widget 在 `None` 时映射为业务 notice/failure，读服务的 widget 映射为业务 failure。**需裁决**：P4 给两个 connector 增 gpui-free fixture 缝后改回必填 |
+| R-1 | `WidgetServices::{market_participants, kytrix_service}` 为 `Option` | 两者都是 application-shell 对象，契约层测试无法在零工具包上下文构造（P3 时点两个 crate 仍依赖 `gpui-kit`）。**P4-5 已补 gpui-free 缝**：`KytrixServiceConnector::spawn(runtime, network, transport)`（+ `test-support` 的 `spawn_signed_out`）、`MarketParticipantsConnectorInput::new(transport, ConfigNotification<…>).with_runtime(Runtime::from_handle(handle))`，P5-1 后统一收 `tokio::runtime::Handle`；组合根恒给 `Some`。**`Option` 形状保留**（headless 需要「没有这个协作者」的缺席语义，P6-1 验收构建亦用 signed-out 构造器）；读市场的 widget 在 `None` 时映射为业务 notice/failure，读服务的 widget 映射为业务 failure。**已关闭**（原「需裁决」项由 P4-5 落地） |
 | R-2 | `WidgetServices` 形状相对 P3-0 变更 | `config: ConfigManager` → `Signal<Config>`（P3-0 R4 已预告）；新增 `theme`（P3-1）、`kytrix_service`/`open_url`/`sound`/`reduce_motion`（P3-1b）与 `catalog_generation`（P3-1c）；见 design-changes。P3-0 的 5 字段不复存在 |
 | R-3 | 正文一次建树 | 引擎无 `.cached()`；widget 若按帧重建 body 会破坏节点身份/依赖边。20 crate 迁移时以此为准。`WidgetView::sync` 里才「有内容」的 body 晚一帧出现（framework 在 sync 前采样 `has_content`），widget 自行 `request_frame` |
-| R-4 | notice 的 markdown 文案 | **P3-1b/P3-1d 已收口**：`Notice::is_markdown(&Translate)` 对**解析后的目录值**判定（HTML 标签 / markdown 链接、图片 / 强调 / 行内代码），任意文案来源（`MarketNotLoaded` 与 `Message` 皆可）命中即由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），纯文本 notice 仍由 `kit::empty_state` 画一句。**残余（P3-1c 裁决：登记为资产批次事项，不阻塞 W1）**：行内图片的绘制是占位色块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路属资产批次（P4/P5），不影响文字与 kbd 的正确呈现；**W1 真窗口验收不据此判缺陷** |
+| R-4 | notice 的 markdown 文案 | **P3-1b/P3-1d 已收口**：`Notice::is_markdown(&Translate)` 对**解析后的目录值**判定（HTML 标签 / markdown 链接、图片 / 强调 / 行内代码），任意文案来源（`MarketNotLoaded` 与 `Message` 皆可）命中即由 `kit::markdown` 的 `MarkdownNode` 画成节点树（段落对齐 / `<kbd>` / 行内 logo 是 inline box），纯文本 notice 仍由 `kit::empty_state` 画一句。**残余（P3-1c 裁决，P6 后仍在）**：行内图片的绘制是占位色块（`PlaceholderImagePaint`）——富文本图片的 `ResourceCache` 通路未接，归 **P6 后资产批 backlog（§14.6）**，不影响文字与 kbd 的正确呈现；**W1 与 P6 真窗口验收均不据此判缺陷** |
 | R-5 | `AnyWidget` 内部唯一 downcast | 类型擦除在 vtable 单态化函数内部完成，公开面无 downcast/trait object；安全由 mount 时同一 `W` 填充保证 |
 | R-6 | a11y 角色 | 引擎 `A11yRole` 无 `Alert`；banner 用 `GenericContainer` + `A11yLive::Assertive` 表达告警语义 |
 | R-7 | P3-1b 对 P3-1 冻结面的增量 | 相对 `2e4d3d6` 的必须变更（W1 开工前收口）：`WidgetCx::config` → `config_ref`（不克隆；`Arc<Config>` 出口删除）、新增 `account`/`window_mut`/`set_canvas`；`WidgetServices` 6 → 10 字段；`Notice::is_markdown`；`FrameRouter::new/install` → `Result`；引擎新增 `App::frame_hook_installed` 与 `EngineError::FrameHookInstalled`；`WidgetTestApp` 新增 `with_translate`/`try_mount`/`tree`/`a11y_hidden` 等并删除假 `recovery_action`。P3-1b 之前没有下游代码（W 批未开工），故不构成迁移负担，登记于 design-changes §13 |
@@ -4537,6 +4690,148 @@ an_internally_numbered_call_continues_the_reserved_sequence}`；五个 W 批 wid
 「mount/release 反复 N 轮后 `slots` / `live` 不增长」是组件 / widget 释放的泄漏断言（W2c-R9）；`widget::test_support::tests::
 releasing_a_widget_reclaims_every_value_slot` 是写法样例，`AnyWidget` recovery→load 的端到端测试见
 `widget::any::tests::the_recovery_control_runs_the_widget_load_again`（F6）。
+
+## 14. 迁移收口（P6-5，2026-11-23）
+
+> **结论**：GPUI-Kit / GPUI 全家桶已被本仓自研 GUI 引擎**完全替换**。`gui-engine-migration` 分支 HEAD **`752d653`**
+> （P0–P6 全部完成；P6-1 验收构建合并 `1324430c`），三端（Windows / macOS / Linux）真机跑通**验收构建 + `--acceptance`
+> 7 步自检**。本章是终态事实的汇总；逐条细节见 `.docs/gui-migration/final-report.md`、`plan.md` v1.6、`ledger.md` P6 收口章。
+
+### 14.1 单引擎分层与依赖方向（终态）
+
+```
+kytrix（外壳）         widget_gallery_ui        market_participants_ui / profile_ui / updater_ui /
+                                                instrument_selector_ui / settings_ui
+        │                       │                                   │
+        └──────────────┬────────┴───────────────┬───────────────────┘
+                       ▼                        ▼
+         widget_registry（24 条注册，唯一装配口）   widget（契约层：WidgetView / WidgetCx / AnyWidget /
+                                                 WidgetStatus / WidgetSurface / FrameRouter / WidgetBinding /
+                                                 WidgetServices / TranslatedError / WidgetTestApp）
+                       │                        │
+                       └───────────┬────────────┴──────────┐
+                                   ▼                       ▼
+                    base_ui（设计系统：theme/ 64 角色 · kit/ 33 组件族 · style_builder 35+6 · build.rs 55 图标）
+                                   │
+                                   ▼
+                    ui_core（引擎：app/window/layout/text/paint/geometry/render×3/a11y/platform；
+                              features: test-support / hud / automation）
+```
+
+- **单向依赖**：上层只见下层；`base_ui` **只见引擎类型**（I9）；`widget` 只见 `ui_core` + `base_ui::{kit,theme,style_builder}` + `i18n`；
+  `*_ui` / `kytrix` 只见三者 + 业务服务 crate。`pub trait` 全仓仍为 **0**（组件用五段式约定，不用 trait）。
+- **workspace**：**42 个成员**（基线 43，`widget_tokio_runtime` 已删）；`crates/` 下 **23 个顶层目录**（含 `widgets/`，其下 **20 个 widget crate**）。
+- **零 gpui（判据与实测）**：
+  - `Cargo.lock`：**760 包**（迁移前 1,136；`name = "gpui*"` **36 → 0**，`wgpu` / `x11rb` / `winit` 亦 **0**）；根 `Cargo.toml` 无
+    `gpui-kit`、无 `rust-embed`。
+  - `cargo tree -p kytrix -e normal` / `-p base_ui` / workspace：**0 行 gpui**（P5-2 起 `base_ui` 首批树级 0；P5-3 全仓 0）。
+  - `crates/**` 的 `*.rs` / `*.toml`：仅 **11 条文档注释**把 GPUI 作为设计先例/对照提及（如「与 GPUI 的 borrow guard 同思路」），
+    **无 import、无依赖、无工具包 API**。
+  - `KYTRIX_UI_CORE_MANIFEST` 环境变量、`widget_tokio_runtime` crate、旧 `base_ui` 顶层模块（37 个模块/目录 25,471 行）**均不存在**。
+- **唯一外部 GUI 相关依赖**：平台原生 `windows` / `objc2`+`metal`+`accesskit_macos` / `wayland-*`+`vulkan`、文本 `parley`/`swash`、
+  布局 `taffy`、a11y `accesskit*`、三角化 `lyon`（只有 20 widget 用）、构建期 `resvg`/`usvg`/`image`（只 base_ui 用）。
+
+### 14.2 应用层最终形态
+
+组合根、启动时序、自绘标题栏、侧栏/页面/pane/画廊接线与每帧顺序见 **§12.11**；验收构建 feature 形状与 `--acceptance` 自检见 **§12.12**。
+一句话概括：**`ui_core` 提供全部 GUI 能力，`base_ui` 提供设计系统，`widget` 冻结契约，`kytrix` 只做装配与产品逻辑**；
+整个应用只有 **一条** `App::on_frame` 注册者（组合根的 `Rc<FrameRouter>`）与 **一条** `App::on_animation_complete` 注册者
+（`Rc<AnimationRouter>`）。
+
+### 14.3 验收构建 feature 形状（终态）
+
+| 构建 | 命令 | 产物（Windows x64） | 用途 |
+|---|---|---|---|
+| 发布默认 | `cargo build -p kytrix` | 289,893,376 B | 产品形态：`ai` + `audio`（llama.cpp 翻译 + rodio 音效） |
+| 纯验收 | `cargo build -p kytrix --no-default-features --features acceptance` | **121,204,224 B** | 三端验收：无 `llama`/`rodio`/`alsa`/`cpal`（`aws-lc-sys` 仍在，需 cmake） |
+| 全量+自检 | `cargo build -p kytrix --features acceptance` | 290,004,480 B | 覆盖「全量 + 自检」组合（P6-2 追加验证，7/7 PASS） |
+
+- `acceptance` feature = `ui_core/automation` + `kytrix_service_provider/test-support`；`--acceptance` 只在该 feature 下存在，
+  **不属于发布应用的运行时模式**（对默认二进制传参会被静默忽略）。
+- 依赖树判据：`cargo tree -p kytrix --no-default-features --features acceptance` 按词边界 `\b(llama|rodio|alsa|cpal)\b` = **0 命中**。
+
+### 14.4 三端验收方式与结论（P6-2 / P6-3 / P6-4）
+
+统一方式：**验收构建 + `kytrix --acceptance --acceptance-report=<路径>`**，判据 = 退出码 **0** + 报告 `RESULT: PASS (7 steps)`；
+报告由脚本逐步写（步骤名 + 观测值），失败即写下失败步骤名并关窗、退出码 1。
+
+| 端 | 主机 / 渲染 | 构建 | 结果 | 真窗口证据 | 证据目录 |
+|---|---|---|---|---|---|
+| **Windows**（P6-2） | Win11 10.0.26300 / RTX 5080 D3D12 | 验收构建 77.0 s、全量+acceptance 67.7 s，均 exit 0 | 两种二进制各 **7/7 PASS**（14 committed frames，报告内 0.61 s / 0.65 s；193 primitives / 4 texts）（**1**） | 两张 1600×1200 截图（非空白、深色壳 + 自绘标题栏 + 侧栏 + 空工作区提示）；窗口标题 `Kytrix`；优雅关闭 0.08 s、退出码 0、无残留 | `.review/p6-2-*`、`p6-win-*` |
+| **macOS**（P6-3） | macOS 15.8.3 / Intel x86_64 / Metal | 验收构建 4m01s、exit 0（1 条 `unused_mut` warning，已在 `752d653` 修）（**2**） | **10/10** 运行 exit 0、**10/10** `RESULT: PASS (7 steps)`（10–12 committed frames，0.33–1.73 s；190 primitives / 4 texts） | `CGWindowList`：`WIN id=283 pid=… layer=0 alpha=1.00 bounds=1280x960+80+42 owner=kytrix`，运行期位于 window list 最前；菜单栏切到 `kytrix`（`p6-mac-shot-3.jpg`）。**截图不作为像素证据**（TCC 限制，**3**） | `.review/p6-mac-*` |
+| **Linux**（P6-4） | Ubuntu 26.04 / VMware 2 核 / GNOME Wayland / llvmpipe（无硬件 Vulkan） | 验收构建 5m03s、exit 0（1 条既有 `unused_mut` warning，已在 `752d653` 修）（**2**） | 首次 **7/7 PASS** + 追加 3 次重复 = **4/4** exit 0、7/7 PASS（9 committed frames，0.49–0.68 s；193 primitives / 4 texts） | **真窗口实证 = Vulkan 交换链**：`extent=(1280,960) format=B8G8R8A8_SRGB present_mode=MAILBOX composite_alpha=OPAQUE images=4` + `wayland_surface=true` + 逐 tick/逐步骤日志 + `PASSED`；**无截图**（Mutter 无 `wlr-screencopy`、D-Bus/portal 截图被拒、装工具需 sudo，**4**） | `.review/p6-linux-*` |
+
+注：
+1. Windows 全量二进制传 `--acceptance` 的第一轮 180 s 未退出，是**参数被编译掉**（按普通应用运行），不是 hang / 崩溃；随后用
+   `--features acceptance` 的第三种构建覆盖该组合并通过。
+2. 两条 warning 都是既有 `open_url` 分支的多余 `mut`（macOS / Linux 各一条，Windows 分支需要），已由 `752d653` 修掉；
+   `clippy -D warnings` 在两端不再因此变红（本批未复跑 clippy，按 lint 级别判定，标记为**未验证**于 §14.6）。
+3. macOS 截图为 TCC 限制：ssh 会话发起的 `screencapture` 只拿到壁纸 + 菜单栏（P2 的 `p2-6b-mac-gallery.png` 同现象），
+   `screencapture -l` 报 `could not create image from window`；`CGWindowListCreateImage` 在 macOS 15 SDK 已 obsolete。
+   故以「退出码 + 报告 + 窗口登记/激活」为证。
+4. Linux 四条截图路径（grim / `org.gnome.Shell.Screenshot` / portal / 现成工具）全部封死，`apt install` 需 sudo 密码；
+   真窗口性由交换链与帧提交记录承担（比静态截图更难伪造）。
+
+### 14.5 质量数据（终态）
+
+| 项 | 数字 | 来源 |
+|---|---|---|
+| `cargo test --workspace`（默认特性） | **8,581 passed / 0 failed / 36 ignored**（102 个测试二进制） | `.review/mig-p6-1-test-workspace.log`（P6-1 合并后；P5-3 时 8,556） |
+| `ui_core --lib`（`--features hud,test-support`） | **2,305 passed / 1 ignored**；`--test snapshot` **11 passed**，42 张 golden（3 平台 × 14）零 diff | `.review/mig-e24-g3-test.log`、E24 / P3-1j 台账 |
+| `ui_core` 自动化面 | **6** 条（`automation` feature，不依赖 test-support） | `test-ledger/p6-1.md` §2 |
+| `base_ui --lib` | **772**（kit 715 / theme 49 / style_builder 8；P2 时点 1,139，P5-2 随旧模块删 −367） | `test-ledger/p5-2.md` |
+| `widget` 契约层 | **183**（P3-1 起点 131） | §13.8 |
+| `widget_registry` / `widget_gallery_ui` | **28** / **33** | `test-ledger/p3-3a.md` / `p3-3b.md` |
+| 20 个 widget crate | 8（`empty`）… **353**（`candlestick`）；合计 **2,644** | `test-ledger/*.md`、`mig-p6-1-test-workspace.log` |
+| 五个 `*_ui`（+ `widget_gallery_ui` 归 P3-3） | settings **233** / profile **88** / instrument_selector **86** / updater **72+1** / market_participants **22**（合计 **502**；`widget_gallery_ui` **33** 另计） | 同上 |
+| `kytrix` | **80**（P4-3 起点 54；+9 验收用例） | P6-1 §4、`test-ledger/p6-1.md` |
+| 变异测试 | 台账逐条登记 `变异 N/N` 片段 **100 处**、累计 **470** 项（机械统计；含跨批复述，未见「变异未红」记录） | `ledger.md` + `test-ledger/*.md` 正则统计 |
+| 独立审查报告 | **62** 份（`.review/mig-*-review*.md`，P0–P6 全覆盖；含多轮复核：P0-1 3 轮、P0-2 2 轮、P1-E1 4 轮、P2-3 3 轮等） | `.review/` 文件清单 + `ledger.md` §3 审查列 |
+
+### 14.6 已知限制与 P6 后 backlog
+
+**验收限制**（不阻断迁移收口）：
+1. **macOS / Linux 无像素截图**（TCC / Wayland 合成器限制，§14.4 注 3/4）⇒ 真窗口证据为退出码 + 报告 + 窗口登记 / 交换链日志。
+2. **ulimit / DPI**：三端验收都在默认 DPI、默认窗口尺寸（1280×960）；100% / 150% / 200% / 混合 DPI 仍只有纯函数覆盖（§11.8 R-13）。
+3. **Linux 只覆盖 CPU 渲染**（llvmpipe，无硬件 Vulkan）；Windows 只有 D3D12（RTX 5080）；macOS 只有 Metal（Intel 集显）。
+4. **验收是注入式输入的进程内自检**（引擎 `automation` 面走 `dispatch_input`），不是合成器级输入注入；Wayland 的输入注入限制不影响该方式，
+   但「OS 层真实鼠标/键盘」路径仍由 P1 的 `gui_smoke` 与真机手工验收覆盖。
+5. 本批未复跑 `clippy -D warnings`（两端 warning 已按 lint 级别修掉，**未验证**）；`cargo test --workspace` 与三端验收构建均已实跑。
+
+**功能 / 设计 backlog**（按优先级；均**未实现**，不得当作已交付能力引用）：
+1. **`kit` 静态文案绑定面**：`SelectOptions::label` / `placeholder` / `SelectItem.label`、`Badge` / `Button` label、`Table::set_header_texts`
+   缺失 ⇒ 语言切换仍「删节点 → release → 重建」（§12.10、§13.10、`crates/widgets/AGENTS.md` §15.1/§15.2）；`kit` 层序
+   `Alert < Popup` 由 `market_participants_ui` 以 `Band::Dialog` 本地规避。
+2. **图表抗锯齿**：自绘折线/条带（`perpetual_statistics` D3、`prediction_market` G3、`global_shipping_chokepoint` ⑤、`candlestick` 折线）
+   走 `GeometryPipeline::Ui`（coverage = −1，硬边），无 AA feather；需引擎侧 coverage/AA 通道（新引擎扩展，未编号）。
+3. **E22 双向滚动容器**：`grid` 横向滚动 + 内容居中未实现，当前是单轴降级（窄面板换行、无横滚）；规格草稿
+   `.docs/gui-migration/spec-deltas/E22.md`（**已登记、未实现**）。
+4. **富文本行内图片**：`PlaceholderImagePaint` 占位色块，`ResourceCache` 通路未接（§13.9 R-4 残余，归资产批）。
+5. **`P3-1i` 残余**：`RequestId` + `Pending` 归因是冻结写法，20 widget 已按此实现；但 `call_with_timeout` 入口在 widget 侧无消费方、
+   跨 crate 的归因对账未做（**未验证**，见 §13.12 与 `ledger.md`）。
+6. **§11.8 已接受残余**：R-11 wrap、R-12 图片 tile 判活、R-13 DPI 矩阵、R-14 Win11 Snap Layouts `HTMAXBUTTON`、R-15 Windows 全屏、
+   R-19 裸 `unload`、R-20 图片 padding、R-21 应用侧卸载清理（引擎下沉未做）、R-22 Canvas 不受组不透明度、R-23 无隔离组、
+   R-24 阴影边界、R-25 a11y 表格接口、R-26 定时器平台边界（④ 无三端自动化回归）、R-27 浮层非目标、R-28 `set_a11y_patch` 作用域、
+   R-29 集合根 D9–D12（D12 的 `pos_in_set`/`size_of_set` 摘要仍缺）。
+7. **窗口状态持久化**：窗口位置/大小未持久化（`WindowOptions.position` 与 `Event::Moved` 可接）；日志 sink 已在 P4-5 补上（`env_logger`）。
+8. **资产与音效**：`assets/sounds/news_notification.wav` 未接线（音效在引擎外）；品牌 logo 浅色变体（G7）未补。
+9. **验收基础设施**：macOS 需给 sshd / helper 授屏幕录制权限才能拍 GUI 窗口；Linux 需 sudo 装 `gnome-screenshot` 或换 wlroots 会话；
+   远端共享 target 体积（mac 34 G / Linux 23 G 可用）需定期清理。
+
+### 14.7 证据索引
+
+| 类型 | 路径 |
+|---|---|
+| 三端证据逐文件清单（路径 + 一句话说明 + 结果） | `.docs/gui-migration/acceptance-evidence.md` |
+| 迁移最终报告（背景/方法/阶段成果/质量数据/经验教训） | `.docs/gui-migration/final-report.md` |
+| 完整台账（Lead 唯一权威，append-only） | `.docs/gui-migration/ledger.md`（P6 收口章） |
+| 执行计划 v1.6（P0–P6 完成标 + 后续 backlog） | `.docs/gui-migration/plan.md` |
+| 设计回写记录（逐条 delta → 章节 → 源码证据） | `.docs/gui-migration/design-changes.md` §23 |
+| 各批测试折算台账（逐条旧→新） | `.docs/gui-migration/test-ledger/*.md`（含 `p6-1`…`p6-4`） |
+| 引擎规格差异（E1–E25） | `.docs/gui-migration/spec-deltas/*.md` |
+| 原始日志/截图（gitignored，本机） | `.review/`（`mig-p6-1-*` / `p6-2-*` / `p6-mac-*` / `p6-linux-*`） |
+
+---
 
 ## 附录 A：核心接口草图汇总（v2.3 起与 `crates/ui_core/src` 对齐）
 
@@ -4733,4 +5028,4 @@ pub struct OverlayOptions { /* …, pub trap_focus: bool, pub a11y: A11yOverride
 > 坐标全为**绝对窗口逻辑像素**（`GeometryDraw.transform` 是唯一 per-primitive 变换）；`Primitive` 实测 `size_of == 80` B（软上限 128 B）。
 ---
 
-*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.12**，2026-11-22；P3-1 契约层 §13 冻结 + P3-1b 契约扩槽/修复 + P3-1c 目录世代与收尾 + P3-1d 上下文/宿主补缝 + P3-1e 组合根三单例 + P3-1f 服务句柄/静态文案通法 + P3-1g 测试时钟 + P3-1h 每实例组件 key + P3-1i RPC 回复归因）；已实现部分与 `crates/ui_core/src` 对齐，**E1–E15（§11）已全部实现**，**P2 应用层（§12）已实现**（P2-5 `gallery` 已合入 `1b65c9d`；真实窗口缺陷修复批次 P2-6 在途）；E2b 候选（§11.2）与已接受残余（§11.8）明确标注为未实现/限制，不得当作已交付能力。*
+*文档完 · 本文描述 D1–D25 定案下的最终设计（**v2.14**，2026-11-23；**迁移完成归档**：引擎 §11（E1–E15，含 E21/E23/E24 观测面与 E25 验收面）、widget 契约层 §13、应用层 §12、迁移收口 §14；P0–P6 全部完成，`gui-engine-migration@752d653`，三端验收见 `.docs/gui-migration/final-report.md` 与 `acceptance-evidence.md`）。已实现部分与 `crates/ui_core/src` 对齐；**E22 未实现**（§14.6 backlog），E2b 候选（§11.2）与已接受残余（§11.8 / §13.9）明确标注为未实现 / 限制，不得当作已交付能力引用。*
