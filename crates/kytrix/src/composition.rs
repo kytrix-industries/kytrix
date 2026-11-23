@@ -315,7 +315,7 @@ enum Accounts {
     /// The real OAuth session (the keyring credential store).
     Production,
     /// The signed-out in-memory session a headless host runs over.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "acceptance"))]
     SignedOut,
 }
 
@@ -376,6 +376,27 @@ impl Composition {
         recovery: Option<ConfigRecovery>,
     ) -> Result<Rc<Self>, InitializationError> {
         Self::build(app, runtime, store, recovery, Accounts::SignedOut)
+    }
+
+    /// Builds the acceptance self-check's application.
+    ///
+    /// The acceptance run drives a real window, but it must not read or write the user's
+    /// settings file and must not touch the keyring: the run switches the language and the
+    /// appearance as part of its steps, so it runs over a fresh in-memory installation and
+    /// the signed-out session. Everything else — the catalogue, the registries, the shell —
+    /// is the production build's.
+    #[cfg(feature = "acceptance")]
+    pub(crate) fn for_acceptance(
+        app: &mut App,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Rc<Self>, InitializationError> {
+        Self::build(
+            app,
+            runtime,
+            ConfigStore::in_memory(Config::default()),
+            None,
+            Accounts::SignedOut,
+        )
     }
 
     /// Builds every collaborator, in dependency order.
@@ -593,7 +614,7 @@ fn spawn_connector(
 ) -> Result<Arc<KytrixServiceConnector>, InitializationError> {
     let connector = match accounts {
         Accounts::Production => KytrixServiceConnector::spawn(runtime.clone(), network, transport)?,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "acceptance"))]
         Accounts::SignedOut => {
             KytrixServiceConnector::spawn_signed_out(runtime.clone(), network, transport)?
         }
@@ -604,9 +625,10 @@ fn spawn_connector(
 
 /// The prediction-event dialog's translation engine of this build.
 ///
-/// Windows ARM64 has no llama.cpp build, so there the dialog runs without a translator and
-/// reports it cannot translate; every other target gets the local model adapter.
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+/// The engine is in the build when the `ai` feature is on and the target has a llama.cpp
+/// build in this workspace (Windows ARM64 has none). A build without it — the acceptance
+/// build — runs the dialog without a translator and reports it cannot translate.
+#[cfg(ai_translation)]
 fn prediction_translator(
     config: &Config,
 ) -> Option<std::sync::Arc<dyn instrument_selector_ui::prediction_translation::LocalTranslator>> {
@@ -619,7 +641,8 @@ fn prediction_translator(
     }
 }
 
-#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+/// A build without the local translation engine: the dialog reports it cannot translate.
+#[cfg(not(ai_translation))]
 fn prediction_translator(
     _config: &Config,
 ) -> Option<std::sync::Arc<dyn instrument_selector_ui::prediction_translation::LocalTranslator>> {

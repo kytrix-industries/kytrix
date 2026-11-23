@@ -4,6 +4,12 @@ version.workspace = true
 publish.workspace = true
 edition.workspace = true
 
+[features]
+# The notification sound backend the news widget plays through. The application decides
+# whether its build has audio; the default keeps the full build full.
+default = ["audio"]
+audio = ["news/audio"]
+
 [dependencies]
 app_config = { workspace = true }
 smol_str = { workspace = true }

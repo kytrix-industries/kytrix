@@ -98,13 +98,15 @@ use widget::{
     view::{HeaderGroup, ReloadHandle, WidgetView},
 };
 
+#[cfg(feature = "audio")]
+use super::sound::{NOTIFICATION_CLIP, SoundPlayer};
 use super::{
     model::{MAX_NEWS_ITEMS, NewsCategory, NewsSnapshot, has_new_news, unshown},
     service::{
         NewsProtocol, NewsRequest, NewsScope, NewsService, NewsSource, NewsStatus, NewsStreamError,
         NewsStreamMessage,
     },
-    sound::{NOTIFICATION_CLIP, NotificationSound, SilentSound, SoundPlayer, Throttle},
+    sound::{NotificationSound, SilentSound, Throttle},
 };
 
 /// The height a row is estimated at until the list has measured one.
@@ -1036,11 +1038,22 @@ fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineErro
 }
 
 /// The sound a host hands over: the clip's bytes, or a silent sound when it has none.
+///
+/// A build without the `audio` feature has no backend to hand a clip to (the acceptance
+/// build runs on a Linux host without ALSA): it is a silent host for every clip.
+#[cfg(feature = "audio")]
 fn notification_sound(services: &WidgetServices) -> Box<dyn NotificationSound> {
     match (services.sound)(NOTIFICATION_CLIP) {
         Some(clip) => Box::new(SoundPlayer::new(clip)),
         None => Box::new(SilentSound),
     }
+}
+
+/// The sound of a build without an audio backend: the pane still gets a real
+/// implementation, it just never has a clip to be heard.
+#[cfg(not(feature = "audio"))]
+fn notification_sound(_services: &WidgetServices) -> Box<dyn NotificationSound> {
+    Box::new(SilentSound)
 }
 
 /// The recovery an account without news access is offered.

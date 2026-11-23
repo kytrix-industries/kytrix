@@ -4,6 +4,12 @@ version.workspace = true
 publish.workspace = true
 edition.workspace = true
 
+[features]
+# The notification sound backend (`rodio` -> `cpal` -> ALSA on Linux). Off for the
+# acceptance build, whose Linux host has no `libasound2-dev`; everything above the
+# device (the seam, the throttle, the silent host) stays compiled either way.
+audio = ["dep:rodio"]
+
 [dependencies]
 app_config = { workspace = true }
 base_ui = { workspace = true }
@@ -12,7 +18,7 @@ i18n = { workspace = true }
 kytrix_service_provider = { workspace = true }
 log = { workspace = true }
 network = { workspace = true }
-rodio = { workspace = true, features = ["playback", "hound"] }
+rodio = { workspace = true, features = ["playback", "hound"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
 time = { workspace = true }

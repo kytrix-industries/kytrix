@@ -8,6 +8,8 @@
 
 mod a11y;
 mod animation;
+#[cfg(feature = "automation")]
+mod automation;
 #[cfg(feature = "hud")]
 mod debug;
 mod event_queue;
@@ -3221,6 +3223,56 @@ impl App {
     pub(crate) fn eval_stack_is_empty_for_test(&self) -> bool {
         signal_api::eval_stack_is_empty_for_test(self)
     }
+
+    // ── automation：生产可见的注入 / 观测面（P6-1 / E25）──────────────────────
+    //
+    // 这一组方法属于 `automation` feature：给真实窗口的脚本化自检（kytrix
+    // `--acceptance`）一个注入输入、读取绘制结果的面。它不是测试基建（`test-support`
+    // 不进发布物），也不改变任何引擎语义：注入走与平台泵相同的 `dispatch_input`，
+    // 读取只读已有状态。
+
+    /// 注入一次输入事件（与平台泵同一条 [`App::dispatch_input`] 路径，回执即返回值）。
+    ///
+    /// 注入**可能**请求帧（指针改变 hover / 焦点、按键触发动作时），这是输入路径本身的
+    /// 语义；不需要重绘的注入（例如指针在空白处移动）不产生帧。
+    ///
+    /// I3 只约束读取面：[`Self::frame_index`] / [`Self::painted_primitives`] /
+    /// [`Self::texts`] 都不请求帧。
+    #[cfg(feature = "automation")]
+    pub fn inject_input(
+        &mut self,
+        window: WindowId,
+        event: crate::event::InputEvent,
+    ) -> crate::event::InputOutcome {
+        automation::inject_input(self, window, event)
+    }
+
+    /// 窗口最近一次**提交**的帧序号（`None` = 窗口不存在；`FrameIndex::default()` = 从未提交）。
+    #[cfg(feature = "automation")]
+    #[must_use]
+    pub fn frame_index(&self, window: WindowId) -> Option<crate::window::FrameIndex> {
+        automation::frame_index(self, window)
+    }
+
+    /// 窗口当前场景里的图元数（**最近一帧绘制了什么**的只读观测面；`0` = 窗口不存在或空场景）。
+    ///
+    /// 空场景 / 首帧之前是 `0`；它不随帧变化重置（场景跨帧保留），因此一个「重绘后仍有内容」
+    /// 的断言应该配 [`Self::frame_index`] 的推进一起用。
+    #[cfg(feature = "automation")]
+    #[must_use]
+    pub fn painted_primitives(&self, window: WindowId) -> usize {
+        automation::painted_primitives(self, window)
+    }
+
+    /// 窗口节点树里全部文本节点的文本（树序）。
+    ///
+    /// 它是「这一帧会画出的文字」的只读快照：验收自检用它断言语言切换后文案真的换了
+    /// （`bind_text` 的重算结果是节点载荷），不依赖像素读回。
+    #[cfg(feature = "automation")]
+    #[must_use]
+    pub fn texts(&self, window: WindowId) -> Vec<smol_str::SmolStr> {
+        automation::texts(self, window)
+    }
 }
 
 #[cfg(test)]
@@ -3272,3 +3324,8 @@ mod e17_tests;
 /// `has_action_handler` / `scoped_key_binding_count`），因此只在特性开启时编译。
 #[cfg(all(test, feature = "test-support"))]
 mod removal_tests;
+
+/// E25 / P6-1：`automation` feature 的注入与观测面（注入走同一个 `dispatch_input`，
+/// 读取不请求帧）。断言面只用公开 API + 本 feature 的读点，不依赖 `test-support`。
+#[cfg(all(test, feature = "automation"))]
+mod automation_tests;

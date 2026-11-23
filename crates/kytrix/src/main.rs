@@ -30,6 +30,8 @@
 //! `App::on_animation_complete` is registered only by the composition root's
 //! [`AnimationRouter`].
 
+#[cfg(any(test, feature = "acceptance"))]
+mod acceptance;
 mod account;
 mod composition;
 mod downloads;
@@ -37,7 +39,7 @@ mod language;
 mod shell;
 #[cfg(test)]
 mod test_support;
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[cfg(ai_translation)]
 mod translation;
 
 use app_config_provider::store::ConfigStore;
@@ -48,6 +50,9 @@ use crate::composition::Composition;
 
 fn main() {
     install_logging();
+
+    #[cfg(feature = "acceptance")]
+    let acceptance = acceptance::options::Options::parse(std::env::args().skip(1));
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -61,7 +66,19 @@ fn main() {
     };
 
     let mut app = App::new(runtime.handle().clone());
-    let composition = match Composition::new(&mut app, runtime.handle().clone()) {
+    // The acceptance run drives a real window, but over a fresh in-memory installation: it
+    // switches the language and the appearance as part of its steps and must not touch the
+    // user's settings file or the keyring. A normal start (including a full-featured build
+    // that happens to contain the acceptance code) takes the production path.
+    #[cfg(feature = "acceptance")]
+    let composition = if acceptance.is_some() {
+        Composition::for_acceptance(&mut app, runtime.handle().clone())
+    } else {
+        Composition::new(&mut app, runtime.handle().clone())
+    };
+    #[cfg(not(feature = "acceptance"))]
+    let composition = Composition::new(&mut app, runtime.handle().clone());
+    let composition = match composition {
         Ok(composition) => composition,
         Err(error) => {
             log::error!("failed to initialize the application: {error}");
@@ -70,22 +87,40 @@ fn main() {
         }
     };
 
-    match shell::root::Shell::open(&mut app, std::rc::Rc::clone(&composition)) {
-        Ok(shell) => {
-            if let Err(error) = shell::root::Shell::install(&mut app, shell).map(|_| ()) {
-                log::error!("failed to install the application shell: {error}");
-                eprintln!("kytrix: failed to install the application shell: {error}");
-                std::process::exit(1);
-            }
-        }
+    let shell = match shell::root::Shell::open(&mut app, std::rc::Rc::clone(&composition)) {
+        Ok(shell) => shell,
         Err(error) => {
             log::error!("failed to open the main window: {error}");
             eprintln!("kytrix: failed to open the main window: {error}");
             std::process::exit(1);
         }
+    };
+    // The acceptance run drives the window the shell draws; a normal start never reads it.
+    #[cfg(feature = "acceptance")]
+    let acceptance_window = shell.window_id();
+    if let Err(error) = shell::root::Shell::install(&mut app, shell).map(|_| ()) {
+        log::error!("failed to install the application shell: {error}");
+        eprintln!("kytrix: failed to install the application shell: {error}");
+        std::process::exit(1);
     }
 
-    if let Err(error) = Application::new().run(app) {
+    // The acceptance run drives the window from its own E10 timer chain; a normal start has
+    // no such clock.
+    #[cfg(feature = "acceptance")]
+    let acceptance_run = acceptance
+        .map(|options| acceptance::host::start(&mut app, &composition, acceptance_window, options));
+
+    let result = Application::new().run(app);
+
+    #[cfg(feature = "acceptance")]
+    if let Some(run) = acceptance_run {
+        if let Err(error) = &result {
+            run.record_engine_error(error);
+        }
+        std::process::exit(if run.finish() { 0 } else { 1 });
+    }
+
+    if let Err(error) = result {
         log::error!("the application event loop failed: {error}");
         eprintln!("kytrix: the application event loop failed: {error}");
         std::process::exit(1);
@@ -101,7 +136,7 @@ pub(crate) enum InitializationError {
     Engine(#[from] ui_core::error::EngineError),
     #[error(transparent)]
     Auth(#[from] kytrix_service_provider::auth::model::AuthError),
-    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+    #[cfg(ai_translation)]
     #[error(transparent)]
     AiTranslation(#[from] ai_translator::error::TranslationError),
     #[error("the widget catalogue could not be assembled: {0}")]
