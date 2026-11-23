@@ -45,20 +45,23 @@ use test_support::{
     entry_with_aliases, failing, fixture_batch, gated, instrument_normalization, listing,
     listing_key, perp_route, requirements, spot, spot_route, spot_token, token,
 };
-use widget_tokio_runtime::runtime::Runtime;
+use tokio::runtime::Handle;
 
-use crate::catalog::{
-    batch::{CatalogBatch, CatalogEntry, ReferencedTerms},
-    display::types::DisplayError,
-    error::{CatalogError, CatalogValidationError, SourceError},
-    generation::CatalogGenerationId,
-    registry::asset::{AssetRegistry, AssetRegistryPending, AssetTerms},
-    source::{
-        CatalogFetchContext, CatalogRouteRegistration, CatalogRouteRequirements,
-        CatalogRouteUpdate, CatalogSource, CatalogSourceId, RouteInputRevision,
+use crate::{
+    catalog::{
+        batch::{CatalogBatch, CatalogEntry, ReferencedTerms},
+        display::types::DisplayError,
+        error::{CatalogError, CatalogValidationError, SourceError},
+        generation::CatalogGenerationId,
+        registry::asset::{AssetRegistry, AssetRegistryPending, AssetTerms},
+        source::{
+            CatalogFetchContext, CatalogRouteRegistration, CatalogRouteRequirements,
+            CatalogRouteUpdate, CatalogSource, CatalogSourceId, RouteInputRevision,
+        },
+        store::Catalog,
+        test_support,
     },
-    store::Catalog,
-    test_support,
+    test_support::test_handle,
 };
 
 /// The native event lookups a route publishes, read from the public surface.
@@ -112,11 +115,10 @@ fn btc_key() -> VenueListingKey {
 /// The application runtime a load crosses its blocking boundary on.
 ///
 /// One runtime for the whole test binary, exactly as the application has one, and a
-/// test that drives a load from its own thread never runs it — which is the
-/// situation a GPUI task is in.
-fn application() -> Runtime {
-    static APPLICATION: OnceLock<Runtime> = OnceLock::new();
-    APPLICATION.get_or_init(Runtime::for_test).clone()
+/// test that drives a load from its own thread never runs it — which is the\r\n/// situation a frame thread is in.
+fn application() -> Handle {
+    static APPLICATION: OnceLock<Handle> = OnceLock::new();
+    APPLICATION.get_or_init(test_handle).clone()
 }
 
 /// A source that counts its fetches and reports the thread they ran on.
@@ -1354,7 +1356,6 @@ fn a_load_from_a_thread_without_a_runtime_still_fetches() {
     let catalog = Arc::clone(fixture.catalog_arc());
 
     let listings = application()
-        .handle()
         .block_on(catalog.refresh_for_test(&spot_route()))
         .expect("a load must answer instead of panicking");
 
@@ -1391,7 +1392,6 @@ fn a_load_runs_on_the_application_runtime_rather_than_the_caller() {
     let catalog = Arc::clone(fixture.catalog_arc());
 
     let listings = application()
-        .handle()
         .block_on(catalog.refresh_for_test(&spot_route()))
         .expect("the cold route loads");
 

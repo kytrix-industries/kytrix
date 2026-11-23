@@ -3,9 +3,15 @@
 //! It is the seam the service, the selector and the pane all read index data
 //! through, so it is shared rather than copied: what the pane's tests need to
 //! control is the same session the service's tests refuse, delay and close.
+//!
+//! It also holds the two hosts the interface tests are written over: the product
+//! translation catalogue (what a reader of the shipped application reads) and the
+//! framework's headless [`WidgetTestApp`], whose runtime is what the fake session's
+//! messages are delivered through.
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,6 +19,7 @@ use std::{
     time::Duration,
 };
 
+use i18n::{language::codes::LanguageCode, translate::Translate};
 use kytrix_proto::types::v1 as proto_types;
 use kytrix_service_provider::service::engine::{
     ErrorCode, FinancialIndexEvent, FinancialIndexTopic, KytrixServiceError, KytrixSessionState,
@@ -20,6 +27,7 @@ use kytrix_service_provider::service::engine::{
 use network::transport::{error::TransportError, subscription::SubscriptionStatus};
 use smol_str::{SmolStr, format_smolstr};
 use tokio::sync::{Notify, mpsc, watch};
+use widget::test_support::WidgetTestApp;
 
 use crate::{
     model::{LocalizedFinancialIndexName, SelectedFinancialIndex},
@@ -28,33 +36,17 @@ use crate::{
 
 /// The account every fixture scope belongs to.
 pub(crate) const ACCOUNT: &str = "test-account";
-
-/// Lets a widget and its service run until what a test is waiting for has happened.
-///
-/// Two executors are involved: a widget sends its commands from GPUI's own, and the
-/// service answers on the application runtime. So both are given a turn — the widget
-/// first, because a command that has not been sent is a service with nothing to answer.
-pub(crate) fn settle_until(
-    cx: &mut gpui_kit::TestAppContext,
-    what: &str,
-    ready: impl Fn(&gpui_kit::App) -> bool,
-) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        cx.run_until_parked();
-        let handle = cx.update(runtime_handle);
-        handle.block_on(async { tokio::task::yield_now().await });
-        if cx.update(|cx| ready(cx)) {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what} should happen");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+/// The translator the product ships: what these tests assert is the catalogue's copy.
+pub(crate) fn product_translate(language: LanguageCode) -> Translate {
+    Translate::new(
+        Rc::new(i18n::embedded::load().expect("the embedded locales load")),
+        language,
+    )
 }
 
-/// The installed application runtime's handle.
-fn runtime_handle(cx: &mut gpui_kit::App) -> tokio::runtime::Handle {
-    widget_tokio_runtime::global::handle(cx).handle().clone()
+/// The framework's headless host, over the product catalogue.
+pub(crate) fn harness() -> WidgetTestApp {
+    WidgetTestApp::with_translate(product_translate(LanguageCode::En))
 }
 
 pub(crate) fn topic(code: &str) -> FinancialIndexTopic {

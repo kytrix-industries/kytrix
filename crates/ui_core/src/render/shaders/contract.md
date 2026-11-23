@@ -284,6 +284,24 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 只会出现上面列出的走样。这与「与 Skia 的 AA 三角化一致」的旧表述不同：Skia 在 CPU 侧完成了
 三角化 + 覆盖率顶点生成，本引擎把它交给应用。
 
+### `GeometryDraw.range`（E4：CPU 侧索引子区间）
+
+`GeometryDraw.range` 是**索引元素**的半开区间（与 `IndexType` 无关；`TriangleStrip` 同样按索引计），
+**只在 CPU 侧裁剪，不进 `GpuPrimitive`、不改本文件任何字节布局或 shader 源**：
+
+| 项         | 契约                                                                                                                                                                                                                   |
+|------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 整份       | `0..u32::MAX`（`GeometryDraw::full`）。用哨兵而不是 `0..index_count`：几何可被 `update_*` / `truncate_geometry` 改变长度，真正的上界在绘制期裁剪                                                                        |
+| 空绘制     | 空区间 / `start >= end` / `start >= index_count` ⇒ 无 op、无 damage、无 draw call                                                                                                                                     |
+| 越界       | `end > index_count` 的一端 **clamp**（几何可能被 `truncate_geometry` 变短，不报错）；越界不产生越界读                                                                                                                 |
+| 三角形对齐 | `TriangleList` 的 range 两端**向下**对齐到 3 的倍数（起点向下取整、长度向下取整；起点不在三角形边界时最多多画起点之前的 2 个索引，不会漏画、不会错位）；块边界也是 3 的倍数，因此逐块绘制与单次 `DrawIndexed` 画整段等价。`TriangleStrip` 是单块拓扑，不截断                                                                    |
+| 块求交     | 引擎把 range 与 4096 B 页级上传的**块表**求交，逐块产出 op（块间顺序 = 索引顺序）；`first_index` / `index_count` 是**索引缓冲里的绝对索引区间**                                                                         |
+| 三端一致   | 三端 `DrawIndexed` 只消费裁剪后的区间（`GeometryDrawGpu::draw_indexed` 是唯一入口，参数由纯函数 `draw_indexed_params` 推导并单测）：D3D12 / Vulkan 直接给 `first_index`，Metal 的 `indexBufferOffset` = `first_index × index_type.size()`；vertex offset / base vertex 恒 0 |
+| 错误       | 区间越过**已上传**的索引数是引擎内部不变量被破坏 ⇒ `EngineError::GeometryRegister`（不静默越界读）；应用侧越界按上表 clamp                                                                                            |
+
+块大小（`GEOMETRY_CHUNK_INDICES = 12288` 索引）是引擎内部策略（主设计 §5.5），应用不可见、本文件
+也不暴露。视觉回归（I8）必须覆盖「同几何、不同 range」的 case：可见三角形集合变化 ⇒ 像素快照变化。
+
 ### 呈现色彩空间（R06-10）
 
 引擎只产出一件事：**sRGB 编码的 8-bit RGBA**（`apply_gamma` 恒等，编码由 sRGB 渲染目标完成一次）。
@@ -309,6 +327,21 @@ resolve 附件）。`Textured` 没有覆盖率属性，其顶点写 `KYTRIX_AA_I
 | image 图集 | `BGRA8` **sRGB**；纹素是 **linear-premultiplied 后 sRGB 编码**；`out = texel × color0`                                                         |
 | 纹理视图   | image 图集的 SRV / 纹理视图**必须**声明为 sRGB 格式（`*_UNORM_SRGB` / `.bgra8Unorm_srgb` / `*_SRGB`）；glyph 图集必须保持非 sRGB 的 `R8_UNORM` |
 | 上传方职责 | P15 必须「linear 空间预乘 → sRGB 编码」后写图集；改成直通 alpha 时 shader 与本文件必须同时改（`texel.rgb *= texel.a`）                         |
+
+**CPU 侧 `AtlasTile`（不进 GPU 字节布局）**：`paint/atlas.rs` 的 `AtlasTile` 是 I2 的**CPU 数据契约**
+（`{ atlas, page, u0, v0, u1, v1, generation }`，v2.1 E1d 起再带分配身份 `slot: u32` / `slot_epoch: u32`）。
+GPU 只消费 `uv()`（上表 UV 行）、`page`（编码进 `params1.y`）与 `atlas`（`params1.z` 的 `kind` 由来）；
+`slot` / `slot_epoch` 只是 CPU 侧**淘汰检测身份**（`render/atlas.rs` 的 `AtlasAllocator::is_alive`
+用它做 O(1) 判活，供编码期过滤失效字形 run），既不在 `GpuPrimitive` 的 128 B 里，也不出现在任何
+shader / uniform / 顶点布局中。因此 `AtlasTile` 的 CPU 侧尺寸变化（24 → 32 B）**不是**渲染契约变更：
+三端 shader、绑定表与 `GpuPrimitive` 偏移都不受影响，无需改动本文件 §1–§7。
+
+**CPU 侧：文本装饰与 InlineBox 绘制（v2.1 E2，不进 GPU 字节布局）**：`paint/pass.rs` 把
+`ShapedTextLine.decorations`（下划线/删除线）与 `InlineBoxPaint::{Quad, Image}` 编码成**既有的**
+`Primitive::Quad` / `Primitive::Image`（I2：不新增图元变体、不改 `GpuPrimitive`）。装饰矩形就是普通
+实色 quad（`color0` + 全 0 `corner_radius`/`params0`），InlineBox 图片就是普通图集 image（`uv` 来自
+`ResourceImage.tile`，`color0` = 调制色）。因此三端 shader / 绑定 / §1–§7 **零变更**，也不触发
+参数 golden（I8）；像素 golden 只受「单 run 无装饰」路径影响（与改动前逐位一致）。
 
 ## 9. 禁止项
 

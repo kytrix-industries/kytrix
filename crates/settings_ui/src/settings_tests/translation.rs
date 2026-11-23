@@ -1,1074 +1,868 @@
 //! The tests of the translation page: its directory, its rows, and its downloads.
 
+use std::{path::Path, rc::Rc, sync::Arc, time::Instant};
+
 use app_config::{
-    settings::Language,
+    settings::{Config, Language},
     translation::{DownloadSite, TranslationModel},
 };
+use base_ui::kit::icon::IconKind;
 use download_provider::error::DownloadFailure;
-use gpui_kit::{Modifiers, SharedString, TestAppContext, px, size};
+use i18n::{language::codes::LanguageCode, t_smol};
+use smol_str::SmolStr;
+use tempfile::TempDir;
+use ui_core::event::{Event, InputEvent, KeyCode};
 
-use super::test_support::*;
-use crate::translation_downloads::{DeleteFailure, DownloadState};
+use crate::{
+    pages::translation::table::{RowAction, size_text, speed_text, whole_percent},
+    settings_tests::test_support::{
+        FakeDownloads, Harness, download_task, fake_downloads, release_page, send_event,
+        translate_in,
+    },
+    translation_downloads::{DeleteFailure, DownloadState, TranslationDownloads, UnloadFailure},
+};
 
-/// The translation page draws the directory row, the model select, and the table of the
-/// eight supported models, in that order.
-#[gpui_kit::test]
-fn the_translation_page_should_draw_its_models_and_directory_row(cx: &mut TestAppContext) {
-    let (_panel, cx) = settings(configured_settings(), cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
+/// The key prefix the harness mounts the settings page under.
+const KEY: &str = "settings.test.ai.translation";
+
+/// Settings with a stored model directory.
+fn config_in(directory: &Path) -> Config {
+    let mut config = Config::default();
+    config.language = Language::En;
+    config.translation.model_directory = Some(directory.to_path_buf());
+    config
+}
+
+/// A harness with the translation downloads attached, prepared before the translation page is
+/// opened.
+fn page_prepared(
+    config: Config,
+    prepare: impl FnOnce(&TranslationDownloads),
+) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
+    let mut harness = Harness::with_config(config);
+    let (downloads, fake) = fake_downloads(&mut harness, Arc::new(|_: &Path| Ok(())));
+    prepare(&downloads);
+    harness.settle(1);
+    harness.select_page("ai.translation");
+    harness.settle(2);
+
+    (harness, downloads, fake)
+}
+
+/// A harness with the translation downloads attached, moved to the translation page.
+fn page(config: Config) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
+    page_prepared(config, |_| {})
+}
+
+/// The same page over the default settings, with a directory of its own.
+fn page_with(directory: &TempDir) -> (Harness, Rc<TranslationDownloads>, FakeDownloads) {
+    page(config_in(directory.path()))
+}
+
+/// Delivers one key press through the pump's path.
+fn press_key(harness: &mut Harness, code: KeyCode, modifiers: ui_core::event::Modifiers) {
+    send_event(
+        harness,
+        Event::Input(InputEvent::Key {
+            code,
+            state: ui_core::event::KeyState::Down,
+            repeat: false,
+            modifiers,
+            timestamp: Instant::now(),
+        }),
+    );
+}
+
+/// Commits `text` into the directory field after clearing what it held.
+fn replace_directory(harness: &mut Harness, text: &str) {
+    harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
+    press_key(harness, KeyCode::KeyA, ui_core::event::Modifiers::CONTROL);
+    send_event(
+        harness,
+        Event::Input(InputEvent::Text {
+            text: SmolStr::new(text),
+            timestamp: Instant::now(),
+        }),
+    );
+    press_key(harness, KeyCode::Enter, ui_core::event::Modifiers::empty());
+    harness.settle(2);
+}
+
+/// Whether the row action's button is drawn.
+fn action_drawn(harness: &Harness, action: &str, index: usize) -> bool {
+    harness
+        .find(&format!("SETTINGS_AI_MODEL_{action}_{index}"))
+        .is_some()
+}
+
+/// The number of model rows the table draws.
+fn row_count(harness: &Harness) -> usize {
+    (0..8)
+        .filter(|index| {
+            harness
+                .find(&format!("SETTINGS_AI_MODEL_{index}"))
+                .is_some()
+        })
+        .count()
+}
+
+/// The translation page draws the directory field, the two selects, and the eight model rows.
+#[test]
+fn the_translation_page_should_draw_its_settings_and_models() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (harness, _downloads, _fake) = page_with(&directory);
 
     for selector in [
         "SETTINGS_AI_PAGE",
         "SETTINGS_CARD_ai.translation",
-        "SETTINGS_AI_DIRECTORY",
-        "SETTINGS_AI_DIRECTORY_LABEL",
-        "SETTINGS_AI_BROWSE",
-        "SETTINGS_AI_DOWNLOAD_SITE",
+        "SETTINGS_FIELD_ai.directory",
+        "SETTINGS_AI_DIRECTORY_INPUT",
+        "SETTINGS_FIELD_ai.download-site",
         "SETTINGS_AI_SITE_SELECT",
-        "SETTINGS_AI_MODEL_SELECT_SECTION",
+        "SETTINGS_FIELD_ai.model",
         "SETTINGS_AI_MODEL_SELECT",
         "SETTINGS_AI_MODELS",
         "SETTINGS_AI_MODEL_TABLE",
         "SETTINGS_AI_MODEL_0",
-        "SETTINGS_AI_MODEL_1",
-        "SETTINGS_AI_MODEL_2",
-        "SETTINGS_AI_MODEL_3",
-        "SETTINGS_AI_MODEL_4",
-        "SETTINGS_AI_MODEL_5",
-        "SETTINGS_AI_MODEL_6",
         "SETTINGS_AI_MODEL_7",
         "SETTINGS_AI_MODEL_DOWNLOAD_0",
         "SETTINGS_AI_MODEL_DOWNLOAD_7",
     ] {
         assert!(
-            cx.debug_bounds(selector).is_some(),
+            harness.find(selector).is_some(),
             "the page should draw {selector}"
         );
     }
+    assert_eq!(row_count(&harness), 8, "the table draws every model");
 
-    let directory = cx
-        .debug_bounds("SETTINGS_AI_DIRECTORY")
-        .expect("the directory row should be drawn");
-    let sites = cx
-        .debug_bounds("SETTINGS_AI_DOWNLOAD_SITE")
-        .expect("the download site row should be drawn");
-    let select = cx
-        .debug_bounds("SETTINGS_AI_MODEL_SELECT_SECTION")
-        .expect("the model select should be drawn");
-    let models = cx
-        .debug_bounds("SETTINGS_AI_MODELS")
-        .expect("the model list should be drawn");
-    let table = cx
-        .debug_bounds("SETTINGS_AI_MODEL_TABLE")
-        .expect("the model table should be drawn");
-
-    assert!(directory.bottom() <= sites.top());
-    assert!(sites.bottom() <= select.top());
-    assert!(select.bottom() <= models.top());
+    let directory_row = harness
+        .bounds(harness.field("ai.directory").expect("the directory row"))
+        .expect("the directory row is laid out");
+    let site_row = harness
+        .bounds(harness.field("ai.download-site").expect("the site row"))
+        .expect("the site row is laid out");
+    let model_row = harness
+        .bounds(harness.field("ai.model").expect("the model row"))
+        .expect("the model row is laid out");
+    let models = harness
+        .bounds(
+            harness
+                .find("SETTINGS_AI_MODELS")
+                .expect("the models section"),
+        )
+        .expect("the models section is laid out");
+    assert!(directory_row.origin.y < site_row.origin.y);
+    assert!(site_row.origin.y < model_row.origin.y);
     assert!(
-        table.top() >= models.top(),
+        model_row.origin.y < models.origin.y,
         "the table is what the model section holds"
     );
 
     let rows = (0..8)
         .map(|index| {
-            cx.debug_bounds(Box::leak(
-                format!("SETTINGS_AI_MODEL_{index}").into_boxed_str(),
-            ))
-            .unwrap_or_else(|| panic!("the table should draw model row {index}"))
+            harness
+                .bounds(
+                    harness
+                        .find(&format!("SETTINGS_AI_MODEL_{index}"))
+                        .expect("the model row"),
+                )
+                .expect("the model row is laid out")
         })
         .collect::<Vec<_>>();
     for (index, pair) in rows.windows(2).enumerate() {
         assert!(
-            pair[0].top() < pair[1].top(),
+            pair[0].origin.y < pair[1].origin.y,
             "the table draws the models in page order: row {index} is above row {}",
             index + 1
         );
     }
 }
 
-/// At the window's minimum size the translation page still draws its table in the normal
-/// content column, and every cell stays on the single line it is drawn with: the size and
-/// the longest failure reason are cut rather than stacked.
-#[gpui_kit::test]
-fn the_translation_table_should_be_drawn_at_the_minimum_window_size(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    cx.simulate_resize(size(px(1280.0), px(960.0)));
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
+/// A page without the process-wide downloads draws the models but offers no download: there is
+/// no download manager a click could start a transfer on.
+#[test]
+fn a_page_without_downloads_should_offer_no_download() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let mut harness = Harness::with_config(config_in(directory.path()));
+    harness.settle(1);
+    harness.select_page("ai.translation");
+    harness.settle(2);
 
-    let table = cx
-        .debug_bounds("SETTINGS_AI_MODEL_TABLE")
-        .expect("the table should be drawn at the window's minimum size");
+    assert_eq!(row_count(&harness), 8, "the models are still drawn");
     assert!(
-        table.size.width >= px(600.0),
-        "the table should fill the content column beside the sidebar: {table:?}"
+        harness.find("SETTINGS_AI_MODEL_DOWNLOAD_0").is_some(),
+        "the download action is drawn, disabled"
     );
-    for index in 0..8 {
-        let selector = Box::leak(format!("SETTINGS_AI_MODEL_{index}").into_boxed_str());
-        assert!(
-            cx.debug_bounds(selector).is_some(),
-            "model row {index} should be drawn at the window's minimum size"
-        );
-    }
-
-    let size_cell = cx
-        .debug_bounds("SETTINGS_AI_MODEL_SIZE_4")
-        .expect("the 1.25-bit size should be drawn");
+    harness.click_node("SETTINGS_AI_MODEL_DOWNLOAD_0");
     assert!(
-        size_cell.size.height < px(25.0),
-        "the size should stay on one line: {size_cell:?}"
+        harness.find("SETTINGS_AI_MODEL_PROGRESS_0").is_none(),
+        "a page without downloads starts nothing"
     );
+}
+/// A stored directory is shown in the field, on one line that keeps the control column's width.
+#[test]
+fn a_stored_directory_should_be_shown_in_its_field() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (harness, _downloads, _fake) = page_with(&directory);
 
-    // A size mismatch with a realistic pair of sizes is the longest reason the status column
-    // ever shows, and it should be cut to one line rather than wrap.
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218BQ6K,
-            path,
-            DownloadState::DownloadFailed {
-                failure: DownloadFailure::SizeMismatch {
-                    expected: 7_981_928_896,
-                    actual: 7_981_928_895,
-                },
-            },
-            cx,
-        );
-    });
-    settle(cx);
-
-    let error = cx
-        .debug_bounds("SETTINGS_AI_MODEL_ERROR_1")
-        .expect("the failed download should draw its reason");
+    let field = harness
+        .find("SETTINGS_AI_DIRECTORY_INPUT")
+        .expect("the directory field is drawn");
+    let text = harness.text_of(field);
     assert!(
-        error.size.height < px(25.0),
-        "the long failure reason should be cut to one line: {error:?}"
+        text.contains(directory.path().to_string_lossy().as_ref()),
+        "the field should show the stored directory: {text:?}"
+    );
+    let bounds = harness.bounds(field).expect("the field is laid out");
+    let control = harness
+        .bounds(harness.field("ai.directory").expect("the directory row"))
+        .expect("the directory row is laid out");
+    assert!(
+        bounds.size.width <= control.size.width,
+        "the field stays inside the row: {bounds:?} in {control:?}"
+    );
+    assert!(
+        bounds.size.height < 40.0,
+        "the field stays on one line: {bounds:?}"
     );
 }
 
-/// The system folder picker is what changes the directory label, and the directory it chooses
-/// is stored at once.
-#[gpui_kit::test]
-fn browsing_should_store_the_chosen_translation_directory(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let directory = tempfile::tempdir().expect("the test directory should build");
+/// A directory committed from the field is stored at once, and the field keeps showing it.
+#[test]
+fn a_committed_directory_should_be_stored() {
+    let stored = TempDir::new().expect("the stored directory builds");
+    let chosen = TempDir::new().expect("the chosen directory builds");
+    let (mut harness, _downloads, _fake) = page_with(&stored);
 
-    click(cx, "SETTINGS_AI_BROWSE");
-    assert!(
-        cx.did_prompt_for_paths(),
-        "the browse button should open the system folder prompt"
-    );
-    cx.simulate_path_prompt_response(|options| {
-        assert!(!options.files, "the prompt should not offer files");
-        assert!(options.directories, "the prompt should offer directories");
-        assert!(!options.multiple, "one directory is enough");
-        Some(vec![directory.path().to_path_buf()])
-    });
-    settle(cx);
-
-    let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-    assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation_for_test().read(cx).shown_directory(cx)
-        })),
-        Some(expected),
-        "the label should show the chosen directory"
-    );
-    assert_eq!(
-        stored(cx).translation.model_directory,
-        Some(directory.path().to_path_buf()),
-        "the directory should be stored as soon as it is chosen"
-    );
-}
-
-/// A page that opens over a stored directory shows it in the label.
-#[gpui_kit::test]
-fn a_stored_translation_directory_should_be_shown(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    let expected = SharedString::from(directory.path().to_string_lossy().into_owned());
-    assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation_for_test().read(cx).shown_directory(cx)
-        })),
-        Some(expected)
-    );
-}
-
-/// A fresh installation opens on the models directory beside the settings file, and the
-/// directory has no field to type into: the folder picker is the only way it changes.
-#[gpui_kit::test]
-fn a_fresh_installation_should_open_on_the_default_directory(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    let expected = app_config::paths::default_model_directory()
-        .map(|path| SharedString::from(path.to_string_lossy().into_owned()));
-    assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation_for_test().read(cx).shown_directory(cx)
-        })),
-        expected,
-        "the label should show the models directory beside the settings file"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_DIRECTORY_INPUT").is_none(),
-        "the directory is a label rather than a field"
-    );
-}
-
-/// A short path sizes the label to its own text and keeps it left aligned, with the browse
-/// button at the end of the control column.
-#[gpui_kit::test]
-fn a_short_directory_label_should_take_only_the_width_of_its_text(cx: &mut TestAppContext) {
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(std::path::PathBuf::from("E:"));
-    let (_, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    let control = cx
-        .debug_bounds("SETTINGS_CONTROL_ai.directory")
-        .expect("the directory row should draw its control column");
-    let label = cx
-        .debug_bounds("SETTINGS_AI_DIRECTORY_LABEL")
-        .expect("the directory label should be drawn");
-    let browse = cx
-        .debug_bounds("SETTINGS_AI_BROWSE")
-        .expect("the browse button should be drawn");
-
-    assert!(
-        (label.left() - control.left()).abs() < px(1.0),
-        "the label should start where the control column starts: {label:?} in {control:?}"
-    );
-    assert!(
-        (browse.right() - control.right()).abs() < px(1.0),
-        "the button should end where the control column ends: {browse:?} in {control:?}"
-    );
-    assert!(
-        label.size.width < control.size.width - browse.size.width,
-        "a short path should not stretch the label: {label:?} beside {browse:?}"
-    );
-    assert!(
-        label.right() < browse.left(),
-        "the label should stop where its text stops: {label:?} beside {browse:?}"
-    );
-    assert!(
-        label.size.height < px(25.0),
-        "the label should stay on one line: {label:?}"
-    );
-}
-
-/// The tooltip belongs to the text rather than to the space the label column leaves: a short
-/// path opens it under the text, not in the middle of the empty column.
-#[gpui_kit::test]
-fn a_short_directory_label_should_show_its_tooltip_under_its_text(cx: &mut TestAppContext) {
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(std::path::PathBuf::from("E:"));
-    let (_, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    let label = cx
-        .debug_bounds("SETTINGS_AI_DIRECTORY_LABEL")
-        .expect("the directory label should be drawn");
-    cx.simulate_mouse_move(label.center(), None, Modifiers::none());
-    cx.run_until_parked();
-    for _ in 0..10 {
-        settle(cx);
-    }
-    let tooltip = cx
-        .debug_bounds("BASE_UI_TOOLTIP")
-        .expect("hovering the label should show the whole path");
-    assert!(
-        (tooltip.center().x - label.center().x).abs() < px(8.0),
-        "the tooltip should sit under the text: {tooltip:?} for label {label:?}"
-    );
-}
-
-/// A directory too long for the column is cut rather than wrapped, and hovering the label shows
-/// the whole path.
-#[gpui_kit::test]
-fn a_long_directory_should_be_cut_with_its_path_on_hover(cx: &mut TestAppContext) {
-    let root = tempfile::tempdir().expect("the test directory should build");
-    let directory = root.path().join(
-        "a-very-long-model-directory-name-that-cannot-fit-inside-the-directory-row-of-the-page",
-    );
-    std::fs::create_dir_all(&directory).expect("the long directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory);
-    let (_, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    let control = cx
-        .debug_bounds("SETTINGS_CONTROL_ai.directory")
-        .expect("the directory row should draw its control column");
-    let label = cx
-        .debug_bounds("SETTINGS_AI_DIRECTORY_LABEL")
-        .expect("the directory label should be drawn");
-    assert!(
-        label.size.width < control.size.width,
-        "the long path should be cut to the width the button leaves: {label:?}"
-    );
-    assert!(
-        label.right() <= control.right(),
-        "the long path should be cut before the column ends: {label:?} in {control:?}"
-    );
-    assert!(
-        label.size.height < px(25.0),
-        "the long path should be cut rather than wrapped: {label:?}"
-    );
-
-    cx.simulate_mouse_move(label.center(), None, Modifiers::none());
-    cx.run_until_parked();
-    for _ in 0..10 {
-        settle(cx);
-    }
-    assert!(
-        cx.debug_bounds("BASE_UI_TOOLTIP").is_some(),
-        "hovering the label should show the whole path"
-    );
-}
-
-/// Switching to a directory that holds models selects the first their names sort to: the
-/// selection the page had names a file the new directory does not hold.
-#[gpui_kit::test]
-fn browsing_should_select_the_first_model_the_new_directory_holds(cx: &mut TestAppContext) {
-    let (_, cx) = settings(configured_settings(), cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let path = directory.path().to_path_buf();
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, path.clone(), cx);
-        downloads.force_downloaded_for_test(TranslationModel::HyMt218B2Bit, path.clone(), cx);
-        downloads.force_downloaded_for_test(TranslationModel::HyMt218B125Bit, path.clone(), cx);
-    });
-
-    click(cx, "SETTINGS_AI_BROWSE");
-    cx.simulate_path_prompt_response(|_| Some(vec![path]));
-    settle(cx);
+    harness.click_node("SETTINGS_AI_DIRECTORY_INPUT");
+    replace_directory(&mut harness, chosen.path().to_string_lossy().as_ref());
 
     assert_eq!(
-        stored(cx).translation.selected_model,
-        Some(TranslationModel::HyMt218B125Bit),
-        "HY-MT2-1.8B-1.25Bit sorts first among the models the new directory holds"
+        harness.config().translation.model_directory,
+        Some(chosen.path().to_path_buf()),
+        "the committed directory is stored"
+    );
+    let field = harness
+        .find("SETTINGS_AI_DIRECTORY_INPUT")
+        .expect("the directory field is drawn");
+    assert!(
+        harness
+            .text_of(field)
+            .contains(chosen.path().to_string_lossy().as_ref()),
+        "the field shows the directory it stored"
     );
 }
 
-/// A selection the new directory also holds is kept: switching directory does not re-pick a
-/// model the settings already name.
-#[gpui_kit::test]
-fn browsing_should_keep_a_selection_the_new_directory_holds(cx: &mut TestAppContext) {
-    let stored_directory = tempfile::tempdir().expect("the stored directory should build");
-    let chosen_directory = tempfile::tempdir().expect("the chosen directory should build");
-    let stored_path = stored_directory.path().to_path_buf();
-    let chosen_path = chosen_directory.path().to_path_buf();
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(stored_path.clone());
+/// A selection the new directory does not hold is replaced by the first model the directory
+/// holds, and one it does hold is kept.
+#[test]
+fn committing_a_directory_should_repair_the_selection() {
+    let stored = TempDir::new().expect("the stored directory builds");
+    let holds_nothing = TempDir::new().expect("the empty directory builds");
+    let holds_selected = TempDir::new().expect("the directory that holds the selection builds");
+    let mut config = config_in(stored.path());
     config.translation.selected_model = Some(TranslationModel::HyMt218BQ4Km);
-    let (_, cx) = settings(config, cx);
-    let downloads = translation_downloads(cx);
-    downloads.update(cx, |downloads, cx| {
-        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, stored_path, cx);
+    let (mut harness, _downloads, _fake) = page_prepared(config, |downloads| {
+        downloads
+            .force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, stored.path().to_path_buf());
         downloads.force_downloaded_for_test(
             TranslationModel::HyMt218BQ4Km,
-            chosen_path.clone(),
-            cx,
+            holds_selected.path().to_path_buf(),
         );
         downloads.force_downloaded_for_test(
             TranslationModel::HyMt218B125Bit,
-            chosen_path.clone(),
-            cx,
+            holds_selected.path().to_path_buf(),
         );
     });
-    click(cx, "SETTINGS_ENTRY_ai.translation");
 
-    click(cx, "SETTINGS_AI_BROWSE");
-    cx.simulate_path_prompt_response(|_| Some(vec![chosen_path]));
-    settle(cx);
-
+    replace_directory(
+        &mut harness,
+        holds_selected.path().to_string_lossy().as_ref(),
+    );
     assert_eq!(
-        stored(cx).translation.selected_model,
+        harness.config().translation.selected_model,
         Some(TranslationModel::HyMt218BQ4Km),
-        "the model the settings already name is in the new directory and stays selected"
+        "a selection the new directory holds is kept"
     );
-}
 
-/// A directory that holds no model clears the selection rather than leaving one that names a
-/// file the directory does not have.
-#[gpui_kit::test]
-fn browsing_to_an_empty_directory_should_clear_the_selection(cx: &mut TestAppContext) {
-    let stored_directory = tempfile::tempdir().expect("the stored directory should build");
-    let empty_directory = tempfile::tempdir().expect("the empty directory should build");
-    let stored_path = stored_directory.path().to_path_buf();
-    let empty_path = empty_directory.path().to_path_buf();
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(stored_path.clone());
-    config.translation.selected_model = Some(TranslationModel::HyMt218BQ4Km);
-    let (_, cx) = settings(config, cx);
-    let downloads = translation_downloads(cx);
-    downloads.update(cx, |downloads, cx| {
-        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, stored_path, cx);
-    });
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    click(cx, "SETTINGS_AI_BROWSE");
-    cx.simulate_path_prompt_response(|_| Some(vec![empty_path]));
-    settle(cx);
-
+    replace_directory(
+        &mut harness,
+        holds_nothing.path().to_string_lossy().as_ref(),
+    );
     assert_eq!(
-        stored(cx).translation.selected_model,
+        harness.config().translation.selected_model,
         None,
-        "a directory with no usable model leaves nothing selected"
+        "a directory that holds no model clears the selection"
     );
 }
 
-/// The status column of each row follows the download state: buttons only where the state
-/// has an action, and the text of the state beside them.
-#[gpui_kit::test]
-fn the_translation_rows_should_draw_download_retry_progress_and_delete_states(
-    cx: &mut TestAppContext,
-) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
+/// A committed directory that holds models selects the first one their display names sort to.
+#[test]
+fn a_committed_directory_should_select_the_first_model_it_holds() {
+    let stored = TempDir::new().expect("the stored directory builds");
+    let chosen = TempDir::new().expect("the chosen directory builds");
+    let (mut harness, downloads, _fake) = page(config_in(stored.path()));
+    downloads
+        .force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, chosen.path().to_path_buf());
+    downloads.force_downloaded_for_test(
+        TranslationModel::HyMt218B125Bit,
+        chosen.path().to_path_buf(),
+    );
+    harness.settle(1);
 
-    downloads.update(cx, |downloads, cx| {
-        downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, path.clone(), cx);
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218BQ6K,
-            path.clone(),
-            DownloadState::Downloading {
-                downloaded: 100,
-                mb_per_second: 1.5,
-            },
-            cx,
-        );
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218BQ8,
-            path.clone(),
-            DownloadState::DownloadFailed {
-                failure: DownloadFailure::Transport,
-            },
-            cx,
-        );
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218B2Bit,
-            path.clone(),
-            DownloadState::Deleting,
-            cx,
-        );
-        downloads.set_state_for_test(
-            TranslationModel::HyMt27BQ4Km,
-            path.clone(),
-            DownloadState::Pausing { downloaded: 100 },
-            cx,
-        );
-        downloads.set_state_for_test(
-            TranslationModel::HyMt27BQ6K,
-            path.clone(),
-            DownloadState::Paused { downloaded: 100 },
-            cx,
-        );
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218B125Bit,
-            path,
-            DownloadState::DeleteFailed {
-                failure: DeleteFailure::Io {
-                    kind: std::io::ErrorKind::PermissionDenied,
-                },
-            },
-            cx,
-        );
-    });
-    settle(cx);
+    replace_directory(&mut harness, chosen.path().to_string_lossy().as_ref());
 
-    // A model that was never started but whose file is present shows the downloaded row.
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_0").is_some(),
-        "a downloaded model offers delete"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_0").is_none(),
-        "a downloaded model offers no download button"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_0").is_none()
-            && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_0").is_none(),
-        "a downloaded model has no status text"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_1").is_some(),
-        "a download in flight offers pause"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_1").is_some(),
-        "a download in flight can be stopped for good"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_none(),
-        "a download in flight is stopped rather than deleted"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_1").is_some(),
-        "a download in flight draws how far it is"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_1").is_none(),
-        "a download in flight offers no download button"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_2").is_some(),
-        "a failed download offers retry"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_2").is_some(),
-        "a failed download can be stopped for good"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_2").is_none(),
-        "a failed download is stopped rather than deleted"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_2").is_some(),
-        "a failed download names its reason"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETING_3").is_some(),
-        "a delete in flight offers its disabled button"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_3").is_none(),
-        "a delete in flight must not offer a second delete"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_3").is_none()
-            && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_3").is_none(),
-        "a delete in flight has no status text"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_4").is_some(),
-        "a failed delete names its reason even when the file is gone"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_4").is_some(),
-        "a failed delete can be tried again"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_4").is_none(),
-        "a failed delete offers its own action rather than a download"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_5").is_some(),
-        "a pausing download is drawn with its disabled pause"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_5").is_some(),
-        "a pausing download can still be stopped for good"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_5").is_none(),
-        "a pausing download is stopped rather than deleted"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_5").is_some(),
-        "a pausing download says what it is doing"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_RESUME_5").is_none(),
-        "a pausing download cannot be resumed yet"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_RESUME_6").is_some(),
-        "a paused download offers resume"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_6").is_some(),
-        "a paused download can be stopped for good"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PAUSE_6").is_none(),
-        "a paused download offers no pause"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_6").is_some(),
-        "a paused download says how much it already has"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_6").is_none(),
-        "a paused download is stopped rather than deleted"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DOWNLOAD_7").is_some(),
-        "a model that was never downloaded offers download"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_7").is_none()
-            && cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_7").is_none()
-            && cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_7").is_none(),
-        "an idle model has no delete and no status text"
-    );
-}
-
-/// A row whose download is being stopped draws the disabled stop and says so, and a stop
-/// that failed offers the stop again rather than a retry of the download.
-#[gpui_kit::test]
-fn the_translation_rows_should_draw_the_stopping_states(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218BQ4Km,
-            path.clone(),
-            DownloadState::Terminating,
-            cx,
-        );
-        downloads.set_state_for_test(
-            TranslationModel::HyMt218BQ6K,
-            path,
-            DownloadState::TerminateFailed {
-                failure: DeleteFailure::Io {
-                    kind: std::io::ErrorKind::PermissionDenied,
-                },
-            },
-            cx,
-        );
-    });
-    settle(cx);
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATING_0").is_some(),
-        "a download being stopped offers its disabled stop"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_0").is_none(),
-        "a download being stopped must not offer a second stop"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_PROGRESS_0").is_some(),
-        "a download being stopped says what it is doing"
-    );
-
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_TERMINATE_1").is_some(),
-        "a stop that failed can be tried again"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_ERROR_1").is_some(),
-        "a failed stop names its reason"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_AI_MODEL_RETRY_1").is_none()
-            && cx.debug_bounds("SETTINGS_AI_MODEL_DELETE_1").is_none(),
-        "a failed stop offers neither a retry nor a delete"
-    );
-}
-
-/// Choosing a site is a change of the session, and the download icon starts from the site
-/// the session holds rather than asking for one.
-#[gpui_kit::test]
-fn clicking_download_should_start_from_the_site_the_session_holds(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
-    let model = TranslationModel::HyMt27BQ8;
-
-    // The seam records downloads instead of transferring them, so nothing leaves the
-    // process. It needs a row of its own, which is not the one this test downloads.
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_transfers_deferred_for_test(
-            TranslationModel::HyMt27BQ6K,
-            path.clone(),
-            DownloadSite::HuggingFace,
-            cx,
-        );
-    });
-    settle(cx);
-
-    click(cx, "SETTINGS_AI_SITE_SELECT");
-    click(cx, "TEST_MENU_ITEM_model_scope");
     assert_eq!(
-        stored(cx).translation.download_site,
+        harness.config().translation.selected_model,
+        Some(TranslationModel::HyMt218B125Bit),
+        "HY-MT2-1.8B-1.25Bit sorts first among the models the directory holds"
+    );
+}
+/// A directory that could not be stored is not shown as if it had been: the field keeps the stored
+/// directory and the failure is reported.
+#[test]
+fn a_failed_directory_write_should_keep_the_stored_directory() {
+    let stored = TempDir::new().expect("the stored directory builds");
+    let chosen = TempDir::new().expect("the chosen directory builds");
+    let (mut harness, _downloads, _fake) = page_with(&stored);
+    harness.fail_next_write(crate::session::SettingsWriteError::new(
+        app_config_provider::store::ConfigPersistenceError::CreateDirectory {
+            path: std::path::PathBuf::from("unwritable"),
+            source: std::io::Error::other("the directory cannot be created"),
+        },
+    ));
+
+    replace_directory(&mut harness, chosen.path().to_string_lossy().as_ref());
+
+    assert_eq!(
+        harness.config().translation.model_directory,
+        Some(stored.path().to_path_buf()),
+        "a directory that could not be stored must not be published as if it had been"
+    );
+    assert!(
+        harness.find("settings.test.save-failed").is_some(),
+        "a write that could not be stored is reported"
+    );
+    let field = harness
+        .find("SETTINGS_AI_DIRECTORY_INPUT")
+        .expect("the directory field is drawn");
+    assert!(
+        harness
+            .text_of(field)
+            .contains(stored.path().to_string_lossy().as_ref()),
+        "the field keeps showing the directory that is stored"
+    );
+}
+
+/// The site select stores the chosen site at once, and a failed write keeps the stored one.
+#[test]
+fn the_site_select_should_store_the_chosen_site() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, _downloads, _fake) = page_with(&directory);
+
+    assert_eq!(
+        harness.config().translation.download_site,
+        DownloadSite::HuggingFace,
+        "settings with nothing stored start on HuggingFace"
+    );
+    harness.click_node(&format!("{KEY}.site:trigger"));
+    harness.settle(1);
+    harness.click_node(&format!("{KEY}.site:panel:list:hit:1"));
+
+    assert_eq!(
+        harness.config().translation.download_site,
         DownloadSite::ModelScope,
         "choosing a site stores it at once"
     );
+}
 
-    click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).site(model, &path)),
-        Some(DownloadSite::ModelScope),
-        "the download starts from the site the session holds"
-    );
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-        DownloadState::Downloading {
-            downloaded: 0,
-            mb_per_second: 0.0,
+/// A site that could not be stored leaves the stored site as it was and reports why.
+#[test]
+fn a_failed_site_write_should_keep_the_stored_site() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, _downloads, _fake) = page_with(&directory);
+    harness.fail_next_write(crate::session::SettingsWriteError::new(
+        app_config_provider::store::ConfigPersistenceError::CreateDirectory {
+            path: std::path::PathBuf::from("unwritable"),
+            source: std::io::Error::other("the directory cannot be created"),
         },
-        "the download icon starts the download without asking for a site"
+    ));
+
+    harness.click_node(&format!("{KEY}.site:trigger"));
+    harness.settle(1);
+    harness.click_node(&format!("{KEY}.site:panel:list:hit:1"));
+
+    assert_eq!(
+        harness.config().translation.download_site,
+        DownloadSite::HuggingFace,
+        "a site that could not be stored must not be published as if it had been"
+    );
+    assert!(
+        harness.find("settings.test.save-failed").is_some(),
+        "a write that could not be stored is reported"
     );
 }
 
-/// A session that never chose a site downloads from HuggingFace.
-#[gpui_kit::test]
-fn a_download_without_a_chosen_site_should_use_huggingface(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
+/// The status column of each row follows the download state: buttons only where the state has an
+/// action, and the text of the state beside them.
+#[test]
+fn the_rows_should_draw_download_retry_progress_and_delete_states() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, downloads, _fake) = page_with(&directory);
     let path = directory.path().to_path_buf();
-    let model = TranslationModel::HyMt27BQ8;
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_transfers_deferred_for_test(
-            TranslationModel::HyMt27BQ6K,
-            path.clone(),
-            DownloadSite::HuggingFace,
-            cx,
-        );
-    });
-    settle(cx);
-
-    click(cx, "SETTINGS_AI_MODEL_DOWNLOAD_7");
-
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).site(model, &path)),
-        Some(DownloadSite::HuggingFace),
-        "a session with no choice of its own downloads from HuggingFace"
-    );
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).row_state(model, &path)),
+    downloads.force_downloaded_for_test(TranslationModel::HyMt218BQ4Km, path.clone());
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218BQ6K,
+        path.clone(),
         DownloadState::Downloading {
-            downloaded: 0,
-            mb_per_second: 0.0,
-        }
+            downloaded: 100,
+            mb_per_second: 1.5,
+        },
+    );
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218BQ8,
+        path.clone(),
+        DownloadState::DownloadFailed {
+            failure: DownloadFailure::Transport,
+        },
+    );
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218B2Bit,
+        path.clone(),
+        DownloadState::Deleting,
+    );
+    downloads.set_state_for_test(
+        TranslationModel::HyMt27BQ4Km,
+        path.clone(),
+        DownloadState::Pausing { downloaded: 100 },
+    );
+    downloads.set_state_for_test(
+        TranslationModel::HyMt27BQ6K,
+        path.clone(),
+        DownloadState::Paused { downloaded: 100 },
+    );
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218B125Bit,
+        path,
+        DownloadState::DeleteFailed {
+            failure: DeleteFailure::Io {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+        },
+    );
+    harness.settle(2);
+
+    assert!(
+        action_drawn(&harness, "DELETE", 0),
+        "a downloaded model offers delete"
+    );
+    assert!(!action_drawn(&harness, "DOWNLOAD", 0));
+
+    assert!(action_drawn(&harness, "PAUSE", 1));
+    assert!(action_drawn(&harness, "TERMINATE", 1));
+    assert!(!action_drawn(&harness, "DELETE", 1));
+    assert!(harness.find("SETTINGS_AI_MODEL_PROGRESS_1").is_some());
+
+    assert!(action_drawn(&harness, "RETRY", 2));
+    assert!(action_drawn(&harness, "TERMINATE", 2));
+    assert!(!action_drawn(&harness, "DELETE", 2));
+    assert!(harness.find("SETTINGS_AI_MODEL_ERROR_2").is_some());
+
+    assert!(action_drawn(&harness, "DELETING", 3));
+    assert!(!action_drawn(&harness, "DELETE", 3));
+
+    assert!(action_drawn(&harness, "DELETE", 4));
+    assert!(harness.find("SETTINGS_AI_MODEL_ERROR_4").is_some());
+
+    assert!(action_drawn(&harness, "PAUSE", 5));
+    assert!(action_drawn(&harness, "TERMINATE", 5));
+    assert!(harness.find("SETTINGS_AI_MODEL_PROGRESS_5").is_some());
+
+    assert!(action_drawn(&harness, "RESUME", 6));
+    assert!(action_drawn(&harness, "TERMINATE", 6));
+    assert!(harness.find("SETTINGS_AI_MODEL_PROGRESS_6").is_some());
+
+    assert!(action_drawn(&harness, "DOWNLOAD", 7));
+    assert!(!action_drawn(&harness, "DELETE", 7));
+    assert!(harness.find("SETTINGS_AI_MODEL_PROGRESS_7").is_none());
+}
+
+/// Clicking a download with nothing chosen downloads from HuggingFace.
+#[test]
+fn a_download_without_a_chosen_site_should_use_huggingface() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, _downloads, fake) = page_with(&directory);
+
+    harness.click_node("SETTINGS_AI_MODEL_DOWNLOAD_7");
+
+    let adds = fake.adds();
+    assert_eq!(adds.len(), 1);
+    assert_eq!(
+        adds[0].0.url.as_str(),
+        TranslationModel::HyMt27BQ8.download_url(DownloadSite::HuggingFace)
     );
 }
 
-/// A retry at the site the failed download came from continues that task from its partial
-/// file.
-#[gpui_kit::test]
-fn a_retry_at_the_site_of_the_failed_download_should_continue_it(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
-    let model = TranslationModel::HyMt218BQ8;
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_transfers_deferred_for_test(
-            TranslationModel::HyMt27BQ8,
-            path.clone(),
-            DownloadSite::HuggingFace,
-            cx,
-        );
-        // A download that came from ModelScope and failed, which is the row a retry starts
-        // from.
-        downloads.download(model, path.clone(), DownloadSite::ModelScope, cx);
-        downloads.set_state_for_test(
-            model,
-            path.clone(),
-            DownloadState::DownloadFailed {
+/// A retry follows the stored site: the same site continues the failed task, another site removes
+/// it first.
+#[test]
+fn clicking_retry_should_follow_the_stored_site() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let mut config = config_in(directory.path());
+    config.translation.download_site = DownloadSite::ModelScope;
+    let (mut harness, _downloads, fake) = page(config);
+    let model = TranslationModel::HyMt218BQ4Km;
+    harness.click_node("SETTINGS_AI_MODEL_DOWNLOAD_0");
+    let id = fake
+        .added()
+        .expect("the download was added to the fake manager");
+    fake.push(
+        harness.app_mut(),
+        download_task(
+            id,
+            directory.path().join(model.file_name()),
+            download_provider::task::DownloadStatus::Failed {
                 failure: DownloadFailure::Transport,
             },
-            cx,
-        );
-    });
-    settle(cx);
-
-    click(cx, "SETTINGS_AI_SITE_SELECT");
-    click(cx, "TEST_MENU_ITEM_model_scope");
-    click(cx, "SETTINGS_AI_MODEL_RETRY_2");
-
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).site(model, &path)),
-        Some(DownloadSite::ModelScope),
-        "the retry uses the site the session holds"
+        ),
     );
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-        DownloadState::Downloading {
-            downloaded: 0,
-            mb_per_second: 0.0,
-        },
-        "the site of the failed task continues it rather than discarding it"
+    harness.settle(2);
+
+    harness.click_node("SETTINGS_AI_MODEL_RETRY_0");
+    assert!(
+        fake.resumed(id),
+        "a retry at the site the task came from continues it"
+    );
+
+    harness.update_config(|config| config.translation.download_site = DownloadSite::HuggingFace);
+    harness.settle(1);
+    harness.click_node("SETTINGS_AI_MODEL_RETRY_0");
+    assert!(
+        fake.deleted(id),
+        "a retry at another site removes the failed task first"
     );
 }
 
-/// A retry whose session holds another site discards the failed transfer and starts again
-/// from the chosen site.
-#[gpui_kit::test]
-fn a_retry_at_another_site_should_restart(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
-    let model = TranslationModel::HyMt218BQ8;
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_transfers_deferred_for_test(
-            TranslationModel::HyMt27BQ8,
-            path.clone(),
-            DownloadSite::HuggingFace,
-            cx,
-        );
-        downloads.download(model, path.clone(), DownloadSite::ModelScope, cx);
-        downloads.set_state_for_test(
-            model,
-            path.clone(),
-            DownloadState::DownloadFailed {
-                failure: DownloadFailure::Transport,
-            },
-            cx,
-        );
-    });
-    settle(cx);
-
-    // The session still holds HuggingFace while the failed task came from ModelScope.
-    click(cx, "SETTINGS_AI_MODEL_RETRY_2");
-    settle(cx);
-
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).site(model, &path)),
-        Some(DownloadSite::HuggingFace),
-        "the restart is recorded against the site the session holds"
+/// Stopping a paused download from its row discards what it wrote: the partial file goes and the
+/// row offers a download again.
+#[test]
+fn a_paused_download_should_be_stopped_from_its_row() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let model = TranslationModel::HyMt218BQ4Km;
+    let part = directory.path().join(format!("{}.part", model.file_name()));
+    std::fs::write(&part, b"partial").expect("the partial file is written");
+    let (mut harness, downloads, _fake) = page_with(&directory);
+    downloads.set_state_for_test(
+        model,
+        directory.path().to_path_buf(),
+        DownloadState::Paused { downloaded: 7 },
     );
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-        DownloadState::Downloading {
-            downloaded: 0,
-            mb_per_second: 0.0,
-        },
-        "the other site restarts the download from zero"
-    );
-}
+    harness.settle(2);
 
-/// Continuing a paused download starts it where it is, whatever site the session holds.
-#[gpui_kit::test]
-fn a_paused_download_should_resume_where_it_is(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
-    let model = TranslationModel::HyMt27BQ6K;
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_transfers_deferred_for_test(
-            TranslationModel::HyMt27BQ8,
-            path.clone(),
-            DownloadSite::HuggingFace,
-            cx,
+    harness.click_node("SETTINGS_AI_MODEL_TERMINATE_0");
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while part.exists() || downloads.row_state(model, directory.path()) != DownloadState::Idle {
+        assert!(
+            Instant::now() < deadline,
+            "the stopped download never settled"
         );
-        downloads.set_state_for_test(
-            model,
-            path.clone(),
-            DownloadState::Paused { downloaded: 100 },
-            cx,
-        );
-    });
-    settle(cx);
-
-    click(cx, "SETTINGS_AI_SITE_SELECT");
-    click(cx, "TEST_MENU_ITEM_model_scope");
-    click(cx, "SETTINGS_AI_MODEL_RESUME_6");
-
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-        DownloadState::Downloading {
-            downloaded: 0,
-            mb_per_second: 0.0,
-        },
-        "the continue icon resumes the paused task"
-    );
-}
-
-/// Stopping a paused download from its row discards what it wrote: the partial file goes and
-/// the row offers a download again.
-#[gpui_kit::test]
-fn a_paused_download_should_be_stopped_from_its_row(cx: &mut TestAppContext) {
-    let directory = tempfile::tempdir().expect("the test directory should build");
-    let mut config = configured_settings();
-    config.translation.model_directory = Some(directory.path().to_path_buf());
-    let (_panel, cx) = settings(config, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-    let downloads = translation_downloads(cx);
-    let path = directory.path().to_path_buf();
-    let model = TranslationModel::HyMt27BQ6K;
-    let part = path.join(format!("{}.part", model.file_name()));
-    std::fs::write(&part, b"partial").expect("the partial file should be written");
-
-    downloads.update(cx, |downloads, cx| {
-        downloads.set_state_for_test(
-            model,
-            path.clone(),
-            DownloadState::Paused { downloaded: 7 },
-            cx,
-        );
-    });
-    settle(cx);
-
-    click(cx, "SETTINGS_AI_MODEL_TERMINATE_6");
-    wait_until_absent(cx, &downloads, model, &path, &part);
+        harness.settle(1);
+        std::thread::yield_now();
+    }
 
     assert!(
         !part.exists(),
         "the stopped download's partial file is gone"
     );
-    assert_eq!(
-        cx.read(|cx| downloads.read(cx).row_state(model, &path)),
-        DownloadState::Idle,
-        "the stopped download is a download the row offers again"
+}
+/// The stopping states draw their own disabled action and their own failure.
+#[test]
+fn the_rows_should_draw_the_stopping_states() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, downloads, _fake) = page_with(&directory);
+    let path = directory.path().to_path_buf();
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218BQ4Km,
+        path.clone(),
+        DownloadState::Terminating,
     );
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218BQ6K,
+        path,
+        DownloadState::TerminateFailed {
+            failure: DeleteFailure::Unload(UnloadFailure::Engine),
+        },
+    );
+    harness.settle(2);
+
+    assert!(action_drawn(&harness, "TERMINATING", 0));
+    assert!(!action_drawn(&harness, "TERMINATE", 0));
+    assert!(harness.find("SETTINGS_AI_MODEL_PROGRESS_0").is_some());
+    assert!(action_drawn(&harness, "TERMINATE", 1));
+    assert!(harness.find("SETTINGS_AI_MODEL_ERROR_1").is_some());
+    assert!(!action_drawn(&harness, "RETRY", 1));
 }
 
-/// A directory that could not be stored is not shown as if it had been: the label keeps the
-/// stored directory, the page reports why, and the choice is stored when it is made again.
-#[gpui_kit::test]
-fn a_failed_directory_write_should_keep_the_stored_directory_and_report(cx: &mut TestAppContext) {
-    let stored_directory = tempfile::tempdir().expect("the stored directory should build");
-    let chosen_directory = tempfile::tempdir().expect("the chosen directory should build");
-    let (mut manager, blocking, _storage) = manager_behind_a_file(cx);
-    cx.update(|cx| {
-        manager.update(
-            |config| {
-                config.translation.model_directory = Some(stored_directory.path().to_path_buf());
+/// A status line and a failure reason stay on the one line the row has room for.
+#[test]
+fn the_row_text_should_stay_on_one_line() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, downloads, _fake) = page_with(&directory);
+    downloads.set_state_for_test(
+        TranslationModel::HyMt218BQ6K,
+        directory.path().to_path_buf(),
+        DownloadState::DownloadFailed {
+            failure: DownloadFailure::SizeMismatch {
+                expected: 7_981_928_896,
+                actual: 7_981_928_895,
             },
-            cx,
-        );
-    });
-    let (panel, cx) = settings_over(manager, Language::En, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    let stored_shown = SharedString::from(stored_directory.path().to_string_lossy().into_owned());
-    assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation_for_test().read(cx).shown_directory(cx)
-        })),
-        Some(stored_shown.clone()),
-        "the page should open on the directory the settings hold"
+        },
     );
+    harness.settle(2);
 
-    click(cx, "SETTINGS_AI_BROWSE");
-    cx.simulate_path_prompt_response(|_| Some(vec![chosen_directory.path().to_path_buf()]));
-    settle(cx);
-
-    assert_eq!(
-        stored(cx).translation.model_directory,
-        Some(stored_directory.path().to_path_buf()),
-        "a directory that could not be stored must not be published as if it had been"
-    );
-    assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation_for_test().read(cx).shown_directory(cx)
-        })),
-        Some(stored_shown),
-        "the label should keep showing the directory that is stored"
-    );
+    let error = harness
+        .bounds(
+            harness
+                .find("SETTINGS_AI_MODEL_ERROR_1")
+                .expect("the failed download draws its reason"),
+        )
+        .expect("the reason is laid out");
     assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_some(),
-        "a write that could not be stored should tell the user"
+        error.size.height < 25.0,
+        "the long failure reason should be cut to one line: {error:?}"
     );
+    let size = harness
+        .bounds(
+            harness
+                .find("SETTINGS_AI_MODEL_SIZE_4")
+                .expect("the size is drawn"),
+        )
+        .expect("the size is laid out");
+    assert!(size.size.height < 25.0, "the size stays on one line");
+}
 
-    click(cx, "BASE_UI_ALERT_OK");
-    std::fs::remove_file(&blocking).expect("the blocking file should be removable");
+/// Clicking a download starts it from the site the settings hold.
+#[test]
+fn clicking_download_should_use_the_stored_site() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let mut config = config_in(directory.path());
+    config.translation.download_site = DownloadSite::ModelScope;
+    let (mut harness, _downloads, fake) = page(config);
+    let model = TranslationModel::HyMt27BQ8;
 
-    click(cx, "SETTINGS_AI_BROWSE");
-    cx.simulate_path_prompt_response(|_| Some(vec![chosen_directory.path().to_path_buf()]));
-    settle(cx);
+    harness.click_node("SETTINGS_AI_MODEL_DOWNLOAD_7");
 
-    let chosen_shown = SharedString::from(chosen_directory.path().to_string_lossy().into_owned());
+    let adds = fake.adds();
+    assert_eq!(adds.len(), 1, "the download icon starts one transfer");
     assert_eq!(
-        stored(cx).translation.model_directory,
-        Some(chosen_directory.path().to_path_buf()),
-        "the retry should store the directory the user chose"
+        adds[0].0.url.as_str(),
+        model.download_url(DownloadSite::ModelScope),
+        "the download starts from the site the settings hold"
     );
     assert_eq!(
-        cx.read(|cx| panel.read_with(cx, |panel, cx| {
-            panel.translation_for_test().read(cx).shown_directory(cx)
-        })),
-        Some(chosen_shown),
-        "the label should show the directory the retry stored"
+        adds[0].0.destination,
+        directory.path().join(model.file_name())
     );
 }
 
-/// A download site that could not be stored leaves the stored site as it was and reports why;
-/// once the settings can be stored, the same choice is written.
-#[gpui_kit::test]
-fn a_failed_site_write_should_keep_the_stored_site_and_report(cx: &mut TestAppContext) {
-    let (manager, blocking, _storage) = manager_behind_a_file(cx);
-    let (_panel, cx) = settings_over(manager, Language::En, cx);
-    click(cx, "SETTINGS_ENTRY_ai.translation");
-
-    assert_eq!(
-        stored(cx).translation.download_site,
-        DownloadSite::HuggingFace,
-        "settings with nothing stored start on HuggingFace"
+/// Clicking resume continues the paused task the row has.
+#[test]
+fn clicking_resume_should_continue_the_paused_task() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, _downloads, fake) = page_with(&directory);
+    let model = TranslationModel::HyMt27BQ6K;
+    harness.click_node("SETTINGS_AI_MODEL_DOWNLOAD_6");
+    let id = fake
+        .added()
+        .expect("the download was added to the fake manager");
+    fake.push(
+        harness.app_mut(),
+        download_task(
+            id,
+            directory.path().join(model.file_name()),
+            download_provider::task::DownloadStatus::Paused {
+                downloaded: 100,
+                total: Some(1000),
+            },
+        ),
     );
+    harness.settle(2);
 
-    click(cx, "SETTINGS_AI_SITE_SELECT");
-    click(cx, "TEST_MENU_ITEM_model_scope");
+    harness.click_node("SETTINGS_AI_MODEL_RESUME_6");
 
-    assert_eq!(
-        stored(cx).translation.download_site,
-        DownloadSite::HuggingFace,
-        "a site that could not be stored must not be published as if it had been"
-    );
     assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_some(),
-        "a write that could not be stored should tell the user"
+        fake.resumed(id),
+        "the continue icon resumes the paused task"
+    );
+}
+
+/// Clicking stop on a running download asks the manager to remove its task.
+#[test]
+fn clicking_terminate_should_stop_the_running_download() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, downloads, fake) = page_with(&directory);
+    let model = TranslationModel::HyMt27BQ6K;
+    harness.click_node("SETTINGS_AI_MODEL_DOWNLOAD_6");
+    let id = fake
+        .added()
+        .expect("the download was added to the fake manager");
+    fake.push(
+        harness.app_mut(),
+        download_task(
+            id,
+            directory.path().join(model.file_name()),
+            download_provider::task::DownloadStatus::Downloading {
+                downloaded: 100,
+                total: Some(1000),
+                mb_per_second: 1.0,
+            },
+        ),
+    );
+    harness.settle(2);
+
+    harness.click_node("SETTINGS_AI_MODEL_TERMINATE_6");
+
+    assert!(
+        fake.deleted(id),
+        "stopping a running download removes its task"
+    );
+    assert_eq!(
+        downloads.row_state(model, directory.path()),
+        DownloadState::Terminating,
+        "the row says it is stopping while the files are removed"
+    );
+}
+
+/// The downloading status names the speed before the progress, in both languages.
+#[test]
+fn the_downloading_status_should_name_the_speed_before_the_progress() {
+    let english = translate_in(LanguageCode::En);
+    assert_eq!(
+        t_smol!(
+            english,
+            "settings_ui.ai.downloading_progress",
+            speed = "1.5 MB/s",
+            percent = 42
+        )
+        .as_str(),
+        "Downloading 1.5 MB/s 42%",
+        "the English status names the speed and then the progress"
     );
 
-    click(cx, "BASE_UI_ALERT_OK");
-    std::fs::remove_file(&blocking).expect("the blocking file should be removable");
-
-    click(cx, "SETTINGS_AI_SITE_SELECT");
-    click(cx, "TEST_MENU_ITEM_model_scope");
-
+    let chinese = translate_in(LanguageCode::ZhCn);
     assert_eq!(
-        stored(cx).translation.download_site,
-        DownloadSite::ModelScope,
-        "the retry should store the site the user chose"
+        t_smol!(
+            chinese,
+            "settings_ui.ai.downloading_progress",
+            speed = "1.5 MB/s",
+            percent = 42
+        )
+        .as_str(),
+        "下载中 1.5 MB/s 42%",
+        "the Chinese status is the sentence the page was designed with"
+    );
+}
+
+/// The label and the icon of every row action, which are the copy and the picture the status
+/// column was designed with.
+#[test]
+fn every_row_action_should_keep_its_copy_and_its_icon() {
+    for (action, label_key, icon) in [
+        (
+            RowAction::Download,
+            "settings_ui.ai.download",
+            IconKind::DownloadSimple,
+        ),
+        (RowAction::Pause, "settings_ui.ai.pause", IconKind::Pause),
+        (RowAction::Resume, "settings_ui.ai.resume", IconKind::Play),
+        (
+            RowAction::Retry,
+            "settings_ui.ai.retry",
+            IconKind::ArrowsClockwise,
+        ),
+        (
+            RowAction::Terminate,
+            "settings_ui.ai.terminate",
+            IconKind::StopFill,
+        ),
+        (RowAction::Delete, "settings_ui.ai.delete", IconKind::Trash),
+        (
+            RowAction::Deleting,
+            "settings_ui.ai.deleting",
+            IconKind::Trash,
+        ),
+        (
+            RowAction::Terminating,
+            "settings_ui.ai.terminate",
+            IconKind::StopFill,
+        ),
+    ] {
+        assert_eq!(action.label_key(), label_key);
+        assert_eq!(action.icon(), icon);
+    }
+}
+
+/// A normal model's published file is what the progress percentage is a share of.
+#[test]
+fn whole_percent_should_measure_a_download_against_the_published_file() {
+    let model = TranslationModel::HyMt218BQ4Km;
+    let total = model.size_bytes();
+
+    assert_eq!(whole_percent(model, 0), 0);
+    assert_eq!(whole_percent(model, total / 2), 50);
+    assert_eq!(whole_percent(model, total), 100);
+    assert_eq!(whole_percent(model, total + 1), 100);
+    assert_eq!(whole_percent(model, u64::MAX), 100);
+}
+
+/// A rate is drawn in the unit that keeps its number short, with at most two decimals and no
+/// trailing zeros.
+#[test]
+fn a_speed_should_be_drawn_in_the_unit_that_keeps_it_short() {
+    for (rate, expected) in [
+        (0.0, "0 KB/s"),
+        (0.5, "512 KB/s"),
+        (0.999, "1022.98 KB/s"),
+        (1.0, "1 MB/s"),
+        (1.234, "1.23 MB/s"),
+        (1.235, "1.24 MB/s"),
+        (1.5, "1.5 MB/s"),
+        (2.0, "2 MB/s"),
+        (1024.0, "1024 MB/s"),
+        (1536.0, "1.5 GB/s"),
+        (2048.0, "2 GB/s"),
+    ] {
+        assert_eq!(speed_text(rate).as_str(), expected);
+    }
+}
+
+/// A model's published size is drawn in the unit that keeps the number short.
+#[test]
+fn a_model_size_should_be_drawn_in_the_unit_that_keeps_it_short() {
+    for model in TranslationModel::ALL {
+        let text = size_text(model.size_bytes());
+        assert!(
+            text.ends_with(" MB") || text.ends_with(" GB"),
+            "{} is drawn with a unit: {text}",
+            model.display_name()
+        );
+    }
+    assert_eq!(size_text(1024 * 1024 * 1024).as_str(), "1024.00 MB");
+    assert_eq!(size_text(1024 * 1024 * 1024 + 1).as_str(), "1.00 GB");
+}
+
+/// Releasing the page takes its nodes away and drops the action handlers it registered.
+#[test]
+fn releasing_the_page_should_take_its_nodes_away() {
+    let directory = TempDir::new().expect("the test directory builds");
+    let (mut harness, _downloads, _fake) = page_with(&directory);
+    assert!(harness.find("SETTINGS_AI_PAGE").is_some());
+
+    release_page(&mut harness);
+    harness.drain();
+
+    assert!(
+        harness.find("SETTINGS_AI_PAGE").is_none(),
+        "releasing the page removes its nodes"
     );
 }

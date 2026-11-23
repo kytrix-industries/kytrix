@@ -26,7 +26,6 @@
 use std::{collections::VecDeque, ops::Range, path::PathBuf, sync::Arc};
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use gpui_kit::SharedString;
 use kytrix_service_provider::service::{
     engine::{TweetReference, XProfileEvent, XTweetEvent, XTweetMedia, XTweetTextSegment},
     x::{MAX_X_SEARCH_PROFILES, MAX_X_SELECTIONS, XSelection, XSelectionsResponse},
@@ -63,9 +62,9 @@ pub(super) type MediaStates = Arc<HashMap<SmolStr, MediaState>>;
 /// One author a tweet is read with.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TweetAuthor {
-    pub username: SharedString,
-    pub display_name: SharedString,
-    pub avatar_url: SharedString,
+    pub username: SmolStr,
+    pub display_name: SmolStr,
+    pub avatar_url: SmolStr,
     pub verified: bool,
     revision: u64,
 }
@@ -73,9 +72,9 @@ pub(super) struct TweetAuthor {
 impl From<XProfileEvent> for TweetAuthor {
     fn from(profile: XProfileEvent) -> Self {
         Self {
-            username: SharedString::new(profile.username.as_str()),
-            display_name: SharedString::new(profile.display_name.as_str()),
-            avatar_url: SharedString::new(profile.avatar_url.as_str()),
+            username: SmolStr::new(profile.username.as_str()),
+            display_name: SmolStr::new(profile.display_name.as_str()),
+            avatar_url: SmolStr::new(profile.avatar_url.as_str()),
             verified: profile.verified,
             revision: profile.revision,
         }
@@ -89,9 +88,9 @@ impl TweetAuthor {
     /// read yet is still an author, and a row that waited for one would be a hole in the feed.
     pub(super) fn fallback(x_user_id: &str) -> Self {
         Self {
-            username: SharedString::new(x_user_id),
-            display_name: SharedString::new(format_smolstr!("@{x_user_id}").as_str()),
-            avatar_url: SharedString::new_static(""),
+            username: SmolStr::new(x_user_id),
+            display_name: format_smolstr!("@{x_user_id}"),
+            avatar_url: SmolStr::new_static(""),
             verified: false,
             revision: 0,
         }
@@ -109,18 +108,18 @@ pub(super) enum TweetReferenceItem {
 #[derive(Debug)]
 pub(super) enum TweetMediaItem {
     Image {
-        image_url: SharedString,
+        image_url: SmolStr,
         width: u32,
         height: u32,
     },
     /// A video, of which only the still frame is ever fetched.
     Video {
-        thumbnail_url: SharedString,
+        thumbnail_url: SmolStr,
         width: u32,
         height: u32,
     },
     Gif {
-        image_url: SharedString,
+        image_url: SmolStr,
         width: u32,
         height: u32,
         /// Whether the picture is a still frame standing in for an animation that is not
@@ -145,7 +144,7 @@ impl TweetMediaItem {
     }
 
     /// The URL this item is fetched from, which for a video is its still frame.
-    pub(super) fn url(&self) -> &SharedString {
+    pub(super) fn url(&self) -> &SmolStr {
         match self {
             Self::Image { image_url, .. } | Self::Gif { image_url, .. } => image_url,
             Self::Video { thumbnail_url, .. } => thumbnail_url,
@@ -161,7 +160,7 @@ impl From<XTweetMedia> for TweetMediaItem {
                 width,
                 height,
             } => Self::Image {
-                image_url: SharedString::new(image_url.as_str()),
+                image_url: SmolStr::new(image_url.as_str()),
                 width,
                 height,
             },
@@ -171,7 +170,7 @@ impl From<XTweetMedia> for TweetMediaItem {
                 height,
                 ..
             } => Self::Video {
-                thumbnail_url: SharedString::new(thumbnail_url.as_str()),
+                thumbnail_url: SmolStr::new(thumbnail_url.as_str()),
                 width,
                 height,
             },
@@ -182,7 +181,7 @@ impl From<XTweetMedia> for TweetMediaItem {
                 height,
             } => Self::Gif {
                 poster_only: animation_url != image_url && !is_animated_image_url(&image_url),
-                image_url: SharedString::new(image_url.as_str()),
+                image_url: SmolStr::new(image_url.as_str()),
                 width,
                 height,
             },
@@ -195,7 +194,7 @@ impl From<XTweetMedia> for TweetMediaItem {
 pub(super) struct TweetTextLink {
     /// The byte range of the link within the tweet's whole text.
     pub range: Range<usize>,
-    pub url: SharedString,
+    pub url: SmolStr,
 }
 
 /// The text of a tweet, joined into one string with the ranges that are links.
@@ -205,7 +204,7 @@ pub(super) struct TweetTextLink {
 /// built from one element per segment cannot wrap a line in the middle of a sentence.
 #[derive(Debug)]
 pub(super) struct TweetText {
-    text: SharedString,
+    text: SmolStr,
     links: Box<[TweetTextLink]>,
 }
 
@@ -220,18 +219,18 @@ impl TweetText {
             if let Some(url) = segment.url {
                 links.push(TweetTextLink {
                     range: start..text.len(),
-                    url: SharedString::new(url.as_str()),
+                    url: SmolStr::new(url.as_str()),
                 });
             }
         }
         Self {
-            text: SharedString::new(text),
+            text: SmolStr::new(text),
             links: links.into_boxed_slice(),
         }
     }
 
     /// The text itself, for a row that draws it as one paragraph.
-    pub(super) fn shared(&self) -> SharedString {
+    pub(super) fn shared(&self) -> SmolStr {
         self.text.clone()
     }
 
@@ -260,6 +259,14 @@ impl TweetItem {
         &self.tweet_id
     }
 
+    /// When this tweet was published, in Unix seconds.
+    ///
+    /// The row's age is derived on the frame that draws it, in the reader's zone and
+    /// language, so the plan stores the instant rather than a formatted age.
+    pub(super) const fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
     /// The tweet this row shows, and whether it is a repost of it.
     ///
     /// A repost is drawn as the tweet that was reposted — its text, its author, its pictures —
@@ -270,16 +277,6 @@ impl TweetItem {
             Some(TweetReferenceItem::Repost(tweet)) => (tweet, true),
             Some(TweetReferenceItem::Quote(_)) | None => (self, false),
         }
-    }
-
-    /// How long ago this tweet was published, read in `zone`.
-    pub(super) fn age(&self, now: OffsetDateTime, zone: UtcOffset) -> TweetAge {
-        tweet_age(self.timestamp, now, zone)
-    }
-
-    /// When this tweet was published, read in `zone`, to the second.
-    pub(super) fn published_at(&self, zone: UtcOffset) -> SharedString {
-        absolute_time(self.timestamp, zone)
     }
 }
 
@@ -532,13 +529,13 @@ fn collect_media_urls(
     seen: &mut HashSet<SmolStr>,
 ) {
     if let Some(author) = profiles.get(&tweet.x_user_id) {
-        push_media_url(author.avatar_url.as_ref(), urls, seen);
+        push_media_url(author.avatar_url.as_str(), urls, seen);
     }
     for media in &tweet.media {
         if urls.len() == MAX_MEDIA_URLS {
             return;
         }
-        push_media_url(media.url().as_ref(), urls, seen);
+        push_media_url(media.url().as_str(), urls, seen);
     }
     if let Some(TweetReferenceItem::Repost(tweet) | TweetReferenceItem::Quote(tweet)) =
         tweet.reference.as_ref()
@@ -635,7 +632,7 @@ pub(super) fn tweet_age(timestamp: i64, now: OffsetDateTime, zone: UtcOffset) ->
 }
 
 /// When a tweet was published, read in `zone`, to the second.
-pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
     // The offset can move an instant past the last date the calendar holds — a
     // timestamp at the far end of the range is one the service cannot publish, and
     // it is written as a placeholder rather than taken to a date that is not one.
@@ -643,19 +640,16 @@ pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SharedString {
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--"),
+            || SmolStr::new_static("--"),
             |time| {
-                SharedString::new(
-                    format_smolstr!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        time.year(),
-                        u8::from(time.month()),
-                        time.day(),
-                        time.hour(),
-                        time.minute(),
-                        time.second()
-                    )
-                    .as_str(),
+                format_smolstr!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    time.year(),
+                    u8::from(time.month()),
+                    time.day(),
+                    time.hour(),
+                    time.minute(),
+                    time.second()
                 )
             },
         )
@@ -670,11 +664,11 @@ pub(super) fn absolute_time(timestamp: i64, zone: UtcOffset) -> SharedString {
 /// here, so no two answers can disagree about one row.
 pub(super) fn selection_name<'a>(
     selection: &'a XSelection,
-    hints: &'a HashMap<SmolStr, SharedString>,
+    hints: &'a HashMap<SmolStr, SmolStr>,
 ) -> Option<&'a str> {
     match selection.profile.as_ref() {
         Some(profile) => Some(profile.username.as_str()),
-        None => hints.get(&selection.x_user_id).map(SharedString::as_str),
+        None => hints.get(&selection.x_user_id).map(SmolStr::as_str),
     }
 }
 
@@ -687,9 +681,9 @@ pub(super) fn selection_name<'a>(
 /// What is left is a memo beside the rows rather than a second list of accounts, which is what
 /// keeps a name from outliving the row it belongs to.
 pub(super) fn retained_hints(
-    hints: &HashMap<SmolStr, SharedString>,
+    hints: &HashMap<SmolStr, SmolStr>,
     selections: &[XSelection],
-) -> HashMap<SmolStr, SharedString> {
+) -> HashMap<SmolStr, SmolStr> {
     let mut retained = HashMap::with_capacity(hints.len());
     retained.extend(hints.iter().filter_map(|(x_user_id, name)| {
         let unnamed = selections
@@ -749,7 +743,7 @@ impl SelectionData {
     pub(super) fn contains_username(
         &self,
         username: &str,
-        hints: &HashMap<SmolStr, SharedString>,
+        hints: &HashMap<SmolStr, SmolStr>,
     ) -> bool {
         self.selections.iter().any(|selection| {
             selection_name(selection, hints).is_some_and(|name| name.eq_ignore_ascii_case(username))
@@ -1041,12 +1035,12 @@ mod tests {
             media: Vec::new(),
         });
 
-        assert_eq!(item.text.shared().as_ref(), "😀 @a x.test");
+        assert_eq!(item.text.shared().as_str(), "😀 @a x.test");
         assert_eq!(
             item.text
                 .links()
                 .iter()
-                .map(|link| (link.range.clone(), link.url.as_ref()))
+                .map(|link| (link.range.clone(), link.url.as_str()))
                 .collect::<Vec<_>>(),
             [(5..7, "https://x.com/a"), (8..14, "https://t.co/a")]
         );
@@ -1205,7 +1199,7 @@ mod tests {
     #[test]
     fn absolute_time_should_be_read_in_the_display_zone_to_the_second() {
         assert_eq!(
-            absolute_time(1_800_000_000_000, UtcOffset::UTC).as_ref(),
+            absolute_time(1_800_000_000_000, UtcOffset::UTC).as_str(),
             "2027-01-15 08:00:00"
         );
         assert_eq!(
@@ -1213,10 +1207,10 @@ mod tests {
                 1_800_000_000_000,
                 UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "2027-01-15 16:00:00"
         );
-        assert_eq!(absolute_time(i64::MAX, UtcOffset::UTC).as_ref(), "--");
+        assert_eq!(absolute_time(i64::MAX, UtcOffset::UTC).as_str(), "--");
     }
 
     /// The display offset can move an instant past the last day the calendar holds, so
@@ -1234,7 +1228,7 @@ mod tests {
             .expect("the last day is a millisecond timestamp");
         let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
 
-        assert_eq!(absolute_time(timestamp, zone).as_ref(), "--");
+        assert_eq!(absolute_time(timestamp, zone).as_str(), "--");
         assert_eq!(
             tweet_age(timestamp, OffsetDateTime::now_utc(), zone),
             TweetAge::Seconds(0),
@@ -1250,7 +1244,7 @@ mod tests {
         let zone = UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset");
 
         assert_eq!(
-            absolute_time(timestamp, zone).as_ref(),
+            absolute_time(timestamp, zone).as_str(),
             "--",
             "a western offset runs off the other end of the calendar"
         );
@@ -1344,9 +1338,9 @@ mod tests {
             x_account_limit: 3,
         });
         let hints = HashMap::from([
-            (SmolStr::new_static("1"), SharedString::new_static("stale")),
-            (SmolStr::new_static("2"), SharedString::new_static("two")),
-            (SmolStr::new_static("9"), SharedString::new_static("nine")),
+            (SmolStr::new_static("1"), SmolStr::new_static("stale")),
+            (SmolStr::new_static("2"), SmolStr::new_static("two")),
+            (SmolStr::new_static("9"), SmolStr::new_static("nine")),
         ]);
 
         assert!(
@@ -1376,7 +1370,7 @@ mod tests {
     /// id — and by nothing at all when nothing is.
     #[test]
     fn a_row_should_be_named_by_its_profile_or_by_what_is_remembered_for_its_id() {
-        let hints = HashMap::from([(SmolStr::new_static("2"), SharedString::new_static("two"))]);
+        let hints = HashMap::from([(SmolStr::new_static("2"), SmolStr::new_static("two"))]);
 
         assert_eq!(
             selection_name(&selection("1", Some("one")), &hints),
@@ -1400,9 +1394,9 @@ mod tests {
     #[test]
     fn remembered_hints_should_be_pruned_to_the_rows_they_still_name() {
         let hints = HashMap::from([
-            (SmolStr::new_static("1"), SharedString::new_static("stale")),
-            (SmolStr::new_static("2"), SharedString::new_static("two")),
-            (SmolStr::new_static("3"), SharedString::new_static("gone")),
+            (SmolStr::new_static("1"), SmolStr::new_static("stale")),
+            (SmolStr::new_static("2"), SmolStr::new_static("two")),
+            (SmolStr::new_static("3"), SmolStr::new_static("gone")),
         ]);
 
         let read = [
@@ -1413,7 +1407,7 @@ mod tests {
         let retained = retained_hints(&hints, &read);
 
         assert_eq!(
-            retained.get("2").map(SharedString::as_str),
+            retained.get("2").map(SmolStr::as_str),
             Some("two"),
             "a hint for a row that is still waiting to be activated should be kept"
         );

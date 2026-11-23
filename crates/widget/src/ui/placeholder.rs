@@ -1,459 +1,439 @@
 //! What a widget body shows while it has nothing of its own to render.
 //!
 //! A placeholder replaces the body, never accompanies it: either the widget has
-//! content and draws it, or it does not and this stands in its place. Anything
-//! the user must read while content *is* on screen belongs to a banner instead.
+//! content and draws it, or it does not and this stands in its place. Anything the
+//! user must read while content *is* on screen belongs to a banner instead.
 //!
-//! It fills its stand-in box and places its own contents; what that box looks
-//! like — its background and its corners — is the body slot's, drawn by
-//! [`crate::surface`], so a placeholder reads as the same surface a real body
-//! does.
+//! The three stand-ins are built from the shared component library:
 //!
-//! The widget's own message is drawn by the markdown component, so a copy that
-//! points at a control can carry that control's icon and its label inside one
-//! `<kbd>`. The other two places this stands in — the name of the work in
-//! progress, and a failure's detail — are plain text: a failure has to read
-//! exactly as it was reported, and it is drawn from the same string in the banner
-//! beside content.
+//! | situation | components |
+//! |---|---|
+//! | busy (`Connecting`, `Loading`, `Ready`) | [`kit::spinner`](base_ui::kit::spinner), labelled with the name of the work |
+//! | waiting (a plain [`Notice`]) | the notice's sentence in a muted [`kit::empty_state`](base_ui::kit::empty_state) |
+//! | waiting (a rich [`Notice`]) | the notice's markdown through [`kit::markdown`](base_ui::kit::markdown) |
+//! | failed ([`Failure`]) | the failure's detail plus a [`kit::button`](base_ui::kit::button) that runs the recovery |
 //!
-//! The component draws its document across the whole width it is given, so every
-//! line of a message starts at the same left edge, one line or several. A message
-//! is therefore laid out like the rest of the interface's prose rather than
-//! centred line by line; the plain-text stands-in above are centred because they
-//! are single runs of text this element can place itself.
+//! A waiting notice is a **catalogue reference**, and the catalogue authors some of
+//! those values as rich text: `common.market_not_loaded` is an aligned paragraph
+//! with a `<kbd>` icon and one markdown line per venue (see [`crate::venue`]), and
+//! several widgets' own notices (`widget.news.logged_out`, say) are `<p …>`
+//! paragraphs as well. Drawing their source as plain text would put
+//! `<p align="center">…` and `![](file://…)` in front of the user, so a notice
+//! whose resolved value carries markup goes through the engine's markdown component
+//! — which is the same component the rest of the interface reads catalogue markdown
+//! with. [`Notice::is_markdown`] answers that question in the language showing now;
+//! a plain notice stays a sentence, drawn by the empty state.
 //!
 //! This lives with the framework rather than with the shared component library
-//! because it is not a general-purpose component: it exists to be a widget
-//! body's stand-in, and only the framework decides when one is shown. The
-//! primitives it is built from — the spinner, the style, the buttons — stay in
-//! [`ui`], which this crate depends on.
+//! because it is not a general-purpose component: it exists to be a widget body's
+//! stand-in, and only the framework decides when one is shown.
+//!
+//! # Ownership
+//!
+//! A [`Placeholder`] owns the stateful components it built (a spinner, a recovery
+//! button, a markdown node), so the surface can drive their `sync`, forward events
+//! their way, and release them when the state moves on. The nodes themselves are
+//! removed by the surface through [`App::remove_node`]: the nodes are removed first,
+//! then the components' scopes and action handlers are released — the engine's
+//! documented teardown order (E16; the same order
+//! [`App::remove_node_with_scope`](ui_core::app::App::remove_node_with_scope) uses).
+
+use std::{borrow::Cow, sync::Arc};
 
 use base_ui::{
-    markdown::view::{Markdown, MarkdownState},
-    spinner::Spinner,
-    style::theme::ThemeExt,
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        spinner::Spinner,
+    },
+    theme::role::Role,
 };
-use gpui_kit::{prelude::FluentBuilder, *};
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    event::Event,
+    node::{builder::NodeBuilder, id::NodeId},
+    paint::style::StylePatch,
+    text::TextStyle,
+};
 
-/// The stand-in a widget body uses while it has nothing to render.
+use crate::{
+    cx::WidgetCx,
+    status::{Failure, Notice},
+};
+
+/// The size the stand-in's own text is drawn at.
+const PLACEHOLDER_TEXT_SIZE: f32 = 13.0;
+/// The spinner size: visible without competing with the pane's content.
+const SPINNER_SIZE: f32 = 18.0;
+
+/// The embedded product assets, as the markdown parser's image-size seam.
 ///
-/// One of three things: the widget is busy and this names the work under a
-/// spinner, the widget has a notice to show, or the widget failed. Only the
-/// failure is announced as an alert — a notice is a status, not a problem.
-#[derive(IntoElement)]
-pub struct WidgetPlaceholder {
-    message: PlaceholderMessage,
-    kind: PlaceholderKind,
-    action: Option<AnyElement>,
-    id: ElementId,
+/// The parser only needs the file header of an inline image, and only when the source
+/// writes no explicit `?size=`. `common.market_not_loaded` writes a size for every
+/// brand logo; the `<kbd>` icon is an SVG the engine has no rasterized asset for, so
+/// it resolves to the parser's default size. Nothing here decodes pixels: the static
+/// image payload is a marker box (the resource pipeline for rich-text images belongs
+/// to the asset batch, not to the widget contract).
+struct EmbeddedAssets;
+
+impl MarkdownAssets for EmbeddedAssets {
+    fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+        base_ui::kit::assets::bytes(path).map(Cow::Borrowed)
+    }
 }
 
-/// What a stand-in says.
-enum PlaceholderMessage {
-    /// Words drawn as they stand: the name of the work in progress, and a failure's detail.
-    Plain(SharedString),
-    /// The document a notice resolves to, drawn by the markdown component.
-    Markdown(Entity<MarkdownState>),
+/// The components one placeholder is built from.
+///
+/// The nodes are already in the tree; this is what the surface keeps to drive them.
+#[derive(Default)]
+pub struct Placeholder {
+    spinner: Option<Spinner>,
+    button: Option<Button>,
+    markdown: Option<MarkdownNode>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum PlaceholderKind {
-    /// Busy, under the name of the work in progress.
-    Busy,
-    /// A notice: an empty state, a signed-out state.
-    Message,
-    /// A failure, announced as an alert.
-    Failure,
-}
-
-impl WidgetPlaceholder {
-    /// Stands in for a widget that is establishing its connection.
-    pub fn connect(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        Self::busy(id, text)
-    }
-
-    /// Stands in for a widget that is fetching or refreshing data.
-    pub fn load(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        Self::busy(id, text)
-    }
-
-    fn busy(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        Self {
-            message: PlaceholderMessage::Plain(text.into()),
-            kind: PlaceholderKind::Busy,
-            action: None,
-            id: id.into(),
-        }
-    }
-
-    /// Stands in for a widget with a notice and nothing to show yet.
+impl Placeholder {
+    /// Builds the busy stand-in under `parent`.
     ///
-    /// `document` is the markdown the notice's sentence resolves to, and it belongs to the
-    /// widget instance: the framework re-reads it into that one document rather than
-    /// building a new one per frame, so the parse is reused until the sentence moves.
-    pub fn message(id: impl Into<ElementId>, document: &Entity<MarkdownState>) -> Self {
-        Self {
-            message: PlaceholderMessage::Markdown(document.clone()),
-            kind: PlaceholderKind::Message,
-            action: None,
-            id: id.into(),
+    /// `label` names the work in progress, drawn under the spinner; `None` draws the
+    /// spinner alone, which is what a widget that is ready with nothing to say shows.
+    pub fn busy(
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        label: Option<SmolStr>,
+    ) -> Result<Self, EngineError> {
+        let key = spinner_key(parent);
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let mut spinner = Spinner::new(cx.app_mut(), theme, key)
+            .with_size(SPINNER_SIZE)
+            .with_role(Role::BrandBase);
+        if let Some(label) = label.as_ref() {
+            spinner = spinner.with_label(label.clone());
         }
+        spinner.build(cx.app_mut(), window, parent)?;
+
+        if let Some(label) = label {
+            let theme = cx.theme().clone();
+            NodeBuilder::text(label, TextStyle::new(PLACEHOLDER_TEXT_SIZE))
+                .bind_style(move |read| StylePatch {
+                    foreground: Some(theme.role(read, Role::FgMuted)),
+                    ..StylePatch::default()
+                })
+                .build(cx.tree_mut(), parent)?;
+        }
+
+        Ok(Self {
+            spinner: Some(spinner),
+            button: None,
+            markdown: None,
+        })
     }
 
-    /// Stands in for a widget that failed before it had anything to show.
+    /// Builds a widget's own notice under `parent`.
     ///
-    /// `text` is the failure detail exactly as the widget reported it. A
-    /// placeholder adds nothing to it — no prefix, no wrapper — so a failure
-    /// reads the same here as it does in a banner beside content.
-    pub fn failure(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        Self {
-            message: PlaceholderMessage::Plain(text.into()),
-            kind: PlaceholderKind::Failure,
-            action: None,
-            id: id.into(),
+    /// A plain notice is one sentence: the catalogue holds it as text, and it is
+    /// resolved in the language showing now. A rich notice ([`Notice::is_markdown`])
+    /// is authored as markdown/HTML and is drawn by the engine's markdown component;
+    /// its sentence is resolved here too, because the surface rebuilds the
+    /// stand-in when the notice or the language moves.
+    pub fn notice(
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        notice: &Notice,
+    ) -> Result<Self, EngineError> {
+        if notice.is_markdown(cx.translate()) {
+            let source = notice.resolve(cx.translate());
+            let document = parse_document(source.as_str(), &EmbeddedAssets);
+            let window = cx.window();
+            let theme = cx.theme().clone();
+            let markdown =
+                MarkdownNode::mount(cx.app_mut(), window, parent, theme, Arc::new(document))?;
+
+            return Ok(Self {
+                spinner: None,
+                button: None,
+                markdown: Some(markdown),
+            });
         }
+
+        let text = notice.resolve(cx.translate());
+        EmptyState::new(cx.theme().clone(), notice_key(parent))
+            .text(text)
+            .build(cx.tree_mut(), parent)?;
+
+        Ok(Self::default())
     }
 
-    /// Adds the recovery control offered alongside the text.
+    /// Builds a failure under `parent`: its detail exactly as the error states it,
+    /// plus the recovery control the failure offers.
+    pub fn failure(
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        failure: &Failure,
+    ) -> Result<Self, EngineError> {
+        failure_text(cx, parent, failure)?;
+        let button = recovery_button(cx, parent, failure, button_key(parent))?;
+
+        Ok(Self {
+            spinner: None,
+            button,
+            markdown: None,
+        })
+    }
+
+    /// Frame-driven synchronization of the stateful components.
     ///
-    /// A busy placeholder shows no control, so this is ignored while the widget
-    /// is working.
-    pub fn action(mut self, action: impl IntoElement) -> Self {
-        self.action = Some(action.into_any_element());
-        self
+    /// Called only while the placeholder is on screen: a hidden spinner must not keep
+    /// an animation alive, so the surface releases the placeholder instead of hiding
+    /// it. The markdown node is static payload baked for an appearance; its `sync`
+    /// rebuilds the subtree when the appearance moved (the one dynamic channel a
+    /// per-run coloured document has).
+    pub fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        if let Some(spinner) = &self.spinner {
+            spinner.sync(app)?;
+        }
+        if let Some(button) = &self.button {
+            button.sync(app)?;
+        }
+        if let Some(markdown) = &mut self.markdown {
+            markdown.sync(app);
+        }
+        Ok(())
+    }
+
+    /// Forwards one platform event to the controls the placeholder built.
+    pub fn dispatch(&self, app: &mut App, event: &Event) -> bool {
+        self.button
+            .as_ref()
+            .is_some_and(|button| button.dispatch(app, event))
+    }
+
+    /// Releases the components' scopes and action handlers. Returns the number of
+    /// signal values released.
+    pub fn release(&self, app: &mut App) -> usize {
+        let spinner = self
+            .spinner
+            .as_ref()
+            .map_or(0, |spinner| spinner.release(app));
+        let button = self.button.as_ref().map_or(0, |button| button.release(app));
+
+        spinner + button
     }
 }
 
-impl RenderOnce for WidgetPlaceholder {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let Self {
-            message,
-            kind,
-            action,
-            id,
-        } = self;
+/// Builds a failure's detail under `parent`.
+///
+/// The text is a live binding: the closure reads the language signal and then
+/// renders through the translator, so moving the language redraws the sentence
+/// without the surface rebuilding anything. This is the pattern every widget's own
+/// language-dependent text follows.
+pub(crate) fn failure_text(
+    cx: &mut WidgetCx<'_>,
+    parent: NodeId,
+    failure: &Failure,
+) -> Result<NodeId, EngineError> {
+    let language = cx.language();
+    let translate = cx.translate().clone();
+    let theme = cx.theme().clone();
+    let failure = failure.clone();
 
-        let theme = cx.theme();
-        let (role, color) = match kind {
-            PlaceholderKind::Busy => (Role::ProgressIndicator, theme.roles.fg.default),
-            PlaceholderKind::Message => (Role::Status, theme.roles.fg.default),
-            PlaceholderKind::Failure => (Role::Alert, theme.roles.status.danger.base),
-        };
+    NodeBuilder::text(SmolStr::default(), TextStyle::new(PLACEHOLDER_TEXT_SIZE))
+        .bind_text(move |read| {
+            let _language: ui_core::node::signal::SignalRef<LanguageCode> = read.read(&language);
+            failure.text(&translate)
+        })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, Role::StatusDangerBase)),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), parent)
+}
 
-        // Whatever shape the message has, the stand-in is announced as one name: a failure's
-        // detail as it stands, and a markdown message as the text of the document it was
-        // drawn from — never the markup of it, and never a control's icon spelled out.
-        let (label, content) = match message {
-            // A failure reads exactly as it was reported: the banner draws the same string
-            // as plain text, and passing it through a parser here would let the two disagree.
-            PlaceholderMessage::Plain(text) => (text.clone(), div().child(text).into_any_element()),
-            PlaceholderMessage::Markdown(document) => (
-                document.read(cx).plain_text(),
-                Markdown::new(&document)
-                    .text_color(color.hsla)
-                    .into_any_element(),
-            ),
-        };
+/// Builds a failure's recovery control under `parent`.
+///
+/// A control that does not accept input is given no click handler at all: `disabled`
+/// only draws that state, it does not stop a click.
+pub(crate) fn recovery_button(
+    cx: &mut WidgetCx<'_>,
+    parent: NodeId,
+    failure: &Failure,
+    key: SmolStr,
+) -> Result<Option<Button>, EngineError> {
+    let action = failure.action();
+    let label = action.label(cx.translate());
+    let enabled = action.is_enabled();
+    let run = action.run_handle();
+    let theme = cx.theme().clone();
+    let window = cx.window();
 
-        div()
-            .id(id)
-            .debug_selector(|| "WIDGET_PLACEHOLDER".into())
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .px_4()
-            .text_center()
-            .text_sm()
-            .text_color(color.hsla)
-            .role(role)
-            .aria_label(label)
-            .when(kind == PlaceholderKind::Busy, |this| {
-                this.child(
-                    div()
-                        .debug_selector(|| "WIDGET_PLACEHOLDER_SPINNER".into())
-                        .size_4()
-                        .child(Spinner::new("widget-placeholder-spinner")),
-                )
-            })
-            .child(
-                div()
-                    .debug_selector(|| "WIDGET_PLACEHOLDER_MESSAGE".into())
-                    .min_w_0()
-                    .max_w_full()
-                    .child(content),
-            )
-            .when_some(action, |this, action| {
-                this.child(
-                    div()
-                        .debug_selector(|| "WIDGET_PLACEHOLDER_ACTION".into())
-                        .flex_none()
-                        .child(action),
-                )
-            })
+    let mut button = Button::new(cx.app_mut(), theme, key).outline().label(label);
+    if enabled {
+        button = button.on_click(move |action_ctx| {
+            let run = run.clone();
+            run(action_ctx.app_mut());
+        });
+    } else {
+        button = button.disabled(true);
+    }
+    button.build(cx.app_mut(), window, parent)?;
+
+    Ok(Some(button))
+}
+
+/// A per-parent spinner key: a spinner's debug identity, unique inside the tree.
+fn spinner_key(parent: NodeId) -> SmolStr {
+    format_smolstr!("widget.placeholder.spinner.{}", parent.to_bits())
+}
+
+/// A per-parent notice key, for the same reason.
+fn notice_key(parent: NodeId) -> SmolStr {
+    format_smolstr!("widget.placeholder.notice.{}", parent.to_bits())
+}
+
+/// A per-parent recovery-button key. The engine's action identity is
+/// `"{key}.click"`, so this must be unique across the whole application.
+fn button_key(parent: NodeId) -> SmolStr {
+    format_smolstr!("widget.placeholder.action.{}", parent.to_bits())
+}
+
+/// The name of the work in progress, in the language showing now.
+pub(crate) fn busy_label(translate: &Translate, connecting: bool) -> SmolStr {
+    if connecting {
+        t_smol!(translate, "common.connecting")
+    } else {
+        t_smol!(translate, "common.loading")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use base_ui::{markdown::view::MarkdownState, style::theme::Theme};
-    use gpui_kit::{
-        App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-        Styled, TestAppContext, VisualTestContext, Window, div, px, size,
+    use smol_str::SmolStr;
+    use ui_core::node::tree::NodeKind;
+
+    use super::busy_label;
+    use crate::{
+        status::{Notice, WidgetAction, WidgetState},
+        test_support::{FixtureFailure, WidgetTestApp},
     };
-    use i18n::t;
 
-    use super::WidgetPlaceholder;
-    use crate::ui::test_support::install_translator;
+    #[test]
+    fn the_busy_label_names_the_work_in_progress() {
+        let harness = WidgetTestApp::new();
+        let translate = harness.services().translate.clone();
 
-    fn connecting() -> WidgetPlaceholder {
-        WidgetPlaceholder::connect("test-placeholder", "Connecting")
+        assert_eq!(busy_label(&translate, true), "Connecting");
+        assert_eq!(busy_label(&translate, false), "Loading");
     }
 
-    fn loading() -> WidgetPlaceholder {
-        WidgetPlaceholder::load("test-placeholder", "Loading")
+    #[test]
+    fn a_notice_placeholder_draws_the_sentence_the_catalogue_holds() {
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+
+        harness.with_cx(|cx| {
+            super::Placeholder::notice(cx, parent, &Notice::message("test.waiting"))
+                .expect("the notice builds");
+        });
+        harness.drain();
+
+        assert!(
+            harness.text_of(parent).contains("Waiting for orders"),
+            "the notice's sentence is drawn: {:?}",
+            harness.text_of(parent)
+        );
+        assert!(
+            harness.find_by_debug_prefix(parent, "MARKDOWN").is_none(),
+            "a plain sentence is drawn by the empty state, not the markdown component"
+        );
     }
 
-    /// The document a notice of one widget instance is drawn from, read from the fixture
-    /// catalogue.
-    ///
-    /// The `test.notice` fixture is markdown that names a control the user has to reach
-    /// for, so the stand-in draws that control — its icon and its label inside one
-    /// `<kbd>` — the way the copy is written rather than as the sentence it would read
-    /// as. `test.waiting` is the same drawer with a sentence that fits on one line.
-    fn document(cx: &mut App, key: &'static str) -> Entity<MarkdownState> {
-        let source = t!(cx, key);
-        cx.new(|cx| MarkdownState::new(source, cx))
+    /// The catalogue also authors a widget's own messages as rich text; the
+    /// decision comes from the resolved value, so such a message is drawn by the
+    /// markdown component and its source markup never reaches the user.
+    #[test]
+    fn a_rich_message_notice_goes_through_the_markdown_component() {
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+
+        harness.with_cx(|cx| {
+            super::Placeholder::notice(cx, parent, &Notice::message("test.rich"))
+                .expect("the rich notice builds");
+        });
+        harness.drain();
+
+        let text = harness.text_of(parent);
+        assert!(
+            harness.find_by_debug_prefix(parent, "MARKDOWN").is_some(),
+            "the message's catalogue value is rich text: {text:?}"
+        );
+        assert!(
+            !text.contains("<p ") && !text.contains("<kbd>") && !text.contains("![]("),
+            "the source markup is not drawn as text: {text:?}"
+        );
+        assert!(
+            harness.has_inline_boxes(parent),
+            "the `<kbd>` icon is an inline box, not source text: {text:?}"
+        );
     }
 
-    /// The document, built over a context that has the fixture catalogue installed.
-    ///
-    /// `open` installs it too, but a fixture that reads a key before the window exists
-    /// needs it first.
-    fn fixture_document(cx: &mut TestAppContext, key: &'static str) -> Entity<MarkdownState> {
-        cx.update(|cx| {
-            install_translator(cx);
-            document(cx, key)
-        })
+    #[test]
+    fn a_busy_placeholder_draws_a_spinner() {
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+
+        harness.with_cx(|cx| {
+            super::Placeholder::busy(cx, parent, Some(SmolStr::new_static("Loading")))
+                .expect("the spinner builds");
+        });
+        harness.drain();
+
+        let tree = harness.tree();
+        let canvas = tree
+            .get(parent)
+            .expect("the placeholder container exists")
+            .children()
+            .iter()
+            .any(|child| matches!(tree.get(*child).expect("child").kind(), NodeKind::Canvas(_)));
+
+        assert!(
+            canvas,
+            "the spinner is a canvas leaf: {:?}",
+            tree.get(parent)
+        );
     }
 
-    fn message(document: &Entity<MarkdownState>) -> WidgetPlaceholder {
-        WidgetPlaceholder::message("test-placeholder", document)
-    }
-
-    /// The width the stand-in leaves its message: what it is given, less its own
-    /// horizontal padding (`px_4` on each side).
-    fn block_expected_width(area: gpui_kit::Bounds<gpui_kit::Pixels>) -> f32 {
-        area.size.width.as_f32() - 32.
-    }
-
-    fn failure() -> WidgetPlaceholder {
-        WidgetPlaceholder::failure("test-placeholder", "route unavailable")
-            .action(div().debug_selector(|| "TEST_ACTION".into()).h_4().w_8())
-    }
-
-    /// The same failure with a longer detail, so a test can tell the text the
-    /// placeholder was given apart from any text it might have added itself.
-    fn longer_failure() -> WidgetPlaceholder {
-        WidgetPlaceholder::failure(
-            "test-placeholder",
-            "route unavailable, and the fallback failed too",
+    #[test]
+    fn a_failure_placeholder_draws_its_detail_and_its_recovery() {
+        let mut harness = WidgetTestApp::new();
+        let parent = harness.placeholder_parent();
+        let failure = WidgetState::failed(
+            std::sync::Arc::new(FixtureFailure),
+            WidgetAction::new("common.retry", |_| {}),
         )
-    }
+        .failure()
+        .expect("the state carries the failure")
+        .clone();
 
-    struct Harness {
-        /// Builds this frame's stand-in. The message fixture captures the document entity
-        /// its widget instance owns, so every frame draws the same one — which is what the
-        /// framework does with the document it holds.
-        placeholder: Box<dyn Fn() -> WidgetPlaceholder>,
-    }
-
-    impl Render for Harness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child((self.placeholder)())
-        }
-    }
-
-    fn open(
-        cx: &mut TestAppContext,
-        placeholder: impl Fn() -> WidgetPlaceholder + 'static,
-    ) -> &mut VisualTestContext {
-        cx.update(|cx| {
-            install_translator(cx);
-            cx.set_global(Theme::default());
+        harness.with_cx(|cx| {
+            super::Placeholder::failure(cx, parent, &failure).expect("the failure stand-in builds");
         });
-        let (_, cx) = cx.add_window_view(move |_, _| Harness {
-            placeholder: Box::new(placeholder),
-        });
-        cx.simulate_resize(size(px(240.0), px(160.0)));
-        cx.run_until_parked();
+        harness.drain();
 
-        cx
-    }
-
-    #[gpui_kit::test]
-    fn a_busy_placeholder_should_show_a_spinner_above_the_name_of_its_work(
-        cx: &mut TestAppContext,
-    ) {
-        for placeholder in [connecting, loading] {
-            let cx = open(cx, placeholder);
-
-            let area = cx
-                .debug_bounds("WIDGET_PLACEHOLDER")
-                .expect("the placeholder should render");
-            let spinner = cx
-                .debug_bounds("WIDGET_PLACEHOLDER_SPINNER")
-                .expect("a busy placeholder should show a spinner");
-            let message = cx
-                .debug_bounds("WIDGET_PLACEHOLDER_MESSAGE")
-                .expect("the placeholder should name the work in progress");
-
-            assert_eq!(area.size, size(px(240.0), px(160.0)));
-            assert!(spinner.bottom() <= message.top());
-            assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_ACTION").is_none());
-        }
-    }
-
-    #[gpui_kit::test]
-    fn a_failure_placeholder_should_show_no_spinner_and_offer_its_action(cx: &mut TestAppContext) {
-        let cx = open(cx, failure);
-
-        let area = cx
-            .debug_bounds("WIDGET_PLACEHOLDER")
-            .expect("the placeholder should render");
-        let message = cx
-            .debug_bounds("WIDGET_PLACEHOLDER_MESSAGE")
-            .expect("the placeholder should show its message");
-        let action = cx
-            .debug_bounds("WIDGET_PLACEHOLDER_ACTION")
-            .expect("a failure placeholder should offer its action");
-
-        assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_SPINNER").is_none());
-        assert!(message.bottom() <= action.top());
-        assert!(action.bottom() <= area.bottom());
-        assert!(action.left() >= area.left());
-        assert!(action.right() <= area.right());
-    }
-
-    #[gpui_kit::test]
-    fn a_message_placeholder_should_show_neither_spinner_nor_action(cx: &mut TestAppContext) {
-        let document = fixture_document(cx, "test.notice");
-        let cx = open(cx, move || message(&document));
-
-        assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_MESSAGE").is_some());
-        assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_SPINNER").is_none());
-        assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_ACTION").is_none());
-    }
-
-    /// A neutral message is drawn by the markdown component as the document it is: the
-    /// stand-in gives it a box and adds nothing of its own around it. What the copy does
-    /// inside that box — its lines, the control it names — belongs to the component, so
-    /// the assertion is about where the document is drawn, not about the shape of the
-    /// sentence.
-    #[gpui_kit::test]
-    fn a_message_placeholder_should_draw_its_message_as_markdown(cx: &mut TestAppContext) {
-        let document = fixture_document(cx, "test.notice");
-        let cx = open(cx, move || message(&document));
-
-        let area = cx
-            .debug_bounds("WIDGET_PLACEHOLDER")
-            .expect("the placeholder should render");
-        let message = cx
-            .debug_bounds("WIDGET_PLACEHOLDER_MESSAGE")
-            .expect("the placeholder should show its message");
-        let block = cx
-            .debug_bounds("BASE_UI_MARKDOWN_BLOCK_0")
-            .expect("the message should be drawn as markdown");
-
+        let text = harness.text_of(parent);
         assert!(
-            block.top() >= message.top() && block.bottom() <= message.bottom(),
-            "the document should stand inside the box the placeholder gives it"
+            text.contains("the fixture failed"),
+            "the detail is drawn: {text}"
         );
         assert!(
-            block.left() >= area.left() && block.right() <= area.right(),
-            "and inside the stand-in itself, however the copy wraps"
-        );
-        assert!(
-            (block.size.width.as_f32() - block_expected_width(area)).abs() < 0.5,
-            "the document should be drawn across the width the stand-in gives it, so the \
-             column of text is one box rather than one per line: the block is {:?} wide in a \
-             placeholder of {:?}",
-            block.size.width,
-            area.size.width
-        );
-        assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_SPINNER").is_none());
-        assert!(cx.debug_bounds("WIDGET_PLACEHOLDER_ACTION").is_none());
-    }
-
-    /// A message that fits on one line still fills the block it is drawn in, so its words
-    /// start at the left edge of the stand-in rather than in the middle of it.
-    ///
-    /// This is the layout the markdown component gives every document, and pinning it here
-    /// is what keeps the module's account of the alignment honest: should the block ever
-    /// come to shrink to its words, this fails and the sentence above it has to be rewritten
-    /// along with the assertion.
-    #[gpui_kit::test]
-    fn a_single_line_message_should_fill_the_block_it_is_drawn_in(cx: &mut TestAppContext) {
-        let document = fixture_document(cx, "test.waiting");
-        let cx = open(cx, move || message(&document));
-
-        let area = cx
-            .debug_bounds("WIDGET_PLACEHOLDER")
-            .expect("the placeholder should render");
-        let block = cx
-            .debug_bounds("BASE_UI_MARKDOWN_BLOCK_0")
-            .expect("the message should be drawn as markdown");
-
-        assert_eq!(
-            block.left(),
-            area.left() + px(16.),
-            "which is where that copy is painted from"
-        );
-        assert!(
-            (block.size.width.as_f32() - block_expected_width(area)).abs() < 0.5,
-            "one line of copy should still be laid out across the stand-in: the block is \
-             {:?} wide in a placeholder of {:?}",
-            block.size.width,
-            area.size.width
-        );
-    }
-
-    /// A placeholder adds nothing to the failure it is given.
-    ///
-    /// Which text ends up on screen is decided by the widget's error type alone.
-    /// A prefix, a wrapper, or a rewritten message here would make the same
-    /// failure read differently from the banner that shows it whenever the widget
-    /// does have content, and this is the only place that can happen: the banner
-    /// renders the reported text as it stands.
-    ///
-    /// The text box grows with the text, and the failure fixture is a single
-    /// short line, so its width is the text's own measure. Two lengths are
-    /// compared instead of one against a constant, which keeps the assertion
-    /// independent of the font size the placeholder happens to use.
-    #[gpui_kit::test]
-    fn a_failure_placeholder_should_not_change_the_text_it_was_given(cx: &mut TestAppContext) {
-        let cx = open(cx, failure);
-        let short = cx
-            .debug_bounds("WIDGET_PLACEHOLDER_MESSAGE")
-            .expect("the placeholder should show its message")
-            .size
-            .width;
-
-        let cx = open(cx, longer_failure);
-        let long = cx
-            .debug_bounds("WIDGET_PLACEHOLDER_MESSAGE")
-            .expect("the placeholder should show its message")
-            .size
-            .width;
-
-        assert!(
-            long > short,
-            "the placeholder must render the detail it was given: a message of {short:?} \
-             that does not grow with its text is not that text"
+            harness
+                .find_by_debug_prefix(parent, "widget.placeholder.action.")
+                .is_some(),
+            "the recovery control is drawn"
         );
     }
 }

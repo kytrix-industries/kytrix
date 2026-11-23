@@ -618,7 +618,6 @@ widget:
     country: 国家
     day_label: '%{year}年%{month}%{day}日 %{weekday}'
     filter_choice: '%{filter}：%{value}'
-    filter_tooltip: 按%{filter}筛选
     importance: 重要性
     importance_level:
       high: 高
@@ -994,6 +993,7 @@ widget:
     account_ratio: 账户比
     amount: 数量
     buy_volume: 买入量
+    chart: 永续统计图表
     contracts_unit: 合约
     interval: 统计周期
     long_accounts: 多头账户
@@ -1040,15 +1040,12 @@ widget:
     protected: 受保护
     refresh: 刷新监控账号
     reposted: '%{name} 已转贴'
-    scroll_tweets: 滚动推文
     search_placeholder: 用户名
     search_users: 搜索 X 账号
     searching_users: 正在搜索 X 账号
     stream_unavailable: X 推文流尚未连接
     success_title: 成功
-    timeline_end: 当前没有更多推文
     tweet: '%{author} 的推文，时间 %{time}'
-    waiting: <p align="center">等待推文</p>
   volume_heatmap:
     choose_venue: 请选择市场参与者
     refresh_now: 立即刷新成交量热力图
@@ -1166,6 +1163,11 @@ window:
     rename: 修改名称
     settings: 设置
     toggle: 显示或隐藏侧边栏
+  system:
+    close: 关闭
+    maximize: 最大化
+    minimize: 最小化
+    restore: 还原
   updater:
     available: 有可用更新
     download: 更新

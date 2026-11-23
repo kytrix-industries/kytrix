@@ -11,7 +11,7 @@ use crate::{
         AnimatedValue, AnimationSpec, DragPhase, Easing, InputThresholds, OverlayDismiss,
         OverlayOptions, OverlayPlacement, ScrollAxis, ScrollConfig, VirtualListConfig,
     },
-    math::{Point, Rect, Scale, Size},
+    math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
     paint::{
         color::Color,
@@ -736,6 +736,213 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
     );
 }
 
+/// 内层滚动容器（外层内容坐标 `y = 300`、高 100）：外层视口只有 150 高，所以它首帧在
+/// 外层视口之外 —— 与 gallery 页面里 ⑥⑦⑧⑨ 的列表/表格/树一致。
+fn mount_nested_scroll_container(app: &mut App, window: WindowId, outer: NodeId) -> NodeId {
+    let mut style = Style::default();
+    style.inner.size = taffy::geometry::Size {
+        width: taffy::style::Dimension::length(200.0),
+        height: taffy::style::Dimension::length(100.0),
+    };
+    style.inner.margin = taffy::geometry::Rect {
+        left: taffy::style::LengthPercentageAuto::length(0.0),
+        right: taffy::style::LengthPercentageAuto::length(0.0),
+        top: taffy::style::LengthPercentageAuto::length(300.0),
+        bottom: taffy::style::LengthPercentageAuto::length(0.0),
+    };
+    style.clip = Clip::Bounds;
+    NodeBuilder::boxed()
+        .style(style)
+        .build(app.window_mut(window).expect("window").tree_mut(), outer)
+        .expect("mount inner")
+}
+
+/// 一个容器的合成端槽位条目（偏移 + 屏幕裁剪区）；未登记 ⇒ `None`。
+fn scroll_slot_of(app: &App, window: WindowId, node: NodeId) -> Option<(Point, PhysicalRect)> {
+    let view = app.window(window).expect("window");
+    let slot = view.tree().scroll_slot_cached(node) as usize;
+    view.scroll_slots().get(slot).copied()
+}
+
+/// 登记两个滚动容器的槽位（`make_scroll` 不标脏、不请求帧；`scroll_reg_epoch` 会让下一帧
+/// 走全量路径，因此这里用一次 `mark_paint` 把帧要出来）。
+fn register_slots(app: &mut App, window: WindowId, nodes: [NodeId; 2]) {
+    for node in nodes {
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .mark_paint(node);
+    }
+    frame(app, window);
+}
+
+/// **P2-6a G1 回归（真实窗口暴露）**：外层滚动容器内嵌内层滚动容器时，外层滚动必须让内层
+/// 内容跟着移动，并重算内层槽位的屏幕裁剪区。
+///
+/// 旧实现把「没有节点脏、只有偏移变了」的帧当纯滚动帧（`window/paint.rs` 的快路径）：
+/// 只把偏移刷进槽位表、**不遍历树**。但内层槽位的图元烘焙偏移里含**外层**位移
+/// （`bake = total − 本槽偏移`），内层槽位的屏幕裁剪区也随外层移动 —— 两者都只有遍历才能
+/// 更新。于是页面一滚，内层内容按旧坐标烘焙、又被旧裁剪区剪掉：整块空白（gallery 的
+/// ⑥⑦⑧⑨ 列表/表格/树/自绘滚动条行，`mounted_rows` 并未丢）。
+#[test]
+fn a_nested_scroll_container_follows_the_outer_container_scroll() {
+    let (_rt, mut app, window) = setup();
+    let outer = mount_scroll_container(&mut app, window, 150.0);
+    let inner = mount_nested_scroll_container(&mut app, window, outer);
+    let row = mount_override(&mut app, window, inner, Rect::new(0.0, 0.0, 200.0, 40.0));
+    frame(&mut app, window);
+    let outer_handle = app
+        .make_scroll(
+            window,
+            outer,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("outer scroll");
+    app.set_scroll_content(&outer_handle, Size::new(200.0, 800.0))
+        .expect("outer content");
+    let inner_handle = app
+        .make_scroll(
+            window,
+            inner,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("inner scroll");
+    app.set_scroll_content(&inner_handle, Size::new(200.0, 400.0))
+        .expect("inner content");
+    register_slots(&mut app, window, [outer, inner]);
+    assert!(
+        scroll_slot_of(&app, window, inner).is_some(),
+        "前置条件：内层滚动容器必须已登记槽位"
+    );
+
+    // 外层滚 320：内层容器屏幕 y = 300 − 320 = −20（首帧时它在视口外）。
+    app.scroll_to(&outer_handle, Point::new(0.0, 320.0))
+        .expect("outer scroll");
+    frame(&mut app, window);
+
+    // 内层槽位的屏幕裁剪区 = 内层 padding box ∩ 外层 clip（都在屏幕坐标）：
+    // (0, −20, 200, 100) ∩ (0, 0, 200, 150) = (0, 0, 200, 80)。
+    let (offset, viewport) = scroll_slot_of(&app, window, inner).expect("inner slot");
+    assert_eq!(offset, Point::new(0.0, 0.0), "内层自身未滚动");
+    assert_eq!(
+        viewport,
+        PhysicalRect::new(0, 0, 200, 80),
+        "内层槽位的屏幕裁剪区必须随外层滚动重算（旧裁剪区 = 首帧的空交集）"
+    );
+    // 内层行的图元必须重烘焙：屏幕 = 烘焙 + 槽位偏移 ⇒ 烘焙 = (0, 300) − 320 = (0, −20)。
+    assert_eq!(
+        lane_quad_bounds(&app, window, row),
+        vec![Rect::new(0.0, -20.0, 200.0, 40.0)],
+        "内层行的烘焙偏移必须含外层位移（否则它停在旧坐标、被旧裁剪区剪掉）"
+    );
+}
+
+/// **P2-6a G1 回归（虚拟列表形态）**：页面滚动容器里嵌一个虚拟列表（gallery ⑥⑦⑧⑨ 的
+/// 真实形态），外层滚动后已挂载行的图元与内层槽位裁剪区必须一起跟上。
+#[test]
+fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() {
+    let (_rt, mut app, window) = setup();
+    let page = mount_scroll_container(&mut app, window, 150.0);
+    let inner = mount_nested_scroll_container(&mut app, window, page);
+    frame(&mut app, window);
+    // `make_virtual_list` 要求 `position: relative`（内层容器在 `setup` 里还是 static）。
+    {
+        let mut style = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .get(inner)
+            .expect("inner")
+            .style()
+            .clone();
+        style.inner.position = taffy::style::Position::Relative;
+        let _ = app
+            .window_mut(window)
+            .expect("window")
+            .tree_mut()
+            .set_style_for_test(inner, style);
+    }
+    let list = app
+        .make_virtual_list(
+            window,
+            inner,
+            VirtualListConfig {
+                extent: 25.0,
+                extents: None,
+                overscan: 0,
+            },
+        )
+        .expect("virtual list");
+    app.set_virtual_items(&list, 100, |index| {
+        NodeBuilder::boxed()
+            .paint(background())
+            .id(format!("row{index}"))
+    })
+    .expect("items");
+    let page_handle = app
+        .make_scroll(
+            window,
+            page,
+            ScrollConfig {
+                axis: ScrollAxis::Vertical,
+                line_height: 48.0,
+            },
+        )
+        .expect("page scroll");
+    app.set_scroll_content(&page_handle, Size::new(200.0, 800.0))
+        .expect("page content");
+    register_slots(&mut app, window, [page, inner]);
+    let rows = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .virtual_slot(inner)
+        .expect("virtual slot")
+        .mounted
+        .clone();
+    assert!(!rows.is_empty(), "前置条件：虚拟列表已挂载可见行");
+
+    app.scroll_to(&page_handle, Point::new(0.0, 320.0))
+        .expect("page scroll");
+    frame(&mut app, window);
+
+    // 行仍在（G1 的关键事实：`mounted_rows` 没丢，只是不绘制）。
+    let still_mounted = app
+        .window(window)
+        .expect("window")
+        .tree()
+        .virtual_slot(inner)
+        .expect("virtual slot")
+        .mounted
+        .len();
+    assert_eq!(still_mounted, rows.len(), "外层滚动不得丢行");
+    // 内层视口（内层容器高 100，屏幕 y = −20..80）∩ 外层视口 ⇒ (0, 0, 200, 80)。
+    let (_, viewport) = scroll_slot_of(&app, window, inner).expect("inner slot");
+    assert_eq!(
+        viewport,
+        PhysicalRect::new(0, 0, 200, 80),
+        "虚拟列表槽位的屏幕裁剪区必须随页面滚动重算"
+    );
+    // 第 0 行在内容坐标 y = 0（绝对 y = 300）⇒ 烘焙偏移 = 300 − 320 = −20。
+    let first_row = rows
+        .iter()
+        .find(|(index, _)| *index == 0)
+        .map(|(_, row)| *row)
+        .expect("第 0 行已挂载");
+    assert_eq!(
+        lane_quad_bounds(&app, window, first_row)[0],
+        Rect::new(0.0, -20.0, 200.0, 25.0),
+        "行图元的烘焙偏移必须含页面位移"
+    );
+}
+
 /// P0 回归：inline composer 在 Idle 帧不得提前消费并丢弃已编码的 lane 实例字节；下一
 /// 个滚动提交帧必须能重新编码出非空 payload。
 #[cfg(all(windows, feature = "test-support"))]
@@ -776,7 +983,11 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
     let idle = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("idle paint");
     assert_eq!(
         (idle.damage.rects, idle.damage.full),
@@ -800,7 +1011,11 @@ fn an_idle_frame_does_not_advance_the_inline_composer() {
     let scroll = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("scroll paint");
     assert!(
         scroll.uploaded_bytes > 0,
@@ -860,7 +1075,11 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
         let report = app
             .window_mut(window)
             .expect("window")
-            .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+            .paint_frame(
+                &crate::paint::geometry_store::GeometryStore::new(),
+                None,
+                None,
+            )
             .expect("idle paint");
         assert_eq!(
             (report.damage.rects, report.damage.full),
@@ -902,7 +1121,11 @@ fn consecutive_idle_frames_accumulate_their_scene_deltas() {
     let report = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("scroll paint");
     assert!(report.damage.rects > 0, "滚动帧必须产出 damage");
     let pending = app
@@ -958,7 +1181,11 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
     let idle = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("idle paint");
     assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
     let lane = app
@@ -986,7 +1213,11 @@ fn a_removed_lane_survives_an_idle_frame_and_reaches_the_next_commit() {
     let _ = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("removal paint");
     let pending = app
         .window(window)
@@ -1062,7 +1293,11 @@ fn an_a11y_only_frame_still_runs_after_a_retained_delta() {
     let idle = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("idle paint");
     assert_eq!((idle.damage.rects, idle.damage.full), (0, false));
     assert!(
@@ -1174,7 +1409,11 @@ fn an_idle_frame_keeps_its_scene_delta_for_the_next_scroll_frame() {
     let report = app
         .window_mut(window)
         .expect("window")
-        .paint_frame(&crate::paint::geometry_store::GeometryStore::new(), None)
+        .paint_frame(
+            &crate::paint::geometry_store::GeometryStore::new(),
+            None,
+            None,
+        )
         .expect("scroll paint");
     assert!(report.damage.rects > 0, "滚动帧必须产出视口 damage");
     let pending = app
@@ -1468,6 +1707,7 @@ fn virtual_rows_carry_their_position_in_the_set() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -1518,6 +1758,7 @@ fn virtual_list_mounts_the_visible_window_and_recycles() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -2063,6 +2304,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -2135,6 +2377,7 @@ fn virtual_rows_are_laid_out_with_the_configured_extent() {
             container,
             VirtualListConfig {
                 extent: 25.0,
+                extents: None,
                 overscan: 0,
             },
         )
@@ -2980,6 +3223,7 @@ fn a_modal_overlay_traps_focus_and_restores_it_on_close() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("overlay");
@@ -3210,6 +3454,7 @@ fn a_popup_opened_from_a_modal_receives_clicks() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3305,6 +3550,7 @@ fn a_popup_opened_in_the_same_callback_as_its_modal_receives_clicks() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3393,6 +3639,7 @@ fn a_popup_opened_without_any_focus_still_receives_clicks() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3487,6 +3734,7 @@ fn a_modal_opened_without_any_focus_fills_the_first_focusable_node() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3551,6 +3799,7 @@ fn enter_cannot_activate_a_background_button_behind_a_modal() {
                 dismiss: OverlayDismiss::Explicit,
                 trap_focus: true,
                 restore_focus: true,
+                a11y: crate::a11y::A11yOverride::default(),
             },
         )
         .expect("modal");
@@ -3625,7 +3874,7 @@ fn removing_the_captured_node_releases_the_capture() {
     let _ = app.drain_events();
 
     // 删掉**祖先**：捕获目标随之卸载。
-    assert!(app.remove_node(window, panel));
+    assert!(app.remove_node(window, panel).is_ok());
     assert_eq!(
         app.pointer_captured(window),
         None,
@@ -3895,4 +4144,353 @@ fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
         3.0,
         "纵向分量必须传给外层容器"
     );
+}
+
+// ── E12：浮层 a11y 角色 + 模态作用域 ─────────────────────────────────────
+
+/// E12：浮层包装节点的 a11y 角色来自**显式声明**，`App::modal_scope` 是可查询的模态作用域。
+///
+/// 旧实现把每个浮层包装节点自动推成 `Dialog`（并带 Expand/Collapse 死动作），菜单 / tooltip
+/// 会被 AT 读成对话框；而且应用无法在建节点后覆写（`Tree::set_a11y_patch` 是 crate 内 API）。
+/// 现在：无声明 ⇒ `GenericContainer`；声明 Menu / Dialog 原样生效；模态状态由 `trap_focus`
+/// 表达（包装的 `aria-modal` 跟它走，不再跟角色走）。
+#[test]
+fn an_overlay_a11y_role_is_declared_explicitly_and_the_modal_scope_is_queryable() {
+    let (_rt, mut app, window) = setup();
+    frame(&mut app, window);
+    assert_eq!(app.modal_scope(window), None, "没有模态浮层");
+
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(120.0, 60.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                a11y: crate::a11y::A11yOverride {
+                    role: Some(crate::a11y::A11yRole::Menu),
+                    label: Some(smol_str::SmolStr::new_static("交易菜单")),
+                    ..crate::a11y::A11yOverride::default()
+                },
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    frame(&mut app, window);
+    let snapshot = app.a11y_take(window).expect("首笔 a11y 交付");
+    let menu_record = snapshot
+        .node_for(menu.node())
+        .expect("浮层包装必须出现在 a11y 树里");
+    assert_eq!(
+        menu_record.role,
+        crate::a11y::A11yRole::Menu,
+        "显式 Menu 角色必须生效（不得被浮层 kind 覆盖成 Dialog）"
+    );
+    assert_eq!(menu_record.label_text(), Some("交易菜单"));
+    assert!(
+        menu_record.actions.is_empty(),
+        "菜单包装不得自动宣告 Expand/Collapse：{:?}",
+        menu_record.actions
+    );
+    assert!(!menu_record.hidden);
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(20.0, 20.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                a11y: crate::a11y::A11yOverride {
+                    role: Some(crate::a11y::A11yRole::Dialog),
+                    label: Some(smol_str::SmolStr::new_static("确认下单")),
+                    ..crate::a11y::A11yOverride::default()
+                },
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("modal");
+    assert_eq!(
+        app.modal_scope(window),
+        Some(modal.node()),
+        "模态作用域根必须可查询"
+    );
+    let confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 80.0, 24.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+    let snapshot = app.a11y_take(window).expect("模态打开必须交付 a11y 增量");
+    let modal_record = snapshot.node_for(modal.node()).expect("模态包装");
+    assert_eq!(modal_record.role, crate::a11y::A11yRole::Dialog);
+    assert!(
+        modal_record.modal,
+        "a11y modal 必须跟 trap_focus 走（引擎真值），与角色无关"
+    );
+    assert!(!modal_record.hidden);
+    assert!(
+        !snapshot.node_for(confirm).expect("确认按钮").hidden,
+        "模态子树对 AT 必须可见"
+    );
+    assert!(
+        snapshot.node_for(menu.node()).expect("菜单").hidden,
+        "模态作用域外的浮层必须 aria-hidden（tooltip / 菜单不得被 AT 读到）"
+    );
+
+    // 关闭模态：作用域消失、背景恢复可见。
+    assert!(app.close_overlay(&modal));
+    assert_eq!(app.modal_scope(window), None);
+    frame(&mut app, window);
+    let snapshot = app.a11y_take(window).expect("模态关闭必须交付 a11y 增量");
+    assert!(
+        !snapshot.node_for(menu.node()).expect("菜单").hidden,
+        "模态关闭后背景必须重新可见"
+    );
+}
+
+/// E12：模态打开时背景 hover 被过滤 —— 背景 tooltip **不可能**在模态之上打开（P2-4b R07）。
+///
+/// 旧 `BlockMouse` 的 hitbox 同时挡命中与 hover；引擎模态作用域必须给出同一语义。这里钉住：
+/// - 模态**打开瞬间**，作用域外的悬停立即结束（派生 `HoverChanged(None)`，不需要动鼠标）；
+/// - 指针在背景上移动不会重新产生悬停；
+/// - 模态子树（以及属于该模态的弹出层）的悬停照常。
+#[test]
+fn a_modal_filters_background_hover_so_tooltips_cannot_open_over_it() {
+    let (_rt, mut app, window) = setup();
+    let root = root_of(&app, window);
+    let trigger = mount_override(&mut app, window, root, Rect::new(0.0, 0.0, 100.0, 100.0));
+    frame(&mut app, window);
+    let _ = app.drain_events();
+
+    // 前置：没有模态时，背景触发器正常悬停（tooltip 的输入就是这个）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(50.0, 50.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(trigger));
+    let _ = app.drain_events();
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(200.0, 0.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("modal");
+    let confirm = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 80.0, 40.0))
+        .on_click(Action::custom("modal.confirm"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // 模态打开 ⇒ 作用域外的悬停立即结束（不需要 PointerMove）。
+    assert_eq!(
+        app.hovered(window),
+        None,
+        "模态一打开，背景悬停必须立即失效（tooltip 不得留在模态之上）"
+    );
+    let hover_event = app
+        .drain_events()
+        .into_iter()
+        .find_map(|(_, event)| match event {
+            Event::HoverChanged { hovered, left, .. } => Some((hovered, left)),
+            _ => None,
+        })
+        .expect("作用域外悬停结束必须派生 HoverChanged");
+    assert_eq!(hover_event.0, None);
+    assert!(
+        hover_event.1.contains(&trigger),
+        "背景触发器必须收到 leave：{:?}",
+        hover_event.1
+    );
+
+    // 指针在背景上移动：仍然没有悬停（背景 `:hover` 不得亮）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(60.0, 60.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), None);
+    assert!(
+        app.drain_events()
+            .into_iter()
+            .all(|(_, event)| !matches!(event, Event::HoverChanged { .. })),
+        "背景被模态挡住时不得产生悬停迁移事件"
+    );
+
+    // 模态子树里的悬停照常（对话框按钮仍要有 :hover）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(215.0, 15.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(confirm), "模态内部的悬停必须正常");
+
+    // 对话框里的菜单（opener 在模态内）也属于作用域：悬停照常。
+    let menu = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(300.0, 100.0)),
+                dismiss: OverlayDismiss::OutsideClick,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("menu");
+    let item = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 100.0, 20.0))
+        .on_click(Action::custom("menu.item"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            menu.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(320.0, 118.0), Modifiers::empty()),
+    );
+    assert_eq!(
+        app.hovered(window),
+        Some(item),
+        "属于模态的弹出层必须可悬停（对话框里的下拉菜单）"
+    );
+}
+
+/// E12：模态挡住背景点击，但 Esc / 焦点陷阱 / 关闭后的交互恢复保持不变。
+#[test]
+fn a_modal_blocks_background_clicks_and_restores_interaction_on_close() {
+    let (_rt, mut app, window) = setup();
+    let clicks = Rc::new(Cell::new(0_u32));
+    let seen = clicks.clone();
+    app.on_action(Action::custom("background"), move |_ctx| {
+        seen.set(seen.get() + 1);
+    });
+    let ok_clicks = Rc::new(Cell::new(0_u32));
+    let seen_ok = ok_clicks.clone();
+    app.on_action(Action::custom("modal.ok"), move |_ctx| {
+        seen_ok.set(seen_ok.get() + 1);
+    });
+    let root = root_of(&app, window);
+    let background = NodeBuilder::boxed()
+        .layout_override(Rect::new(0.0, 0.0, 100.0, 100.0))
+        .on_click(Action::custom("background"))
+        .build(app.window_mut(window).expect("window").tree_mut(), root)
+        .expect("mount");
+    frame(&mut app, window);
+    // 模态打开前焦点在背景（模态打开瞬间背景仍是 raw focus）。
+    assert!(app.set_focus(window, Some(background)));
+
+    let modal = app
+        .create_overlay(
+            window,
+            OverlayOptions {
+                placement: OverlayPlacement::Point(Point::new(150.0, 50.0)),
+                dismiss: OverlayDismiss::Explicit,
+                trap_focus: true,
+                ..OverlayOptions::default()
+            },
+        )
+        .expect("modal");
+    let ok = NodeBuilder::boxed()
+        .layout_override(Rect::new(10.0, 10.0, 60.0, 24.0))
+        .on_click(Action::custom("modal.ok"))
+        .build(
+            app.window_mut(window).expect("window").tree_mut(),
+            modal.node(),
+        )
+        .expect("mount");
+    frame(&mut app, window);
+
+    // a11y 焦点（E12）：模态作用域外的 raw 焦点不得作为 `TreeUpdate.focus` 发给 AT ——
+    // 背景已经被标 hidden，AT 焦点停在那里与 inert 语义自相矛盾。
+    let snapshot = app.a11y_take(window).expect("a11y 交付");
+    assert_ne!(
+        snapshot.focus_node().engine,
+        background,
+        "作用域外的背景不得成为 a11y 焦点"
+    );
+
+    // 焦点陷阱：作用域外节点不得被设为焦点；焦点移动落在模态内。
+    assert!(
+        !app.set_focus(window, Some(background)),
+        "模态作用域外的节点不得获得焦点"
+    );
+    app.focus_next(window);
+    assert_eq!(app.focused(window), Some(ok), "Tab 必须落在模态内");
+
+    // 背景点击被整体消费（不派发任何动作）。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(clicks.get(), 0, "模态作用域外的点击不得派发");
+
+    // 模态内点击正常。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(170.0, 70.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(170.0, 70.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(ok_clicks.get(), 1, "模态内的点击必须正常派发");
+
+    // Esc（`Dismiss`）仍然可关模态：作用域只约束「激活节点」，引擎级动作不受限。
+    assert!(app.dispatch_action(window, root, Action::Dismiss, ActionSource::Programmatic));
+    assert_eq!(app.modal_scope(window), None, "Esc/Dismiss 必须关掉模态");
+
+    // 关闭后背景恢复：hover 与点击都回来了。
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_move(Point::new(50.0, 50.0), Modifiers::empty()),
+    );
+    assert_eq!(app.hovered(window), Some(background));
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_down(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    app.dispatch_input(
+        window,
+        InputEvent::pointer_up(
+            Point::new(50.0, 50.0),
+            PointerButton::Primary,
+            Modifiers::empty(),
+        ),
+    );
+    assert_eq!(clicks.get(), 1, "模态关闭后背景点击必须恢复");
 }

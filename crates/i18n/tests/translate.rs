@@ -1,6 +1,5 @@
 use i18n::{
     language::codes::LanguageCode,
-    t,
     translator::{builder::Builder, types::I18n},
 };
 
@@ -31,19 +30,19 @@ fn flattens_nested_sections_into_dotted_keys() {
     let i18n = i18n();
 
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.market").as_str(),
         "Market"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.portfolio").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.portfolio").as_str(),
         "Portfolio"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.sub.quant").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.sub.quant").as_str(),
         "Quant"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::En, "window.close").as_ref(),
+        i18n.translate(LanguageCode::En, "window.close").as_str(),
         "Close"
     );
 }
@@ -53,15 +52,15 @@ fn renders_every_language_at_runtime() {
     let i18n = i18n();
 
     assert_eq!(
-        i18n.translate(LanguageCode::En, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::En, "menu.market").as_str(),
         "Market"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "menu.market").as_str(),
         "行情"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::ZhTw, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::ZhTw, "menu.market").as_str(),
         "行情"
     );
 }
@@ -75,7 +74,7 @@ fn interpolates_every_argument_kind() {
 
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "greeting", &[("name", &name)])
-            .as_ref(),
+            .as_str(),
         "Hello, Ada!"
     );
     assert_eq!(
@@ -84,12 +83,12 @@ fn interpolates_every_argument_kind() {
             "inbox",
             &[("count", &count), ("name", &name)]
         )
-        .as_ref(),
+        .as_str(),
         "Ada has 3 unread messages."
     );
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "ratio", &[("ratio", &ratio)])
-            .as_ref(),
+            .as_str(),
         "Ratio: 0.5"
     );
 }
@@ -101,24 +100,24 @@ fn interpolated_messages_follow_the_language_they_are_given() {
 
     assert_eq!(
         i18n.translate_with(LanguageCode::En, "greeting", &[("name", &name)])
-            .as_ref(),
+            .as_str(),
         "Hello, Ada!"
     );
     assert_eq!(
         i18n.translate_with(LanguageCode::ZhCn, "greeting", &[("name", &name)])
-            .as_ref(),
+            .as_str(),
         "你好，Ada！"
     );
 }
 
 #[test]
-fn translations_are_shared_strings() {
+fn translations_are_cheap_clones_that_keep_their_text() {
     let i18n = i18n();
     let translated = i18n.translate(LanguageCode::En, "menu.market");
 
-    let shared: gpui_kit::SharedString = translated.clone();
-    assert_eq!(shared, translated);
-    assert_eq!(shared.as_ref(), "Market");
+    let cloned = translated.clone();
+    assert_eq!(cloned, translated);
+    assert_eq!(cloned.as_str(), "Market");
 }
 
 #[test]
@@ -138,8 +137,8 @@ fn repeated_translation_returns_the_same_text_without_rerendering() {
         &[("count", &count), ("name", &name)],
     );
 
-    assert_eq!(first.as_ref(), "Inbox has 7 unread messages.");
-    assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
+    assert_eq!(first.as_str(), "Inbox has 7 unread messages.");
+    assert!(std::ptr::eq(first.as_str(), second.as_str()));
 }
 
 #[test]
@@ -149,24 +148,24 @@ fn fallback_covers_messages_a_language_lacks() {
     // `zh-TW` only translates `menu.market`, and `%{name}` is not supplied, so the
     // rest of the message comes from `zh-CN` and renders without argument.
     assert_eq!(
-        i18n.translate(LanguageCode::ZhTw, "menu.market").as_ref(),
+        i18n.translate(LanguageCode::ZhTw, "menu.market").as_str(),
         "行情"
     );
     assert_eq!(
-        i18n.translate(LanguageCode::ZhTw, "greeting").as_ref(),
+        i18n.translate(LanguageCode::ZhTw, "greeting").as_str(),
         "你好，！"
     );
     assert_eq!(
         i18n.translate(LanguageCode::ZhTw, "menu.sub.quant")
-            .as_ref(),
+            .as_str(),
         "量化"
     );
 
     // `zh-CN` lacks `ratio`, which only English defines, and English is not the
     // fallback of this instance.
-    assert_eq!(i18n.translate(LanguageCode::ZhCn, "ratio").as_ref(), "");
+    assert_eq!(i18n.translate(LanguageCode::ZhCn, "ratio").as_str(), "");
     assert_eq!(
-        i18n.translate(LanguageCode::ZhCn, "nothing.here").as_ref(),
+        i18n.translate(LanguageCode::ZhCn, "nothing.here").as_str(),
         ""
     );
 }
@@ -175,31 +174,10 @@ fn fallback_covers_messages_a_language_lacks() {
 fn messages_missing_from_every_loaded_locale_translate_to_empty_text() {
     let i18n = i18n();
 
-    assert_eq!(i18n.translate(LanguageCode::En, "menu.quant").as_ref(), "");
+    assert_eq!(i18n.translate(LanguageCode::En, "menu.quant").as_str(), "");
     assert!(i18n.try_translate(LanguageCode::En, "menu.quant").is_none());
     assert_eq!(
-        i18n.translate(LanguageCode::En, "window.close").as_ref(),
+        i18n.translate(LanguageCode::En, "window.close").as_str(),
         "Close"
     );
-}
-
-#[test]
-fn t_macro_translates_the_installed_translator() {
-    let cx = gpui_kit::TestAppContext::single();
-
-    cx.update(|cx| {
-        cx.set_global(i18n());
-        cx.set_global(LanguageCode::En);
-
-        assert_eq!(t!(cx, "menu.market").as_ref(), "Market");
-
-        cx.set_global(LanguageCode::ZhCn);
-        assert_eq!(t!(cx, "menu.market").as_ref(), "行情");
-
-        let name = "Ada";
-        assert_eq!(t!(cx, "greeting", name = name).as_ref(), "你好，Ada！");
-
-        cx.set_global(LanguageCode::En);
-        assert_eq!(t!(cx, "greeting", name = name).as_ref(), "Hello, Ada!");
-    });
 }

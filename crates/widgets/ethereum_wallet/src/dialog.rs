@@ -2,602 +2,1584 @@
 //!
 //! # What the dialog owns, and what it does not
 //!
-//! It owns what a pane has no use for — what the user is typing, the list of addresses with
-//! the place a reader is in it, the sentence the body stands in with, and the entities those
-//! are drawn through — and draws everything else from the pane, which is what holds the
-//! addresses and the service that answers a read or a change. The state that outlives any one
-//! dialog belongs to the pane: a dialog that held the addresses would lose them on the next
-//! open, and one that held the change in flight would hold it for a session the pane is running.
+//! It owns what a pane has no use for — what the user is typing, the list of addresses
+//! with the place a reader is in it, the sentences the body stands in with, and the
+//! components those are drawn through — and draws everything else from the pane, which
+//! holds the addresses and the service that answers a read or a change. The state that
+//! outlives any one dialog belongs to the pane.
 //!
-//! # Why the two sides only hold each other weakly
+//! # One value channel into the dialog
 //!
-//! The dialog reaches the pane through a [`WeakEntity`], and the pane holds the dialog the
-//! same way. A dialog holding the pane strongly would keep a closed pane's scope alive, and a
-//! pane holding the dialog strongly would never let it close: what the layer holds is the only
-//! strong reference to a dialog, which is what makes closing one release the state below.
+//! The pane is not reachable from the dialog: a kit control's callback owns no widget,
+//! and the engine has no entity the two could hold each other through. So the dialog is
+//! built over **signals**: the pane publishes what it holds into them every frame
+//! ([`EthereumWalletDialog::sync`]), and every dynamic value the dialog draws is a `bind_*`
+//! closure over one of them. What the user does travels back as requests the pane applies
+//! ([`DialogRequest`]) — add, delete and read are all the pane's own operations, sent over
+//! the session the pane's stream is holding.
+//!
+//! # The row controls are built into rows the list owns
+//!
+//! A kit list's row factory is handed a [`NodeTree`] and nothing else: no application
+//! context, and therefore no `Button`. The delete control of an address row is a kit
+//! button all the same, so the row leaves an empty slot for it and the dialog builds the
+//! button into that slot from [`EthereumWalletDialog::sync`], after the list has mounted its
+//! rows. A list that rebuilds its visible rows (a new address count, a language switch)
+//! leaves new slots behind; the sync pairs the buttons with the slots showing now and
+//! releases the ones whose row is gone.
+//!
+//! # Static copy is rebuilt, not re-bound
+//!
+//! The kit components this dialog builds choose their labels when they are built, and a
+//! language switch would otherwise leave them in the language the dialog was opened in.
+//! The buttons the dialog holds (refresh / add / retry / recover / close) are therefore
+//! released and built again into the same parent when the language moves — the same four
+//! steps `crates/widgets/AGENTS.md` §15.1 freezes for static copy, and the rich stand-ins
+//! are parsed again. The dialog's own title is the one piece chosen at open (it is the kit
+//! dialog's accessible name); a language switch while it is open leaves that name in the
+//! language it was opened in, which is registered as a known difference in the W8b ledger.
+//!
+//! # The spinner exists only while it spins
+//!
+//! A kit spinner animates for as long as it is synced, and the engine has no "hidden
+//! animation" state: a spinner that merely sits in a hidden block would keep asking for
+//! frames (I3). It is therefore built when the body enters its loading window and
+//! released when that window closes, which is the framework's own placeholder pattern.
+//! The spinner carries the loading sentence as its accessible name: a kit spinner without
+//! one is a decorative graphic hidden from assistive technology, and a dialog that is
+//! reading its addresses is not decoration (`ProgressIndicator` + the label is what a
+//! screen reader announces).
+//!
+//! # Enter in the address field is the add control
+//!
+//! A kit input only dispatches an action on Enter when its spec names one, and the old
+//! dialog's field added what it held on Enter. The dialog therefore registers its own
+//! submit action (keyed from its instance, like every other control) and answers it with
+//! the same "may this address be monitored" judgement the add button uses — the action
+//! entry point decides again rather than trusting the control's disabled state.
 
-use std::sync::Arc;
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use base_ui::{
-    button::Button,
-    icon::{Icon, IconKind},
-    input::{Input, InputState, InputStateBuilder, InputStateEvent},
-    interactive::{Interactive, InteractiveVariantExt},
-    layer::LayerExt,
-    markdown::view::{Markdown, MarkdownState},
-    separator::Separator,
-    size::UnifiedSizable,
-    spinner::Spinner,
-    static_sized_list::StaticSizedList,
-    style::theme::ThemeExt,
-    tooltip::TooltipExt,
+    kit::{
+        assets,
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogError},
+        icon::IconKind,
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions, SelectionMode},
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        overlay::OverlayError,
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, AppContext, Context, DismissEvent, ElementId, Entity, EventEmitter,
-    FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, base::Disableable, div, px,
-};
-use i18n::t;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::ethereum_wallet::{
     EthereumWalletSelection, ethereum_wallet_address,
 };
 use smol_str::{SmolStr, format_smolstr};
-use widget::{error::LocalizedError, status::WidgetAction};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    event::{Action, Event, InputEvent},
+    interaction::ActionCtx,
+    node::{
+        builder::NodeBuilder,
+        dependency::ReadCtx,
+        id::NodeId,
+        signal::{Signal, SignalScope},
+        tree::NodeTree,
+    },
+    paint::style::StylePatch,
+    text::{TextOverflow, TextStyle},
+    window::WindowId,
+};
+use widget::{cx::WidgetCx, error::TranslatedError, status::WidgetAction};
 
 use super::{
     model::SelectionData,
-    view::{EthereumWalletWidget, SelectionNotice, SelectionOperation},
+    view::{SelectionNotice, SelectionOperation},
 };
 
-/// The size of the address dialog's panel.
+/// The width of the address dialog's panel.
 const DIALOG_WIDTH: f32 = 620.0;
-const DIALOG_HEIGHT: f32 = 480.0;
 
-/// The address field of the dialog.
-///
-/// Shared with the tests that build a dialog by hand, so that what they build the field under is the
-/// id production uses rather than a copy of it.
-pub(super) const ADDRESS_INPUT_ID: &str = "ethereum_wallet-monitor-address";
+/// The height of the panel's content column (the old dialog's 480 px panel less the title
+/// row and padding the kit dialog's panel brings).
+const CONTENT_HEIGHT: f32 = 400.0;
 
-/// The list the dialog draws the addresses with.
-const ADDRESS_LIST_ID: &str = "ethereum_wallet-monitor-address-list";
+/// The widest a sentence standing in for the address list is drawn.
+const MESSAGE_WIDTH: f32 = 420.0;
+
+/// What one frame hands the dialog: the pane's selection state, as the dialog draws it.
+#[derive(Clone)]
+pub(super) struct DialogView {
+    /// Whether anybody is signed in.
+    pub signed_in: bool,
+    /// Whether the stream carrying the account is live.
+    pub ready: bool,
+    /// The addresses the account monitors, once a read has answered.
+    pub selections: Option<SelectionData>,
+    /// What the pane is waiting for, if anything.
+    pub operation: Option<SelectionOperation>,
+    /// What the pane says about the last change.
+    pub notice: Option<SelectionNotice>,
+    /// The recovery the pane itself offers, for a dialog that has no stream.
+    pub recovery: WidgetAction,
+}
+
+/// What the user asked the pane for through the dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DialogRequest {
+    /// Read the addresses again.
+    Reload,
+    /// Monitor one more address.
+    Add(SmolStr),
+    /// Stop monitoring one address.
+    Delete(SmolStr),
+}
 
 /// The dialog a pane opens to manage the addresses its transfers are watched for.
-///
-/// The dialog says it is done by emitting [`DismissEvent`], which is the signal the layer that
-/// hosts it subscribes to: it needs no window to be handed and no way of being the dialog on
-/// top, and a dismissal taken from the window instead would close whatever happens to be on top.
 pub(super) struct EthereumWalletDialog {
-    widget: WeakEntity<EthereumWalletWidget>,
-    address: Entity<InputState>,
-    /// What the field holds.
-    ///
-    /// The input element is rebuilt every frame and its state exposes no value, so what is
-    /// typed is followed through the events the input emits rather than read back off it.
-    typed: Option<SmolStr>,
-    list: Entity<StaticSizedList<EthereumWalletSelection>>,
-    /// The addresses the list was last told to draw, which is how a frame knows whether what
-    /// the pane holds is something the list has not been shown.
-    shown: Option<Arc<[EthereumWalletSelection]>>,
-    /// The document the body's own message is drawn from when there is nothing to list.
-    ///
-    /// The sentence is catalogue copy — the same copy the pane's placeholder draws — and it is
-    /// written as markdown, so it is drawn by the markdown component here too. The document
-    /// lives with the dialog rather than being built per frame, and a frame that resolves a
-    /// different sentence is the one that re-parses it: a language the interface moved to since
-    /// is a different sentence, so the same frame catches that as well.
-    message: Entity<MarkdownState>,
+    inner: Rc<RefCell<DialogState>>,
 }
-
-impl EventEmitter<DismissEvent> for EthereumWalletDialog {}
 
 impl EthereumWalletDialog {
-    /// Opens the dialog over the window, for the pane the control belongs to.
+    /// Builds the dialog over the pane's window and opens it.
     ///
-    /// Nothing happens when it is already open: the control is the dialog's only entrance,
-    /// and replacing the open one would throw away what the user has typed.
-    pub(super) fn show(
-        widget: WeakEntity<EthereumWalletWidget>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let Some(pane) = widget.upgrade() else {
-            return;
+    /// The content is built against signals, so nothing about the pane is needed here:
+    /// what the dialog draws is published by the first frame.
+    ///
+    /// # Errors
+    /// The kit dialog could not be built or opened (the window is gone, or the content
+    /// subtree could not be created).
+    pub(super) fn open(cx: &mut WidgetCx<'_>) -> Result<Self, EngineError> {
+        let inner = Rc::new(RefCell::new(DialogState::new(cx)));
+        inner.borrow_mut().create_kit(cx)?;
+
+        let dialog = {
+            let weak = Rc::downgrade(&inner);
+            DialogState::build_dialog(&weak, cx)
         };
-        if pane.read(cx).dialog_open() {
-            return;
-        }
-        // The field belongs to the dialog, and so does what it holds: a field that emptied
-        // itself under the user would be one they could not correct, so it keeps the address
-        // it was given until the user replaces or clears it.
-        let address = cx.new(|cx| {
-            InputStateBuilder::new(ADDRESS_INPUT_ID)
-                .placeholder(t!(cx, "widget.ethereum_wallet.address_placeholder"))
-                .build(window, cx)
-        });
-        let dialog = cx.new(|cx| Self::new(widget.clone(), address, cx));
-        // The pane's handle is taken before the entity is handed to the layer, which is what
-        // holds the only strong reference to it from here: a handle kept past this call would
-        // be a second owner, and the dialog would outlive its own closing.
-        let handle = dialog.downgrade();
-        window.dialog(cx, dialog);
-        pane.update(cx, |pane, cx| pane.attach_dialog(handle, cx));
-    }
+        inner.borrow_mut().dialog = Some(dialog.clone());
 
-    /// The dialog a pane holds.
-    ///
-    /// The tests on either side of it build one this way too: `show` needs the window layer the
-    /// application installs, and what a test is about is what the dialog draws and asks for.
-    pub(super) fn new(
-        widget: WeakEntity<EthereumWalletWidget>,
-        address: Entity<InputState>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        cx.subscribe(
-            &address,
-            |dialog, _, event: &InputStateEvent, cx| match event {
-                InputStateEvent::Change(value) => {
-                    let typed = (!value.is_empty()).then(|| SmolStr::new(value.as_str()));
-                    if dialog.typed != typed {
-                        dialog.typed = typed;
-                        cx.notify();
-                    }
-                }
-                InputStateEvent::PressEnter(_) => dialog.add(cx),
-                // Nothing here commits on a blur: what these fields hold is submitted by
-                // the button or by Enter.
-                InputStateEvent::Blur(_) => {}
-            },
-        )
-        .detach();
-
-        // The list is built once and told what to draw, so the row it draws is given the
-        // dialog rather than the state of the frame it is drawn in: what a row reads is the
-        // pane the dialog reads, which is what holds the addresses and the change in flight.
-        let dialog = cx.entity().downgrade();
-        let list = cx.new(|_| {
-            StaticSizedList::new(
-                ElementId::Name(SharedString::new_static(ADDRESS_LIST_ID)),
-                move |_index, selection: &EthereumWalletSelection, _window, cx| {
-                    address_row(selection, &dialog, cx)
-                },
-            )
-        });
-
-        Self {
-            widget,
-            address,
-            typed: None,
-            list,
-            shown: None,
-            // The document starts empty: the sentence a body with nothing to list says depends
-            // on the pane, which the first frame reads and resolves like every frame after it.
-            message: cx.new(|cx| MarkdownState::new("", cx)),
-        }
-    }
-
-    /// Whether a change may be asked for right now.
-    ///
-    /// A row disables its control instead of leaving it to fail, and a row is drawn on every
-    /// frame of the dialog, so what disables it is read from the pane as the row is drawn
-    /// rather than handed to the list once.
-    fn may_change(&self, cx: &App) -> bool {
-        self.widget
-            .upgrade()
-            .is_some_and(|pane| pane.read(cx).dialog_state().may_change())
-    }
-
-    /// Reads the addresses again.
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let Some(pane) = self.widget.upgrade() else {
-            return;
-        };
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
-        });
-    }
-
-    /// Monitors the address that was typed, when it is one that could be monitored.
-    ///
-    /// The control that sends it is disabled for anything else, but the field also answers
-    /// Enter, which reaches here without a control to have been disabled.
-    fn add(&mut self, cx: &mut Context<Self>) {
-        let Some(pane) = self.widget.upgrade() else {
-            return;
-        };
-        let typed = self.typed.clone();
-        let address = pane.read(cx).dialog_state().addable_address(typed.as_ref());
-        let Some(address) = address else {
-            return;
-        };
-        pane.update(cx, |pane, cx| {
-            pane.add_selection(address, cx);
-        });
-    }
-
-    /// Stops monitoring one address.
-    fn delete(&mut self, address: SmolStr, cx: &mut Context<Self>) {
-        let Some(pane) = self.widget.upgrade() else {
-            return;
-        };
-        pane.update(cx, |pane, cx| {
-            pane.delete_selection(address, cx);
-        });
-    }
-
-    /// What the account monitors, and the way to read it again.
-    fn header(&self, state: &DialogState, dialog: &Entity<Self>, cx: &Context<Self>) -> AnyElement {
-        let count = state.selections.as_ref().map_or_else(
-            || t!(cx, "widget.ethereum_wallet.dialog_title"),
-            |data| {
-                t!(
-                    cx,
-                    "widget.ethereum_wallet.monitored_addresses",
-                    current = data.selections().len(),
-                    limit = data.limit()
-                )
-            },
-        );
-        let refresh = Button::new("ethereum_wallet-monitor-refresh")
-            .ghost()
-            .medium()
-            .disabled(state.operation.is_some() || !state.ready)
-            .aria_label(t!(cx, "widget.ethereum_wallet.refresh"))
-            .with_tooltip(t!(cx, "widget.ethereum_wallet.refresh"))
-            .on_click({
-                let dialog = dialog.clone();
-                move |_, _, cx| {
-                    dialog.update(cx, |dialog, cx| dialog.reload(cx));
-                }
-            })
-            .child(Icon::new(IconKind::ArrowsClockwise).size_3());
-
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(count),
-            )
-            .child(div().flex_none().child(refresh))
-            .into_any_element()
-    }
-
-    /// The address field and the control that monitors what it holds.
-    ///
-    /// The field itself is never disabled: typing is free, and what would be done with the
-    /// address is what the control beside it decides. An account that may not monitor
-    /// another one — because the stream is down, the list is full, or the address is already
-    /// on it — is refused there rather than by a field that will not take input.
-    ///
-    /// The control carries no label of its own, so its tooltip is what names it and its icon
-    /// is sized as the text it stands in for: a plus that is smaller than the address beside
-    /// it reads as a decoration of the field rather than as the act of adding to it.
-    fn toolbar(
-        &self,
-        state: &DialogState,
-        dialog: &Entity<Self>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let add = Button::new("ethereum_wallet-monitor-add")
-            .filled()
-            .medium()
-            .disabled(state.addable_address(self.typed.as_ref()).is_none())
-            .aria_label(t!(cx, "widget.ethereum_wallet.add_address"))
-            .with_tooltip(t!(cx, "widget.ethereum_wallet.add_address"))
-            .on_click({
-                let dialog = dialog.clone();
-                move |_, _, cx| {
-                    dialog.update(cx, |dialog, cx| dialog.add(cx));
-                }
-            })
-            .child(Icon::new(IconKind::Plus).size_4());
-
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .debug_selector(|| "TEST_ETHEREUM_WALLET_ADDRESS_FIELD".into())
-                    .min_w_0()
-                    .flex_1()
-                    .child(Input::new(&self.address).medium().clearable(true)),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "TEST_ETHEREUM_WALLET_ADD_ADDRESS".into())
-                    .flex_none()
-                    .child(add),
-            )
-            .into_any_element()
-    }
-
-    /// What the last change says, if it said anything.
-    fn notice(&self, state: &DialogState, cx: &Context<Self>) -> Option<AnyElement> {
-        let theme = cx.theme();
-        let (text, color) = match state.notice.as_ref()? {
-            SelectionNotice::Added => (
-                t!(cx, "widget.ethereum_wallet.add_success"),
-                theme.roles.status.success.base.hsla,
-            ),
-            SelectionNotice::Problem(failure) => (
-                failure.localized_message(cx),
-                theme.roles.status.danger.base.hsla,
-            ),
-        };
-
-        Some(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .text_color(color)
-                .child(text)
-                .into_any_element(),
-        )
-    }
-
-    /// The addresses, or why there are none to show.
-    ///
-    /// A sentence stands in for the list by drawing the document the frame read into
-    /// [`Self::resolve_message`], so nothing here parses anything: the two situations that have
-    /// nothing to list are one document, read before the body is drawn.
-    fn body(
-        &mut self,
-        state: &DialogState,
-        dialog: &Entity<Self>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        if !state.signed_in {
-            return centered_message(&self.message, theme.roles.fg.muted.hsla);
-        }
-        let Some(data) = state.selections.as_ref() else {
-            return match state.operation {
-                // A read is on its way, whether it is out or waiting for the stream.
-                Some(operation) if operation.is_read() => loading_addresses(cx),
-                // Nothing is holding the account, so a read has nothing to answer it: the way
-                // out is the recovery the pane itself offers, which is the same control the
-                // pane is showing behind this dialog.
-                _ if !state.ready => message_with_action(
-                    t!(cx, "widget.ethereum_wallet.stream_unavailable"),
-                    recovery_button(&state.recovery, cx),
-                ),
-                // The read was answered with a failure, which the notice above names.
-                _ => message_with_action(
-                    t!(cx, "widget.ethereum_wallet.load_failed"),
-                    self.retry_button(dialog, cx),
-                ),
+        let window = cx.window();
+        if let Err(error) = dialog.open(cx.app_mut(), window) {
+            let (components, scope) = {
+                let mut state = inner.borrow_mut();
+                state.released = true;
+                (state.take_components(), state.scope)
             };
-        };
-        if data.selections().is_empty() {
-            return centered_message(&self.message, theme.roles.fg.muted.hsla);
+            release_components(cx.app_mut(), components);
+            let _ = cx.app_mut().release_scope(scope);
+            return Err(engine_error_of(error, window));
         }
 
-        self.show_addresses(&data.shared_selections(), cx);
-
-        self.address_list()
+        let _ = cx.request_frame();
+        Ok(Self { inner })
     }
 
-    /// The sentence the body stands in with when it has nothing to list.
+    /// One frame of the dialog: follow the language, publish the pane's state, feed the
+    /// field its typed events, and sync every component the dialog owns.
     ///
-    /// It is the same copy the pane's placeholder shows for the same two situations, so the
-    /// pane behind the dialog and the dialog itself say one thing rather than two.
-    fn message_text(state: &DialogState, cx: &App) -> SharedString {
-        if !state.signed_in {
-            return t!(cx, "widget.ethereum_wallet.logged_out");
-        }
-
-        t!(cx, "widget.ethereum_wallet.empty_addresses")
-    }
-
-    /// Reads the body's sentence into this dialog's document, if it is not the one already there.
-    ///
-    /// `set_source` is what decides that: a sentence that has not moved is left alone, so a frame
-    /// spends no parse on it — and a sentence that has moved, because the pane changed or the
-    /// language did, is parsed exactly once.
-    fn resolve_message(&mut self, state: &DialogState, cx: &mut Context<Self>) {
-        let message = Self::message_text(state, cx);
-        self.message
-            .update(cx, |document, cx| document.set_source(message, cx));
-    }
-
-    /// Shows the addresses the pane is holding, if they are not the ones the list holds.
-    ///
-    /// A list draws what it was given and remembers where the reader is, so it is told about a
-    /// new set of addresses rather than rebuilt every frame: being told would put the reader
-    /// back at the top of a list that had not changed.
-    fn show_addresses(
+    /// # Errors
+    /// The kit dialog or one of its components failed to sync; the caller releases the
+    /// dialog rather than leaving dead nodes behind.
+    pub(super) fn sync(
         &mut self,
-        selections: &Arc<[EthereumWalletSelection]>,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .shown
-            .as_ref()
-            .is_some_and(|shown| Arc::ptr_eq(shown, selections))
-        {
-            return;
+        cx: &mut WidgetCx<'_>,
+        view: &DialogView,
+    ) -> Result<(), EngineError> {
+        if self.finished() {
+            return Ok(());
         }
-        self.shown = Some(selections.clone());
-        self.list.update(cx, |list, cx| {
-            list.replace(selections.iter().cloned());
-            cx.notify();
-        });
+        let result = self.inner.borrow_mut().frame(cx, view);
+        if let Err(error) = result {
+            log::warn!("the ethereum wallet address dialog could not be synced: {error}");
+            self.release(cx);
+        }
+        Ok(())
     }
 
-    /// The addresses of the account, each a row that can be left.
-    fn address_list(&self) -> AnyElement {
-        div()
-            .debug_selector(|| "TEST_ETHEREUM_WALLET_ADDRESS_LIST".into())
-            .size_full()
-            .min_h_0()
-            .child(self.list.clone())
-            .into_any_element()
-    }
-
-    /// The way to read the addresses again, for a read that was answered with a failure.
-    fn retry_button(&self, dialog: &Entity<Self>, cx: &Context<Self>) -> AnyElement {
-        Button::new("ethereum_wallet-monitor-retry")
-            .outline()
-            .small()
-            .aria_label(t!(cx, "common.retry"))
-            .on_click({
-                let dialog = dialog.clone();
-                move |_, _, cx| {
-                    dialog.update(cx, |dialog, cx| dialog.reload(cx));
-                }
-            })
-            .child(t!(cx, "common.retry"))
-            .into_any_element()
-    }
-
-    /// The way out of the dialog.
-    ///
-    /// The control closes the dialog by emitting, which is the dialog saying it is done to the
-    /// layer that hosts it: it needs no window to hand and no way of being the dialog on top.
-    fn footer(&self, cx: &Context<Self>) -> AnyElement {
-        div()
-            .w_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(Separator::horizontal())
-            .child(
-                div().w_full().flex().items_center().justify_end().child(
-                    Button::new("ethereum_wallet-monitor-close")
-                        .tonal()
-                        .medium()
-                        .debug_selector(|| "TEST_ETHEREUM_WALLET_DIALOG_CLOSE".into())
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
-                        .child(t!(cx, "common.close")),
-                ),
+    /// Takes the requests the user made through the dialog since the last frame.
+    pub(super) fn take_requests(&mut self, cx: &mut WidgetCx<'_>) -> Vec<DialogRequest> {
+        if self.finished() {
+            return Vec::new();
+        }
+        let (add_request, delete_request, reload_request, seen_reload) = {
+            let state = self.inner.borrow();
+            (
+                state.add_request,
+                state.delete_request,
+                state.reload_request,
+                state.seen_reload,
             )
-            .into_any_element()
-    }
-}
-
-impl Render for EthereumWalletDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(pane) = self.widget.upgrade() else {
-            return div().into_any_element();
         };
-        // Everything the dialog draws is the pane's own, read once for the frame.
-        let state = pane.read(cx).dialog_state();
-        // The body's sentence is read into this dialog's document before anything is drawn, so
-        // the frame that shows a different one is the frame that parsed it.
-        self.resolve_message(&state, cx);
-        let dialog = cx.entity();
-        let theme = cx.theme();
 
-        div()
-            .w(px(DIALOG_WIDTH))
-            .h(px(DIALOG_HEIGHT))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(self.header(&state, &dialog, cx))
-            .child(self.toolbar(&state, &dialog, cx))
-            .children(self.notice(&state, cx))
-            .child(
-                div()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex_1()
-                    .overflow_hidden()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(theme.roles.line.divider.hsla)
-                    .bg(theme.roles.surface.raised.hsla)
-                    .child(self.body(&state, &dialog, cx)),
-            )
-            .child(self.footer(cx))
-            .into_any_element()
+        let mut requests = Vec::new();
+        let add = cx.read(&add_request).clone();
+        if let Some(address) = add {
+            cx.write(&add_request, None);
+            requests.push(DialogRequest::Add(address));
+        }
+        let delete = cx.read(&delete_request).clone();
+        if let Some(address) = delete {
+            cx.write(&delete_request, None);
+            requests.push(DialogRequest::Delete(address));
+        }
+        let reload = *cx.read(&reload_request);
+        if reload != seen_reload {
+            self.inner.borrow_mut().seen_reload = reload;
+            requests.push(DialogRequest::Reload);
+        }
+
+        requests
+    }
+
+    /// Whether the dialog has gone (closed, dismissed, or its window is gone).
+    pub(super) fn finished(&self) -> bool {
+        let state = self.inner.borrow();
+        state.released || state.closed.get()
+    }
+
+    /// Releases the dialog's components and its signal scope. Idempotent.
+    pub(super) fn release(&mut self, cx: &mut WidgetCx<'_>) {
+        let (components, scope) = {
+            let mut state = self.inner.borrow_mut();
+            if state.released {
+                return;
+            }
+            state.released = true;
+            (state.take_components(), state.scope)
+        };
+        // Nodes first (the dialog unmounts the content subtree), components second (E16).
+        release_components(cx.app_mut(), components);
+        let _ = cx.app_mut().release_scope(scope);
     }
 }
 
-/// The pane's own selection state, read once for the frame that draws it.
-///
-/// It is built by the pane, which is what holds the state: the dialog draws what it is handed
-/// rather than reading the pane for each of its fields, and what a row reads again as it is
-/// drawn goes back to the pane through `dialog_state`.
-pub(super) struct DialogState {
-    signed_in: bool,
-    ready: bool,
-    selections: Option<SelectionData>,
-    operation: Option<SelectionOperation>,
-    notice: Option<SelectionNotice>,
-    recovery: WidgetAction,
+/// The handles the crate's tests read a dialog's components through.
+#[cfg(test)]
+impl EthereumWalletDialog {
+    pub(super) fn test_dialog(&self) -> Option<Dialog> {
+        self.inner.borrow().dialog.clone()
+    }
+
+    pub(super) fn test_input(&self) -> Option<InputNode> {
+        self.inner.borrow().input.clone()
+    }
+
+    pub(super) fn test_close_button(&self) -> Option<Button> {
+        self.inner.borrow().close.clone()
+    }
+
+    pub(super) fn test_add_button(&self) -> Option<Button> {
+        self.inner.borrow().add.clone()
+    }
+
+    pub(super) fn test_recover_button(&self) -> Option<Button> {
+        self.inner.borrow().recover.clone()
+    }
+
+    pub(super) fn test_retry_button(&self) -> Option<Button> {
+        self.inner.borrow().retry.clone()
+    }
+
+    pub(super) fn test_delete_button(&self, index: usize) -> Option<Button> {
+        self.inner
+            .borrow()
+            .delete_buttons
+            .get(&index)
+            .map(|entry| entry.button.clone())
+    }
+
+    pub(super) fn test_spinner(&self) -> Option<Spinner> {
+        self.inner.borrow().spinner.clone()
+    }
+
+    pub(super) fn test_submit_action(&self) -> Action {
+        self.inner.borrow().submit.clone()
+    }
+}
+
+/// The parts one open dialog owns.
+struct DialogState {
+    window: WindowId,
+    scope: SignalScope,
+    theme: ThemeHandle,
+    translate: Translate,
+    language: Signal<LanguageCode>,
+    keys: DialogKeys,
+    /// The language the kit components (the buttons, the parsed stand-ins and the field's
+    /// placeholder) were built in.
+    built_language: Option<LanguageCode>,
+    /// The action the address field dispatches when Enter is pressed in it.
+    submit: Action,
+    dialog: Option<Dialog>,
+    list: Option<List>,
+    input: Option<InputNode>,
+    spinner: Option<Spinner>,
+    spinner_parent: Option<NodeId>,
+    refresh: Option<Button>,
+    add: Option<Button>,
+    retry: Option<Button>,
+    recover: Option<Button>,
+    close: Option<Button>,
+    /// The delete control of each mounted address row, keyed by row index.
+    delete_buttons: BTreeMap<usize, DeleteButton>,
+    /// The slot each mounted address row left for its delete control.
+    slots: Rc<RefCell<BTreeMap<usize, NodeId>>>,
+    refresh_parent: Option<NodeId>,
+    add_parent: Option<NodeId>,
+    retry_parent: Option<NodeId>,
+    recover_parent: Option<NodeId>,
+    close_parent: Option<NodeId>,
+    signed_out_parent: Option<NodeId>,
+    empty_parent: Option<NodeId>,
+    /// The rich stand-ins, parsed into the language they were mounted in.
+    signed_out_markdown: Option<MarkdownMessage>,
+    empty_markdown: Option<MarkdownMessage>,
+    /// The number of address rows the list was last told to draw.
+    shown_addresses: Option<usize>,
+    /// The recovery the recover control was built for.
+    recover_built: Option<WidgetAction>,
+    /// The pane's state as the last frame published it.
+    last_view: Option<DialogView>,
+    addresses: Signal<Arc<[EthereumWalletSelection]>>,
+    limit: Signal<Option<usize>>,
+    signed_in: Signal<bool>,
+    ready: Signal<bool>,
+    known: Signal<bool>,
+    operation: Signal<Option<SelectionOperation>>,
+    notice: Signal<Option<SelectionNotice>>,
+    input_state: Signal<InputState>,
+    input_placeholder: Signal<SmolStr>,
+    add_request: Signal<Option<SmolStr>>,
+    delete_request: Signal<Option<SmolStr>>,
+    reload_request: Signal<u64>,
+    seen_reload: u64,
+    released: bool,
+    closed: Rc<Cell<bool>>,
+}
+
+/// The kit keys one dialog mints from its instance identity.
+#[derive(Clone)]
+struct DialogKeys {
+    dialog: SmolStr,
+    list: SmolStr,
+    input: SmolStr,
+    submit: SmolStr,
+    refresh: SmolStr,
+    add: SmolStr,
+    retry: SmolStr,
+    recover: SmolStr,
+    close: SmolStr,
+}
+
+/// One mounted row's delete control.
+struct DeleteButton {
+    slot: NodeId,
+    language: LanguageCode,
+    button: Button,
+}
+
+/// A rich sentence standing in for the address list, and the node it is drawn in.
+struct MarkdownMessage {
+    node: MarkdownNode,
+}
+
+/// The components one dialog owns, taken as one set on release.
+struct DialogComponents {
+    dialog: Option<Dialog>,
+    input: Option<InputNode>,
+    list: Option<List>,
+    spinner: Option<Spinner>,
+    submit: Option<Action>,
+    refresh: Option<Button>,
+    add: Option<Button>,
+    retry: Option<Button>,
+    recover: Option<Button>,
+    close: Option<Button>,
+    delete_buttons: Vec<Button>,
+}
+
+/// The static-copy controls the dialog rebuilds when the language moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogButtonKind {
+    Refresh,
+    Add,
+    Retry,
+    Recover,
+    Close,
 }
 
 impl DialogState {
-    /// The state one pane is in, as the pane hands it over.
-    pub(super) fn new(
-        signed_in: bool,
-        ready: bool,
-        selections: Option<SelectionData>,
-        operation: Option<SelectionOperation>,
-        notice: Option<SelectionNotice>,
-        recovery: WidgetAction,
-    ) -> Self {
+    /// Builds the dialog's signals and keys. No nodes and no kit components yet.
+    fn new(cx: &mut WidgetCx<'_>) -> Self {
+        let scope = cx.app_mut().signal_scope();
+        let language = cx.language();
+        let theme = cx.theme().clone();
+        let translate = cx.translate().clone();
+        let keys = DialogKeys {
+            dialog: cx.unique_key("ethereum_wallet.dialog"),
+            list: cx.unique_key("ethereum_wallet.dialog.addresses"),
+            input: cx.unique_key("ethereum_wallet.dialog.field"),
+            submit: cx.unique_key("ethereum_wallet.dialog.field.submit"),
+            refresh: cx.unique_key("ethereum_wallet.dialog.refresh"),
+            add: cx.unique_key("ethereum_wallet.dialog.add"),
+            retry: cx.unique_key("ethereum_wallet.dialog.retry"),
+            recover: cx.unique_key("ethereum_wallet.dialog.recover"),
+            close: cx.unique_key("ethereum_wallet.dialog.close"),
+        };
+        let placeholder = t_smol!(translate, "widget.ethereum_wallet.address_placeholder");
+        let submit = Action::Custom(format_smolstr!("{}.submit", keys.submit));
+        let addresses: Arc<[EthereumWalletSelection]> = Arc::from([]);
         Self {
-            signed_in,
-            ready,
-            selections,
-            operation,
-            notice,
-            recovery,
+            window: cx.window(),
+            scope,
+            theme,
+            translate,
+            language,
+            keys,
+            built_language: Some(*cx.read(&language)),
+            submit,
+            dialog: None,
+            list: None,
+            input: None,
+            spinner: None,
+            spinner_parent: None,
+            refresh: None,
+            add: None,
+            retry: None,
+            recover: None,
+            close: None,
+            delete_buttons: BTreeMap::new(),
+            slots: Rc::new(RefCell::new(BTreeMap::new())),
+            refresh_parent: None,
+            add_parent: None,
+            retry_parent: None,
+            recover_parent: None,
+            close_parent: None,
+            signed_out_parent: None,
+            empty_parent: None,
+            signed_out_markdown: None,
+            empty_markdown: None,
+            shown_addresses: None,
+            recover_built: None,
+            last_view: None,
+            addresses: cx.app_mut().signal_scoped(scope, addresses),
+            limit: cx.app_mut().signal_scoped(scope, None),
+            signed_in: cx.app_mut().signal_scoped(scope, false),
+            ready: cx.app_mut().signal_scoped(scope, false),
+            known: cx.app_mut().signal_scoped(scope, false),
+            operation: cx.app_mut().signal_scoped(scope, None),
+            notice: cx.app_mut().signal_scoped(scope, None),
+            input_state: cx.app_mut().signal_scoped(scope, InputState::new("")),
+            input_placeholder: cx.app_mut().signal_scoped(scope, placeholder),
+            add_request: cx.app_mut().signal_scoped(scope, None),
+            delete_request: cx.app_mut().signal_scoped(scope, None),
+            reload_request: cx.app_mut().signal_scoped(scope, 0_u64),
+            seen_reload: 0,
+            released: false,
+            closed: Rc::new(Cell::new(false)),
         }
     }
 
-    /// Whether a change may be asked for right now.
-    fn may_change(&self) -> bool {
-        self.ready && self.selections.is_some() && self.operation.is_none()
+    /// Builds the list the dialog draws its addresses with, and registers the action its
+    /// address field dispatches on Enter. Called before the dialog is opened, because the
+    /// dialog's content mounts the list.
+    fn create_kit(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let addresses = self.addresses;
+        let slots = Rc::clone(&self.slots);
+        let theme = self.theme.clone();
+        let key = self.keys.list.clone();
+        let row_height = UnifiedSize::Medium.h();
+        let list = List::new(
+            cx.app_mut(),
+            theme.clone(),
+            key.clone(),
+            ListOptions::fixed(row_height)
+                .selection(SelectionMode::None)
+                .padding(0.0, 0.0),
+            move |tree: &mut NodeTree, parent: NodeId, index: usize| {
+                build_address_row(tree, parent, index, &key, &addresses, &slots, &theme)
+            },
+        );
+        let count = cx.read(&addresses).len();
+        list.set_initial_count(cx.app_mut(), count);
+        self.shown_addresses = Some(count);
+        self.list = Some(list);
+
+        // Enter in the address field is the add control by another route: the same
+        // judgement, made again at the action entry rather than trusting the control's
+        // disabled state (AGENTS §4.2 / §12-7).
+        let input_state = self.input_state;
+        let addresses = self.addresses;
+        let limit = self.limit;
+        let ready = self.ready;
+        let known = self.known;
+        let operation = self.operation;
+        let add_request = self.add_request;
+        cx.app_mut().on_action(self.submit.clone(), move |ctx| {
+            let address = addable_from(
+                ctx,
+                &input_state,
+                &addresses,
+                &limit,
+                &ready,
+                &known,
+                &operation,
+            );
+            if let Some(address) = address {
+                ctx.write(&add_request, Some(address));
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            }
+        });
+        Ok(())
     }
 
-    /// The address a change would carry, when there is one that could be made.
-    ///
-    /// An address counts only when the account may monitor another: one that is already
-    /// monitored, or that would be the address past the quota, is not a change the service
-    /// would accept, so the control that sends it is disabled rather than left to fail.
-    fn addable_address(&self, typed: Option<&SmolStr>) -> Option<SmolStr> {
-        if !self.may_change() {
+    /// Builds the kit dialog around this dialog's content.
+    fn build_dialog(inner: &Weak<RefCell<DialogState>>, cx: &mut WidgetCx<'_>) -> Dialog {
+        let (theme, layer, animation, key, title, closed) = {
+            let state = inner
+                .upgrade()
+                .expect("the dialog is built while its state is alive");
+            let state = state.borrow();
+            (
+                state.theme.clone(),
+                cx.layer().clone(),
+                cx.animation().clone(),
+                state.keys.dialog.clone(),
+                t_smol!(state.translate, "widget.ethereum_wallet.dialog_title"),
+                Rc::clone(&state.closed),
+            )
+        };
+        let content_weak = Weak::clone(inner);
+        DialogBuilder::new(title)
+            .width(DIALOG_WIDTH)
+            .close_button(false)
+            .content(move |app, window, body| {
+                let Some(state) = content_weak.upgrade() else {
+                    return Ok(());
+                };
+                state.borrow_mut().build_content(app, window, body)
+            })
+            .on_close(move |_reason, _app| closed.set(true))
+            .build(cx.app_mut(), theme, layer, animation, key)
+    }
+
+    /// Publishes the pane's state to the signals the dialog's nodes read.
+    fn publish(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) {
+        let addresses = view
+            .selections
+            .as_ref()
+            .map(SelectionData::shared_selections)
+            .unwrap_or_default();
+        let limit = view.selections.as_ref().map(SelectionData::limit);
+        let _ = cx.write(&self.signed_in, view.signed_in);
+        let _ = cx.write(&self.ready, view.ready);
+        let _ = cx.write(&self.known, view.selections.is_some());
+        let _ = cx.write(&self.operation, view.operation);
+        let _ = cx.write(&self.notice, view.notice.clone());
+        let _ = cx.write(&self.addresses, addresses);
+        let _ = cx.write(&self.limit, limit);
+        self.last_view = Some(view.clone());
+    }
+
+    /// Tells the list how many addresses the pane holds.
+    fn show_addresses(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let count = cx.read(&self.addresses).len();
+        if self.shown_addresses == Some(count) {
+            return Ok(());
+        }
+        let Some(list) = self.list.as_ref() else {
+            return Ok(());
+        };
+        list.set_items(cx.app_mut(), count)?;
+        self.shown_addresses = Some(count);
+        let _ = cx.request_frame();
+        Ok(())
+    }
+
+    /// The language the dialog was built in is not the one showing now: release the static
+    /// copy and build it again.
+    fn rebuild_static_copy(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let language = *cx.read(&self.language);
+        if self.built_language == Some(language) {
+            return Ok(());
+        }
+        let placeholder = t_smol!(self.translate, "widget.ethereum_wallet.address_placeholder");
+        if let Some(input) = self.input.as_ref() {
+            input.update_placeholder(cx.app_mut(), placeholder);
+        }
+        let window = cx.window();
+        let app = cx.app_mut();
+        for (parent, kind) in [
+            (self.refresh_parent, DialogButtonKind::Refresh),
+            (self.add_parent, DialogButtonKind::Add),
+            (self.retry_parent, DialogButtonKind::Retry),
+            (self.recover_parent, DialogButtonKind::Recover),
+            (self.close_parent, DialogButtonKind::Close),
+        ] {
+            let Some(parent) = parent else {
+                continue;
+            };
+            if app
+                .window(window)
+                .is_none_or(|target| target.tree().get(parent).is_err())
+            {
+                continue;
+            }
+            if let Some(button) = self.take_button(kind) {
+                remove_button_node(app, window, &button)?;
+                let _ = button.release(app);
+            }
+            self.build_button(app, window, parent, kind)?;
+        }
+        self.rebuild_markdown(cx)?;
+        self.built_language = Some(language);
+        Ok(())
+    }
+
+    /// Rebuilds one static-copy control with the language showing now.
+    fn rebuild_button(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+        kind: DialogButtonKind,
+    ) -> Result<(), EngineError> {
+        if cx.tree().get(parent).is_err() {
+            return Ok(());
+        }
+        if let Some(button) = self.take_button(kind) {
+            let window = cx.window();
+            remove_button_node(cx.app_mut(), window, &button)?;
+            let _ = button.release(cx.app_mut());
+        }
+        let window = cx.window();
+        self.build_button(cx.app_mut(), window, parent, kind)
+    }
+
+    /// Builds one static-copy control into `parent`.
+    fn build_button(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        kind: DialogButtonKind,
+    ) -> Result<(), EngineError> {
+        let theme = self.theme.clone();
+        let translate = self.translate.clone();
+        match kind {
+            DialogButtonKind::Refresh => {
+                let label = t_smol!(translate, "widget.ethereum_wallet.refresh");
+                let reload = self.reload_request;
+                let ready = self.ready;
+                let operation = self.operation;
+                let button = Button::new(app, theme, self.keys.refresh.clone())
+                    .ghost()
+                    .small()
+                    .icon(IconKind::ArrowsClockwise)
+                    .a11y_label(label.clone())
+                    .tooltip_text(label)
+                    .on_click(move |ctx| {
+                        if *ctx.read(&ready) && ctx.read(&operation).is_none() {
+                            ctx.update(&reload, |requests| *requests += 1);
+                            let window = ctx.window();
+                            let _ = ctx.app_mut().request_repaint(window);
+                        }
+                    });
+                button.build(app, window, parent)?;
+                self.refresh = Some(button);
+            }
+            DialogButtonKind::Add => {
+                let label = t_smol!(translate, "widget.ethereum_wallet.add_address");
+                let input_state = self.input_state;
+                let addresses = self.addresses;
+                let limit = self.limit;
+                let ready = self.ready;
+                let known = self.known;
+                let operation = self.operation;
+                let add_request = self.add_request;
+                let button = Button::new(app, theme, self.keys.add.clone())
+                    .primary()
+                    .small()
+                    .icon(IconKind::Plus)
+                    .a11y_label(label.clone())
+                    .tooltip_text(label)
+                    .on_click(move |ctx| {
+                        let address = addable_from(
+                            ctx,
+                            &input_state,
+                            &addresses,
+                            &limit,
+                            &ready,
+                            &known,
+                            &operation,
+                        );
+                        if let Some(address) = address {
+                            ctx.write(&add_request, Some(address));
+                            let window = ctx.window();
+                            let _ = ctx.app_mut().request_repaint(window);
+                        }
+                    });
+                button.build(app, window, parent)?;
+                self.add = Some(button);
+            }
+            DialogButtonKind::Retry => {
+                let label = t_smol!(translate, "common.retry");
+                let reload = self.reload_request;
+                let button = Button::new(app, theme, self.keys.retry.clone())
+                    .outline()
+                    .small()
+                    .label(label)
+                    .on_click(move |ctx| {
+                        ctx.update(&reload, |requests| *requests += 1);
+                        let window = ctx.window();
+                        let _ = ctx.app_mut().request_repaint(window);
+                    });
+                button.build(app, window, parent)?;
+                self.retry = Some(button);
+            }
+            DialogButtonKind::Recover => {
+                let action = self
+                    .last_view
+                    .as_ref()
+                    .map(|view| view.recovery.clone())
+                    .unwrap_or_else(|| WidgetAction::new("common.retry", |_| {}));
+                let label = action.label(&translate);
+                let button = Button::new(app, theme, self.keys.recover.clone())
+                    .outline()
+                    .small()
+                    .label(label)
+                    .disabled(!action.is_enabled())
+                    .on_click(move |ctx| action.run(ctx.app_mut()));
+                button.build(app, window, parent)?;
+                self.recover = Some(button);
+                self.recover_built = self.last_view.as_ref().map(|view| view.recovery.clone());
+            }
+            DialogButtonKind::Close => {
+                let label = t_smol!(translate, "common.close");
+                let dialog = self
+                    .dialog
+                    .as_ref()
+                    .cloned()
+                    .expect("the dialog is built before its content");
+                let button = Button::new(app, theme, self.keys.close.clone())
+                    .secondary()
+                    .medium()
+                    .label(label)
+                    .on_click(move |ctx| {
+                        dialog.close(ctx.app_mut());
+                        let window = ctx.window();
+                        let _ = ctx.app_mut().request_repaint(window);
+                    });
+                button.build(app, window, parent)?;
+                self.close = Some(button);
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the control of one kind out of its field.
+    fn take_button(&mut self, kind: DialogButtonKind) -> Option<Button> {
+        match kind {
+            DialogButtonKind::Refresh => self.refresh.take(),
+            DialogButtonKind::Add => self.add.take(),
+            DialogButtonKind::Retry => self.retry.take(),
+            DialogButtonKind::Recover => self.recover.take(),
+            DialogButtonKind::Close => self.close.take(),
+        }
+    }
+
+    /// The address the add control would carry, from the signals showing this frame.
+    fn addable_now(&self, cx: &WidgetCx<'_>) -> Option<SmolStr> {
+        let text = SmolStr::new(cx.read(&self.input_state).text().trim());
+        let typed = canonical_address(&text)?;
+        ethereum_wallet_address(&typed)?;
+        if !(*cx.read(&self.ready) && *cx.read(&self.known) && cx.read(&self.operation).is_none()) {
             return None;
         }
-        let typed = canonical_address(typed?)?;
-        ethereum_wallet_address(&typed)?;
-        let data = self.selections.as_ref()?;
-        if data.quota_full()
-            || data
-                .selections()
-                .iter()
-                .any(|current| current.address == typed)
-        {
+        let limit = (*cx.read(&self.limit))?;
+        let addresses = cx.read(&self.addresses);
+        if addresses.len() >= limit || addresses.iter().any(|current| current.address == typed) {
             return None;
         }
         Some(typed)
+    }
+
+    /// Whether the pane may change its address list at all right now.
+    fn may_change(&self) -> bool {
+        self.last_view
+            .as_ref()
+            .is_some_and(|view| view.ready && view.selections.is_some() && view.operation.is_none())
+    }
+
+    /// One frame: rebuild static copy, publish, feed the field, sync the components.
+    fn frame(&mut self, cx: &mut WidgetCx<'_>, view: &DialogView) -> Result<(), EngineError> {
+        if self.released || self.closed.get() {
+            return Ok(());
+        }
+        self.rebuild_static_copy(cx)?;
+        self.publish(cx, view);
+        self.sync_recover_button(cx)?;
+        self.dispatch_text_events(cx);
+        self.show_addresses(cx)?;
+        self.sync_components(cx)?;
+        if !self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.is_open(cx.app()))
+        {
+            self.closed.set(true);
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the recover control when the recovery the pane offers moved.
+    fn sync_recover_button(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let current = self.last_view.as_ref().map(|view| view.recovery.clone());
+        if self.recover_built == current {
+            return Ok(());
+        }
+        self.recover_built = current;
+        let Some(parent) = self.recover_parent else {
+            return Ok(());
+        };
+        self.rebuild_button(cx, parent, DialogButtonKind::Recover)
+    }
+
+    /// Feeds this dialog's own typing to its address field.
+    ///
+    /// A dialog owns **the typed text and key presses of its own window, and only while it
+    /// is that window's modal scope**: the engine has already dispatched the interaction
+    /// events, so what is left in the observation queue is what a text input can consume.
+    fn dispatch_text_events(&mut self, cx: &mut WidgetCx<'_>) {
+        let Some(input) = self.input.as_ref() else {
+            return;
+        };
+        if !self.owns_modal(cx.app()) {
+            return;
+        }
+        let window = self.window;
+        let events = cx
+            .app_mut()
+            .drain_events_where(|target, event| target == window && is_text_input(event));
+        for (_, event) in events {
+            let _ = input.dispatch(cx.app_mut(), &event);
+        }
+    }
+
+    /// Whether this dialog is the window's modal scope, and therefore the keyboard's
+    /// owner.
+    fn owns_modal(&self, app: &App) -> bool {
+        let Some(dialog) = self.dialog.as_ref() else {
+            return false;
+        };
+        matches!(
+            (app.modal_scope(self.window), dialog.overlay_node()),
+            (Some(top), Some(own)) if top == own
+        )
+    }
+
+    /// Syncs every component the dialog owns, in the order the engine expects.
+    fn sync_components(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        if let Some(dialog) = self.dialog.as_ref() {
+            dialog
+                .sync(cx.app_mut())
+                .map_err(|error| engine_error_of(error, self.window))?;
+        }
+        if let Some(list) = self.list.as_ref() {
+            list.sync(cx.app_mut())?;
+        }
+        if let Some(input) = self.input.as_ref() {
+            input.sync(cx.app_mut());
+        }
+        self.sync_spinner(cx)?;
+        self.sync_delete_buttons(cx)?;
+        self.sync_button_states(cx);
+        self.sync_markdown(cx);
+        Ok(())
+    }
+
+    /// Builds the spinner when the body enters its loading window and releases it when the
+    /// window closes, so a hidden spinner never keeps asking for frames (I3).
+    fn sync_spinner(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let loading = self.last_view.as_ref().is_some_and(|view| {
+            view.signed_in
+                && view.selections.is_none()
+                && view.operation.is_some_and(SelectionOperation::is_read)
+        });
+        if loading {
+            if let Some(spinner) = self.spinner.as_ref() {
+                spinner.sync(cx.app_mut())?;
+            } else if let Some(parent) = self.spinner_parent {
+                let key = format_smolstr!("{}:spinner", self.keys.dialog);
+                // A kit spinner with no accessible name is a decorative graphic, and the
+                // dialog is announcing that it is reading the addresses: the label is what
+                // puts it in the a11y tree as a progress indicator (W8a review F3).
+                let label = t_smol!(self.translate, "widget.ethereum_wallet.loading_addresses");
+                let spinner = Spinner::new(cx.app_mut(), self.theme.clone(), key).with_label(label);
+                let window = cx.window();
+                spinner.build(cx.app_mut(), window, parent)?;
+                self.spinner = Some(spinner);
+            }
+        } else if let Some(spinner) = self.spinner.take() {
+            spinner.release(cx.app_mut());
+        }
+        Ok(())
+    }
+
+    /// Keeps the controls' enabled state in step with what the pane may do now.
+    fn sync_button_states(&self, cx: &mut WidgetCx<'_>) {
+        let operation = self.last_view.as_ref().and_then(|view| view.operation);
+        let ready = self.last_view.as_ref().is_some_and(|view| view.ready);
+        if let Some(refresh) = self.refresh.as_ref() {
+            let _ = refresh.set_disabled(cx.app_mut(), !ready || operation.is_some());
+        }
+        if let Some(add) = self.add.as_ref() {
+            let enabled = self.addable_now(cx);
+            let _ = add.set_disabled(cx.app_mut(), enabled.is_none());
+        }
+        if let Some(recover) = self.recover.as_ref() {
+            let enabled = self
+                .last_view
+                .as_ref()
+                .is_none_or(|view| view.recovery.is_enabled());
+            let _ = recover.set_disabled(cx.app_mut(), !enabled);
+        }
+    }
+
+    /// Pairs every mounted address row with its delete control.
+    fn sync_delete_buttons(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(list) = self.list.as_ref() else {
+            return Ok(());
+        };
+        let mounted: BTreeSet<usize> = list
+            .mounted_rows(cx.app())
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+        let language = *cx.read(&self.language);
+        let enabled = self.may_change();
+
+        let stale: Vec<usize> = self
+            .delete_buttons
+            .keys()
+            .copied()
+            .filter(|index| !mounted.contains(index))
+            .collect();
+        for index in stale {
+            if let Some(entry) = self.delete_buttons.remove(&index) {
+                let window = cx.window();
+                remove_button_node(cx.app_mut(), window, &entry.button)?;
+                let _ = entry.button.release(cx.app_mut());
+            }
+        }
+
+        let addresses = self.addresses;
+        let delete_request = self.delete_request;
+        let translate = self.translate.clone();
+        let theme = self.theme.clone();
+        let window = cx.window();
+        for index in mounted {
+            let slot = { self.slots.borrow().get(&index).copied() };
+            let Some(slot) = slot else {
+                continue;
+            };
+            let replace = self
+                .delete_buttons
+                .get(&index)
+                .is_none_or(|entry| entry.slot != slot || entry.language != language);
+            if replace {
+                if let Some(entry) = self.delete_buttons.remove(&index) {
+                    remove_button_node(cx.app_mut(), window, &entry.button)?;
+                    let _ = entry.button.release(cx.app_mut());
+                }
+                let label = t_smol!(translate, "widget.ethereum_wallet.delete_address");
+                let key = cx.unique_key(&format_smolstr!("ethereum_wallet.dialog.delete.{index}"));
+                let button = Button::new(cx.app_mut(), theme.clone(), key)
+                    .ghost()
+                    .small()
+                    .icon(IconKind::Trash)
+                    .a11y_label(label.clone())
+                    .tooltip_text(label)
+                    .disabled(!enabled)
+                    .on_click(move |ctx| {
+                        let address = ctx
+                            .read(&addresses)
+                            .get(index)
+                            .map(|selection| selection.address.clone());
+                        if let Some(address) = address {
+                            ctx.write(&delete_request, Some(address));
+                            let window = ctx.window();
+                            let _ = ctx.app_mut().request_repaint(window);
+                        }
+                    });
+                button.build(cx.app_mut(), window, slot)?;
+                self.delete_buttons.insert(
+                    index,
+                    DeleteButton {
+                        slot,
+                        language,
+                        button,
+                    },
+                );
+            } else if let Some(entry) = self.delete_buttons.get(&index) {
+                let _ = entry.button.set_disabled(cx.app_mut(), !enabled);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the parsed stand-ins when the language moved.
+    fn rebuild_markdown(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        if let Some(message) = self.signed_out_markdown.take() {
+            remove_markdown(cx, message)?;
+        }
+        if let Some(message) = self.empty_markdown.take() {
+            remove_markdown(cx, message)?;
+        }
+        if let Some(parent) = self.signed_out_parent {
+            let text = t_smol!(self.translate, "widget.ethereum_wallet.logged_out");
+            self.signed_out_markdown = Some(mount_markdown(cx, parent, &self.theme, &text)?);
+        }
+        if let Some(parent) = self.empty_parent {
+            let text = t_smol!(self.translate, "widget.ethereum_wallet.empty_addresses");
+            self.empty_markdown = Some(mount_markdown(cx, parent, &self.theme, &text)?);
+        }
+        Ok(())
+    }
+
+    /// Keeps the parsed stand-ins' theme-dependent payload in step with the appearance.
+    fn sync_markdown(&mut self, cx: &mut WidgetCx<'_>) {
+        if let Some(message) = self.signed_out_markdown.as_mut() {
+            message.node.sync(cx.app_mut());
+        }
+        if let Some(message) = self.empty_markdown.as_mut() {
+            message.node.sync(cx.app_mut());
+        }
+    }
+
+    /// Builds the dialog's own panel: the count and refresh row, the address field and
+    /// its add control, the notice line, the list area and the footer.
+    fn build_content(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        body: NodeId,
+    ) -> Result<(), EngineError> {
+        let Some(list) = self.list.clone() else {
+            // The dialog is being torn down; there is nothing to mount into.
+            return Ok(());
+        };
+        let key = self.keys.dialog.clone();
+        let theme = self.theme.clone();
+        let translate = self.translate.clone();
+        let text_size = UnifiedSize::Small.text_size();
+
+        let panel = build_node(app, window, body, |tree, body| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:panel"))
+                .style(
+                    StyleBuilder::new()
+                        .width_full()
+                        .height(CONTENT_HEIGHT)
+                        .flex_col()
+                        .gap(8.0)
+                        .min_width_0()
+                        .min_height_0()
+                        .build(),
+                )
+                .build(tree, body)
+        })?;
+
+        // The count and the read-again control.
+        let header = build_node(app, window, panel, |tree, panel| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:header"))
+                .style(
+                    StyleBuilder::new()
+                        .width_full()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .gap(8.0)
+                        .min_width_0()
+                        .build(),
+                )
+                .build(tree, panel)
+        })?;
+        self.heading_node(app, window, header, &key, text_size)?;
+        let refresh_holder = build_node(app, window, header, |tree, header| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:refresh"))
+                .style(StyleBuilder::new().flex_none().build())
+                .build(tree, header)
+        })?;
+        self.refresh_parent = Some(refresh_holder);
+        self.build_button(app, window, refresh_holder, DialogButtonKind::Refresh)?;
+
+        // The address field and the control that monitors what it holds.
+        let toolbar = build_node(app, window, panel, |tree, panel| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:toolbar"))
+                .style(
+                    StyleBuilder::new()
+                        .width_full()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .gap(8.0)
+                        .min_width_0()
+                        .build(),
+                )
+                .build(tree, panel)
+        })?;
+        let field_holder = build_node(app, window, toolbar, |tree, toolbar| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:field-holder"))
+                .style(StyleBuilder::new().flex_1().min_width_0().build())
+                .build(tree, toolbar)
+        })?;
+        let spec = Arc::new(InputSpec {
+            name: self.keys.input.clone(),
+            placeholder: SmolStr::default(),
+            masked: false,
+            multiline: false,
+            readonly: false,
+            disabled: false,
+            max_length: None,
+            size: ControlSize::Medium,
+            submit: Some(self.submit.clone()),
+        });
+        let input = {
+            let tree = app
+                .window_mut(window)
+                .ok_or(EngineError::UnknownWindow { window })?
+                .tree_mut();
+            input::build(
+                tree,
+                field_holder,
+                spec,
+                &theme,
+                &self.input_state,
+                &self.input_placeholder,
+            )
+        };
+        input.install(app);
+        self.input = Some(input);
+
+        let add_holder = build_node(app, window, toolbar, |tree, toolbar| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:add"))
+                .style(StyleBuilder::new().flex_none().build())
+                .build(tree, toolbar)
+        })?;
+        self.add_parent = Some(add_holder);
+        self.build_button(app, window, add_holder, DialogButtonKind::Add)?;
+
+        // The line the last change is reported on.
+        let notice = self.notice;
+        let notice_language = self.language;
+        let notice_translate = translate;
+        let notice_theme = theme.clone();
+        build_node(app, window, panel, |tree, panel| {
+            NodeBuilder::text(
+                SmolStr::default(),
+                TextStyle::new(text_size).with_overflow(TextOverflow::Ellipsis, 1),
+            )
+            .id(format_smolstr!("{key}:notice"))
+            .style(
+                StyleBuilder::new()
+                    .width_full()
+                    .flex_none()
+                    .min_width_0()
+                    .build(),
+            )
+            .bind_style(move |cx| {
+                let notice = cx.read(&notice);
+                let (visible, foreground) = match notice.as_ref() {
+                    Some(SelectionNotice::Added) => {
+                        (true, Some(notice_theme.role(cx, Role::StatusSuccessBase)))
+                    }
+                    Some(SelectionNotice::Problem(_)) => {
+                        (true, Some(notice_theme.role(cx, Role::StatusDangerBase)))
+                    }
+                    None => (false, Some(notice_theme.role(cx, Role::FgMuted))),
+                };
+                StylePatch {
+                    foreground,
+                    visible: Some(visible),
+                    ..StylePatch::default()
+                }
+            })
+            .bind_text(move |cx| {
+                let _language = cx.read(&notice_language);
+                match cx.read(&notice).as_ref() {
+                    Some(SelectionNotice::Added) => {
+                        t_smol!(notice_translate, "widget.ethereum_wallet.add_success")
+                    }
+                    Some(SelectionNotice::Problem(failure)) => {
+                        failure.translated_message(&notice_translate)
+                    }
+                    None => SmolStr::default(),
+                }
+            })
+            .build(tree, panel)
+        })?;
+
+        // The addresses, or the sentence that stands in for them.
+        let area = build_node(app, window, panel, |tree, panel| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:area"))
+                .style(
+                    StyleBuilder::new()
+                        .flex_1()
+                        .min_width_0()
+                        .min_height_0()
+                        .relative()
+                        .overflow_hidden()
+                        .build(),
+                )
+                .build(tree, panel)
+        })?;
+
+        let signed_in = self.signed_in;
+        let known = self.known;
+        let addresses = self.addresses;
+        let list_holder = build_node(app, window, area, |tree, area| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:addresses"))
+                .style(
+                    StyleBuilder::new()
+                        .size_full()
+                        .min_width_0()
+                        .min_height_0()
+                        .build(),
+                )
+                .bind_style(move |cx| StylePatch {
+                    visible: Some(
+                        *cx.read(&signed_in) && *cx.read(&known) && !cx.read(&addresses).is_empty(),
+                    ),
+                    ..StylePatch::default()
+                })
+                .build(tree, area)
+        })?;
+        list.mount(app, window, list_holder)?;
+
+        self.build_message_blocks(app, window, area, &key, text_size)?;
+
+        // The way out of the dialog.
+        let footer = build_node(app, window, panel, |tree, panel| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:footer"))
+                .style(
+                    StyleBuilder::new()
+                        .width_full()
+                        .flex_none()
+                        .flex_col()
+                        .gap(8.0)
+                        .build(),
+                )
+                .build(tree, panel)
+        })?;
+        build_node(app, window, footer, |tree, footer| {
+            Separator::horizontal(theme.clone()).build(tree, footer)
+        })?;
+        let close_holder = build_node(app, window, footer, |tree, footer| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:close"))
+                .style(
+                    StyleBuilder::new()
+                        .width_full()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .build(),
+                )
+                .build(tree, footer)
+        })?;
+        self.close_parent = Some(close_holder);
+        self.build_button(app, window, close_holder, DialogButtonKind::Close)?;
+        Ok(())
+    }
+
+    /// The count line: how many addresses the account monitors, once it is known.
+    fn heading_node(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        key: &str,
+        text_size: f32,
+    ) -> Result<NodeId, EngineError> {
+        let addresses = self.addresses;
+        let limit = self.limit;
+        let known = self.known;
+        let language = self.language;
+        let translate = self.translate.clone();
+        let theme = self.theme.clone();
+        build_node(app, window, parent, |tree, parent| {
+            NodeBuilder::text(
+                SmolStr::default(),
+                TextStyle::new(text_size).with_overflow(TextOverflow::Ellipsis, 1),
+            )
+            .id(format_smolstr!("{key}:heading"))
+            .style(StyleBuilder::new().flex_1().min_width_0().build())
+            .bind_style(move |cx| StylePatch {
+                foreground: Some(theme.role(cx, Role::FgDefault)),
+                ..StylePatch::default()
+            })
+            .bind_text(move |cx| {
+                let _language = cx.read(&language);
+                let limit = *cx.read(&limit);
+                let count = cx.read(&addresses).len();
+                match (limit, *cx.read(&known)) {
+                    (Some(limit), true) => t_smol!(
+                        translate,
+                        "widget.ethereum_wallet.monitored_addresses",
+                        current = count,
+                        limit = limit
+                    ),
+                    _ => t_smol!(translate, "widget.ethereum_wallet.dialog_title"),
+                }
+            })
+            .build(tree, parent)
+        })
+    }
+
+    /// The five situations the list area can be in, each a stand-in drawn over the list.
+    fn build_message_blocks(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        area: NodeId,
+        key: &str,
+        text_size: f32,
+    ) -> Result<(), EngineError> {
+        let signed_in = self.signed_in;
+        let ready = self.ready;
+        let known = self.known;
+        let operation = self.operation;
+        let addresses = self.addresses;
+
+        // Nobody signed in.
+        let signed_out = message_block(
+            app,
+            window,
+            area,
+            format_smolstr!("{key}:signed-out"),
+            move |cx| StylePatch {
+                visible: Some(!*cx.read(&signed_in)),
+                ..StylePatch::default()
+            },
+        )?;
+        self.signed_out_parent = Some(signed_out);
+        let signed_out_text = t_smol!(self.translate, "widget.ethereum_wallet.logged_out");
+        self.signed_out_markdown = Some(mount_markdown_from(
+            app,
+            window,
+            signed_out,
+            &self.theme,
+            &signed_out_text,
+        )?);
+
+        // The addresses are being read.
+        let loading = message_block(
+            app,
+            window,
+            area,
+            format_smolstr!("{key}:loading"),
+            move |cx| StylePatch {
+                visible: Some(
+                    *cx.read(&signed_in)
+                        && !*cx.read(&known)
+                        && cx.read(&operation).is_some_and(SelectionOperation::is_read),
+                ),
+                ..StylePatch::default()
+            },
+        )?;
+        let spinner_holder = build_node(app, window, loading, |tree, loading| {
+            NodeBuilder::boxed()
+                .id(format_smolstr!("{key}:spinner-slot"))
+                .style(StyleBuilder::new().flex_none().build())
+                .build(tree, loading)
+        })?;
+        self.spinner_parent = Some(spinner_holder);
+        self.message_text(
+            app,
+            window,
+            loading,
+            text_size,
+            "widget.ethereum_wallet.loading_addresses",
+        )?;
+
+        // Nothing is holding the account: the way out is the pane's own recovery.
+        let unavailable = message_block(
+            app,
+            window,
+            area,
+            format_smolstr!("{key}:unavailable"),
+            move |cx| StylePatch {
+                visible: Some(
+                    *cx.read(&signed_in)
+                        && !*cx.read(&known)
+                        && !cx.read(&operation).is_some_and(SelectionOperation::is_read)
+                        && !*cx.read(&ready),
+                ),
+                ..StylePatch::default()
+            },
+        )?;
+        self.message_text(
+            app,
+            window,
+            unavailable,
+            text_size,
+            "widget.ethereum_wallet.stream_unavailable",
+        )?;
+        let recover_holder = build_node(app, window, unavailable, |tree, parent| {
+            NodeBuilder::boxed()
+                .style(StyleBuilder::new().flex_none().build())
+                .build(tree, parent)
+        })?;
+        self.recover_parent = Some(recover_holder);
+        self.build_button(app, window, recover_holder, DialogButtonKind::Recover)?;
+
+        // The read failed: the way out is reading again.
+        let failed = message_block(
+            app,
+            window,
+            area,
+            format_smolstr!("{key}:failed"),
+            move |cx| StylePatch {
+                visible: Some(
+                    *cx.read(&signed_in)
+                        && !*cx.read(&known)
+                        && !cx.read(&operation).is_some_and(SelectionOperation::is_read)
+                        && *cx.read(&ready),
+                ),
+                ..StylePatch::default()
+            },
+        )?;
+        self.message_text(
+            app,
+            window,
+            failed,
+            text_size,
+            "widget.ethereum_wallet.load_failed",
+        )?;
+        let retry_holder = build_node(app, window, failed, |tree, parent| {
+            NodeBuilder::boxed()
+                .style(StyleBuilder::new().flex_none().build())
+                .build(tree, parent)
+        })?;
+        self.retry_parent = Some(retry_holder);
+        self.build_button(app, window, retry_holder, DialogButtonKind::Retry)?;
+
+        // The account monitors no address.
+        let empty = message_block(
+            app,
+            window,
+            area,
+            format_smolstr!("{key}:empty"),
+            move |cx| StylePatch {
+                visible: Some(
+                    *cx.read(&signed_in) && *cx.read(&known) && cx.read(&addresses).is_empty(),
+                ),
+                ..StylePatch::default()
+            },
+        )?;
+        self.empty_parent = Some(empty);
+        let empty_text = t_smol!(self.translate, "widget.ethereum_wallet.empty_addresses");
+        self.empty_markdown = Some(mount_markdown_from(
+            app,
+            window,
+            empty,
+            &self.theme,
+            &empty_text,
+        )?);
+
+        Ok(())
+    }
+
+    /// One plain sentence standing in a message block.
+    fn message_text(
+        &self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        text_size: f32,
+        key: &'static str,
+    ) -> Result<NodeId, EngineError> {
+        let language = self.language;
+        let translate = self.translate.clone();
+        let theme = self.theme.clone();
+        build_node(app, window, parent, |tree, parent| {
+            NodeBuilder::text(
+                SmolStr::default(),
+                TextStyle::new(text_size).with_overflow(TextOverflow::Ellipsis, 2),
+            )
+            .style(
+                StyleBuilder::new()
+                    .max_width(MESSAGE_WIDTH)
+                    .min_width_0()
+                    .build(),
+            )
+            .bind_style(move |cx| StylePatch {
+                foreground: Some(theme.role(cx, Role::FgMuted)),
+                ..StylePatch::default()
+            })
+            .bind_text(move |cx| {
+                let _language = cx.read(&language);
+                t_smol!(translate, key)
+            })
+            .build(tree, parent)
+        })
+    }
+
+    /// Takes the components out of the state, leaving the nodes to whoever releases them
+    /// first (the dialog's overlay owns the content subtree).
+    fn take_components(&mut self) -> DialogComponents {
+        let delete_buttons = std::mem::take(&mut self.delete_buttons)
+            .into_values()
+            .map(|entry| entry.button)
+            .collect();
+        DialogComponents {
+            dialog: self.dialog.take(),
+            input: self.input.take(),
+            list: self.list.take(),
+            spinner: self.spinner.take(),
+            submit: Some(self.submit.clone()),
+            refresh: self.refresh.take(),
+            add: self.add.take(),
+            retry: self.retry.take(),
+            recover: self.recover.take(),
+            close: self.close.take(),
+            delete_buttons,
+        }
     }
 }
 
 /// The address a reader typed, as the address it names.
 ///
-/// An Ethereum address is the same address in either case: a wallet writes one in mixed case
-/// to carry a checksum over its digits, and the service holds the addresses it is asked about
-/// in one case, so what is typed is folded to that case before anything reads it — a reader
-/// pasting the address their wallet shows is pasting the address they meant. An address that
-/// is not written in hex is left as it was typed rather than folded into something else.
-fn canonical_address(typed: &str) -> Option<SmolStr> {
+/// An Ethereum address is the same address in either case: a wallet writes one in mixed
+/// case to carry a checksum over its digits, and the service holds the addresses it is
+/// asked about in one case, so what is typed is folded to that case before anything reads
+/// it — a reader pasting the address their wallet shows is pasting the address they meant.
+/// An address that is not written in hex is left as it was typed rather than folded into
+/// something else, and the whitespace a paste can bring along is dropped either way.
+fn canonical_address(typed: &SmolStr) -> Option<SmolStr> {
     let typed = typed.trim();
     if typed.is_empty() {
         return None;
@@ -608,208 +1590,423 @@ fn canonical_address(typed: &str) -> Option<SmolStr> {
     })
 }
 
-/// One monitored address.
-///
-/// The row is the surface the list draws an address on rather than a control of its own: nothing
-/// about an address is asked for by clicking it, so the only thing the row carries that answers
-/// the mouse is the trash that stops monitoring it.
-///
-/// The dialog is read for whether a change may be asked for rather than handed the answer, so
-/// that a row drawn by the list reads what the pane holds now: a list draws its rows again on
-/// every frame of the dialog, and what a row draws is the frame it is drawn in.
-fn address_row(
-    selection: &EthereumWalletSelection,
-    dialog: &WeakEntity<EthereumWalletDialog>,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let address = selection.address.clone();
-    let enabled = dialog
-        .upgrade()
-        .is_some_and(|dialog| dialog.read_with(cx, |dialog, cx| dialog.may_change(cx)));
-    let label = t!(cx, "widget.ethereum_wallet.delete_address");
-    let delete = Button::new((
-        ElementId::Name(SharedString::new_static("EthereumWalletAddressDelete")),
-        selection.address.as_str(),
-    ))
-    .ghost()
-    .small()
-    .disabled(!enabled)
-    .aria_label(label.clone())
-    .with_tooltip(label)
-    .on_click({
-        let dialog = dialog.clone();
-        move |_, _, cx| {
-            let address = address.clone();
-            let Some(dialog) = dialog.upgrade() else {
-                return;
-            };
-            dialog.update(cx, |dialog, cx| dialog.delete(address, cx));
-        }
-    })
-    .child(Icon::new(IconKind::Trash).size_3());
+/// The address the add control would monitor, from the signals showing on this frame.
+fn addable_from(
+    ctx: &ActionCtx<'_>,
+    input_state: &Signal<InputState>,
+    addresses: &Signal<Arc<[EthereumWalletSelection]>>,
+    limit: &Signal<Option<usize>>,
+    ready: &Signal<bool>,
+    known: &Signal<bool>,
+    operation: &Signal<Option<SelectionOperation>>,
+) -> Option<SmolStr> {
+    let text = SmolStr::new(ctx.read(input_state).text().trim());
+    let typed = canonical_address(&text)?;
+    ethereum_wallet_address(&typed)?;
+    if !(*ctx.read(ready) && *ctx.read(known) && ctx.read(operation).is_none()) {
+        return None;
+    }
+    let limit = (*ctx.read(limit))?;
+    let addresses = ctx.read(addresses);
+    if addresses.len() >= limit || addresses.iter().any(|current| current.address == typed) {
+        return None;
+    }
+    Some(typed)
+}
 
-    Interactive::new((
-        ElementId::Name(SharedString::new_static("EthereumWalletAddressRow")),
-        selection.address.as_str(),
-    ))
-    .rounded_sm()
-    .ghost()
-    .medium()
-    .debug_selector(|| "TEST_ETHEREUM_WALLET_ADDRESS_ROW".into())
-    .child(
-        div()
-            .debug_selector(|| "TEST_ETHEREUM_WALLET_ADDRESS_ROW_CONTENT".into())
-            .min_w_0()
-            .flex_1()
-            .truncate()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.roles.fg.default.hsla)
-            .child(SharedString::from(selection.address.as_str())),
+/// One address row of the list: the address, and the slot its delete control goes in.
+fn build_address_row(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    index: usize,
+    key: &str,
+    addresses: &Signal<Arc<[EthereumWalletSelection]>>,
+    slots: &Rc<RefCell<BTreeMap<usize, NodeId>>>,
+    theme: &ThemeHandle,
+) -> Result<(), EngineError> {
+    let row_theme = theme.clone();
+    let row = NodeBuilder::boxed()
+        .id(format_smolstr!("{key}:row:{index}"))
+        .style(
+            StyleBuilder::new()
+                .flex_row()
+                .items_center()
+                .gap(8.0)
+                .width_full()
+                .min_width_0()
+                .build(),
+        )
+        .build(tree, parent)?;
+
+    let text_addresses = *addresses;
+    let text_theme = row_theme;
+    NodeBuilder::text(
+        SmolStr::default(),
+        TextStyle::new(UnifiedSize::Medium.text_size()).with_overflow(TextOverflow::Ellipsis, 1),
     )
-    .child(delete)
-    .into_any_element()
-}
+    .id(format_smolstr!("{key}:row:{index}:address"))
+    .style(StyleBuilder::new().flex_1().min_width_0().build())
+    .bind_text(move |cx| {
+        cx.read(&text_addresses)
+            .get(index)
+            .map_or_else(SmolStr::default, |selection| selection.address.clone())
+    })
+    .bind_style(move |cx| StylePatch {
+        foreground: Some(text_theme.role(cx, Role::FgDefault)),
+        ..StylePatch::default()
+    })
+    .build(tree, row)?;
 
-/// The recovery the pane itself offers, as the dialog's way out of having no stream.
-fn recovery_button(action: &WidgetAction, cx: &App) -> AnyElement {
-    Button::new("ethereum_wallet-monitor-recover")
-        .outline()
-        .small()
-        .disabled(!action.is_enabled())
-        .on_click({
-            let action = action.clone();
-            move |_, _, cx| action.run(cx)
-        })
-        .child(action.label(cx))
-        .into_any_element()
-}
-
-/// The addresses are being read.
-fn loading_addresses(cx: &Context<EthereumWalletDialog>) -> AnyElement {
-    div()
-        .id("ethereum_wallet-monitor-address-loading")
-        .size_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .role(Role::ProgressIndicator)
-        .aria_label(t!(cx, "widget.ethereum_wallet.loading_addresses"))
-        .child(
-            div()
-                .size_5()
-                .child(Spinner::new("ethereum_wallet-monitor-address-spinner")),
+    let slot = NodeBuilder::boxed()
+        .id(format_smolstr!("{key}:row:{index}:actions"))
+        .style(
+            StyleBuilder::new()
+                .width(UnifiedSize::Small.h())
+                .height_full()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .build(),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().roles.fg.muted.hsla)
-                .child(t!(cx, "widget.ethereum_wallet.loading_addresses")),
-        )
-        .into_any_element()
+        .build(tree, row)?;
+    slots.borrow_mut().insert(index, slot);
+
+    Ok(())
 }
 
-/// A message and the control that offers a way out of it.
-fn message_with_action(message: SharedString, action: AnyElement) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .px_4()
-        .text_center()
-        .text_xs()
-        .child(message)
-        .child(div().flex_none().child(action))
-        .into_any_element()
+/// One absolute overlay in the list area, centered.
+fn message_block(
+    app: &mut App,
+    window: WindowId,
+    area: NodeId,
+    id: SmolStr,
+    visible: impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static,
+) -> Result<NodeId, EngineError> {
+    build_node(app, window, area, |tree, area| {
+        NodeBuilder::boxed()
+            .id(id)
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .left(0.0)
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(8.0)
+                    .padding(8.0)
+                    .build(),
+            )
+            .bind_style(visible)
+            .build(tree, area)
+    })
 }
 
-/// A sentence standing in the middle of the body, drawn from the document it was read into.
-///
-/// The copy is catalogue copy, and the sentences of the catalogue are written as markdown — the
-/// ones this dialog shares with the pane's own placeholder carry a `<p align="center">` tag pair
-/// — so it is drawn by the markdown component rather than as the string it is written in. The
-/// document is the dialog's own, which is what keeps the parse out of the frame that draws it.
-fn centered_message(message: &Entity<MarkdownState>, color: Hsla) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_4()
-        .text_center()
-        .text_xs()
-        .text_color(color)
-        .child(Markdown::new(message))
-        .into_any_element()
+/// Parses and mounts one rich stand-in under `parent`.
+fn mount_markdown(
+    cx: &mut WidgetCx<'_>,
+    parent: NodeId,
+    theme: &ThemeHandle,
+    source: &str,
+) -> Result<MarkdownMessage, EngineError> {
+    let window = cx.window();
+    mount_markdown_from(cx.app_mut(), window, parent, theme, source)
+}
+
+/// Parses and mounts one rich stand-in with an application context in hand.
+fn mount_markdown_from(
+    app: &mut App,
+    window: WindowId,
+    parent: NodeId,
+    theme: &ThemeHandle,
+    source: &str,
+) -> Result<MarkdownMessage, EngineError> {
+    let document = parse_document(source, &EmbeddedAssets);
+    let node = MarkdownNode::mount(app, window, parent, theme.clone(), Arc::new(document))?;
+    Ok(MarkdownMessage { node })
+}
+
+/// Removes one parsed stand-in's node; the document goes with it.
+fn remove_markdown(cx: &mut WidgetCx<'_>, message: MarkdownMessage) -> Result<(), EngineError> {
+    let root = message.node.root();
+    if cx.tree().get(root).is_err() {
+        return Ok(());
+    }
+    let window = cx.window();
+    cx.app_mut().remove_node(window, root).map(|_| ())
+}
+
+/// Removes one control's node, if it is still there.
+fn remove_button_node(app: &mut App, window: WindowId, button: &Button) -> Result<(), EngineError> {
+    let Some(node) = button.node() else {
+        return Ok(());
+    };
+    if app
+        .window(window)
+        .is_none_or(|target| target.tree().get(node).is_err())
+    {
+        return Ok(());
+    }
+    app.remove_node(window, node).map(|_| ())
+}
+
+/// Releases the components one dialog owns, node-owning component first (E16).
+fn release_components(app: &mut App, components: DialogComponents) {
+    if let Some(dialog) = components.dialog {
+        dialog.release(app);
+    }
+    if let Some(action) = components.submit {
+        app.off_action(&action);
+    }
+    if let Some(input) = components.input {
+        input.release(app);
+    }
+    if let Some(list) = components.list {
+        list.release(app);
+    }
+    if let Some(spinner) = components.spinner {
+        spinner.release(app);
+    }
+    for button in [
+        components.refresh,
+        components.add,
+        components.retry,
+        components.recover,
+        components.close,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        button.release(app);
+    }
+    for button in components.delete_buttons {
+        button.release(app);
+    }
+}
+
+/// The product assets, as the markdown parser's image-size seam.
+struct EmbeddedAssets;
+
+impl MarkdownAssets for EmbeddedAssets {
+    fn load(&self, path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+        assets::bytes(path).map(std::borrow::Cow::Borrowed)
+    }
+}
+
+/// Whether `event` is one only a dialog's own text input can consume.
+fn is_text_input(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Input(InputEvent::Text { .. } | InputEvent::Key { .. }) | Event::Ime(_)
+    )
+}
+
+/// Maps a kit dialog error onto the engine error the widget contract speaks.
+fn engine_error_of(error: DialogError, window: WindowId) -> EngineError {
+    match error {
+        DialogError::Engine(error) | DialogError::Overlay(OverlayError::Engine(error)) => error,
+        DialogError::Overlay(OverlayError::PlacementConfig { .. }) | DialogError::NotOpen => {
+            EngineError::UnknownWindow { window }
+        }
+    }
+}
+
+/// Builds one node under `parent` with a window's tree in hand.
+fn build_node(
+    app: &mut App,
+    window: WindowId,
+    parent: NodeId,
+    build: impl FnOnce(&mut NodeTree, NodeId) -> Result<NodeId, EngineError>,
+) -> Result<NodeId, EngineError> {
+    let tree = app
+        .window_mut(window)
+        .ok_or(EngineError::UnknownWindow { window })?
+        .tree_mut();
+    build(tree, parent)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use base_ui::{animation::ANIMATION_TICK, layer::Layer, size::UnifiedSize, style::theme};
-    use gpui_kit::{AppContext, EmptyView, TestAppContext, VisualTestContext, WeakEntity};
-    use kytrix_service_provider::service::ethereum_wallet::EthereumWalletSelection;
+    use i18n::{language::codes::LanguageCode, t_smol};
+    use kytrix_service_provider::service::ethereum_wallet::{
+        EthereumWalletSelection, EthereumWalletSelectionsResponse,
+    };
+    use ui_core::event::{ActionSource, KeyCode, Modifiers};
+    use widget::{protocol::RequestId, rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
-    use crate::{
-        test_support::{ACCOUNT, FakeSource, selection, selections, settle_until},
-        view::tests::{asked_for, forget_last_change, live_pane},
-    };
+    use crate::view::{SelectionFailure, SelectionNotice};
 
     const FIRST: &str = "0x1111111111111111111111111111111111111111";
     const SECOND: &str = "0x2222222222222222222222222222222222222222";
-
-    /// One address, in the two cases a wallet may write it in: the mixed case is the checksum
-    /// the address is displayed with, and the lowercase one is the address itself.
+    /// One address, in the two cases a wallet may write it in: the mixed case is the
+    /// checksum the address is displayed with, and the lowercase one is the address itself.
     const CHECKSUMMED: &str = "0x52908400098527886E0F7030069857D2E4169EE7";
     const CANONICAL: &str = "0x52908400098527886e0f7030069857d2e4169ee7";
-
-    /// `SECOND` with the whitespace a paste can bring along.
-    const SPACED_SECOND: &str = "  0x2222222222222222222222222222222222222222  ";
-
-    /// A Solana address, which is base58 and therefore not one this pane accepts.
+    /// A Solana address: base58, and therefore not one this pane accepts.
     const SOLANA: &str = "So11111111111111111111111111111111111111112";
+    const SETTLE_FRAMES: usize = 8;
 
-    /// The state of a pane that is live, holds `addresses`, and is waiting for nothing.
-    fn state(addresses: Vec<EthereumWalletSelection>, limit: usize) -> DialogState {
-        DialogState::new(
-            true,
-            true,
-            Some(SelectionData::new(selections(addresses, limit))),
-            None,
-            None,
-            WidgetAction::new("common.retry", |_: &mut App| {}),
+    fn translate(language: LanguageCode) -> Translate {
+        Translate::new(
+            Rc::new(i18n::embedded::load().expect("the embedded locales load")),
+            language,
         )
     }
 
-    /// A window whose root is the layer an application mounts, which is what a dialog is
-    /// opened on and dismissed from.
-    fn harness(cx: &mut TestAppContext) -> &mut VisualTestContext {
-        cx.update(|cx| {
-            theme::install(cx);
-            i18n::global::embedded::install(cx).expect("the embedded locales should load");
+    fn harness() -> WidgetTestApp {
+        WidgetTestApp::with_translate(translate(LanguageCode::En))
+    }
+
+    fn address(address: &str) -> EthereumWalletSelection {
+        EthereumWalletSelection {
+            address: SmolStr::new(address),
+            created_at: 1,
+        }
+    }
+
+    fn data(addresses: Vec<EthereumWalletSelection>, limit: usize) -> SelectionData {
+        SelectionData::new(EthereumWalletSelectionsResponse {
+            selections: addresses,
+            ethereum_wallet_monitor_address_limit: limit,
+        })
+    }
+
+    fn view(signed_in: bool, ready: bool, selections: Option<SelectionData>) -> DialogView {
+        DialogView {
+            signed_in,
+            ready,
+            selections,
+            operation: None,
+            notice: None,
+            recovery: WidgetAction::new("common.retry", |_| {}),
+        }
+    }
+
+    fn open(harness: &mut WidgetTestApp) -> EthereumWalletDialog {
+        harness
+            .with_cx(EthereumWalletDialog::open)
+            .expect("the dialog opens")
+    }
+
+    fn sync(harness: &mut WidgetTestApp, dialog: &mut EthereumWalletDialog, view: &DialogView) {
+        harness
+            .with_cx(|cx| dialog.sync(cx, view))
+            .expect("the dialog syncs");
+    }
+
+    /// Lets a few production-shaped frames run: nodes built by the frame that created them
+    /// are laid out and painted by the frames after.
+    fn settle_frames(
+        harness: &mut WidgetTestApp,
+        dialog: &mut EthereumWalletDialog,
+        view: &DialogView,
+    ) {
+        for _ in 0..SETTLE_FRAMES {
+            sync(harness, dialog, view);
+            harness.drain();
+        }
+    }
+
+    fn overlay(dialog: &EthereumWalletDialog) -> NodeId {
+        dialog
+            .test_dialog()
+            .expect("the kit dialog is built")
+            .overlay_node()
+            .expect("the dialog is open")
+    }
+
+    fn key(dialog: &EthereumWalletDialog) -> SmolStr {
+        SmolStr::new(dialog.test_dialog().expect("the kit dialog is built").key())
+    }
+
+    /// The key the address list's rows are drawn under.
+    fn list_key(dialog: &EthereumWalletDialog) -> SmolStr {
+        dialog.inner.borrow().keys.list.clone()
+    }
+
+    fn find(
+        harness: &WidgetTestApp,
+        dialog: &EthereumWalletDialog,
+        suffix: &str,
+    ) -> Option<NodeId> {
+        harness.find_by_debug_prefix(
+            overlay(dialog),
+            &format_smolstr!("{}:{suffix}", key(dialog)),
+        )
+    }
+
+    fn find_row(
+        harness: &WidgetTestApp,
+        dialog: &EthereumWalletDialog,
+        suffix: &str,
+    ) -> Option<NodeId> {
+        harness.find_by_debug_prefix(
+            overlay(dialog),
+            &format_smolstr!("{}:{suffix}", list_key(dialog)),
+        )
+    }
+
+    fn text_at(harness: &WidgetTestApp, dialog: &EthereumWalletDialog, suffix: &str) -> String {
+        let node = find(harness, dialog, suffix)
+            .unwrap_or_else(|| panic!("the dialog draws its {suffix} node"));
+        harness.text_of(node)
+    }
+
+    fn click(harness: &mut WidgetTestApp, button: &Button) {
+        let node = button.node().expect("the control is built");
+        let action = button
+            .action_identity()
+            .expect("the control registered a click handler");
+        let window = harness.window();
+        assert!(
+            harness
+                .app_mut()
+                .dispatch_action(window, node, action, ActionSource::Programmatic),
+            "the control is registered"
+        );
+    }
+
+    fn requests(
+        harness: &mut WidgetTestApp,
+        dialog: &mut EthereumWalletDialog,
+    ) -> Vec<DialogRequest> {
+        harness.with_cx(|cx| dialog.take_requests(cx))
+    }
+
+    fn type_address(harness: &mut WidgetTestApp, dialog: &EthereumWalletDialog, text: &str) {
+        let input = dialog.test_input().expect("the address field is built");
+        let window = harness.window();
+        let _ = harness.app_mut().set_focus(window, Some(input.root));
+        let event = Event::Input(InputEvent::Text {
+            text: SmolStr::new(text),
+            timestamp: Instant::now(),
         });
-        let (_, cx) = cx.add_window_view(|_, cx| Layer::new(cx.new(|_| EmptyView)));
-        cx.run_until_parked();
-
-        cx
+        assert!(
+            input.dispatch(harness.app_mut(), &event),
+            "the focused field takes the text"
+        );
     }
 
-    /// Lets the dialog's own transition finish and repaints, so that one just opened is past
-    /// its first frames and one just dismissed is gone rather than still fading out.
-    fn settle(cx: &mut VisualTestContext) {
-        cx.executor()
-            .advance_clock(ANIMATION_TICK + Duration::from_millis(50));
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
+    /// Presses Enter in the address field: the field dispatches its own submit action.
+    fn press_enter(harness: &mut WidgetTestApp, dialog: &EthereumWalletDialog) {
+        let input = dialog.test_input().expect("the address field is built");
+        let window = harness.window();
+        let _ = harness.app_mut().set_focus(window, Some(input.root));
+        let event = Event::Input(InputEvent::key_down(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            input.dispatch(harness.app_mut(), &event),
+            "the focused field takes Enter"
+        );
     }
 
+    /// An Ethereum address is the address it names in either case, and the whitespace a
+    /// paste can bring along is not part of one — but the case the service holds it in is
+    /// the lowercase one, so a checksummed address is folded before it is read.
     #[test]
     fn an_address_should_be_read_as_the_address_it_names() {
         assert_eq!(
@@ -824,326 +2021,405 @@ mod tests {
         );
 
         assert_eq!(
-            canonical_address(CHECKSUMMED),
+            canonical_address(&SmolStr::new_static(CHECKSUMMED)),
             Some(SmolStr::new_static(CANONICAL)),
             "an Ethereum address is the address it names in either case"
         );
         assert_eq!(
-            canonical_address(CANONICAL),
+            canonical_address(&SmolStr::new_static(CANONICAL)),
             Some(SmolStr::new_static(CANONICAL)),
             "an address already written the way the service holds it is left alone"
         );
         assert_eq!(
-            canonical_address(SPACED_SECOND),
+            canonical_address(&SmolStr::new_static(
+                "  0x2222222222222222222222222222222222222222  "
+            )),
             Some(SmolStr::new_static(SECOND)),
             "whitespace around an address is not part of one"
         );
         assert_eq!(
-            canonical_address(SOLANA),
+            canonical_address(&SmolStr::new_static(SOLANA)),
             Some(SmolStr::new_static(SOLANA)),
             "an address that is not written in hex is left as it was typed"
         );
-        assert_eq!(canonical_address(""), None);
-        assert_eq!(canonical_address("   "), None);
+        assert_eq!(canonical_address(&SmolStr::new_static("")), None);
+        assert_eq!(canonical_address(&SmolStr::new_static("   ")), None);
     }
 
     #[test]
-    fn an_address_should_only_be_offered_when_it_could_be_monitored() {
-        let state = state(vec![selection(FIRST)], 3);
+    fn a_dialog_should_draw_the_heading_and_the_addresses_the_pane_holds() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
 
-        assert!(state.may_change());
-        assert_eq!(
-            state.addable_address(Some(&SmolStr::new_static(SECOND))),
-            Some(SmolStr::new_static(SECOND)),
-            "an address the account does not monitor is one it may"
+        assert!(
+            text_at(&harness, &dialog, "heading").contains("Selected addresses: 1/3"),
+            "the heading reads the addresses against the quota"
         );
-        assert_eq!(
-            state.addable_address(Some(&SmolStr::new_static(SPACED_SECOND))),
-            Some(SmolStr::new_static(SECOND)),
-            "an address pasted with its whitespace is the address in it"
+        let row = find_row(&harness, &dialog, "row:0:address")
+            .expect("the list draws the address the pane holds");
+        assert_eq!(harness.text_of(row), FIRST);
+        assert!(
+            dialog.test_delete_button(0).is_some(),
+            "the row carries the control that stops monitoring it"
         );
+    }
+
+    /// Typing an address offers it to the pane; an address the account already monitors is
+    /// not offered, and neither is one past the quota.
+    #[test]
+    fn typing_an_address_should_offer_it_to_the_pane() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        type_address(&mut harness, &dialog, SECOND);
+        settle_frames(&mut harness, &mut dialog, &view);
+        let add = dialog
+            .test_add_button()
+            .expect("the toolbar draws the add control");
+        click(&mut harness, &add);
         assert_eq!(
-            state.addable_address(Some(&SmolStr::new_static(FIRST))),
-            None,
-            "an address already on the list is not a change"
+            requests(&mut harness, &mut dialog),
+            vec![DialogRequest::Add(SmolStr::new_static(SECOND))],
+            "the address the field holds is the one that was asked for"
         );
+
+        // An address already on the list is not a change: the control refuses it rather
+        // than putting a question the service would answer with a conflict.
+        type_address(&mut harness, &dialog, FIRST);
+        settle_frames(&mut harness, &mut dialog, &view);
+        click(&mut harness, &add);
+        assert!(
+            requests(&mut harness, &mut dialog).is_empty(),
+            "an address already monitored is not offered"
+        );
+    }
+
+    /// Enter in the address field is the add control by another route: it offers what the
+    /// field holds, and it refuses what the control would refuse.
+    #[test]
+    fn pressing_enter_in_the_address_field_should_offer_the_typed_address() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        press_enter(&mut harness, &dialog);
+        assert!(
+            requests(&mut harness, &mut dialog).is_empty(),
+            "an empty field has nothing to offer"
+        );
+
+        type_address(&mut harness, &dialog, SECOND);
+        settle_frames(&mut harness, &mut dialog, &view);
+        press_enter(&mut harness, &dialog);
         assert_eq!(
-            state.addable_address(Some(&SmolStr::new_static("0x1234"))),
-            None,
-            "a partial address is not one"
+            requests(&mut harness, &mut dialog),
+            vec![DialogRequest::Add(SmolStr::new_static(SECOND))],
+            "Enter offers the address the field holds, as the add control does"
         );
-        assert_eq!(state.addable_address(Some(&SmolStr::new_static(""))), None);
-        assert_eq!(state.addable_address(None), None);
     }
 
     #[test]
     fn a_full_quota_should_refuse_another_address() {
-        let state = state(vec![selection(FIRST)], 1);
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 1)));
+        settle_frames(&mut harness, &mut dialog, &view);
 
-        assert_eq!(
-            state.addable_address(Some(&SmolStr::new_static(SECOND))),
-            None,
+        type_address(&mut harness, &dialog, SECOND);
+        settle_frames(&mut harness, &mut dialog, &view);
+        let add = dialog
+            .test_add_button()
+            .expect("the toolbar draws the add control");
+        click(&mut harness, &add);
+
+        assert!(
+            requests(&mut harness, &mut dialog).is_empty(),
             "the address past the quota is not one the account may monitor"
         );
         assert!(
-            state.may_change(),
+            dialog.test_delete_button(0).is_some(),
             "a full quota is not a reason to refuse leaving one"
         );
     }
 
-    /// The dialog a pane holds, attached the way the pane attaches the one it opens.
-    ///
-    /// `show` needs the window layer the application installs, and what these tests are about is
-    /// what the dialog draws and asks the pane for rather than how it was opened.
-    fn attach(
-        pane: &Entity<EthereumWalletWidget>,
-        cx: &mut TestAppContext,
-    ) -> Entity<EthereumWalletDialog> {
-        let window = cx.add_empty_window();
-        let dialog = window.update(|window, cx| {
-            let address = cx.new(|cx| InputStateBuilder::new(ADDRESS_INPUT_ID).build(window, cx));
-            cx.new(|cx| EthereumWalletDialog::new(pane.downgrade(), address, cx))
-        });
-        pane.update(cx, |pane, cx| pane.attach_dialog(dialog.downgrade(), cx));
+    /// A row's trash control is built into the row the list mounts, and asks the pane to
+    /// stop monitoring that row's address.
+    #[test]
+    fn removing_an_address_should_ask_the_pane() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(
+            true,
+            true,
+            Some(data(vec![address(FIRST), address(SECOND)], 3)),
+        );
+        settle_frames(&mut harness, &mut dialog, &view);
 
-        dialog
+        let delete = dialog
+            .test_delete_button(0)
+            .expect("the first row carries its control");
+        click(&mut harness, &delete);
+
+        assert_eq!(
+            requests(&mut harness, &mut dialog),
+            vec![DialogRequest::Delete(SmolStr::new_static(FIRST))],
+            "the address of the row that was clicked is the one that was asked to leave"
+        );
     }
 
-    /// Waits for the read the pane sends when it takes a dialog over, which is the one thing
-    /// that stands between opening a dialog and being able to ask it for a change.
-    fn settle_attached(pane: &Entity<EthereumWalletWidget>, cx: &mut TestAppContext) {
-        settle_until(cx, "the read the dialog asked for to be answered", |cx| {
-            pane.read(cx).dialog_state().operation.is_none()
-        });
-    }
-
-    /// A change is asked for from the dialog and made by the pane, which then has to repaint
-    /// the dialog — from inside a frame the dialog is already being updated for, which is the
-    /// one time an entity may not be asked to update itself.
-    ///
-    /// Both ways of asking are here: the control beside the field, and the field's own Enter.
-    #[gpui_kit::test]
-    fn adding_an_address_should_not_re_enter_the_dialog_that_asked_for_it(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let pane = live_pane(cx, &source, &session, vec![selection(FIRST)], 3);
-        // The read the pane sends when it takes the dialog over, answered like the one before it.
-        session.answer_selections(selections(vec![selection(FIRST)], 3));
-        let dialog = attach(&pane, cx);
-        settle_attached(&pane, cx);
-        let field = cx.update(|cx| dialog.read(cx).address.clone());
-
-        // What the control beside the field does when it is clicked.
-        cx.update(|cx| {
-            dialog.update(cx, |dialog, _| {
-                dialog.typed = Some(SmolStr::new_static(CHECKSUMMED));
-            });
-            dialog.update(cx, |dialog, cx| dialog.add(cx));
-        });
-        cx.update(|cx| {
-            assert_eq!(
-                asked_for(&pane, cx).as_deref(),
-                Some(CANONICAL),
-                "the address the ethereum_wallet wrote in mixed case is the one that was asked for"
-            );
-        });
-
-        // What the field does when the same address is confirmed with Enter, which reaches
-        // the pane without a control to have been disabled.
-        cx.update(|cx| {
-            forget_last_change(&pane, cx);
-            field.update(cx, |_, cx| {
-                cx.emit(InputStateEvent::Change(SharedString::new_static(
-                    CHECKSUMMED,
-                )));
-                cx.emit(InputStateEvent::PressEnter(SharedString::new_static(
-                    CHECKSUMMED,
-                )));
-            });
-        });
-        cx.update(|cx| {
-            assert_eq!(
-                asked_for(&pane, cx).as_deref(),
-                Some(CANONICAL),
-                "the field answers Enter with the address it holds"
-            );
-        });
-    }
-
-    /// Leaving an address is asked for the same way, so it repaints the dialog the same way.
-    #[gpui_kit::test]
-    fn removing_an_address_should_not_re_enter_the_dialog_that_asked_for_it(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let pane = live_pane(cx, &source, &session, vec![selection(FIRST)], 3);
-        session.answer_selections(selections(vec![selection(FIRST)], 3));
-        let dialog = attach(&pane, cx);
-        settle_attached(&pane, cx);
-
-        // What the control beside an address on the list does when it is clicked.
-        cx.update(|cx| {
-            dialog.update(cx, |dialog, cx| {
-                dialog.delete(SmolStr::new_static(FIRST), cx);
-            });
-        });
-        cx.update(|cx| {
-            assert_eq!(
-                asked_for(&pane, cx).as_deref(),
-                Some(FIRST),
-                "the address of the row that was clicked is the one that was asked to leave"
-            );
-        });
-    }
-
-    /// The dialog draws the addresses the pane holds — each one a row one line tall — and the
-    /// toolbar that adds one is drawn at the size of the field beside it.
-    #[gpui_kit::test]
-    fn a_dialog_should_draw_the_addresses_the_pane_holds(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let pane = live_pane(cx, &source, &session, vec![selection(FIRST)], 3);
-        session.answer_selections(selections(vec![selection(FIRST)], 3));
-        let dialog = attach(&pane, cx);
-        settle_attached(&pane, cx);
-
-        let (_, window) = cx.add_window_view({
-            let dialog = dialog.clone();
-            move |_, _| DialogHarness { dialog }
-        });
-        window.run_until_parked();
+    /// A list that shrank gives up the controls of the rows it no longer shows: a control
+    /// left behind would draw over whatever row takes that place, and keep its value slots.
+    #[test]
+    fn a_shrunk_address_list_should_release_the_controls_it_no_longer_shows() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let two_rows = view(
+            true,
+            true,
+            Some(data(vec![address(FIRST), address(SECOND)], 3)),
+        );
+        settle_frames(&mut harness, &mut dialog, &two_rows);
+        let before = harness.signal_slot_stats();
         assert!(
-            window
-                .debug_bounds("TEST_ETHEREUM_WALLET_ADDRESS_LIST")
-                .is_some(),
-            "the dialog should draw the addresses the pane holds"
-        );
-        let row = window
-            .debug_bounds("TEST_ETHEREUM_WALLET_ADDRESS_ROW")
-            .expect("a row is drawn from the pane while the list draws it");
-        let content = window
-            .debug_bounds("TEST_ETHEREUM_WALLET_ADDRESS_ROW_CONTENT")
-            .expect("the row draws the address");
-        assert_eq!(
-            row.size.height,
-            UnifiedSize::Medium.h(),
-            "a row is one line tall"
-        );
-        assert!(
-            content.top() >= row.top() && content.bottom() <= row.bottom(),
-            "what a row holds is drawn inside it (row {:?}, content {:?})",
-            row,
-            content
-        );
-        let shown = window.update(|_, cx| {
-            dialog.read_with(cx, |dialog, _| {
-                dialog.shown.as_ref().map(|shown| {
-                    shown
-                        .iter()
-                        .map(|selection| selection.address.clone())
-                        .collect::<Vec<_>>()
-                })
-            })
-        });
-        assert_eq!(
-            shown,
-            Some(vec![SmolStr::new_static(FIRST)]),
-            "the addresses the pane holds should be the ones the list is given"
+            dialog.test_delete_button(1).is_some(),
+            "the second row carries its control"
         );
 
-        let field = window
-            .debug_bounds("TEST_ETHEREUM_WALLET_ADDRESS_FIELD")
-            .expect("the toolbar should draw the field an address is typed into");
-        let add = window
-            .debug_bounds("TEST_ETHEREUM_WALLET_ADD_ADDRESS")
-            .expect("the toolbar should draw the control that adds what the field holds");
-        assert_eq!(
-            add.size.height,
-            UnifiedSize::Medium.h(),
-            "the control that adds an address is drawn at the size the field beside it is"
-        );
-        assert!(
-            field.size.height >= UnifiedSize::Medium.h(),
-            "the field is drawn at that size too, inside its own border (field {:?}, control {:?})",
-            field.size,
-            add.size
-        );
-        assert_eq!(
-            add.size.width, add.size.height,
-            "the control is its icon and nothing else, so it is as wide as it is tall"
-        );
-    }
-
-    /// A frame of its own for a dialog, which the window layer would otherwise hold.
-    struct DialogHarness {
-        dialog: Entity<EthereumWalletDialog>,
-    }
-
-    impl Render for DialogHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.dialog.clone())
-        }
-    }
-
-    /// The dialog owns its own state, so the layer releasing the dialog is the whole of the
-    /// cleanup: nothing outside it has to take its field, its list or what it was showing down.
-    ///
-    /// The dialog closes itself through the event the layer subscribes to, which is the path a
-    /// control of its own takes. The pane is not part of this: what a dialog owns is its own
-    /// whether or not a pane is still there, and the dialog draws nothing without one.
-    #[gpui_kit::test]
-    fn a_dialog_should_release_its_own_state_when_it_closes_itself(cx: &mut TestAppContext) {
-        let cx = harness(cx);
-        let (dialog, field, list) = cx.update(|window, cx| {
-            let field = cx.new(|cx| InputStateBuilder::new(ADDRESS_INPUT_ID).build(window, cx));
-            let dialog = cx
-                .new(|cx| EthereumWalletDialog::new(WeakEntity::new_invalid(), field.clone(), cx));
-            let list = dialog.read(cx).list.clone();
-
-            window.dialog(cx, dialog.clone());
-
-            (dialog, field, list)
-        });
-        let (content, field_weak, list_weak) =
-            (dialog.downgrade(), field.downgrade(), list.downgrade());
-        settle(cx);
+        let one_row = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &one_row);
 
         assert!(
-            content.upgrade().is_some()
-                && field_weak.upgrade().is_some()
-                && list_weak.upgrade().is_some(),
-            "the dialog and what it owns should be alive while it is open"
+            dialog.test_delete_button(1).is_none(),
+            "the control of the row that is gone is let go"
+        );
+        assert!(
+            dialog.test_delete_button(0).is_some(),
+            "the row still shown keeps its control"
+        );
+        assert!(
+            harness.signal_slot_stats().live < before.live,
+            "the released control returns its value slots"
+        );
+    }
+
+    /// The row controls are static copy: a language switch rebuilds them in the language
+    /// showing now (a kit button's accessible name is chosen when it is built).
+    #[test]
+    fn the_row_controls_should_follow_the_language() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let english = t_smol!(
+            translate(LanguageCode::En),
+            "widget.ethereum_wallet.delete_address"
+        );
+        assert_eq!(
+            dialog
+                .test_delete_button(0)
+                .expect("the row carries its control")
+                .a11y_label_text(),
+            Some(english.as_str()),
+            "the row control names what it does"
         );
 
-        // The dialog saying it is done, which is what its own control does by emitting. The
-        // handles the test holds go with it: the layer is what owns the dialog, and a handle
-        // kept here would be the very reference the assertions below are about.
-        cx.update(|_, cx| dialog.update(cx, |_, cx| cx.emit(DismissEvent)));
-        drop((dialog, field, list));
-        // The exit transition is drawn over several frames, and the layer drops the dialog on
-        // the first one past it: this waits for that rather than guessing which frame it is.
-        for _ in 0..4 {
-            if content.upgrade().is_none() {
+        harness.switch_language(LanguageCode::ZhCn);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let chinese = t_smol!(
+            translate(LanguageCode::ZhCn),
+            "widget.ethereum_wallet.delete_address"
+        );
+        assert_eq!(
+            dialog
+                .test_delete_button(0)
+                .expect("the row control is rebuilt")
+                .a11y_label_text(),
+            Some(chinese.as_str()),
+            "the control is rebuilt in the language showing now"
+        );
+    }
+
+    /// Reading the addresses is announced: the spinner is a progress indicator with the
+    /// loading sentence as its name, not a decorative graphic a screen reader skips.
+    #[test]
+    fn a_loading_address_list_should_be_announced_as_a_progress() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let mut view = view(true, true, None);
+        view.operation = Some(SelectionOperation::Loading);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let spinner = dialog
+            .test_spinner()
+            .expect("the loading block draws its spinner");
+        let node = spinner.node().expect("the spinner is mounted");
+        harness.enable_a11y_capture();
+        harness.drain();
+
+        assert!(
+            !harness.a11y_hidden(node),
+            "the progress indicator is announced with the loading sentence"
+        );
+    }
+
+    /// The dialog's static copy follows the language: the buttons are rebuilt and the rich
+    /// stand-ins are parsed again in the language showing now.
+    #[test]
+    fn a_dialog_should_follow_the_language() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let view = view(false, false, None);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let add = dialog.test_add_button().expect("the toolbar is built");
+        assert_eq!(
+            add.a11y_label_text(),
+            Some(
+                t_smol!(
+                    translate(LanguageCode::En),
+                    "widget.ethereum_wallet.add_address"
+                )
+                .as_str()
+            )
+        );
+        let markdown = harness
+            .find_by_debug_prefix(overlay(&dialog), "MARKDOWN")
+            .expect("the signed-out sentence is drawn as rich text");
+        let english = harness.text_of(markdown);
+        assert!(
+            english.contains("register or log in"),
+            "the sentence is resolved and drawn: {english}"
+        );
+        assert!(
+            !english.contains("<p"),
+            "the markup never reaches the user: {english}"
+        );
+
+        harness.switch_language(LanguageCode::ZhCn);
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        let add = dialog.test_add_button().expect("the toolbar is rebuilt");
+        assert_eq!(
+            add.a11y_label_text(),
+            Some(
+                t_smol!(
+                    translate(LanguageCode::ZhCn),
+                    "widget.ethereum_wallet.add_address"
+                )
+                .as_str()
+            ),
+            "the control is rebuilt in the language showing now"
+        );
+        let markdown = harness
+            .find_by_debug_prefix(overlay(&dialog), "MARKDOWN")
+            .expect("the sentence is parsed again");
+        let chinese = harness.text_of(markdown);
+        assert!(
+            chinese.contains("需要注册"),
+            "the sentence is in the language showing now: {chinese}"
+        );
+        assert!(
+            !chinese.contains("<p"),
+            "the markup never reaches the user: {chinese}"
+        );
+    }
+
+    /// A dialog with no stream offers the recovery the pane itself offers, and runs it
+    /// when it is clicked.
+    #[test]
+    fn a_dialog_without_a_stream_should_offer_the_panes_recovery() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let ran = Rc::new(Cell::new(false));
+        let ran_in_action = Rc::clone(&ran);
+        let mut view = view(true, false, None);
+        view.recovery = WidgetAction::new("common.retry", move |_| ran_in_action.set(true));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        assert!(
+            text_at(&harness, &dialog, "unavailable").contains("not connected"),
+            "the dialog says the stream is not connected"
+        );
+        let recover = dialog
+            .test_recover_button()
+            .expect("the unavailable block draws the pane's recovery control");
+        click(&mut harness, &recover);
+        assert!(ran.get(), "the pane's recovery runs");
+    }
+
+    #[test]
+    fn a_read_that_failed_should_offer_another_read() {
+        let mut harness = harness();
+        let mut dialog = open(&mut harness);
+        let mut view = view(true, true, None);
+        view.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(
+            RpcCallError::ServiceClosed {
+                request_id: RequestId::new(2),
+            },
+        )));
+        settle_frames(&mut harness, &mut dialog, &view);
+
+        assert!(
+            text_at(&harness, &dialog, "failed").contains("Could not load wallet addresses"),
+            "the dialog says the read failed"
+        );
+        let retry = dialog
+            .test_retry_button()
+            .expect("the failed read offers another read");
+        let node = retry.node().expect("the retry control is built");
+        assert!(harness.visible(node), "the retry control is on screen");
+        click(&mut harness, &retry);
+        assert_eq!(
+            requests(&mut harness, &mut dialog),
+            vec![DialogRequest::Reload],
+            "the control asks the pane to read again"
+        );
+    }
+
+    #[test]
+    fn closing_the_dialog_should_release_it() {
+        let mut harness = harness();
+        let baseline = harness.signal_slot_stats();
+        let mut dialog = open(&mut harness);
+        let view = view(true, true, Some(data(vec![address(FIRST)], 3)));
+        settle_frames(&mut harness, &mut dialog, &view);
+        assert!(
+            harness.signal_slot_stats().live > baseline.live,
+            "the dialog mints its own values"
+        );
+        let submit = dialog.test_submit_action();
+        assert!(
+            harness.app().has_action_handler(&submit),
+            "the address field's submit action is registered"
+        );
+
+        let close = dialog.test_close_button().expect("the footer is built");
+        click(&mut harness, &close);
+        for _ in 0..SETTLE_FRAMES {
+            harness.advance(Duration::from_millis(40));
+            sync(&mut harness, &mut dialog, &view);
+            if dialog.finished() {
                 break;
             }
-            settle(cx);
         }
+        assert!(dialog.finished(), "the close control ends the dialog");
 
-        assert!(
-            content.upgrade().is_none(),
-            "the dialog should have been released once it left the layer"
+        harness.with_cx(|cx| dialog.release(cx));
+        assert_eq!(
+            harness.signal_slot_stats().live,
+            baseline.live,
+            "releasing the dialog reclaims its values"
         );
         assert!(
-            field_weak.upgrade().is_none(),
-            "the field the dialog owns should be released with the dialog that holds it"
-        );
-        assert!(
-            list_weak.upgrade().is_none(),
-            "the list the dialog owns should be released with the dialog that holds it"
+            !harness.app().has_action_handler(&submit),
+            "releasing the dialog unregisters the address field's submit action"
         );
     }
 }

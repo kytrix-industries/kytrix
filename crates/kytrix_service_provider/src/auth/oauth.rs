@@ -6,23 +6,25 @@ use bytes::BytesMut;
 use futures::future::BoxFuture;
 use network::transport::{http::HttpClientClass, hub::TransportHub};
 use serde::de::DeserializeOwned;
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
-use widget_tokio_runtime::runtime::Runtime;
 
 use super::{
     API_RESOURCE, AccessToken, AccountIdentity, AccountWalletKind, AuthAuthority, AuthError,
     CLIENT_ID, DpopKey, MAX_RESPONSE_BYTES, OAuthErrorBody, RefreshedCredential, SCOPE,
     TOKEN_TTL_SECS, TokenResponse, TokenWalletKind, timestamp,
 };
+#[cfg(test)]
+use crate::test_support::test_handle;
 
 pub(super) struct OAuthAuthority {
     pub config: ConfigNotification<Config>,
     pub transport: Arc<TransportHub>,
     pub account_origin: Url,
     /// The application runtime every route resolution of this authority runs on.
-    pub runtime: Runtime,
+    pub runtime: Handle,
 }
 
 impl AuthAuthority for OAuthAuthority {
@@ -313,7 +315,7 @@ mod tests {
             config,
             transport: Arc::clone(&transport),
             account_origin: Url::parse(ACCOUNT_ORIGIN).unwrap(),
-            runtime: Runtime::for_test(),
+            runtime: test_handle(),
         };
 
         let config = authority.config.current();
@@ -379,7 +381,7 @@ mod tests {
             config,
             transport: Arc::clone(&transport),
             account_origin: Url::parse(ACCOUNT_ORIGIN).unwrap(),
-            runtime: Runtime::for_test(),
+            runtime: test_handle(),
         };
 
         let config = authority.config.current();
@@ -408,7 +410,7 @@ mod tests {
             config,
             transport,
             account_origin: Url::parse(ACCOUNT_ORIGIN).unwrap(),
-            runtime: Runtime::for_test(),
+            runtime: test_handle(),
         };
         let config = authority.config.current();
         let cancellation = CancellationToken::new();
@@ -450,7 +452,7 @@ mod tests {
             config,
             transport: Arc::clone(&transport),
             account_origin: server.origin.clone(),
-            runtime: Runtime::for_test(),
+            runtime: test_handle(),
         };
         let key = DpopKey::generate().unwrap();
         authority

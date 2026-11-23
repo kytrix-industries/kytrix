@@ -1,24 +1,45 @@
 //! The configure page: which proxy each network target is reached through.
+//!
+//! Every row is a line of the network configuration: the default line, the line one market
+//! participant's requests take, and the line a group of Kytrix services shares. A control offers the
+//! built-in lines beside the entries of the proxy catalog, and the row's setting is written through
+//! the session the way every other setting is.
+//!
+//! # Why the choices are compared every frame
+//!
+//! The catalog is a runtime value: another pane can add, rename or remove an entry while this page
+//! is drawn. The old page read the catalog every time it was rendered; this one reads it in `sync`
+//! and replaces a control's items only when the list they would offer changed, so an unchanged
+//! catalog costs a comparison rather than a write and the page keeps the old page's freshness.
 
 use app_config::{
     network::{KytrixServiceCapability, ServiceTarget},
     settings::Config,
 };
-use gpui_kit::{AnyElement, App, IntoElement, SharedString};
-use i18n::t;
+use base_ui::{
+    kit::select::{Select, SelectItem},
+    theme::handle::ThemeHandle,
+};
+use i18n::translate::Translate;
 use market_participants_connector::venue::definition::supported_venues;
 use market_participants_model::identifier::VenueId;
 use smol_str::SmolStr;
+use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
 use widget::venue::VenueDisplay;
 
 use crate::{
-    layout::{self, PageArgs},
-    pages::proxy::route::{
-        PROXY_DIRECT, PROXY_INHERIT, PROXY_MIXED, PROXY_SYSTEM, proxy_default_of,
-        proxy_route_of_group, proxy_route_of_venue, set_proxy_default, set_proxy_route_of_group,
-        set_proxy_route_of_venue,
+    host::SettingsHost,
+    layout,
+    pages::{
+        page::{PageBuild, PageView},
+        proxy::route::{
+            PROXY_DIRECT, PROXY_INHERIT, PROXY_MIXED, PROXY_SYSTEM, proxy_default_of,
+            proxy_route_of_group, proxy_route_of_venue, set_proxy_default,
+            set_proxy_route_of_group, set_proxy_route_of_venue,
+        },
     },
     search::{FieldSearch, PageSearch, words},
+    session::SettingsChange,
 };
 
 /// The id of this page.
@@ -79,6 +100,45 @@ const X_MEDIA: &[ServiceTarget] = &[ServiceTarget::KytrixService {
     capability: KytrixServiceCapability::XMedia,
 }];
 
+/// The group of Kytrix services each row of the third section binds.
+const KYTRIX_GROUPS: [(&str, &str, &str, &[ServiceTarget]); 4] = [
+    (
+        "configure.kytrix.cloud",
+        "settings_ui.proxies.kytrix_cloud",
+        "settings_ui.proxies.kytrix_cloud_description",
+        KYTRIX_CLOUD,
+    ),
+    (
+        "configure.kytrix.updates",
+        "settings_ui.proxies.app_updates",
+        "settings_ui.proxies.app_updates_description",
+        APP_UPDATES,
+    ),
+    (
+        "configure.ai.models",
+        "settings_ui.proxies.ai_model_downloads",
+        "settings_ui.proxies.ai_model_downloads_description",
+        AI_MODELS,
+    ),
+    (
+        "configure.x.media",
+        "settings_ui.proxies.x_post_media",
+        "settings_ui.proxies.x_post_media_description",
+        X_MEDIA,
+    ),
+];
+
+/// The field id one venue's line row is drawn under.
+const fn venue_field_id(venue: VenueId) -> &'static str {
+    match venue {
+        VenueId::Binance => "configure.binance",
+        VenueId::Hyperliquid => "configure.hyperliquid",
+        VenueId::Longbridge => "configure.longbridge",
+        VenueId::Okx => "configure.okx",
+        VenueId::Polymarket => "configure.polymarket",
+    }
+}
+
 /// The explanation one venue's row carries.
 const fn venue_description_key(venue: VenueId) -> &'static str {
     match venue {
@@ -90,220 +150,362 @@ const fn venue_description_key(venue: VenueId) -> &'static str {
     }
 }
 
-pub(crate) fn render(args: &mut PageArgs<'_, '_>) -> AnyElement {
-    let mut groups = Vec::new();
-    let mut default_rows = Vec::new();
-    let mut venue_rows = Vec::new();
-    let mut kytrix_rows = Vec::new();
+/// What one row of the page binds.
+#[derive(Clone, Copy)]
+enum LineKind {
+    /// The line the whole document asks for when no target overrides it.
+    Default,
+    /// The line one venue's own requests take.
+    Venue(VenueId),
+    /// The line a group of Kytrix services shares.
+    Group(&'static [ServiceTarget]),
+}
 
-    if args.filter.admits_field(PAGE, "proxy.default-line") {
-        let label = t!(args.cx, "settings_ui.proxies.default_proxy");
-        let selected = proxy_default_of(args.config);
-
-        default_rows.push(proxy_line_row(
-            args,
-            "proxy.default-line",
-            label,
-            SharedString::default(),
-            selected,
-            true,
-            set_proxy_default,
-        ));
+impl LineKind {
+    /// Whether the row is the default line, which has nothing above it to inherit from.
+    fn default_line(self) -> bool {
+        matches!(self, Self::Default)
     }
 
-    for venue in supported_venues() {
-        let field_id = format!("{PAGE}.{}", venue.as_str());
-        if !args.filter.admits_field(PAGE, &field_id) {
-            continue;
+    /// The line the settings currently bind the row to, as the control spells it.
+    fn value(self, config: &Config) -> SmolStr {
+        match self {
+            Self::Default => proxy_default_of(config),
+            Self::Venue(venue) => proxy_route_of_venue(config, &venue),
+            Self::Group(targets) => proxy_route_of_group(config, targets.iter().cloned()),
+        }
+    }
+
+    /// Makes the change one choice of the row's control names.
+    fn apply(self, config: &mut Config, value: &str) {
+        match self {
+            Self::Default => set_proxy_default(config, value),
+            Self::Venue(venue) => set_proxy_route_of_venue(config, &venue, value),
+            Self::Group(targets) => {
+                set_proxy_route_of_group(config, targets.iter().cloned(), value);
+            }
+        }
+    }
+
+    /// The choices the row's control offers, the chosen line included.
+    ///
+    /// The entries of the catalog are read while the control is drawn, because the catalog is a
+    /// runtime value. The line the row holds is always one of the choices: a group whose targets
+    /// disagree, and an entry the catalog no longer carries, are the two lines a row can hold that
+    /// no other choice names, and both are offered as themselves — a control that showed anything
+    /// else would report a binding the settings do not have.
+    fn choices(self, config: &Config, selected: &str, translate: &Translate) -> Vec<SelectItem> {
+        let mut choices = Vec::with_capacity(config.proxies.len() + 4);
+
+        if !self.default_line() {
+            choices.push(SelectItem::new(
+                SmolStr::new_static(PROXY_INHERIT),
+                i18n::t_smol!(translate, "settings_ui.proxies.inherit"),
+            ));
+        }
+        choices.push(SelectItem::new(
+            SmolStr::new_static(PROXY_DIRECT),
+            i18n::t_smol!(translate, "settings_ui.proxies.no_proxy"),
+        ));
+        choices.push(SelectItem::new(
+            SmolStr::new_static(PROXY_SYSTEM),
+            i18n::t_smol!(translate, "settings_ui.proxies.system_proxy"),
+        ));
+
+        if selected == PROXY_MIXED {
+            choices.push(SelectItem::new(
+                SmolStr::new_static(PROXY_MIXED),
+                i18n::t_smol!(translate, "settings_ui.proxies.mixed"),
+            ));
+        } else {
+            let held_by_the_catalog = config.proxies.contains_key(selected);
+            let built_in = selected == PROXY_DIRECT
+                || selected == PROXY_SYSTEM
+                || (!self.default_line() && selected == PROXY_INHERIT);
+            if !held_by_the_catalog && !built_in {
+                let name = SmolStr::new(selected);
+                choices.push(SelectItem::new(name.clone(), name));
+            }
         }
 
-        let label = t!(args.cx, venue.name_key());
-        let description = t!(args.cx, venue_description_key(venue));
-        let selected = proxy_route_of_venue(args.config, &venue);
-
-        venue_rows.push(proxy_line_row(
-            args,
-            &field_id,
-            label,
-            description,
-            selected,
-            false,
-            move |config, value| set_proxy_route_of_venue(config, &venue, value),
-        ));
-    }
-
-    for (id, label_key, description_key, targets) in [
-        (
-            "configure.kytrix.cloud",
-            "settings_ui.proxies.kytrix_cloud",
-            "settings_ui.proxies.kytrix_cloud_description",
-            KYTRIX_CLOUD,
-        ),
-        (
-            "configure.kytrix.updates",
-            "settings_ui.proxies.app_updates",
-            "settings_ui.proxies.app_updates_description",
-            APP_UPDATES,
-        ),
-        (
-            "configure.ai.models",
-            "settings_ui.proxies.ai_model_downloads",
-            "settings_ui.proxies.ai_model_downloads_description",
-            AI_MODELS,
-        ),
-        (
-            "configure.x.media",
-            "settings_ui.proxies.x_post_media",
-            "settings_ui.proxies.x_post_media_description",
-            X_MEDIA,
-        ),
-    ] {
-        if !args.filter.admits_field(PAGE, id) {
-            continue;
+        for name in config.proxies.keys() {
+            choices.push(SelectItem::new(name.clone(), name.clone()));
         }
 
-        let label = t!(args.cx, label_key);
-        let description = t!(args.cx, description_key);
-        let selected = proxy_route_of_group(args.config, targets.iter().cloned());
+        choices
+    }
+}
 
-        kytrix_rows.push(proxy_line_row(
-            args,
-            id,
-            label,
-            description,
-            selected,
-            false,
-            move |config, value| set_proxy_route_of_group(config, targets.iter().cloned(), value),
-        ));
+/// One row of the page, with the control that draws it.
+struct ProxyLine {
+    kind: LineKind,
+    select: Select,
+    /// The items the control currently offers, so a frame that changed none of them writes none.
+    items: Vec<SelectItem>,
+}
+
+/// The configure page.
+pub(crate) struct ConfigurePage {
+    host: SettingsHost,
+    rows: Vec<ProxyLine>,
+}
+
+/// The fixed text and binding of one row, assembled before its control is built.
+struct RowSpec {
+    id: &'static str,
+    kind: LineKind,
+    label: SmolStr,
+    description: SmolStr,
+}
+
+impl ConfigurePage {
+    /// The page over the injected collaborators, keyed by the settings page instance it belongs to.
+    pub(crate) fn new(host: SettingsHost, _key: &str) -> Self {
+        Self {
+            host,
+            rows: Vec::new(),
+        }
     }
 
-    if !default_rows.is_empty() {
-        groups.push(layout::section(None, "configure_0", default_rows, args.cx));
+    /// Builds one row's control and row, and keeps the control for the frames that follow.
+    ///
+    /// The control is created here rather than in the row's closure because the page keeps it: the
+    /// closure only draws it inside the card the row belongs to.
+    fn row(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        theme: &ThemeHandle,
+        spec: RowSpec,
+        config: &Config,
+        translate: &Translate,
+        cx: &PageBuild<'_>,
+    ) -> layout::RowFn {
+        let selected = spec.kind.value(config);
+        let items = spec.kind.choices(config, selected.as_str(), translate);
+
+        let host = self.host.clone();
+        let select = layout::choice_select(
+            app,
+            &self.host,
+            cx.unique_key(spec.id),
+            selected.as_str(),
+            items
+                .iter()
+                .map(|item| (item.id.clone(), item.label.clone())),
+            spec.label.clone(),
+            move |app, value| {
+                let value = SmolStr::new(value);
+                let kind = spec.kind;
+                let _ = host.write(
+                    app,
+                    window,
+                    SettingsChange::edit(move |config| kind.apply(config, value.as_str())),
+                );
+            },
+        );
+
+        let control = select.clone();
+        let row = layout::row(
+            theme,
+            spec.id,
+            spec.label,
+            spec.description,
+            move |app, window, parent| {
+                control.mount(app, window, parent)?;
+                Ok(())
+            },
+        );
+        self.rows.push(ProxyLine {
+            kind: spec.kind,
+            select,
+            items,
+        });
+
+        row
     }
-    if !venue_rows.is_empty() {
-        groups.push(layout::section(
-            Some(t!(
-                args.cx,
+}
+
+impl PageView for ConfigurePage {
+    fn page_id(&self) -> &'static str {
+        PAGE
+    }
+
+    fn build(
+        &mut self,
+        app: &mut App,
+        window: WindowId,
+        parent: NodeId,
+        cx: &PageBuild<'_>,
+    ) -> Result<(), EngineError> {
+        let theme = self.host.theme_handle();
+        let translate = self.host.translate().clone();
+        let config = self.host.config(app, |config| config.clone());
+
+        let mut default_rows = Vec::new();
+        if cx.filter.admits_field(PAGE, "proxy.default-line") {
+            default_rows.push(self.row(
+                app,
+                window,
+                &theme,
+                RowSpec {
+                    id: "proxy.default-line",
+                    kind: LineKind::Default,
+                    label: i18n::t_smol!(translate, "settings_ui.proxies.default_proxy"),
+                    description: SmolStr::default(),
+                },
+                &config,
+                &translate,
+                cx,
+            ));
+        }
+
+        let mut venue_rows = Vec::new();
+        for venue in supported_venues() {
+            let field_id = venue_field_id(venue);
+            if !cx.filter.admits_field(PAGE, field_id) {
+                continue;
+            }
+            venue_rows.push(self.row(
+                app,
+                window,
+                &theme,
+                RowSpec {
+                    id: field_id,
+                    kind: LineKind::Venue(venue),
+                    label: i18n::t_smol!(translate, venue.name_key()),
+                    description: i18n::t_smol!(translate, venue_description_key(venue)),
+                },
+                &config,
+                &translate,
+                cx,
+            ));
+        }
+
+        let mut kytrix_rows = Vec::new();
+        for (field_id, label_key, description_key, targets) in KYTRIX_GROUPS {
+            if !cx.filter.admits_field(PAGE, field_id) {
+                continue;
+            }
+            kytrix_rows.push(self.row(
+                app,
+                window,
+                &theme,
+                RowSpec {
+                    id: field_id,
+                    kind: LineKind::Group(targets),
+                    label: i18n::t_smol!(translate, label_key),
+                    description: i18n::t_smol!(translate, description_key),
+                },
+                &config,
+                &translate,
+                cx,
+            ));
+        }
+
+        layout::section(
+            app,
+            window,
+            parent,
+            &theme,
+            "configure_0",
+            None,
+            default_rows,
+        )?;
+        layout::section(
+            app,
+            window,
+            parent,
+            &theme,
+            "configure_1",
+            Some(i18n::t_smol!(
+                translate,
                 "settings_ui.proxies.market_participants_section"
             )),
-            "configure_1",
             venue_rows,
-            args.cx,
-        ));
-    }
-    if !kytrix_rows.is_empty() {
-        groups.push(layout::section(
-            Some(t!(args.cx, "settings_ui.proxies.kytrix_section")),
+        )?;
+        layout::section(
+            app,
+            window,
+            parent,
+            &theme,
             "configure_2",
+            Some(i18n::t_smol!(
+                translate,
+                "settings_ui.proxies.kytrix_section"
+            )),
             kytrix_rows,
-            args.cx,
-        ));
+        )?;
+
+        Ok(())
     }
 
-    layout::page(groups)
-}
+    fn sync(&mut self, app: &mut App) -> Result<(), EngineError> {
+        let translate = self.host.translate().clone();
+        let rows = &self.rows;
+        let desired = self.host.config(app, |config| {
+            rows.iter()
+                .map(|row| {
+                    let value = row.kind.value(config);
+                    let items = row.kind.choices(config, value.as_str(), &translate);
+                    (value, items)
+                })
+                .collect::<Vec<_>>()
+        });
 
-/// One proxy-line row: the control offers the entries of the catalog beside the built-in lines.
-fn proxy_line_row(
-    args: &mut PageArgs<'_, '_>,
-    field_id: &str,
-    label: SharedString,
-    description: SharedString,
-    selected: SmolStr,
-    default_line: bool,
-    apply: impl Fn(&mut Config, &str) + 'static,
-) -> AnyElement {
-    let choices = proxy_line_choices(args.config, selected.as_str(), default_line, args.cx);
-    let select = layout::choice_select(
-        layout::element_id("settings-proxy-line", field_id),
-        Some(SharedString::from(selected.as_str())),
-        choices,
-        label.clone(),
-        None,
-        false,
-        layout::on_select(args.handle, apply),
-    );
+        for (row, (value, items)) in self.rows.iter_mut().zip(desired) {
+            let items_changed = row.items != items;
+            if items_changed {
+                row.select.set_items(app, items.clone())?;
+                row.items = items;
+            }
+            let chosen = row.select.chosen(app);
+            let matches = chosen.len() == 1 && chosen[0] == value;
+            if items_changed || !matches {
+                row.select.set_chosen(app, [value.as_str()], false);
+            }
+        }
 
-    layout::row(
-        field_id,
-        label,
-        description,
-        select.into_any_element(),
-        layout::CONTROL_WIDTH,
-        args.cx,
-    )
-}
-
-/// The choices one proxy-line control offers.
-///
-/// The entries of the catalog are read while the control is drawn, because the catalog is a
-/// runtime value. The line the row holds is always one of the choices: a group whose targets
-/// disagree, and an entry the catalog no longer carries, are the two lines a row can hold that no
-/// other choice names, and both are offered as themselves — a control that showed anything else
-/// would report a binding the settings do not have.
-fn proxy_line_choices(
-    config: &Config,
-    selected: &str,
-    default_line: bool,
-    cx: &App,
-) -> Vec<(SharedString, SharedString)> {
-    let mut choices = Vec::with_capacity(config.proxies.len() + 4);
-
-    if !default_line {
-        choices.push((
-            SharedString::new_static(PROXY_INHERIT),
-            t!(cx, "settings_ui.proxies.inherit"),
-        ));
+        Ok(())
     }
-    choices.push((
-        SharedString::new_static(PROXY_DIRECT),
-        t!(cx, "settings_ui.proxies.no_proxy"),
-    ));
-    choices.push((
-        SharedString::new_static(PROXY_SYSTEM),
-        t!(cx, "settings_ui.proxies.system_proxy"),
-    ));
 
-    if selected == PROXY_MIXED {
-        choices.push((
-            SharedString::new_static(PROXY_MIXED),
-            t!(cx, "settings_ui.proxies.mixed"),
-        ));
-    } else {
-        let held_by_the_catalog = config.proxies.contains_key(selected);
-        let built_in = selected == PROXY_DIRECT
-            || selected == PROXY_SYSTEM
-            || (!default_line && selected == PROXY_INHERIT);
-        if !held_by_the_catalog && !built_in {
-            choices.push((SharedString::from(selected), SharedString::from(selected)));
+    fn dispatch(&mut self, app: &mut App, event: &Event) -> bool {
+        let mut consumed = false;
+        for row in &self.rows {
+            consumed |= row.select.dispatch(app, event);
+        }
+        consumed
+    }
+
+    fn release(&mut self, app: &mut App) {
+        for row in self.rows.drain(..) {
+            row.select.release(app);
         }
     }
-
-    for name in config.proxies.keys() {
-        choices.push((
-            SharedString::from(name.as_str()),
-            SharedString::from(name.as_str()),
-        ));
-    }
-
-    choices
 }
 
-pub(crate) fn search(cx: &App) -> PageSearch {
-    let title = t!(cx, "settings_ui.proxies.configure");
-    let default_label = t!(cx, "settings_ui.proxies.default_proxy");
-    let kytrix_cloud = t!(cx, "settings_ui.proxies.kytrix_cloud");
-    let kytrix_cloud_description = t!(cx, "settings_ui.proxies.kytrix_cloud_description");
-    let app_updates = t!(cx, "settings_ui.proxies.app_updates");
-    let app_updates_description = t!(cx, "settings_ui.proxies.app_updates_description");
-    let ai_models = t!(cx, "settings_ui.proxies.ai_model_downloads");
-    let ai_models_description = t!(cx, "settings_ui.proxies.ai_model_downloads_description");
-    let x_media = t!(cx, "settings_ui.proxies.x_post_media");
-    let x_media_description = t!(cx, "settings_ui.proxies.x_post_media_description");
+/// The text this page and its settings are searched by.
+pub(crate) fn search(translate: &Translate) -> PageSearch {
+    let title = i18n::t_smol!(translate, "settings_ui.proxies.configure");
+    let default_label = i18n::t_smol!(translate, "settings_ui.proxies.default_proxy");
+    let kytrix_cloud = i18n::t_smol!(translate, "settings_ui.proxies.kytrix_cloud");
+    let kytrix_cloud_description =
+        i18n::t_smol!(translate, "settings_ui.proxies.kytrix_cloud_description");
+    let app_updates = i18n::t_smol!(translate, "settings_ui.proxies.app_updates");
+    let app_updates_description =
+        i18n::t_smol!(translate, "settings_ui.proxies.app_updates_description");
+    let ai_models = i18n::t_smol!(translate, "settings_ui.proxies.ai_model_downloads");
+    let ai_models_description = i18n::t_smol!(
+        translate,
+        "settings_ui.proxies.ai_model_downloads_description"
+    );
+    let x_media = i18n::t_smol!(translate, "settings_ui.proxies.x_post_media");
+    let x_media_description =
+        i18n::t_smol!(translate, "settings_ui.proxies.x_post_media_description");
 
     let mut fields = Vec::with_capacity(supported_venues().len() + 5);
     fields.push(FieldSearch {
-        id: "proxy.default-line".into(),
+        id: SmolStr::new_static("proxy.default-line"),
         text: words(&[
             default_label.as_ref(),
             "default",
@@ -315,11 +517,10 @@ pub(crate) fn search(cx: &App) -> PageSearch {
         ]),
     });
     for venue in supported_venues() {
-        let label = t!(cx, venue.name_key());
-        let description = t!(cx, venue_description_key(venue));
-        let id = format!("{PAGE}.{}", venue.as_str());
+        let label = i18n::t_smol!(translate, venue.name_key());
+        let description = i18n::t_smol!(translate, venue_description_key(venue));
         fields.push(FieldSearch {
-            id: id.into(),
+            id: SmolStr::new_static(venue_field_id(venue)),
             text: words(&[
                 label.as_ref(),
                 description.as_ref(),
@@ -336,7 +537,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
         });
     }
     fields.push(FieldSearch {
-        id: "configure.kytrix.cloud".into(),
+        id: SmolStr::new_static("configure.kytrix.cloud"),
         text: words(&[
             kytrix_cloud.as_ref(),
             kytrix_cloud_description.as_ref(),
@@ -352,7 +553,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
         ]),
     });
     fields.push(FieldSearch {
-        id: "configure.kytrix.updates".into(),
+        id: SmolStr::new_static("configure.kytrix.updates"),
         text: words(&[
             app_updates.as_ref(),
             app_updates_description.as_ref(),
@@ -362,7 +563,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
         ]),
     });
     fields.push(FieldSearch {
-        id: "configure.ai.models".into(),
+        id: SmolStr::new_static("configure.ai.models"),
         text: words(&[
             ai_models.as_ref(),
             ai_models_description.as_ref(),
@@ -376,7 +577,7 @@ pub(crate) fn search(cx: &App) -> PageSearch {
         ]),
     });
     fields.push(FieldSearch {
-        id: "configure.x.media".into(),
+        id: SmolStr::new_static("configure.x.media"),
         text: words(&[
             x_media.as_ref(),
             x_media_description.as_ref(),

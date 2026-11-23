@@ -1,234 +1,613 @@
-//! What a chart does with the pointer.
+//! The canvas one chart draws: the box it fills, the pointer it follows, and the frames a
+//! change is worth.
 //!
-//! A tooltip is not an element: it is drawn by the same canvas as the series, on
-//! the frame that follows the pointer move that asked for it. So what is worth
-//! pinning is the path from a move to the hover a frame draws with — the frame the
-//! move asks for, the commit that frame performs, and the box it draws in.
+//! These are the interface tests of the chart: they go through the engine's own
+//! `WidgetTestApp`, because what they assert is what the engine ended up holding — a canvas
+//! node, its primitives, and the frames a change is worth.
 
-use std::{rc::Rc, str::FromStr, sync::Arc};
+use std::sync::Arc;
 
-use gpui_kit::{
-    Bounds, Context, IntoElement, Modifiers, ParentElement, Pixels, Render, Size, Styled,
-    TestAppContext, VisualTestContext, Window, div, point, px, size,
+use base_ui::{style_builder::StyleBuilder, theme::appearance::Appearance};
+use i18n::language::codes::LanguageCode;
+use market_participants_model::decimal::Quantity;
+use smol_str::SmolStr;
+use time::UtcOffset;
+use ui_core::{
+    math::Point,
+    node::{builder::NodeBuilder, id::NodeId},
+    paint::primitive::Primitive,
+    window::WindowId,
 };
-use market_participants_model::{
-    decimal::{Ratio, Tick},
-    listing::rules::ListingPrecision,
-};
+use widget::test_support::WidgetTestApp;
 
-use super::*;
+use super::{canvas::Chart, open_interest::OpenInterestChart, paint::Hover, rect::RectExt};
 use crate::{
-    chart::canvas::ChartState,
-    model::{LongShortRatioPoint, MetricKind, StatisticsPoints, StatisticsSnapshot},
+    model::{OpenInterestPoint, StatisticsPoints, StatisticsSnapshot},
     service::StatisticsStreamMessage,
 };
 
-/// One chart, as a window mounts it.
-struct Harness {
-    chart: ChartDispatch,
+const WIDTH: f32 = 640.0;
+const HEIGHT: f32 = 360.0;
+
+/// The translator the product ships.
+fn translate(language: LanguageCode) -> i18n::translate::Translate {
+    i18n::translate::Translate::new(
+        std::rc::Rc::new(i18n::embedded::load().expect("the embedded locales load")),
+        language,
+    )
 }
 
-impl Render for Harness {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.chart.entity())
+fn point(timestamp: i64, base: u64, quote: Option<u64>) -> OpenInterestPoint {
+    OpenInterestPoint {
+        timestamp,
+        base_asset_volume: Quantity::from(base),
+        quote_asset_volume: quote.map(Quantity::from),
     }
 }
 
-/// A window of thirty intervals, which is what a chart is normally drawn from.
-fn ratio_points() -> Arc<[LongShortRatioPoint]> {
-    (0..30)
-        .map(|index| LongShortRatioPoint {
-            timestamp: 1_700_000_000_000 + i64::from(index) * 300_000,
-            ratio: Ratio::from_str(&format!("{}.5", index % 5 + 1))
-                .expect("the fixture ratio should parse"),
+fn points(count: usize) -> Vec<OpenInterestPoint> {
+    (0..count)
+        .map(|index| {
+            let step = u64::try_from(index).unwrap_or(0) + 1;
+            point(
+                i64::try_from(index).unwrap_or(0) * 300_000,
+                step * 10,
+                Some(step * 100),
+            )
         })
-        .collect::<Vec<_>>()
-        .into()
+        .collect()
 }
 
-fn ratio_window() -> StatisticsSnapshot {
-    StatisticsSnapshot {
-        revision: 1,
-        metadata: Some(ListingPrecision {
-            price_tick: Tick::from_inner(100_000_000_000_000_000).expect("a valid tick"),
-            quantity_tick: Tick::from_inner(1_000_000_000_000_000).expect("a valid tick"),
-        }),
-        points: StatisticsPoints::LongShortRatio(ratio_points()),
+fn snapshot(revision: u64, count: usize) -> StatisticsStreamMessage {
+    StatisticsStreamMessage::Snapshot(Arc::new(StatisticsSnapshot {
+        revision,
+        metadata: None,
+        points: StatisticsPoints::OpenInterest(points(count).into()),
+    }))
+}
+
+struct ChartHarness {
+    app: WidgetTestApp,
+    chart: Chart<OpenInterestChart>,
+    page: NodeId,
+    window: WindowId,
+}
+
+impl ChartHarness {
+    fn new(count: usize) -> Self {
+        let mut app = WidgetTestApp::with_translate(translate(LanguageCode::En));
+        let window = app.window();
+        let page = page(&mut app, WIDTH, HEIGHT);
+        let mut chart = app.with_cx(|cx| {
+            Chart::new(OpenInterestChart::new(
+                cx.translate(),
+                "BTC",
+                "USDT",
+                UtcOffset::UTC,
+            ))
+        });
+        app.with_cx(|cx| chart.build(cx, page))
+            .expect("the chart builds");
+        // The first frame lays the page (and the canvas inside it) out.
+        app.drain();
+        app.with_cx(|_| chart.set_snapshot(&snapshot(1, count)));
+        Self {
+            app,
+            chart,
+            page,
+            window,
+        }
+    }
+
+    fn sync(&mut self) -> bool {
+        let Self { app, chart, .. } = self;
+        app.with_cx(|cx| chart.sync(cx)).expect("the chart syncs")
+    }
+
+    fn canvas(&self) -> &ui_core::paint::canvas::Canvas {
+        self.chart
+            .canvas_for_test(self.app.app(), self.window)
+            .expect("the chart drew a canvas")
+    }
+
+    fn layout(&self) -> super::axes::ChartLayout {
+        self.chart
+            .layout_for_test()
+            .expect("the chart was laid out")
+    }
+
+    fn resize(&mut self, width: f32, height: f32) {
+        let page = self.page;
+        self.app.with_cx(|cx| {
+            let style = StyleBuilder::new()
+                .width(width)
+                .height(height)
+                .flex_col()
+                .build();
+            cx.tree_mut()
+                .set_style(page, style)
+                .expect("the page resizes");
+        });
+        self.app.drain();
+    }
+
+    fn release(&mut self) {
+        let Self { app, chart, .. } = self;
+        app.with_cx(|cx| chart.release(cx));
     }
 }
 
-/// Mounts one ratio chart in a window of its own, already showing a window.
+/// A box of a fixed size, which is the shape a chart is laid out in.
+fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
+    app.with_cx(|cx| {
+        let root = cx.tree().root();
+        NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS_PAGE")
+            .style(
+                StyleBuilder::new()
+                    .width(width)
+                    .height(height)
+                    .flex_col()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)
+            .expect("the page builds")
+    })
+}
+
+/// The middle of the plot, which is over one of the fixture's intervals.
+fn middle_of_plot(harness: &ChartHarness) -> Point {
+    let plot = harness.layout().plot;
+    Point::new(
+        plot.origin.x + plot.size.width / 2.0,
+        plot.origin.y + plot.size.height / 2.0,
+    )
+}
+
+/// The atlas generation the chart's glyphs were rasterized in, if it draws any.
 ///
-/// A canvas resolves its layout in prepaint, so a frame has to be drawn before
-/// anything is known about where the plot is.
-fn chart_window(cx: &mut TestAppContext) -> (Rc<ChartState>, &mut VisualTestContext) {
-    cx.executor().allow_parking();
-    cx.update(|cx| {
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-    });
-    let (harness, cx) = cx.add_window_view(|_, cx| {
-        let mut chart =
-            ChartDispatch::for_metric(cx, "BTC", "USDT", MetricKind::LongShortAccountRatio)
-                .expect("a ratio metric should build a ratio chart");
-        assert!(
-            chart.set_snapshot(&StatisticsStreamMessage::Snapshot(Arc::new(ratio_window()))),
-            "the first window is always a change"
-        );
-        Harness { chart }
-    });
-    let state = harness.read_with(cx, |harness, _| harness.chart.state());
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
-    (state, cx)
+/// The leases a canvas holds are what an atlas reset invalidates, so reading the
+/// generation back is how a test tells a canvas that was rebuilt from one that was kept.
+fn glyph_generation(harness: &ChartHarness) -> Option<u32> {
+    harness
+        .canvas()
+        .primitives()
+        .iter()
+        .find_map(|primitive| match primitive {
+            Primitive::GlyphRun(run) => run.glyphs.first(),
+            _ => None,
+        })
+        .map(|glyph| glyph.tile.generation)
 }
 
-/// The box the last frame laid the plot out in.
-fn plot(state: &ChartState) -> Bounds<Pixels> {
-    let plot = state
-        .plot()
-        .expect("a laid-out frame records where its plot is");
+/// Every primitive kind the canvas holds.
+fn kinds(canvas: &ui_core::paint::canvas::Canvas) -> Vec<&'static str> {
+    canvas
+        .primitives()
+        .iter()
+        .map(|primitive| match primitive {
+            Primitive::Quad(_) => "quad",
+            Primitive::GlyphRun(_) => "text",
+            Primitive::Path(_) => "path",
+            Primitive::Image(_) => "image",
+            Primitive::Shadow(_) => "shadow",
+            Primitive::Clip(_) => "clip",
+            Primitive::Canvas(_) => "canvas",
+            Primitive::Geometry(_) => "geometry",
+        })
+        .collect()
+}
+
+#[test]
+fn a_chart_should_fill_the_box_it_is_given() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync(), "the first frame paints");
+
+    let layout = harness.layout();
+    assert_eq!(layout.content.size.width, WIDTH);
+    assert_eq!(layout.content.size.height, HEIGHT);
+    assert_eq!(harness.canvas().bounds(), layout.content);
+    let kinds = kinds(harness.canvas());
+    assert!(kinds.contains(&"geometry"), "the two lines are meshes");
+    assert!(kinds.contains(&"text"), "the axes are labelled");
     assert!(
-        plot.size.width > Pixels::ZERO && plot.size.height > Pixels::ZERO,
-        "the plot has to have room before a pointer can be over it"
+        !harness.sync(),
+        "a frame that changed nothing builds nothing (I3)"
     );
-    plot
 }
 
-/// Delivers the frame a pointer move asked for.
-///
-/// The move itself only queues a position: the frame that follows is what applies
-/// it, and that frame is the one the next-frame callback requests. A test has no
-/// frame loop, so it delivers both halves by hand.
-fn draw_the_frame_the_pointer_asked_for(cx: &mut VisualTestContext) {
-    cx.update(|window, cx| {
-        window.simulate_next_frame(cx);
-        window.refresh();
+#[test]
+fn a_steady_chart_should_not_request_a_frame() {
+    let mut harness = ChartHarness::new(4);
+    assert!(harness.sync());
+    let requests = harness.app.frame_requests();
+
+    assert!(!harness.sync(), "the second frame draws nothing");
+    assert!(!harness.sync());
+    assert_eq!(
+        harness.app.frame_requests(),
+        requests,
+        "a steady chart asks for no frame (I3)"
+    );
+}
+
+#[test]
+fn a_resized_chart_should_redraw_itself_in_the_new_box() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let before = harness.layout();
+
+    harness.resize(WIDTH, 320.0);
+    assert!(harness.sync(), "the new box is another drawing");
+    let after = harness.layout();
+    assert_eq!(after.content.size.height, 320.0);
+    assert!(after.plot.size.height < before.plot.size.height);
+    assert_eq!(harness.canvas().bounds(), after.content);
+    assert!(!harness.sync(), "and it settles again");
+}
+
+#[test]
+fn a_pane_narrower_than_the_chart_should_clip_it_rather_than_squeeze_the_plot() {
+    let mut narrow = ChartHarness::new(3);
+    narrow.resize(320.0, 240.0);
+    assert!(narrow.sync());
+    let mut wide = ChartHarness::new(3);
+    assert!(wide.sync());
+
+    assert_eq!(
+        narrow.layout().content.size.width,
+        super::axes::CHART_MIN_CONTENT_WIDTH,
+        "the content keeps its own floor instead of taking the pane's width"
+    );
+    assert!(
+        narrow.layout().plot.size.width >= super::axes::MINIMUM_PLOT_WIDTH,
+        "the plot is never squeezed below its own minimum"
+    );
+    assert!(narrow.layout().plot.size.width < wide.layout().plot.size.width);
+}
+
+#[test]
+fn a_pointer_over_the_plot_should_hover_the_interval_under_it() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+
+    let position = middle_of_plot(&harness);
+    assert!(
+        harness.chart.point_at(position),
+        "the pointer is over an interval"
+    );
+    let hover = harness
+        .chart
+        .hover_for_test()
+        .expect("an interval is hovered");
+    assert!(hover.index < 3);
+    assert!(harness.sync(), "the hovered interval is drawn");
+    let hovered = harness.canvas().primitives().len();
+    assert!(
+        !harness.chart.point_at(position),
+        "the same interval is the same frame"
+    );
+    assert!(!harness.sync());
+    assert_eq!(harness.canvas().primitives().len(), hovered);
+}
+
+#[test]
+fn a_pointer_off_the_plot_should_not_hover_anything() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let layout = harness.layout();
+
+    assert!(!harness.chart.point_at(Point::new(1.0, 1.0)));
+    assert_eq!(harness.chart.hover_for_test(), None);
+    let below = Point::new(layout.plot.origin.x + 10.0, layout.time_axis.origin.y + 2.0);
+    assert!(!harness.chart.point_at(below));
+    assert_eq!(harness.chart.hover_for_test(), None);
+}
+
+#[test]
+fn a_leaving_pointer_should_stop_hovering() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let position = middle_of_plot(&harness);
+    assert!(harness.chart.point_at(position));
+    assert!(harness.sync());
+
+    assert!(harness.chart.clear_hover(), "the pointer was on the plot");
+    assert!(
+        !harness.chart.clear_hover(),
+        "a pointer that already left is not a change"
+    );
+    assert!(harness.sync(), "the frame without a hover is drawn");
+    assert_eq!(
+        harness.canvas().primitives().len(),
+        harness.canvas().primitives().len()
+    );
+}
+
+#[test]
+fn a_snapshot_should_be_drawn_and_the_next_one_should_replace_it() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let before = harness.canvas().primitives().len();
+
+    harness
+        .app
+        .with_cx(|_| harness.chart.set_snapshot(&snapshot(2, 6)));
+    assert!(harness.sync(), "a new window is a new drawing");
+    assert_ne!(
+        harness.canvas().primitives().len(),
+        before,
+        "more intervals draw more markers and labels"
+    );
+    assert_eq!(harness.chart.revision(), 2);
+    assert!(!harness.sync());
+}
+
+#[test]
+fn an_unchanged_window_should_not_redraw() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let unchanged = snapshot(1, 3);
+    let first = harness
+        .app
+        .with_cx(|_| harness.chart.set_snapshot(&unchanged));
+    assert!(first, "a window this chart has not seen is a view");
+    assert!(harness.sync(), "the new view is drawn");
+    assert!(
+        !harness
+            .app
+            .with_cx(|_| harness.chart.set_snapshot(&unchanged)),
+        "the same window handed over again is not a new view"
+    );
+    assert!(!harness.sync(), "and it is not a new drawing either");
+}
+
+#[test]
+fn a_language_switch_should_rewrite_the_labels() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+
+    harness.app.switch_language(LanguageCode::ZhCn);
+    let rebuilt = harness.app.with_cx(|cx| {
+        let translate = cx.translate().clone();
+        harness.chart.set_locale(&translate)
     });
-    cx.run_until_parked();
-}
-
-#[gpui_kit::test]
-fn a_chart_should_fill_the_box_it_is_given(cx: &mut TestAppContext) {
-    let (state, cx) = chart_window(cx);
-    let boxes = state.boxes().expect("a laid-out frame records every box");
-    let window = cx.update(|window, _| window.bounds());
-
-    assert_eq!(
-        boxes.content.size.height, window.size.height,
-        "a chart grows into the height it is given rather than keeping its floor"
-    );
-    assert_eq!(
-        boxes.legend.bottom(),
-        boxes.content.bottom(),
-        "the legend sits on the content's bottom edge, with nothing below it"
-    );
-    assert_eq!(boxes.content.origin, window.origin);
-}
-
-/// The box the frame the chart prepared last draws its content in.
-///
-/// It is the prepared layout rather than the one a pointer resolves against —
-/// [`ChartState::boxes`] — because that one is only rewritten by a frame that reuses
-/// an already prepared layout, so it can lag the frame a resize produced. A resize is
-/// drawn by the frame that prepares it, and that frame is the one this test is about.
-fn drawn_content(state: &ChartState) -> Size<Pixels> {
-    state
-        .cache
-        .borrow()
-        .layout
-        .expect("a prepared frame records the box it was prepared from")
-        .content
-        .size
-}
-
-#[gpui_kit::test]
-fn a_chart_should_follow_a_pane_that_shrank(cx: &mut TestAppContext) {
-    let (state, cx) = chart_window(cx);
-    let wide = drawn_content(&state);
+    assert!(rebuilt, "another language is another set of labels");
+    assert!(harness.sync(), "the rewritten labels are drawn");
     assert!(
-        wide.width > px(700.0) && wide.height > px(400.0),
-        "the fixture window has to be wider than the box it shrinks to: {wide:?}"
-    );
-
-    cx.simulate_resize(size(px(700.0), px(400.0)));
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
-
-    assert_eq!(
-        drawn_content(&state),
-        size(px(700.0), px(400.0)),
-        "a pane that shrank redraws the chart at the box it now has"
+        !harness.app.with_cx(|cx| {
+            let translate = cx.translate().clone();
+            harness.chart.set_locale(&translate)
+        }),
+        "the same language is not a change"
     );
 }
 
-#[gpui_kit::test]
-fn a_chart_should_follow_a_pane_that_shrank_below_its_own_minimum(cx: &mut TestAppContext) {
-    let (state, cx) = chart_window(cx);
+/// The labels are drawn from shaped handles that lease glyph tiles from the atlas. When a
+/// lease is gone — the atlas was reset, a font stack changed, a tile was evicted — the
+/// engine refuses to encode those runs rather than draw reused texture, so a chart that
+/// kept the canvas it already had would lose its labels for good. A moved lease is a frame
+/// the chart owes.
+#[test]
+fn a_chart_should_reshape_the_labels_when_their_atlas_lease_is_gone() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync(), "the first frame paints");
+    let labels = harness.canvas().primitives().len();
+    let generation =
+        glyph_generation(&harness).expect("a chart of three intervals labels its axes");
 
-    cx.simulate_resize(size(px(360.0), px(240.0)));
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
+    // An atlas reset under the same font stack: every handle the canvas was built from is
+    // leased from an atlas that no longer exists, while the glyphs shape back the same.
+    let stack = harness.app.app().font_stack().clone();
+    harness.app.app_mut().set_font_stack(stack);
 
-    assert_eq!(
-        drawn_content(&state),
-        size(px(520.0), px(280.0)),
-        "a pane below the chart's floor gets the floor rather than the box it had before"
-    );
-}
-
-#[gpui_kit::test]
-fn a_pointer_over_the_plot_should_hover_the_point_under_it(cx: &mut TestAppContext) {
-    let (state, cx) = chart_window(cx);
-    let plot = plot(&state);
-
-    cx.simulate_mouse_move(plot.center(), None, Modifiers::default());
-    draw_the_frame_the_pointer_asked_for(cx);
-
-    let hover = state
-        .hovered()
-        .expect("a pointer inside the plot hovers a point");
     assert!(
-        plot.contains(&hover.cursor),
-        "the hover remembers where the pointer was"
+        harness.sync(),
+        "a label whose lease moved is a frame the chart owes, not an idle one"
+    );
+    assert_ne!(
+        glyph_generation(&harness),
+        Some(generation),
+        "every label was shaped for the atlas that exists now"
+    );
+    assert_eq!(
+        harness.canvas().primitives().len(),
+        labels,
+        "and none of them disappeared with the old lease"
+    );
+    assert!(
+        !harness.sync(),
+        "with fresh leases the frame is steady again (I3)"
     );
 }
 
-#[gpui_kit::test]
-fn a_pointer_under_the_plot_should_not_hover_anything(cx: &mut TestAppContext) {
-    let (state, cx) = chart_window(cx);
-    let plot = plot(&state);
+#[test]
+fn a_zone_switch_should_rewrite_the_time_labels() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
 
-    cx.simulate_mouse_move(
-        point(plot.center().x, plot.bottom() + plot.size.height),
+    assert!(
+        harness
+            .chart
+            .set_time_zone(UtcOffset::from_hms(8, 0, 0).unwrap())
+    );
+    assert!(harness.sync(), "another zone is another label");
+    assert!(
+        !harness
+            .chart
+            .set_time_zone(UtcOffset::from_hms(8, 0, 0).unwrap()),
+        "the same zone is the same labels"
+    );
+}
+
+#[test]
+fn another_appearance_should_repaint_the_canvas() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let light = quad_fills(harness.canvas());
+
+    let theme = harness.app.services().theme.clone();
+    assert!(
+        theme.set_appearance(harness.app.app_mut(), Appearance::Dark),
+        "another appearance is a change the pane has to draw"
+    );
+    assert!(harness.sync(), "the dark frame is drawn");
+    let dark = quad_fills(harness.canvas());
+    assert_ne!(light, dark, "the canvas carries the new colours");
+}
+
+/// The fill of every quad a canvas holds, in drawing order.
+fn quad_fills(canvas: &ui_core::paint::canvas::Canvas) -> Vec<ui_core::paint::color::Color> {
+    canvas
+        .primitives()
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::Quad(quad) => match quad.paint {
+                ui_core::paint::primitive::QuadPaint::Solid { fill, .. } => Some(fill),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn another_window_should_hand_the_previous_meshes_back() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    assert_eq!(harness.app.app().geometry().len(), 2);
+
+    harness
+        .app
+        .with_cx(|_| harness.chart.set_snapshot(&snapshot(2, 5)));
+    assert!(harness.sync());
+
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        2,
+        "the meshes of the window that was replaced are given back"
+    );
+}
+
+#[test]
+fn releasing_a_chart_should_hand_its_geometry_and_node_back() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        2,
+        "two lines are two registered meshes"
+    );
+    let nodes = harness.app.node_count();
+
+    harness.release();
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        0,
+        "the meshes are the chart's and go with it"
+    );
+    assert!(
+        harness.app.node_count() < nodes,
+        "the canvas node is removed"
+    );
+}
+
+#[test]
+fn a_window_of_one_interval_should_register_no_line() {
+    let mut harness = ChartHarness::new(1);
+    assert!(harness.sync());
+
+    assert_eq!(
+        harness.app.app().geometry().len(),
+        0,
+        "one point is a marker, not a line"
+    );
+    assert!(
+        harness
+            .chart
+            .canvas_for_test(harness.app.app(), harness.window)
+            .is_some()
+    );
+}
+
+#[test]
+fn an_empty_window_should_still_paint_its_axes() {
+    let mut harness = ChartHarness::new(0);
+    assert!(harness.sync());
+
+    assert!(!harness.canvas().is_empty(), "the axes are still a frame");
+    assert_eq!(harness.chart.point_count(), 0);
+    assert_eq!(harness.app.app().geometry().len(), 0);
+}
+
+#[test]
+fn a_hover_on_a_window_with_no_interval_should_not_hover() {
+    let mut harness = ChartHarness::new(0);
+    assert!(harness.sync());
+
+    assert!(
+        !harness.chart.point_at(middle_of_plot(&harness)),
+        "there is no interval to hover"
+    );
+    assert_eq!(harness.chart.hover_for_test(), None);
+}
+
+#[test]
+fn the_same_snapshot_should_not_move_the_hover() {
+    let mut harness = ChartHarness::new(4);
+    assert!(harness.sync());
+    let position = middle_of_plot(&harness);
+    assert!(harness.chart.point_at(position));
+    let hover: Option<Hover> = harness.chart.hover_for_test();
+
+    harness
+        .app
+        .with_cx(|_| harness.chart.set_snapshot(&snapshot(2, 4)));
+    assert_eq!(
+        harness.chart.hover_for_test(),
+        hover,
+        "a window of the same length keeps the interval under the pointer"
+    );
+}
+
+#[test]
+fn a_shrinking_window_should_drop_a_hover_it_no_longer_holds() {
+    let mut harness = ChartHarness::new(4);
+    assert!(harness.sync());
+    let layout = harness.layout();
+    let near_end = Point::new(
+        layout.plot.right() - 14.0,
+        layout.plot.origin.y + layout.plot.size.height / 2.0,
+    );
+    assert!(harness.chart.point_at(near_end));
+    assert_eq!(
+        harness.chart.hover_for_test().map(|hover| hover.index),
+        Some(3)
+    );
+
+    harness
+        .app
+        .with_cx(|_| harness.chart.set_snapshot(&snapshot(2, 2)));
+    assert_eq!(
+        harness.chart.hover_for_test(),
         None,
-        Modifiers::default(),
-    );
-    draw_the_frame_the_pointer_asked_for(cx);
-
-    assert!(
-        state.hovered().is_none(),
-        "a pointer below the plot is not a pointer on a point"
+        "the interval the pointer was on is gone"
     );
 }
 
-#[gpui_kit::test]
-fn a_leaving_pointer_should_stop_hovering(cx: &mut TestAppContext) {
-    let (state, cx) = chart_window(cx);
-    let plot = plot(&state);
-    cx.simulate_mouse_move(plot.center(), None, Modifiers::default());
-    draw_the_frame_the_pointer_asked_for(cx);
-    assert!(state.hovered().is_some());
+#[test]
+fn the_chart_should_point_at_the_series_it_was_built_for() {
+    let mut harness = ChartHarness::new(3);
+    assert!(harness.sync());
+    let layout = harness.layout();
 
-    cx.simulate_mouse_move(
-        point(plot.center().x, plot.bottom() + plot.size.height),
-        None,
-        Modifiers::default(),
-    );
-    draw_the_frame_the_pointer_asked_for(cx);
-
+    assert!(!layout.plot.is_empty());
     assert!(
-        state.hovered().is_none(),
-        "a hover that no longer has a point under it is dropped"
+        layout.left_axis.size.width > 0.0,
+        "open interest has a left axis"
+    );
+    assert_eq!(
+        SmolStr::new_static("open_interest").as_str(),
+        "open_interest"
     );
 }

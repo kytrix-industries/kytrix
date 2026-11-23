@@ -7,11 +7,10 @@ edition.workspace = true
 [dependencies]
 ahash = { workspace = true }
 app_config = { workspace = true }
-app_config_provider = { workspace = true }
 base_ui = { workspace = true }
+bytes = { workspace = true }
 const-hex = { workspace = true }
 dirs = { workspace = true }
-gpui-kit = { workspace = true }
 i18n = { workspace = true }
 kytrix_service_provider = { workspace = true }
 log = { workspace = true }
@@ -31,15 +30,15 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 tokio-util = { workspace = true }
+ui_core = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 widget = { workspace = true }
-widget_tokio_runtime = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+widget = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -41,11 +41,10 @@ impl<P: Send + Sync + 'static> ConfigNotification<P> {
 
     /// Replaces the shared projection and wakes the consumer.
     ///
-    /// Crate-visible: the production caller is
-    /// [`crate::events::ConfigEventBridge`]. A cross-crate test fake that drives
-    /// an owner's state uses [`Self::publish_for_test`], which only exists with
-    /// the `test-support` feature.
-    pub(crate) fn publish(&self, projection: Arc<P>) {
+    /// The owner publishes after it has applied the change the projection names:
+    /// it drains its [`crate::manager::ConfigManager`] subscription and projects
+    /// the current snapshot itself after each settings commit.
+    pub fn publish(&self, projection: Arc<P>) {
         // The write must precede the wake: a woken consumer reads `current()`.
         *self.shared.write() = projection;
         self.notify.notify_one();

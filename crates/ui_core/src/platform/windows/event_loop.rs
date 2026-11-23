@@ -14,8 +14,9 @@
 //! `WM_NCCALCSIZE` / `WM_NCLBUTTONDOWN` **全部**交 `DefWindowProcW`；`WM_NCHITTEST` 只在应用
 //! 声明的**自绘标题栏拖动区**（X2）命中时返回 `HTCAPTION`，其余点仍交默认过程。命中码、边框
 //! 几何、缩放光标，以及 caption 的 move 模态循环与 8 个命中码的 size 模态循环都由系统提供
-//! （Chrome / Qt / GPUI 同款）。Aero Snap / Win11 Snap Layouts / 双击边框 / `Alt+Space` →
-//! 大小 / 拖动中跨屏 DPI 因此全部免费。
+//! （Chrome / Qt / GPUI 同款）。Aero Snap（拖边）/ 双击边框 / `Alt+Space` → 大小 / 拖动中跨屏
+//! DPI 因此全部免费。Win11 Snap Layouts 的悬停浮层需要 `HTMAXBUTTON`，本批未实现（见
+//! `wndproc` 的 `WM_NCHITTEST` 注释与 spec-delta E6）。
 //!
 //! size 模态循环期间泵的 ④ 不运行，但**重排 + 重绘并没有停**：模态循环会同步
 //! `DispatchMessage` 到本窗口的 `WndProc`，每一条 `WM_SIZE` 都由
@@ -90,6 +91,21 @@ pub(crate) struct WndProcState {
     /// `WM_GETMINMAXINFO` 的最小尺寸都读它；`NativeWindow::scale` 是同一值的窗口侧副本，
     /// 由泵在派发 `Dpi` 事件时对齐。
     scale: Scale,
+    /// 窗口装饰模式（E6）：`Decorations::None` ⇒ frameless（`WM_NCCALCSIZE` 返回 0、
+    /// `WM_NCHITTEST` 自算 resize 命中）。三端语义见 [`crate::window::Decorations`]。
+    decorations: crate::window::Decorations,
+    /// frameless 的 resize 命中带厚度（物理像素，窗口 DPI 的
+    /// `SM_CXSIZEFRAME/SM_CYSIZEFRAME + SM_CXPADDEDBORDER`）。
+    ///
+    /// 由 [`Self::note_dpi`] 在 DPI 变化时重算（`WM_DPICHANGED` 同步生效）；`WM_NCCALCSIZE` 的
+    /// 最大化补偿与 `WM_NCHITTEST` 的命中带读同一个值 —— 两处漂移会让缩放带与客户区错位。
+    resize_border: (i32, i32),
+    /// 窗口 chrome 状态（最大化 / 还原）需要在下一轮泵对账（E6 / I3）。
+    ///
+    /// `WM_SIZE` 是最大化 / 还原 / Snap 的**唯一**信号（客户区必然变化），窗口过程只置位；
+    /// `NativeWindow::sync_chrome` 读 `IsZoomed` 并把变化写进 `Window::set_state` + 请求一帧。
+    /// 建窗时为 `true`：首个泵轮次必须写入真实状态（初始值是 `Decorations` 派生的保守值）。
+    chrome_dirty: bool,
     close_requested: bool,
     /// 待泵消费的显示 / 电源恢复请求（R07-14；同一批里的多条消息合并成一次）。
     ///
@@ -157,11 +173,13 @@ pub(crate) struct WndProcState {
 impl WndProcState {
     /// `limits` = 建窗时从 `WindowOptions` 解析出的客户区尺寸约束（B3：
     /// `WM_GETMINMAXINFO` 的 `ptMinTrackSize` / `ptMaxTrackSize` 来源）。
+    /// `decorations` = 建窗时的装饰模式（E6：frameless 的跟踪尺寸与命中带都依赖它）。
     pub(crate) fn new(
         dispatcher: Arc<Dispatcher>,
         hwnd: HWND,
         window: WindowId,
         limits: placement::ClientLimits,
+        decorations: crate::window::Decorations,
         driver: Option<Rc<ResizeFrameDriver>>,
         a11y_consumer_epoch: crate::a11y::adapter::A11yConsumerEpoch,
     ) -> Result<Self, EngineError> {
@@ -169,7 +187,7 @@ impl WndProcState {
         let scale = dpi::scale_from_dpi(dpi).ok_or(EngineError::InvalidDpiScale {
             factor: dpi as f32 / dpi::BASE_DPI as f32,
         })?;
-        let (min_track_size, max_track_size) = limits.track_sizes(dpi);
+        let (min_track_size, max_track_size) = limits.track_sizes(dpi, decorations);
         Ok(Self {
             dispatcher: dispatcher.clone(),
             events: Vec::with_capacity(8),
@@ -180,6 +198,9 @@ impl WndProcState {
             max_track_size,
             limits,
             scale,
+            decorations,
+            resize_border: dpi::resize_border(dpi),
+            chrome_dirty: true,
             close_requested: false,
             display_recovery: false,
             mouse_tracking: false,
@@ -232,9 +253,31 @@ impl WndProcState {
     /// 新值。
     pub(crate) fn note_dpi(&mut self, dpi: u32, scale: Scale) {
         self.scale = scale;
-        let (min_track_size, max_track_size) = self.limits.track_sizes(dpi);
+        let (min_track_size, max_track_size) = self.limits.track_sizes(dpi, self.decorations);
         self.min_track_size = min_track_size;
         self.max_track_size = max_track_size;
+        // E6：frameless 的 resize 命中带 / 最大化补偿必须与当前 DPI 同步（同一个值两处消费）。
+        self.resize_border = dpi::resize_border(dpi);
+    }
+
+    /// 窗口装饰模式（`WndProc` 的 `WM_NCCALCSIZE` / `WM_NCHITTEST` 分支读点；E6）。
+    pub(crate) fn decorations(&self) -> crate::window::Decorations {
+        self.decorations
+    }
+
+    /// frameless 的 resize 命中带厚度（物理像素；`WM_DPICHANGED` 时随 [`Self::note_dpi`] 更新）。
+    pub(crate) fn resize_border(&self) -> (i32, i32) {
+        self.resize_border
+    }
+
+    /// `WM_SIZE` 到达（最大化 / 还原 / Snap 的客户区变化）：下一轮泵对账 chrome 状态。
+    pub(crate) fn note_chrome_dirty(&mut self) {
+        self.chrome_dirty = true;
+    }
+
+    /// 取走「chrome 状态待对账」位（`NativeWindow::sync_chrome` 的唯一读点，取走即清）。
+    pub(crate) fn take_chrome_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.chrome_dirty)
     }
 
     /// 应用配置的客户区尺寸约束（`NativeWindow::apply_dpi_and_size` 建窗时钳制请求尺寸用）。

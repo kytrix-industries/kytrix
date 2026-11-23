@@ -1,123 +1,156 @@
 //! The X pane: the timeline it follows, and the accounts it manages.
 //!
+//! # What moved, and what it moved to
+//!
+//! The old pane was an element tree of the retired toolkit: a list of rendered rows,
+//! two dialogs owned as entities of their own, and process-global managers for the
+//! settings and the executor. The migrated pane is the framework's
+//! five-phase widget over engine nodes: the feed is a [`List`] whose rows are built
+//! once into their containers and updated through `bind_text` / `bind_style` /
+//! `bind_a11y`, the header is a [`Button`], and the account dialog is a
+//! [`TweetDialog`] built from `base_ui::kit` components over the same signals.
+//!
 //! # What a pane is scoped to
 //!
-//! One account. The account is the pane's scope and the stream key at once, so the pane never
-//! has to decide whether a tweet belongs to the account on screen: a message published for an
-//! account the pane has left is a message the framework does not deliver, and one that arrives
-//! by hand is refused by comparing the key.
+//! One account. The account is the pane's scope and the stream key at once, so the
+//! pane never has to decide whether a tweet belongs to the account on screen: a
+//! message published for an account the pane has left is a message the binding does
+//! not deliver, and one that arrives by hand is refused by comparing the key. The
+//! account is read from [`WidgetCx::account`] on every frame and compared — the
+//! settings signal is what schedules the frame, so a sign-in or sign-out is a reload
+//! on the frame that presents it.
 //!
 //! # The pane owns the accounts, the service owns the session
 //!
-//! Following a timeline and managing the accounts it comes from are two things the same
-//! account is asked for, and the same service answers both with the same session. So the pane
-//! is what waits for both, and the accounts the dialog draws are the pane's rather than the
-//! dialog's: they outlive any one dialog, and a dialog that held them would lose them on the
-//! next open.
+//! Following a timeline and managing the accounts it comes from are two things the
+//! same account is asked for, and the same service answers both with the same
+//! session. So the pane is what waits for both, and the accounts the dialog draws are
+//! the pane's rather than the dialog's: they outlive any one dialog, and a dialog
+//! that held them would lose them on the next open. The dialog's own page state (the
+//! typed filter, the query, what one search answered, which page is showing) belongs
+//! to the dialog and dies with it.
 //!
-//! What a dialog does hold is the search of X it runs for one more account. A search is a
-//! procedure of that dialog's own page rather than a change to the accounts, so what it found
-//! belongs to the dialog that asked and dies with it — which is the opposite of what the
-//! accounts need, and the reason the two are kept apart.
+//! # One call at a time, attributed by identity
 //!
-//! # The binding carries one call at a time
+//! A request reaches the service through the pane's binding, and the binding replaces
+//! the call it holds with the next one. [`WidgetBinding::call`] returns the
+//! [`RequestId`] that identifies the call, and [`Pending`] remembers which command is
+//! waiting for that identity: a reply whose id the table does not know is a late
+//! answer to a replaced call, dropped rather than applied to whatever replaced it.
+//! The stream guards (stream key, terminal failure) and the id attribution are two
+//! independent doors — every entry checks both.
 //!
-//! A request reaches the service through the pane's binding, and the binding replaces the call
-//! it holds with the next one. A search and a change therefore cannot both be out, and it is
-//! the pane that refuses whichever is asked for second — while a call the stream itself asks
-//! for (a read as the stream comes up, an avatar watched for a dialog that opened) is not the
-//! dialog's to refuse, and closes out the search it displaces instead of leaving a page waiting
-//! for an answer that can no longer arrive.
+//! # The timeline is a list of measured rows
 //!
-//! # What a change the pane stopped waiting for means
-//!
-//! A request the pane stops waiting for — because the user retried, or because the account
-//! changed under it — is dropped rather than decided: whether the service made the change is
-//! not something the pane can know, and it does not guess. What settles it is the next read,
-//! which is why a dialog that is open reads the accounts again as soon as the stream that
-//! answers reads is live.
-//!
-//! # Why the timeline is a list of measured rows
-//!
-//! A tweet is a paragraph, a gallery and a quoted tweet, so its height is the sum of things
-//! only the text system can measure. The body is therefore a bounded list of rows of their own
-//! height which holds the newest tweets and remembers which row a reader is looking at. A newer
-//! timeline is reported to it as the tweets it has not been shown rather than as a new set of
-//! rows: a list rebuilt from scratch would re-measure every row on screen and, worse, move a
-//! reader who had scrolled into the timeline back to the top. The one case that does move them
-//! is a tweet that arrives while the newest row is the one they are reading — the newest tweet
-//! belongs on screen, and that is exactly where they are looking.
+//! A tweet is a paragraph, a gallery and a quoted tweet, so its height is the sum of
+//! things only the text system can measure. The body is therefore a bounded variable
+//! list ([`ListOptions::variable`]) that holds the newest tweets and remembers where a
+//! reader is. A newer timeline is reported to it as the tweets it has not been shown
+//! rather than as a new set of rows: a list rebuilt from scratch would re-measure
+//! every row on screen and, worse, move a reader who had scrolled into the timeline
+//! back to the top.
 //!
 //! # Pictures are drawn from what the stream said
 //!
-//! A row draws a picture from the state the service published with the tweets it belongs to,
-//! never by fetching anything itself: what a frame shows is one message, and a picture whose
-//! bytes are not on disk yet is a tile that says so. The one thing a row can ask for is that a
-//! picture which failed be fetched again, which is the same request the service already knows
-//! how to answer.
+//! A row draws a picture from the state the service published with the tweets it
+//! belongs to, never by fetching anything itself: the service's media cache writes the
+//! bytes, the pane reads the cached file once and hands it to the engine's resource
+//! cache ([`App::resources_mut`]), and the row holds the resulting
+//! [`ImageSource`] — a pending handle that the engine rewrites in place when the decode
+//! lands, so nothing rebuilds for a picture arriving. A picture whose bytes are not on
+//! disk yet is a tile that says so, and one that failed is a tile a click asks again.
+//! Reading the cached file is the one synchronous disk read this pane does; it happens
+//! once per URL on the frame the media state first arrives.
+//!
+//! # Empty is content
+//!
+//! A live stream whose accounts have not posted has an *empty timeline*, and an empty
+//! timeline is content: the body draws `common.no_data` over the list rather than
+//! leaving the framework's placeholder to say the pane is waiting
+//! (`crates/widgets/AGENTS.md` §6). Only "no account" — nobody to read a timeline for —
+//! is a neutral [`Notice`].
 
-use std::sync::Arc;
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+    sync::Arc,
+};
 
 use ahash::AHashMap as HashMap;
-use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use app_config_provider::{events::AccountChanged, manager::ConfigManager};
+use app_config::{
+    network::Config as NetworkConfig,
+    settings::Config as SettingsConfig,
+    widget::{WidgetConfig, WidgetConfigSchemaVersion},
+};
 use base_ui::{
-    button::Button,
-    deque_unsized_list::DequeUnsizedList,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    separator::Separator,
-    size::UnifiedSizable,
-    style::theme::{Theme, ThemeExt},
-    tooltip::{Tooltip, TooltipExt},
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::{IconKind, RasterTier, raster},
+        list::{List, ListOptions, SelectionMode},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
-use gpui_kit::{
-    AnyElement, App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement,
-    InteractiveText, IntoElement, ListAlignment, ObjectFit, ParentElement, Render, Role,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, StyledText, Subscription,
-    WeakEntity, Window, base::Disableable, div, img, px,
-};
-use i18n::t;
+use bytes::Bytes;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::{
-    connector::KytrixServiceConnector,
+    engine::KytrixServiceError,
     x::{XApiError, XMutationOutcome, XMutationUnknown, XSelectionStatus},
 };
 use network::transport::hub::{TransportHub, TransportPolicy};
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use time::OffsetDateTime;
+use ui_core::{
+    a11y::{A11yOverride, A11yPatch},
+    error::EngineError,
+    event::{Action, Event, InputEvent, PointerButton},
+    node::{
+        builder::NodeBuilder,
+        dependency::ReadCtx,
+        id::NodeId,
+        image::{ImageFit, ImageSource},
+        signal::Signal,
+        tree::NodeTree,
+    },
+    paint::{color::Color, style::StylePatch},
+    text::{TextAlign, TextOverflow, TextRun, TextStyle},
+};
 use widget::{
-    account::account_of,
-    binding::{WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding},
     category::WidgetCategory,
     config::WidgetConfigChange,
-    error::LocalizedError,
+    cx::WidgetCx,
+    error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
-    status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
-    time_zone::{data_time_zone, on_data_time_zone_change},
-    view::{WidgetHeader, WidgetView},
+    status::{Notice, WidgetAction, WidgetState, WidgetStatus},
+    view::{HeaderGroup, ReloadHandle, WidgetView},
 };
-use widget_tokio_runtime::global;
 
 use super::{
-    dialog::{DialogState, SearchAnswer, TweetDialog},
+    dialog::{DialogRequest, DialogView, SearchAnswer, TweetDialog},
     media::{MediaDownloader, SharedTransport},
     model::{
         MAX_TWEETS, MediaState, MediaStates, SelectionData, TweetAge, TweetItem, TweetMediaItem,
-        TweetReferenceItem, TweetSnapshot, retained_hints, unshown,
+        TweetReferenceItem, TweetSnapshot, absolute_time, retained_hints, tweet_age, unshown,
     },
     service::{
-        TweetProtocol, TweetRequest, TweetResponse, TweetScope, TweetService, TweetSource,
-        TweetStatus, TweetStreamError, TweetStreamMessage, TweetUpdate,
+        TweetProtocol, TweetRequest, TweetResponse, TweetScope, TweetService, TweetStatus,
+        TweetStreamError, TweetStreamMessage, TweetUpdate,
     },
 };
 
-/// How far above and below the viewport the list measures rows it cannot see, which is what
-/// keeps a row from appearing a moment after it was scrolled to. A tweet is a paragraph, a
-/// gallery and sometimes a quoted tweet, so a row is tall and expensive to measure: eight
-/// hundred is the two or three rows around the viewport rather than a screenful of them.
-const LIST_OVERDRAW: f32 = 800.0;
+/// The height a row is estimated at until the list has measured one.
+///
+/// A tweet is a face, a header line, a paragraph and sometimes a gallery; a couple of
+/// rows either side of the viewport keeps a row from appearing a moment after it was
+/// scrolled to. The list replaces the estimate with the measured height.
+const ROW_ESTIMATE: f32 = 240.0;
 
 /// The size of the face a timeline row is drawn with.
 const AVATAR_SIZE: f32 = 40.0;
@@ -127,14 +160,26 @@ const QUOTE_AVATAR_SIZE: f32 = 28.0;
 
 /// How wide a gallery of several pictures is laid out, and how tall.
 const GALLERY_WIDE_WIDTH: f32 = 510.0;
-const GALLERY_WIDE_HEIGHT: f32 = 510.0;
-const GALLERY_COMPACT_WIDTH: f32 = 420.0;
-const GALLERY_COMPACT_HEIGHT: f32 = 320.0;
+const GALLERY_HEIGHT: f32 = 320.0;
+
+/// The size a tweet's body text is drawn at, from the kit's size ladder (the theme has
+/// no body typography token yet; the ladder is the same source kit controls read).
+const BODY_SIZE: UnifiedSize = UnifiedSize::Medium;
+
+/// The size secondary lines (handles, times, quoted text) are drawn at.
+const META_SIZE: UnifiedSize = UnifiedSize::Small;
+
+/// The length of the trail of the bounded feed: the newest 50 tweets, as before.
+const FEED_CAPACITY: usize = MAX_TWEETS;
+
+/// The longest search string the service accepts, in bytes.
+const MAX_SEARCH_QUERY_BYTES: usize = 100;
 
 /// The X widget carries no options.
 ///
-/// What a pane follows is the account's own list of monitored accounts, which is read from the
-/// service rather than configured here, so there is nothing to persist but the schema version.
+/// What a pane follows is the account's own list of monitored accounts, which is read
+/// from the service rather than configured here, so there is nothing to persist but the
+/// schema version.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct XConfig;
 
@@ -149,20 +194,20 @@ enum XFailure {
     Rpc(RpcCallError<XApiError>),
 }
 
-impl LocalizedError for XFailure {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for XFailure {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Stream(error) => error.localized_message(cx),
-            Self::Rpc(error) => error.localized_message(cx),
+            Self::Stream(error) => error.translated_message(translate),
+            Self::Rpc(error) => error.translated_message(translate),
         }
     }
 }
 
 /// What the dialog is doing, or waiting for.
 ///
-/// A search is not here: it is a procedure of the dialog's own page rather than something the
-/// accounts are waiting for, and it is carried by the pane apart from what it waits on the
-/// accounts with.
+/// A search is not here: it is a procedure of the dialog's own page rather than
+/// something the accounts are waiting for, and it is carried by the pane apart from what
+/// it waits on the accounts with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelectionOperation {
     /// The accounts are being read for a dialog that has none to show.
@@ -176,7 +221,7 @@ pub(super) enum SelectionOperation {
 }
 
 impl SelectionOperation {
-    /// Whether this operation is a read rather than a search or a change.
+    /// Whether this operation is a read rather than a change.
     pub(super) const fn is_read(self) -> bool {
         matches!(self, Self::Loading | Self::Refreshing)
     }
@@ -186,22 +231,17 @@ impl SelectionOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SelectionPending {
     operation: SelectionOperation,
-    /// What the operation is about: the username being monitored or the id being left, which
-    /// is what a confirmation is projected from.
+    /// What the operation is about: the username being monitored or the id being left.
     target: Option<SmolStr>,
     /// Whether the request is out.
     ///
-    /// A read asked for before the stream is live is held here instead: there is no session
-    /// behind the account yet, and the readiness that arrives later is what makes the read
-    /// possible.
+    /// A read asked for before the stream is live is held here instead: there is no
+    /// session behind the account yet, and the readiness that arrives later is what
+    /// makes the read possible.
     sent: bool,
 }
 
 /// What the last change said.
-///
-/// The dialog reports it in an alert over itself, and holds the report it has already made, so
-/// what a change says is read by the user where they asked for it rather than in a line of the
-/// dialog's own.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SelectionNotice {
     /// The account is now being monitored.
@@ -215,75 +255,253 @@ pub(super) enum SelectionNotice {
 pub(super) enum SelectionFailure {
     /// The service refused the change.
     Rejected(XApiError),
-    /// The change may or may not have been made, which is what the service answers when it
-    /// could not tell.
+    /// The change may or may not have been made, which is what the service answers when
+    /// it could not tell.
     Unknown(XMutationUnknown),
     /// The call itself failed.
     Rpc(RpcCallError<XApiError>),
 }
 
-impl LocalizedError for SelectionFailure {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for SelectionFailure {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Rejected(error) => error.localized_message(cx),
-            Self::Unknown(error) => error.localized_message(cx),
-            Self::Rpc(error) => error.localized_message(cx),
+            Self::Rejected(error) => error.translated_message(translate),
+            Self::Unknown(error) => error.translated_message(translate),
+            Self::Rpc(error) => error.translated_message(translate),
         }
+    }
+}
+
+/// One command this pane sent and has not seen the answer to.
+///
+/// The binding replaces its one command slot on every call and aborts the call it
+/// replaced, but a reply can already be queued when that happens. The identity the
+/// binding returned is what says whose answer arrived: only a reply tracked here may
+/// steer the pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingCommand {
+    /// A read: `Load` or `Retry`.
+    Start,
+    /// The stop that lets go of the stream an account left behind.
+    Stop,
+    /// A read of the monitored accounts.
+    FetchSelections,
+    /// Whether a dialog is showing the accounts' avatars.
+    WatchSelections,
+    /// A search of X.
+    Search,
+    /// Monitoring one more account.
+    Add,
+    /// Leaving one account.
+    Delete,
+    /// Fetching one picture again.
+    RetryMedia,
+}
+
+/// The image resources the rows and the dialog draw.
+type ImageMap = HashMap<SmolStr, ImageSource>;
+
+/// The bytes-to-resource handles one pane has registered, shared with its row builders.
+type RowImages = Rc<RefCell<ImageMap>>;
+
+/// The icon resources one pane has registered, by kind.
+///
+/// A row builder has no `App` and therefore cannot call [`IconSpec::build_themed`]; the
+/// pane registers the icon PNGs once and hands the row builders the resource ids, and
+/// the image nodes take their colour from `bind_style`'s `foreground` channel.
+#[derive(Clone)]
+struct RowIcons {
+    repost: ImageSource,
+    verified: ImageSource,
+    warning: ImageSource,
+    play: ImageSource,
+    retry: ImageSource,
+}
+
+/// One picture a row draws, resolved from the model at accept time.
+#[derive(Clone, Debug, PartialEq)]
+struct MediaPlan {
+    url: SmolStr,
+    kind: MediaKind,
+    ratio: f32,
+    /// Whether this is a still frame standing in for an animation that is not fetched.
+    poster_only: bool,
+}
+
+/// Which of the kinds of picture one tile is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaKind {
+    Image,
+    Video,
+    Gif,
+}
+
+/// What one frame's row draws, resolved at accept time.
+///
+/// Rows are built by a list closure that has no `App`, so everything structural —
+/// whether there is text, how many pictures there are, what is quoted — is a value in
+/// this plan rather than a read of the frame. The dynamic parts (ages, labels) are
+/// `bind_*` closures over the same plan signal.
+#[derive(Clone, Debug, PartialEq)]
+struct RowPlan {
+    tweet_id: SmolStr,
+    /// The top-level row this plan belongs to (its own id, or the quoting tweet's id
+    /// when this plan is the quoted tweet underneath it).
+    row_id: SmolStr,
+    /// Whether this plan is a quoted tweet rather than the row's own.
+    quote_of: bool,
+    /// The URL a click on the row opens.
+    url: SmolStr,
+    /// Who reposted this timeline entry, when it is one.
+    reposted_by: Option<SmolStr>,
+    author_name: SmolStr,
+    author_handle: SmolStr,
+    avatar_url: SmolStr,
+    verified: bool,
+    /// The timestamp the row's age is derived from.
+    published_at: i64,
+    text: SmolStr,
+    /// Whether the tweet says anything at all (an empty body is a gallery-only tweet).
+    has_text: bool,
+    /// Byte ranges of `text` that are links, with the URLs they open.
+    links: Rc<[(Range<usize>, SmolStr)]>,
+    media: Arc<[MediaPlan]>,
+    quote: Option<Box<RowPlan>>,
+}
+
+/// The images and links a row's descendants are, so the pane's `dispatch` can tell what
+/// a pointer landed on.
+#[derive(Clone, Default)]
+struct RowHits {
+    /// Row root → the tweet URL a click opens.
+    rows: Rc<RefCell<HashMap<NodeId, SmolStr>>>,
+    /// Text node → the link ranges inside it.
+    links: Rc<RefCell<HashMap<NodeId, Rc<[(Range<usize>, SmolStr)]>>>>,
+    /// A failed picture's tile → the URL to fetch again.
+    failed: Rc<RefCell<HashMap<NodeId, SmolStr>>>,
+}
+
+impl RowHits {
+    fn clear(&self) {
+        self.rows.borrow_mut().clear();
+        self.links.borrow_mut().clear();
+        self.failed.borrow_mut().clear();
+    }
+}
+
+/// The state a list row builder is handed, beyond its parent and index.
+#[derive(Clone)]
+struct RowContext {
+    plans: Rc<RefCell<Arc<[RowPlan]>>>,
+    plan_signal: Signal<Arc<[RowPlan]>>,
+    language: Signal<LanguageCode>,
+    config: Signal<SettingsConfig>,
+    theme: ThemeHandle,
+    /// The appearance the visible rows were built against.
+    ///
+    /// A text run's colour is a static load the engine does not re-read (there is no
+    /// dynamic channel inside a run), so a link's colour is the brand role of the
+    /// appearance the row was built for: the pane updates this cell and rebuilds the
+    /// visible window when the appearance moves.
+    appearance: Rc<Cell<Appearance>>,
+    translate: Translate,
+    images: RowImages,
+    /// The picture states the rows draw, mirrored from the feed's media map.
+    media: Rc<RefCell<MediaStates>>,
+    icons: RowIcons,
+    hits: RowHits,
+    /// The action a failed picture's tile declares: Enter / Space on the focused tile
+    /// (and an assistive technology's activation) ask for the picture again.
+    retry: Action,
+}
+
+impl RowContext {
+    fn media(&self) -> MediaStates {
+        Arc::clone(&self.media.borrow())
     }
 }
 
 /// One pane: the timeline it holds, and the accounts it manages.
 pub struct XWidget {
-    binding: WidgetBinding<TweetProtocol>,
-    status: Entity<WidgetStatus>,
+    /// The executor bridge, absent on a host that installed no Kytrix service.
+    binding: Option<WidgetBinding<TweetProtocol>>,
+    /// The commands in flight, keyed by the identity the binding returned.
+    pending: Pending<PendingCommand>,
+    status: WidgetStatus,
     recovery: WidgetAction,
+    /// Opens a URL through the application's own command.
+    open_url: Rc<dyn Fn(&str)>,
     /// The account the pane reads for, which is its whole scope.
     account_id: Option<SmolStr>,
     /// The tweets the pane is showing, once a stream has published them.
     feed: Option<TweetSnapshot>,
     /// What is known about every picture the feed wants.
     media: MediaStates,
+    /// The same picture states as a shared cell the row builders read (they have no
+    /// `App` to read a signal with).
+    media_mirror: Rc<RefCell<MediaStates>>,
     /// How many updates the stream this feed came from has published.
     revision: u64,
     /// Whether the subscription has reported itself live.
     ///
-    /// It is what keeps a read of the monitored accounts from being sent before there is a
-    /// session to answer it, and a change from being sent while the stream carrying the
-    /// account is down.
+    /// It is what keeps a read of the monitored accounts from being sent before there
+    /// is a session to answer it, and a change from being sent while the stream carrying
+    /// the account is down.
     ready: bool,
-    /// The list itself, which holds the newest tweets, measures their rows and remembers where
-    /// a reader is.
-    list: Entity<DequeUnsizedList<Arc<TweetItem>>>,
+    /// What the list's rows are drawn from, shared with the row builders.
+    plans: Rc<RefCell<Arc<[RowPlan]>>>,
+    /// The same plans as an engine signal, so a row's text can follow the language and
+    /// the display time zone without rebuilding the row.
+    plan_signal: Signal<Arc<[RowPlan]>>,
+    /// The picture state the rows were last built against, so a media change rebuilds
+    /// the visible window.
+    built_media: Option<MediaStates>,
+    /// The appearance the visible rows were built against (a link's colour is a static
+    /// run colour, see [`RowContext::appearance`]).
+    appearance: Rc<Cell<Appearance>>,
+    /// The image resources registered for the pictures on screen.
+    images: RowImages,
+    /// The action a failed picture's tile declares, registered on the app for the
+    /// keyboard / assistive-technology activation of that tile.
+    media_retry_action: Option<Action>,
+    /// The URL a failed picture's tile asked to fetch again, written by the tile's own
+    /// handler or by a pointer landing on it and taken by the next `sync`.
+    media_retry: Signal<Option<SmolStr>>,
+    /// The icon resources the rows draw, registered once in `body`.
+    icons: Option<RowIcons>,
+    /// What a pointer lands on inside the feed.
+    hits: RowHits,
+    /// The list itself, built by [`WidgetView::body`], where its parent is known.
+    list: Option<List>,
+    /// The root of the body this pane built.
+    body_root: Option<NodeId>,
+    /// The stand-in a feed with nothing in it draws.
+    empty: Option<NodeId>,
+    /// The language the stand-in was built in.
+    empty_language: Option<LanguageCode>,
     /// The accounts the account monitors, as the service last answered them.
     selections: Option<SelectionData>,
     /// The query the binding is carrying a search of X for, if it is carrying one.
-    ///
-    /// A search is the dialog's page's, and what it found is delivered there; what is here is
-    /// the one fact only the pane can know, because the binding is the pane's: which call it is
-    /// carrying. That is what keeps a search and a change from displacing each other, and what
-    /// lets a search that another call displaced be closed out rather than left as a page
-    /// waiting for an answer nothing will bring.
     searching: Option<SmolStr>,
     /// What the dialog is waiting for, if anything.
-    pending: Option<SelectionPending>,
+    selection_pending: Option<SelectionPending>,
     /// What the dialog says about the last change.
     notice: Option<SelectionNotice>,
-    /// The username of every monitored account that came back without a profile, so a row
-    /// waiting to be activated is named rather than numbered.
-    ///
-    /// The rows of the dialog's list are drawn from it, one frame at a time, so the map is
-    /// shared with them rather than copied into each row's state. It is a memo beside the rows
-    /// rather than a second list of accounts: it is born where the pane is told a name, and it
-    /// is pruned against the set every time that set is read, so it cannot outlive the rows it
-    /// names. What it is *not* is dropped by a read: the accounts are read again every time a
-    /// dialog opens, and a row that is still waiting to be activated comes back without the
-    /// name the user added it under.
-    hints: Arc<HashMap<SmolStr, SharedString>>,
-    /// The open dialog, which is the pane's only way of managing accounts.
-    dialog: Option<WeakEntity<TweetDialog>>,
-    _account: Subscription,
-    /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone: Option<Subscription>,
+    /// The username of every monitored account that came back without a profile.
+    hints: Arc<HashMap<SmolStr, SmolStr>>,
+    /// The open dialog, if one is open.
+    dialog: Option<TweetDialog>,
+    /// The control that opens the monitored-accounts dialog.
+    manage_button: Option<Button>,
+    /// The header group the control lives in, so a rebuild can find its parent.
+    manage_parent: Option<NodeId>,
+    /// What the control was built with: the language, and whether an account scopes the
+    /// pane. A difference is what makes the control rebuild.
+    manage_built: Option<(LanguageCode, bool)>,
+    /// Opens the dialog request: the control's handler has no widget to borrow, so it
+    /// asks the next `sync` for the open instead of performing it.
+    open_dialog_requests: Signal<u64>,
+    seen_open_requests: u64,
 }
 
 impl WidgetView for XWidget {
@@ -297,119 +515,348 @@ impl WidgetView for XWidget {
 
     fn new(
         _instance_id: WidgetInstanceId,
-        config: Self::Config,
-        status: Entity<WidgetStatus>,
-        _reload: impl Fn(&mut App) + 'static,
+        _config: Self::Config,
+        status: WidgetStatus,
+        _reload: ReloadHandle,
         _config_change: WidgetConfigChange,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let source = cx.global::<KytrixServiceConnector>().clone();
-        // Pictures are fetched by this pane rather than by the service, and the transport they
-        // are fetched over is the application's own build policy: the two X image origins are
-        // the only hosts a picture URL may name, and they are always reached over HTTPS.
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<Self, EngineError> {
+        let source = cx.services().kytrix_service().cloned();
+        // Pictures are fetched by this pane rather than by the service they belong to,
+        // and the transport they are fetched over is the application's own build policy:
+        // the two X image origins are the only hosts a picture URL may name, and they
+        // are always reached over HTTPS.
+        let config: NetworkConfig = cx.config_ref(|config| config.network_config());
         let transport = SharedTransport::new(
             Arc::new(TransportHub::new(TransportPolicy::default())),
-            source.network_notification(),
-            global::handle(cx),
-        );
-        Self::new_with_source(
             config,
-            source,
-            MediaDownloader::new(transport),
-            status,
-            WidgetConfigChange::default(),
-            recovery,
-            cx,
-        )
+        );
+        let binding = source.map(|source| {
+            WidgetBinding::spawn(
+                cx,
+                TweetService::new(source, MediaDownloader::new(transport)),
+            )
+        });
+
+        Ok(Self::assemble(binding, status, recovery, cx))
     }
 
-    fn load(&mut self, cx: &mut Context<Self>) {
-        let retry = self.status.is_failed(cx);
-        self.account_id = account_of(&cx.global::<ConfigManager>().read());
-        self.start(retry, cx);
+    fn load(&mut self, cx: &mut WidgetCx<'_>) {
+        let retry = self.status.is_failed(cx.app());
+        self.account_id = cx.account();
+        if let Err(error) = self.start(retry, cx) {
+            log::error!("the x pane could not start: {error}");
+        }
     }
 
     /// A pane is content once a stream has published a timeline for it.
     ///
-    /// An empty timeline is not content: an account whose monitored accounts have not posted
-    /// is an account the pane has nothing to show for, and what it has instead is the
-    /// framework's own "waiting" placeholder, which is where a neutral sentence belongs.
+    /// An empty timeline is content: the pane has a feed, it is just a feed with nothing
+    /// in it yet, and the body says so with `common.no_data` rather than leaving the
+    /// framework's placeholder to call it waiting.
     fn has_content(&self) -> bool {
-        self.feed.as_ref().is_some_and(|feed| !feed.is_empty())
+        self.feed.is_some()
+    }
+
+    fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let root = NodeBuilder::boxed()
+            .id("TEST_TWEET_BODY")
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .size_full()
+                    .min_width_0()
+                    .min_height_0()
+                    .relative()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        self.body_root = Some(root);
+        self.icons = Some(register_row_icons(cx)?);
+        self.list = Some(self.make_list(cx, root)?);
+        self.sync_empty_state(cx)?;
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
+    fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        // The settings are the pane's scope: signing in as someone else is another
+        // timeline, and signing out is no timeline at all.
+        let account = cx.account();
+        if account != self.account_id {
+            self.account_id = account;
+            self.start(false, cx)?;
+        }
+
+        let messages = self
+            .binding
+            .as_ref()
+            .map(WidgetBinding::take)
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                Inbound::Reliable { key, message } => {
+                    let _ = self.apply_reliable(key, message, cx);
+                }
+                Inbound::Latest { key, message } => {
+                    let _ = self.apply_latest(key, message, cx);
+                }
+                Inbound::Rpc { request_id, result } => {
+                    self.apply_rpc(request_id, result, cx);
+                }
+            }
+        }
+
+        // Pictures whose bytes the stream published are registered before anything
+        // draws them: the row builders read this map, and the decode happens after.
+        self.register_media(cx);
+
+        let requests = *cx.read(&self.open_dialog_requests);
+        if requests != self.seen_open_requests {
+            self.seen_open_requests = requests;
+            self.open_dialog(cx)?;
+        }
+        self.sync_dialog(cx)?;
+        self.sync_media_retry(cx);
+
+        // A link's colour is a static run colour, so the rows are built for an
+        // appearance: a theme that moved rebuilds the visible window, as a media change
+        // does.
+        self.sync_appearance(cx)?;
+
+        if let Some(list) = &self.list {
+            list.sync(cx.app_mut())?;
+        }
+        self.sync_empty_state(cx)?;
+        self.sync_manage_button(cx)?;
+
+        // The body is built by the framework from the answer `has_content` gives, and it
+        // asks that question before this hook runs: content that first appeared here is
+        // one frame away, so ask for that frame.
+        if self.feed.is_some() && self.body_root.is_none() {
+            cx.request_frame()?;
+        }
+
+        Ok(())
     }
 
     /// The control that opens the monitored-accounts dialog.
-    fn header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> WidgetHeader {
-        WidgetHeader::empty().left(self.manage_button(cx))
+    fn header(
+        &mut self,
+        group: HeaderGroup,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        if group != HeaderGroup::Left {
+            return Ok(());
+        }
+        self.release_manage_button(cx, true)?;
+        self.build_manage_button(parent, cx)
+    }
+
+    fn dispatch(&mut self, event: &Event, cx: &mut WidgetCx<'_>) -> bool {
+        let Event::Input(InputEvent::PointerUp {
+            position, button, ..
+        }) = event
+        else {
+            return false;
+        };
+        if *button != PointerButton::Primary {
+            return false;
+        }
+        let Some(hit) = cx.tree().hit_test(*position) else {
+            return false;
+        };
+
+        // A link inside a tweet's text is the most specific target: the byte the pointer
+        // is over names which link (if any) was clicked.
+        let links = self.hits.links.borrow().get(&hit.node).cloned();
+        if let Some(links) = links {
+            let byte = cx
+                .window_mut()
+                .text_byte_index_at(hit.node, hit.local_point)
+                .ok();
+            if let Some(byte) = byte
+                && let Some((_, url)) = links.iter().find(|(range, _)| range.contains(&byte))
+            {
+                (self.open_url)(url);
+                return true;
+            }
+        }
+
+        // A failed picture's tile asks for it again rather than opening the tweet. The
+        // hit is one of the tile's children (its icon), so the tile is found by walking
+        // up to the nearest ancestor the pane registered.
+        let failed_url = {
+            let failed = self.hits.failed.borrow();
+            let mut node = Some(hit.node);
+            let mut found = None;
+            while let Some(current) = node {
+                if let Some(url) = failed.get(&current) {
+                    found = Some(url.clone());
+                    break;
+                }
+                node = cx.tree().get(current).ok().and_then(|node| node.parent());
+            }
+            found
+        };
+        if let Some(url) = failed_url {
+            // The tile's own action is what the engine dispatches for a pointer landing on
+            // it (and for Enter / Space on it); a headless caller reaching this hook
+            // directly asks for the same picture through the same request.
+            let _ = cx.write(&self.media_retry, Some(url));
+            let _ = cx.request_frame();
+            return true;
+        }
+
+        // Otherwise the row the pointer is in opens its tweet. The hit is a descendant
+        // of the row container, so the row is the nearest ancestor the pane registered.
+        let row_url = {
+            let rows = self.hits.rows.borrow();
+            let mut node = Some(hit.node);
+            let mut found = None;
+            while let Some(current) = node {
+                if let Some(url) = rows.get(&current) {
+                    found = Some(url.clone());
+                    break;
+                }
+                node = cx.tree().get(current).ok().and_then(|node| node.parent());
+            }
+            found
+        };
+        let Some(url) = row_url else {
+            return false;
+        };
+        (self.open_url)(&url);
+        true
+    }
+
+    fn release(&mut self, cx: &mut WidgetCx<'_>) {
+        // Dropping the bridge aborts its forwarding tasks and cancels the service.
+        self.binding = None;
+        self.pending.clear();
+        // The header's nodes belong to the pane, which removes its row: only the
+        // component's signal scope and action handler are this widget's to release.
+        let _ = self.release_manage_button(cx, false);
+        if let Some(action) = self.media_retry_action.take() {
+            let _ = cx.app_mut().off_action(&action);
+        }
+        if let Some(mut dialog) = self.dialog.take() {
+            dialog.release(cx);
+        }
+        // The list documents its own teardown order: its nodes first, then the component.
+        if let Some(root) = self.body_root.take() {
+            let window = cx.window();
+            let _ = cx.app_mut().remove_node(window, root);
+        }
+        if let Some(list) = self.list.take() {
+            let _ = list.release(cx.app_mut());
+        }
+        self.feed = None;
+        self.hits.clear();
+        self.images.borrow_mut().clear();
+        self.icons = None;
+        self.empty = None;
+        self.empty_language = None;
     }
 }
 
 impl XWidget {
-    /// The seam a test can answer through: `new` only picks the production source and
-    /// transport.
-    fn new_with_source<S, T>(
-        _config: XConfig,
-        source: S,
-        downloader: MediaDownloader<T>,
-        status: Entity<WidgetStatus>,
-        _config_change: WidgetConfigChange,
+    /// The seam the framework and the tests build a pane through.
+    ///
+    /// The pane has no opinion about where its timeline comes from, so the binding is an
+    /// argument: the production constructor answers it with the injected Kytrix service
+    /// connection, and a test with a fake subscription.
+    fn assemble(
+        binding: Option<WidgetBinding<TweetProtocol>>,
+        status: WidgetStatus,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self
-    where
-        S: TweetSource,
-        T: super::media::MediaTransport,
-    {
-        let binding = WidgetBinding::spawn_conditionally(
-            global::handle(cx).handle(),
-            TweetService::new(source, downloader),
-            cx,
-            Self::apply_reliable,
-            Self::apply_latest,
-        );
-        // The account is the pane's scope, and the user can change it while the pane is open:
-        // signing out has to take the timeline with it, and signing in as someone else has to
-        // read again.
-        let events = cx.global::<ConfigManager>().events().clone();
-        let account = cx.subscribe(&events, |this, _, _: &AccountChanged, cx| {
-            this.reconcile_account(account_of(&cx.global::<ConfigManager>().read()), cx);
-        });
+        cx: &mut WidgetCx<'_>,
+    ) -> Self {
+        let open_url = Rc::clone(&cx.services().open_url);
+        let plans: Arc<[RowPlan]> = Arc::from([]);
+        let plans = Rc::new(RefCell::new(plans));
+        let plan_signal = cx.signal(Arc::clone(&plans.borrow()));
+        let open_dialog_requests = cx.signal(0_u64);
+        let account_id = cx.account();
+        let appearance = Rc::new(Cell::new(cx.theme().current(cx.app())));
 
-        // The list holds the timeline itself, so what a reader is reading is the list's to keep:
-        // it is told about the tweets a feed added rather than about the feed.
-        let widget = cx.weak_entity();
-        let list = cx.new(|_| feed_list(widget));
+        // A failed picture's tile declares this action: the keyboard (Enter / Space on the
+        // focused tile) and an assistive technology both activate the target node, and the
+        // handler reads the URL that node stands for out of the hit table — a row builder
+        // has no `App` to register a handler of its own.
+        let hits = RowHits::default();
+        let media_retry = cx.signal(None::<SmolStr>);
+        let media_retry_action = Action::Custom(cx.unique_key("x.feed.retry_media"));
+        let retry_hits = hits.clone();
+        let retry_request = media_retry;
+        let window = cx.window();
+        cx.app_mut()
+            .on_action(media_retry_action.clone(), move |ctx| {
+                let url = retry_hits.failed.borrow().get(&ctx.node()).cloned();
+                let Some(url) = url else {
+                    return;
+                };
+                ctx.write(&retry_request, Some(url));
+                let _ = ctx.app_mut().request_repaint(window);
+            });
 
-        // What this pane waits with is a reference into the catalogue, resolved by the
-        // framework on the frame that draws it, so nothing here has to be re-reported when the
-        // language moves.
         Self {
             binding,
+            pending: Pending::new(),
             status,
             recovery,
-            // The pane records the account it was built for, but it starts nothing: the
-            // framework calls `load` once construction is done.
-            account_id: account_of(&cx.global::<ConfigManager>().read()),
+            open_url,
+            account_id,
             feed: None,
             media: Arc::new(HashMap::new()),
+            media_mirror: Rc::new(RefCell::new(Arc::new(HashMap::new()))),
             revision: 0,
             ready: false,
-            list,
+            plans,
+            plan_signal,
+            built_media: None,
+            appearance,
+            images: Rc::new(RefCell::new(HashMap::new())),
+            media_retry_action: Some(media_retry_action),
+            media_retry,
+            icons: None,
+            hits,
+            list: None,
+            body_root: None,
+            empty: None,
+            empty_language: None,
             selections: None,
             searching: None,
-            pending: None,
+            selection_pending: None,
             notice: None,
             hints: Arc::new(HashMap::new()),
             dialog: None,
-            _account: account,
-            // The rows are built by the list entity, which keeps what it drew until it
-            // is told otherwise: moving the display zone has to wake the list itself.
-            _time_zone: on_data_time_zone_change(cx, |this, _, cx| {
-                this.list.update(cx, |_, cx| cx.notify());
-                cx.notify();
-            }),
+            manage_button: None,
+            manage_parent: None,
+            manage_built: None,
+            open_dialog_requests,
+            seen_open_requests: 0,
         }
+    }
+
+    /// A pane over a source the caller answers, for the crate's own tests.
+    #[cfg(test)]
+    fn new_with_source<S, T>(
+        source: S,
+        downloader: MediaDownloader<T>,
+        status: WidgetStatus,
+        recovery: WidgetAction,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self
+    where
+        S: super::service::TweetSource,
+        T: super::media::MediaTransport,
+    {
+        let binding = WidgetBinding::spawn(cx, TweetService::new(source, downloader));
+        Self::assemble(Some(binding), status, recovery, cx)
     }
 
     /// The scope this pane follows, which is the account it reads as.
@@ -417,147 +864,182 @@ impl XWidget {
         TweetScope::new(self.account_id.as_ref())
     }
 
-    /// Follows the account the settings now hold.
+    /// Starts reading, or restarts for a pane the user is recovering.
     ///
-    /// Another account is another timeline and another list of accounts, so what the pane is
-    /// showing is dropped rather than kept under a new name — and a change the pane was
-    /// waiting for is dropped with it, because whether that change was made is not something
-    /// the new account's list can answer.
-    fn reconcile_account(&mut self, account: Option<SmolStr>, cx: &mut Context<Self>) {
-        if self.account_id == account {
-            return;
+    /// A recovery keeps the timeline the user is still reading — blanking a feed to
+    /// reconnect would flash it away — while an account change starts over, because the
+    /// pane cannot vouch for what it was showing.
+    fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(scope) = self.current_scope() else {
+            self.clear(cx)?;
+            self.report_no_content_notice(cx);
+            // Nothing is followed, so nothing should stay subscribed on this pane's
+            // behalf: an account that signed out must not keep a seat it is not using.
+            self.hand_over(TweetRequest::Stop, PendingCommand::Stop, cx)?;
+            cx.request_frame()?;
+            return Ok(());
+        };
+        self.ready = false;
+        // Every stream numbers its own updates from the beginning, so what this pane last
+        // applied belongs to the stream being replaced rather than to the one starting
+        // here.
+        self.revision = 0;
+        if !retry {
+            self.clear(cx)?;
         }
-        self.account_id = account;
-        self.start(false, cx);
+        // Starting a stream replaces whatever the binding was awaiting, so a change that
+        // was in flight is dropped rather than remembered.
+        self.selection_pending = None;
+        self.status.report(cx.app_mut(), WidgetState::Connecting);
+        let request = if retry {
+            TweetRequest::Retry(scope)
+        } else {
+            TweetRequest::Load(scope)
+        };
+        let Some(binding) = self.binding.as_mut() else {
+            self.fail(TweetStreamError::Service(KytrixServiceError::Closed), cx);
+            return Ok(());
+        };
+        let request_id = binding.call(cx, request);
+        self.pending.track(request_id, PendingCommand::Start);
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
+    /// Drops what a pane is leaving behind.
+    fn clear(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        self.feed = None;
+        self.media = Arc::new(HashMap::new());
+        *self.media_mirror.borrow_mut() = Arc::clone(&self.media);
+        self.built_media = None;
+        let _ = cx.write(&self.media_retry, None);
+        self.revision = 0;
+        self.ready = false;
+        self.replace_plans(Arc::from([]), cx);
+        self.hits.clear();
+        if let Some(list) = &self.list {
+            list.set_items(cx.app_mut(), 0)?;
+        }
+        self.selections = None;
+        self.searching = None;
+        self.selection_pending = None;
+        self.notice = None;
+        self.hints = Arc::new(HashMap::new());
+        self.sync_empty_state(cx)?;
+        cx.request_frame()?;
+
+        Ok(())
     }
 
     /// Reports the notice that stands in while the pane has nothing to show.
     ///
-    /// Nobody signed in and a live stream whose accounts have not posted are the two states
-    /// this pane waits in, and each is a reference into the catalogue rather than a sentence:
-    /// the timeline, the accounts and the dialog belong to `start` and `report_ready`, and
-    /// saying the same reference again is not a change and schedules no frame.
-    fn report_no_content_notice(&self, cx: &mut Context<Self>) {
-        let notice = if self.current_scope().is_none() {
-            // Nobody is signed in: what stands in is the sentence that sends the reader to
-            // the account settings, which is the one `start` reports for the same state.
-            Notice::message("widget.x.logged_out")
-        } else {
-            Notice::message("widget.x.waiting")
-        };
-        self.status.report(WidgetState::waiting(notice), cx);
-    }
-
-    /// Starts reading, or restarts for a pane the user is recovering.
-    ///
-    /// A recovery keeps the timeline the user is still reading — blanking a feed to reconnect
-    /// would flash it away, and the accounts are read again once the stream this pane is
-    /// recovering is live — while an account change starts over, because the pane cannot
-    /// vouch for what it was showing.
-    fn start(&mut self, retry: bool, cx: &mut Context<Self>) {
-        let Some(scope) = self.current_scope() else {
-            self.clear(cx);
-            self.report_no_content_notice(cx);
-            // Nothing is followed, so nothing should stay subscribed on this pane's behalf: an
-            // account that signed out must not keep a seat it is not using.
-            self.hand_over(TweetRequest::Stop, cx, |_, _, _| {});
-            cx.notify();
-            return;
-        };
-        self.ready = false;
-        // Every stream numbers its own updates from the beginning, so what this pane last
-        // applied belongs to the stream being replaced rather than to the one starting here.
-        // A stale update cannot arrive by hand either: the framework retires the generation a
-        // replaced stream published under.
-        self.revision = 0;
-        if !retry {
-            self.clear(cx);
-        }
-        // Starting a stream replaces whatever the binding was awaiting, so a change that was in
-        // flight is dropped rather than remembered: whether it was made is not something this
-        // pane knows, and what settles it is the read that follows the stream coming back.
-        self.pending = None;
-        self.status.report(WidgetState::Connecting, cx);
-        self.hand_over(
-            if retry {
-                TweetRequest::Retry(scope)
-            } else {
-                TweetRequest::Load(scope)
-            },
-            cx,
-            Self::apply_load_result,
+    /// A pane with no body has no account, and no account is the only neutral notice this
+    /// pane has: a live stream with nothing in it is an empty timeline, which is content
+    /// (`common.no_data`), not a waiting state (AGENTS §6).
+    fn report_no_content_notice(&self, cx: &mut WidgetCx<'_>) {
+        self.status.report(
+            cx.app_mut(),
+            WidgetState::waiting(Notice::message("widget.x.logged_out")),
         );
-        cx.notify();
     }
 
-    /// Drops what a pane is leaving behind.
-    ///
-    /// A list holds the tweets it was given and can only take more of them, so the timeline it
-    /// held is left behind by building the list again rather than by telling it about a feed it
-    /// no longer has. What is remembered about the accounts goes with them: this is a pane
-    /// starting over on another account or on no account at all, and a name remembered for one
-    /// account's row is not a name for another account's.
-    fn clear(&mut self, cx: &mut Context<Self>) {
-        self.feed = None;
-        self.media = Arc::new(HashMap::new());
-        self.revision = 0;
-        self.ready = false;
-        let widget = cx.weak_entity();
-        self.list = cx.new(|_| feed_list(widget));
-        self.selections = None;
-        self.searching = None;
-        self.pending = None;
-        self.notice = None;
-        self.hints = Arc::new(HashMap::new());
-        self.notify_dialog(cx);
+    /// Reports the state of a pane whose stream is live.
+    fn report_ready(&self, cx: &mut WidgetCx<'_>) {
+        if self.feed.is_some() {
+            self.status.report(cx.app_mut(), WidgetState::Ready);
+        } else if self.current_scope().is_some() {
+            self.status.report(cx.app_mut(), WidgetState::Loading);
+        } else {
+            self.report_no_content_notice(cx);
+        }
+    }
+
+    /// Reports why a subscription stopped.
+    fn fail(&self, error: TweetStreamError, cx: &mut WidgetCx<'_>) {
+        let failure = Arc::new(XFailure::Stream(error));
+        self.status.report(
+            cx.app_mut(),
+            WidgetState::failed(failure, self.recovery.clone()),
+        );
+    }
+
+    /// Applies one RPC reply, once its identity says it answers the command in flight.
+    fn apply_rpc(
+        &mut self,
+        request_id: RequestId,
+        result: widget::binding::WidgetRpcResult<TweetProtocol>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        // A failure is terminal: only the user's recovery leaves it, and no answer that was
+        // already out can steer a pane that has given up. This is the second of the two
+        // doors every entry checks (AGENTS §4.4 / design §13.12), and it comes before the
+        // identity is attributed so a late answer is not even taken off the table.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
+        match self.pending.take(request_id) {
+            Some(PendingCommand::Start) => self.apply_load_result(result, cx),
+            Some(PendingCommand::FetchSelections) => self.apply_selections_result(result, cx),
+            Some(PendingCommand::Search) => self.apply_search_result(result, cx),
+            Some(PendingCommand::Add) => self.apply_add_result(result, cx),
+            Some(PendingCommand::Delete) => self.apply_delete_result(result, cx),
+            // The stop, the watch and a picture fetched again are calls the pane does not
+            // report on: what they answer is either nothing or drawn on the stream.
+            Some(
+                PendingCommand::Stop | PendingCommand::WatchSelections | PendingCommand::RetryMedia,
+            ) => {}
+            None => {
+                log::debug!("the x pane ignored reply {request_id}: no command is waiting for it")
+            }
+        }
     }
 
     fn apply_load_result(
         &mut self,
-        result: WidgetRpcResult<TweetProtocol>,
-        cx: &mut Context<Self>,
+        result: widget::binding::WidgetRpcResult<TweetProtocol>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        // The answer says the service took the account; what the subscription then reports
-        // about itself arrives on the stream, which is where a failure to subscribe is drawn
-        // from.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
         if let Err(error) = result {
             self.ready = false;
-            // A read the dialog is waiting for is answered by the account being taken, so it
-            // does not outlive the failure of the request that would have taken it.
-            self.pending = None;
-            self.notify_dialog(cx);
-            let recovery = self.recovery.clone();
+            // A read the dialog is waiting for is answered by the account being taken, so
+            // it does not outlive the failure of the request that would have taken it.
+            self.selection_pending = None;
+            let failure = Arc::new(XFailure::Rpc(error));
             self.status.report(
-                WidgetState::failed(Arc::new(XFailure::Rpc(error)), recovery),
-                cx,
+                cx.app_mut(),
+                WidgetState::failed(failure, self.recovery.clone()),
             );
+            let _ = cx.request_frame();
         }
     }
 
     /// Applies the timeline a subscription published.
-    ///
-    /// Returns whether what a frame draws changed, which for a feed is always: the service
-    /// publishes it when a tweet or a picture moved it.
     fn apply_latest(
         &mut self,
         key: TweetScope,
         message: Arc<TweetStreamMessage>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) -> bool {
-        if self.current_scope().as_ref() != Some(&key) || self.status.is_failed(cx) {
+        if self.current_scope().as_ref() != Some(&key) || self.status.is_failed(cx.app()) {
             return false;
         }
         let TweetStreamMessage::Update(update) = message.as_ref() else {
             return false;
         };
-        // The latest channel coalesces, so an update can arrive after a newer one already has:
-        // what a stream published before the last thing this pane applied is not a timeline
-        // any more.
+        // The latest channel coalesces, so an update can arrive after a newer one already
+        // has: what a stream published before the last thing this pane applied is not a
+        // timeline any more.
         if update.revision() <= self.revision {
             return false;
         }
-
-        self.accept(update, cx);
+        if let Err(error) = self.accept(update, cx) {
+            log::error!("the x pane could not take the timeline it was published: {error}");
+            return false;
+        }
         if self.ready {
             self.report_ready(cx);
         }
@@ -565,17 +1047,13 @@ impl XWidget {
     }
 
     /// Applies a status the stream reported.
-    ///
-    /// Returns whether what a frame draws changed, which a status never does on its own: the
-    /// framework draws the state around the body, and a row of tweets says nothing about the
-    /// subscription it arrived on.
     fn apply_reliable(
         &mut self,
         key: TweetScope,
         message: Arc<TweetStreamMessage>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) -> bool {
-        if self.current_scope().as_ref() != Some(&key) || self.status.is_failed(cx) {
+        if self.current_scope().as_ref() != Some(&key) || self.status.is_failed(cx.app()) {
             return false;
         }
         let TweetStreamMessage::Status(status) = message.as_ref() else {
@@ -585,305 +1063,434 @@ impl XWidget {
         match status {
             TweetStatus::Connecting => {
                 self.ready = false;
-                // The timeline already read stays: a reconnecting feed is not a reason to blank
-                // what a reader was looking at.
-                self.status.report(WidgetState::Connecting, cx);
-                self.notify_dialog(cx);
+                // The timeline already read stays: a reconnecting feed is not a reason to
+                // blank what a reader was looking at.
+                self.status.report(cx.app_mut(), WidgetState::Connecting);
             }
             TweetStatus::Ready => {
                 self.ready = true;
                 self.report_ready(cx);
-                // What a pane shows is only as true as the read it came from, and a change the
-                // pane stopped waiting for was never read back. The stream coming up is what
-                // makes reading the accounts possible again, so it is what reads them.
-                if self.pending.is_some() {
-                    self.send_pending_selections(cx);
+                // What a pane shows is only as true as the read it came from, and a change
+                // the pane stopped waiting for was never read back. The stream coming up
+                // is what makes reading the accounts possible again.
+                if self.selection_pending.is_some() {
+                    let _ = self.send_pending_selections(cx);
                 }
-                if self.dialog_open() {
-                    // A search the dialog had out is displaced by the read this asks for: the
-                    // stream coming back settles what the accounts are, and a page waiting for
-                    // an answer that the read took the place of would wait forever.
-                    self.watch_selections(true, cx);
-                    if self.pending.is_none() {
+                if self.dialog.is_some() {
+                    // A search the dialog had out is displaced by the read this asks for:
+                    // a page waiting for an answer the read took the place of would wait
+                    // forever.
+                    if let Err(error) = self.watch_selections(true, cx) {
+                        log::error!("the x pane could not watch the accounts: {error}");
+                    }
+                    if self.selection_pending.is_none() {
                         self.load_selections(cx);
                     }
                 }
             }
             TweetStatus::Failed(error) => {
                 self.ready = false;
-                // A read that never went out has nothing left to wait for: the stream it was
-                // waiting for failed, and the dialog says so rather than spinning.
-                if self.pending.as_ref().is_some_and(|pending| !pending.sent) {
-                    self.pending = None;
+                // A read that never went out has nothing left to wait for: the stream it
+                // was waiting for failed, and the dialog says so rather than spinning.
+                if self
+                    .selection_pending
+                    .as_ref()
+                    .is_some_and(|pending| !pending.sent)
+                {
+                    self.selection_pending = None;
                 }
-                self.notify_dialog(cx);
-                self.fail(error, cx);
+                self.fail(error.clone(), cx);
             }
         }
+        let _ = cx.request_frame();
 
         false
     }
 
-    /// Reports the state of a pane whose stream is live.
-    ///
-    /// A live stream with nothing to show is not a failure and not a load: it is a pane
-    /// waiting for the accounts it monitors to post, which is a sentence the framework's
-    /// placeholder draws.
-    fn report_ready(&mut self, cx: &mut Context<Self>) {
-        if self.has_content() {
-            self.status.report(WidgetState::Ready, cx);
-        } else {
-            self.report_no_content_notice(cx);
-        }
-    }
-
-    /// Reports why a subscription stopped.
-    fn fail(&mut self, error: &TweetStreamError, cx: &mut Context<Self>) {
-        let failure = XFailure::Stream(error.clone());
-        let recovery = self.recovery.clone();
-        self.status
-            .report(WidgetState::failed(Arc::new(failure), recovery), cx);
-    }
-
     /// Tells the list about the tweets this feed added.
-    ///
-    /// The list holds the newest tweets and remembers the one a reader is looking at, so it is
-    /// told the tweets it has not been shown rather than the feed itself: a list that keeps the
-    /// tweets it holds where they are is what keeps a reader on the tweet they are reading. The
-    /// one tweet that does move them is one that arrives while the newest tweet is the one they
-    /// are reading, which is where the newest tweet belongs — and a feed the list cannot be
-    /// extended into is one it holds no tweet of, which is built for instead.
-    fn accept(&mut self, update: &TweetUpdate, cx: &mut Context<Self>) {
+    fn accept(&mut self, update: &TweetUpdate, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let unshown = unshown(
             self.feed.as_ref().map_or(&[], TweetSnapshot::items),
             update.feed().items(),
         );
+        // The service publishes a fresh map with every event, so the question is whether
+        // the picture states changed, not whether this event's map is another allocation:
+        // a pointer comparison would rebuild the window on every update (media or not).
+        let media_changed = self
+            .built_media
+            .as_ref()
+            .is_none_or(|built| built != update.media());
         self.feed = Some(update.feed().clone());
         self.media = update.media().clone();
+        *self.media_mirror.borrow_mut() = Arc::clone(&self.media);
         self.revision = update.revision();
+        let plans = build_plans(update.feed());
+        self.replace_plans(plans, cx);
+        self.register_media(cx);
 
+        let Some(list) = self.list.as_ref() else {
+            // The body is built from `has_content`, which the framework asks before this
+            // hook: the frame that builds it reads the count from the list it creates.
+            cx.request_frame()?;
+            return Ok(());
+        };
+        let count = update.feed().items().len();
         match unshown {
-            // The oldest of the tweets it has not been shown goes in first, so the newest of
-            // them ends up where a list that draws its newest tweet first draws it.
-            Some(count) => {
-                self.list.update(cx, |list, cx| {
-                    for tweet in update.feed().items()[..count].iter().rev() {
-                        list.push(tweet.clone());
-                    }
-                    // What a row draws is not only the tweet it holds: a picture can be fetched,
-                    // or fail, while the timeline does not move at all.
-                    cx.notify();
-                });
+            // The oldest of the tweets it has not been shown goes in first, so the newest
+            // of them ends up where a list that draws its newest tweet first draws it.
+            Some(pushed) => {
+                for _ in 0..pushed {
+                    list.push(cx.app_mut())?;
+                }
             }
-            // Nothing the list holds survives, so there is no edit it can be told: every tweet
-            // on screen is one the feed no longer has. A list holds the tweets it was given and
-            // can only take more of them, so the one this pane draws is built again for the feed
-            // it has now, and the reader starts over on the tweet that feed draws first.
-            None => {
-                let widget = cx.weak_entity();
-                let tweets: Vec<Arc<TweetItem>> = update.feed().items().to_vec();
-                self.list = cx.new(move |_| {
-                    let mut list = feed_list(widget);
-                    for tweet in tweets.iter().rev() {
-                        list.push(tweet.clone());
-                    }
-                    list
-                });
-                // The rows are drawn by the list built here rather than the one it replaced, so
-                // the pane is what is told about it.
-                cx.notify();
+            // Nothing the list holds survives, so there is no edit it can be told: the
+            // list is rebuilt for the feed it has now, and the reader starts over on the
+            // tweet that feed draws first.
+            None => list.set_items(cx.app_mut(), count)?,
+        }
+        if media_changed {
+            list.set_count(cx.app_mut(), count)?;
+            self.built_media = Some(Arc::clone(update.media()));
+        }
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
+    /// Replaces the plans the rows are built from, and the signal their text follows.
+    fn replace_plans(&mut self, plans: Arc<[RowPlan]>, cx: &mut WidgetCx<'_>) {
+        *self.plans.borrow_mut() = Arc::clone(&plans);
+        cx.write(&self.plan_signal, plans);
+    }
+
+    /// Registers every picture the stream says is on disk, once.
+    fn register_media(&mut self, cx: &mut WidgetCx<'_>) {
+        let mut registered = false;
+        for (url, state) in self.media.iter() {
+            if !matches!(state, MediaState::Ready(_)) {
+                continue;
+            }
+            if self.images.borrow().contains_key(url) {
+                continue;
+            }
+            let MediaState::Ready(path) = state else {
+                continue;
+            };
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log::warn!("the x pane could not read a cached picture: {error}");
+                    continue;
+                }
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            let pending = cx
+                .app_mut()
+                .resources_mut()
+                .insert_async(Bytes::from(bytes));
+            self.images
+                .borrow_mut()
+                .insert(url.clone(), ImageSource::Pending(pending));
+            registered = true;
+        }
+        if registered && let Some(list) = &self.list {
+            let count = list.count(cx.app());
+            if count > 0 {
+                let _ = list.set_count(cx.app_mut(), count);
             }
         }
     }
 
-    /// The list, which draws the tweets the pane holds.
-    fn list_body(&self, cx: &Context<Self>) -> AnyElement {
-        div()
-            .id(ElementId::Name(SharedString::new_static("XFrame")))
-            .debug_selector(|| "TEST_TWEET_LIST".into())
-            .aria_label(t!(cx, "widget.x.scroll_tweets"))
-            .relative()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .child(self.list.clone())
-            .into_any_element()
+    /// Takes the request a failed picture's tile made, and asks the service for that
+    /// picture again.
+    ///
+    /// The tile's own action writes the same signal a pointer landing on it does, so the
+    /// keyboard path, an assistive technology and a click are one request.
+    fn sync_media_retry(&mut self, cx: &mut WidgetCx<'_>) {
+        let request = cx.read(&self.media_retry).clone();
+        let Some(url) = request else {
+            return;
+        };
+        cx.write(&self.media_retry, None);
+        self.retry_media(url, cx);
     }
 
-    /// The control that opens the monitored-accounts dialog.
+    /// Rebuilds the visible window when the appearance moved.
     ///
-    /// It is disabled without an account: the accounts belong to one, so a reader the service
-    /// does not know has nothing to manage — and a live control that can only fail reads as if
-    /// the pane were broken.
-    fn manage_button(&self, cx: &Context<Self>) -> AnyElement {
-        let widget = cx.entity().downgrade();
+    /// A link's colour is a static run colour (`TextContent::runs`), which the engine does
+    /// not re-read on a theme change: the rows are built for the appearance showing when
+    /// they are built, so a moved appearance is another window of rows (AGENTS §7 does not
+    /// allow a colour baked at mount time to outlive the appearance it was read from).
+    fn sync_appearance(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let appearance = cx.theme().current(cx.app());
+        if appearance == self.appearance.get() {
+            return Ok(());
+        }
+        self.appearance.set(appearance);
+        if let Some(list) = &self.list {
+            let count = list.count(cx.app());
+            if count > 0 {
+                list.set_count(cx.app_mut(), count)?;
+            }
+        }
+        cx.request_frame()?;
 
-        div()
-            .debug_selector(|| "TEST_TWEET_MONITOR_MANAGE".into())
-            .flex_none()
-            // A control in the header row has to take its own clicks: the row is the pane's
-            // drag area as well.
-            .occlude()
-            .child(
-                Button::new(ElementId::Name(SharedString::new_static("XManage")))
-                    .filled()
-                    .small()
-                    .disabled(self.account_id.is_none())
-                    .aria_label(t!(cx, "widget.x.manage"))
-                    .with_tooltip(t!(cx, "widget.x.manage"))
-                    .on_click(move |_, window, cx| {
-                        TweetDialog::show(widget.clone(), window, cx);
-                    })
-                    .child(Icon::new(IconKind::Faders).size_3()),
+        Ok(())
+    }
+
+    /// Builds the list the body draws its feed with.
+    fn make_list(&mut self, cx: &mut WidgetCx<'_>, parent: NodeId) -> Result<List, EngineError> {
+        let context = RowContext {
+            plans: Rc::clone(&self.plans),
+            plan_signal: self.plan_signal,
+            language: cx.language(),
+            config: cx.services().config,
+            theme: cx.theme().clone(),
+            appearance: Rc::clone(&self.appearance),
+            translate: cx.translate().clone(),
+            images: Rc::clone(&self.images),
+            media: Rc::clone(&self.media_mirror),
+            icons: self
+                .icons
+                .clone()
+                .expect("the row icons are registered before the list is built"),
+            hits: self.hits.clone(),
+            retry: self
+                .media_retry_action
+                .clone()
+                .expect("the retry action is registered before the list is built"),
+        };
+        let count = self.feed.as_ref().map_or(0, |feed| feed.items().len());
+        let key = cx.unique_key("x.feed.list");
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let list = List::new(
+            cx.app_mut(),
+            theme,
+            key,
+            ListOptions::variable(ROW_ESTIMATE)
+                .deque(FEED_CAPACITY)
+                .reverse()
+                .keep_on_newest()
+                .separator()
+                .selection(SelectionMode::None)
+                .padding(0.0, 0.0),
+            move |tree, row_parent, index| build_row(tree, row_parent, index, &context),
+        );
+        list.set_initial_count(cx.app_mut(), count);
+        self.built_media = Some(Arc::clone(&self.media));
+        list.mount(cx.app_mut(), window, parent)?;
+
+        Ok(list)
+    }
+
+    /// Shows `common.no_data` over a feed that holds nothing.
+    ///
+    /// The stand-in is the widget's, not the framework's: an empty timeline is content,
+    /// so this is the body saying there is nothing in it rather than a placeholder
+    /// saying there is no body. Its copy is static, so it is built for the language
+    /// showing now and rebuilt when that moves.
+    fn sync_empty_state(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let empty = self.feed.as_ref().is_some_and(TweetSnapshot::is_empty);
+        if !empty {
+            if let Some(node) = self.empty.take() {
+                remove_own_node(cx, node)?;
+                self.empty_language = None;
+            }
+            return Ok(());
+        }
+
+        let language = *cx.read(&cx.language());
+        let stale = self
+            .empty
+            .is_none_or(|_| self.empty_language != Some(language));
+        if !stale {
+            return Ok(());
+        }
+        if let Some(node) = self.empty.take() {
+            remove_own_node(cx, node)?;
+        }
+        let Some(root) = self.body_root else {
+            return Ok(());
+        };
+        let overlay = NodeBuilder::boxed()
+            .id("TEST_TWEET_EMPTY")
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .left(0.0)
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .build(),
             )
-            .into_any_element()
+            .build(cx.tree_mut(), root)?;
+        let text = t_smol!(cx.translate(), "common.no_data");
+        let key = cx.unique_key("x.empty");
+        EmptyState::new(cx.theme().clone(), key)
+            .text(text)
+            .build(cx.tree_mut(), overlay)?;
+        self.empty = Some(overlay);
+        self.empty_language = Some(language);
+
+        Ok(())
     }
 
-    /// Whether the monitored-accounts dialog is open.
-    pub(super) fn dialog_open(&self) -> bool {
-        self.dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.upgrade().is_some())
-    }
-
-    /// The pane's own state, read for the frame the dialog draws it in.
-    ///
-    /// The dialog's list reads it again for each row it draws, so everything in it is shared
-    /// rather than copied: a row is drawn on every frame of the dialog, and rebuilding what it
-    /// reads would be work per row rather than per frame.
-    pub(super) fn dialog_state(&self) -> DialogState {
-        DialogState::new(
-            self.account_id.is_some(),
-            self.ready,
-            self.selections.clone(),
-            self.searching.clone(),
-            self.pending.as_ref().map(|pending| pending.operation),
-            self.notice.clone(),
-            self.hints.clone(),
-            self.media.clone(),
-            self.recovery.clone(),
-        )
-    }
-
-    /// Takes over the dialog that was just opened over this pane.
-    ///
-    /// A dialog is showing the accounts, so opening one is what makes their faces worth
-    /// fetching, and it is what asks for them: the service answers once the stream carrying
-    /// the account is live, which is where a read waits.
-    pub(super) fn attach_dialog(
+    /// Builds the pane's manage control into `parent`.
+    fn build_manage_button(
         &mut self,
-        dialog: WeakEntity<TweetDialog>,
-        cx: &mut Context<Self>,
-    ) {
-        self.dialog = Some(dialog);
-        self.watch_selections(true, cx);
-        self.load_selections(cx);
-    }
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        let language = *cx.read(&cx.language());
+        let enabled = self.account_id.is_some();
+        let label = t_smol!(cx.translate(), "widget.x.manage");
+        let key = cx.unique_key("x.header.manage");
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let requests = self.open_dialog_requests;
 
-    /// Stops asking for the avatars a dialog was showing.
-    ///
-    /// A dismissed dialog is a pane with no row that draws a face, so what it was fetching is
-    /// no longer worth a request. A search of X it had out is that dialog's too, and what it
-    /// would have answered has nowhere left to be drawn: the pane stops waiting for it rather
-    /// than carrying a search whose answer is nobody's.
-    ///
-    /// The search is taken here rather than left to the call that stops the watch, which closes
-    /// out what it displaces: that call is only made for a pane following an account on a live
-    /// stream, while a search that is out is a search the stream can go down under — nothing
-    /// displaces it there, nothing would take it away, and a pane waiting for an answer it will
-    /// not be given is a pane that refuses every change.
-    pub(super) fn on_dialog_closed(&mut self, cx: &mut Context<Self>) {
-        self.dialog = None;
-        self.searching = None;
-        self.watch_selections(false, cx);
-    }
-
-    /// Repaints the dialog, which draws the state this pane holds.
-    ///
-    /// The dialog is told that it changed rather than asked to change: a pane is what answers
-    /// the dialog's own requests, so this runs inside a frame that dialog is already being
-    /// updated for — and an entity cannot be updated while it is being updated. Notifying it
-    /// by id is what says the same thing without taking it.
-    fn notify_dialog(&self, cx: &mut Context<Self>) {
-        if let Some(dialog) = self.dialog.as_ref().and_then(WeakEntity::upgrade) {
-            App::notify(cx, dialog.entity_id());
+        let mut button = Button::new(cx.app_mut(), theme, key)
+            .ghost()
+            .small()
+            .icon(IconKind::Faders)
+            .a11y_label(label.clone())
+            .tooltip_text(label);
+        if enabled {
+            button = button.on_click(move |ctx| {
+                // A button handler owns no widget; it asks the next sync for the open.
+                ctx.update(&requests, |requests| *requests += 1);
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        } else {
+            button = button.disabled(true);
         }
+        button.build(cx.app_mut(), window, parent)?;
+
+        self.manage_button = Some(button);
+        self.manage_parent = Some(parent);
+        self.manage_built = Some((language, enabled));
+
+        Ok(())
+    }
+
+    /// Rebuilds the manage control when the language or the account moved.
+    fn sync_manage_button(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(button) = self.manage_button.as_ref() else {
+            return Ok(());
+        };
+        button.sync(cx.app_mut())?;
+        let state = (*cx.read(&cx.language()), self.account_id.is_some());
+        if self.manage_built == Some(state) {
+            return Ok(());
+        }
+        let Some(parent) = self.manage_parent else {
+            return Ok(());
+        };
+        // The pane may have rebuilt the header row since: its group is not this widget's
+        // node, so a stale parent means the control already went with it.
+        if cx.tree().get(parent).is_err() {
+            return Ok(());
+        }
+        self.release_manage_button(cx, true)?;
+        self.build_manage_button(parent, cx)
+    }
+
+    /// Removes the control's node (when the widget owns the teardown) and releases the
+    /// component's scope and action handler.
+    fn release_manage_button(
+        &mut self,
+        cx: &mut WidgetCx<'_>,
+        remove_node: bool,
+    ) -> Result<(), EngineError> {
+        let Some(button) = self.manage_button.take() else {
+            return Ok(());
+        };
+        if remove_node && let Some(node) = button.node() {
+            remove_own_node(cx, node)?;
+        }
+        let _ = button.release(cx.app_mut());
+        self.manage_parent = None;
+        self.manage_built = None;
+
+        Ok(())
     }
 
     /// Hands one request to the service, of which the binding carries one at a time.
     ///
-    /// The requests that come here are the ones the pane is not waiting for an answer to — a
-    /// stream watched for a dialog that opened, a picture fetched again, a stream started or
-    /// stopped — so what the binding was carrying is what this takes the place of, and it is
-    /// closed out first: see [`Self::drop_displaced`]. The requests the pane *does* wait on go
-    /// to the binding directly, because each of them is the call the pane's guards keep the
-    /// others out of the way of.
+    /// The requests that come here are the ones the pane is not waiting for an answer to
+    /// — a stream watched for a dialog that opened, a picture fetched again, a stream
+    /// stopped — so what the binding was carrying is taken over, and the dialog's waiter
+    /// for it is closed out first.
     fn hand_over(
         &mut self,
         request: TweetRequest,
-        cx: &mut Context<Self>,
-        on_result: fn(&mut Self, WidgetRpcResult<TweetProtocol>, &mut Context<Self>),
-    ) {
+        command: PendingCommand,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
         self.drop_displaced(cx);
-        self.binding.call(request, cx, on_result);
+        let Some(binding) = self.binding.as_mut() else {
+            return Ok(());
+        };
+        let request_id = binding.call(cx, request);
+        self.pending.track(request_id, command);
+        Ok(())
     }
 
     /// Closes out what a call the pane is not waiting on takes the place of.
-    ///
-    /// The binding carries one call at a time and replaces it with the next, so a call that was
-    /// already out is one whose answer can no longer arrive. Waiting for it anyway is what
-    /// leaves a dialog spinning and its controls disabled forever, so what is left behind is
-    /// dropped here rather than guessed at: a search dies with the page that asked for it, and a
-    /// change is dropped rather than decided — whether it was made is not something this pane
-    /// knows, and the read that follows the call which displaced it is what settles the list.
-    ///
-    /// A read that has not gone out yet is left alone: it is not a call the binding is carrying,
-    /// so a call that takes the place of nothing leaves it waiting for the stream that will send
-    /// it.
-    fn drop_displaced(&mut self, cx: &mut Context<Self>) {
+    fn drop_displaced(&mut self, cx: &mut WidgetCx<'_>) {
         let search = self.searching.take().is_some();
-        let sent = self.pending.as_ref().is_some_and(|pending| pending.sent);
+        let sent = self
+            .selection_pending
+            .as_ref()
+            .is_some_and(|pending| pending.sent);
         if sent {
-            self.pending = None;
+            self.selection_pending = None;
         }
         if search || sent {
-            self.notify_dialog(cx);
+            let _ = cx.request_frame();
         }
     }
 
     /// Says whether a dialog is showing the monitored accounts.
-    ///
-    /// Their avatars are only fetched while one is: a pane whose dialog is closed has no row
-    /// that draws them, and fetching thousands of faces nobody is looking at is not what a
-    /// timeline should spend its requests on.
-    pub(super) fn watch_selections(&mut self, watched: bool, cx: &mut Context<Self>) {
+    fn watch_selections(
+        &mut self,
+        watched: bool,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
         let Some(scope) = self.current_scope() else {
-            return;
+            return Ok(());
         };
         if !self.ready {
-            return;
+            return Ok(());
         }
         self.hand_over(
             TweetRequest::WatchSelections { scope, watched },
+            PendingCommand::WatchSelections,
             cx,
-            |_, _, _| {},
-        );
+        )
     }
 
     /// Reads the accounts the account monitors.
     ///
     /// A read goes over a live stream, because a live stream is what says the service is
-    /// holding the account: before it there is no session to answer one. A read asked for too
-    /// early waits here instead, and the readiness that arrives later is what sends it.
-    pub(super) fn load_selections(&mut self, cx: &mut Context<Self>) -> bool {
+    /// holding the account: before it there is no session to answer one. A read asked
+    /// for too early waits here instead, and the readiness that arrives later is what
+    /// sends it.
+    pub(super) fn load_selections(&mut self, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
         };
-        if self.pending.is_some() {
+        if self.selection_pending.is_some() {
             return false;
         }
-        self.pending = Some(SelectionPending {
+        self.selection_pending = Some(SelectionPending {
             operation: if self.selections.is_some() {
                 SelectionOperation::Refreshing
             } else {
@@ -894,74 +1501,66 @@ impl XWidget {
         });
         self.notice = None;
         if self.ready {
-            self.send_selections(scope, cx);
+            let _ = self.send_selections(scope, cx);
         }
-        self.notify_dialog(cx);
+        let _ = cx.request_frame();
         true
     }
 
     /// Sends the read a dialog is waiting for.
-    fn send_pending_selections(&mut self, cx: &mut Context<Self>) {
+    fn send_pending_selections(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
         let Some(scope) = self.current_scope() else {
-            return;
+            return Ok(());
         };
         if self
-            .pending
+            .selection_pending
             .as_ref()
             .is_some_and(|pending| !pending.sent && pending.operation.is_read())
         {
-            self.send_selections(scope, cx);
-            self.notify_dialog(cx);
+            self.send_selections(scope, cx)?;
+            cx.request_frame()?;
         }
+        Ok(())
     }
 
-    fn send_selections(&mut self, scope: TweetScope, cx: &mut Context<Self>) {
-        if let Some(pending) = self.pending.as_mut() {
+    fn send_selections(
+        &mut self,
+        scope: TweetScope,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        if let Some(pending) = self.selection_pending.as_mut() {
             pending.sent = true;
         }
-        // A read is a call the pane waits on, so it goes to the binding rather than through the
-        // hand-over that closes out what a call displaces: what it displaces is a watch or a
-        // picture fetched again, neither of which the pane is waiting for.
-        self.binding.call(
-            TweetRequest::FetchSelections(scope),
-            cx,
-            Self::apply_selections_result,
-        );
+        let Some(binding) = self.binding.as_mut() else {
+            return Ok(());
+        };
+        let request_id = binding.call(cx, TweetRequest::FetchSelections(scope));
+        self.pending
+            .track(request_id, PendingCommand::FetchSelections);
+        Ok(())
     }
 
     /// Searches X for an account to monitor.
-    ///
-    /// The request is the pane's to send — the binding is the pane's, and it carries one call at
-    /// a time — while what the search is *for* is the dialog's page: the query is typed there
-    /// and what comes back is handed to it. So the pane waits on nothing here beyond the call
-    /// itself: a search is not an operation the accounts are waiting for, and the dialog that
-    /// asked for it is what draws one being out.
-    pub(super) fn search_users(&mut self, query: SmolStr, cx: &mut Context<Self>) -> bool {
+    pub(super) fn search_users(&mut self, query: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
         };
-        // The control that sends a search is disabled for one that could not be answered, but
-        // the field also answers Enter, which reaches here without a control to have been
-        // disabled: what a change and a read are waiting for is refused the same way here.
+        let query = SmolStr::new(query.trim());
         if !self.may_change(cx) || !valid_search_query(&query) {
             return false;
         }
+        let Some(binding) = self.binding.as_mut() else {
+            return false;
+        };
         self.searching = Some(query.clone());
-        // What a search being out looks like is drawn by the page that asked for it, and it is
-        // read from here: a search that goes out without telling the dialog leaves that page
-        // showing the answer before it — or nothing at all — while the pane turns the next one
-        // away, with nothing on screen to say why.
-        self.notify_dialog(cx);
-        self.binding.call(
-            TweetRequest::SearchUsers { scope, query },
-            cx,
-            Self::apply_search_result,
-        );
+        let _ = cx.request_frame();
+        let request_id = binding.call(cx, TweetRequest::SearchUsers { scope, query });
+        self.pending.track(request_id, PendingCommand::Search);
         true
     }
 
     /// Monitors one more account.
-    pub(super) fn add_selection(&mut self, username: SmolStr, cx: &mut Context<Self>) -> bool {
+    pub(super) fn add_selection(&mut self, username: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
         };
@@ -974,161 +1573,147 @@ impl XWidget {
         if data.quota_full() || data.contains_username(&username, &self.hints) {
             return false;
         }
+        if self.binding.is_none() {
+            return false;
+        }
         self.begin_change(SelectionOperation::Adding, Some(username.clone()), cx);
-        // A change is a call the pane waits on, and one the guards keep from being asked for
-        // while a read or a search is out: it goes to the binding directly.
-        self.binding.call(
-            TweetRequest::AddSelection { scope, username },
-            cx,
-            Self::apply_add_result,
-        );
+        let binding = self
+            .binding
+            .as_mut()
+            .expect("the binding was checked before the change began");
+        let request_id = binding.call(cx, TweetRequest::AddSelection { scope, username });
+        self.pending.track(request_id, PendingCommand::Add);
         true
     }
 
     /// Stops monitoring one account.
-    pub(super) fn delete_selection(&mut self, x_user_id: SmolStr, cx: &mut Context<Self>) -> bool {
+    pub(super) fn delete_selection(&mut self, x_user_id: SmolStr, cx: &mut WidgetCx<'_>) -> bool {
         let Some(scope) = self.current_scope() else {
             return false;
         };
         if !self.may_change(cx) {
             return false;
         }
+        if self.binding.is_none() {
+            return false;
+        }
         self.begin_change(SelectionOperation::Deleting, Some(x_user_id.clone()), cx);
-        self.binding.call(
-            TweetRequest::DeleteSelection { scope, x_user_id },
-            cx,
-            Self::apply_delete_result,
-        );
+        let binding = self
+            .binding
+            .as_mut()
+            .expect("the binding was checked before the change began");
+        let request_id = binding.call(cx, TweetRequest::DeleteSelection { scope, x_user_id });
+        self.pending.track(request_id, PendingCommand::Delete);
         true
     }
 
     /// Fetches one picture again.
-    ///
-    /// The picture is the service's to describe, so this only says which one: what comes of it
-    /// is published on the stream like every other picture state.
-    pub(super) fn retry_media(&mut self, url: SmolStr, cx: &mut Context<Self>) {
+    fn retry_media(&mut self, url: SmolStr, cx: &mut WidgetCx<'_>) {
         let Some(scope) = self.current_scope() else {
             return;
         };
-        self.hand_over(TweetRequest::RetryMedia { scope, url }, cx, |_, _, _| {});
+        if let Err(error) = self.hand_over(
+            TweetRequest::RetryMedia { scope, url },
+            PendingCommand::RetryMedia,
+            cx,
+        ) {
+            log::error!("the x pane could not ask for a picture again: {error}");
+        }
     }
 
     /// Whether the pane is in a position to ask the service about the monitored accounts.
-    ///
-    /// A change is sent over the same session the stream was opened with, so a pane whose
-    /// stream is not live has no session to change anything through. A search and a change are
-    /// carried by the binding one at a time, so neither may be asked for while the other is
-    /// out: the two would otherwise take each other's place, and whichever was displaced would
-    /// never be answered.
-    fn may_change(&self, cx: &Context<Self>) -> bool {
+    fn may_change(&self, cx: &WidgetCx<'_>) -> bool {
         self.ready
             && self.selections.is_some()
-            && self.pending.is_none()
+            && self.selection_pending.is_none()
             && self.searching.is_none()
-            && !self.status.is_failed(cx)
+            && !self.status.is_failed(cx.app())
     }
 
     fn begin_change(
         &mut self,
         operation: SelectionOperation,
         target: Option<SmolStr>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        self.pending = Some(SelectionPending {
+        self.selection_pending = Some(SelectionPending {
             operation,
             target,
             sent: true,
         });
         self.notice = None;
-        self.notify_dialog(cx);
+        let _ = cx.request_frame();
     }
 
     fn apply_selections_result(
         &mut self,
-        result: WidgetRpcResult<TweetProtocol>,
-        cx: &mut Context<Self>,
+        result: widget::binding::WidgetRpcResult<TweetProtocol>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        self.pending = None;
+        self.selection_pending = None;
         match result {
             Ok(TweetResponse::Selections(data)) => {
                 // What is remembered is kept for the rows this read still has and has no
-                // profile for, and for no others: a hint is a name for a row that is monitored
-                // and unnamed, so what the read does not hold cannot be named by it.
+                // profile for, and for no others.
                 self.hints = Arc::new(retained_hints(&self.hints, data.selections()));
                 self.selections = Some(data);
                 self.notice = None;
             }
-            // The protocol types the answer, so anything else is a service that answered the
-            // wrong question rather than a shape a reader could describe: nothing changes.
+            // The protocol types the answer, so anything else is a service that answered
+            // the wrong question rather than a shape a reader could describe.
             Ok(_) => {}
             Err(error) => {
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
             }
         }
-        self.notify_dialog(cx);
+        let _ = cx.request_frame();
     }
 
     /// Hands what a search answered to the dialog that asked for it.
-    ///
-    /// A search is the dialog's page's, so the answer is delivered there rather than kept here:
-    /// a dialog is the only thing that draws it, and an answer that outlived the dialog would be
-    /// drawn by the next one under a query it does not stand for.
-    ///
-    /// The answer is delivered in a later effect rather than in this update, because the dialog
-    /// asks for a search from inside its own update and an entity cannot be updated while it is
-    /// being updated. A dialog that is gone by then is a dialog with nowhere to draw it, and the
-    /// answer is dropped rather than cached: what a search found belongs to the query that asked
-    /// for it, and the query went with the dialog.
     fn apply_search_result(
         &mut self,
-        result: WidgetRpcResult<TweetProtocol>,
-        cx: &mut Context<Self>,
+        result: widget::binding::WidgetRpcResult<TweetProtocol>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        // An answer arrives only for the call the binding was carrying, so a search the pane is
-        // no longer waiting for — the dialog was dismissed while it was out — has none to hand
-        // over.
+        // An answer arrives only for the call the binding was carrying, so a search the
+        // pane is no longer waiting for — the dialog was dismissed while it was out — has
+        // none to hand over.
         let Some(query) = self.searching.take() else {
-            return;
-        };
-        self.notify_dialog(cx);
-        let Some(dialog) = self.dialog.clone() else {
             return;
         };
         let answer = match result {
             Ok(TweetResponse::SearchResults(profiles)) => SearchAnswer::Found(profiles),
-            // The protocol types the answer, so anything else is a service that answered the
-            // wrong question rather than one a page could draw: the search is over, and the page
-            // is left with nothing to show for it.
             Ok(_) => return,
             Err(error) => SearchAnswer::Failed(error),
         };
-        cx.defer(move |cx| {
-            // The dialog is taken where the answer is delivered rather than where it arrived: a
-            // dialog that is gone by then is one with nothing to draw the answer, and the answer
-            // is dropped rather than kept for a dialog that never asked for it.
-            let Some(dialog) = dialog.upgrade() else {
-                return;
-            };
-            dialog.update(cx, |dialog, cx| {
-                dialog.answered_search(&query, answer, cx);
-            });
-        });
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.answered_search(cx, &query, answer);
+        }
+        let _ = cx.request_frame();
     }
 
-    fn apply_add_result(&mut self, result: WidgetRpcResult<TweetProtocol>, cx: &mut Context<Self>) {
-        let requested = self.pending.take().and_then(|pending| pending.target);
+    fn apply_add_result(
+        &mut self,
+        result: widget::binding::WidgetRpcResult<TweetProtocol>,
+        cx: &mut WidgetCx<'_>,
+    ) {
+        let requested = self
+            .selection_pending
+            .take()
+            .and_then(|pending| pending.target);
         let outcome = match result {
             Ok(TweetResponse::Added(outcome)) => outcome,
             Ok(_) => return,
             Err(error) => {
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
-                self.notify_dialog(cx);
+                let _ = cx.request_frame();
                 return;
             }
         };
         self.notice = match outcome {
             // What the list becomes is the confirmation applied to it, and an account that
-            // came back without a profile is named by what was asked for rather than numbered.
+            // came back without a profile is named by what was asked for rather than
+            // numbered.
             XMutationOutcome::Confirmed(selection) => {
                 let grown = self
                     .selections
@@ -1141,7 +1726,7 @@ impl XWidget {
                             && let Some(username) = requested
                         {
                             Arc::make_mut(&mut self.hints)
-                                .insert(selection.x_user_id, SharedString::new(username.as_str()));
+                                .insert(selection.x_user_id, SmolStr::new(username.as_str()));
                         }
                         Some(SelectionNotice::Added)
                     }
@@ -1151,27 +1736,30 @@ impl XWidget {
             XMutationOutcome::Rejected(error) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Rejected(error)))
             }
-            // The change may or may not have been made, so the list the pane holds is not one
-            // it can change: it is left as it was, and the next read settles it.
+            // The change may or may not have been made, so the list the pane holds is not
+            // one it can change: it is left as it was, and the next read settles it.
             XMutationOutcome::Unknown(unknown) => {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
         };
-        self.notify_dialog(cx);
+        let _ = cx.request_frame();
     }
 
     fn apply_delete_result(
         &mut self,
-        result: WidgetRpcResult<TweetProtocol>,
-        cx: &mut Context<Self>,
+        result: widget::binding::WidgetRpcResult<TweetProtocol>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        let requested = self.pending.take().and_then(|pending| pending.target);
+        let requested = self
+            .selection_pending
+            .take()
+            .and_then(|pending| pending.target);
         let outcome = match result {
             Ok(TweetResponse::Deleted(outcome)) => outcome,
             Ok(_) => return,
             Err(error) => {
                 self.notice = Some(SelectionNotice::Problem(SelectionFailure::Rpc(error)));
-                self.notify_dialog(cx);
+                let _ = cx.request_frame();
                 return;
             }
         };
@@ -1194,61 +1782,135 @@ impl XWidget {
                 Some(SelectionNotice::Problem(SelectionFailure::Unknown(unknown)))
             }
         };
-        self.notify_dialog(cx);
+        let _ = cx.request_frame();
+    }
+
+    /// The pane's state, read for the frame the dialog draws it in.
+    fn dialog_view(&self) -> DialogView {
+        DialogView {
+            signed_in: self.account_id.is_some(),
+            ready: self.ready,
+            selections: self.selections.clone(),
+            searching: self.searching.clone(),
+            operation: self
+                .selection_pending
+                .as_ref()
+                .map(|pending| pending.operation),
+            notice: self.notice.clone(),
+            hints: Arc::clone(&self.hints),
+            media: Arc::clone(&self.media),
+            images: Rc::clone(&self.images),
+            recovery: self.recovery.clone(),
+        }
+    }
+
+    /// Opens the monitored-accounts dialog.
+    fn open_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        if self.dialog.is_some() {
+            return Ok(());
+        }
+        let dialog = match TweetDialog::show(cx) {
+            Ok(dialog) => dialog,
+            Err(error) => {
+                log::error!("the x pane could not open its account dialog: {error}");
+                return Ok(());
+            }
+        };
+        self.dialog = Some(dialog);
+        if let Err(error) = self.watch_selections(true, cx) {
+            log::error!("the x pane could not watch the accounts: {error}");
+        }
+        self.load_selections(cx);
+        cx.request_frame()?;
+
+        Ok(())
+    }
+
+    /// Syncs the open dialog: publishes this frame's state, takes the requests the user
+    /// made through it, and closes it when it finishes.
+    fn sync_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let finished = self.dialog.as_ref().is_some_and(TweetDialog::finished);
+        if finished {
+            return self.close_dialog(cx);
+        }
+        let view = self.dialog_view();
+        let requests = {
+            let Some(dialog) = self.dialog.as_mut() else {
+                return Ok(());
+            };
+            if dialog.sync(cx, &view).is_err() {
+                None
+            } else {
+                Some(dialog.take_requests(cx))
+            }
+        };
+        let Some(requests) = requests else {
+            return self.close_dialog(cx);
+        };
+        for request in requests {
+            match request {
+                DialogRequest::Reload => {
+                    self.load_selections(cx);
+                }
+                DialogRequest::Search(query) => {
+                    self.search_users(query, cx);
+                }
+                DialogRequest::Add(username) => {
+                    self.add_selection(username, cx);
+                }
+                DialogRequest::Delete(x_user_id) => {
+                    self.delete_selection(x_user_id, cx);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the dialog down after it closed itself, and stops what it was the reason
+    /// for.
+    fn close_dialog(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(mut dialog) = self.dialog.take() else {
+            return Ok(());
+        };
+        dialog.release(cx);
+        self.searching = None;
+        if let Err(error) = self.watch_selections(false, cx) {
+            log::error!("the x pane could not stop watching the accounts: {error}");
+        }
+        cx.request_frame()?;
+
+        Ok(())
     }
 }
 
-impl Render for XWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .child(self.list_body(cx))
-    }
+/// Registers the icons the rows draw, once per body.
+fn register_row_icons(cx: &mut WidgetCx<'_>) -> Result<RowIcons, EngineError> {
+    let mut register = |kind: IconKind| -> Result<ImageSource, EngineError> {
+        let image = cx
+            .app_mut()
+            .resources_mut()
+            .insert(raster(kind, RasterTier::Small48))?;
+        Ok(ImageSource::Ready(image.id))
+    };
+    Ok(RowIcons {
+        repost: register(IconKind::Repeat)?,
+        verified: register(IconKind::CheckCircle)?,
+        warning: register(IconKind::WarningCircle)?,
+        play: register(IconKind::Play)?,
+        retry: register(IconKind::ArrowsClockwise)?,
+    })
 }
 
-/// The list a pane draws its timeline with.
-///
-/// The list holds the timeline itself, so what a reader is reading is the list's to keep: it is
-/// told about the tweets a feed added rather than about the feed. What it was given is what it
-/// holds, which is why a feed that is not one the list it holds can be extended into is a list
-/// built again rather than a list told about it.
-///
-/// The row it draws is built once here while what it shows is rebuilt for every frame, which is
-/// why the pane is read inside the closure rather than captured with it.
-fn feed_list(widget: WeakEntity<XWidget>) -> DequeUnsizedList<Arc<TweetItem>> {
-    DequeUnsizedList::new(
-        ElementId::Name(SharedString::new_static("TweetList")),
-        ListAlignment::Top,
-        MAX_TWEETS,
-        px(LIST_OVERDRAW),
-        move |index, tweet: &Arc<TweetItem>, _window, cx| {
-            let Some(pane_entity) = widget.upgrade() else {
-                return div().into_any_element();
-            };
-            let pane = pane_entity.read(cx);
-            let Some(feed) = pane.feed.as_ref() else {
-                return div().into_any_element();
-            };
-            let retry = pane.current_scope().map(|_| MediaRetry {
-                widget: pane_entity.clone(),
-            });
-            tweet_row(index, tweet, feed, &pane.media, retry.as_ref(), cx)
-        },
-    )
-    .separator(|_, _| Separator::horizontal().into_any_element())
-    .render_reverse()
-    .keep_on_newest()
-    // The row after the last tweet says there are no more, so it is the list's own footer rather
-    // than part of the feed: it is never one of the tweets a push drops.
-    .footer(move |_window, cx| timeline_end(cx))
+/// Removes a node this pane built, if it is still in the tree.
+fn remove_own_node(cx: &mut WidgetCx<'_>, node: NodeId) -> Result<(), EngineError> {
+    if cx.tree().get(node).is_err() {
+        return Ok(());
+    }
+    let window = cx.window();
+    cx.app_mut().remove_node(window, node).map(|_| ())
 }
 
 /// Whether one search string is one X could be asked about.
-///
-/// The bound is the service's own, and it counts bytes: a query that is longer is one the
-/// service would refuse, so it is refused here rather than sent.
 pub(super) fn valid_search_query(query: &str) -> bool {
     let query = query.trim();
     !query.is_empty()
@@ -1256,3374 +1918,891 @@ pub(super) fn valid_search_query(query: &str) -> bool {
         && !query.chars().any(char::is_control)
 }
 
-/// The longest search string the service accepts.
-const MAX_SEARCH_QUERY_BYTES: usize = 100;
-
-/// What a row needs to fetch one of its pictures again.
-///
-/// The picture is the service's to describe, so the request only names it: which stream the
-/// picture belongs to is the pane's current scope, which is what the pane sends it with.
-struct MediaRetry {
-    widget: Entity<XWidget>,
-}
-
-/// One row of the timeline: one tweet, and everything it carries.
-fn tweet_row(
-    index: usize,
-    item: &Arc<TweetItem>,
-    feed: &TweetSnapshot,
-    media: &MediaStates,
-    retry: Option<&MediaRetry>,
-    cx: &App,
-) -> AnyElement {
-    let (tweet, reposted) = item.displayed();
-    let outer = feed.author(&item.x_user_id);
-    let author = feed.author(&tweet.x_user_id);
-    // A repost row shows the tweet that was reposted and opens *that* tweet, while the line
-    // above it names who reposted it.
-    let url = tweet_url(author.username.as_ref(), tweet.tweet_id());
-    let age = tweet.age(OffsetDateTime::now_utc(), data_time_zone(cx));
-
-    let mut row = div()
-        .id(ElementId::NamedInteger(
-            SharedString::new_static("XRow"),
-            index as u64,
-        ))
-        .debug_selector(|| "TEST_TWEET_ROW".into())
-        .role(Role::ListItem)
-        .aria_label(t!(
-            cx,
-            "widget.x.tweet",
-            author = author.username,
-            time = age_text(age, cx)
-        ))
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .px_3()
-        .py_3()
-        .cursor_pointer()
-        .on_click(move |_, _, cx| cx.open_url(&url));
-    if reposted {
-        row = row.child(repost_line(&outer, cx));
-    }
-
-    row.child(tweet_content(tweet, feed, media, reposted, retry, cx))
-        .into_any_element()
-}
-
-/// The line above a repost that says who reposted it.
-fn repost_line(author: &super::model::TweetAuthor, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    div()
-        .min_w_0()
-        .pl(px(AVATAR_SIZE + 12.0))
-        .flex()
-        .items_center()
-        .gap_1()
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.roles.fg.muted.hsla)
-        .child(
-            Icon::new(IconKind::Repeat)
-                .size_3()
-                .text_color(theme.roles.fg.muted.hsla),
-        )
-        .child(div().min_w_0().truncate().child(t!(
-            cx,
-            "widget.x.reposted",
-            name = author.display_name.clone()
-        )))
-        .into_any_element()
-}
-
-/// One tweet's own content: its face, its author, its text, its pictures and what it quotes.
-fn tweet_content(
-    tweet: &TweetItem,
-    feed: &TweetSnapshot,
-    media: &MediaStates,
-    reposted: bool,
-    retry: Option<&MediaRetry>,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let author = feed.author(&tweet.x_user_id);
-    let mut column = div().min_w_0().flex_1().flex().flex_col().gap_2();
-    column = column.child(tweet_header(tweet, &author, cx));
-    if !tweet.text.is_empty() {
-        column = column.child(
-            div()
-                .min_w_0()
-                .text_sm()
-                .whitespace_normal()
-                .debug_selector(|| "TEST_TWEET_TEXT".into())
-                .child(interactive_text(tweet, false, cx)),
-        );
-    }
-    if !tweet.media.is_empty() {
-        column = column.child(media_gallery(tweet, media, false, retry, cx));
-    }
-    if let Some(TweetReferenceItem::Quote(quoted)) = tweet.reference.as_ref() {
-        column = column.child(quote_block(quoted, feed, media, retry, cx));
-    }
-
-    let content = div()
-        .min_w_0()
-        .flex()
-        .items_start()
-        .gap_3()
-        .child(avatar(
-            author.avatar_url.as_ref(),
-            media,
-            format_id("tweet-avatar", tweet.tweet_id()),
-            None,
-            theme.roles.surface.raised.hsla,
-            theme.roles.fg.muted.hsla,
-            px(AVATAR_SIZE),
-        ))
-        .child(column);
-
-    if !reposted {
-        return content.into_any_element();
-    }
-    // A repost's inner tweet is a control of its own, so a click on it opens the tweet that was
-    // reposted rather than the repost.
-    let url = tweet_url(author.username.as_ref(), tweet.tweet_id());
-    div()
-        .id(format_id("tweet-repost", tweet.tweet_id()))
-        .w_full()
-        .min_w_0()
-        .cursor_pointer()
-        .on_click(move |_, _, cx| {
-            cx.stop_propagation();
-            cx.open_url(&url);
-        })
-        .child(content)
-        .into_any_element()
-}
-
-/// Who wrote one tweet, when, and whether X vouches for them.
-fn tweet_header(tweet: &TweetItem, author: &super::model::TweetAuthor, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let muted = theme.roles.fg.muted.hsla;
-    let age = tweet.age(OffsetDateTime::now_utc(), data_time_zone(cx));
-    let mut name_row = div()
-        .min_w_0()
-        .flex()
-        .items_center()
-        .gap_1()
-        .text_sm()
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .font_weight(FontWeight::SEMIBOLD)
-                .debug_selector(|| "TEST_TWEET_DISPLAY_NAME".into())
-                .child(author.display_name.clone()),
-        );
-    if author.verified {
-        name_row = name_row.child(
-            div()
-                .flex_none()
-                .debug_selector(|| "TEST_TWEET_VERIFIED".into())
-                .child(
-                    Icon::new(IconKind::CheckCircle)
-                        .size_4()
-                        .text_color(theme.roles.brand.base.hsla),
-                ),
-        );
-    }
-    name_row = name_row
-        .child(div().flex_none().text_color(muted).child("·"))
-        .child(
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(muted)
-                .debug_selector(|| "TEST_TWEET_TIME".into())
-                .child(
-                    Tooltip::new(
-                        format_id("tweet-time", tweet.tweet_id()),
-                        div().flex_none().child(age_text(age, cx)),
-                    )
-                    .content(tweet.published_at(data_time_zone(cx))),
-                ),
-        );
-
-    div()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .child(name_row)
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .text_color(muted)
-                .child(SharedString::new(format_smolstr!(
-                    "@{}",
-                    author.username.as_ref()
-                ))),
-        )
-        .into_any_element()
-}
-
-/// One tweet's text, with the runs that are links made clickable.
-fn interactive_text(tweet: &TweetItem, compact: bool, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let link_color = theme.roles.brand.base.hsla;
-    let ranges = tweet
-        .text
-        .links()
-        .iter()
-        .map(|link| link.range.clone())
-        .collect::<Vec<_>>();
-    let urls = tweet
-        .text
-        .links()
-        .iter()
-        .map(|link| link.url.clone())
-        .collect::<Vec<_>>();
-    let highlights = tweet
-        .text
-        .links()
-        .iter()
-        .map(|link| {
-            (
-                link.range.clone(),
-                gpui_kit::HighlightStyle {
-                    color: Some(link_color),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let text = StyledText::new(tweet.text.shared()).with_highlights(highlights);
-
-    InteractiveText::new(
-        ElementId::Name(SharedString::new(format_smolstr!(
-            "tweet-text-{}-{compact}",
-            tweet.tweet_id()
-        ))),
-        text,
-    )
-    .on_click(ranges, move |index, _, cx| {
-        let Some(url) = urls.get(index) else {
-            return;
-        };
-        cx.stop_propagation();
-        cx.open_url(url.as_ref());
-    })
-    .into_any_element()
-}
-
-/// A tweet that is quoted under the tweet quoting it.
-fn quote_block(
-    tweet: &TweetItem,
-    feed: &TweetSnapshot,
-    media: &MediaStates,
-    retry: Option<&MediaRetry>,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let author = feed.author(&tweet.x_user_id);
-    let url = tweet_url(author.username.as_ref(), tweet.tweet_id());
-    let mut column = div()
-        .min_w_0()
-        .flex_1()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(tweet_header(tweet, &author, cx));
-    if !tweet.text.is_empty() {
-        column = column.child(
-            div()
-                .min_w_0()
-                .text_xs()
-                .whitespace_normal()
-                .debug_selector(|| "TEST_TWEET_QUOTE_TEXT".into())
-                .child(interactive_text(tweet, true, cx)),
-        );
-    }
-    if !tweet.media.is_empty() {
-        column = column.child(media_gallery(tweet, media, true, retry, cx));
-    }
-
-    div()
-        .id(format_id("tweet-quote", tweet.tweet_id()))
-        .min_w_0()
-        .flex()
-        .gap_2()
-        .rounded_sm()
-        .border_1()
-        .border_color(theme.roles.line.divider.hsla)
-        .px_2()
-        .py_2()
-        .cursor_pointer()
-        .on_click(move |_, _, cx| {
-            cx.stop_propagation();
-            cx.open_url(&url);
-        })
-        .child(avatar(
-            author.avatar_url.as_ref(),
-            media,
-            format_id("tweet-quote-avatar", tweet.tweet_id()),
-            None,
-            theme.roles.surface.raised.hsla,
-            theme.roles.fg.muted.hsla,
-            px(QUOTE_AVATAR_SIZE),
-        ))
-        .child(column)
-        .into_any_element()
-}
-
-/// Every picture one tweet carries, laid out as one gallery.
-fn media_gallery(
-    tweet: &TweetItem,
-    media: &MediaStates,
-    compact: bool,
-    retry: Option<&MediaRetry>,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let (count, ratio, fitted_width, max_height) = gallery_geometry(&tweet.media, compact);
-    let columns = if count == 1 { 1 } else { 2 };
-    let rows = if count >= 3 { 2 } else { 1 };
-
-    let mut grid = div()
-        .w_full()
-        .max_w(px(fitted_width))
-        .max_h(px(max_height))
-        .min_w_0()
-        .grid()
-        .grid_cols(columns)
-        .grid_rows(rows)
-        .gap_0p5()
-        .aspect_ratio(ratio)
-        .rounded_sm()
-        .overflow_hidden()
-        // The gallery's own backdrop is a surface, not an edge: it is what shows between and
-        // behind the tiles while they load, and it matches the surfaces the tiles themselves
-        // fall back to.
-        .bg(theme.roles.surface.raised.hsla);
-
-    for (index, item) in tweet.media.iter().take(count).enumerate() {
-        let mut tile = div().size_full().min_h_0().overflow_hidden();
-        if count == 3 && index == 0 {
-            tile = tile.row_span(2);
-        }
-        grid = grid.child(tile.child(media_tile(tweet, item, media, index, retry, cx)));
-    }
-
-    grid.into_any_element()
-}
-
-/// How tall one gallery is, and how wide: the numbers X's own layout is closest to.
-fn gallery_geometry(media: &[TweetMediaItem], compact: bool) -> (usize, f32, f32, f32) {
-    let count = media.len().min(4);
-    let ratio = match media.first() {
-        Some(first) if count == 1 => {
-            let ratio = first.aspect_ratio();
-            if compact {
-                ratio.clamp(1.5, 2.4)
-            } else {
-                ratio.clamp(0.75, 2.0)
-            }
-        }
-        _ if compact => 2.0,
-        _ => 16.0 / 9.0,
-    };
-    let (max_width, max_height) = if compact {
-        (GALLERY_COMPACT_WIDTH, GALLERY_COMPACT_HEIGHT)
-    } else {
-        (GALLERY_WIDE_WIDTH, GALLERY_WIDE_HEIGHT)
-    };
-    (count, ratio, max_width.min(max_height * ratio), max_height)
-}
-
-/// One picture: what is known about it, or the way to ask for it again.
-fn media_tile(
-    tweet: &TweetItem,
-    item: &TweetMediaItem,
-    media: &MediaStates,
-    index: usize,
-    retry: Option<&MediaRetry>,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let url = item.url().clone();
-    let id = SharedString::new(format_smolstr!("tweet-media-{}-{index}", tweet.tweet_id()));
-
-    match media.get(url.as_ref()) {
-        Some(MediaState::Ready(path)) => media_ready(item, path, id, cx),
-        Some(MediaState::Failed) => media_failed(theme, id, url, retry, cx),
-        // Nothing known about a picture and a picture being fetched look the same, because
-        // from here they are the same: neither has bytes on disk yet.
-        Some(MediaState::Loading) | None => media_loading(theme),
-    }
-}
-
-/// A picture whose bytes are on disk.
-fn media_ready(
-    item: &TweetMediaItem,
-    path: &std::path::Path,
-    id: SharedString,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let mut tile = div()
-        .relative()
-        .size_full()
-        .rounded_sm()
-        .bg(theme.roles.surface.raised.hsla)
-        .child(
-            img(path.to_path_buf())
-                .id(ElementId::Name(id))
-                .size_full()
-                .rounded_sm()
-                .object_fit(ObjectFit::Cover),
-        );
-    match item {
-        TweetMediaItem::Video { .. } => {
-            tile = tile.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .size(px(32.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(theme.roles.brand.base.hsla)
-                            .child(
-                                Icon::new(IconKind::Play)
-                                    .size_4()
-                                    .text_color(theme.roles.fg.on_brand.hsla),
-                            ),
-                    ),
-            );
-        }
-        // A GIF whose still frame is what was fetched says so, because what is on screen is
-        // not what the tweet carries.
-        TweetMediaItem::Gif {
-            poster_only: true, ..
-        } => {
-            tile = tile.child(
-                div()
-                    .absolute()
-                    .left(px(6.0))
-                    .bottom(px(6.0))
-                    .h(px(18.0))
-                    .px_1()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(theme.roles.brand.base.hsla)
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.roles.fg.on_brand.hsla)
-                    .child(SharedString::new_static("GIF")),
-            );
-        }
-        TweetMediaItem::Image { .. } | TweetMediaItem::Gif { .. } => {}
-    }
-    tile.into_any_element()
-}
-
-/// A picture that is being fetched.
-///
-/// The frame is not animated: the body this tile is drawn in is cached, and an animation
-/// inside a cached subtree would freeze rather than spin.
-fn media_loading(theme: &Theme) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_sm()
-        .bg(theme.roles.surface.raised.hsla)
-        .child(
-            Icon::new(IconKind::CircleNotch)
-                .size_5()
-                .text_color(theme.roles.fg.muted.hsla),
-        )
-        .into_any_element()
-}
-
-/// A picture that could not be fetched, and the way to ask for it again.
-fn media_failed(
-    theme: &Theme,
-    id: SharedString,
-    url: SharedString,
-    retry: Option<&MediaRetry>,
-    cx: &App,
-) -> AnyElement {
-    let muted = theme.roles.fg.muted.hsla;
-    let mut tile = div()
-        .size_full()
-        .min_h_0()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .px_2()
-        .rounded_sm()
-        .bg(theme.roles.surface.raised.hsla)
-        .text_center()
-        .text_xs()
-        .text_color(muted)
-        .child(
-            Icon::new(IconKind::WarningCircle)
-                .size_5()
-                .text_color(muted),
-        )
-        .child(t!(cx, "widget.x.media_load_failed"));
-    if let Some(retry) = retry {
-        let widget = retry.widget.clone();
-        tile = tile.child(
-            Button::new(ElementId::Name(SharedString::new(format_smolstr!(
-                "{id}-retry"
-            ))))
-            .ghost()
-            .small()
-            .aria_label(t!(cx, "common.retry"))
-            .with_tooltip(t!(cx, "common.retry"))
-            .on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                let url = SmolStr::new(url.as_str());
-                widget.update(cx, |widget, cx| widget.retry_media(url, cx));
-            })
-            .child(Icon::new(IconKind::ArrowsClockwise).size_3()),
-        );
-    }
-    tile.into_any_element()
-}
-
-/// The row that says the timeline has no more tweets to show.
-fn timeline_end(cx: &App) -> AnyElement {
-    div()
-        .id(ElementId::Name(SharedString::new_static("XTimelineEnd")))
-        .debug_selector(|| "TEST_TWEET_TIMELINE_END".into())
-        .role(Role::ListItem)
-        .w_full()
-        .min_w_0()
-        .py_2()
-        .text_center()
-        .text_xs()
-        .text_color(cx.theme().roles.fg.muted.hsla)
-        .child(t!(cx, "widget.x.timeline_end"))
-        .into_any_element()
-}
-
-/// A face, or the stand-in that says there is one to come.
-///
-/// `selector` names the place the face is drawn in, which is what a test measures a row by: a
-/// face is the tallest thing a dialog's row holds, so where it sits is where the row's own
-/// height shows.
-pub(super) fn avatar(
-    url: &str,
-    media: &MediaStates,
-    id: ElementId,
-    selector: Option<&'static str>,
-    background: Hsla,
-    foreground: Hsla,
-    size: gpui_kit::Pixels,
-) -> AnyElement {
-    let face = div()
-        .size(size)
-        .flex_none()
-        .debug_selector(move || selector.map_or_else(String::new, String::from));
-    match media.get(url) {
-        Some(MediaState::Ready(path)) => face
-            .rounded_full()
-            .overflow_hidden()
-            .bg(background)
-            .child(
-                img(path.clone())
-                    .id(id)
-                    .size_full()
-                    .rounded_full()
-                    .object_fit(ObjectFit::Cover),
-            )
-            .into_any_element(),
-        Some(MediaState::Loading) | Some(MediaState::Failed) | None => face
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(background)
-            .text_sm()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(foreground)
-            .child(SharedString::new_static("@"))
-            .into_any_element(),
-    }
-}
-
-/// A message in the middle of a panel.
-pub(super) fn centered_message(message: SharedString, color: Hsla) -> AnyElement {
-    div()
-        .size_full()
-        .min_h_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_4()
-        .text_center()
-        .text_sm()
-        .text_color(color)
-        .child(message)
-        .into_any_element()
-}
-
-/// A message and the control that offers a way out of it.
-pub(super) fn message_with_action(message: SharedString, action: AnyElement) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .px_4()
-        .text_center()
-        .text_xs()
-        .child(message)
-        .child(div().flex_none().child(action))
-        .into_any_element()
-}
-
-/// The recovery the pane itself offers, as a dialog's way out of having no stream.
-pub(super) fn recovery_button(action: &WidgetAction, cx: &App) -> AnyElement {
-    Button::new("x-recover")
-        .outline()
-        .small()
-        .disabled(!action.is_enabled())
-        .on_click({
-            let action = action.clone();
-            move |_, _, cx| action.run(cx)
-        })
-        .child(action.label(cx))
-        .into_any_element()
-}
-
-pub(super) fn status_label(status: XSelectionStatus, cx: &App) -> SharedString {
-    match status {
-        XSelectionStatus::Active => t!(cx, "widget.x.active"),
-        XSelectionStatus::Paused => t!(cx, "widget.x.paused"),
-        XSelectionStatus::Pending => t!(cx, "widget.x.pending"),
-    }
-}
-
-/// The address of one tweet on X, which is what a row opens.
-fn tweet_url(username: &str, tweet_id: &str) -> String {
+/// The URL of one tweet on X.
+pub(super) fn tweet_url(username: &str, tweet_id: &str) -> String {
     format!("https://x.com/{username}/status/{tweet_id}")
 }
 
+/// Resolves the feed into the row plans the list draws.
+fn build_plans(feed: &TweetSnapshot) -> Arc<[RowPlan]> {
+    feed.items()
+        .iter()
+        .map(|item| {
+            let author = feed.author(&item.x_user_id);
+            plan_of(item, &author, feed)
+        })
+        .collect()
+}
+
+/// Resolves one tweet (and the tweet it quotes) into a row plan.
+fn plan_of(
+    item: &Arc<TweetItem>,
+    outer_author: &super::model::TweetAuthor,
+    feed: &TweetSnapshot,
+) -> RowPlan {
+    let (tweet, reposted) = item.displayed();
+    let author = feed.author(&tweet.x_user_id);
+    let links: Rc<[(Range<usize>, SmolStr)]> = tweet
+        .text
+        .links()
+        .iter()
+        .map(|link| (link.range.clone(), link.url.clone()))
+        .collect();
+    let tweet_id = SmolStr::new(tweet.tweet_id());
+    let row_id = tweet_id.clone();
+    RowPlan {
+        tweet_id,
+        row_id: row_id.clone(),
+        quote_of: false,
+        url: SmolStr::new(tweet_url(author.username.as_ref(), tweet.tweet_id())),
+        reposted_by: reposted.then(|| SmolStr::new(outer_author.display_name.as_str())),
+        author_name: SmolStr::new(author.display_name.as_str()),
+        author_handle: format_smolstr!("@{}", author.username),
+        avatar_url: SmolStr::new(author.avatar_url.as_str()),
+        verified: author.verified,
+        published_at: tweet.timestamp(),
+        text: tweet.text.shared(),
+        has_text: !tweet.text.is_empty(),
+        links,
+        media: media_plans(&tweet.media),
+        quote: match tweet.reference.as_ref() {
+            Some(TweetReferenceItem::Quote(quoted)) => {
+                Some(Box::new(plan_of_quote(quoted, feed, row_id)))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Resolves one quoted tweet into a row plan (it has no repost line of its own).
+fn plan_of_quote(tweet: &Arc<TweetItem>, feed: &TweetSnapshot, row_id: SmolStr) -> RowPlan {
+    let author = feed.author(&tweet.x_user_id);
+    let links: Rc<[(Range<usize>, SmolStr)]> = tweet
+        .text
+        .links()
+        .iter()
+        .map(|link| (link.range.clone(), link.url.clone()))
+        .collect();
+    RowPlan {
+        tweet_id: SmolStr::new(tweet.tweet_id()),
+        row_id,
+        quote_of: true,
+        url: SmolStr::new(tweet_url(author.username.as_ref(), tweet.tweet_id())),
+        reposted_by: None,
+        author_name: SmolStr::new(author.display_name.as_str()),
+        author_handle: format_smolstr!("@{}", author.username),
+        avatar_url: SmolStr::new(author.avatar_url.as_str()),
+        verified: author.verified,
+        published_at: tweet.timestamp(),
+        text: tweet.text.shared(),
+        has_text: !tweet.text.is_empty(),
+        links,
+        media: media_plans(&tweet.media),
+        quote: None,
+    }
+}
+
+/// Finds the plan a row's bind closure draws: the row's own plan, or the quoted plan
+/// nested under it.
+fn plan_in<'a>(
+    plans: &'a [RowPlan],
+    row_id: &SmolStr,
+    tweet_id: &SmolStr,
+    quote_of: bool,
+) -> Option<&'a RowPlan> {
+    if !quote_of {
+        return plans.iter().find(|plan| plan.tweet_id == *tweet_id);
+    }
+    plans
+        .iter()
+        .find(|plan| plan.tweet_id == *row_id)
+        .and_then(|plan| plan.quote.as_deref())
+        .filter(|quote| quote.tweet_id == *tweet_id)
+}
+
+/// The pictures one tweet carries, resolved into what a row needs.
+fn media_plans(media: &[TweetMediaItem]) -> Arc<[MediaPlan]> {
+    media
+        .iter()
+        .map(|item| MediaPlan {
+            url: item.url().clone(),
+            kind: match item {
+                TweetMediaItem::Image { .. } => MediaKind::Image,
+                TweetMediaItem::Video { .. } => MediaKind::Video,
+                TweetMediaItem::Gif { .. } => MediaKind::Gif,
+            },
+            ratio: item.aspect_ratio(),
+            poster_only: matches!(
+                item,
+                TweetMediaItem::Gif {
+                    poster_only: true,
+                    ..
+                }
+            ),
+        })
+        .collect()
+}
+
+/// Builds one row of the timeline into the list's row container.
+fn build_row(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    index: usize,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let plan = context.plans.borrow().get(index).cloned();
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    let row = NodeBuilder::boxed()
+        .id(format_smolstr!("TEST_TWEET_ROW:{}", plan.tweet_id))
+        .style(
+            StyleBuilder::new()
+                .flex_col()
+                .gap(6.0)
+                .padding_sides(12.0, 12.0, 12.0, 12.0)
+                .width_full()
+                .min_width_0()
+                .build(),
+        )
+        .bind_a11y(row_a11y(plan.tweet_id.clone(), context))
+        .build(tree, parent)?;
+    context.hits.rows.borrow_mut().insert(row, plan.url.clone());
+
+    if plan.reposted_by.is_some() {
+        build_repost_line(tree, row, &plan, context)?;
+    }
+    build_tweet(tree, row, &plan, context)?;
+
+    Ok(())
+}
+
+/// The a11y description of one row: who wrote it, and how long ago.
+fn row_a11y(
+    tweet_id: SmolStr,
+    context: &RowContext,
+) -> impl Fn(&mut ReadCtx<'_>) -> A11yPatch + 'static {
+    let plan_signal = context.plan_signal;
+    let language = context.language;
+    let config = context.config;
+    let translate = context.translate.clone();
+    move |read| {
+        let _language = read.read(&language);
+        let plans = read.read(&plan_signal);
+        let settings = read.read(&config);
+        let zone = widget::time_zone::data_time_zone(&settings);
+        let Some(plan) = plans.iter().find(|plan| plan.tweet_id == tweet_id) else {
+            return A11yPatch::default();
+        };
+        let age = tweet_age(plan.published_at, OffsetDateTime::now_utc(), zone);
+        A11yPatch {
+            label: Some(t_smol!(
+                translate,
+                "widget.x.tweet",
+                author = plan.author_handle.clone(),
+                time = age_text(age, &translate)
+            )),
+            description: Some(absolute_time(plan.published_at, zone)),
+            ..A11yPatch::default()
+        }
+    }
+}
+
+/// The line above a repost that says who reposted it.
+fn build_repost_line(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let line = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_row()
+                .items_center()
+                .gap(4.0)
+                .padding_sides(0.0, 0.0, 0.0, AVATAR_SIZE + 12.0)
+                .min_width_0()
+                .build(),
+        )
+        .build(tree, parent)?;
+    build_icon(
+        tree,
+        line,
+        context.icons.repost,
+        14.0,
+        context.theme.clone(),
+        Role::FgMuted,
+    )?;
+    let repost = t_smol!(
+        context.translate,
+        "widget.x.reposted",
+        name = plan.reposted_by.clone().unwrap_or_default()
+    );
+    NodeBuilder::text(repost, TextStyle::new(META_SIZE.text_size()))
+        .style(StyleBuilder::new().min_width_0().build())
+        .bind_text({
+            let plan_signal = context.plan_signal;
+            let language = context.language;
+            let translate = context.translate.clone();
+            let row_id = plan.row_id.clone();
+            let tweet_id = plan.tweet_id.clone();
+            move |read| {
+                let _language = read.read(&language);
+                let plans = read.read(&plan_signal);
+                plan_in(&plans, &row_id, &tweet_id, false)
+                    .and_then(|plan| plan.reposted_by.clone())
+                    .map_or_else(SmolStr::default, |name| {
+                        t_smol!(translate, "widget.x.reposted", name = name)
+                    })
+            }
+        })
+        .bind_style(themed_foreground(context.theme.clone(), Role::FgMuted))
+        .build(tree, line)?;
+
+    Ok(())
+}
+
+/// One tweet's own content: its face, its author, its text, its pictures and what it
+/// quotes.
+fn build_tweet(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let content = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_row()
+                .items_center()
+                .gap(12.0)
+                .min_width_0()
+                .width_full()
+                .build(),
+        )
+        .build(tree, parent)?;
+    build_avatar(tree, content, plan, context)?;
+
+    let column = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_col()
+                .flex_1()
+                .gap(6.0)
+                .min_width_0()
+                .build(),
+        )
+        .build(tree, content)?;
+    build_tweet_header(tree, column, plan, context)?;
+    if plan.has_text {
+        build_text(tree, column, plan, context)?;
+    }
+    if !plan.media.is_empty() {
+        build_gallery(tree, column, plan, context)?;
+    }
+    if let Some(quote) = plan.quote.as_deref() {
+        build_quote(tree, column, quote, context)?;
+    }
+
+    Ok(())
+}
+
+/// A face, or the stand-in that says there is one to come.
+fn build_avatar(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let size = if plan.quote_of {
+        QUOTE_AVATAR_SIZE
+    } else {
+        AVATAR_SIZE
+    };
+    let style = StyleBuilder::new()
+        .width(size)
+        .height(size)
+        .flex_none()
+        .build();
+    let image = if plan.avatar_url.is_empty() {
+        None
+    } else {
+        context.images.borrow().get(&plan.avatar_url).copied()
+    };
+    let Some(image) = image else {
+        // No bytes yet (or no face to fetch): a surface-toned tile with an `@` is what
+        // the old interface drew for a face that had not arrived.
+        let placeholder = NodeBuilder::boxed()
+            .style(style)
+            .bind_style(themed_background(
+                context.theme.clone(),
+                Role::SurfaceRaised,
+            ))
+            .build(tree, parent)?;
+        let mut text_style = TextStyle::new(META_SIZE.text_size());
+        text_style.alignment = TextAlign::Center;
+        text_style.color = Color::WHITE;
+        NodeBuilder::text(SmolStr::new_static("@"), text_style)
+            .style(StyleBuilder::new().width_full().height_full().build())
+            .bind_style(themed_foreground(context.theme.clone(), Role::FgMuted))
+            .a11y(A11yOverride {
+                hidden: true,
+                ..A11yOverride::default()
+            })
+            .build(tree, placeholder)?;
+        return Ok(());
+    };
+    let node = match image {
+        ImageSource::Ready(resource) => NodeBuilder::image(resource, ImageFit::Cover),
+        ImageSource::Pending(pending) => NodeBuilder::image_pending(pending, ImageFit::Cover),
+    };
+    node.style(style)
+        .a11y(A11yOverride {
+            hidden: true,
+            ..A11yOverride::default()
+        })
+        .build(tree, parent)?;
+
+    Ok(())
+}
+
+/// Who wrote one tweet, when, and whether X vouches for them.
+fn build_tweet_header(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let name_row = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_row()
+                .items_center()
+                .gap(4.0)
+                .min_width_0()
+                .build(),
+        )
+        .build(tree, parent)?;
+
+    NodeBuilder::text(
+        plan.author_name.clone(),
+        TextStyle {
+            size: BODY_SIZE.text_size(),
+            weight: 600,
+            ..TextStyle::new(BODY_SIZE.text_size())
+        },
+    )
+    .style(StyleBuilder::new().min_width_0().build())
+    .bind_text({
+        let plan_signal = context.plan_signal;
+        let row_id = plan.row_id.clone();
+        let tweet_id = plan.tweet_id.clone();
+        let quote_of = plan.quote_of;
+        move |read| {
+            let plans = read.read(&plan_signal);
+            plan_in(&plans, &row_id, &tweet_id, quote_of)
+                .map_or_else(SmolStr::default, |plan| plan.author_name.clone())
+        }
+    })
+    .bind_style(themed_foreground(context.theme.clone(), Role::FgDefault))
+    .build(tree, name_row)?;
+
+    if plan.verified {
+        build_icon(
+            tree,
+            name_row,
+            context.icons.verified,
+            16.0,
+            context.theme.clone(),
+            Role::BrandBase,
+        )?;
+    }
+
+    NodeBuilder::text(
+        SmolStr::new_static("·"),
+        TextStyle::new(META_SIZE.text_size()),
+    )
+    .style(StyleBuilder::new().flex_none().build())
+    .bind_style(themed_foreground(context.theme.clone(), Role::FgMuted))
+    .build(tree, name_row)?;
+
+    NodeBuilder::text(SmolStr::default(), TextStyle::new(META_SIZE.text_size()))
+        .style(StyleBuilder::new().flex_none().build())
+        .bind_text({
+            let plan_signal = context.plan_signal;
+            let config = context.config;
+            let language = context.language;
+            let translate = context.translate.clone();
+            let row_id = plan.row_id.clone();
+            let tweet_id = plan.tweet_id.clone();
+            let quote_of = plan.quote_of;
+            move |read| {
+                let _language = read.read(&language);
+                let plans = read.read(&plan_signal);
+                let settings = read.read(&config);
+                let zone = widget::time_zone::data_time_zone(&settings);
+                plan_in(&plans, &row_id, &tweet_id, quote_of).map_or_else(
+                    SmolStr::default,
+                    |plan| {
+                        age_text(
+                            tweet_age(plan.published_at, OffsetDateTime::now_utc(), zone),
+                            &translate,
+                        )
+                    },
+                )
+            }
+        })
+        .bind_style(themed_foreground(context.theme.clone(), Role::FgMuted))
+        .build(tree, name_row)?;
+
+    NodeBuilder::text(
+        plan.author_handle.clone(),
+        TextStyle::new(META_SIZE.text_size()),
+    )
+    .style(StyleBuilder::new().min_width_0().build())
+    .bind_text({
+        let plan_signal = context.plan_signal;
+        let row_id = plan.row_id.clone();
+        let tweet_id = plan.tweet_id.clone();
+        let quote_of = plan.quote_of;
+        move |read| {
+            let plans = read.read(&plan_signal);
+            plan_in(&plans, &row_id, &tweet_id, quote_of)
+                .map_or_else(SmolStr::default, |plan| plan.author_handle.clone())
+        }
+    })
+    .bind_style(themed_foreground(context.theme.clone(), Role::FgMuted))
+    .build(tree, parent)?;
+
+    Ok(())
+}
+
+/// One tweet's text, with the runs that are links styled and clickable.
+///
+/// A link's colour is a **static run colour** (`TextContent::runs`): the engine has no
+/// dynamic channel inside a run, so the rows are built for the appearance showing at build
+/// time and the pane rebuilds the visible window when the appearance moves (see
+/// [`RowContext::appearance`]). The run ranges are the plan's link byte ranges, which is
+/// also what `dispatch` hit-tests a click over a link against — one source for what is
+/// coloured and what is clickable.
+fn build_text(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let mut style = TextStyle::new(if plan.quote_of {
+        META_SIZE.text_size()
+    } else {
+        BODY_SIZE.text_size()
+    });
+    style.overflow = TextOverflow::Clip;
+    let link_color = context
+        .theme
+        .theme_for(context.appearance.get())
+        .role(Role::BrandBase);
+    let mut run_style = style.clone();
+    run_style.color = link_color;
+    let runs: Vec<TextRun> = plan
+        .links
+        .iter()
+        .map(|(range, _)| TextRun::new(range.clone(), run_style.clone()))
+        .collect();
+    let links = Rc::clone(&plan.links);
+    let node = NodeBuilder::text(plan.text.clone(), style)
+        .id(format_smolstr!("TEST_TWEET_TEXT:{}", plan.tweet_id))
+        .runs(runs)
+        .style(StyleBuilder::new().min_width_0().build())
+        .bind_text({
+            let plan_signal = context.plan_signal;
+            let row_id = plan.row_id.clone();
+            let tweet_id = plan.tweet_id.clone();
+            let quote_of = plan.quote_of;
+            move |read| {
+                let plans = read.read(&plan_signal);
+                plan_in(&plans, &row_id, &tweet_id, quote_of)
+                    .map_or_else(SmolStr::default, |plan| plan.text.clone())
+            }
+        })
+        .bind_style({
+            let theme = context.theme.clone();
+            move |read| StylePatch {
+                foreground: Some(theme.role(read, Role::FgDefault)),
+                ..StylePatch::default()
+            }
+        })
+        .bind_a11y({
+            let plan_signal = context.plan_signal;
+            let row_id = plan.row_id.clone();
+            let tweet_id = plan.tweet_id.clone();
+            let quote_of = plan.quote_of;
+            move |read| {
+                let plans = read.read(&plan_signal);
+                let text = plan_in(&plans, &row_id, &tweet_id, quote_of)
+                    .map_or_else(SmolStr::default, |plan| plan.text.clone());
+                A11yPatch {
+                    description: Some(text),
+                    ..A11yPatch::default()
+                }
+            }
+        })
+        .build(tree, parent)?;
+    if !links.is_empty() {
+        context.hits.links.borrow_mut().insert(node, links);
+    }
+
+    Ok(())
+}
+
+/// A gallery of the pictures one tweet carries.
+fn build_gallery(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let count = plan.media.len().min(4);
+    let columns = if count == 1 { 1 } else { 2 };
+    let tile_width = if count == 1 {
+        GALLERY_WIDE_WIDTH.min(GALLERY_HEIGHT * plan.media[0].ratio)
+    } else {
+        (GALLERY_WIDE_WIDTH - 4.0) * 0.5
+    };
+    let rows = if count > 2 { 2 } else { 1 };
+    let tile_height = GALLERY_HEIGHT / rows as f32;
+    let grid = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_col()
+                .gap(4.0)
+                .width(tile_width * columns as f32 + 4.0 * (columns - 1) as f32)
+                .max_width(GALLERY_WIDE_WIDTH)
+                .build(),
+        )
+        .build(tree, parent)?;
+    let mut index = 0;
+    for _ in 0..rows {
+        let line = NodeBuilder::boxed()
+            .style(
+                StyleBuilder::new()
+                    .flex_row()
+                    .gap(4.0)
+                    .width_full()
+                    .min_width_0()
+                    .build(),
+            )
+            .build(tree, grid)?;
+        let mut in_line = 0;
+        while in_line < columns && index < count {
+            build_media_tile(tree, line, plan, index, tile_width, tile_height, context)?;
+            in_line += 1;
+            index += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// One picture: what is known about it, or the way to ask for it again.
+fn build_media_tile(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    index: usize,
+    width: f32,
+    height: f32,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let item = &plan.media[index];
+    let media = context.media();
+    let state = media.get(&item.url);
+    let style = StyleBuilder::new()
+        .width(width)
+        .height(height)
+        .flex_none()
+        .build();
+    let mut tile = NodeBuilder::boxed()
+        .id(format_smolstr!(
+            "TEST_TWEET_MEDIA:{}:{index}",
+            plan.tweet_id
+        ))
+        .style(style)
+        .bind_style(themed_background(
+            context.theme.clone(),
+            Role::SurfaceRaised,
+        ))
+        .bind_a11y({
+            let media = Rc::clone(&context.media);
+            let language = context.language;
+            let translate = context.translate.clone();
+            let url = item.url.clone();
+            let poster_only = item.poster_only;
+            move |read| {
+                let _language = read.read(&language);
+                let state = media.borrow().get(&url).cloned();
+                match state {
+                    // A picture that could not be fetched is a way to ask for it again:
+                    // it is in the a11y tree with that name, and its activation is the
+                    // retry (see the tile action below).
+                    Some(MediaState::Failed) => A11yPatch {
+                        label: Some(t_smol!(translate, "common.retry")),
+                        description: Some(t_smol!(translate, "widget.x.media_load_failed")),
+                        hidden: Some(false),
+                        ..A11yPatch::default()
+                    },
+                    // A still frame standing in for an animation says what it is; every
+                    // other picture is decoration the row's label already names.
+                    Some(MediaState::Ready(_)) if poster_only => A11yPatch {
+                        label: Some(SmolStr::new_static("GIF")),
+                        hidden: Some(false),
+                        ..A11yPatch::default()
+                    },
+                    _ => A11yPatch {
+                        hidden: Some(true),
+                        ..A11yPatch::default()
+                    },
+                }
+            }
+        });
+    if matches!(state, Some(MediaState::Failed)) {
+        // A row builder has no `App` to register a handler, so the tile declares the
+        // pane's retry action: the pointer, Enter / Space on the focused tile and an
+        // assistive technology's activation all reach that one handler.
+        tile = tile.on_action(context.retry.clone());
+    }
+    let tile = tile.build(tree, parent)?;
+
+    match state {
+        Some(MediaState::Ready(_)) => {
+            let image = context.images.borrow().get(&item.url).copied();
+            if let Some(image) = image {
+                let node = match image {
+                    ImageSource::Ready(resource) => NodeBuilder::image(resource, ImageFit::Cover),
+                    ImageSource::Pending(pending) => {
+                        NodeBuilder::image_pending(pending, ImageFit::Cover)
+                    }
+                };
+                node.style(StyleBuilder::new().width(width).height(height).build())
+                    .a11y(A11yOverride {
+                        hidden: true,
+                        ..A11yOverride::default()
+                    })
+                    .build(tree, tile)?;
+            } else {
+                build_icon_centered(
+                    tree,
+                    tile,
+                    context.icons.warning,
+                    20.0,
+                    context.theme.clone(),
+                    Role::FgMuted,
+                )?;
+            }
+        }
+        Some(MediaState::Failed) => {
+            build_icon_centered(
+                tree,
+                tile,
+                context.icons.warning,
+                20.0,
+                context.theme.clone(),
+                Role::StatusDangerBase,
+            )?;
+            context
+                .hits
+                .failed
+                .borrow_mut()
+                .insert(tile, item.url.clone());
+        }
+        Some(MediaState::Loading) | None => {
+            build_icon_centered(
+                tree,
+                tile,
+                context.icons.retry,
+                18.0,
+                context.theme.clone(),
+                Role::FgMuted,
+            )?;
+        }
+    }
+    // A video's still frame is not the video; the play mark says so.
+    if item.kind == MediaKind::Video {
+        build_icon(
+            tree,
+            tile,
+            context.icons.play,
+            24.0,
+            context.theme.clone(),
+            Role::FgOnBrand,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// A tweet that is quoted under the tweet quoting it.
+fn build_quote(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    plan: &RowPlan,
+    context: &RowContext,
+) -> Result<(), EngineError> {
+    let quote = NodeBuilder::boxed()
+        .id(format_smolstr!("TEST_TWEET_QUOTE:{}", plan.tweet_id))
+        .style(
+            StyleBuilder::new()
+                .flex_row()
+                .gap(8.0)
+                .padding(8.0)
+                .border(1.0)
+                .min_width_0()
+                .build(),
+        )
+        .bind_style({
+            let theme = context.theme.clone();
+            move |read| StylePatch {
+                border: Some(ui_core::paint::primitive::Border {
+                    width: 1.0,
+                    color: theme.role(read, Role::LineDivider),
+                }),
+                ..StylePatch::default()
+            }
+        })
+        .build(tree, parent)?;
+    context
+        .hits
+        .rows
+        .borrow_mut()
+        .insert(quote, plan.url.clone());
+    build_avatar(tree, quote, plan, context)?;
+    let column = NodeBuilder::boxed()
+        .style(
+            StyleBuilder::new()
+                .flex_col()
+                .flex_1()
+                .gap(4.0)
+                .min_width_0()
+                .build(),
+        )
+        .build(tree, quote)?;
+    build_tweet_header(tree, column, plan, context)?;
+    if plan.has_text {
+        build_text(tree, column, plan, context)?;
+    }
+    if !plan.media.is_empty() {
+        build_gallery(tree, column, plan, context)?;
+    }
+
+    Ok(())
+}
+
+/// Draws one icon image at `size`, toned by a theme role.
+fn build_icon(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    icon: ImageSource,
+    size: f32,
+    theme: ThemeHandle,
+    role: Role,
+) -> Result<(), EngineError> {
+    let node = match icon {
+        ImageSource::Ready(resource) => NodeBuilder::image(resource, ImageFit::Contain),
+        ImageSource::Pending(pending) => NodeBuilder::image_pending(pending, ImageFit::Contain),
+    };
+    node.style(
+        StyleBuilder::new()
+            .width(size)
+            .height(size)
+            .flex_none()
+            .build(),
+    )
+    .bind_style(themed_foreground(theme, role))
+    .a11y(A11yOverride {
+        hidden: true,
+        ..A11yOverride::default()
+    })
+    .build(tree, parent)?;
+
+    Ok(())
+}
+
+/// Draws one icon centred in its parent.
+fn build_icon_centered(
+    tree: &mut NodeTree,
+    parent: NodeId,
+    icon: ImageSource,
+    size: f32,
+    theme: ThemeHandle,
+    role: Role,
+) -> Result<(), EngineError> {
+    let node = match icon {
+        ImageSource::Ready(resource) => NodeBuilder::image(resource, ImageFit::Contain),
+        ImageSource::Pending(pending) => NodeBuilder::image_pending(pending, ImageFit::Contain),
+    };
+    node.style(StyleBuilder::new().width(size).height(size).build())
+        .bind_style(themed_foreground(theme, role))
+        .a11y(A11yOverride {
+            hidden: true,
+            ..A11yOverride::default()
+        })
+        .build(tree, parent)?;
+
+    Ok(())
+}
+
+/// A dynamic foreground colour read through the theme handle.
+fn themed_foreground(
+    theme: ThemeHandle,
+    role: Role,
+) -> impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static {
+    move |read| StylePatch {
+        foreground: Some(theme.role(read, role)),
+        ..StylePatch::default()
+    }
+}
+
+/// A dynamic background colour read through the theme handle.
+fn themed_background(
+    theme: ThemeHandle,
+    role: Role,
+) -> impl Fn(&mut ReadCtx<'_>) -> StylePatch + 'static {
+    move |read| StylePatch {
+        background: Some(theme.role(read, role)),
+        ..StylePatch::default()
+    }
+}
+
 /// How long ago a tweet was published, in the reader's language.
-fn age_text(age: TweetAge, cx: &App) -> SharedString {
+fn age_text(age: TweetAge, translate: &Translate) -> SmolStr {
     match age {
-        TweetAge::Seconds(seconds) => {
-            t!(cx, "widget.x.age_seconds", count = seconds)
-        }
+        TweetAge::Seconds(seconds) => t_smol!(translate, "widget.x.age_seconds", count = seconds),
         TweetAge::Minutes(minutes) => {
-            t!(cx, "widget.x.age_minutes", count = minutes)
+            t_smol!(translate, "widget.x.age_minutes", count = minutes)
         }
-        TweetAge::Hours(hours) => t!(cx, "widget.x.age_hours", count = hours),
-        TweetAge::Date { month, day } => t!(cx, "widget.x.age_date", month = month, day = day),
-        TweetAge::FullDate { year, month, day } => t!(
-            cx,
+        TweetAge::Hours(hours) => t_smol!(translate, "widget.x.age_hours", count = hours),
+        TweetAge::Date { month, day } => {
+            t_smol!(translate, "widget.x.age_date", month = month, day = day)
+        }
+        TweetAge::FullDate { year, month, day } => t_smol!(
+            translate,
             "widget.x.age_full_date",
             year = year,
             month = month,
             day = day
         ),
-        TweetAge::Unknown => SharedString::new_static("--"),
+        TweetAge::Unknown => SmolStr::new_static("--"),
     }
 }
 
-/// The element id of one of a row's own parts, which is unique within the row it is drawn in.
-fn format_id(prefix: &str, tweet_id: &str) -> ElementId {
-    ElementId::Name(SharedString::new(format_smolstr!("{prefix}-{tweet_id}")))
+/// The status of one monitored account, in the reader's language.
+pub(super) fn status_label(status: XSelectionStatus, translate: &Translate) -> SmolStr {
+    match status {
+        XSelectionStatus::Active => t_smol!(translate, "widget.x.active"),
+        XSelectionStatus::Paused => t_smol!(translate, "widget.x.paused"),
+        XSelectionStatus::Pending => t_smol!(translate, "widget.x.pending"),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{cell::Cell, rc::Rc, time::Duration};
-
-    use app_config::{
-        settings::{AccountConfig, AccountWalletKind, Config},
-        widget::{VersionedWidgetConfig, decode_or_default},
-    };
-    use base_ui::{input::InputStateBuilder, layer::Layer};
-    use gpui_kit::{
-        AppContext, BorrowAppContext, Bounds, IntoElement, Modifiers, Pixels, TestAppContext,
-        VisualTestContext, px,
-    };
-    use i18n::language::codes::LanguageCode;
-    use kytrix_service_provider::service::{
-        engine::{KytrixServiceError, XTweetEvent},
-        x::XMutationUnknown,
-    };
-    use network::transport::error::TransportError;
-    use widget::protocol::RequestId;
-
-    use super::*;
-    use crate::{
-        service::{TweetStreamMessage, TweetUpdate},
-        test_support::{
-            ACCOUNT, FakeFeed, FakeSession, FakeSource, FakeTransport, media_cache, media_url,
-            profile, search_profile, seed_picture, selection, selections, settle_until, tweet,
-            tweet_with_media,
-        },
-    };
-
-    const OTHER_ACCOUNT: &str = "another-account";
-
-    /// Settings holding `account`, or holding nobody when it is `None`.
-    fn settings(account: Option<&str>) -> Config {
-        let mut config = Config::default();
-        config.account = account.map(|user_id| AccountConfig {
-            user_id: user_id.to_owned(),
-            wallet_address: "0x1111111111111111111111111111111111111111".to_owned(),
-            wallet_kind: AccountWalletKind::Ethereum,
-        });
-        config
-    }
-
-    /// Installs everything a pane reads, with `account` signed in or nobody.
-    ///
-    /// The base layer's own state is installed first, because the dialog's fields are built on
-    /// it: a field that is typed into reads the state `gpui_kit::base::init` installs.
-    fn install(cx: &mut App, account: Option<&str>) {
-        gpui_kit::base::init(cx);
-        base_ui::style::theme::install(cx);
-        i18n::global::embedded::install(cx).expect("the embedded locales should load");
-        global::install(cx).expect("the test Tokio runtime should build");
-        let manager = ConfigManager::in_memory(settings(account), cx);
-        cx.set_global(manager);
-    }
-
-    /// A pane the framework would have built, driven by a fake account and a fake transport.
-    fn pane_with_source<S, T>(
-        source: S,
-        downloader: MediaDownloader<T>,
-        cx: &mut Context<XWidget>,
-    ) -> XWidget
-    where
-        S: TweetSource,
-        T: crate::media::MediaTransport,
-    {
-        let status = cx.new(|_| WidgetStatus::new());
-        let weak = cx.weak_entity();
-        let recovery = WidgetAction::new("common.retry", move |cx: &mut App| {
-            let _ = weak.update(cx, |pane, cx| pane.load(cx));
-        });
-        XWidget::new_with_source(
-            XConfig,
-            source,
-            downloader,
-            status,
-            WidgetConfigChange::default(),
-            recovery,
-            cx,
-        )
-    }
-
-    /// A pane a test drives by hand, with the production stream left where it is.
-    fn pane_with(
-        cx: &mut TestAppContext,
-        account: Option<&str>,
-        source: FakeSource,
-        transport: FakeTransport,
-        cache: crate::media::MediaCache,
-    ) -> Entity<XWidget> {
-        cx.executor().allow_parking();
-        cx.update(|cx| {
-            install(cx, account);
-            cx.new(|cx| pane_with_source(source, MediaDownloader::with_cache(transport, cache), cx))
-        })
-    }
-
-    /// A pane holding an account with nothing started, so what a test reports to it is the
-    /// only input it has.
-    ///
-    /// The cache directory is handed back with the pane because a pane that fetches a picture
-    /// creates it: the caller holds the handle, so the directory goes away with the test rather
-    /// than outliving it as an empty directory nothing owns.
-    fn quiet_pane(
-        cx: &mut TestAppContext,
-        source: FakeSource,
-    ) -> (Entity<XWidget>, tempfile::TempDir) {
-        let (cache, root) = media_cache();
-        let pane = pane_with(cx, Some(ACCOUNT), source, FakeTransport::failing(), cache);
-        pane.update(cx, |pane, _| {
-            pane.account_id = Some(SmolStr::new_static(ACCOUNT));
-        });
-        (pane, root)
-    }
-
-    /// A pane nobody is signed in for.
-    fn signed_out_pane(
-        cx: &mut TestAppContext,
-        source: FakeSource,
-    ) -> (Entity<XWidget>, tempfile::TempDir) {
-        let (cache, root) = media_cache();
-        let pane = pane_with(cx, None, source, FakeTransport::failing(), cache);
-        pane.update(cx, |pane, cx| pane.load(cx));
-        (pane, root)
-    }
-
-    /// A pane reading an account, with the stream the framework starts left running.
-    fn pane(cx: &mut TestAppContext, source: &FakeSource) -> (Entity<XWidget>, tempfile::TempDir) {
-        let (cache, root) = media_cache();
-        let pane = pane_with(
-            cx,
-            Some(ACCOUNT),
-            source.clone(),
-            FakeTransport::failing(),
-            cache,
-        );
-        pane.update(cx, |pane, cx| pane.load(cx));
-        (pane, root)
-    }
-
-    /// A pane whose stream is live and whose timeline is the one it read.
-    fn live_pane(
-        cx: &mut TestAppContext,
-        source: &FakeSource,
-        session: &FakeSession,
-        tweets: Vec<XTweetEvent>,
-    ) -> (Entity<XWidget>, tempfile::TempDir) {
-        let (cache, root) = media_cache();
-        live_pane_over(cx, source, session, tweets, cache, root)
-    }
-
-    /// A live pane over a cache of the caller's choosing, which is what a test that wants a
-    /// picture on disk before the stream reaches it holds.
-    fn live_pane_over(
-        cx: &mut TestAppContext,
-        source: &FakeSource,
-        session: &FakeSession,
-        tweets: Vec<XTweetEvent>,
-        cache: crate::media::MediaCache,
-        root: tempfile::TempDir,
-    ) -> (Entity<XWidget>, tempfile::TempDir) {
-        session.answer_history(tweets, vec![profile("42", "kytrix")]);
-        let pane = pane_with(
-            cx,
-            Some(ACCOUNT),
-            source.clone(),
-            FakeTransport::failing(),
-            cache,
-        );
-        pane.update(cx, |pane, cx| pane.load(cx));
-        settle_until(cx, "the stream to come up", |cx| pane.read(cx).ready);
-        settle_until(cx, "the timeline to arrive", |cx| {
-            pane.read(cx).feed.is_some()
-        });
-
-        (pane, root)
-    }
-
-    /// A live pane holding a timeline of `count` tweets.
-    fn live_pane_with(
-        cx: &mut TestAppContext,
-        source: &FakeSource,
-        session: &FakeSession,
-        count: usize,
-    ) -> (Entity<XWidget>, tempfile::TempDir) {
-        let tweets = (0..count)
-            .map(|index| tweet(&index.to_string(), index as i64))
-            .collect();
-        live_pane(cx, source, session, tweets)
-    }
-
-    /// A live pane with the monitored accounts already read.
-    fn live_pane_reading(
-        cx: &mut TestAppContext,
-        source: &FakeSource,
-        session: &FakeSession,
-        accounts: Vec<kytrix_service_provider::service::x::XSelection>,
-        limit: usize,
-    ) -> (Entity<XWidget>, tempfile::TempDir) {
-        let (pane, root) = live_pane(cx, source, session, vec![tweet("1", 1)]);
-        session.answer_selections(selections(accounts, limit));
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
-        });
-        settle_until(cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-
-        (pane, root)
-    }
-
-    /// The dialog a pane opens, as the pane holds it.
-    ///
-    /// `show` itself needs the window layer the application installs, so a test attaches the
-    /// same dialog the way the pane would hold it.
-    fn attach_dialog(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Entity<TweetDialog> {
-        let window = cx.add_empty_window();
-        let dialog = window.update(|window, cx| {
-            let filter = cx.new(|cx| InputStateBuilder::new("tweet-filter").build(window, cx));
-            let query = cx.new(|cx| InputStateBuilder::new("tweet-query").build(window, cx));
-            cx.new(|cx| TweetDialog::new(pane.downgrade(), filter, query, cx))
-        });
-        pane.update(cx, |pane, _| pane.dialog = Some(dialog.downgrade()));
-        dialog
-    }
-
-    /// Opens the page that searches X and runs one search from it, the way a reader does: the
-    /// query is typed into the page's own field and the control beside it is clicked.
-    ///
-    /// The page is what a search belongs to, so this is the whole way in — and a query is typed
-    /// rather than set because an answer belongs to the query that asked for it.
-    fn search_from_page(
-        pane: &Entity<XWidget>,
-        dialog: &Entity<TweetDialog>,
-        typed: &str,
-        window: &mut VisualTestContext,
-    ) {
-        dialog.update(&mut window.cx, |dialog, cx| dialog.open_add(cx));
-        settle_pages(window);
-        let field = window
-            .debug_bounds("TEST_TWEET_QUERY_FIELD")
-            .expect("the search page should draw the field X is searched with")
-            .center();
-        window.simulate_click(field, Modifiers::none());
-        window.simulate_input(typed);
-        settle_pages(window);
-        let search = window
-            .debug_bounds("TEST_TWEET_SEARCH")
-            .expect("the search page should draw the control that sends the search")
-            .center();
-        window.simulate_click(search, Modifiers::none());
-        settle_until(&mut window.cx, "the search to be answered", |cx| {
-            pane.read(cx).searching.is_none()
-        });
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-    }
-
-    /// Reports one timeline as a stream would, at the revision after the last one.
-    fn report_update(
-        pane: &Entity<XWidget>,
-        feed: TweetSnapshot,
-        media: MediaStates,
-        cx: &mut TestAppContext,
-    ) -> bool {
-        cx.update(|cx| {
-            let scope = pane
-                .read(cx)
-                .current_scope()
-                .expect("the pane follows an account");
-            let revision = pane.read(cx).revision + 1;
-            pane.update(cx, |pane, cx| {
-                pane.apply_latest(
-                    scope,
-                    Arc::new(TweetStreamMessage::Update(TweetUpdate::published(
-                        revision, feed, media,
-                    ))),
-                    cx,
-                )
-            })
-        })
-    }
-
-    /// Reports a status as a stream would.
-    fn report_status(pane: &Entity<XWidget>, status: TweetStatus, cx: &mut TestAppContext) -> bool {
-        cx.update(|cx| {
-            let scope = pane
-                .read(cx)
-                .current_scope()
-                .expect("the pane follows an account");
-            pane.update(cx, |pane, cx| {
-                pane.apply_reliable(scope, Arc::new(TweetStreamMessage::Status(status)), cx)
-            })
-        })
-    }
-
-    /// What the pane reports, as a frame would read it.
-    fn state_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> WidgetState {
-        cx.update(|cx| pane.read(cx).status.state(cx))
-    }
-
-    /// The notice the pane is standing in with.
-    fn notice_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Option<Notice> {
-        cx.update(|cx| pane.read(cx).status.state(cx).notice().cloned())
-    }
-
-    /// Whether the pane has a body to draw.
-    fn has_content(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> bool {
-        cx.update(|cx| pane.read(cx).has_content())
-    }
-
-    /// The tweet ids the pane holds, which is what its list is drawn from.
-    ///
-    /// The list is not read: what it holds is the list's own, and what a reader sees of it is
-    /// asserted by drawing the pane.
-    fn feed_ids(pane: &XWidget) -> Vec<String> {
-        pane.feed
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .items()
-                    .iter()
-                    .map(|item| item.tweet_id().to_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The tweet ids the pane a test is holding has.
-    fn ids_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Vec<String> {
-        cx.update(|cx| feed_ids(pane.read(cx)))
-    }
-
-    /// One row the service has not activated yet, which by contract carries no profile.
-    fn pending(x_user_id: &str) -> kytrix_service_provider::service::x::XSelection {
-        let mut selection = selection(x_user_id, "");
-        selection.status = XSelectionStatus::Pending;
-        selection.profile = None;
-        selection
-    }
-
-    /// What the pane remembers about the names of the rows it holds, which is what a row
-    /// waiting to be activated is drawn with.
-    fn remembered_names(
-        pane: &Entity<XWidget>,
-        cx: &mut TestAppContext,
-    ) -> HashMap<SmolStr, SharedString> {
-        cx.update(|cx| (*pane.read(cx).hints).clone())
-    }
-
-    /// The usernames of the accounts the pane holds.
-    fn usernames_of(pane: &Entity<XWidget>, cx: &mut TestAppContext) -> Vec<String> {
-        cx.update(|cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .map_or_else(Vec::new, |data| {
-                    data.selections()
-                        .iter()
-                        .map(|selection| {
-                            selection.profile.as_ref().map_or_else(
-                                || selection.x_user_id.to_string(),
-                                |profile| profile.username.to_string(),
-                            )
-                        })
-                        .collect()
-                })
-        })
-    }
-
-    #[test]
-    fn the_widget_should_have_a_stable_identity() {
-        assert_eq!(XWidget::ID.as_str(), "kytrix.x");
-        assert_eq!(XWidget::DISPLAY_NAME, "widget.names.x");
-        assert_eq!(XConfig::SCHEMA_VERSION, WidgetConfigSchemaVersion::V1);
-    }
-
-    #[test]
-    fn the_config_should_round_trip_through_its_envelope() {
-        let stored = VersionedWidgetConfig::encode(&XConfig).expect("an X config should encode");
-
-        assert_eq!(stored.schema_version(), WidgetConfigSchemaVersion::V1);
-        assert_eq!(stored.decode::<XConfig>(), XConfig);
-        assert_eq!(decode_or_default::<XConfig>(None), XConfig);
-    }
-
-    /// A missing key is an empty string on screen rather than an error, so a gap in the
-    /// interface is what a typo looks like: this is the test that turns it into a failure.
-    #[gpui_kit::test]
-    fn every_message_this_pane_shows_should_resolve_to_text(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            install(cx, Some(ACCOUNT));
-
-            for key in [
-                "widget.names.x",
-                "widget.x.account_id",
-                "widget.x.active",
-                "widget.x.add_account",
-                "widget.x.add_search_result",
-                "widget.x.add_success",
-                "widget.x.age_date",
-                "widget.x.age_full_date",
-                "widget.x.age_hours",
-                "widget.x.age_minutes",
-                "widget.x.age_seconds",
-                "widget.x.already_monitored",
-                "widget.x.back",
-                "widget.x.delete_account",
-                "widget.x.dialog_title",
-                "widget.x.empty_accounts",
-                "widget.x.error_title",
-                "widget.x.filter_placeholder",
-                "widget.x.followers_following",
-                "widget.x.load_failed",
-                "widget.x.loading_accounts",
-                "widget.x.logged_out",
-                "widget.x.manage",
-                "widget.x.media_load_failed",
-                "widget.x.monitored_accounts",
-                "widget.x.no_search_results",
-                "widget.x.paused",
-                "widget.x.pending",
-                "widget.x.protected",
-                "widget.x.refresh",
-                "widget.x.reposted",
-                "widget.x.scroll_tweets",
-                "widget.x.search_placeholder",
-                "widget.x.search_users",
-                "widget.x.searching_users",
-                "widget.x.stream_unavailable",
-                "widget.x.success_title",
-                "widget.x.timeline_end",
-                "widget.x.tweet",
-                "widget.x.waiting",
-            ] {
-                assert!(!t!(cx, key).is_empty(), "{key} has no copy");
-            }
-
-            for failure in [
-                SelectionFailure::Rejected(XApiError::Authentication),
-                SelectionFailure::Unknown(XMutationUnknown::Timeout),
-                SelectionFailure::Rpc(RpcCallError::DeadlineExceeded {
-                    request_id: RequestId::new(2),
-                }),
-            ] {
-                assert!(!failure.localized_message(cx).is_empty());
-            }
-            // A search the service refused is drawn on the page that asked for it in the words
-            // the failure itself gives, so those words have to be there: a key a locale does not
-            // define translates to nothing, and a search that failed would say so with a blank
-            // panel.
-            for failure in [
-                RpcCallError::Service {
-                    request_id: RequestId::new(3),
-                    source: XApiError::NotReady,
-                },
-                RpcCallError::ServiceClosed {
-                    request_id: RequestId::new(4),
-                },
-                RpcCallError::ResponseDropped {
-                    request_id: RequestId::new(5),
-                },
-            ] {
-                assert!(!failure.localized_message(cx).is_empty());
-            }
-            assert!(
-                !XFailure::Stream(TweetStreamError::Transport(TransportError::Closed))
-                    .localized_message(cx)
-                    .is_empty()
-            );
-            assert!(
-                !XFailure::Stream(TweetStreamError::Service(KytrixServiceError::Timeout))
-                    .localized_message(cx)
-                    .is_empty()
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_pane_nobody_is_signed_in_for_should_wait_and_follow_nothing(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let (pane, _root) = signed_out_pane(cx, source.clone());
-
-        settle_until(cx, "the pane to report waiting", |cx| {
-            pane.read(cx).status.state(cx).notice().is_some()
-        });
-        assert!(!has_content(&pane, cx));
-        assert_eq!(
-            state_of(&pane, cx),
-            WidgetState::waiting(Notice::message("widget.x.logged_out")),
-            "a pane nobody is signed in for waits rather than working"
-        );
-        // A sign-out takes the subscription with it: nothing is followed for an account the
-        // pane is not reading as, which is what an acquisition that never happened says.
-        assert!(source.requested().is_empty());
-    }
-
-    #[gpui_kit::test]
-    fn a_pane_whose_account_could_not_be_taken_should_fail_and_offer_a_way_out(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        source.refuse(KytrixServiceError::Authentication(SmolStr::new_static(
-            "the test credential is gone",
-        )));
-        let (pane, _root) = pane(cx, &source);
-
-        settle_until(cx, "the failure to be reported", |cx| {
-            pane.read(cx).status.is_failed(cx)
-        });
-        let state = cx.update(|cx| pane.read(cx).status.state(cx));
-        let failure = state
-            .failure()
-            .expect("an account that could not be taken is reported");
-        assert_eq!(
-            failure.action().label_key(),
-            "common.retry",
-            "every failure offers the way out the framework wired"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn a_pane_should_be_content_only_once_a_timeline_arrives(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-
-        assert!(has_content(&pane, cx));
-        assert_eq!(ids_of(&pane, cx), ["1"]);
-        assert_eq!(state_of(&pane, cx), WidgetState::Ready);
-    }
-
-    #[gpui_kit::test]
-    fn an_empty_timeline_should_be_a_pane_waiting_rather_than_content(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, Vec::new());
-
-        assert!(!has_content(&pane, cx));
-        assert_eq!(
-            notice_of(&pane, cx),
-            Some(Notice::message("widget.x.waiting")),
-            "a live stream with nothing to show says so"
-        );
-    }
-
-    /// A waiting pane follows the language without being reloaded: the notice is a reference
-    /// into the catalogue, resolved on the frame that draws it, so the language moving writes
-    /// no state at all.
-    ///
-    /// The same test pins the other half of that contract, which is what keeps it cheap: the
-    /// pane reports its notice on every accepted timeline update, so the reference is compared
-    /// where it is written — the same one again is not a write and schedules no frame.
-    #[gpui_kit::test]
-    fn a_language_change_should_relabel_the_sentence_a_waiting_pane_shows(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, Vec::new());
-
-        let notice = notice_of(&pane, cx).expect("a live stream with nothing to show stands in");
-        assert_eq!(notice, Notice::message("widget.x.waiting"));
-        let english = cx.update(|cx| notice.resolve(cx));
-        assert_eq!(
-            english,
-            cx.update(|cx| t!(cx, "widget.x.waiting")),
-            "the pane starts out in the language showing now"
-        );
-
-        let cell = cx.update(|cx| pane.read(cx).status.clone());
-        let reports = Rc::new(Cell::new(0));
-        let _observation = cx.update({
-            let reports = reports.clone();
-            move |cx| {
-                cx.observe(&cell, move |_, _| {
-                    reports.set(reports.get() + 1);
-                })
-            }
-        });
-
-        // The hot path: a timeline update reports the notice that is already there.
-        pane.update(cx, |pane, cx| pane.report_no_content_notice(cx));
-        assert_eq!(reports.get(), 0, "the same notice again is not a write");
-
-        cx.update(|cx| cx.set_global(LanguageCode::ZhCn));
-
-        assert_eq!(
-            reports.get(),
-            0,
-            "a language change is not a write either: the sentence is resolved where it is drawn"
-        );
-        let chinese = cx.update(|cx| notice.resolve(cx));
-        assert_ne!(chinese, english, "the two locales differ");
-        assert_eq!(
-            notice_of(&pane, cx),
-            Some(Notice::message("widget.x.waiting")),
-            "and the pane still stands in with the same reference"
-        );
-        assert_eq!(
-            chinese,
-            cx.update(|cx| t!(cx, "widget.x.waiting")),
-            "which is what the pane says in the language showing now"
-        );
-    }
-
-    /// A pane nobody is signed in for is waiting too, with the notice that sends the reader to
-    /// the account settings: that one follows the language the same way, because it too is a
-    /// reference resolved where it is drawn.
-    #[gpui_kit::test]
-    fn a_language_change_should_relabel_the_sentence_of_a_signed_out_pane(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let (pane, _root) = signed_out_pane(cx, source);
-
-        settle_until(cx, "the pane to report waiting", |cx| {
-            pane.read(cx).status.state(cx).notice().is_some()
-        });
-        let notice = notice_of(&pane, cx).expect("a pane nobody is signed in for stands in");
-        assert_eq!(notice, Notice::message("widget.x.logged_out"));
-        let logged_out = cx.update(|cx| notice.resolve(cx));
-        assert_eq!(
-            logged_out,
-            cx.update(|cx| t!(cx, "widget.x.logged_out")),
-            "a pane nobody is signed in for says so"
-        );
-
-        cx.update(|cx| cx.set_global(LanguageCode::ZhCn));
-
-        let signed_out_now = cx.update(|cx| notice.resolve(cx));
-        assert_ne!(signed_out_now, logged_out, "the two locales differ");
-        assert_eq!(
-            signed_out_now,
-            cx.update(|cx| t!(cx, "widget.x.logged_out")),
-            "and the same reference resolves in the language showing now"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn a_timeline_from_another_account_should_not_be_shown(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let mut feed = FakeFeed::new();
-        let snapshot = feed.push("9", 9);
-
-        let applied = pane.update(cx, |pane, cx| {
-            pane.apply_latest(
-                TweetScope::new(Some(&SmolStr::new_static(OTHER_ACCOUNT)))
-                    .expect("another account is a scope"),
-                Arc::new(TweetStreamMessage::Update(TweetUpdate::published(
-                    9,
-                    snapshot,
-                    Arc::new(HashMap::new()),
-                ))),
-                cx,
-            )
-        });
-
-        assert!(!applied);
-        assert_eq!(ids_of(&pane, cx), ["1"]);
-    }
-
-    #[gpui_kit::test]
-    fn an_update_older_than_the_one_on_screen_should_not_be_shown(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let mut feed = FakeFeed::new();
-        let snapshot = feed.push("2", 2);
-        let revision = cx.update(|cx| pane.read(cx).revision);
-
-        // The same revision the pane already applied is not a newer timeline: the latest
-        // channel coalesces, so an update can arrive after one that already replaced it.
-        let applied = cx.update(|cx| {
-            let scope = pane
-                .read(cx)
-                .current_scope()
-                .expect("the pane follows an account");
-            pane.update(cx, |pane, cx| {
-                pane.apply_latest(
-                    scope,
-                    Arc::new(TweetStreamMessage::Update(TweetUpdate::published(
-                        revision,
-                        snapshot,
-                        Arc::new(HashMap::new()),
-                    ))),
-                    cx,
-                )
-            })
-        });
-
-        assert!(!applied);
-        assert_eq!(ids_of(&pane, cx), ["1"]);
-    }
-
-    #[gpui_kit::test]
-    fn a_failure_should_keep_the_timeline_and_offer_a_way_out(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1), tweet("2", 2)]);
-
-        report_status(
-            &pane,
-            TweetStatus::Failed(TweetStreamError::Transport(TransportError::Closed)),
-            cx,
-        );
-
-        let state = cx.update(|cx| pane.read(cx).status.state(cx));
-        assert!(state.is_failed());
-        let failure = state.failure().expect("a failure is what the pane reports");
-        assert!(
-            !cx.update(|cx| failure.text(cx)).is_empty(),
-            "a failure has to say what went wrong"
-        );
-        assert_eq!(
-            failure.action().label_key(),
-            "common.retry",
-            "every failure offers the way out the framework wired"
-        );
-        // What a reader was looking at is not blanked by a stream that ended.
-        assert_eq!(ids_of(&pane, cx), ["2", "1"]);
-        assert!(has_content(&pane, cx));
-    }
-
-    #[gpui_kit::test]
-    fn a_message_after_a_failure_should_not_be_applied(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        report_status(
-            &pane,
-            TweetStatus::Failed(TweetStreamError::Service(KytrixServiceError::Closed)),
-            cx,
-        );
-        let mut feed = FakeFeed::new();
-        let snapshot = feed.push("9", 9);
-
-        let applied = report_update(&pane, snapshot, Arc::new(HashMap::new()), cx);
-
-        assert!(!applied);
-        assert_eq!(ids_of(&pane, cx), ["1"]);
-    }
-
-    #[gpui_kit::test]
-    fn a_recovery_should_keep_the_timeline_and_another_account_should_drop_it(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-
-        let replacement = source.session(ACCOUNT);
-        replacement.answer_history(vec![tweet("2", 2)], vec![profile("42", "kytrix")]);
-        let _control = replacement.subscribe();
-        pane.update(cx, |pane, cx| pane.start(true, cx));
-        assert_eq!(
-            ids_of(&pane, cx),
-            ["1"],
-            "a recovery keeps what a reader was looking at"
-        );
-        settle_until(cx, "the recovered stream to come up", |cx| {
-            pane.read(cx).ready
-        });
-        settle_until(cx, "the recovered timeline to arrive", |cx| {
-            !feed_ids(pane.read(cx)).is_empty()
-        });
-        settle_until(cx, "the new tweet to be the newest row", |cx| {
-            feed_ids(pane.read(cx)) == ["2"]
-        });
-
-        // Another account is another timeline, and the pane cannot vouch for the one it has.
-        let _other = source.session(OTHER_ACCOUNT).subscribe();
-        pane.update(cx, |pane, cx| {
-            pane.reconcile_account(Some(SmolStr::new_static(OTHER_ACCOUNT)), cx);
-        });
-        assert!(ids_of(&pane, cx).is_empty());
-        assert!(!has_content(&pane, cx));
-    }
-
-    /// Another account is another timeline, and the pane hears about it from the settings
-    /// rather than from the framework: what it follows and what it was showing move together.
-    #[gpui_kit::test]
-    fn an_account_change_should_start_the_pane_over_on_the_new_account(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        assert_eq!(ids_of(&pane, cx), ["1"]);
-
-        // The stream the new account is read through is queued first, so what the pane starts
-        // over with is the account it was told about rather than a refusal to report.
-        let _other = source.session(OTHER_ACCOUNT).subscribe();
-
-        cx.update(|cx| {
-            cx.update_global::<ConfigManager, _>(|manager, cx| {
-                manager.update(
-                    |config| {
-                        config.account = Some(AccountConfig {
-                            user_id: OTHER_ACCOUNT.to_owned(),
-                            wallet_address: "0x0000000000000000000000000000000000000002".to_owned(),
-                            wallet_kind: AccountWalletKind::Ethereum,
-                        });
-                    },
-                    cx,
-                );
-            });
-        });
-
-        settle_until(cx, "the pane to follow the new account", |cx| {
-            pane.read(cx).account_id.as_deref() == Some(OTHER_ACCOUNT)
-        });
-        assert!(
-            ids_of(&pane, cx).is_empty(),
-            "another account is another timeline, so the one it left is dropped"
-        );
-        assert!(!has_content(&pane, cx));
-    }
-
-    #[gpui_kit::test]
-    fn a_read_should_wait_for_a_live_stream(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) = quiet_pane(cx, source);
-        pane.update(cx, |pane, cx| pane.load(cx));
-
-        // The stream is not live yet, so a read has nothing to answer it and is held.
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
-        });
-        assert_eq!(
-            session.state().fetches,
-            0,
-            "a read asked for before the stream is live is not sent"
-        );
-
-        settle_until(cx, "the read to go out", |cx| {
-            let _ = cx;
-            session.state().fetches == 1
-        });
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
-        });
-        settle_until(cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-        assert_eq!(usernames_of(&pane, cx), ["seven"]);
-    }
-
-    #[gpui_kit::test]
-    fn a_dialog_should_ask_for_the_accounts_and_for_their_avatars(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-
-        let _dialog = attach_dialog(&pane, cx);
-        pane.update(cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-            pane.load_selections(cx);
-        });
-
-        settle_until(cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-        assert!(cx.update(|cx| pane.read(cx).dialog_open()));
-
-        // A dismissed dialog is a pane with nothing drawing a face, and the pane stops asking
-        // for the ones it was showing.
-        pane.update(cx, |pane, cx| pane.on_dialog_closed(cx));
-        assert!(!cx.update(|cx| pane.read(cx).dialog_open()));
-    }
-
-    /// The dialog draws the page that is showing, and each page is a list of its own: what a
-    /// pane holds for one of them is not what the other one draws, and a page shown again is
-    /// the page a reader left rather than one starting over.
-    ///
-    /// The rows are drawn from the pane while the list draws them, so a frame is the only thing
-    /// that puts those two in an order.
-    #[gpui_kit::test]
-    fn a_dialog_should_draw_the_list_of_the_page_that_is_showing(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_search(vec![search_profile("9", "nine")]);
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-
-        pane.update(cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-            pane.load_selections(cx);
-        });
-        settle_until(cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-
-        let (dialog, window) = draw_dialog(cx, &pane);
-        assert!(
-            window.debug_bounds("TEST_TWEET_ACCOUNT_ROW").is_some(),
-            "the monitored page draws the accounts the pane holds"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_LIST").is_none(),
-            "what one search found belongs to the other page"
-        );
-
-        search_from_page(&pane, &dialog, "nine", window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_ROW").is_some(),
-            "the search page draws what the search found"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_ACCOUNT_LIST").is_none(),
-            "the accounts belong to the page that draws them"
-        );
-        // The page that searches X is a page over the one that manages the accounts: what it
-        // adds is added to that list, so the controls that belong to it are not drawn here.
-        assert!(
-            window.debug_bounds("TEST_TWEET_REFRESH").is_none()
-                && window.debug_bounds("TEST_TWEET_ADD_ACCOUNT").is_none(),
-            "the controls the accounts page offers belong to the accounts page"
-        );
-
-        dialog.update(&mut window.cx, |dialog, cx| dialog.go_back(cx));
-        settle_pages(window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_ACCOUNT_ROW").is_some(),
-            "a page popped back to is the page the pane still holds"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_ADD_PAGE").is_none(),
-            "the page that was popped is off the stack rather than drawn under the one on top"
-        );
-    }
-
-    /// What one dialog searched for is not what the next one draws: a search is a procedure of
-    /// the page that runs it, so its answer belongs to the dialog that asked for it and goes
-    /// with it.
-    ///
-    /// The pane keeps nothing of a search, which is why the answer cannot be drawn again — and
-    /// the dialog that opens next draws an empty query, an empty list and no spinner.
-    #[gpui_kit::test]
-    fn a_search_should_not_be_drawn_by_the_dialog_that_opens_after_it(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_search(vec![search_profile("9", "nine")]);
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let window = dialog_window(cx, &pane);
-
-        // A search run and answered from the dialog's own page, drawn by the dialog that ran it.
-        let dialog = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        window.update(|window, _| window.refresh());
-        search_from_page(&pane, &dialog, "nine", window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_ROW").is_some(),
-            "the dialog that asked for the search should draw what it found"
-        );
-
-        // The dialog is closed and another one opens over the same pane. The handle this test
-        // holds goes with the close, because a dialog is released once the layer stops drawing it
-        // and nothing else holds it — which is what tells the pane that it is gone.
-        close_dialog_from_its_footer(dialog, &pane, window);
-        assert!(
-            !window.cx.update(|cx| pane.read(cx).dialog_open()),
-            "the closed dialog should leave the pane holding none"
-        );
-
-        let second = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        second.update(&mut window.cx, |dialog, cx| dialog.open_add(cx));
-        settle_pages(window);
-
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_ROW").is_none(),
-            "what the last dialog searched for is not this dialog's to draw"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_LIST").is_none(),
-            "nor is the list it was drawn in"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCHING").is_none(),
-            "a dialog just opened is not waiting for a search it never asked for"
-        );
-    }
-
-    /// A search is not something the accounts are waiting for, so a dialog dismissed while one
-    /// is out leaves the pane able to read the accounts and to change them: what it must not do
-    /// is keep waiting for an answer that the dismissal took the place of.
-    ///
-    /// Nothing answers the search this is asserted with, so the pane is still waiting for it when
-    /// the dialog goes: what stops it waiting is the dismissal, and a pane that a dismissal left
-    /// waiting would show it here rather than in the change it refuses next.
-    #[gpui_kit::test]
-    fn a_search_that_is_out_when_the_dialog_closes_should_leave_nothing_waiting(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
-        // The search this dialog is dismissed over is one the service never answers, so it is
-        // still out for as long as the pane is waiting for it.
-        let _held = session.block_search();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let window = dialog_window(cx, &pane);
-
-        let dialog = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-
-        // The search is asked for with nothing pumped in between, so it is still out when the
-        // dialog is dismissed: what stops the pane waiting for it is the dismissal, because the
-        // answer this one is waiting for is never given.
-        pane.update(&mut window.cx, |pane, cx| {
-            assert!(pane.search_users(SmolStr::new_static("nine"), cx));
-        });
-        settle_until(
-            &mut window.cx,
-            "the held search to reach the service",
-            |cx| {
-                let _ = cx;
-                session.state().searches_made == 1
-            },
-        );
-        assert!(
-            window.cx.update(|cx| pane.read(cx).searching.is_some()),
-            "the search should be out when the dialog is dismissed"
-        );
-        assert!(
-            window.cx.update(|cx| pane.read(cx).pending.is_none()),
-            "a search is not an operation the accounts are waiting for"
-        );
-
-        close_dialog_from_its_footer(dialog, &pane, window);
-        assert!(!window.cx.update(|cx| pane.read(cx).dialog_open()));
-        assert!(
-            window.cx.update(|cx| pane.read(cx).searching.is_none()),
-            "the pane should stop waiting for the search of the closed dialog"
-        );
-        assert!(
-            window.cx.update(|cx| pane.read(cx).pending.is_none()),
-            "nothing should be left waiting for a search that will not be answered"
-        );
-
-        // The pane is still able to read the accounts, and still able to change them.
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        pane.update(&mut window.cx, |pane, cx| {
-            assert!(
-                pane.load_selections(cx),
-                "the accounts should be readable again"
-            );
-        });
-        settle_until(&mut window.cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some() && pane.read(cx).pending.is_none()
-        });
-        pane.update(&mut window.cx, |pane, cx| {
-            assert!(
-                pane.add_selection(SmolStr::new_static("eight"), cx),
-                "an account should be addable again"
-            );
-        });
-        settle_until(&mut window.cx, "the account to join the list", |cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.selections().len() == 2)
-        });
-        assert_eq!(usernames_of(&pane, &mut window.cx), ["seven", "eight"]);
-
-        // And the dialog that opens next is not waiting for a search either.
-        let _second = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        window.update(|window, _| window.refresh());
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCHING").is_none(),
-            "a dialog that has just opened should not be showing a search that is over"
-        );
-    }
-
-    /// A search that has just gone out is what the page that sent it draws.
-    ///
-    /// What a search being out looks like is read from the pane, so the pane is what has to tell
-    /// the dialog that the page changed: a page that is not told goes on drawing the answer
-    /// before the search — or nothing at all — while the pane turns the next one away, with
-    /// nothing on screen to say why.
-    ///
-    /// The search is sent here the way this file's own pane tests send one rather than from the
-    /// page's control, because the control cannot assert this: it keeps its own hover and press
-    /// state in the window, and a change to the state a control keeps redraws the page it is
-    /// drawn on — which redraws the dialog above it — so a frame drawn for a click shows the
-    /// search being out even for a pane that told the dialog nothing at all.
-    #[gpui_kit::test]
-    fn a_search_that_has_just_been_sent_should_be_drawn_as_out(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        // Nothing answers this search, so what the page draws after it is sent is the search
-        // being out rather than whatever an answer would have put in its place.
-        let _held = session.block_search();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let (dialog, window) = draw_dialog(cx, &pane);
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-        });
-        dialog.update(&mut window.cx, |dialog, cx| dialog.open_add(cx));
-        settle_pages(window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCHING").is_none(),
-            "a page nothing has been searched from is not waiting for a search"
-        );
-
-        // The search goes out with nothing else changing in the window, so the frame the pane
-        // asks for is the only thing that can draw it: a pane that asks for none leaves the page
-        // showing what it drew while no search was out.
-        window.cx.update(|cx| {
-            pane.update(cx, |pane, cx| {
-                assert!(pane.search_users(SmolStr::new_static("nine"), cx));
-            });
-        });
-
-        assert!(
-            window.cx.update(|cx| pane.read(cx).searching.is_some()),
-            "the search should be out"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCHING").is_some(),
-            "the page that sent the search should draw it as out on the frame it went out on"
-        );
-    }
-
-    /// A dialog dismissed over a pane whose stream is down takes its search with it as well.
-    ///
-    /// A search that is out is a search the stream can go down under, and the call that stops the
-    /// watch a dialog asked for is one a pane without a live stream does not make: there is
-    /// nothing to displace the search, so the dismissal is what has to take it — or the pane sits
-    /// on a search whose page is gone and turns every change away.
-    #[gpui_kit::test]
-    fn a_search_should_go_with_a_dialog_dismissed_over_a_pane_whose_stream_went_down(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let _held = session.block_search();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let window = dialog_window(cx, &pane);
-
-        let dialog = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        pane.update(&mut window.cx, |pane, cx| {
-            assert!(pane.search_users(SmolStr::new_static("nine"), cx));
-        });
-        settle_until(
-            &mut window.cx,
-            "the held search to reach the service",
-            |cx| {
-                let _ = cx;
-                session.state().searches_made == 1
-            },
-        );
-
-        // The stream reports that it is connecting again, which is the pane still following the
-        // account with nothing live behind it: a search out here is one the dismissal has to
-        // answer for.
-        report_status(&pane, TweetStatus::Connecting, &mut window.cx);
-        assert!(
-            !window.cx.update(|cx| pane.read(cx).ready),
-            "the pane should not be reading over a stream that is not live"
-        );
-
-        close_dialog_from_its_footer(dialog, &pane, window);
-        assert!(!window.cx.update(|cx| pane.read(cx).dialog_open()));
-        assert!(
-            window.cx.update(|cx| pane.read(cx).searching.is_none()),
-            "closing the dialog should take the search of a pane whose stream is down"
-        );
-    }
-
-    /// The two pages are pushed and popped, and each control that does it is the one in the
-    /// header of the page it belongs to.
-    #[gpui_kit::test]
-    fn a_dialog_should_push_and_pop_its_search_page_with_the_controls_in_its_headers(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let (_, window) = draw_dialog(cx, &pane);
-
-        // The accounts are read, so that the page the search is pushed over has rows to draw and
-        // the pop below has something to come back to.
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-            pane.load_selections(cx);
-        });
-        settle_until(&mut window.cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-        window.update(|window, _| window.refresh());
-
-        // The page the stack opens on is the accounts, and the control that opens the search is
-        // the add button in its header.
-        let add = window
-            .debug_bounds("TEST_TWEET_ADD_ACCOUNT")
-            .expect("the accounts page should draw the control that searches X")
-            .center();
-        window.simulate_click(add, Modifiers::none());
-        settle_pages(window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_ADD_PAGE").is_some(),
-            "the control in the accounts header should push the search page"
-        );
-
-        // The control at the top of the search page's own header is what pops it again.
-        let back = window
-            .debug_bounds("TEST_TWEET_BACK")
-            .expect("the search page should draw the control that goes back")
-            .center();
-        window.simulate_click(back, Modifiers::none());
-        settle_pages(window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_ADD_PAGE").is_none(),
-            "the control at the top of the search page should pop it off the stack"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_ACCOUNT_ROW").is_some(),
-            "the page the search was pushed over should be the one it is popped back to"
-        );
-    }
-
-    /// The control at the foot of the dialog closes it by emitting the event the layer listens for,
-    /// rather than by asking the window to dismiss whatever is on top.
-    ///
-    /// What tells the two apart is that emitting closes *this* dialog wherever it sits, so what the
-    /// test reads is that the dialog leaves the layer once its exit transition has settled — the
-    /// same thing the footer's control used to ask the window for.
-    #[gpui_kit::test]
-    fn a_control_at_the_foot_of_the_dialog_should_close_it(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let window = dialog_window(cx, &pane);
-
-        let dialog = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        window.update(|window, _| window.refresh());
-        assert!(
-            window.debug_bounds("TEST_TWEET_CLOSE").is_some(),
-            "the dialog should draw the control at its foot"
-        );
-
-        close_dialog_from_its_footer(dialog, &pane, window);
-
-        assert!(
-            !window.cx.update(|cx| pane.read(cx).dialog_open()),
-            "the control at the foot of the dialog should have closed it"
-        );
-        window.update(|window, _| window.refresh());
-        assert!(
-            window.debug_bounds("TEST_TWEET_CLOSE").is_none(),
-            "the dialog the control closed should be off the layer once its exit transition is over"
-        );
-    }
-
-    /// A dialog closed by the control at its foot still runs the pane's cleanup, which is what
-    /// stops it asking for avatars nobody is drawing and what takes a search that is out with it.
-    ///
-    /// The cleanup is hung on the dialog *entity* rather than on the event the control emits,
-    /// because that is the only hook that runs on every way a dialog can go. What it leaves behind
-    /// is what this reads: a search still held by the pane is a pane waiting for an answer to a
-    /// page that is gone, and it is what turns the next change away.
-    #[gpui_kit::test]
-    fn a_dialog_closed_by_its_own_control_should_still_be_cleaned_up_after(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        // Nothing answers this search, so it is still out when the dialog is closed: what takes it
-        // away is the cleanup, and a pane left holding it would show it here.
-        let _held = session.block_search();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let window = dialog_window(cx, &pane);
-
-        let dialog = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        pane.update(&mut window.cx, |pane, cx| {
-            assert!(pane.search_users(SmolStr::new_static("nine"), cx));
-        });
-        settle_until(
-            &mut window.cx,
-            "the held search to reach the service",
-            |cx| {
-                let _ = cx;
-                session.state().searches_made == 1
-            },
-        );
-        assert!(
-            window.cx.update(|cx| pane.read(cx).searching.is_some()),
-            "the search should be out when the dialog is closed"
-        );
-
-        close_dialog_from_its_footer(dialog, &pane, window);
-
-        assert!(
-            !window.cx.update(|cx| pane.read(cx).dialog_open()),
-            "the dialog the control closed should have left the pane holding none"
-        );
-        assert!(
-            window.cx.update(|cx| pane.read(cx).searching.is_none()),
-            "the pane should stop waiting for the search of a dialog its own control closed"
-        );
-        assert!(
-            window.cx.update(|cx| pane.read(cx).pending.is_none()),
-            "nothing should be left waiting for a search that will not be answered"
-        );
-    }
-
-    /// Lets one page finish sliding over the other.
-    ///
-    /// The page on top of a change is the page showing once the transition is over; until then
-    /// both of them are mounted, which is what a frame drawn right after the push would see.
-    fn settle_pages(window: &mut VisualTestContext) {
-        window.executor().advance_clock(Duration::from_millis(400));
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-    }
-
-    /// The dialog is one panel of a fixed height, so what its pages are drawn in is what is left
-    /// of that height once the way out of it is laid out at the foot.
-    ///
-    /// A page that took the whole height rather than what is left would push the control at the
-    /// foot of the dialog past the edge of the panel it is drawn in.
-    #[gpui_kit::test]
-    fn a_dialogs_pages_should_not_push_the_way_out_of_it_past_its_panel(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let (_, window) = draw_dialog(cx, &pane);
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-            pane.load_selections(cx);
-        });
-        settle_until(&mut window.cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-        window.update(|window, _| window.refresh());
-
-        let close = drawn(window, "TEST_TWEET_CLOSE");
-        let list = drawn(window, "TEST_TWEET_ACCOUNT_LIST");
-
-        assert!(
-            list.bottom() <= close.top(),
-            "the way out of the dialog is drawn under the page rather than over it"
-        );
-    }
-
-    /// The page a change puts on top covers the page it is over, and both keep the box a page is
-    /// drawn in while they travel.
-    ///
-    /// Two pages are drawn at once for the length of a change, which is the only time either of
-    /// them is not the whole of what the panel holds. So the page on top has to be as wide as that
-    /// box wherever it is in its journey — a page squeezed between the two edges it is placed by
-    /// would be a page that reflows as it moves — and it has to carry the surface it is drawn on,
-    /// or what is under it reads through the header and the field of the page over it.
-    ///
-    /// What the surface is *is* the panel's own token (`components.dialog.background`, which
-    /// is what `base_ui::dialog::Dialog` paints the panel with), so what this pins is that a page
-    /// paints that token and nothing else: the panel itself is not in this window — the dialog is
-    /// attached to the pane rather than opened through the layer — so a test cannot read the two
-    /// off one frame and compare them.
-    #[gpui_kit::test]
-    fn a_page_on_its_way_in_should_cover_the_page_it_is_over(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let (dialog, window) = draw_dialog(cx, &pane);
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-            pane.load_selections(cx);
-        });
-        settle_until(&mut window.cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-        window.update(|window, _| window.refresh());
-
-        // The box a page fills, read off the page that is showing before the change starts.
-        let page_box = drawn(window, "TEST_TWEET_MONITORED_PAGE");
-        let surface = window
-            .cx
-            .update(|cx| cx.theme().components.dialog.background.hsla);
-
-        dialog.update(&mut window.cx, |dialog, cx| dialog.open_add(cx));
-        window.run_until_parked();
-        // Halfway through: both pages are inside the panel, and the one arriving is over the one
-        // it is covering rather than beside it.
-        window
-            .executor()
-            .advance_clock(crate::dialog::PAGE_TRANSITION / 2);
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-
-        let covered = drawn(window, "TEST_TWEET_MONITORED_PAGE");
-        let arriving = drawn(window, "TEST_TWEET_ADD_PAGE");
-        assert_eq!(
-            (arriving.size, covered.size),
-            (page_box.size, page_box.size),
-            "a page is the size of the box it is drawn in, wherever it is on its way in from: \
-             {arriving:?} and {covered:?} against {page_box:?}"
-        );
-        assert!(
-            arriving.left() > covered.left(),
-            "the page arriving is the page over the one it covers: {arriving:?} against {covered:?}"
-        );
-        assert_eq!(
-            painted_surface(window, "TEST_TWEET_ADD_PAGE"),
-            Some(surface),
-            "the page on top carries the panel's own surface"
-        );
-        assert_eq!(
-            painted_surface(window, "TEST_TWEET_MONITORED_PAGE"),
-            Some(surface),
-            "and so does the page it is covering"
-        );
-    }
-
-    /// Every place of a list is laid out at the height of the first row it measures, so a row
-    /// that is not the height its content needs is a row the places after it are drawn out of
-    /// step with.
-    ///
-    /// What a row used to be given was the height of a control — one line — while a dialog's row
-    /// holds a face and the lines beside it, so the row is given a height of its own here and
-    /// measured where it is drawn.
-    #[gpui_kit::test]
-    fn a_dialogs_rows_should_be_drawn_at_a_height_their_content_fits_in(cx: &mut TestAppContext) {
-        /// The height one row of either of the dialog's lists is given.
-        const ROW: f32 = 72.0;
-
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_search(vec![search_profile("9", "nine")]);
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let (dialog, window) = draw_dialog(cx, &pane);
-
-        // The pane is driven through the window's own context: the dialog and the pane are read
-        // in one application, and the window is what the tests below measure a frame of.
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-            pane.load_selections(cx);
-        });
-        settle_until(&mut window.cx, "the accounts to arrive", |cx| {
-            pane.read(cx).selections.is_some()
-        });
-        window.update(|window, _| window.refresh());
-
-        assert_eq!(
-            drawn(window, "TEST_TWEET_ACCOUNT_ROW").size.height,
-            px(ROW),
-            "a monitored account is drawn at the height its list lays its places out at"
-        );
-
-        // A face is the tallest thing a row holds, and it has to be drawn at its own size and
-        // inside the row rather than over the edge of it: a row drawn the height of a control
-        // clips exactly this.
-        let face = drawn(window, "TEST_TWEET_ACCOUNT_AVATAR");
-        let row = drawn(window, "TEST_TWEET_ACCOUNT_ROW");
-        assert_eq!(
-            face.size.height,
-            px(42.0),
-            "a row draws the face it was given at the size it was given"
-        );
-        assert!(
-            face.top() >= row.top() && face.bottom() <= row.bottom(),
-            "the face of a row sits inside the row rather than over the edge of it"
-        );
-
-        // The page that searches X draws rows of the same size.
-        search_from_page(&pane, &dialog, "nine", window);
-        assert_eq!(
-            drawn(window, "TEST_TWEET_SEARCH_ROW").size.height,
-            px(ROW),
-            "an account one search found is drawn at the height its list lays its places out at"
-        );
-        let face = drawn(window, "TEST_TWEET_SEARCH_AVATAR");
-        let row = drawn(window, "TEST_TWEET_SEARCH_ROW");
-        assert!(
-            face.top() >= row.top() && face.bottom() <= row.bottom(),
-            "the face of a row of either list sits inside the row"
-        );
-    }
-
-    /// The dialog's own controls are the sizes the dialog asks for: a field as tall as a field,
-    /// a control as tall as a control, and the one at the foot of the dialog a way out of it.
-    ///
-    /// Nothing reads a control's size back off a style, so what each control was given is what
-    /// the frame drew it at.
-    #[gpui_kit::test]
-    fn a_dialogs_controls_should_be_drawn_at_the_sizes_the_dialog_asks_for(
-        cx: &mut TestAppContext,
-    ) {
-        /// The height a control is drawn at when the dialog asks for the medium size.
-        const MEDIUM: f32 = 30.0;
-
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1)]);
-        let (dialog, window) = draw_dialog(cx, &pane);
-
-        // The field the accounts are filtered by, and the way out at the foot of the dialog.
-        for field in ["TEST_TWEET_FILTER_FIELD", "TEST_TWEET_CLOSE"] {
-            assert_eq!(
-                drawn(window, field).size.height,
-                px(MEDIUM),
-                "{field} is a control the dialog asks the medium size for"
-            );
-        }
-
-        // The header's controls are medium, and the row they are laid out in reads the way to
-        // add an account before the way to read the same accounts again.
-        for control in ["TEST_TWEET_REFRESH", "TEST_TWEET_ADD_ACCOUNT"] {
-            assert_eq!(
-                drawn(window, control).size.height,
-                px(MEDIUM),
-                "{control} is a control the dialog asks the medium size for"
-            );
-        }
-        assert!(
-            drawn(window, "TEST_TWEET_ADD_ACCOUNT").left()
-                < drawn(window, "TEST_TWEET_REFRESH").left(),
-            "the way to add an account comes before the way to read the accounts again, which \
-             is the order the two controls were exchanged for"
-        );
-
-        // The page that searches X has a field of its own, drawn at the same size.
-        dialog.update(&mut window.cx, |dialog, cx| dialog.open_add(cx));
-        settle_pages(window);
-        assert_eq!(
-            drawn(window, "TEST_TWEET_QUERY_FIELD").size.height,
-            px(MEDIUM)
-        );
-    }
-
-    /// The frame the dialog is drawn in, inside the window layer that holds it.
-    struct DialogHarness {
-        dialog: Entity<TweetDialog>,
-    }
-
-    impl Render for DialogHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.dialog.clone())
-        }
-    }
-
-    /// A window with a frame of its own for the dialog a pane holds.
-    ///
-    /// `show` itself needs the window layer the application installs, so what a test attaches is
-    /// the same dialog the pane would hold, drawn in a window whose root is that layer: it is
-    /// also where an alert a change is reported in is opened, over the dialog it is about.
-    fn draw_dialog<'a>(
-        cx: &'a mut TestAppContext,
-        pane: &Entity<XWidget>,
-    ) -> (Entity<TweetDialog>, &'a mut VisualTestContext) {
-        let dialog = attach_dialog(pane, cx);
-        let (_, window) = cx.add_window_view({
-            let dialog = dialog.clone();
-            move |_, cx| Layer::new(cx.new(move |_| DialogHarness { dialog }))
-        });
-        window.run_until_parked();
-
-        (dialog, window)
-    }
-
-    /// A window whose root is the application's dialog layer, with the pane drawn in it.
-    ///
-    /// This is the window a dialog is really opened over and dismissed from: the pane's own
-    /// control opens it, the layer holds it while it is open, and the layer is what drops it
-    /// once it has left — which is the only thing that tells the pane its dialog is gone.
-    fn dialog_window<'a>(
-        cx: &'a mut TestAppContext,
-        pane: &Entity<XWidget>,
-    ) -> &'a mut VisualTestContext {
-        let pane = pane.clone();
-        let (_, window) =
-            cx.add_window_view(move |_, cx| Layer::new(cx.new(move |_| PaneHarness { pane })));
-        window.run_until_parked();
-
-        window
-    }
-
-    /// Opens the pane's dialog over the layer, as the pane's own control does.
-    fn open_dialog(pane: &Entity<XWidget>, window: &mut VisualTestContext) -> Entity<TweetDialog> {
-        window.update(|window, cx| TweetDialog::show(pane.downgrade(), window, cx));
-        settle_pages(window);
-
-        window.update(|_, cx| {
-            pane.read(cx)
-                .dialog
-                .as_ref()
-                .and_then(WeakEntity::upgrade)
-                .expect("the pane should hold the dialog it opened")
-        })
-    }
-
-    /// Closes the dialog by the control at the foot of it, which is the way a reader closes it.
-    ///
-    /// This is the path the dialog closes itself by: the control emits the event the layer reads,
-    /// rather than asking the window to close whatever happens to be on top. The dialog is closed
-    /// here and nowhere else — there is no way to close one from outside it — so this is what every
-    /// test that needs a dialog gone goes through.
-    ///
-    /// The test's own handle on the dialog goes once the click has been made, because the layer has
-    /// to be the last thing holding it from then on: a handle kept here would keep the dialog's
-    /// state alive after it has left, and the release below — which is the only thing that tells the
-    /// pane it is gone — would never run.
-    fn close_dialog_from_its_footer(
-        dialog: Entity<TweetDialog>,
-        pane: &Entity<XWidget>,
-        window: &mut VisualTestContext,
-    ) {
-        let close = window
-            .debug_bounds("TEST_TWEET_CLOSE")
-            .expect("the dialog should draw the control at its foot")
-            .center();
-
-        window.simulate_click(close, Modifiers::none());
-        drop(dialog);
-
-        for _ in 0..4 {
-            settle_pages(window);
-            if !window.cx.update(|cx| pane.read(cx).dialog_open()) {
-                return;
-            }
-        }
-        panic!("the control at the foot of the dialog should have closed it");
-    }
-
-    /// Where one selector is drawn, which is the only thing a test can read a control's own size
-    /// or place back from: there is no style to read off an element once it is a frame.
-    fn drawn(window: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
-        window
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("the dialog should draw {selector}"))
-    }
-
-    /// What one page is painted on: the colour of the quad the page's own box was painted with.
-    ///
-    /// Where a page is drawn is read off the frame's selectors, what it is drawn *on* is read off
-    /// the frame's quads — the one thing a page can cover the page under it with. The bounds are
-    /// compared in device pixels, which is the unit both are recorded in: a frame's quads are the
-    /// layout snapped to them, so the two agree exactly at any whole scale factor — which is what
-    /// the windows tests are drawn in.
-    fn painted_surface(window: &mut VisualTestContext, selector: &'static str) -> Option<Hsla> {
-        let bounds = window.debug_bounds(selector)?;
-        let scale = window.update(|window, _| window.scale_factor());
-        window
-            .update(|window, _| window.painted_quads())
-            .into_iter()
-            .find(|quad| quad.bounds == bounds.scale(scale))
-            .and_then(|quad| quad.background.as_solid())
-    }
-
-    /// Lets the alert a change is reported in arrive and be drawn.
-    ///
-    /// The alert is opened at the end of the effect cycle the frame that read the report was
-    /// drawn in, so the frame that draws the dialog is not the frame that draws the alert.
-    fn settle_alert(window: &mut VisualTestContext) {
-        window.executor().advance_clock(Duration::from_millis(400));
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-    }
-
-    /// A change reports itself in an alert over the dialog, rather than in a line of the page
-    /// that asked for it.
-    ///
-    /// The report is not a question, so it is one alert with the one button that says it was
-    /// read rather than one with a way of saying no.
-    #[gpui_kit::test]
-    fn a_change_that_was_refused_should_be_reported_in_an_alert(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let (_, window) = draw_dialog(cx, &pane);
-
-        session.answer_add(XMutationOutcome::Rejected(XApiError::QuotaExceeded));
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx);
-        });
-        settle_until(&mut window.cx, "the refusal to be reported", |cx| {
-            pane.read(cx).notice.is_some()
-        });
-        settle_alert(window);
-
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_some(),
-            "a change that was refused should be reported over the dialog"
-        );
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT_OK").is_some(),
-            "the report should offer the button that says it was read"
-        );
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT_CANCEL").is_none(),
-            "a report asks nothing, so it should not offer a way of saying no"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_ACCOUNT_LIST").is_some(),
-            "the dialog the change was asked for in should still be drawn under the report"
-        );
-    }
-
-    /// An account that joined the list is reported in the same alert, and what a change said is
-    /// reported once: the frames after the alert are not the change reported again.
-    #[gpui_kit::test]
-    fn a_change_should_be_reported_once(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let (_, window) = draw_dialog(cx, &pane);
-
-        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx);
-        });
-        settle_until(&mut window.cx, "the account to join the list", |cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.selections().len() == 2)
-        });
-        settle_alert(window);
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_some(),
-            "an account that joined the list should be reported too"
-        );
-
-        // The report is read, which is the whole of answering it.
-        let ok = window
-            .debug_bounds("BASE_UI_ALERT_OK")
-            .expect("the report should offer the button that says it was read")
-            .center();
-        window.simulate_click(ok, Modifiers::none());
-        settle_alert(window);
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_none(),
-            "reading the report should leave nothing raised"
-        );
-
-        // The pane still holds what the change said, so what the frames after it draw is what
-        // says whether the dialog reports the change again or leaves it reported.
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_none(),
-            "a change should be one alert rather than one per frame the dialog is drawn in"
-        );
-    }
-
-    /// A report the pane was already holding when a dialog opened was not made to that dialog:
-    /// what a dialog raises is what a change says while it is there to hear it.
-    ///
-    /// The pane holds what a change said until another change replaces it, so a dialog that
-    /// started out with nothing reported would read a report from before it opened as one it had
-    /// not raised — and raise the alert of a session that is over.
-    #[gpui_kit::test]
-    fn a_notice_the_pane_was_already_holding_should_not_be_raised_by_a_new_dialog(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        // A change that was answered while no dialog was open: the pane holds what it said, and
-        // nobody was there to be told.
-        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-        });
-        settle_until(cx, "the change to be answered", |cx| {
-            pane.read(cx).notice.is_some()
-        });
-
-        let (_, window) = draw_dialog(cx, &pane);
-        settle_alert(window);
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_none(),
-            "a change the dialog was not there to hear is not one it raises"
-        );
-    }
-
-    /// A dialog that opens over a change a previous one made does not raise it again: the alert
-    /// belongs to the session that asked for the change, and reopening the dialog is a new one.
-    #[gpui_kit::test]
-    fn a_change_a_previous_dialog_reported_should_not_be_raised_again(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let window = dialog_window(cx, &pane);
-
-        // A change made from the dialog, reported in the alert over it and read there.
-        let dialog = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx);
-        });
-        settle_until(&mut window.cx, "the change to be reported", |cx| {
-            pane.read(cx).notice.is_some()
-        });
-        settle_alert(window);
-        let ok = window
-            .debug_bounds("BASE_UI_ALERT_OK")
-            .expect("the report should offer the button that says it was read")
-            .center();
-        window.simulate_click(ok, Modifiers::none());
-        settle_alert(window);
-
-        // The dialog goes, and another one opens over the same pane.
-        close_dialog_from_its_footer(dialog, &pane, window);
-        assert!(
-            !window.cx.update(|cx| pane.read(cx).dialog_open()),
-            "the dialog that went should leave the pane holding none"
-        );
-        let _second = open_dialog(&pane, window);
-        settle_until(&mut window.cx, "the accounts to be read", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        settle_alert(window);
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_none(),
-            "a report a previous dialog made should not be raised by the next one"
-        );
-    }
-
-    /// A change is asked for from the dialog and made by the pane, which then has to repaint
-    /// the dialog — from inside a frame the dialog is already being updated for, which is the
-    /// one time an entity may not be asked to update itself.
-    ///
-    /// This is the chain the control beside a search result starts: the dialog's frame, the
-    /// pane's act, and the repaint the pane owes the dialog for it.
-    #[gpui_kit::test]
-    fn adding_an_account_should_not_re_enter_the_dialog_that_asked_for_it(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let dialog = attach_dialog(&pane, cx);
-
-        cx.update(|cx| {
-            dialog.update(cx, |_, cx| {
-                pane.update(cx, |pane, cx| {
-                    assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-                });
-            });
-        });
-        cx.update(|cx| {
-            assert_eq!(
-                pane.read(cx)
-                    .pending
-                    .as_ref()
-                    .and_then(|pending| pending.target.as_deref()),
-                Some("eight"),
-                "the account that was asked for is the one the change carries"
-            );
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_confirmed_add_should_join_the_list_and_be_noticed(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        session.answer_add(XMutationOutcome::Confirmed(selection("8", "eight")));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-        });
-        settle_until(cx, "the account to join the list", |cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.selections().len() == 2)
-        });
-        assert_eq!(usernames_of(&pane, cx), ["seven", "eight"]);
-        assert!(matches!(
-            cx.update(|cx| pane.read(cx).notice.clone()),
-            Some(SelectionNotice::Added)
-        ));
-    }
-
-    #[gpui_kit::test]
-    fn a_refused_add_should_say_why_and_leave_the_list_alone(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        session.answer_add(XMutationOutcome::Rejected(XApiError::QuotaExceeded));
-        pane.update(cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx);
-        });
-        settle_until(cx, "the refusal to be noticed", |cx| {
-            pane.read(cx).notice.is_some()
-        });
-
-        assert!(matches!(
-            cx.update(|cx| pane.read(cx).notice.clone()),
-            Some(SelectionNotice::Problem(SelectionFailure::Rejected(
-                XApiError::QuotaExceeded
-            )))
-        ));
-        assert_eq!(usernames_of(&pane, cx), ["seven"]);
-    }
-
-    #[gpui_kit::test]
-    fn an_unknown_add_should_say_so_and_leave_the_list_alone(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        session.answer_add(XMutationOutcome::Unknown(XMutationUnknown::Timeout));
-        pane.update(cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx);
-        });
-        settle_until(cx, "the unknown outcome to be noticed", |cx| {
-            pane.read(cx).notice.is_some()
-        });
-
-        assert!(matches!(
-            cx.update(|cx| pane.read(cx).notice.clone()),
-            Some(SelectionNotice::Problem(SelectionFailure::Unknown(
-                XMutationUnknown::Timeout
-            )))
-        ));
-        assert_eq!(usernames_of(&pane, cx), ["seven"]);
-    }
-
-    #[gpui_kit::test]
-    fn a_confirmed_delete_should_leave_the_list(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane_reading(
-            cx,
-            &source,
-            &session,
-            vec![selection("7", "seven"), selection("8", "eight")],
-            3,
-        );
-
-        session.answer_delete(XMutationOutcome::Confirmed(()));
-        pane.update(cx, |pane, cx| {
-            pane.delete_selection(SmolStr::new_static("7"), cx);
-        });
-        settle_until(cx, "the account to leave the list", |cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.selections().len() == 1)
-        });
-        assert_eq!(usernames_of(&pane, cx), ["eight"]);
-        assert!(cx.update(|cx| pane.read(cx).notice.is_none()));
-    }
-
-    #[gpui_kit::test]
-    fn a_change_that_could_not_be_read_should_be_a_problem(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane_reading(cx, &source, &session, Vec::new(), 3);
-
-        session.refuse_selections(XApiError::Closed);
-        pane.update(cx, |pane, cx| {
-            pane.load_selections(cx);
-        });
-        settle_until(cx, "the failure to be noticed", |cx| {
-            pane.read(cx).notice.is_some()
-        });
-
-        assert!(matches!(
-            cx.update(|cx| pane.read(cx).notice.clone()),
-            Some(SelectionNotice::Problem(SelectionFailure::Rpc(_)))
-        ));
-    }
-
-    #[gpui_kit::test]
-    fn a_change_should_be_refused_while_the_stream_is_not_live(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let _session = source.session(ACCOUNT);
-        let (pane, _root) = quiet_pane(cx, source);
-
-        let started = pane.update(cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx)
-        });
-
-        assert!(!started, "nothing may be changed without a live stream");
-    }
-
-    #[gpui_kit::test]
-    fn a_change_a_started_stream_displaced_should_be_forgotten(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        // A change is in flight, and the user restarts the stream before it answers: what
-        // became of it is not something the pane knows, so it stops waiting for it.
-        let block = session.block_mutation();
-        pane.update(cx, |pane, cx| {
-            pane.add_selection(SmolStr::new_static("eight"), cx);
-        });
-        assert!(cx.update(|cx| pane.read(cx).pending.is_some()));
-        // The change is in flight once the session has been asked for it, which is what the
-        // hold is inside.
-        settle_until(cx, "the change to be in flight", |cx| {
-            let _ = cx;
-            session.state().add_calls == 1
-        });
-
-        let replacement = source.session(ACCOUNT);
-        replacement.answer_history(vec![tweet("1", 1)], vec![profile("42", "kytrix")]);
-        let _control = replacement.subscribe();
-        pane.update(cx, |pane, cx| pane.start(true, cx));
-
-        assert!(cx.update(|cx| pane.read(cx).pending.is_none()));
-        settle_until(cx, "the displaced change to be let go", |cx| {
-            let _ = cx;
-            block.is_dropped()
-        });
-    }
-
-    /// What a search found belongs to the query it was asked with, so editing the query takes
-    /// the answer away rather than leaving it under a query it does not stand for — and what the
-    /// next query is searched with is drawn in its place.
-    ///
-    /// The two searches find different accounts, which is what makes the page's own answer
-    /// readable: the row the page draws is the one the second search found, named with a name
-    /// the first one's row is not drawn at.
-    #[gpui_kit::test]
-    fn a_search_answer_should_belong_to_the_query_that_asked_for_it(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_search(vec![search_profile("9", "nine")]);
-        session.answer_search(vec![search_profile("19", "nineteen")]);
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let (dialog, window) = draw_dialog(cx, &pane);
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-        });
-
-        search_from_page(&pane, &dialog, "nine", window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_ROW").is_some(),
-            "the search page should draw the row the search found"
-        );
-        let first = drawn(window, "TEST_TWEET_PROFILE_NAME").size.width;
-
-        // Editing the query is a question this answer was not to, so the page stops drawing it.
-        let field = window
-            .debug_bounds("TEST_TWEET_QUERY_FIELD")
-            .expect("the search page should draw the field X is searched with")
-            .center();
-        window.simulate_click(field, Modifiers::none());
-        window.simulate_input("teen");
-        settle_pages(window);
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_ROW").is_none(),
-            "an answer should not be drawn under a query it does not stand for"
-        );
-
-        // And what the next search answers is drawn in its place: the page draws the account
-        // that search found, in the name that account is drawn with.
-        let search = window
-            .debug_bounds("TEST_TWEET_SEARCH")
-            .expect("the search page should draw the control that sends the search")
-            .center();
-        window.simulate_click(search, Modifiers::none());
-        settle_until(&mut window.cx, "the second search to be answered", |cx| {
-            pane.read(cx).searching.is_none()
-        });
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_ROW").is_some(),
-            "the page should draw what the search it just ran found"
-        );
-        assert_eq!(
-            session.state().searches_made,
-            2,
-            "both searches should have reached the service"
-        );
-        assert!(
-            drawn(window, "TEST_TWEET_PROFILE_NAME").size.width > first,
-            "the row the page draws should be the account the second query found rather than the one the first did"
-        );
-    }
-
-    /// A search that found nobody is an answer, and the page that asked says so: an empty result
-    /// is not the same as a query nothing has been searched with.
-    #[gpui_kit::test]
-    fn an_empty_search_answer_should_say_so_on_the_page_that_asked(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_search(Vec::new());
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let (dialog, window) = draw_dialog(cx, &pane);
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-        });
-
-        search_from_page(&pane, &dialog, "nobody", window);
-
-        assert!(
-            window
-                .debug_bounds("TEST_TWEET_NO_SEARCH_RESULTS")
-                .is_some(),
-            "an answer with nobody in it should say so on the page that asked"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_LIST").is_none(),
-            "there are no rows for a search that found none"
-        );
-    }
-
-    /// A search that could not be answered is drawn where it was asked for, in the words the
-    /// failure itself gives — and it is not an alert over the dialog, because a search is not a
-    /// change to the accounts.
-    #[gpui_kit::test]
-    fn a_search_that_could_not_be_answered_should_be_drawn_where_it_was_asked(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        // Nothing answers a search, which is a service that refuses to answer it.
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let (dialog, window) = draw_dialog(cx, &pane);
-        pane.update(&mut window.cx, |pane, cx| {
-            pane.watch_selections(true, cx);
-        });
-
-        search_from_page(&pane, &dialog, "nine", window);
-
-        assert!(
-            window.debug_bounds("TEST_TWEET_SEARCH_FAILED").is_some(),
-            "a search that failed should be drawn on the page that asked for it"
-        );
-        assert!(
-            window.debug_bounds("TEST_TWEET_QUERY_FIELD").is_some(),
-            "the page should still offer the field the search was asked with"
-        );
-        settle_alert(window);
-        assert!(
-            window.debug_bounds("BASE_UI_ALERT").is_none(),
-            "a search is not a change to the accounts, so it is not reported in an alert"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn a_search_that_is_not_one_should_not_be_sent(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        let before = session.state().searches_made;
-
-        for invalid in ["", "   ", "with\ncontrol", &"中".repeat(40)] {
-            let started = pane.update(cx, |pane, cx| pane.search_users(SmolStr::new(invalid), cx));
-            assert!(!started, "{invalid:?} is not a query");
-        }
-
-        assert_eq!(session.state().searches_made, before);
-    }
-
-    /// A binding carries one call at a time, so a search and a change cannot both be out: the
-    /// pane refuses whichever is asked for while the other is, which is what keeps either from
-    /// taking the place of the other and leaving it unanswered.
-    #[gpui_kit::test]
-    fn a_search_and_a_change_should_not_take_each_others_place(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_search(vec![search_profile("9", "nine")]);
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        // A change that is out is a search the pane does not send.
-        let block = session.block_mutation();
-        pane.update(cx, |pane, cx| {
-            assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-        });
-        settle_until(cx, "the change to be in flight", |cx| {
-            let _ = cx;
-            session.state().add_calls == 1
-        });
-        let searches = session.state().searches_made;
-        assert!(
-            !pane.update(cx, |pane, cx| pane
-                .search_users(SmolStr::new_static("nine"), cx)),
-            "a search should not be sent while a change is out"
-        );
-        assert_eq!(
-            session.state().searches_made,
-            searches,
-            "and it should not reach the service either"
-        );
-
-        // A search that is out is a change the pane does not send, and neither of them is
-        // cancelled by the other because neither is ever sent while the other is out.
-        pane.update(cx, |pane, cx| pane.watch_selections(true, cx));
-        settle_until(cx, "the displaced change to be let go", |cx| {
-            let _ = cx;
-            block.is_dropped()
-        });
-        assert!(cx.update(|cx| pane.read(cx).pending.is_none()));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.search_users(SmolStr::new_static("nine"), cx));
-        });
-        assert!(
-            cx.update(|cx| pane.read(cx).searching.is_some()),
-            "the search should be out"
-        );
-        assert!(
-            !pane.update(cx, |pane, cx| {
-                pane.add_selection(SmolStr::new_static("ten"), cx)
-            }),
-            "a change should not be sent while a search is out"
-        );
-        assert!(
-            !pane.update(cx, |pane, cx| {
-                pane.delete_selection(SmolStr::new_static("7"), cx)
-            }),
-            "nor should a removal"
-        );
-        assert!(
-            cx.update(|cx| pane.read(cx).searching.is_some()),
-            "and neither of them should have taken the search's place"
-        );
-    }
-
-    /// A call the stream asks for takes the place of the call the binding was carrying, and what
-    /// it displaced is closed out rather than left waiting for an answer that can no longer
-    /// arrive: a search, whose page would otherwise spin forever, and a change, which is dropped
-    /// rather than decided and settled by the read that follows.
-    #[gpui_kit::test]
-    fn a_call_the_stream_asked_for_should_close_out_what_it_displaced(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-        // A dialog is open, because the calls the stream asks for as it comes up — the accounts
-        // read again, their avatars watched — are the ones a dialog's presence asks for.
-        let _dialog = attach_dialog(&pane, cx);
-
-        // A search that is out when the stream comes back up: the read the stream asks for takes
-        // its place, and the page that asked for it stops waiting.
-        pane.update(cx, |pane, cx| {
-            assert!(pane.search_users(SmolStr::new_static("nine"), cx));
-        });
-        assert!(cx.update(|cx| pane.read(cx).searching.is_some()));
-        report_status(&pane, TweetStatus::Ready, cx);
-        assert!(
-            cx.update(|cx| pane.read(cx).searching.is_none()),
-            "a search the stream took the place of should not be waited for"
-        );
-        settle_until(cx, "the read the stream asked for", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-
-        // A change that is out when the stream comes back up is dropped rather than left
-        // pending, and the read the stream asks for is what settles the list.
-        let block = session.block_mutation();
-        pane.update(cx, |pane, cx| {
-            assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-        });
-        settle_until(cx, "the change to be in flight", |cx| {
-            let _ = cx;
-            session.state().add_calls == 1
-        });
-        assert!(cx.update(|cx| pane.read(cx).pending.is_some()));
-        report_status(&pane, TweetStatus::Ready, cx);
-        assert!(
-            cx.update(|cx| pane
-                .read(cx)
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.operation.is_read())),
-            "a change whose answer cannot arrive should be replaced by the read the stream asked \
-             for, which is what settles the list"
-        );
-        settle_until(cx, "the read the stream asked for", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        assert_eq!(
-            usernames_of(&pane, cx),
-            ["seven"],
-            "the read is what settles a list the dropped change may have altered"
-        );
-        settle_until(cx, "the displaced change to be let go", |cx| {
-            let _ = cx;
-            block.is_dropped()
-        });
-    }
-
-    /// What is remembered about a row waiting to be activated is a memo beside the rows: a read
-    /// of the accounts keeps it for the rows the read still holds, and an account change is a
-    /// pane starting over with a set of rows that are not the ones it named.
-    #[gpui_kit::test]
-    fn a_remembered_name_should_survive_a_read_and_not_an_account_change(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) =
-            live_pane_reading(cx, &source, &session, vec![selection("7", "seven")], 3);
-
-        session.answer_add(XMutationOutcome::Confirmed(pending("8")));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-        });
-        settle_until(cx, "the account to be added", |cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.selections().len() == 2)
-        });
-        assert_eq!(
-            remembered_names(&pane, cx),
-            HashMap::from([(SmolStr::new_static("8"), SharedString::new_static("eight"))]),
-            "an account that came back without a profile should be remembered by its username"
-        );
-
-        // The accounts are read again, and the row the read does not name a profile for is named
-        // by what the pane was told when it was added.
-        session.answer_selections(selections(vec![selection("7", "seven"), pending("8")], 3));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.load_selections(cx));
-        });
-        settle_until(cx, "the accounts to be read again", |cx| {
-            pane.read(cx).pending.is_none()
-        });
-        assert_eq!(
-            remembered_names(&pane, cx),
-            HashMap::from([(SmolStr::new_static("8"), SharedString::new_static("eight"))]),
-            "a read should keep the name of a row that is still waiting to be activated"
-        );
-        assert!(
-            cx.update(|cx| pane
-                .read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.contains_username("eight", &pane.read(cx).hints))),
-            "and the account should still be recognised by that name"
-        );
-
-        // A read that no longer holds the row leaves nothing of it behind.
-        session.answer_selections(selections(vec![selection("7", "seven")], 3));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.load_selections(cx));
-        });
-        settle_until(cx, "the accounts to be read once more", |cx| {
-            pane.read(cx).pending.is_none()
-                && pane
-                    .read(cx)
-                    .selections
-                    .as_ref()
-                    .is_some_and(|data| data.selections().len() == 1)
-        });
-        assert!(
-            cx.update(|cx| pane.read(cx).hints.is_empty()),
-            "a name whose row the read no longer holds should not be remembered"
-        );
-
-        // Another account is another list of rows, and a name remembered for one of them is not
-        // a name for the other.
-        session.answer_add(XMutationOutcome::Confirmed(pending("8")));
-        pane.update(cx, |pane, cx| {
-            assert!(pane.add_selection(SmolStr::new_static("eight"), cx));
-        });
-        settle_until(cx, "the account to be added again", |cx| {
-            pane.read(cx)
-                .selections
-                .as_ref()
-                .is_some_and(|data| data.selections().len() == 2)
-        });
-        let _other = source.session(OTHER_ACCOUNT).subscribe();
-        pane.update(cx, |pane, cx| {
-            pane.reconcile_account(Some(SmolStr::new_static(OTHER_ACCOUNT)), cx);
-        });
-        assert!(
-            cx.update(|cx| pane.read(cx).hints.is_empty()),
-            "an account change should drop what was remembered about the account it left"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn a_picture_the_service_reported_as_failed_should_be_drawn_as_one(cx: &mut TestAppContext) {
-        let url = media_url("failed");
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, Vec::new());
-        settle_until(cx, "the timeline to arrive", |cx| {
-            pane.read(cx).feed.is_some()
-        });
-
-        let mut feed = FakeFeed::new();
-        let snapshot = feed.push("1", 1);
-        let media = Arc::new(HashMap::from([(
-            SmolStr::new(url.as_str()),
-            MediaState::Failed,
-        )]));
-        report_update(&pane, snapshot, media, cx);
-
-        assert_eq!(ids_of(&pane, cx), ["1"]);
-        assert_eq!(
-            cx.update(|cx| pane.read(cx).media.get(url.as_str()).cloned()),
-            Some(MediaState::Failed)
-        );
-    }
-
-    #[gpui_kit::test]
-    fn a_timeline_that_fills_up_should_keep_the_newest_fifty(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane_with(cx, &source, &session, MAX_TWEETS);
-
-        let mut feed = FakeFeed::new();
-        for index in 0..MAX_TWEETS {
-            feed.push(&index.to_string(), index as i64);
-        }
-        let snapshot = feed.push("new", MAX_TWEETS as i64);
-        report_update(&pane, snapshot, Arc::new(HashMap::new()), cx);
-
-        let ids = ids_of(&pane, cx);
-        assert_eq!(ids.len(), MAX_TWEETS);
-        assert_eq!(ids[0], "new");
-    }
-
-    /// Draws one more frame with every cache missed, so what a debug selector reports is what this
-    /// frame painted rather than what the frame before it left behind. A paint action is what fills
-    /// a selector, and a frame that hits the body cache reuses the last paint range without drawing
-    /// (AGENTS.md §10); `window.refresh()` is the one frame that cannot hit it. It matters
-    /// for an absence most of all: a reused paint range would keep saying a row is gone.
-    fn repaint(window: &mut VisualTestContext) {
-        window.update(|window, _| window.refresh());
-        window.run_until_parked();
-    }
-
-    /// One pane drawn into a window, which is what a frame's selectors are read from.
-    ///
-    /// The pane is drawn as the entity it is rather than by calling its body here, because
-    /// what a row draws is read from the pane while the list draws it: a frame is the only
-    /// thing that puts those two in an order.
-    struct PaneHarness {
-        pane: Entity<XWidget>,
-    }
-
-    impl Render for PaneHarness {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.pane.clone())
-        }
-    }
-
-    #[gpui_kit::test]
-    fn a_frame_should_draw_the_rows_its_timeline_holds(cx: &mut TestAppContext) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane_with(cx, &source, &session, 2);
-        {
-            let (_, window) = cx.add_window_view(|_, _| PaneHarness { pane: pane.clone() });
-            window.run_until_parked();
-            // The rows, their text and the end row are all drawn inside the body, which is the one
-            // cached layer (AGENTS.md §10).
-            repaint(window);
-
-            for selector in [
-                "TEST_TWEET_LIST",
-                "TEST_TWEET_ROW",
-                "TEST_TWEET_TEXT",
-                "TEST_TWEET_TIME",
-                "TEST_TWEET_DISPLAY_NAME",
-                "TEST_TWEET_VERIFIED",
-                "TEST_TWEET_TIMELINE_END",
-            ] {
-                assert!(
-                    window.debug_bounds(selector).is_some(),
-                    "{selector} should be drawn"
-                );
-            }
-        }
-
-        // A pane that dropped its timeline draws the list and its end row only: the row that
-        // says there are no more is the list's own footer rather than one of its tweets.
-        pane.update(cx, |pane, cx| pane.clear(cx));
-        let (_, window) = cx.add_window_view(|_, _| PaneHarness { pane: pane.clone() });
-        window.run_until_parked();
-        // A cleared timeline draws its end row and no tweet rows, and both readings are of the
-        // cached body: the frame has to be a fresh one (AGENTS.md §10).
-        repaint(window);
-        assert!(window.debug_bounds("TEST_TWEET_ROW").is_none());
-        assert!(
-            window.debug_bounds("TEST_TWEET_TIMELINE_END").is_some(),
-            "a cleared timeline still says there are no more tweets"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn a_frame_should_offer_a_failed_picture_again(cx: &mut TestAppContext) {
-        let url = media_url("retry");
-        let (cache, root) = media_cache();
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        // A transport that refuses and a cache with nothing in it, so the tile the frame draws
-        // is the one that failed.
-        let (pane, _root) = live_pane_over(
-            cx,
-            &source,
-            &session,
-            vec![tweet_with_media("1", 1, url.as_str())],
-            cache.clone(),
-            root,
-        );
-        settle_until(cx, "the picture to fail", |cx| {
-            pane.read(cx).media.get(url.as_str()) == Some(&MediaState::Failed)
-        });
-
-        {
-            let (_, window) = cx.add_window_view(|_, _| PaneHarness { pane: pane.clone() });
-            window.run_until_parked();
-            // A row whose picture failed is still a row of the cached body.
-            repaint(window);
-            assert!(window.debug_bounds("TEST_TWEET_ROW").is_some());
-        }
-
-        // The retry control is part of the failed tile, and clicking it is what asks the
-        // service for the picture again. The picture is put on disk first, which is what the
-        // second attempt finds where the first found nothing.
-        {
-            let handle = cx.update(|cx| widget_tokio_runtime::global::handle(cx).handle().clone());
-            handle.block_on(seed_picture(&cache, &url, b"image"));
-        }
-        pane.update(cx, |pane, cx| {
-            pane.retry_media(SmolStr::new(url.as_str()), cx)
-        });
-        settle_until(cx, "the picture to be fetched again", |cx| {
-            matches!(
-                pane.read(cx).media.get(url.as_str()),
-                Some(MediaState::Ready(_))
-            )
-        });
-    }
-
-    /// A feed nothing the list held survives in is one the list is built again for: a list holds
-    /// the tweets it was given, so the feed a pane draws is the one it has now rather than the
-    /// rows of the one before it.
-    #[gpui_kit::test]
-    fn a_feed_nothing_of_which_survives_should_be_held_by_a_list_built_again(
-        cx: &mut TestAppContext,
-    ) {
-        let source = FakeSource::default();
-        let session = source.session(ACCOUNT);
-        let _control = session.subscribe();
-        let (pane, _root) = live_pane(cx, &source, &session, vec![tweet("1", 1), tweet("2", 2)]);
-
-        let held = cx.update(|cx| pane.read(cx).list.entity_id());
-
-        let mut feed = FakeFeed::new();
-        let snapshot = feed.push("9", 9);
-        report_update(&pane, snapshot, Arc::new(HashMap::new()), cx);
-
-        assert_eq!(
-            ids_of(&pane, cx),
-            ["9"],
-            "the pane holds the feed it was given"
-        );
-        let built = cx.update(|cx| pane.read(cx).list.entity_id());
-
-        assert_ne!(
-            held, built,
-            "the list is built again for a feed none of what it held survives in"
-        );
-    }
-}
+mod tests;

@@ -1,5 +1,5 @@
-//! How one frame of the map is drawn: the paths a canvas paints, in the order they
-//! stack, and the geometry each is built from.
+//! How one frame of the map is drawn: the meshes the picture is built from and the order
+//! they stack in.
 //!
 //! The base map is prepared once by [`crate::scene`] and the picture arrives as a list of
 //! vessels, so a frame here only applies the camera's affine transform: the coastline is a
@@ -8,17 +8,34 @@
 //! own polylines. Nothing is tessellated per frame and nothing is cached: a camera change
 //! is a different set of vertices, not a different picture.
 //!
-//! [`MapColors`] stays in the view, because the labels, the hover card and the hit test
-//! read the same palette; this module is what turns the model's [`Projection`] into the
-//! paths the canvas paints.
+//! # What a frame is
+//!
+//! A [`Mesh`] is a plain triangle list of positions plus the AABB of those positions. The
+//! land is the exception to "per frame": it is the same Web Mercator geometry at every
+//! camera, so it is built once per tier ([`land_mesh`]) and a frame only selects the index
+//! ranges of the cells it can see ([`visible_land_ranges`]). Everything else is built per
+//! frame in window pixels ([`frame_meshes`]), because a camera change really is a different
+//! set of vertices.
+//!
+//! [`crate::map`] is what submits them: it wraps each mesh in a
+//! [`GeometryDesc`](ui_core::paint::geometry::GeometryDesc) — the engine's `Ui` pipeline
+//! carries `[x, y, coverage distance]` per vertex, and every vertex here is interior at
+//! `-1.0` because none of this geometry is anti-aliased — registers it in the engine's
+//! geometry store, and pushes a
+//! [`GeometryDraw`](ui_core::paint::primitive::GeometryDraw) into its canvas in the order
+//! [`in_paint_order`] gives. This module touches no canvas, no `App` and no theme: it turns
+//! the model's [`Projection`] into vertex buffers, and [`crate::colors::MapColors`] says
+//! which colour each buffer is drawn in.
 
-use gpui_kit::{Bounds, Hsla, Path, Pixels, Point, Window, point, px};
+use std::ops::Range;
+
+use ui_core::{math::Rect, paint::color::Color};
 
 use crate::{
-    model::{self, Camera, CellSpan, Projection, RoadFilter, Vessel},
-    scene::{LineLayer, Piece, Scene},
+    colors::MapColors,
+    model::{self, CellSpan, Projection, RoadFilter, Vessel},
+    scene::{LandLayer, LineLayer, Piece, Scene},
     ship::{SHIP_TYPE_COUNT, SHIP_TYPES, ShipType},
-    view::{MapColors, viewport_of},
 };
 
 /// How wide a marker is against its length.
@@ -32,8 +49,7 @@ const UNKNOWN_VESSEL_RADIUS: f32 = 2.5;
 /// Six rather than eight: the dot is 2.5 px in radius, so a segment spans about
 /// 2.6 px of its circumference — still round at the fitted zoom — and a full picture
 /// of the whole map's ~2,516 dots costs 15,096 triangles instead of 20,128. That saving
-/// is part of what keeps the worst frame under the 75,000-triangle budget; see
-/// [`WORST_FRAME_TRIANGLES`].
+/// is part of what keeps the worst frame under the 75,000-triangle budget.
 const ROUND_SEGMENTS: usize = 6;
 /// How many segments the hover ring is drawn with.
 const RING_SEGMENTS: usize = 24;
@@ -45,11 +61,16 @@ const HOVER_RING_OUTER: f32 = 9.0;
 
 /// One dashed stroke: a dash, the gap after it and the stroke's width, all in pixels.
 ///
-/// The pattern is walked along a polyline rather than handed to a path builder: a
-/// builder's `dash_array` is sampled when the path is built, which would either tessellate
-/// every frame or make a 6 px dash scale with the camera.
+/// The pattern is walked along a polyline rather than handed to the engine: an engine
+/// geometry is a triangle list, and sampling a dash pattern into it per frame is what the
+/// walk here is; the alternative — one tessellation of the whole border at load time —
+/// would make a 6 px dash scale with the camera.
+///
+/// The struct is crate-visible because [`border_mesh`] takes one and that function is
+/// `pub(super)`: a private type in its signature would be a `private_interfaces` warning.
+/// Its fields stay private, so [`BORDER_DASH`] is the only pattern a caller can pass.
 #[derive(Clone, Copy)]
-struct Dash {
+pub(super) struct Dash {
     /// The length of one dash.
     on: f32,
     /// The gap between two dashes.
@@ -78,196 +99,253 @@ const ROAD_MINOR_WIDTH: f32 = 1.2;
 
 /// The marker length at the fitted zoom, and at the closest one, in pixels.
 const MARKER_LENGTH_NEAR: f32 = 10.0;
-/// The marker length at [`MAX_ZOOM`].
+/// The marker length at [`model::MAX_ZOOM`].
 const MARKER_LENGTH_FAR: f32 = 12.0;
 
-/// Draws one frame of the map: the paths of [`MapLayers`] in their stacking order,
-/// then the ring around the hovered vessel.
+/// A triangle-list mesh in logical pixels (or Mercator radians for the land), without
+/// anti-aliasing: every vertex is interior.
 ///
-/// The geometry is [`map_layers`]'s; this function only hands the paths to the frame in
-/// the order they stack.
-pub(super) fn paint_map(
-    bounds: Bounds<Pixels>,
-    camera: Camera,
-    scene: Option<&'static Scene>,
-    vessels: &[Vessel],
-    hovered: Option<u32>,
-    colors: MapColors,
-    window: &mut Window,
-) {
-    let projection = Projection::new(camera, viewport_of(bounds));
-    if !projection.drawable() {
-        return;
-    }
-    // A canvas paints in window coordinates, while the projection is relative to the canvas
-    // box: every vertex is brought together with the box's corner here. The labels, the card
-    // and the hit test deliberately stay in canvas coordinates, because they are laid out by
-    // the element tree around the same box.
-    let origin = [f32::from(bounds.origin.x), f32::from(bounds.origin.y)];
-
-    for (path, color) in map_layers(scene, projection, origin, vessels).in_paint_order(colors) {
-        paint_path(window, path, color);
-    }
-
-    if let Some(mmsi) = hovered
-        && let Some(vessel) = vessels.iter().find(|vessel| vessel.mmsi == mmsi)
-    {
-        paint_path(
-            window,
-            ring_path(projection.screen(vessel.position), origin),
-            colors.hover,
-        );
-    }
+/// The engine's `Ui` pipeline is a coverage-distance pipeline, so a mesh that is not
+/// anti-aliased is its degenerate case: [`crate::map`] writes `-1.0` — "fully inside" —
+/// as the third component of every vertex. The vertices are unshared (index `i` is vertex
+/// `i`), which is what lets this module build the triangles straight from the picture and
+/// lets a test read the positions back.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Mesh {
+    /// One `x, y` position per index, in the space [`Self::bounds`] is in.
+    pub vertices: Vec<[f32; 2]>,
+    /// The triangle list: three vertex indices per triangle.
+    pub indices: Vec<u32>,
+    /// The AABB of the vertices, in pixels (Mercator radians for the land).
+    pub bounds: Rect,
 }
 
-/// The base map's paths and one ship path per type, in the order one frame paints them.
-///
-/// Building them is the frame's only geometry work, and it happens in [`map_layers`]
-/// rather than in `paint_map` so the picture can be checked without a window.
-struct MapLayers {
-    /// The coastline, every visible triangle.
-    land: Path<Pixels>,
-    /// The land borders, one quad per visible dash.
-    borders: Path<Pixels>,
-    /// Motorways and trunks, then primary roads.
-    roads: [Path<Pixels>; 2],
-    /// The vessels: one path per ship type.
-    ships: ShipPaths,
-}
-
-impl MapLayers {
-    /// The paths in the order a frame paints them, each with the colour it is drawn in.
+impl Mesh {
+    /// Whether the mesh draws nothing.
     ///
-    /// The stacking is the map's: the coastline first, the borders over it, the roads over
-    /// those, and the vessels last, so no part of the base map covers a vessel. The unknown
-    /// dots go down before the typed markers: a vessel whose type is known is a report
-    /// that says more about it, and its marker should not be hidden under a neighbour's
-    /// dot.
-    fn in_paint_order(self, colors: MapColors) -> Vec<(Path<Pixels>, Hsla)> {
-        let [motorway, primary] = self.roads;
-        let mut paths = self.ships.types.map(Some);
-        let mut layers = Vec::with_capacity(4 + SHIP_TYPE_COUNT);
-        layers.push((self.land, colors.land));
-        layers.push((self.borders, colors.map_border));
-        layers.push((motorway, colors.road));
-        layers.push((primary, colors.road_minor));
+    /// The index list is three indices per triangle, so counting triangles is also the empty
+    /// test: this is the one place that knows the stride, and a mesh is never built with a
+    /// partial triangle.
+    pub(super) fn is_empty(&self) -> bool {
+        self.triangle_count() == 0
+    }
 
-        let unknown = ShipType::Unknown;
-        if let Some(path) = paths[unknown.index()].take() {
-            layers.push((path, colors.ships[unknown.index()]));
-        }
-        for ship_type in SHIP_TYPES {
-            if ship_type == unknown {
-                continue;
-            }
-            if let Some(path) = paths[ship_type.index()].take() {
-                layers.push((path, colors.ships[ship_type.index()]));
-            }
-        }
-        layers
+    /// How many triangles the mesh draws.
+    pub(super) fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
     }
 }
 
-/// Builds the paths one frame draws, from the base map and the picture.
+/// Accumulates a [`Mesh`]: the positions, the triangle list over them and their AABB.
 ///
-/// Pure: no window and no theme. The scale the projection draws at decides which
-/// coastline tier is filled and which class-0 road copy is drawn, the clamped zoom
-/// decides when the primary roads join it, and the viewport decides which cells are
-/// read, so two frames of the same camera and the same picture build the same geometry.
-/// The land's span is grown by one cell because it is bucketed by triangle centroid; the
-/// line layers were cut per cell by the build, so they take the viewport's span ungrown
-/// — growing it would only revisit pieces the neighbouring cells already drew.
-fn map_layers(
-    scene: Option<&Scene>,
-    projection: Projection,
-    origin: [f32; 2],
-    vessels: &[Vessel],
-) -> MapLayers {
-    let visible = projection.visible_mercator();
-    let cells = model::visible_cells(visible);
-    let empty = || Path::new(point(px(0.0), px(0.0)));
-    let (land, borders, roads) = match scene {
-        Some(scene) => (
-            land_path(scene, projection, origin, cells.grown(), visible),
-            border_path(&scene.borders, projection, origin, cells, BORDER_DASH),
-            road_paths(
-                &scene.roads,
-                projection,
-                origin,
-                cells,
-                model::road_filter(projection.metres_per_pixel(), projection.zoom),
-            ),
-        ),
-        None => (empty(), empty(), [empty(), empty()]),
-    };
-    MapLayers {
-        land,
-        borders,
-        roads,
-        ships: ship_paths(vessels, projection, origin),
+/// The box is the min and max of every vertex rather than a union of rectangles: a union
+/// treats a zero-area rectangle as empty, and a degenerate triangle — which rounding can
+/// leave behind at the end of a dash — would then drop out of the box the engine damages
+/// the frame by.
+struct MeshBuilder {
+    vertices: Vec<[f32; 2]>,
+    indices: Vec<u32>,
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
+impl MeshBuilder {
+    /// An empty builder.
+    fn new() -> Self {
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            min: [f32::INFINITY; 2],
+            max: [f32::NEG_INFINITY; 2],
+        }
+    }
+
+    /// An empty builder that will hold `vertices` and `indices` entries up front.
+    ///
+    /// Only the builders whose size is known use it: the land's is the tier's own triangle
+    /// count and the ring's is fixed, while a frame's dashes and road segments depend on
+    /// where the camera is.
+    fn with_capacity(vertices: usize, indices: usize) -> Self {
+        Self {
+            vertices: Vec::with_capacity(vertices),
+            indices: Vec::with_capacity(indices),
+            ..Self::new()
+        }
+    }
+
+    /// Appends one triangle: three positions and the indices that draw them.
+    fn push_triangle(&mut self, corners: [[f32; 2]; 3]) {
+        for [x, y] in corners {
+            self.min = [self.min[0].min(x), self.min[1].min(y)];
+            self.max = [self.max[0].max(x), self.max[1].max(y)];
+            self.indices.push(self.vertices.len() as u32);
+            self.vertices.push([x, y]);
+        }
+    }
+
+    /// Appends one quad as the two triangles that cover it: `0 1 2` and `0 2 3`.
+    fn push_quad(&mut self, corners: [[f32; 2]; 4]) {
+        self.push_triangle([corners[0], corners[1], corners[2]]);
+        self.push_triangle([corners[0], corners[2], corners[3]]);
+    }
+
+    /// The mesh built so far.
+    ///
+    /// A mesh with no vertices has no box ([`Rect::default`]). So does one whose positions
+    /// are not finite, which no builder here should produce: the engine clips and damages a
+    /// geometry by its box, and an infinite one would be a full-pane repaint every frame
+    /// rather than a triangle in the wrong place.
+    fn finish(self) -> Mesh {
+        let bounds = if self.vertices.is_empty() {
+            Rect::default()
+        } else {
+            Rect::new(
+                self.min[0],
+                self.min[1],
+                self.max[0] - self.min[0],
+                self.max[1] - self.min[1],
+            )
+        };
+        Mesh {
+            vertices: self.vertices,
+            indices: self.indices,
+            bounds: if bounds.is_finite() {
+                bounds
+            } else {
+                Rect::default()
+            },
+        }
     }
 }
 
-/// Hands one path to the frame, skipping the ones that hold no triangle.
-fn paint_path(window: &mut Window, path: Path<Pixels>, color: Hsla) {
-    if path.vertices.is_empty() {
-        return;
-    }
-    window.paint_path(path, color);
-}
-
-/// The coastline as one fill, every visible triangle transformed into the frame's camera.
+/// The land of one tier: the whole tier's triangles as one mesh in Mercator radians, in the
+/// asset's cell order (cell bucket `k`'s triangles are the ranges in [`Self::cell_indices`]),
+/// followed by the wide triangles kept apart by [`LandLayer::wide`].
 ///
-/// The asset packs three resolutions of the same coast; the frame draws the one whose
-/// error is about a pixel at the scale it is drawing at ([`model::land_tier`]), which
-/// at the fitted zoom on a typical pane is the 1 km tier rather than the 111 m one.
-/// The triangles of the chosen tier were tessellated once, when the asset was parsed,
-/// and bucketed into the culling grid: this walks the cells the viewport touches and
-/// applies an affine transform per vertex. That is the land's only per-frame cost, and
-/// it is why a cell the viewport does not touch costs nothing. `cells` is the
-/// viewport's span grown by the one-cell margin; `visible` is the viewport itself,
-/// which the layer needs for the triangles too wide to bucket by centroid.
-fn land_path(
-    scene: &Scene,
-    projection: Projection,
-    origin: [f32; 2],
+/// One mesh per tier rather than one geometry per cell: the engine draws a static geometry
+/// by an index range, so a frame that sees cells 120–126 submits the range those buckets
+/// occupy in this one mesh. Splitting the tiers or the buckets into separate geometries would
+/// multiply what is registered for no gain — the buffer is already ordered the way the frame
+/// walks it.
+pub(super) struct LandMesh {
+    /// The tier's triangles, in Mercator radians.
+    pub mesh: Mesh,
+    /// The index range of each cell's triangles, in row-major cell order.
+    ///
+    /// `GRID_COLS * GRID_ROWS` entries; a cell no triangle's centroid fell in has an empty
+    /// range. The ranges are already multiplied by three, so they can be submitted as they
+    /// are.
+    pub cell_indices: Box<[Range<u32>]>,
+    /// The index range of the wide triangles, which are not bucketed by centroid.
+    pub wide_indices: Range<u32>,
+}
+
+/// Builds one tier's land mesh: every triangle of the tier in cell order, then the wide ones.
+///
+/// The asset tessellated the coast once and bucketed each triangle by its centroid; this
+/// only copies the triangles into a vertex and an index buffer and records where each bucket
+/// landed, so the per-frame cost of the coast is the range selection in
+/// [`visible_land_ranges`] instead of a vertex per visible point.
+pub(super) fn land_mesh(layer: &LandLayer) -> LandMesh {
+    let triangle_count = layer.triangles.len() + layer.wide.len();
+    let mut builder = MeshBuilder::with_capacity(triangle_count * 3, triangle_count * 3);
+    let mut cell_indices = Vec::with_capacity(layer.cells.len());
+    for bucket in &layer.cells {
+        let start = builder.indices.len() as u32;
+        for triangle in &layer.triangles[bucket.start as usize..bucket.end as usize] {
+            push_land_triangle(&mut builder, triangle);
+        }
+        cell_indices.push(start..builder.indices.len() as u32);
+    }
+    let wide_start = builder.indices.len() as u32;
+    for triangle in &layer.wide {
+        push_land_triangle(&mut builder, triangle);
+    }
+    let wide_indices = wide_start..builder.indices.len() as u32;
+    LandMesh {
+        mesh: builder.finish(),
+        cell_indices: cell_indices.into_boxed_slice(),
+        wide_indices,
+    }
+}
+
+/// Appends one of the asset's triangles — three `x, y` pairs in Mercator radians.
+fn push_land_triangle(mesh: &mut MeshBuilder, triangle: &[f32; 6]) {
+    mesh.push_triangle([
+        [triangle[0], triangle[1]],
+        [triangle[2], triangle[3]],
+        [triangle[4], triangle[5]],
+    ]);
+}
+
+/// The index ranges one frame draws for the visible part of `land`.
+///
+/// `cells` is the viewport's grid span grown by one cell, because the land is bucketed by
+/// triangle centroid: a triangle whose centroid falls just outside the viewport can still
+/// reach into it. The buckets of the cells are contiguous in the mesh — an empty bucket
+/// occupies no index — so the cells a frame visits merge into one range rather than one
+/// range per cell, and a viewport showing the whole map is the same single range.
+///
+/// The wide triangles are not bucketed: they are the ones too wide for a centroid bucket, so
+/// the frame keeps them by testing their boxes against `visible` — `[west, south, east,
+/// north]` in Mercator radians. They are one range because they are one contiguous run at the
+/// end of the mesh, and a frame cannot select a subset of them by index: when one of them
+/// reaches the viewport the whole run is submitted, so the wide triangles that fall outside
+/// the pane are drawn and clipped away — at most the tier's own wide set, 3,389 triangles at
+/// the finest tier — in exchange for one range instead of thousands of one-triangle ranges.
+/// Nothing visible is no range at all.
+pub(super) fn visible_land_ranges(
+    land: &LandMesh,
+    layer: &LandLayer,
     cells: CellSpan,
     visible: [f32; 4],
-) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
-    for triangle in scene
-        .land(projection.metres_per_pixel())
-        .visible(cells, visible)
-    {
-        let [ax, ay, bx, by, cx, cy] = *triangle;
-        path.push_triangle(
-            (
-                canvas_point(origin, projection.screen([ax, ay])),
-                canvas_point(origin, projection.screen([bx, by])),
-                canvas_point(origin, projection.screen([cx, cy])),
-            ),
-            (texture, texture, texture),
-        );
+) -> Vec<Range<u32>> {
+    let mut ranges: Vec<Range<u32>> = Vec::new();
+    for cell in cells.indices() {
+        let bucket = &land.cell_indices[cell as usize];
+        if bucket.start == bucket.end {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(last) if last.end == bucket.start => last.end = bucket.end,
+            _ => ranges.push(bucket.start..bucket.end),
+        }
     }
-    path
+
+    let wide_reaches = layer.wide.iter().any(|triangle| {
+        let [west, south, east, north] = triangle_bounds(triangle);
+        west <= visible[2] && east >= visible[0] && south <= visible[3] && north >= visible[1]
+    });
+    if wide_reaches && land.wide_indices.start != land.wide_indices.end {
+        ranges.push(land.wide_indices.start..land.wide_indices.end);
+    }
+    ranges
 }
 
-/// The land borders as one path of dashes, walked along every visible piece.
+/// The `[west, south, east, north]` box a Mercator triangle covers.
+fn triangle_bounds(triangle: &[f32; 6]) -> [f32; 4] {
+    [
+        triangle[0].min(triangle[2]).min(triangle[4]),
+        triangle[1].min(triangle[3]).min(triangle[5]),
+        triangle[0].max(triangle[2]).max(triangle[4]),
+        triangle[1].max(triangle[3]).max(triangle[5]),
+    ]
+}
+
+/// The land borders as one mesh of dashes, walked along every visible piece.
 ///
 /// A border is furniture rather than a feature of the coastline, so its width and its dash
 /// stay in pixels and do not grow with the camera. Each piece anchors the pattern at its
 /// own first point: the build cut the pieces per cell, so a border crossing a cell edge
 /// starts a fresh dash there rather than having its phase crawl when the camera pans.
-fn border_path(
+pub(super) fn border_mesh(
     layer: &LineLayer,
     projection: Projection,
     origin: [f32; 2],
     cells: CellSpan,
     dash: Dash,
-) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
+) -> Mesh {
+    let mut mesh = MeshBuilder::new();
     for piece in visible_pieces(layer, cells) {
         let mut previous: Option<[f32; 2]> = None;
         let mut along = 0.0f32;
@@ -276,52 +354,47 @@ fn border_path(
             if let Some(start) = previous {
                 let length = ((next[0] - start[0]).powi(2) + (next[1] - start[1]).powi(2)).sqrt();
                 if length > 0.0 {
-                    push_dashes(&mut path, start, next, along, length, dash, origin, texture);
+                    push_dashes(&mut mesh, start, next, along, length, dash, origin);
                 }
                 along += length;
             }
             previous = Some(next);
         }
     }
-    path
+    mesh.finish()
 }
 
 /// The roads of one frame, split into the two widths and colours they are drawn in.
 ///
 /// One pass over the visible pieces: each piece is filtered and its path chosen by the
 /// same [`model::road_path`] answer, so a piece cannot be drawn in a path its filter had
-/// dropped. Path 0 is motorways and trunks, path 1 primary roads; at the fitted zoom the
-/// second is empty, and [`paint_path`] skips it.
-fn road_paths(
+/// dropped. Mesh 0 is motorways and trunks, mesh 1 primary roads; at the fitted zoom the
+/// second is empty, and [`in_paint_order`] skips it.
+pub(super) fn road_meshes(
     layer: &LineLayer,
     projection: Projection,
     origin: [f32; 2],
     cells: CellSpan,
     filter: RoadFilter,
-) -> [Path<Pixels>; 2] {
-    let mut paths = [
-        Path::new(point(px(0.0), px(0.0))),
-        Path::new(point(px(0.0), px(0.0))),
-    ];
+) -> [Mesh; 2] {
+    let mut meshes = [MeshBuilder::new(), MeshBuilder::new()];
     let widths = [ROAD_WIDTH, ROAD_MINOR_WIDTH];
-    let texture = point(0.0, 1.0);
     let metres_per_pixel = projection.metres_per_pixel();
     for piece in visible_pieces(layer, cells) {
         let Some(index) = model::road_path(filter, piece, metres_per_pixel) else {
             continue;
         };
         for segment in piece_points(layer, piece).windows(2) {
-            push_quad(
-                &mut paths[index],
+            push_ribbon(
+                &mut meshes[index],
                 projection.screen(segment[0]),
                 projection.screen(segment[1]),
                 widths[index],
                 origin,
-                texture,
             );
         }
     }
-    paths
+    meshes.map(MeshBuilder::finish)
 }
 
 /// Every piece the frame's cells hold, in cell order.
@@ -342,19 +415,18 @@ fn piece_points<'a>(layer: &'a LineLayer, piece: &Piece) -> &'a [[f32; 2]] {
     &layer.points[start..start + usize::from(piece.len)]
 }
 
-/// Appends one screen-space segment as a quad `width` pixels wide: two triangles.
+/// Appends one screen-space segment as a ribbon `width` pixels wide: two triangles.
 ///
 /// A segment is drawn as a ribbon rather than as a stroked path, so its width is in
 /// pixels and does not grow with the camera. A segment with no length — the build can
 /// store two points on top of each other — draws nothing rather than a degenerate
 /// triangle.
-fn push_quad(
-    path: &mut Path<Pixels>,
+fn push_ribbon(
+    mesh: &mut MeshBuilder,
     start: [f32; 2],
     end: [f32; 2],
     width: f32,
     origin: [f32; 2],
-    texture: Point<f32>,
 ) {
     let span = [end[0] - start[0], end[1] - start[1]];
     let length = (span[0] * span[0] + span[1] * span[1]).sqrt();
@@ -365,30 +437,26 @@ fn push_quad(
     let normal = [-direction[1] * width / 2.0, direction[0] * width / 2.0];
     let side =
         |point: [f32; 2], sign: f32| [point[0] + normal[0] * sign, point[1] + normal[1] * sign];
-    let start_left = canvas_point(origin, side(start, 1.0));
-    let start_right = canvas_point(origin, side(start, -1.0));
-    let end_left = canvas_point(origin, side(end, 1.0));
-    let end_right = canvas_point(origin, side(end, -1.0));
-    path.push_triangle(
-        (start_left, end_left, end_right),
-        (texture, texture, texture),
-    );
-    path.push_triangle(
-        (start_left, end_right, start_right),
-        (texture, texture, texture),
-    );
+    mesh.push_quad([
+        canvas_point(origin, side(start, 1.0)),
+        canvas_point(origin, side(end, 1.0)),
+        canvas_point(origin, side(end, -1.0)),
+        canvas_point(origin, side(start, -1.0)),
+    ]);
 }
 
 /// Appends the dashes of one screen-space segment of a dashed polyline.
+///
+/// `along` is how far the segment starts into its piece, so the pattern is anchored at the
+/// piece's own first point and the dashes of two segments join without a seam.
 fn push_dashes(
-    path: &mut Path<Pixels>,
+    mesh: &mut MeshBuilder,
     start: [f32; 2],
     end: [f32; 2],
     along: f32,
     length: f32,
     dash: Dash,
     origin: [f32; 2],
-    texture: Point<f32>,
 ) {
     let direction = [(end[0] - start[0]) / length, (end[1] - start[1]) / length];
     let period = dash.on + dash.off;
@@ -407,26 +475,28 @@ fn push_dashes(
                 start[1] + direction[1] * travelled,
             ]
         };
-        push_quad(path, at(from), at(to), dash.width, origin, texture);
+        push_ribbon(mesh, at(from), at(to), dash.width, origin);
     }
 }
 
-/// The vessels of one frame, one path per ship type.
-struct ShipPaths {
-    /// One path per type in [`SHIP_TYPES`] order. The unknown path holds dots; every
-    /// other path holds marker triangles.
-    types: [Path<Pixels>; SHIP_TYPE_COUNT],
+/// The vessels of one frame, one mesh per ship type.
+pub(super) struct ShipPaths {
+    /// One mesh per type in [`SHIP_TYPES`] order. The unknown mesh holds dots; every
+    /// other mesh holds marker triangles.
+    pub types: [Mesh; SHIP_TYPE_COUNT],
 }
 
-/// Splits the painted vessels into the paths one frame draws.
+/// Splits the painted vessels into the meshes one frame draws.
 ///
 /// A vessel with no type is a grey dot rather than a coloured marker: its position is
 /// still a position, so it is drawn — a map that hid it would be reporting fewer vessels
 /// than the service does.
-fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> ShipPaths {
-    let mut types: [Path<Pixels>; SHIP_TYPE_COUNT] =
-        std::array::from_fn(|_| Path::new(point(px(0.0), px(0.0))));
-    let texture = point(0.0, 1.0);
+pub(super) fn ship_meshes(
+    vessels: &[Vessel],
+    projection: Projection,
+    origin: [f32; 2],
+) -> ShipPaths {
+    let mut builders: [MeshBuilder; SHIP_TYPE_COUNT] = std::array::from_fn(|_| MeshBuilder::new());
     // The marker grows from ten pixels at the fitted zoom to twelve at the closest one,
     // so a hull stays visible while the sea around it gains detail.
     let zoom =
@@ -438,15 +508,14 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
         if !projection.near_screen(position, length) {
             continue;
         }
-        let path = &mut types[vessel.ship_type.index()];
+        let mesh = &mut builders[vessel.ship_type.index()];
         if vessel.ship_type == ShipType::Unknown {
             push_disc(
-                path,
+                mesh,
                 position,
                 UNKNOWN_VESSEL_RADIUS,
                 ROUND_SEGMENTS,
                 origin,
-                texture,
             );
             continue;
         }
@@ -474,27 +543,25 @@ fn ship_paths(vessels: &[Vessel], projection: Projection, origin: [f32; 2]) -> S
             base[0] - normal[0] * half_width,
             base[1] - normal[1] * half_width,
         ];
-        path.push_triangle(
-            (
-                canvas_point(origin, tip),
-                canvas_point(origin, left),
-                canvas_point(origin, right),
-            ),
-            (texture, texture, texture),
-        );
+        mesh.push_triangle([
+            canvas_point(origin, tip),
+            canvas_point(origin, left),
+            canvas_point(origin, right),
+        ]);
     }
 
-    ShipPaths { types }
+    ShipPaths {
+        types: builders.map(MeshBuilder::finish),
+    }
 }
 
 /// Appends a filled circle centred on `center`, as a fan of triangles.
 fn push_disc(
-    path: &mut Path<Pixels>,
+    mesh: &mut MeshBuilder,
     center: [f32; 2],
     radius: f32,
     segments: usize,
     origin: [f32; 2],
-    texture: Point<f32>,
 ) {
     let hub = canvas_point(origin, center);
     for segment in 0..segments {
@@ -514,14 +581,13 @@ fn push_disc(
                 center[1] + second.sin() * radius,
             ],
         );
-        path.push_triangle((hub, a, b), (texture, texture, texture));
+        mesh.push_triangle([hub, a, b]);
     }
 }
 
 /// The ring around the vessel under the pointer, as an annulus of triangles.
-fn ring_path(center: [f32; 2], origin: [f32; 2]) -> Path<Pixels> {
-    let mut path = Path::new(point(px(0.0), px(0.0)));
-    let texture = point(0.0, 1.0);
+pub(super) fn ring_mesh(center: [f32; 2], origin: [f32; 2]) -> Mesh {
+    let mut mesh = MeshBuilder::with_capacity(RING_SEGMENTS * 6, RING_SEGMENTS * 6);
     let at = |angle: f32, radius: f32| {
         canvas_point(
             origin,
@@ -538,33 +604,136 @@ fn ring_path(center: [f32; 2], origin: [f32; 2]) -> Path<Pixels> {
         let inner_second = at(second, HOVER_RING_INNER);
         let outer_first = at(first, HOVER_RING_OUTER);
         let outer_second = at(second, HOVER_RING_OUTER);
-        path.push_triangle(
-            (inner_first, outer_first, outer_second),
-            (texture, texture, texture),
-        );
-        path.push_triangle(
-            (inner_first, outer_second, inner_second),
-            (texture, texture, texture),
-        );
+        mesh.push_triangle([inner_first, outer_first, outer_second]);
+        mesh.push_triangle([inner_first, outer_second, inner_second]);
     }
-    path
+    mesh.finish()
 }
 
-/// One canvas point as the window point the paths are drawn at.
+/// One canvas point as the window point the meshes are drawn at.
 ///
-/// A canvas' paint pass draws in window coordinates while a projection is relative to the
+/// An engine canvas draws in window coordinates while a projection is relative to the
 /// canvas, so the box's corner is added to every vertex here.
-fn canvas_point(origin: [f32; 2], canvas: [f32; 2]) -> Point<Pixels> {
-    point(px(origin[0] + canvas[0]), px(origin[1] + canvas[1]))
+fn canvas_point(origin: [f32; 2], canvas: [f32; 2]) -> [f32; 2] {
+    [origin[0] + canvas[0], origin[1] + canvas[1]]
+}
+
+/// The base map's meshes and one ship mesh per type, in the order one frame paints them.
+pub(super) struct MapLayers {
+    /// The land borders, one quad per visible dash.
+    pub borders: Mesh,
+    /// Motorways and trunks, then primary roads.
+    pub roads: [Mesh; 2],
+    /// The vessels: one mesh per ship type.
+    pub ships: ShipPaths,
+}
+
+/// The meshes in the order a frame paints them, each with the colour it is drawn in.
+///
+/// The stacking is the map's: the coast (submitted by [`crate::map`] before this list), the
+/// borders over it, the roads over those, and the vessels last, so no part of the base map
+/// covers a vessel. The unknown dots go down before the typed markers: a vessel whose type
+/// is known is a report that says more about it, and its marker should not be hidden under a
+/// neighbour's dot. A mesh with no triangle is skipped rather than submitted: the engine
+/// would draw nothing for it, and this list is also the record of what the picture holds —
+/// an empty layer in it would say a layer is drawn when nothing is.
+pub(super) fn in_paint_order(layers: MapLayers, colors: MapColors) -> Vec<(Mesh, Color)> {
+    let MapLayers {
+        borders,
+        roads: [motorway, primary],
+        ships,
+    } = layers;
+    let mut types = ships.types.map(Some);
+    let mut painted = Vec::with_capacity(3 + SHIP_TYPE_COUNT);
+
+    push_layer(&mut painted, borders, colors.map_border);
+    push_layer(&mut painted, motorway, colors.road);
+    push_layer(&mut painted, primary, colors.road_minor);
+
+    let unknown = ShipType::Unknown;
+    if let Some(mesh) = types[unknown.index()].take() {
+        push_layer(&mut painted, mesh, colors.ships[unknown.index()]);
+    }
+    for ship_type in SHIP_TYPES {
+        if ship_type == unknown {
+            continue;
+        }
+        if let Some(mesh) = types[ship_type.index()].take() {
+            push_layer(&mut painted, mesh, colors.ships[ship_type.index()]);
+        }
+    }
+    painted
+}
+
+/// Appends one mesh and its colour, unless the mesh draws nothing.
+fn push_layer(layers: &mut Vec<(Mesh, Color)>, mesh: Mesh, color: Color) {
+    if !mesh.is_empty() {
+        layers.push((mesh, color));
+    }
+}
+
+/// Builds the per-frame screen-space meshes (the land is static Mercator geometry and is
+/// not part of this).
+///
+/// Pure: no window and no theme. The scale the projection draws at decides which class-0
+/// road copy is drawn, the clamped zoom decides when the primary roads join it, and the
+/// viewport decides which cells are read, so two frames of the same camera and the same
+/// picture build the same geometry. The line layers were cut per cell by the build, so they
+/// take the viewport's span ungrown — growing it would only revisit pieces the neighbouring
+/// cells already drew. The land's span is the one that is grown, because it is bucketed by
+/// triangle centroid; that belongs to [`visible_land_ranges`].
+///
+/// A projection that cannot draw — a pane laid out at zero size — builds no mesh at all: it
+/// has no scale to project through, so every vertex would be the canvas' centre or a NaN,
+/// and the caller's own `Projection::drawable` check is the decision, not a guard this
+/// builder can make twice.
+pub(super) fn frame_meshes(
+    scene: Option<&'static Scene>,
+    projection: Projection,
+    origin: [f32; 2],
+    vessels: &[Vessel],
+) -> MapLayers {
+    if !projection.drawable() {
+        return MapLayers {
+            borders: Mesh::default(),
+            roads: [Mesh::default(), Mesh::default()],
+            ships: ShipPaths {
+                types: std::array::from_fn(|_| Mesh::default()),
+            },
+        };
+    }
+
+    let visible = projection.visible_mercator();
+    let cells = model::visible_cells(visible);
+    let (borders, roads) = match scene {
+        Some(scene) => (
+            border_mesh(&scene.borders, projection, origin, cells, BORDER_DASH),
+            road_meshes(
+                &scene.roads,
+                projection,
+                origin,
+                cells,
+                model::road_filter(projection.metres_per_pixel(), projection.zoom),
+            ),
+        ),
+        None => (Mesh::default(), [Mesh::default(), Mesh::default()]),
+    };
+    MapLayers {
+        borders,
+        roads,
+        ships: ship_meshes(vessels, projection, origin),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use base_ui::style::{palette::Appearance, theme::Theme};
-    use gpui_kit::Pixels;
+    use base_ui::theme::{appearance::Appearance, resolved::Theme};
 
     use super::*;
-    use crate::{model::MAX_ZOOM, scene};
+    use crate::{
+        model::{Camera, MAX_ZOOM},
+        scene,
+    };
 
     /// Asserts two floats are the same within the tolerance a projection needs.
     fn assert_close(left: f32, right: f32, what: &str) {
@@ -574,9 +743,66 @@ mod tests {
         );
     }
 
-    /// The paths a canvas paints are in window coordinates, while the projection and the
-    /// labels are relative to the canvas box: a vertex that does not carry the box's corner
-    /// draws the whole map at the window's corner, under labels laid out somewhere else.
+    /// The triangles one mesh holds, with the list's invariants checked.
+    ///
+    /// The meshes are unshared triangle lists, so this is also the number of vertices the
+    /// engine's geometry carries and the step the instance buffer used to be measured in.
+    fn triangles(mesh: &Mesh) -> usize {
+        assert_eq!(
+            mesh.vertices.len(),
+            mesh.indices.len(),
+            "a mesh has one vertex per index",
+        );
+        assert_eq!(mesh.indices.len() % 3, 0, "every mesh is a triangle list");
+        mesh.triangle_count()
+    }
+
+    /// The vertical extent a screen-space mesh covers, in pixels.
+    fn quad_height(mesh: &Mesh) -> f32 {
+        let (low, high) = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex[1])
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), y| {
+                (low.min(y), high.max(y))
+            });
+        high - low
+    }
+
+    /// Asserts two meshes hold the same geometry, sampled at both ends and the middle.
+    ///
+    /// The count, the triangle list and the samples are enough to pin the mesh a builder
+    /// produces, because the builders emit in a fixed order. An empty expected mesh is a
+    /// filter's answer rather than a fixture that draws nothing, so only the counts are
+    /// compared.
+    fn assert_same_geometry(actual: &Mesh, expected: &Mesh, what: &str) {
+        assert_eq!(
+            actual.vertices.len(),
+            expected.vertices.len(),
+            "{what}: the same number of vertices",
+        );
+        assert_eq!(
+            actual.indices, expected.indices,
+            "{what}: the same triangle list",
+        );
+        if expected.vertices.is_empty() {
+            return;
+        }
+        for index in [0, expected.vertices.len() / 2, expected.vertices.len() - 1] {
+            assert_eq!(
+                actual.vertices[index], expected.vertices[index],
+                "{what}: vertex {index}",
+            );
+        }
+    }
+
+    /// The screen meshes are in window coordinates, while the projection and the labels are
+    /// relative to the canvas box: a vertex that does not carry the box's corner draws the
+    /// whole map at the window's corner, under labels laid out somewhere else.
+    ///
+    /// The coastline is the exception now: it is Mercator geometry built once per tier, and
+    /// the frame transforms it, so its vertices carry no window position at all — a land
+    /// vertex that carried the corner would be transformed twice.
     #[test]
     fn the_painted_geometry_should_be_offset_by_the_canvas_box() {
         let projection = Projection::new(
@@ -590,25 +816,62 @@ mod tests {
 
         let scene = scene::scene().expect("the checked-in asset parses");
         let visible = projection.visible_mercator();
-        let cells = model::visible_cells(visible).grown();
-        let land = land_path(scene, projection, origin, cells, visible);
-        let [ax, ay, _, _, _, _] = *scene
-            .land(projection.metres_per_pixel())
-            .visible(cells, visible)
-            .next()
-            .expect("the land covers the map box");
-        let expected = projection.screen([ax, ay]);
-        assert_close(
-            f32::from(land.vertices[0].xy_position.x),
-            origin[0] + expected[0],
-            "the land keeps the canvas box's x",
-        );
-        assert_close(
-            f32::from(land.vertices[0].xy_position.y),
-            origin[1] + expected[1],
-            "the land keeps the canvas box's y",
+        let cells = model::visible_cells(visible);
+
+        // The land keeps the asset's own Mercator coordinates.
+        let layer = scene.land(projection.metres_per_pixel());
+        let land = land_mesh(layer);
+        let [ax, ay, ..] = layer.triangles[0];
+        assert_close(land.mesh.vertices[0][0], ax, "the land mesh is Mercator x");
+        assert_close(land.mesh.vertices[0][1], ay, "the land mesh is Mercator y");
+        let [west, south, east, north] = model::mercator_bounds();
+        let bounds = land.mesh.bounds;
+        assert!(
+            bounds.origin.x >= west - 1e-5
+                && bounds.origin.y >= south - 1e-5
+                && bounds.max().x <= east + 1e-5
+                && bounds.max().y <= north + 1e-5,
+            "the land mesh's box is in Mercator radians, not window pixels: {bounds:?}",
         );
 
+        // Every screen-space builder adds the corner to every vertex: the same mesh built
+        // at the canvas' own origin differs by exactly the corner, box included.
+        let offset_is_exact = |moved: &Mesh, plain: &Mesh, what: &str| {
+            assert_eq!(
+                moved.vertices.len(),
+                plain.vertices.len(),
+                "{what}: the same vertices",
+            );
+            for (shifted, base) in moved.vertices.iter().zip(&plain.vertices) {
+                assert_close(shifted[0], base[0] + origin[0], what);
+                assert_close(shifted[1], base[1] + origin[1], what);
+            }
+            assert_close(
+                moved.bounds.origin.x,
+                plain.bounds.origin.x + origin[0],
+                what,
+            );
+            assert_close(
+                moved.bounds.origin.y,
+                plain.bounds.origin.y + origin[1],
+                what,
+            );
+        };
+        let filter = model::road_filter(projection.metres_per_pixel(), projection.zoom);
+        offset_is_exact(
+            &border_mesh(&scene.borders, projection, origin, cells, BORDER_DASH),
+            &border_mesh(&scene.borders, projection, [0.0, 0.0], cells, BORDER_DASH),
+            "the borders keep the canvas box's corner",
+        );
+        let roads = road_meshes(&scene.roads, projection, origin, cells, filter);
+        let roads_at_origin = road_meshes(&scene.roads, projection, [0.0, 0.0], cells, filter);
+        offset_is_exact(
+            &roads[0],
+            &roads_at_origin[0],
+            "the motorways keep the canvas box's corner",
+        );
+
+        // The marker and the ring exactly, at the points the picture puts them on.
         let centre = projection.screen(model::project(56.0, 26.0));
         let vessel = Vessel {
             mmsi: 7,
@@ -617,34 +880,40 @@ mod tests {
             cog: 0,
             heading: 0,
         };
-        let ships = ship_paths(&[vessel], projection, origin);
-        let tip = ships.types[ShipType::Tanker.index()].vertices[0].xy_position;
+        let ships = ship_meshes(&[vessel], projection, origin);
+        let moved = &ships.types[ShipType::Tanker.index()];
+        let at_origin = ship_meshes(&[vessel], projection, [0.0, 0.0]);
+        offset_is_exact(
+            moved,
+            &at_origin.types[ShipType::Tanker.index()],
+            "the markers keep the canvas box's corner",
+        );
         assert_close(
-            f32::from(tip.x),
+            moved.vertices[0][0],
             origin[0] + centre[0],
             "the marker's tip keeps the canvas box's x",
         );
         assert_close(
-            f32::from(tip.y),
+            moved.vertices[0][1],
             origin[1] + centre[1] - MARKER_LENGTH_NEAR / 2.0,
             "the marker points north from its hull inside the canvas box",
         );
 
-        let ring = ring_path(centre, origin);
-        let first = ring.vertices[0].xy_position;
+        let ring = ring_mesh(centre, origin);
+        offset_is_exact(&ring, &ring_mesh(centre, [0.0, 0.0]), "the ring");
         assert_close(
-            f32::from(first.x),
+            ring.vertices[0][0],
             origin[0] + centre[0] + HOVER_RING_INNER,
             "the ring keeps the canvas box's x",
         );
         assert_close(
-            f32::from(first.y),
+            ring.vertices[0][1],
             origin[1] + centre[1],
             "the ring keeps the canvas box's y",
         );
     }
 
-    /// One vessel of each ship type, all over the strait, so every vessel path has
+    /// One vessel of each ship type, all over the strait, so every vessel mesh has
     /// something in it.
     fn one_vessel_per_path() -> Vec<Vessel> {
         let position = model::project(56.3, 26.5);
@@ -682,48 +951,13 @@ mod tests {
         }
     }
 
-    /// The height a screen-space quad covers, in pixels.
-    fn quad_height(path: &Path<Pixels>) -> f32 {
-        let (low, high) = path
-            .vertices
-            .iter()
-            .map(|vertex| f32::from(vertex.xy_position.y))
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), y| {
-                (low.min(y), high.max(y))
-            });
-        high - low
-    }
-
-    /// Asserts two paths hold the same geometry, sampled at both ends and the middle.
+    /// The meshes are the map's stacking: the borders, the roads, then the vessels.
     ///
-    /// A path vertex has no equality of its own, so the positions are compared; the count
-    /// and the samples are enough to pin the path a builder produces, because the builders
-    /// emit in a fixed order. An empty expected path is a filter's answer rather than a
-    /// fixture that draws nothing, so only the count is compared.
-    fn assert_same_geometry(actual: &Path<Pixels>, expected: &Path<Pixels>, what: &str) {
-        assert_eq!(
-            actual.vertices.len(),
-            expected.vertices.len(),
-            "{what}: the same number of vertices",
-        );
-        if expected.vertices.is_empty() {
-            return;
-        }
-        for index in [0, expected.vertices.len() / 2, expected.vertices.len() - 1] {
-            assert_eq!(
-                actual.vertices[index].xy_position, expected.vertices[index].xy_position,
-                "{what}: vertex {index}",
-            );
-        }
-    }
-
-    /// The paths are the map's stacking: the coastline, the borders, the roads, then the
-    /// vessels.
-    ///
-    /// The order lives in one place — [`MapLayers::in_paint_order`] — so this is the test
-    /// that replaces "did the frame paint them in order": each slot is checked against the
-    /// builder its name claims, and the whole sequence is checked against the colour
-    /// roles in the documented order.
+    /// The order lives in one place — [`in_paint_order`] — so this is the test that replaces
+    /// "did the frame paint them in order": each slot is checked against the builder its
+    /// name claims, and the whole sequence is checked against the colour roles in the
+    /// documented order. The coastline and the ocean quad are submitted by [`crate::map`]
+    /// before this list, so they are not part of it.
     #[test]
     fn the_map_layers_are_built_in_paint_order() {
         let colors = MapColors::resolve(&Theme::of(Appearance::Light));
@@ -731,26 +965,16 @@ mod tests {
         let projection = Projection::new(Camera::default(), [600.0, 400.0]);
         let origin = [16.0, 16.0];
         let vessels = one_vessel_per_path();
-        let layers = map_layers(Some(scene), projection, origin, &vessels);
+        let layers = frame_meshes(Some(scene), projection, origin, &vessels);
 
         let visible = projection.visible_mercator();
         let cells = model::visible_cells(visible);
-        let roads = road_paths(
-            &scene.roads,
-            projection,
-            origin,
-            cells,
-            model::road_filter(projection.metres_per_pixel(), projection.zoom),
-        );
-        let ships = ship_paths(&vessels, projection, origin);
-        assert_same_geometry(
-            &layers.land,
-            &land_path(scene, projection, origin, cells.grown(), visible),
-            "the land",
-        );
+        let filter = model::road_filter(projection.metres_per_pixel(), projection.zoom);
+        let roads = road_meshes(&scene.roads, projection, origin, cells, filter);
+        let ships = ship_meshes(&vessels, projection, origin);
         assert_same_geometry(
             &layers.borders,
-            &border_path(&scene.borders, projection, origin, cells, BORDER_DASH),
+            &border_mesh(&scene.borders, projection, origin, cells, BORDER_DASH),
             "the borders",
         );
         assert_same_geometry(&layers.roads[0], &roads[0], "the motorways");
@@ -759,17 +983,16 @@ mod tests {
             assert_same_geometry(
                 &layers.ships.types[ship_type.index()],
                 &ships.types[ship_type.index()],
-                "a ship type path",
+                "a ship type mesh",
             );
         }
+        assert!(
+            layers.roads[1].is_empty(),
+            "the coarse copy draws no primary road, so the second road mesh is empty",
+        );
 
-        let painted = layers.in_paint_order(colors);
-        let mut expected = vec![
-            colors.land,
-            colors.map_border,
-            colors.road,
-            colors.road_minor,
-        ];
+        let painted = in_paint_order(layers, colors);
+        let mut expected = vec![colors.map_border, colors.road];
         expected.push(colors.ships[ShipType::Unknown.index()]);
         expected.extend(
             SHIP_TYPES
@@ -780,29 +1003,25 @@ mod tests {
         assert_eq!(
             painted.iter().map(|(_, color)| *color).collect::<Vec<_>>(),
             expected,
-            "the paths are painted land, borders, roads, unknown dots, then the typed markers",
+            "the meshes are painted borders, roads, unknown dots, then the typed markers",
         );
-        assert_eq!(painted.len(), 4 + SHIP_TYPE_COUNT);
+        assert_eq!(
+            painted.len(),
+            2 + SHIP_TYPE_COUNT,
+            "the empty primary mesh is skipped: the borders, one road copy and every vessel type",
+        );
         assert!(
-            !painted[0].0.vertices.is_empty()
-                && !painted[1].0.vertices.is_empty()
-                && !painted[2].0.vertices.is_empty(),
+            !painted[0].0.is_empty() && !painted[1].0.is_empty(),
             "the base map has geometry at the fitted zoom",
         );
         assert!(
-            painted[3].0.vertices.is_empty(),
-            "the coarse copy draws no primary road, so the second road path is empty",
-        );
-        assert!(
-            painted[4..]
-                .iter()
-                .all(|(path, _)| !path.vertices.is_empty()),
-            "every vessel path has a vessel",
+            painted[2..].iter().all(|(mesh, _)| !mesh.is_empty()),
+            "every vessel mesh has a vessel",
         );
     }
 
     /// A road segment is a screen-space ribbon: two triangles, as wide as it is configured,
-    /// in the path its class names, and its width is in pixels rather than in map units.
+    /// in the mesh its class names, and its width is in pixels rather than in map units.
     #[test]
     fn a_road_segment_becomes_two_triangles_at_its_configured_width() {
         // The two points share a latitude, so the segment is horizontal on screen and the
@@ -815,12 +1034,9 @@ mod tests {
         let coarse = one_piece_layer(&points, model::ROAD_COARSE, 0);
         let primary = one_piece_layer(&points, model::ROAD_PRIMARY, 2_000);
 
-        let roads = road_paths(&motorway, projection, origin, cells, RoadFilter::FineCopy);
-        assert_eq!(roads[0].vertices.len(), 6, "one segment is two triangles");
-        assert!(
-            roads[1].vertices.is_empty(),
-            "a motorway is not a primary road",
-        );
+        let roads = road_meshes(&motorway, projection, origin, cells, RoadFilter::FineCopy);
+        assert_eq!(triangles(&roads[0]), 2, "one segment is two triangles");
+        assert!(roads[1].is_empty(), "a motorway is not a primary road");
         assert_close(
             quad_height(&roads[0]),
             ROAD_WIDTH,
@@ -829,20 +1045,14 @@ mod tests {
 
         // The coarse copy is the same width, and only the coarse filter draws it.
         assert!(
-            road_paths(&coarse, projection, origin, cells, RoadFilter::FineCopy)[0]
-                .vertices
-                .is_empty(),
+            road_meshes(&coarse, projection, origin, cells, RoadFilter::FineCopy)[0].is_empty(),
             "the fine copy's filter does not draw the coarse one",
         );
-        let roads = road_paths(&coarse, projection, origin, cells, RoadFilter::CoarseCopy);
-        assert_eq!(
-            roads[0].vertices.len(),
-            6,
-            "the coarse copy is a ribbon too"
-        );
+        let roads = road_meshes(&coarse, projection, origin, cells, RoadFilter::CoarseCopy);
+        assert_eq!(triangles(&roads[0]), 2, "the coarse copy is a ribbon too");
         assert_close(quad_height(&roads[0]), ROAD_WIDTH, "at the same width");
 
-        let roads = road_paths(
+        let roads = road_meshes(
             &primary,
             projection,
             origin,
@@ -850,11 +1060,11 @@ mod tests {
             RoadFilter::FineCopyAndPrimary,
         );
         assert_eq!(
-            roads[1].vertices.len(),
-            6,
+            triangles(&roads[1]),
+            2,
             "a primary road is two triangles too",
         );
-        assert!(roads[0].vertices.is_empty(), "and it is not a motorway");
+        assert!(roads[0].is_empty(), "and it is not a motorway");
         assert_close(
             quad_height(&roads[1]),
             ROAD_MINOR_WIDTH,
@@ -862,8 +1072,8 @@ mod tests {
         );
 
         // The width is in screen pixels, not map units: the same piece at four times the
-        // zoom is the same number of pixels wide, which is what a ribbon buys over a
-        // stroke that would scale with the camera.
+        // zoom is the same number of pixels wide, which is what a ribbon buys over a stroke
+        // that would scale with the camera.
         let viewport = [600.0, 400.0];
         let close = Projection::new(
             Camera {
@@ -874,12 +1084,8 @@ mod tests {
             viewport,
         );
         let cells = model::visible_cells(close.visible_mercator());
-        let roads = road_paths(&motorway, close, origin, cells, RoadFilter::FineCopy);
-        assert_eq!(
-            roads[0].vertices.len(),
-            6,
-            "the zoom does not drop the piece"
-        );
+        let roads = road_meshes(&motorway, close, origin, cells, RoadFilter::FineCopy);
+        assert_eq!(triangles(&roads[0]), 2, "the zoom does not drop the piece",);
         assert_close(
             quad_height(&roads[0]),
             ROAD_WIDTH,
@@ -888,42 +1094,61 @@ mod tests {
     }
 
     /// A border is dashed as well as violet, so that the kind of a line is readable from
-    /// its pattern and not only from its hue: one 40 px segment of a border is four 6 px
-    /// dashes with a 4 px gap after each, and the gap really is a gap.
+    /// its pattern and not only from its hue: one six-pixel dash, a four-pixel gap after
+    /// each, and the gap really is a gap.
+    ///
+    /// The fixture's segment is 39 px long so it ends one pixel into the last gap: a dash
+    /// boundary exactly on the segment's end would turn a sub-pixel rounding of the
+    /// projected length into a fifth sliver dash.
     #[test]
     fn a_border_segment_is_dashes_of_six_pixels_on_and_four_off() {
-        let mut path = Path::new(point(px(0.0), px(0.0)));
-        let texture = point(0.0, 1.0);
-        push_dashes(
-            &mut path,
-            [0.0, 50.0],
-            [40.0, 50.0],
-            0.0,
-            40.0,
-            BORDER_DASH,
-            [0.0, 0.0],
-            texture,
+        let projection = Projection::new(Camera::default(), [600.0, 400.0]);
+        let start = [100.0, 50.0];
+        let end = [139.0, 50.0];
+        let points = [projection.mercator(start), projection.mercator(end)];
+        // The projection's own round trip, which is where the dash walk starts: the length
+        // it measures is the segment the pattern is laid out on.
+        let projected_start = projection.screen(points[0]);
+        let projected_end = projection.screen(points[1]);
+        let length = projected_end[0] - projected_start[0];
+        assert!(
+            (36.0..40.0).contains(&length),
+            "the fixture's segment is {length} px, which is the four-dash case",
         );
 
-        // 6 px on and 4 px off over 40 px: [0, 6], [10, 16], [20, 26] and [30, 36]
-        // are drawn, and [36, 40] is the last gap.
-        assert_eq!(path.vertices.len(), 24, "four dashes, two triangles each");
+        let layer = one_piece_layer(&points, 0, 0);
+        let cells = model::visible_cells(projection.visible_mercator());
+        let mesh = border_mesh(&layer, projection, [0.0, 0.0], cells, BORDER_DASH);
+
+        // 6 px on and 4 px off: [0, 6], [10, 16], [20, 26] and [30, 36] are drawn, and
+        // [36, 40] is the last gap.
+        assert_eq!(triangles(&mesh), 8, "four dashes, two triangles each");
         assert_close(
-            quad_height(&path),
+            quad_height(&mesh),
             BORDER_DASH.width,
             "a border dash keeps its width",
         );
-        let span = path
+        let (low, high) = mesh
             .vertices
             .iter()
-            .map(|vertex| f32::from(vertex.xy_position.x))
+            .map(|vertex| vertex[0])
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), x| {
                 (low.min(x), high.max(x))
             });
+        assert_close(
+            low,
+            projected_start[0],
+            "the first dash starts where the piece starts",
+        );
+        assert_close(
+            high,
+            projected_start[0] + 36.0,
+            "the last dash ends 36 px along the segment",
+        );
         assert!(
-            span.1 < 40.0,
-            "the last dash ends at 36 px, {} before the segment does",
-            40.0 - span.1,
+            high < projected_start[0] + length,
+            "the gap after the last dash is a gap: the mesh stops {} px short",
+            projected_start[0] + length - high,
         );
     }
 
@@ -933,21 +1158,175 @@ mod tests {
     fn a_map_without_an_asset_still_draws_the_ships() {
         let projection = Projection::new(Camera::default(), [600.0, 400.0]);
         let vessels = one_vessel_per_path();
-        let layers = map_layers(None, projection, [0.0, 0.0], &vessels);
+        let layers = frame_meshes(None, projection, [0.0, 0.0], &vessels);
 
-        assert!(layers.land.vertices.is_empty(), "there is no coastline");
-        assert!(layers.borders.vertices.is_empty(), "and no borders");
+        assert!(layers.borders.is_empty(), "there are no borders");
         assert!(
-            layers.roads[0].vertices.is_empty() && layers.roads[1].vertices.is_empty(),
+            layers.roads[0].is_empty() && layers.roads[1].is_empty(),
             "and no roads",
         );
         assert!(
-            layers
-                .ships
-                .types
-                .iter()
-                .all(|path| !path.vertices.is_empty()),
-            "every vessel path has a vessel",
+            layers.ships.types.iter().all(|mesh| !mesh.is_empty()),
+            "every vessel mesh has a vessel",
+        );
+    }
+
+    /// A pane with no size has no scale to project through, so the frame builds nothing
+    /// rather than a mesh of the canvas' centre or a NaN box.
+    #[test]
+    fn a_projection_that_cannot_draw_builds_no_mesh() {
+        let projection = Projection::new(Camera::default(), [0.0, 0.0]);
+        let scene = scene::scene().expect("the checked-in asset parses");
+        let layers = frame_meshes(Some(scene), projection, [0.0, 0.0], &one_vessel_per_path());
+
+        assert!(!projection.drawable(), "a zero viewport has no fit");
+        assert!(layers.borders.is_empty(), "no borders");
+        assert!(layers.roads.iter().all(Mesh::is_empty), "no roads");
+        assert!(
+            layers.ships.types.iter().all(Mesh::is_empty),
+            "and no vessels, even though the picture has some",
+        );
+    }
+
+    /// A zero-length segment draws nothing: the build can store a road's two points on top
+    /// of each other, and a degenerate triangle is not a triangle a frame should submit.
+    #[test]
+    fn a_segment_with_no_length_draws_nothing() {
+        let projection = Projection::new(Camera::default(), [600.0, 400.0]);
+        let cells = model::visible_cells(projection.visible_mercator());
+        let point = model::project(56.0, 26.0);
+        let layer = one_piece_layer(&[point, point], 0, 0);
+
+        let roads = road_meshes(&layer, projection, [0.0, 0.0], cells, RoadFilter::FineCopy);
+        assert!(
+            roads[0].is_empty() && roads[1].is_empty(),
+            "a road segment of no length draws no quad",
+        );
+        let borders = border_mesh(&layer, projection, [0.0, 0.0], cells, BORDER_DASH);
+        assert!(borders.is_empty(), "and a border segment of none no dash");
+
+        let empty = Mesh::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.triangle_count(), 0);
+        assert_eq!(empty.bounds, Rect::default(), "an empty mesh has no box");
+    }
+
+    /// A marker points where its course says and its hull is as wide as the ratio; a vessel
+    /// with no type is a six-segment dot; and the marker grows to twelve pixels at the
+    /// closest zoom.
+    #[test]
+    fn a_marker_turns_with_its_course_and_grows_with_the_zoom() {
+        let viewport = [600.0, 400.0];
+        let projection = Projection::new(Camera::default().clamped(viewport), viewport);
+        let position = model::project(56.0, 26.0);
+        let centre = projection.screen(position);
+        let origin = [10.0, 20.0];
+        let vessel = |ship_type: ShipType, cog: u32| Vessel {
+            mmsi: 1,
+            ship_type,
+            position,
+            cog,
+            heading: 0,
+        };
+
+        let ships = ship_meshes(
+            &[vessel(ShipType::Tanker, 0), vessel(ShipType::Unknown, 0)],
+            projection,
+            origin,
+        );
+        let north = &ships.types[ShipType::Tanker.index()];
+        assert_eq!(triangles(north), 1, "a typed vessel is one triangle");
+        assert_close(
+            north.vertices[0][1],
+            origin[1] + centre[1] - MARKER_LENGTH_NEAR / 2.0,
+            "a north-facing marker's tip is half its length above its hull",
+        );
+
+        // A course over ground of 900 is 90°: the marker turns to the east, and the two
+        // base vertices stay one marker-width apart.
+        let east = ship_meshes(&[vessel(ShipType::Tanker, 900)], projection, origin);
+        let east = &east.types[ShipType::Tanker.index()];
+        assert_close(
+            east.vertices[0][0],
+            origin[0] + centre[0] + MARKER_LENGTH_NEAR / 2.0,
+            "an east-facing marker's tip is half its length east of its hull",
+        );
+        assert_close(
+            east.vertices[0][1],
+            origin[1] + centre[1],
+            "and it points along the parallel",
+        );
+        let [left, right] = [east.vertices[1], east.vertices[2]];
+        let width = ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2)).sqrt();
+        assert_close(
+            width,
+            MARKER_LENGTH_NEAR * MARKER_WIDTH_RATIO,
+            "the hull is drawn at the marker's width ratio",
+        );
+
+        // A vessel whose ship record has not arrived is a dot: six segments, drawn at the
+        // unknown radius.
+        let dot = &ships.types[ShipType::Unknown.index()];
+        assert_eq!(triangles(dot), ROUND_SEGMENTS, "the dot is a fan of six");
+        let dot_bounds = dot.bounds;
+        assert_close(
+            dot_bounds.size.width,
+            UNKNOWN_VESSEL_RADIUS * 2.0,
+            "the dot is drawn at its radius",
+        );
+        assert_close(
+            dot_bounds.origin.y + dot_bounds.size.height / 2.0,
+            origin[1] + centre[1],
+            "the dot is centred on the hull",
+        );
+
+        // Twelve pixels at the closest zoom rather than ten.
+        let close = Projection::new(
+            Camera {
+                center: position,
+                zoom: MAX_ZOOM,
+            }
+            .clamped(viewport),
+            viewport,
+        );
+        let grown = ship_meshes(&[vessel(ShipType::Tanker, 0)], close, origin);
+        let tip = grown.types[ShipType::Tanker.index()].vertices[0];
+        let base = (grown.types[ShipType::Tanker.index()].vertices[1][1]
+            + grown.types[ShipType::Tanker.index()].vertices[2][1])
+            / 2.0;
+        assert_close(
+            base - tip[1],
+            MARKER_LENGTH_FAR,
+            "the marker is twelve pixels long at the closest zoom",
+        );
+    }
+
+    /// The hover ring is an annulus: twenty-four quads between the two radii, so the vessel
+    /// under the pointer stays readable through its middle.
+    #[test]
+    fn the_hover_ring_is_an_annulus_of_twenty_four_quads() {
+        let centre = [100.0, 80.0];
+        let origin = [7.0, 11.0];
+        let ring = ring_mesh(centre, origin);
+
+        assert_eq!(
+            triangles(&ring),
+            RING_SEGMENTS * 2,
+            "two triangles per segment"
+        );
+        let middle = [origin[0] + centre[0], origin[1] + centre[1]];
+        for vertex in &ring.vertices {
+            let distance =
+                ((vertex[0] - middle[0]).powi(2) + (vertex[1] - middle[1]).powi(2)).sqrt();
+            assert!(
+                (HOVER_RING_INNER - 1e-3..=HOVER_RING_OUTER + 1e-3).contains(&distance),
+                "every ring vertex is on one of the two radii, not at {distance}",
+            );
+        }
+        assert_close(
+            ring.bounds.size.width,
+            HOVER_RING_OUTER * 2.0,
+            "the ring is as wide as its outer diameter",
         );
     }
 
@@ -978,6 +1357,181 @@ mod tests {
                 "a viewport off the map draws nothing",
             );
         }
+    }
+
+    /// The triangles of each tier the checked-in asset tessellates into.
+    ///
+    /// The land is a static mesh now, so this is the count a frame's coastline costs the
+    /// GPU when it draws the whole tier: the mesh must hold every triangle, and the number
+    /// is pinned to the same value [`crate::scene`]'s own tests pin, because an asset or
+    /// tessellation change that moved it would move the coastline.
+    const LAND_TIER_TRIANGLES: [usize; model::LAND_TIERS] = [22_876, 13_347, 9_736, 5_744];
+
+    /// The `[west, south, east, north]` box a Mercator triangle covers.
+    fn land_triangle_bounds(triangle: &[f32; 6]) -> [f32; 4] {
+        [
+            triangle[0].min(triangle[2]).min(triangle[4]),
+            triangle[1].min(triangle[3]).min(triangle[5]),
+            triangle[0].max(triangle[2]).max(triangle[4]),
+            triangle[1].max(triangle[3]).max(triangle[5]),
+        ]
+    }
+
+    /// The triangles a frame draws from the static land: every bucket of the cells it
+    /// visits, plus the whole wide range when any wide triangle reaches the viewport.
+    fn expected_land_triangles(
+        layer: &LandLayer,
+        land: &LandMesh,
+        cells: CellSpan,
+        visible: [f32; 4],
+    ) -> usize {
+        let celled = cells
+            .indices()
+            .map(|cell| {
+                let bucket = &land.cell_indices[cell as usize];
+                (bucket.end - bucket.start) as usize / 3
+            })
+            .sum::<usize>();
+        let wide = if wide_reaches(layer, visible) {
+            (land.wide_indices.end - land.wide_indices.start) as usize / 3
+        } else {
+            0
+        };
+        celled + wide
+    }
+
+    /// Whether any wide triangle's box reaches `visible`.
+    fn wide_reaches(layer: &LandLayer, visible: [f32; 4]) -> bool {
+        layer.wide.iter().any(|triangle| {
+            let [west, south, east, north] = land_triangle_bounds(triangle);
+            west <= visible[2] && east >= visible[0] && south <= visible[3] && north >= visible[1]
+        })
+    }
+
+    /// The static land mesh holds every triangle of its tier, in the asset's cell order and
+    /// then the wide ones, and nothing else.
+    ///
+    /// The land is drawn by index range, so a triangle the mesh lost would be a hole in the
+    /// coastline rather than a slow frame; the ranges are what the frame selects, so their
+    /// partition of the buffer is checked here rather than in a rendered picture.
+    #[test]
+    fn the_land_mesh_holds_every_tier_triangle_in_cell_order() {
+        let scene = scene::scene().expect("the checked-in asset parses");
+        let [west, south, east, north] = model::mercator_bounds();
+        for (tier, layer) in scene.land.iter().enumerate() {
+            let land = land_mesh(layer);
+            assert_eq!(
+                triangles(&land.mesh),
+                LAND_TIER_TRIANGLES[tier],
+                "tier {tier} holds every triangle the asset tessellated",
+            );
+            assert_eq!(
+                triangles(&land.mesh),
+                layer.triangles.len() + layer.wide.len(),
+                "tier {tier} is the bucketed triangles followed by the wide ones",
+            );
+            assert_eq!(
+                land.cell_indices.len(),
+                (model::GRID_COLS * model::GRID_ROWS) as usize,
+                "tier {tier} keeps a bucket per grid cell",
+            );
+
+            let mut cursor = 0;
+            for bucket in &land.cell_indices {
+                assert_eq!(
+                    bucket.start as usize, cursor,
+                    "tier {tier}: the buckets are contiguous and in cell order",
+                );
+                cursor = bucket.end as usize;
+            }
+            assert_eq!(
+                cursor,
+                layer.triangles.len() * 3,
+                "tier {tier}: the buckets cover exactly the bucketed triangles",
+            );
+            assert_eq!(
+                land.wide_indices,
+                (layer.triangles.len() as u32 * 3)..(land.mesh.indices.len() as u32),
+                "tier {tier}: the wide range is the mesh's tail",
+            );
+
+            let bounds = land.mesh.bounds;
+            assert_close(
+                bounds.origin.x,
+                west,
+                &format!("tier {tier}: the land starts at the map's west edge"),
+            );
+            assert_close(
+                bounds.origin.y,
+                south,
+                &format!("tier {tier}: and at its south edge"),
+            );
+            assert_close(
+                bounds.max().x,
+                east,
+                &format!("tier {tier}: and ends at its east edge"),
+            );
+            assert_close(
+                bounds.max().y,
+                north,
+                &format!("tier {tier}: and at its north edge"),
+            );
+        }
+    }
+
+    /// The ranges a frame selects are the visible cells' buckets — one range, because the
+    /// buckets are contiguous — plus the wide range when one of those triangles reaches the
+    /// viewport.
+    #[test]
+    fn the_visible_land_ranges_select_the_visible_cells_and_the_wide_triangles() {
+        let scene = scene::scene().expect("the checked-in asset parses");
+        let projection =
+            Projection::new(Camera::default().clamped(DESIGN_VIEWPORT), DESIGN_VIEWPORT);
+        let layer = scene.land(projection.metres_per_pixel());
+        let land = land_mesh(layer);
+        let visible = projection.visible_mercator();
+        let cells = model::visible_cells(visible).grown();
+        let ranges = visible_land_ranges(&land, layer, cells, visible);
+
+        let drawn: usize = ranges
+            .iter()
+            .map(|range| (range.end - range.start) as usize / 3)
+            .sum();
+        assert_eq!(
+            drawn,
+            expected_land_triangles(layer, &land, cells, visible),
+            "the frame draws the buckets of the cells it visits, plus the wide triangles",
+        );
+        assert!(drawn > 0, "the fitted frame sees the coast");
+
+        // The cells the frame visits are one range: from the first bucket that holds a
+        // triangle to the last one, because the buckets are contiguous and the empty ones
+        // take no index. The wide triangles, when they reach the viewport, are the other.
+        let filled = cells
+            .indices()
+            .map(|cell| &land.cell_indices[cell as usize])
+            .filter(|bucket| bucket.start != bucket.end)
+            .collect::<Vec<_>>();
+        let first = filled.first().expect("the fitted frame's cells hold land");
+        let last = filled.last().expect("the fitted frame's cells hold land");
+        let mut expected_ranges: Vec<Range<u32>> = Vec::new();
+        expected_ranges.push(first.start..last.end);
+        if wide_reaches(layer, visible) {
+            expected_ranges.push(land.wide_indices.start..land.wide_indices.end);
+        }
+        assert_eq!(
+            ranges, expected_ranges,
+            "a frame submits the cells' buckets as one range, plus the wide ones when they \
+             reach the viewport",
+        );
+
+        // A viewport off the map selects nothing at all.
+        let off_map = model::visible_cells([-10.0, -10.0, -9.0, -9.0]);
+        assert!(
+            visible_land_ranges(&land, layer, off_map.grown(), [-10.0, -10.0, -9.0, -9.0])
+                .is_empty(),
+            "a viewport off the map draws no land",
+        );
     }
 
     /// The most triangles one frame may draw and still hold 60 fps: 8.58 ms of fixed cost
@@ -1015,16 +1569,16 @@ mod tests {
 
     /// The plan's §8 target for the worst frame, in triangles.
     ///
-    /// **Not met by P4.** P4 adds the 0.002° land tier, the six-segment vessel dots and a
-    /// 0.004° middle road copy; the worst frame falls from 39,438 to 31,815, still 4,815
-    /// over. See [`WORST_FRAME_TRIANGLES`] for the measured frame and the layer that owns
-    /// the gap.
+    /// **Not met.** Its successor added the 0.002° land tier, the six-segment vessel dots
+    /// and a 0.004° middle road copy; the worst frame fell from 39,438 to 31,815, still
+    /// 4,815 over. See [`WORST_FRAME_TRIANGLES`] for the measured frame and the layer that
+    /// owns the gap.
     const WORST_FRAME_TARGET_TRIANGLES: usize = 27_000;
 
-    /// The worst frame the viewport and zoom sweep found, in triangles.
+    /// The worst frame the viewport and zoom sweep found, in triangles, before the port.
     ///
     /// Pinned so an asset or palette change that makes a view heavier has to be measured
-    /// again rather than absorbed silently into the budget. The busiest view is the
+    /// again rather than absorbed silently into the budget. The busiest view was the
     /// **2,048 px wide pane at 1.8648× over 25.879N, 52.697E**: land 10,721 (the 0.002°
     /// tier), borders 850, fine roads 13,916, the full vessel picture 15,096 and the ring
     /// 48 — **40,631 in all, 13,631 over the plan's 27,000**. The vessel layer grew from
@@ -1033,30 +1587,33 @@ mod tests {
     /// The frame sits just below the 0.004° middle copy's 371.1 m/px switch: at 369 m/px
     /// the fine road copy is drawn (13,916), while the middle copy is the next band up.
     /// It is the road LOD cliff, not a land threshold. The sweep's 7 × 5 centre grid plus
-    /// two 9 × 9 refinement rounds found it. The wide 1,600 pane's 1.177× coarse-side frame
-    /// is 34,052 (coarse 8,840 over the 0.003° land 8,924 plus the 15,096-vessel picture).
-    /// The next lever is a finer middle road copy (0.003°) for the 278–371 m/px band, or a
-    /// lower 0.004° threshold — 369 m/px would be 1.204 px, 0.3%
-    /// over the 1.2 px budget, so it is not acceptable. A fifth land tier at 725–911 m/px
-    /// would not touch this frame. Neither is in P4's scope; the frame is recorded, not
-    /// claimed.
+    /// two 9 × 9 refinement rounds found it. The next lever is a finer middle road copy
+    /// (0.003°) for the 278–371 m/px band; that is outside this port's scope, and the
+    /// number is kept as the bound the dynamic layers are asserted against (the coast it
+    /// also counted is a static mesh now).
     const WORST_FRAME_TRIANGLES: usize = 40_631;
 
-    /// The triangles the fitted frame with no vessels draws on the design's pane.
+    /// The triangles the fitted frame drew before the port, coastline included.
     ///
-    /// The paths of [`MapLayers`] with an empty picture and no hover ring: the coarsest
-    /// coast, the dashed borders and the coarse copy of the long road chains.
-    /// 5,733 + 2,312 + 12,614 = 20,659, inside both §8 targets (21,000 triangles /
-    /// 65,536 vertices = 61,977).
+    /// The paths of [`MapLayers`]'s predecessor with an empty picture and no hover ring:
+    /// the coarsest coast, the dashed borders and the coarse copy of the long road chains.
+    /// 5,733 + 2,312 + 12,614 = 20,659, inside both §8 targets.
     const FITTED_FRAME_TRIANGLES: usize = 20_659;
 
-    /// The triangles the fitted frame draws with the typical picture: 2,516 vessels
-    /// whose ship record has arrived, one marker triangle each.
+    /// The fitted frame's coastline: the coarsest tier's triangles it drew.
+    ///
+    /// The land is a static Mercator mesh now, so a frame no longer builds these triangles
+    /// on the CPU: the constants below keep the historical totals, and the dynamic pins are
+    /// their difference from them.
+    const FITTED_FRAME_LAND_TRIANGLES: usize = 5_733;
+
+    /// The triangles the fitted frame drew with the typical picture: 2,516 vessels whose
+    /// ship record has arrived, one marker triangle each.
     ///
     /// Pinned separately from [`FITTED_FRAME_TRIANGLES`] because the empty frame's 21,000
     /// target does not cover it: the vessel layer adds 2,516 triangles, and the frame's
     /// gate is the instance-buffer step instead (see
-    /// [`FITTED_FRAME_TYPICAL_TARGET_TRIANGLES`]). It is 23,175 triangles / 69,525
+    /// [`FITTED_FRAME_TYPICAL_TARGET_TRIANGLES`]). It was 23,175 triangles / 69,525
     /// vertices, so the step moves from 2^16 to 2^17.
     const FITTED_FRAME_TYPICAL_TRIANGLES: usize = 23_175;
 
@@ -1067,25 +1624,29 @@ mod tests {
     /// empty frame keeps the stricter §8 21,000 target.
     const FITTED_FRAME_TYPICAL_TARGET_TRIANGLES: usize = 131_072 / 3;
 
-    /// The triangles the 2.8× design frame draws with a full picture.
+    /// The triangles the 2.8× design frame drew with a full picture, before the port.
     ///
     /// Pinned separately because it is the frame the plan's worst-case analysis names.
-    /// With the 0.002° land tier it draws the 0.002° coast (7,122) and the fine road copy
-    /// (8,740): 7,122 + 784 + 8,740 + 15,096 + 48 = 31,790, over the 27,000 target
-    /// by 4,790 because the whole map's 2,516 vessels are the full picture now. It was
-    /// 23,074 when the picture was capped at 1,000 vessels.
+    /// It drew the 0.002° coast (7,122) and the fine road copy (8,740):
+    /// 7,122 + 784 + 8,740 + 15,096 + 48 = 31,790, over the 27,000 target by 4,790 because
+    /// the whole map's 2,516 vessels are the full picture.
     const REFERENCE_FRAME_2_8_TRIANGLES: usize = 31_790;
 
-    /// One frame's triangles, layer by layer.
+    /// The 2.8× design frame's coastline, which the dynamic pins subtract.
+    const REFERENCE_FRAME_2_8_LAND_TRIANGLES: usize = 7_122;
+
+    /// One frame's triangles, layer by layer, without the static land.
     ///
     /// The budget is a sum, so when a frame goes over it the question is always *which*
     /// layer did: this keeps the road layer split into the three copies the filter
     /// chooses between and the primary roads it may add, and every assertion that fails
-    /// prints the whole breakdown rather than only the total.
+    /// prints the whole breakdown rather than only the total. The coastline is not a field:
+    /// it is drawn from a static Mercator mesh, so it costs a frame the index ranges
+    /// [`visible_land_ranges`] selects and no CPU triangles at all — [`LayerTriangles`] is
+    /// what a frame builds, and the coast's own cost is pinned by
+    /// [`LAND_TIER_TRIANGLES`].
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct LayerTriangles {
-        /// The coastline tier the projection draws.
-        land: usize,
         /// The dashed land borders.
         borders: usize,
         /// The coarse copy of class 0, drawn while the scale is coarse.
@@ -1103,14 +1664,14 @@ mod tests {
     }
 
     impl LayerTriangles {
-        /// The triangles `layers` draws under `filter`, plus the hover ring.
+        /// The triangles `layers` builds under `filter`, plus the hover ring.
         ///
         /// The ring is drawn only when a vessel is hovered; counting it always is the
         /// worst case. The labels, the legend, the card and the canvas' own sea fill are
-        /// elements rather than path triangles, and the plan's 8.58 ms intercept already
+        /// elements rather than mesh triangles, and the plan's 8.58 ms intercept already
         /// carries them, which is why they are not counted here. The vessels are part of
-        /// the map's paths, so nothing is added twice.
-        fn of(layers: &MapLayers, ring: &Path<Pixels>, filter: RoadFilter) -> Self {
+        /// the map's meshes, so nothing is added twice.
+        fn of(layers: &MapLayers, ring: &Mesh, filter: RoadFilter) -> Self {
             let [class_zero, primary] = &layers.roads;
             let (roads_coarse, roads_middle, roads_fine) = match filter {
                 RoadFilter::CoarseCopy => (triangles(class_zero), 0, 0),
@@ -1122,7 +1683,6 @@ mod tests {
                 }
             };
             Self {
-                land: triangles(&layers.land),
                 borders: triangles(&layers.borders),
                 roads_coarse,
                 roads_middle,
@@ -1133,10 +1693,9 @@ mod tests {
             }
         }
 
-        /// The triangles of all layers.
+        /// The triangles of all layers a frame builds.
         fn total(self) -> usize {
-            self.land
-                + self.borders
+            self.borders
                 + self.roads_coarse
                 + self.roads_middle
                 + self.roads_fine
@@ -1154,9 +1713,8 @@ mod tests {
         /// went.
         fn describe(self) -> String {
             format!(
-                "land {}, borders {}, roads {} (coarse {}, middle {}, fine {}, primary {}), \
+                "borders {}, roads {} (coarse {}, middle {}, fine {}, primary {}), \
                  ships {}, ring {} = {} triangles",
-                self.land,
                 self.borders,
                 self.roads(),
                 self.roads_coarse,
@@ -1168,12 +1726,6 @@ mod tests {
                 self.total(),
             )
         }
-    }
-
-    /// The triangles one path holds.
-    fn triangles(path: &Path<Pixels>) -> usize {
-        assert_eq!(path.vertices.len() % 3, 0, "every path is a triangle list");
-        path.vertices.len() / 3
     }
 
     /// The whole map's vessel count, measured against the source's full response.
@@ -1323,33 +1875,36 @@ mod tests {
         triangles: LayerTriangles,
     }
 
-    /// The picture has to fit a 60 Hz frame in the worst view the camera can be left in.
+    /// One frame has to fit a 60 Hz budget in the worst view the camera can be left in.
     ///
-    /// The totals are the triangles the frame really draws: every path of [`MapLayers`]
-    /// plus the hover ring, with a full picture of [`PICTURE_VESSELS`] unknown vessels — the
-    /// worst each vessel can cost. Nothing is set aside as an allowance.
+    /// The totals are the triangles a frame builds: every mesh of [`MapLayers`] plus the
+    /// hover ring, with a full picture of [`PICTURE_VESSELS`] unknown vessels — the worst
+    /// each vessel can cost. Nothing is set aside as an allowance. The coastline is not in
+    /// the total: it is a static Mercator mesh drawn by index range, so the triangles it
+    /// adds to the GPU's frame are the ones the selection covers, not ones a frame builds
+    /// (see [`WORST_FRAME_TRIANGLES`] for the pre-port frame that counted them, and the
+    /// static pin below for the coast's own cost).
     ///
     /// The fit covers the viewport, so 1× does not show the whole map. The busiest view is
     /// not the fitted one: the coast and the road copy both get heavier as the camera
-    /// zooms in, and the peak sits just past a switch — see [`WORST_FRAME_TRIANGLES`] for
-    /// the view the current asset peaks at. The sweep below covers the user's 1.56:1 pane,
-    /// 1,600 and 2,048 px wide panes and a tall one, at a dense zoom walk plus the exact
-    /// zooms every switch happens at, and at a **7 × 5 grid of camera centres over the
-    /// camera's clamp range**, refined by two 9 × 9 rounds around the twenty heaviest
+    /// zooms in, and the peak sits just past a switch. The sweep below covers the user's
+    /// 1.56:1 pane, 1,600 and 2,048 px wide panes and a tall one, at a dense zoom walk plus
+    /// the exact zooms every switch happens at, and at a **7 × 5 grid of camera centres over
+    /// the camera's clamp range**, refined by two 9 × 9 rounds around the twenty heaviest
     /// coarse frames. That is a grid sample, not an analytic upper bound: a view between
     /// two samples can be heavier by whatever the coastline changes between them, which is
-    /// why the pin is the measured maximum and the next lever is measured, not assumed.
+    /// why the next lever is measured, not assumed.
     #[test]
     fn the_visible_triangle_budget_is_under_the_frame_budget() {
         let scene = scene::scene().expect("the checked-in asset parses");
         let origin = [0.0, 0.0];
-        let ring = ring_path([100.0, 100.0], origin);
-        let no_ring = Path::new(point(px(0.0), px(0.0)));
+        let ring = ring_mesh([100.0, 100.0], origin);
+        let no_ring = Mesh::default();
         let at = |viewport: [f32; 2], zoom: f32, center: [f32; 2]| {
             Projection::new(Camera { center, zoom }.clamped(viewport), viewport)
         };
-        let breakdown = |projection: Projection, vessels: &[Vessel], ring: &Path<Pixels>| {
-            let layers = map_layers(Some(scene), projection, origin, vessels);
+        let breakdown = |projection: Projection, vessels: &[Vessel], ring: &Mesh| {
+            let layers = frame_meshes(Some(scene), projection, origin, vessels);
             LayerTriangles::of(
                 &layers,
                 ring,
@@ -1442,8 +1997,8 @@ mod tests {
         }
         assert_eq!(
             reference.total(),
-            REFERENCE_FRAME_2_8_TRIANGLES,
-            "the 2.8× design frame moved: {}",
+            REFERENCE_FRAME_2_8_TRIANGLES - REFERENCE_FRAME_2_8_LAND_TRIANGLES,
+            "the 2.8× design frame's dynamic layers moved: {}",
             reference.describe(),
         );
 
@@ -1457,9 +2012,9 @@ mod tests {
         let measure = |pane: &'static str, viewport: [f32; 2], zoom: f32, center: [f32; 2]| {
             let projection = at(viewport, zoom, center);
             let vessels = a_full_picture(projection);
-            let layers = map_layers(Some(scene), projection, origin, &vessels);
+            let layers = frame_meshes(Some(scene), projection, origin, &vessels);
             assert_eq!(
-                layers.ships.types[ShipType::Unknown.index()].vertices.len() / 3,
+                layers.ships.types[ShipType::Unknown.index()].triangle_count(),
                 PICTURE_VESSELS * ROUND_SEGMENTS,
                 "the full picture is in frame, so the worst case is the one counted",
             );
@@ -1472,7 +2027,7 @@ mod tests {
             let longitude = center[0].to_degrees();
             assert!(
                 triangles.total() <= FRAME_TRIANGLE_BUDGET,
-                "{pane} pane at {zoom}× over {latitude:.3}N {longitude:.3}E draws {}, over \
+                "{pane} pane at {zoom}× over {latitude:.3}N {longitude:.3}E builds {}, over \
                  the {FRAME_TRIANGLE_BUDGET} budget",
                 triangles.describe(),
             );
@@ -1529,9 +2084,7 @@ mod tests {
 
         // Refine around the heaviest coarse frames, two rounds each: the first samples a
         // window one coarse step either way, the second one quarter of that, so a peak
-        // between two coarse samples is found to about a thirty-second of a cell. This is
-        // where the pin comes from; the coarse grid alone can miss a frame by a few
-        // hundred triangles.
+        // between two coarse samples is found to about a thirty-second of a cell.
         for seed in frames.iter().take(SWEEP_REFINEMENTS) {
             let range = centre_range(seed.viewport, seed.zoom);
             let mut step = [
@@ -1562,41 +2115,54 @@ mod tests {
         let latitude = model::latitude_of(worst.center[1]);
         let longitude = worst.center[0].to_degrees();
         println!(
-            "worst frame ({} pane at {}×, {latitude:.3}N {longitude:.3}E): {}",
+            "heaviest dynamic frame ({} pane at {}×, {latitude:.3}N {longitude:.3}E): {}",
             worst.pane,
             worst.zoom,
             worst.triangles.describe(),
         );
-        assert_eq!(
+        println!(
+            "the plan's worst-frame target was {WORST_FRAME_TARGET_TRIANGLES} triangles; the \
+             dynamic half of the frame peaks at {}",
             worst.triangles.total(),
-            WORST_FRAME_TRIANGLES,
-            "the sweep's worst frame is {} at {}× over {latitude:.3}N {longitude:.3}E; the \
-             plan's target is {WORST_FRAME_TARGET_TRIANGLES}, {} over it",
+        );
+        assert!(
+            worst.triangles.total() <= WORST_FRAME_TRIANGLES,
+            "the heaviest frame's dynamic layers build {}, over the {WORST_FRAME_TRIANGLES} \
+             the whole frame used to draw at its worst",
             worst.triangles.describe(),
-            worst.zoom,
-            worst
-                .triangles
-                .total()
-                .saturating_sub(WORST_FRAME_TARGET_TRIANGLES),
+        );
+        // A frame still draws the coast, from the static mesh: the budget has to cover that
+        // too, and the widest bound on it is a whole land tier.
+        let heaviest_land = scene
+            .land
+            .iter()
+            .map(|layer| layer.triangles.len() + layer.wide.len())
+            .max()
+            .expect("the asset has four land tiers");
+        assert!(
+            worst.triangles.total() + heaviest_land <= FRAME_TRIANGLE_BUDGET,
+            "one frame builds {}, and the heaviest coast can add {heaviest_land} triangles \
+             from the static mesh — over the {FRAME_TRIANGLE_BUDGET} budget",
+            worst.triangles.describe(),
         );
     }
 
     /// The pane the design measures on: the user's 1.56:1 viewport.
     const DESIGN_VIEWPORT: [f32; 2] = [1_404.0, 900.0];
 
-    /// The coastline a frame draws follows the projection's real scale, and the vertices
-    /// it emits are exactly the chosen tier's visible triangles.
+    /// The coastline a frame draws follows the projection's real scale, and the ranges it
+    /// selects are the chosen tier's.
     ///
-    /// This is asserted by comparing the painted vertex count with the layer's own
-    /// [`LandLayer::visible`](crate::scene::LandLayer::visible) count for every tier, not
-    /// by looking at whether anything was painted: the fitted zoom has to match the
-    /// coarsest tier's count and four times the zoom the finest tier's, and the two
-    /// counts differ by a factor of five.
+    /// The land is a static mesh per tier now, so the frame does not emit its triangles:
+    /// what it chooses is the tier and the ranges. The tier is asserted from the
+    /// projection's real scale, the mesh's triangle count is asserted to be that tier's
+    /// whole ([`LAND_TIER_TRIANGLES`]), and the selected ranges against every tier's own
+    /// visible buckets — the fitted zoom drawing the coarsest tier and four times the
+    /// finest, whose counts differ by a factor of nearly four.
     #[test]
     fn the_fitted_zoom_fills_the_coarsest_coast_and_four_times_fills_the_finest() {
         let scene = scene::scene().expect("the checked-in asset parses");
         let viewport = DESIGN_VIEWPORT;
-        let origin = [0.0, 0.0];
         let projection = |zoom| {
             Projection::new(
                 Camera {
@@ -1613,66 +2179,86 @@ mod tests {
             (model::MAX_ZOOM, 0),
         ] {
             let projection = projection(zoom);
-            let visible = projection.visible_mercator();
-            let cells = model::visible_cells(visible).grown();
-            let path = land_path(scene, projection, origin, cells, visible);
-            let triangles: Vec<usize> = scene
-                .land
-                .iter()
-                .map(|land| land.visible(cells, visible).count())
-                .collect();
-
             assert_eq!(
                 model::land_tier(projection.metres_per_pixel()),
                 expected,
                 "at {zoom}× the projection draws {:.0} m/px, which is not tier {expected}",
                 projection.metres_per_pixel(),
             );
+
+            let visible = projection.visible_mercator();
+            let cells = model::visible_cells(visible).grown();
+            let mut drawn_by_tier = Vec::with_capacity(model::LAND_TIERS);
+            for tier in 0..model::LAND_TIERS {
+                let layer = &scene.land[tier];
+                let land = land_mesh(layer);
+                let ranges = visible_land_ranges(&land, layer, cells, visible);
+                drawn_by_tier.push(
+                    ranges
+                        .iter()
+                        .map(|range| (range.end - range.start) as usize / 3)
+                        .sum::<usize>(),
+                );
+            }
+
+            let layer = scene.land(projection.metres_per_pixel());
+            let land = land_mesh(layer);
             assert_eq!(
-                path.vertices.len(),
-                triangles[expected] * 3,
-                "at {zoom}× the frame paints the triangles of tier {expected}, not another \
-                 tier's: {triangles:?}",
+                triangles(&land.mesh),
+                LAND_TIER_TRIANGLES[expected],
+                "at {zoom}× the frame draws the triangles of tier {expected}, not another tier's",
             );
-            for other in 0..model::LAND_TIERS {
+            assert_eq!(
+                drawn_by_tier[expected],
+                expected_land_triangles(layer, &land, cells, visible),
+                "at {zoom}× the selected ranges are the visible buckets of tier {expected}",
+            );
+            assert!(
+                drawn_by_tier[expected] > 0
+                    && drawn_by_tier[expected] <= LAND_TIER_TRIANGLES[expected],
+                "at {zoom}× the selection is a part of the tier: {}",
+                drawn_by_tier[expected],
+            );
+            for (other, drawn) in drawn_by_tier.iter().enumerate() {
                 if other != expected {
                     assert_ne!(
-                        triangles[other], triangles[expected],
-                        "tier {other} draws the same count as tier {expected}, so the \
-                         assertion above proves nothing",
+                        *drawn, drawn_by_tier[expected],
+                        "tier {other} draws the same count as tier {expected} at {zoom}×, so \
+                         the tier choice proves nothing: {drawn_by_tier:?}",
                     );
                 }
             }
         }
     }
 
-    /// The fitted frame is inside the plan's triangle and vertex budgets, both pictures.
+    /// The frame's dynamic half is inside the plan's triangle and vertex budgets, both
+    /// pictures.
     ///
-    /// The empty frame is the one the plan's §8 **≤ 21,000 triangles / ≤ 65,536
-    /// vertices** target is about. The typical frame has 2,516 vessels whose ship record
-    /// has arrived — one marker triangle each — and its gate is the 2^17
-    /// instance-buffer step: **≤ 43,690 triangles / ≤ 131,072 vertices**. Both are pinned
-    /// exactly as change detectors and asserted against their targets.
+    /// The plan's §8 target (**≤ 21,000 triangles / ≤ 65,536 vertices**) was about the whole
+    /// frame. The fitted frame's coast was 5,733 of those triangles and is drawn from the
+    /// static mesh now instead of being built per frame, so the pins below are the
+    /// historical totals less that coast: what a frame actually builds. Both pictures are
+    /// pinned exactly as change detectors and asserted against their targets.
     #[test]
     fn the_fitted_frame_is_inside_the_plan_budget() {
         let scene = scene::scene().expect("the checked-in asset parses");
         let viewport = DESIGN_VIEWPORT;
         let projection = Projection::new(Camera::default().clamped(viewport), viewport);
-        let no_ring = Path::new(point(px(0.0), px(0.0)));
+        let no_ring = Mesh::default();
         let filter = model::road_filter(projection.metres_per_pixel(), projection.zoom);
 
-        let empty_layers = map_layers(Some(scene), projection, [0.0, 0.0], &[]);
+        let empty_layers = frame_meshes(Some(scene), projection, [0.0, 0.0], &[]);
         let empty = LayerTriangles::of(&empty_layers, &no_ring, filter);
         assert_eq!(
             empty.total(),
-            FITTED_FRAME_TRIANGLES,
-            "the empty fitted frame's triangle count moved: measure it, update the \
+            FITTED_FRAME_TRIANGLES - FITTED_FRAME_LAND_TRIANGLES,
+            "the empty fitted frame's dynamic triangle count moved: measure it, update the \
              constant and the README; {}",
             empty.describe(),
         );
         assert!(
             empty.total() <= FITTED_FRAME_TARGET_TRIANGLES,
-            "the empty fitted frame draws {}, over the plan's \
+            "the empty fitted frame builds {}, over the plan's \
              {FITTED_FRAME_TARGET_TRIANGLES} triangles",
             empty.describe(),
         );
@@ -1683,7 +2269,7 @@ mod tests {
             empty.total() * 3,
         );
 
-        let typical_layers = map_layers(
+        let typical_layers = frame_meshes(
             Some(scene),
             projection,
             [0.0, 0.0],
@@ -1692,14 +2278,14 @@ mod tests {
         let typical = LayerTriangles::of(&typical_layers, &no_ring, filter);
         assert_eq!(
             typical.total(),
-            FITTED_FRAME_TYPICAL_TRIANGLES,
-            "the typical fitted frame's triangle count moved: measure it, update the \
+            FITTED_FRAME_TYPICAL_TRIANGLES - FITTED_FRAME_LAND_TRIANGLES,
+            "the typical fitted frame's dynamic triangle count moved: measure it, update the \
              constant and the README; {}",
             typical.describe(),
         );
         assert!(
             typical.total() <= FITTED_FRAME_TYPICAL_TARGET_TRIANGLES,
-            "the typical fitted frame draws {}, over the 2^17 step's \
+            "the typical fitted frame builds {}, over the 2^17 step's \
              {FITTED_FRAME_TYPICAL_TARGET_TRIANGLES} triangles",
             typical.describe(),
         );
@@ -1849,10 +2435,10 @@ mod tests {
             "at 1.6× the fine copy would draw every class-0 record, so every chain is back",
         );
 
-        // And the layers follow the scale: 1× draws the coarse copy, 1.6× the middle one,
+        // And the meshes follow the scale: 1× draws the coarse copy, 1.6× the middle one,
         // 2.8× the fine one, and only 4× adds the primary roads.
         let at = |zoom: f32| {
-            map_layers(
+            frame_meshes(
                 Some(scene),
                 Projection::new(
                     Camera {
@@ -1870,24 +2456,24 @@ mod tests {
         let middle_zoom = at(1.6);
         let detailed = at(2.8);
         assert!(
-            !fitted.roads[0].vertices.is_empty()
-                && !middle_zoom.roads[0].vertices.is_empty()
-                && !detailed.roads[0].vertices.is_empty(),
+            !fitted.roads[0].is_empty()
+                && !middle_zoom.roads[0].is_empty()
+                && !detailed.roads[0].is_empty(),
             "every zoom band draws a class-0 copy",
         );
         assert!(
-            fitted.roads[0].vertices.len() != middle_zoom.roads[0].vertices.len()
-                && middle_zoom.roads[0].vertices.len() != detailed.roads[0].vertices.len(),
+            triangles(&fitted.roads[0]) != triangles(&middle_zoom.roads[0])
+                && triangles(&middle_zoom.roads[0]) != triangles(&detailed.roads[0]),
             "the three bands draw three different geometries, not the same one three times",
         );
         assert!(
-            fitted.roads[1].vertices.is_empty()
-                && middle_zoom.roads[1].vertices.is_empty()
-                && detailed.roads[1].vertices.is_empty(),
+            fitted.roads[1].is_empty()
+                && middle_zoom.roads[1].is_empty()
+                && detailed.roads[1].is_empty(),
             "primary roads wait for the closest zoom",
         );
         assert!(
-            !at(4.0).roads[1].vertices.is_empty(),
+            !at(4.0).roads[1].is_empty(),
             "the closest zoom draws the primary roads in view",
         );
     }

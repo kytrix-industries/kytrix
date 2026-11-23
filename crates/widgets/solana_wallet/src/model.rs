@@ -26,7 +26,7 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use gpui_kit::{App, SharedString};
+use i18n::{t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     engine::SolanaWalletTransfer,
     solana_wallet::{
@@ -36,7 +36,7 @@ use kytrix_service_provider::service::{
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
-use widget::error::LocalizedError;
+use widget::error::TranslatedError;
 
 /// How many transfers one subscription retains.
 ///
@@ -49,10 +49,10 @@ pub(super) const MAX_TRANSFERS: usize = 50;
 pub(super) struct TransferItem {
     event_id: SmolStr,
     timestamp: i64,
-    from_address: SharedString,
-    to_address: SharedString,
-    amount: SharedString,
-    token_symbol: SharedString,
+    from_address: SmolStr,
+    to_address: SmolStr,
+    amount: SmolStr,
+    token_symbol: SmolStr,
     display: Mutex<Option<(UtcOffset, Arc<TransferDisplay>)>>,
 }
 
@@ -61,10 +61,10 @@ impl TransferItem {
         Self {
             event_id: transfer.event_id,
             timestamp: transfer.timestamp,
-            from_address: SharedString::new(transfer.from_address.as_str()),
-            to_address: SharedString::new(transfer.to_address.as_str()),
-            amount: SharedString::new(transfer.amount.as_str()),
-            token_symbol: SharedString::new(transfer.token_symbol.as_str()),
+            from_address: transfer.from_address,
+            to_address: transfer.to_address,
+            amount: transfer.amount,
+            token_symbol: transfer.token_symbol,
             display: Mutex::new(None),
         }
     }
@@ -79,11 +79,11 @@ impl TransferItem {
         &self.event_id
     }
 
-    pub(super) const fn origin(&self) -> &SharedString {
+    pub(super) const fn origin(&self) -> &SmolStr {
         &self.from_address
     }
 
-    pub(super) const fn destination(&self) -> &SharedString {
+    pub(super) const fn destination(&self) -> &SmolStr {
         &self.to_address
     }
 
@@ -112,16 +112,14 @@ impl TransferItem {
 #[derive(Debug)]
 pub(super) struct TransferDisplay {
     /// The amount and what it is denominated in, which a row reads as one value.
-    pub amount: SharedString,
-    pub time: SharedString,
+    pub amount: SmolStr,
+    pub time: SmolStr,
 }
 
 impl TransferDisplay {
     fn new(item: &TransferItem, zone: UtcOffset) -> Self {
         Self {
-            amount: SharedString::new(
-                format_smolstr!("{} {}", item.amount, item.token_symbol).as_str(),
-            ),
+            amount: format_smolstr!("{} {}", item.amount, item.token_symbol),
             time: format_time(item.timestamp, zone),
         }
     }
@@ -139,6 +137,27 @@ impl TransferSnapshot {
         &self.items
     }
 }
+
+impl Default for TransferSnapshot {
+    fn default() -> Self {
+        Self {
+            items: Arc::from([]),
+        }
+    }
+}
+
+/// Two snapshots are the same feed when they are the same retained set.
+///
+/// A feed is published as one immutable value: a snapshot the service publishes is a
+/// fresh `Arc`, so a signal holding it is told apart from the one before it by the
+/// value's own identity rather than by comparing up to fifty transfers.
+impl PartialEq for TransferSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.items, &other.items)
+    }
+}
+
+impl Eq for TransferSnapshot {}
 
 /// The transfers one subscription retains.
 pub(super) struct TransferState {
@@ -322,11 +341,11 @@ pub(super) enum SolanaWalletDataError {
     InconsistentSelections,
 }
 
-impl LocalizedError for SolanaWalletDataError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for SolanaWalletDataError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
             Self::InconsistentSelections => {
-                i18n::t!(cx, "widget.solana_wallet.inconsistent_selections")
+                t_smol!(translate, "widget.solana_wallet.inconsistent_selections")
             }
         }
     }
@@ -336,7 +355,7 @@ impl LocalizedError for SolanaWalletDataError {
 ///
 /// The service stamps transfers in UTC, so what a reader sees is that instant
 /// converted by the offset the caller read from the settings.
-fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
+fn format_time(timestamp: i64, zone: UtcOffset) -> SmolStr {
     // The offset can move an instant past the last date the calendar holds — a
     // timestamp at the far end of the range is one the service cannot publish, and
     // it is written as a placeholder rather than taken to a date that is not one.
@@ -344,19 +363,16 @@ fn format_time(timestamp: i64, zone: UtcOffset) -> SharedString {
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--"),
+            || SmolStr::new_static("--"),
             |time| {
-                SharedString::new(
-                    format_smolstr!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        time.year(),
-                        u8::from(time.month()),
-                        time.day(),
-                        time.hour(),
-                        time.minute(),
-                        time.second()
-                    )
-                    .as_str(),
+                format_smolstr!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    time.year(),
+                    u8::from(time.month()),
+                    time.day(),
+                    time.hour(),
+                    time.minute(),
+                    time.second()
                 )
             },
         )

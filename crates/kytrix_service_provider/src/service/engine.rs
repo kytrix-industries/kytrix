@@ -26,13 +26,13 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::{
+    runtime::Handle,
     sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep_until, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 use yawc::{Frame, WebSocketError};
 
 use super::{
@@ -673,13 +673,13 @@ pub(super) struct KytrixServiceConnectorInner {
     /// The task that turns one publication of the network projection into a
     /// [`SupervisorCommand::Reconfigure`] for every live session.
     ///
-    /// [`KytrixServiceConnector::install`] is the production entry point for
+    /// [`KytrixServiceConnector::spawn`] is the production entry point for
     /// this task; every `KytrixServiceConnector` constructor starts it.
     pub config_task: Mutex<Option<JoinHandle<()>>>,
     pub next_subscriber_id: AtomicU64,
     pub session_state: SessionStateRegistry,
     /// The application runtime every route resolution of this connector runs on.
-    pub runtime: Runtime,
+    pub runtime: Handle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -898,7 +898,7 @@ pub(super) struct ServiceSessionContext {
     pub wake: Arc<Notify>,
     pub transport_policy: TransportPolicy,
     /// The application runtime every route resolution of a session runs on.
-    pub runtime: Runtime,
+    pub runtime: Handle,
 }
 
 pub(super) struct ServiceSessionActor {
@@ -946,7 +946,7 @@ pub(super) struct ServiceSessionActor {
     pub observed_session_state: SessionStateRegistry,
     pub session_generation: u64,
     pub transport_policy: TransportPolicy,
-    pub runtime: Runtime,
+    pub runtime: Handle,
 }
 
 pub(super) enum ConnectedAction {

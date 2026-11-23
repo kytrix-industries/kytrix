@@ -1,143 +1,75 @@
-//! The tests of the page's appearance and language: what is stored is what is drawn.
+//! The tests of the appearance page: the theme and the language it switches.
 
-use app_config::settings::{Appearance, Config, Language};
-use base_ui::style::palette::Appearance as ThemeAppearance;
-use gpui_kit::{SharedString, TestAppContext, WindowAppearance};
-use i18n::language::codes::LanguageCode;
+use app_config::settings::{Appearance, Language};
+use base_ui::theme::appearance::Appearance as ThemeAppearance;
 
-use super::test_support::*;
+use crate::settings_tests::test_support::Harness;
 
-/// A value the user changes reaches the settings at once: there is nothing to confirm.
-#[gpui_kit::test]
-fn a_field_change_should_reach_the_settings_at_once(cx: &mut TestAppContext) {
-    let (_panel, cx) = settings(Config::default(), cx);
+/// The page the settings open on is the appearance page, and its two settings are drawn.
+#[test]
+fn the_settings_should_open_on_the_appearance_page() {
+    let mut harness = Harness::new();
+    harness.settle(2);
 
-    click(cx, "SETTINGS_CONTROL_appearance");
-    click(cx, "TEST_MENU_ITEM_Dark");
-
-    assert_eq!(
-        stored(cx).appearance,
-        Appearance::Dark,
-        "the change should be the settings of the moment it was made"
+    assert_eq!(harness.page().current_page(), "appearance");
+    assert!(
+        harness.field("appearance").is_some(),
+        "the appearance setting should be drawn"
     );
     assert!(
-        cx.debug_bounds("SETTINGS_PAGE").is_some(),
-        "the page has no commit that closes it, so a change leaves it open"
+        harness.field("language").is_some(),
+        "the language setting should be drawn"
     );
 }
 
-/// The theme is what the settings name, as soon as they name it.
-///
-/// A control writes the settings rather than a copy of them, so the appearance the interface
-/// is drawn in follows the stored preference at once.
-#[gpui_kit::test]
-fn the_theme_should_follow_the_appearance_at_once(cx: &mut TestAppContext) {
-    let (_panel, cx) = settings(Config::default(), cx);
+/// Switching the appearance in the settings switches the theme.
+#[test]
+fn a_stored_dark_appearance_should_be_the_applied_theme() {
+    let mut harness = Harness::new();
+    harness.settle(2);
+    assert_eq!(
+        harness.theme().current(harness.app()),
+        ThemeAppearance::Light
+    );
 
-    click(cx, "SETTINGS_CONTROL_appearance");
-    click(cx, "TEST_MENU_ITEM_Dark");
+    harness.update_config(|config| config.appearance = Appearance::Dark);
+    harness.settle(1);
 
     assert_eq!(
-        drawn_appearance(cx),
-        ThemeAppearance::Dark,
-        "the appearance the user chose should be the one the application is drawn in"
+        harness.theme().current(harness.app()),
+        ThemeAppearance::Dark
     );
 }
 
-/// The theme is drawn from the appearance the settings name, and a preference that names an
-/// appearance is not the system's to answer.
-///
-/// The precedence itself — every preference against every appearance a system reports, the
-/// pinned cases included — is a table in [`crate::appearance`], where the system appearance is
-/// an argument and so can be put to it. What only a whole session can show is that the resolved
-/// appearance reaches the theme: a chosen `Dark` draws the dark appearance, and handing the
-/// preference back to the system draws the appearance the system's own appearance resolves
-/// to — which the window reports itself, so the test asks the window rather than assuming one.
-#[gpui_kit::test]
-fn an_appearance_should_draw_the_appearance_it_resolves_to(cx: &mut TestAppContext) {
-    let (_panel, cx) = settings(Config::default(), cx);
+/// Switching the language in the settings redraws the page's static text in the new language.
+#[test]
+fn a_stored_language_should_redraw_the_page_in_it() {
+    let mut harness = Harness::new();
+    harness.settle(2);
+    let english = harness.field_label("appearance");
+    assert_eq!(english, "Mode");
 
-    click(cx, "SETTINGS_CONTROL_appearance");
-    click(cx, "TEST_MENU_ITEM_Dark");
+    harness.update_config(|config| config.language = Language::ZhCn);
+    harness.settle(2);
 
-    assert_eq!(
-        drawn_appearance(cx),
-        ThemeAppearance::Dark,
-        "the appearance the user chose is the one the application is drawn in"
-    );
-
-    let reported = cx.update(|window, _| window.appearance());
-    click(cx, "SETTINGS_CONTROL_appearance");
-    click(cx, "TEST_MENU_ITEM_System");
-
-    assert_eq!(
-        stored(cx).appearance,
-        Appearance::System,
-        "the settings should have moved the preference back to the system"
-    );
-    assert_eq!(
-        drawn_appearance(cx),
-        match reported {
-            WindowAppearance::Light | WindowAppearance::VibrantLight => ThemeAppearance::Light,
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => ThemeAppearance::Dark,
-        },
-        "following the system again means being drawn in the appearance the system reports"
-    );
+    assert_eq!(harness.field_label("appearance"), "模式");
 }
 
-/// The language switches at once, the sidebar is labelled in it, and the page the user was on
-/// is still reachable — or the page moves to one that is.
-#[gpui_kit::test]
-fn the_language_should_switch_at_once_and_the_page_should_stay_reachable(cx: &mut TestAppContext) {
-    let (panel, cx) = settings_in(Config::default(), Language::ZhCn, cx);
+/// A settings page whose language was written through the session follows it on the next frame.
+#[test]
+fn a_language_written_through_the_session_should_be_drawn() {
+    let mut harness = Harness::new();
+    harness.settle(2);
 
+    harness.update_config(|config| config.language = Language::ZhCn);
+    harness.settle(2);
+
+    assert_eq!(harness.page().query(), "");
     assert!(
-        labels(&panel, cx).contains(&SharedString::new_static("外观")),
-        "the sidebar should open in the language the window opened in"
-    );
-
-    click(cx, "SETTINGS_CONTROL_language");
-    click(cx, "TEST_MENU_ITEM_en");
-
-    assert_eq!(
-        cx.read(|cx| *cx.global::<LanguageCode>()),
-        LanguageCode::En,
-        "choosing the language should switch the interface to it at once"
-    );
-    assert_eq!(
-        stored(cx).language,
-        Language::En,
-        "choosing the language should store it at once"
-    );
-    let translated = labels(&panel, cx);
-    assert!(
-        translated.contains(&SharedString::new_static("Appearance")),
-        "the sidebar should be labelled in the language that was chosen: {translated:?}"
-    );
-    assert_eq!(
-        current_page(&panel, cx),
-        "appearance",
-        "the page that was drawn should still be the page the new language reaches"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_PAGE").is_some(),
-        "switching the language leaves the settings page open"
-    );
-}
-
-/// The data formatting page's time zone is chosen from the offsets the setting stores, and
-/// choosing one writes it.
-#[gpui_kit::test]
-fn the_time_zone_should_be_chosen_from_its_row(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(Config::default(), cx);
-
-    select(&panel, "data-format", cx);
-    click(cx, "SETTINGS_CONTROL_data-format.offset");
-    click(cx, "TEST_MENU_ITEM_8");
-
-    assert_eq!(
-        stored(cx).data_time_zone.hours(),
-        8,
-        "the row writes the offset the user chose"
+        harness
+            .debug_ids()
+            .iter()
+            .any(|id| id.starts_with("SETTINGS_FIELD_")),
+        "the page should still be drawn after the language switch"
     );
 }

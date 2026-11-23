@@ -73,6 +73,12 @@ pub(crate) struct TextContext {
     diagnostics: SmallVec<[TextDiagnostic; 8]>,
     /// 字体代际（`set_font_stack` / `reload_system_fonts` 时 +1；字形缓存与图集的失效依据，B2）。
     font_epoch: u32,
+    /// 真正跑 `RangedBuilder::build` 的次数（仅测试构建；E24 的缓存断言观测面）。
+    ///
+    /// 生产路径不需要它：节点路径的塑形次数由 `TextPassReport.shaped` 覆盖，Canvas 文本的
+    /// 次数由调用方自己控制。E24 用它断言「同文本换色命中形状缓存、不重复塑形」。
+    #[cfg(test)]
+    shapes: u32,
 }
 
 impl TextContext {
@@ -92,6 +98,8 @@ impl TextContext {
             stack_resolutions: 0,
             diagnostics: SmallVec::new(),
             font_epoch: 1,
+            #[cfg(test)]
+            shapes: 0,
         }
     }
 
@@ -189,7 +197,8 @@ impl TextContext {
         let key = ShapeKey::new(content, self.font_stack_version);
         if let Some(hit) = self.cache.get(&key)
             && hit.text() == content.text
-            && hit.same_shaping_inputs(&content.style)
+            && hit.same_shaping_inputs(&content.style, content.runs())
+            && hit.normalized_runs() == content.normalized_runs()
             && hit.inline_boxes() == content.inline_boxes.as_ref()
         {
             return (hit, true);
@@ -198,7 +207,12 @@ impl TextContext {
         let family = self.family_for(content.style.family());
         let font_identity = self.font_identity(content.style.family());
         // 数字快速路径：先试「字符 → glyph id → advance」直拼（R12 最重要的性能项）。
+        // v2.1 E2：富文本 runs 与文本装饰都不走快速路径（快速路径产出的 ShapedLine 没有
+        // 逐 run 颜色 / 装饰几何；装饰也不是纯数字字形序列的属性）。
         if content.inline_boxes.is_empty()
+            && content.runs().is_empty()
+            && content.normalized_runs() == 0
+            && content.style.decoration().is_none()
             && let Some(simple) = self.fast.try_shape(
                 &mut self.font_cx,
                 &mut self.layout_cx,
@@ -212,15 +226,36 @@ impl TextContext {
             self.cache.insert(key, Rc::clone(&shaped));
             return (shaped, false);
         }
+        // run 的家族覆盖在进入 parley 之前解析（`shape` 不持有 `TextContext`）。
+        let run_families: Vec<(core::ops::Range<usize>, parley::FontFamily<'static>)> = content
+            .runs()
+            .iter()
+            .filter(|run| run.style.family().is_some())
+            .map(|run| {
+                let run_family = self.family_for(run.style.family());
+                (run.range.clone(), run_family)
+            })
+            .collect();
+        #[cfg(test)]
+        {
+            self.shapes += 1;
+        }
         let shaped = Rc::new(ShapedText::shape(
             &mut self.font_cx,
             &mut self.layout_cx,
             &family,
             content,
             self.font_stack_version,
+            &run_families,
         ));
         self.cache.insert(key, Rc::clone(&shaped));
         (shaped, false)
+    }
+
+    /// 真正的 parley 塑形次数（仅测试：E24 断言「换色命中形状缓存、不重复塑形」）。
+    #[cfg(test)]
+    pub(crate) fn shape_count(&self) -> u32 {
+        self.shapes
     }
 
     /// 该样式的字体栈身份（快速路径验证缓存的键的一部分）。

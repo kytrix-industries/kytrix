@@ -27,8 +27,7 @@
 use std::{collections::VecDeque, convert::Infallible, future::Future};
 
 use futures::StreamExt;
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_connector::market::{
     error::MarketError, provider::MarketCapability, streams::OrderBookStream,
 };
@@ -38,10 +37,11 @@ use market_participants_model::{
         ListingOrderBook, ListingOrderBookLevel, ListingOrderBookUpdate, MarketSequence,
     },
 };
+use smol_str::SmolStr;
 use thiserror::Error;
 use tokio::time::Instant;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     protocol::WidgetProtocol,
     runtime::{ServiceContext, WidgetService},
     stream::StreamPublisher,
@@ -156,16 +156,20 @@ pub(super) enum OrderBookStreamError {
     SubscriptionClosed,
 }
 
-impl LocalizedError for OrderBookStreamError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for OrderBookStreamError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::MarketParticipant(error) => error.localized_message(cx),
+            Self::MarketParticipant(error) => error.translated_message(translate),
             Self::SnapshotSynchronizationFailed => {
-                t!(cx, "error.order_book.snapshot_sync_failed")
+                t_smol!(translate, "error.order_book.snapshot_sync_failed")
             }
-            Self::SnapshotBehindUpdates => t!(cx, "error.order_book.snapshot_behind_updates"),
-            Self::SnapshotUnavailable => t!(cx, "error.order_book.snapshot_unavailable"),
-            Self::SubscriptionClosed => t!(cx, "error.order_book.subscription_closed"),
+            Self::SnapshotBehindUpdates => {
+                t_smol!(translate, "error.order_book.snapshot_behind_updates")
+            }
+            Self::SnapshotUnavailable => {
+                t_smol!(translate, "error.order_book.snapshot_unavailable")
+            }
+            Self::SubscriptionClosed => t_smol!(translate, "error.order_book.subscription_closed"),
         }
     }
 }

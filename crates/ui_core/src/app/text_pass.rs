@@ -801,9 +801,11 @@ pub(crate) fn layout_text(
         }
         // 有 tile 被淘汰 / 图集换代：本 pass 早先的 `ShapedLine` 可能引用已失效的矩形。
         // 把全部文本重新入队后重跑（有界：淘汰只发生在容量不足时，第二轮会优先淘汰
-        // 不在本帧使用的 tile，工作集放得下就收敛）。
+        // 不在本帧使用的 tile，工作集放得下就收敛）。Canvas 节点同样要重画（编码期丢弃
+        // 失效 run，见 `paint/pass.rs` 的 D-5 canvas 安全网）。
         any_eviction = true;
         tree.invalidate_text_lines();
+        tree.mark_canvas_nodes_paint();
         round += 1;
         if round >= MAX_LAYOUT_TEXT_PASSES {
             // 兜底：不再重跑本帧。此时行刚被清空、全部文本节点**已入队**（`invalidate_text_lines`），
@@ -824,6 +826,7 @@ pub(crate) fn layout_text(
                 continue;
             }
             other.tree_mut().invalidate_text_lines();
+            other.tree_mut().mark_canvas_nodes_paint();
         }
     }
     // 可见失败兜底：连续 `ATLAS_FULL_ESCALATION_FRAMES` 个 pass 都以软失败收尾 ⇒ 上报
@@ -933,7 +936,11 @@ pub(crate) fn repaint_text_if_atlas_changed(app: &mut App) {
     }
     app.atlas_generation_seen = generation;
     for window in app.windows.values_mut() {
-        window.tree_mut().invalidate_text_lines();
+        let tree = window.tree_mut();
+        tree.invalidate_text_lines();
+        // E1b F2：Canvas 图元里同样烘焙了 `AtlasTile`（应用经 `push_shaped_text` 写入）。
+        // 只是文本节点失效的话，Canvas 节点会整桶复用旧 lane，编码期逐 run 校验不会执行。
+        tree.mark_canvas_nodes_paint();
     }
 }
 
@@ -972,7 +979,9 @@ mod tests {
         node::{builder::NodeBuilder, id::NodeId},
         paint::{atlas::AtlasKind, primitive::Primitive},
         render::AtlasAllocator,
-        text::{TextDiagnostic, TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES},
+        text::{
+            TextContent, TextDiagnostic, TextRun, TextStyle, atlas::ATLAS_FULL_ESCALATION_FRAMES,
+        },
         window::{WindowId, WindowOptions},
     };
 
@@ -1139,6 +1148,72 @@ mod tests {
         );
         let tree = app.window(window).expect("窗口存在").tree();
         assert_eq!(tree.text_layout_dirty_len(), 0, "没有软失败就不该重新入队");
+    }
+
+    /// v2.1 E2b（审查 F4，Lead 裁定 b）：非法 runs 在构造期归一化，**归一化计数必须可观测**
+    /// —— 形状期压一条 `InvalidTextRun { runs }`（D17 不静默）；重复 pass 由 `TextContext` 的
+    /// 按值去重收敛为一条（不每帧刷屏）。
+    #[test]
+    fn normalized_runs_emit_one_invalid_text_run_diagnostic() {
+        let (_rt, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        // "a界b"：1..2 落在多字节字符中间（内收为空 ⇒ 丢弃）；4..6 越界（内收为 4..5）。
+        let content = TextContent::new("a界b", TextStyle::new(16.0)).with_runs([
+            TextRun::new(0..1, TextStyle::new(16.0)),
+            TextRun::new(1..2, TextStyle::new(16.0)),
+            TextRun::new(4..6, TextStyle::new(16.0)),
+        ]);
+        assert_eq!(content.normalized_runs(), 2, "构造期两个 run 被改动");
+        let node = {
+            let w = app.window_mut(window).expect("窗口存在");
+            let root = w.tree().root();
+            let node = NodeBuilder::text("", TextStyle::new(16.0))
+                .style(text_style(Some(200.0)))
+                .build(w.tree_mut(), root)
+                .expect("挂载成功");
+            assert!(w.tree_mut().set_text_content(node, content), "文本载荷");
+            node
+        };
+        let _ = frame_text(&mut app, window);
+        let invalid: Vec<_> = app
+            .text_diagnostics()
+            .iter()
+            .filter(|diagnostic| matches!(diagnostic, TextDiagnostic::InvalidTextRun { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            invalid,
+            vec![TextDiagnostic::InvalidTextRun { runs: 2 }],
+            "归一化计数必须成为可观测诊断（diagnostics: {:?}）",
+            app.text_diagnostics()
+        );
+        assert!(
+            app.window(window)
+                .expect("窗口存在")
+                .tree()
+                .text_line(node)
+                .is_some(),
+            "归一化后的 runs 仍必须正常成形（不失败）"
+        );
+
+        // 重排一次（图集换代 ⇒ 重新光栅）会重新提交同一条诊断：按值去重必须收敛为一条。
+        assert!(app.atlas.grow(), "512² → 1024² 必须成功");
+        app.repaint_text_if_atlas_changed();
+        let _ = app
+            .layout_text(window)
+            .expect("窗口存在")
+            .expect("重排不报错");
+        let count = app
+            .text_diagnostics()
+            .iter()
+            .filter(|diagnostic| matches!(diagnostic, TextDiagnostic::InvalidTextRun { runs: 2 }))
+            .count();
+        assert_eq!(
+            count,
+            1,
+            "同一诊断去重，不随 pass 刷屏: {:?}",
+            app.text_diagnostics()
+        );
     }
 
     /// 重试必须真的能补齐：容量恢复后同一节点重排，`skipped` 归零且 `ShapedLine` 的字形数补齐

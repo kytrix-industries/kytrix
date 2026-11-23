@@ -7,10 +7,12 @@ use app_config::network::{Config, KytrixServiceCapability, RouteTarget, ServiceT
 use bytes::BytesMut;
 use network::transport::{http::HttpClientClass, hub::TransportHub};
 use serde::Deserialize;
+use tokio::runtime::Handle;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 use crate::auth::model::AuthError;
+#[cfg(test)]
+use crate::test_support::test_handle;
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const HANDOFF_CODE_CHARS: usize = 43;
@@ -23,7 +25,7 @@ struct DashboardHandoffResponse {
 pub(super) async fn request_dashboard_handoff(
     config: &Config,
     transport: &TransportHub,
-    runtime: &Runtime,
+    runtime: &Handle,
     endpoint: &Url,
     access_token: &str,
     proof: &str,
@@ -95,7 +97,7 @@ mod tests {
         let code = request_dashboard_handoff(
             &Config::default(),
             &transport,
-            &Runtime::for_test(),
+            &test_handle(),
             &endpoint,
             "access-token",
             "dpop-proof",
@@ -139,7 +141,7 @@ mod tests {
         let status = request_dashboard_handoff(
             &Config::default(),
             &transport,
-            &Runtime::for_test(),
+            &test_handle(),
             &endpoint,
             "access-token",
             "dpop-proof",
@@ -154,7 +156,7 @@ mod tests {
         let malformed = request_dashboard_handoff(
             &Config::default(),
             &transport,
-            &Runtime::for_test(),
+            &test_handle(),
             &endpoint,
             "access-token",
             "dpop-proof",

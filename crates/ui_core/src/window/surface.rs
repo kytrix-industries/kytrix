@@ -312,6 +312,19 @@ pub(crate) fn reset_atlas_deferrals(window: &mut Window) {
     window.atlas_deferrals = 0;
 }
 
+// 消费者：`impl Window::note_stale_canvas_followup` 的薄委托（外部调用点见该方法文档）。
+/// 记一次「Canvas 失效 run 已被编码期丢弃」；返回是否应**为该图集代际补一帧**。
+///
+/// 每个代际至多补一次：补帧给出一次让应用在 `on_frame` 钩子里重建 Canvas 的机会（应用义务），
+/// 应用忽略义务时同一代际的后续帧不再请求（I3：不能变成空转）。
+pub(crate) fn note_stale_canvas_followup(window: &mut Window, generation: u32) -> bool {
+    if window.stale_canvas_followup_generation == Some(generation) {
+        return false;
+    }
+    window.stale_canvas_followup_generation = Some(generation);
+    true
+}
+
 // 消费者：`impl Window::queue_atlas_upload` 的薄委托（外部调用点见该方法文档）。
 /// 把一页图集像素交给渲染器；`false` = 没有渲染器或渲染器已关闭（**没有**入队）。
 ///

@@ -2,7 +2,7 @@
 //!
 //! `app.rs` 的 `impl App` 只保留同名薄委托，方法体在这里（零行为变更的纯拆分）。
 
-use super::{App, overlay_style};
+use super::{App, input, overlay_style};
 use crate::{
     error::EngineError,
     interaction,
@@ -55,28 +55,47 @@ pub(crate) fn create_overlay(
             .or_else(|| candidate(target.pointer().last_hit.map(|hit| hit.node)))
             .or(scope)
     });
+    let OverlayOptions {
+        placement,
+        dismiss,
+        trap_focus,
+        restore_focus,
+        a11y,
+    } = options;
     let Some(target) = app.windows.get_mut(&window) else {
         return Err(EngineError::UnknownWindow { window });
     };
     let root = target.tree().root();
     // 新建时还不知道浮层尺寸：`Above` / `Left` 首帧先按零尺寸定位，布局之后由
     // resolve_overlay_placements 用实测尺寸纠正（P2-6）。
-    let origin = interaction::resolve_placement(target.tree(), options.placement, Size::ZERO);
+    let origin = interaction::resolve_placement(target.tree(), placement, Size::ZERO);
     let style = overlay_style(origin);
+    // 包装节点的 a11y 角色**只来自显式声明**（E12）：无 `role` ⇒ `GenericContainer`，
+    // 不再按「浮层槽」猜成 `Dialog`（P2-4b R12）。
     let node = NodeBuilder::boxed()
         .style(style)
+        .a11y(a11y)
         .build(target.tree_mut(), root)?;
     if let Some(slot) = target.tree_mut().ensure_interaction(node) {
         slot.overlay = Some(OverlaySlot {
-            dismiss: options.dismiss,
-            placement: options.placement,
-            trap_focus: options.trap_focus,
+            dismiss,
+            placement,
+            trap_focus,
             opener,
-            restore_focus: options.restore_focus,
+            restore_focus,
         });
     }
     // 反向索引：锚点纠位每帧只遍历浮层（`resolve_overlay_placements`）。
     target.tree_mut().note_overlay_container(node);
+    // 模态作用域建立 ⇒ 背景的 a11y `hidden` 语义整体改变：全树标 `A11Y`，下一笔增量交付
+    // 才能把 `inert` 背景送到 AT（否则背景节点没有脏位、影子树里永远留着旧值）。
+    if trap_focus {
+        crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
+    }
+    // 作用域外的悬停立即结束（:hover / tooltip 不得在模态之上继续；与旧 `BlockMouse` 同义）。
+    if trap_focus {
+        input::revalidate_hover(app, window);
+    }
     #[cfg(feature = "hud")]
     app.raise_debug_hud(window);
     app.request_frame();
@@ -86,7 +105,7 @@ pub(crate) fn create_overlay(
 /// 关闭浮层（节点不存在 ⇒ `false`）。
 /// 消费者：`App::close_overlay`。
 pub(crate) fn close_overlay(app: &mut App, overlay: &Overlay) -> bool {
-    app.remove_node(overlay.window(), overlay.node())
+    app.remove_node(overlay.window(), overlay.node()).is_ok()
 }
 
 /// 帧首按**上一帧布局的实测尺寸**重新求值锚点定位（P2-6）。
@@ -167,12 +186,27 @@ pub(crate) fn place_overlay(app: &mut App, overlay: &Overlay, placement: Overlay
 pub(crate) fn bring_overlay_to_front(app: &mut App, overlay: &Overlay) -> bool {
     let window = overlay.window();
     let node = overlay.node();
-    let Some(target) = app.windows.get_mut(&window) else {
-        return false;
+    let modal = {
+        let Some(target) = app.windows.get_mut(&window) else {
+            return false;
+        };
+        let modal = target
+            .tree()
+            .overlay_slot(node)
+            .is_some_and(|slot| slot.trap_focus);
+        let root = target.tree().root();
+        if target.tree_mut().append_child(root, node).is_err() {
+            return false;
+        }
+        // 多个模态浮层并存时「最上层」决定作用域；提层可能换掉作用域根 ⇒ 背景 hidden 语义
+        // 整体改变（同一份 [mark_modal_scope_changed] 理由）。
+        if modal {
+            crate::a11y::tree::mark_modal_scope_changed(target.tree_mut());
+        }
+        modal
     };
-    let root = target.tree().root();
-    if target.tree_mut().append_child(root, node).is_err() {
-        return false;
+    if modal {
+        input::revalidate_hover(app, window);
     }
     #[cfg(feature = "hud")]
     app.raise_debug_hud(window);
@@ -204,7 +238,7 @@ pub(crate) fn dismiss_overlay(app: &mut App, window: WindowId) -> bool {
         overlay_util::topmost(tree, tree.root()).map(|(node, _)| node)
     });
     match node {
-        Some(node) => app.remove_node(window, node),
+        Some(node) => app.remove_node(window, node).is_ok(),
         None => false,
     }
 }

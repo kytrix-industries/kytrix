@@ -31,10 +31,10 @@ use smol_str::{SmolStr, format_smolstr};
 use tokio::{
     fs::{File, OpenOptions},
     io::AsyncWriteExt,
+    runtime::Handle,
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use widget_tokio_runtime::runtime::Runtime;
 
 use crate::{
     error::{DownloadError, RangeFailure, RedirectFailure},
@@ -81,7 +81,7 @@ impl Validator {
 pub(crate) async fn download(
     transport: &TransportHub,
     config: &Config,
-    runtime: &Runtime,
+    runtime: &Handle,
     request: &DownloadRequest,
     fresh: bool,
     validator: Arc<Mutex<Option<Validator>>>,
@@ -116,7 +116,7 @@ pub(crate) async fn download(
 async fn attempt(
     transport: &TransportHub,
     config: &Config,
-    runtime: &Runtime,
+    runtime: &Handle,
     request: &DownloadRequest,
     fresh: bool,
     validator: Arc<Mutex<Option<Validator>>>,
@@ -565,13 +565,13 @@ mod tests {
     use tokio::{net::TcpListener, time::Sleep};
     use tokio_util::sync::CancellationToken;
     use url::Url;
-    use widget_tokio_runtime::runtime::Runtime;
 
     use super::{ContentRange, Validator, content_range, download, redirect_target};
     use crate::{
         error::{DownloadError, DownloadFailure, RangeFailure, RedirectFailure},
         progress::{Progress, Snapshot},
         request::DownloadRequest,
+        test_support::test_handle,
     };
 
     /// How much of a paced payload each frame carries.
@@ -1057,7 +1057,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let cancellation = CancellationToken::new();
         let progress = Progress::default();
         let request = request(
@@ -1123,7 +1123,7 @@ mod tests {
             .join("model.bin");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let progress = Progress::default();
         let request = request(
             address,
@@ -1169,7 +1169,7 @@ mod tests {
         let destination = blocker.join("model.bin");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let progress = Progress::default();
         let request = request(
             address,
@@ -1214,7 +1214,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let progress = Progress::default();
         let request = request(
             address,
@@ -1272,7 +1272,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let cancellation = CancellationToken::new();
         let progress = Arc::new(Progress::default());
         let watcher = cancel_when(&progress, &cancellation, |snapshot| snapshot.opened());
@@ -1316,7 +1316,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/paced", &destination, Some(payload.len() as u64));
 
         let cancellation = CancellationToken::new();
@@ -1395,7 +1395,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let progress = Progress::default();
         let request = request(
             address,
@@ -1442,7 +1442,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let validator = validator();
         let request = request(
             address,
@@ -1508,7 +1508,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let validator = validator();
 
         let started = request(
@@ -1578,7 +1578,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, Some(expected));
 
         let outcome = download(
@@ -1620,7 +1620,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, Some(expected));
 
         let outcome = download(
@@ -1664,7 +1664,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, None);
 
         let outcome = download(
@@ -1702,7 +1702,7 @@ mod tests {
         let (_directory, destination, _part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/missing", &destination, None);
 
         let outcome = download(
@@ -1738,7 +1738,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(
             address,
             "/redirect",
@@ -1782,7 +1782,7 @@ mod tests {
         let (_directory, destination, _part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/bad-redirect", &destination, None);
 
         let outcome = download(
@@ -1816,7 +1816,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let validator = validator();
         let request = request(
             address,
@@ -1885,7 +1885,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let validator = validator();
         let request = request(
             address,
@@ -1951,7 +1951,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let mut request = request(address, "/oversized", &destination, None);
         request.class = HttpClientClass::UpdaterDownload;
 
@@ -1991,7 +1991,7 @@ mod tests {
         let (_directory, destination, part) = downloading();
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let mut request = request(address, "/chunked", &destination, None);
         // The smallest budget stands in for a body that grows past its class
         // limit without announcing a length.
@@ -2037,7 +2037,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(
             address,
             "/payload",
@@ -2084,7 +2084,7 @@ mod tests {
             .expect("the stale partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, None);
 
         let written = download(
@@ -2128,7 +2128,7 @@ mod tests {
             .expect("the stale partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/unsolicited", &destination, None);
 
         let outcome = download(
@@ -2177,7 +2177,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, None);
 
         let outcome = download(
@@ -2231,7 +2231,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, None);
 
         let outcome = download(
@@ -2278,7 +2278,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let request = request(address, "/payload", &destination, None);
 
         let written = download(
@@ -2312,7 +2312,7 @@ mod tests {
             .expect("the partial file is written");
         let hub = transport();
         let config = Config::default();
-        let runtime = Runtime::for_test();
+        let runtime = test_handle();
         let mut request = request(address, "/oversized-range", &destination, None);
         request.class = HttpClientClass::UpdaterDownload;
 

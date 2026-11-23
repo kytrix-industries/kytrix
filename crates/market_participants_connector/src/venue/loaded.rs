@@ -14,22 +14,16 @@
 //! reachable through this view's query face: they exist for the commit's own
 //! correctness and for the pruning of the next one.
 //!
-//! The event boundary is [`VenueEventSource`], one entity owned by the
-//! application. It is attached when the market participants root is installed there, and
-//! every successful commit is announced through it exactly once. A commit with no
-//! boundary attached is a defect rather than a silent success, so the
-//! announcement is what reports it.
+//! A commit reaches the application through the catalogue's published generation: the
+//! composition root mirrors `CatalogGenerationId` into the engine signal widgets follow,
+//! and this view answers the routing questions of the same commit. There is no event
+//! boundary to attach and no subscriber to announce to.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use ahash::AHashMap;
-use gpui_kit::{Entity, EventEmitter};
 use market_participants_model::{identifier::VenueId, listing::route::VenueRoute};
 use parking_lot::{RwLock, RwLockWriteGuard};
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     catalog::generation::CatalogGenerationId,
@@ -116,12 +110,10 @@ pub struct LoadedVenues {
     /// A venue that publishes no scope leaves the table, but its commit history does
     /// not: the counter is what makes every successful commit of a venue — a first
     /// load, a refresh, a whole-venue removal — exactly one revision higher than the
-    /// commit before it. Without it a removal would either announce the previous
-    /// commit's revision again or lose the trail, and a subscriber that dedups by
-    /// `(venue, revision)` would drop the removal.
+    /// commit before it. Without it a removal would either report the previous
+    /// commit's revision again or lose the trail, and a reader that compares
+    /// revisions would drop the removal.
     revisions: RwLock<AHashMap<VenueId, u64>>,
-    events: OnceLock<Entity<VenueEventSource>>,
-    updates: RwLock<Option<UnboundedSender<VenuesUpdated>>>,
 }
 
 impl LoadedVenues {
@@ -130,69 +122,6 @@ impl LoadedVenues {
         Self {
             venues: RwLock::new(BTreeMap::new()),
             revisions: RwLock::new(AHashMap::new()),
-            events: OnceLock::new(),
-            updates: RwLock::new(None),
-        }
-    }
-
-    /// Takes the event entity every commit is announced through.
-    ///
-    /// The entity belongs to an application, so it is created once by the
-    /// market participants root's install path and handed to this view there. A root built
-    /// without an application has no event boundary to attach, and a commit in
-    /// such a root is refused rather than announced to nobody.
-    pub(crate) fn attach_events(&self, events: Entity<VenueEventSource>) {
-        if self.events.set(events).is_err() {
-            log::error!("the venue event source is already attached");
-        }
-    }
-
-    /// Takes the sink a commit is announced through.
-    ///
-    /// A load runs on the application runtime, which holds no GPUI context, so the
-    /// announcement crosses back as a message: the install path owns the task that
-    /// turns each message into an emission on the entity. Without the sink a
-    /// commit cannot be announced at all, which [`Self::announce`] reports.
-    pub(crate) fn attach_update_sink(&self, updates: UnboundedSender<VenuesUpdated>) {
-        *self.updates.write() = Some(updates);
-    }
-
-    /// Returns the event entity every commit is announced through.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the market participants root was built without an application: nothing
-    /// could ever announce a venue commit there, so asking for the event
-    /// boundary is a programming error rather than an empty answer.
-    pub fn events(&self) -> Entity<VenueEventSource> {
-        self.events
-            .get()
-            .expect(
-                "the venue event source is attached when the market participants root is installed",
-            )
-            .clone()
-    }
-
-    /// Announces one successful commit.
-    ///
-    /// A commit that cannot be announced is a defect in the composition root, not
-    /// a commit that silently happened: the menu, the selector and every pane are
-    /// subscribers, so a commit nobody hears would leave them showing the previous
-    /// one forever. The call therefore reports rather than returns, and it happens
-    /// after the venue table's lock is released.
-    ///
-    /// # Panics
-    ///
-    /// Panics when no event boundary is attached — see [`Self::events`]. A root
-    /// built without an application cannot have subscribers, and silently
-    /// committing there is what the contract forbids.
-    pub(crate) fn announce(&self, venue: VenueId, revision: u64) {
-        let update = VenuesUpdated { venue, revision };
-        let sink = self.updates.read().clone().unwrap_or_else(|| {
-            panic!("a venue commit was announced with no event boundary attached")
-        });
-        if let Err(error) = sink.send(update) {
-            log::error!("the venue event boundary is gone: {error}");
         }
     }
 
@@ -320,21 +249,3 @@ impl VenueCommitGuard<'_> {
         revision
     }
 }
-
-/// The GPUI entity a venue commit is announced through.
-pub struct VenueEventSource;
-
-/// Indicates that one venue committed everything it published.
-///
-/// The revision names which commit this is, so a subscriber can tell "my venue
-/// committed again" from "my venue committed the same scope set again" without
-/// re-reading anything.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VenuesUpdated {
-    /// The venue that committed.
-    pub venue: VenueId,
-    /// The revision that commit published.
-    pub revision: u64,
-}
-
-impl EventEmitter<VenuesUpdated> for VenueEventSource {}

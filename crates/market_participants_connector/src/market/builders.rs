@@ -736,7 +736,6 @@ mod tests {
         error::ModelError, instrument::InstrumentKind, routing::CapabilityId,
     };
     use network::transport::hub::{TransportHub, TransportPolicy};
-    use widget_tokio_runtime::runtime::Runtime;
 
     use super::MarketError;
     use crate::{
@@ -752,6 +751,7 @@ mod tests {
         market::{provider::MarketCapability, timeframe::Adjustment},
         market_participants::model::TimeFrame,
         runtime::MarketParticipantNetworkSnapshot,
+        test_support::test_handle,
     };
 
     /// A market capability whose spot route publishes one fixture listing.
@@ -764,7 +764,7 @@ mod tests {
                 Arc::new(TransportHub::new(TransportPolicy::default())),
                 notification,
             )
-            .with_runtime(Runtime::for_test()),
+            .with_runtime(test_handle()),
             Arc::clone(&catalog),
         )
         .expect("the root builds from typed runtime inputs");

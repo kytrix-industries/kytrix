@@ -825,7 +825,7 @@ fn removing_a_node_detaches_its_dependencies() {
         .tree_mut()
         .remove(bare)
         .expect("裸卸载");
-    assert!(app.remove_node(window, managed), "App 路径卸载");
+    assert!(app.remove_node(window, managed).is_ok(), "App 路径卸载");
 
     let after = crate::test_support::diagnostics::dependency_dump(&app);
     assert_eq!(
@@ -1614,7 +1614,17 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
 fn close_window_forgets_the_scale_epoch() {
     let (_rt, mut app, window, _node) = text_app("x", None);
     let _ = refresh(&mut app, window);
+    // 首帧的 `refresh_images` 会为窗口登记图片 scale epoch（E7 旁表）。
+    let _ = app.frame(window).expect("窗口存在").expect("帧成功");
+    assert!(
+        app.image_scale_epochs.contains_key(&window),
+        "首帧必须登记图片 scale epoch（否则下面的清理断言是空断言）"
+    );
     assert!(app.close_window(window));
+    assert!(
+        !app.image_scale_epochs.contains_key(&window),
+        "关窗必须清 image_scale_epochs（create/close 循环下否则无界增长）"
+    );
     assert!(!app.close_window(window), "second close is a no-op");
 }
 
@@ -1669,6 +1679,7 @@ fn inline_boxes_changes_relayout() {
         size: crate::math::Size::new(20.0, 20.0),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
+        paint: None,
     };
     let node = {
         let w = app.window_mut(window).expect("window");
@@ -1688,6 +1699,7 @@ fn inline_boxes_changes_relayout() {
         size: crate::math::Size::new(40.0, 10.0),
         baseline: Some(8.0),
         align: crate::text::InlineAlign::Top,
+        paint: None,
     };
     {
         let tree = app.window_mut(window).expect("window").tree_mut();
@@ -1698,6 +1710,66 @@ fn inline_boxes_changes_relayout() {
     let pass = refresh(&mut app, window);
     assert_eq!(pass.shaped, 1, "inline boxes are part of the shape key");
     assert_eq!(text_layout(&mut app, window).laid, 1);
+}
+
+/// v2.1 E2b（审查 F11/F12）：`App::frame` 把行内盒图片缺失接成 `InlineBoxImageMissing`
+/// 诊断（D17 不静默）；同一 id 的重复帧由 `TextContext` 按值去重，环里始终只有一条。
+#[test]
+fn app_frame_reports_missing_inline_box_images_once() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+    let spec = crate::text::InlineBoxSpec {
+        id: 11,
+        index: 1,
+        size: crate::math::Size::new(16.0, 16.0),
+        baseline: None,
+        align: crate::text::InlineAlign::Baseline,
+        paint: Some(crate::text::InlineBoxPaint::Image {
+            resource: crate::resources::ResourceId::for_test(4242, 1),
+            modulation: crate::paint::color::Color::WHITE,
+        }),
+    };
+    {
+        let w = app.window_mut(window).expect("window");
+        let root = w.tree().root();
+        NodeBuilder::text("a b", crate::text::TextStyle::new(16.0))
+            .inline_boxes([spec])
+            .build(w.tree_mut(), root)
+            .expect("build");
+    }
+    let missing_count = |app: &App| {
+        app.text_diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    crate::text::TextDiagnostic::InlineBoxImageMissing { id: 11 }
+                )
+            })
+            .count()
+    };
+    let outcome = app.frame(window).expect("窗口存在").expect("帧成功");
+    assert!(matches!(outcome, FrameOutcome::Committed(_)));
+    assert_eq!(
+        missing_count(&app),
+        1,
+        "App::frame 必须把跳过的行内图片接成诊断：{:?}",
+        app.text_diagnostics()
+    );
+    let _ = app.frame(window).expect("窗口存在").expect("帧不报错");
+    assert_eq!(
+        missing_count(&app),
+        1,
+        "同一诊断按值去重，不随帧数增长：{:?}",
+        app.text_diagnostics()
+    );
+    assert!(
+        app.window(window)
+            .expect("window")
+            .inline_box_image_diagnostics()
+            .is_empty(),
+        "App 路径的文本诊断不写窗口级快照"
+    );
 }
 
 #[test]
@@ -1711,6 +1783,7 @@ fn bind_text_preserves_inline_boxes() {
         size: crate::math::Size::new(16.0, 16.0),
         baseline: None,
         align: crate::text::InlineAlign::Baseline,
+        paint: None,
     };
     let node = {
         let w = app.window_mut(window).expect("window");
@@ -1978,4 +2051,146 @@ fn closing_the_owner_cascades_to_owned_and_modal_windows() {
     assert!(app.window(panel).is_none(), "owned 面板级联关闭");
     assert!(app.window(modal).is_none(), "模态窗口级联关闭");
     assert!(app.window(grandchild).is_none(), "级联必须递归");
+}
+
+// ── E6（P1-E6）：窗口 chrome 的运行时 API ──────────────────────────────
+
+/// E6：`App::set_title` 写窗口参数（泵下一轮对账到原生窗口）并拒绝未知窗口；
+/// 同值写是 no-op（不产生额外的平台系统调用）。
+#[test]
+fn set_title_updates_the_window_and_rejects_unknown_windows() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions {
+        title: smol_str::SmolStr::new_static("before"),
+        ..WindowOptions::default()
+    });
+
+    app.set_title(window, smol_str::SmolStr::new_static("after"))
+        .expect("已知窗口必须接受标题");
+    assert_eq!(
+        app.window(window).expect("窗口存在").options().title,
+        "after"
+    );
+    // 同值：仍是 Ok 且不改任何东西（幂等）。
+    app.set_title(window, smol_str::SmolStr::new_static("after"))
+        .expect("同值标题必须成功");
+
+    let error = app
+        .set_title(WindowId::for_test(999), smol_str::SmolStr::new_static("x"))
+        .expect_err("未知窗口必须是强类型错误");
+    assert!(
+        matches!(error, crate::error::EngineError::UnknownWindow { .. }),
+        "必须是 UnknownWindow：{error:?}"
+    );
+}
+
+/// E6：`App::request_window_control` 三端可见（去 `cfg(linux)`）：窗口存在性优先，其次是
+/// 平台能力判定；请求进入单槽，由平台泵取走执行。
+#[test]
+fn request_window_control_queues_supported_controls_and_rejects_unknown_windows() {
+    use crate::window::{WindowControl, WindowResizeEdge};
+
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+
+    let error = app
+        .request_window_control(WindowId::for_test(999), WindowControl::Minimize)
+        .expect_err("未知窗口必须优先报错");
+    assert!(matches!(
+        error,
+        crate::error::EngineError::UnknownWindow { .. }
+    ));
+
+    app.request_window_control(window, WindowControl::Minimize)
+        .expect("Minimize 三端都支持");
+    assert_eq!(
+        app.take_window_control(),
+        Some((window, WindowControl::Minimize)),
+        "请求必须进单槽由平台泵取走"
+    );
+    assert_eq!(app.take_window_control(), None, "取走后槽必须为空");
+
+    // 平台能力差异：Windows 没有全屏 / 程序化 move / resize；macOS 没有程序化 move / resize。
+    let unsupported: &[(&str, WindowControl)] = if cfg!(windows) {
+        &[
+            ("fullscreen", WindowControl::ToggleFullscreen),
+            ("interactive move", WindowControl::BeginMove),
+            (
+                "interactive resize",
+                WindowControl::BeginResize(WindowResizeEdge::TopLeft),
+            ),
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            ("interactive move", WindowControl::BeginMove),
+            (
+                "interactive resize",
+                WindowControl::BeginResize(WindowResizeEdge::BottomRight),
+            ),
+        ]
+    } else {
+        &[]
+    };
+    for (needle, control) in unsupported {
+        let error = app
+            .request_window_control(window, *control)
+            .expect_err("该端必须强类型拒绝");
+        let crate::error::EngineError::UnsupportedWindowCapability { capability, .. } = &error
+        else {
+            panic!("必须是 UnsupportedWindowCapability：{error:?}");
+        };
+        assert!(
+            capability.contains(needle),
+            "capability 诊断名必须可 grep（期望含 {needle}）：{capability}"
+        );
+    }
+    // 被拒绝的控制不得留在槽里。
+    assert_eq!(app.take_window_control(), None);
+
+    // 三端都支持的控制（Windows/macOS 的 Minimize/ToggleMaximize；Linux 全部）仍可入队。
+    app.request_window_control(window, WindowControl::ToggleMaximize)
+        .expect("ToggleMaximize 三端都支持");
+    assert_eq!(
+        app.take_window_control(),
+        Some((window, WindowControl::ToggleMaximize))
+    );
+}
+
+/// E6 / I10：非 macOS 的交通灯 API 必须**强类型**报错（setter）或如实返回 None（getter），
+/// 不得静默成功；未知窗口仍然优先。
+#[test]
+fn traffic_light_api_is_unsupported_off_macos() {
+    let (_rt, mut app) = new_app();
+    let window = app.create_window(WindowOptions::default());
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        use crate::math::Point;
+
+        assert_eq!(app.traffic_light_inset(window), None, "非 macOS 没有交通灯");
+        let error = app
+            .set_traffic_light_position(window, Point::new(8.0, 8.0))
+            .expect_err("非 macOS 必须强类型拒绝");
+        let crate::error::EngineError::UnsupportedWindowCapability { capability, .. } = &error
+        else {
+            panic!("必须是 UnsupportedWindowCapability：{error:?}");
+        };
+        assert!(capability.contains("traffic light"), "{capability}");
+
+        let error = app
+            .set_traffic_light_position(WindowId::for_test(999), Point::ZERO)
+            .expect_err("未知窗口优先");
+        assert!(matches!(
+            error,
+            crate::error::EngineError::UnknownWindow { .. }
+        ));
+        assert_eq!(app.traffic_light_inset(WindowId::for_test(999)), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // 建窗路径（AppKit）由平台层在 real run loop 里完成；headless 的 `App` 没有原生窗口，
+        // 这里只验证 API 契约的两端都存在（`None` 表示「尚未由平台写入」）。
+        assert_eq!(app.traffic_light_inset(window), None);
+    }
 }

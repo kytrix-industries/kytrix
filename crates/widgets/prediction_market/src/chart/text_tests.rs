@@ -1,28 +1,35 @@
 //! The chart's formatters, asserted at fixed instants and offsets.
 //!
 //! Both interface languages are pinned: the axis and the hovered time have to follow
-//! the language showing, not the venue's English spelling.
+//! the language showing, not the venue's English spelling. The shaped-line cache is
+//! asserted through the engine's own test host, because a lease is what it manages.
 
-use i18n::{global::embedded, language::codes::LanguageCode, translator::types::I18n};
+use std::{rc::Rc, sync::Arc};
+
+use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use time::{Date, Month, UtcOffset};
+use ui_core::paint::color::Color;
+use widget::test_support::WidgetTestApp;
 
 use super::{
     geometry::TimeLabelKind,
     text::{
-        format_axis_labels, format_axis_time, format_hover_time, format_percent_integer,
-        format_percent_one_decimal,
+        ChartTextCache, REGULAR_WEIGHT, TEXT_CACHE_CAPACITY, format_axis_labels, format_axis_time,
+        format_hover_time, format_percent_integer, format_percent_one_decimal, label_style,
     },
 };
 
-/// The catalogue the chart formats through.
-fn catalog() -> I18n {
-    embedded::load().expect("the embedded locales should load")
+/// The catalogue the chart formats through, rendering `language`.
+fn translate(language: LanguageCode) -> Translate {
+    Translate::new(
+        Rc::new(embedded::load().expect("the embedded locales should load")),
+        language,
+    )
 }
 
 /// One axis label at UTC.
 fn axis(timestamp: i64, label: TimeLabelKind, language: LanguageCode) -> String {
-    let i18n = catalog();
-    format_axis_time(timestamp, label, UtcOffset::UTC, &i18n, language).to_string()
+    format_axis_time(timestamp, label, UtcOffset::UTC, &translate(language)).to_string()
 }
 
 /// One axis label in a display zone.
@@ -32,14 +39,12 @@ fn axis_in(
     zone: UtcOffset,
     language: LanguageCode,
 ) -> String {
-    let i18n = catalog();
-    format_axis_time(timestamp, label, zone, &i18n, language).to_string()
+    format_axis_time(timestamp, label, zone, &translate(language)).to_string()
 }
 
 /// One hovered time at UTC.
 fn hover(timestamp: i64, language: LanguageCode) -> String {
-    let i18n = catalog();
-    format_hover_time(timestamp, UtcOffset::UTC, &i18n, language).to_string()
+    format_hover_time(timestamp, UtcOffset::UTC, &translate(language)).to_string()
 }
 
 /// The instant 2026-01-05 08:00:00 UTC, in milliseconds.
@@ -61,6 +66,11 @@ fn midnight() -> i64 {
         .assume_utc()
         .unix_timestamp()
         * 1_000
+}
+
+/// The style the chart's axis labels are shaped in.
+fn axis_style() -> ui_core::text::TextStyle {
+    label_style(12.0, 14.0, Color::WHITE, REGULAR_WEIGHT)
 }
 
 #[test]
@@ -202,13 +212,11 @@ fn a_repeated_clock_label_is_blanked_while_its_tick_stays() {
         january_fifth_eight() + 3 * 3_600_000,
         january_fifth_eight() + 24 * 3_600_000,
     ];
-    let i18n = catalog();
     let labels = format_axis_labels(
         &timestamps,
         TimeLabelKind::Clock,
         UtcOffset::UTC,
-        &i18n,
-        LanguageCode::En,
+        &translate(LanguageCode::En),
     );
 
     assert_eq!(labels[0].as_str(), "8:00 AM");
@@ -269,4 +277,109 @@ fn the_axis_and_legend_round_to_whole_percent() {
     assert_eq!(format_percent_integer(27.4).as_str(), "27%");
     assert_eq!(format_percent_integer(0.0).as_str(), "0%");
     assert_eq!(format_percent_integer(100.0).as_str(), "100%");
+}
+
+/// A shaped line is shaped once: the second read of the same text and style is the
+/// same handle, which is what makes a hover re-shape nothing.
+#[test]
+fn the_text_cache_shapes_a_line_once() {
+    let mut app = WidgetTestApp::new();
+    let mut cache = ChartTextCache::default();
+    let style = axis_style();
+
+    let first = cache.line(app.app_mut(), "8:00 AM", &style);
+    let same = cache.line(app.app_mut(), "8:00 AM", &style);
+
+    assert!(Arc::ptr_eq(&first, &same));
+    assert_eq!(cache.cached_len(), 1);
+}
+
+/// A different style is a different line: colour and weight are part of its identity.
+#[test]
+fn the_text_cache_keeps_a_line_per_style() {
+    let mut app = WidgetTestApp::new();
+    let mut cache = ChartTextCache::default();
+    let style = axis_style();
+    let coloured = label_style(12.0, 14.0, Color::BLACK, REGULAR_WEIGHT);
+
+    let first = cache.line(app.app_mut(), "8:00 AM", &style);
+    let second = cache.line(app.app_mut(), "8:00 AM", &coloured);
+
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(cache.cached_len(), 2);
+}
+
+/// The cache is bounded and drops the least recently used label: reads refresh an
+/// entry, so the label that falls out is the one furthest from the last read.
+#[test]
+fn the_text_cache_keeps_a_bounded_lru_window() {
+    let mut app = WidgetTestApp::new();
+    let mut cache = ChartTextCache::default();
+    let style = axis_style();
+    let mut second = None;
+    for index in 0..TEXT_CACHE_CAPACITY {
+        let handle = cache.line(app.app_mut(), &format!("label-{index}"), &style);
+        if index == 2 {
+            second = Some(handle);
+        }
+    }
+    let second = second.expect("the third label was shaped");
+    assert_eq!(cache.cached_len(), TEXT_CACHE_CAPACITY);
+
+    // Two recent reads: `label-0` and `label-1` are no longer the least recently used,
+    // so the next miss has to evict `label-2`.
+    cache.line(app.app_mut(), "label-0", &style);
+    let first = cache.line(app.app_mut(), "label-1", &style);
+    cache.line(app.app_mut(), "new-label", &style);
+
+    assert_eq!(cache.cached_len(), TEXT_CACHE_CAPACITY);
+    let evicted = cache.line(app.app_mut(), "label-2", &style);
+    assert!(
+        !Arc::ptr_eq(&evicted, &second),
+        "the least recently used label was the one dropped"
+    );
+    let kept = cache.line(app.app_mut(), "label-1", &style);
+    assert!(
+        Arc::ptr_eq(&kept, &first),
+        "a label that was read again survived the eviction window"
+    );
+}
+
+/// A handle whose atlas lease moved is re-shaped rather than drawn from reused
+/// texture: the engine refuses to encode it, so keeping it would lose the label.
+#[test]
+fn the_text_cache_reshapes_a_line_whose_atlas_lease_is_gone() {
+    let mut app = WidgetTestApp::new();
+    let mut cache = ChartTextCache::default();
+    let style = axis_style();
+    let before = cache.line(app.app_mut(), "8:00 AM", &style);
+
+    // An atlas reset under the same font stack: every handle shaped so far is leased
+    // from an atlas that no longer exists.
+    let stack = app.app().font_stack().clone();
+    app.app_mut().set_font_stack(stack);
+
+    let after = cache.line(app.app_mut(), "8:00 AM", &style);
+
+    assert!(before.is_stale(), "the font stack change moved the lease");
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "the stale handle was shaped again"
+    );
+    assert!(!after.is_stale(), "and the fresh one is drawable");
+    assert_eq!(cache.cached_len(), 1);
+}
+
+/// The width the cache reports is the shaped line's own advance width.
+#[test]
+fn the_text_cache_measures_the_line_it_shaped() {
+    let mut app = WidgetTestApp::new();
+    let mut cache = ChartTextCache::default();
+    let style = axis_style();
+
+    let width = cache.width(app.app_mut(), "100%", &style);
+    let line = cache.line(app.app_mut(), "100%", &style);
+
+    assert_eq!(width, line.size().width);
+    assert!(width > 0.0);
 }

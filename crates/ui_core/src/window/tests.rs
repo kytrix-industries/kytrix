@@ -1,14 +1,17 @@
 #[cfg(windows)]
 use super::frame::surface_change_plan;
 use super::{
-    FrameIndex, FrameOutcome, FramePresentation, Window, WindowId, WindowOptions,
-    frame::frame_reaches_gpu, surface::covering_surface,
+    Decorations, FrameIndex, FrameOutcome, FramePresentation, Window, WindowId, WindowOptions,
+    WindowState, frame::frame_reaches_gpu, surface::covering_surface,
 };
 use crate::{
-    math::{PhysicalRect, Rect, Scale, Size},
-    node::dirty::DirtyFlags,
-    paint::color::Color,
+    app::App,
+    error::EngineError,
+    math::{PhysicalRect, Point, Rect, Scale, Size},
+    node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
+    paint::{canvas::Canvas, color::Color, style::Style},
     render::compositor::{DamageRects, Plan},
+    text::{InlineAlign, InlineBoxSpec, TextAlign, TextContent, TextStyle},
 };
 
 fn window() -> Window {
@@ -494,10 +497,7 @@ fn scale_epoch_bumps_on_dpi_change() {
 
 // ── P06：帧推进 ──
 
-use crate::{
-    node::builder::NodeBuilder,
-    paint::style::{PaintSpec, StylePatch},
-};
+use crate::paint::style::{PaintSpec, StylePatch};
 
 fn painted_window() -> (Window, crate::node::id::NodeId) {
     let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
@@ -511,6 +511,73 @@ fn painted_window() -> (Window, crate::node::id::NodeId) {
         .build(window.tree_mut(), root)
         .expect("挂载成功");
     (window, node)
+}
+
+/// v2.1 E2b（审查 F11，D17）：`Window::frame` 没有 `ResourceCache`，行内盒图片一律跳过 ——
+/// 跳过不能静默：本帧跳过的 id 必须出现在 `Window::inline_box_image_diagnostics`。
+#[test]
+fn window_frame_reports_skipped_inline_box_images() {
+    use crate::text::{
+        InlineAlign, InlineBoxPaint, InlineBoxSpec, ShapedInlineBox, ShapedLine, ShapedTextItem,
+        ShapedTextLine, TextContent, TextDiagnostic, TextStyle,
+    };
+
+    let mut window = Window::new(WindowId::for_test(1), WindowOptions::default());
+    let spec = InlineBoxSpec {
+        id: 21,
+        index: 1,
+        size: Size::new(8.0, 8.0),
+        baseline: None,
+        align: InlineAlign::Baseline,
+        paint: Some(InlineBoxPaint::Image {
+            resource: crate::resources::ResourceId::for_test(4242, 1),
+            modulation: Color::WHITE,
+        }),
+    };
+    let content = TextContent::new("a b", TextStyle::new(16.0)).with_inline_boxes([spec]);
+    let shaped_line = ShapedLine {
+        text: smol_str::SmolStr::new_static("a b"),
+        lines: vec![ShapedTextLine {
+            text_range: 0..3,
+            baseline: 12.0,
+            line_height: 16.0,
+            advance: 20.0,
+            items: vec![ShapedTextItem::InlineBox(ShapedInlineBox {
+                id: 21,
+                rect: Rect::new(2.0, 2.0, 8.0, 8.0),
+                baseline: None,
+            })],
+            decorations: Vec::new(),
+        }],
+        width: 20.0,
+        height: 16.0,
+        first_baseline: Some(12.0),
+        atlas_generation: 0,
+        font_stack_version: 1,
+        scale: 1.0,
+    };
+    let node = {
+        let root = window.tree().root();
+        let node = NodeBuilder::text("a b", TextStyle::new(16.0))
+            .layout_override(Rect::new(0.0, 0.0, 40.0, 16.0))
+            .build(window.tree_mut(), root)
+            .expect("挂载成功");
+        let tree = window.tree_mut();
+        assert!(tree.set_text_content(node, content.clone()), "文本载荷");
+        assert!(
+            tree.install_text_line_for_test(node, &content, std::rc::Rc::new(shaped_line), 40.0),
+            "注入行快照"
+        );
+        node
+    };
+    let outcome = window.frame().expect("帧成功");
+    assert!(matches!(outcome, FrameOutcome::Committed(_)));
+    assert_eq!(
+        window.inline_box_image_diagnostics(),
+        [TextDiagnostic::InlineBoxImageMissing { id: 21 }],
+        "Window::frame 路径的图片跳过必须可观测（D17）"
+    );
+    let _ = node;
 }
 
 /// V-122 ⑧：提交判据的纯函数（不碰 GPU）。Full/Partial 有工作；Idle 只在目标尺寸变化时
@@ -837,4 +904,637 @@ fn frame_presentations_are_recorded_and_bounded() {
             .all(|presentation| presentation.index.get() != 1),
         "被历史挤掉的帧不会被复活"
     );
+}
+
+// ── E6（P1-E6）：窗口 chrome 的数据面 ───────────────────────────────────
+
+/// E6：`Decorations` 与平台能力决定 `WindowState` 的**建窗初值**：Windows `None` ⇒ 应用自绘、
+/// 且 `can_fullscreen` 初值就是 `false`（没有全屏控制，不能等首轮泵校正 —— 审查 F8）；macOS
+/// `client_decoration` **恒 `false`**（原生交通灯，`Decorations::None` 是文档化降级）。
+/// 默认值保持 `Native`（默认路径回归）。
+#[test]
+fn decorations_drive_the_initial_client_decoration_state() {
+    let native = window();
+    assert_eq!(
+        native.options().decorations,
+        Decorations::Native,
+        "WindowOptions 默认必须是 Native（既有行为）"
+    );
+    assert!(!native.state().client_decoration, "Native ⇒ 系统装饰");
+    assert!(!native.state().maximized);
+    assert!(!native.state().fullscreen);
+    assert!(native.state().can_maximize);
+    assert!(native.state().can_minimize);
+    if cfg!(windows) {
+        assert!(
+            !native.state().can_fullscreen,
+            "Windows 没有全屏控制：初值就必须是 false（首轮泵不产生校正性状态变化）"
+        );
+    } else {
+        assert!(native.state().can_fullscreen, "macOS/Linux 原生支持全屏");
+    }
+
+    let frameless = Window::new(
+        WindowId::for_test(2),
+        WindowOptions {
+            decorations: Decorations::None,
+            ..WindowOptions::default()
+        },
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            !frameless.state().client_decoration,
+            "macOS 恒由系统装饰（原生交通灯）：Decorations::None 是文档化降级"
+        );
+    } else {
+        assert!(frameless.state().client_decoration, "None ⇒ 应用自绘装饰");
+    }
+}
+
+/// E6 / §8.6.4 / I3：`set_state` 同值 no-op；值变化时给**根节点**标 `PAINT`（应用据此重画
+/// 最大化 / 还原按钮），平台泵随后请求一帧。
+///
+/// 变异守卫：删掉 `set_state` 里的 `mark_paint(root)` ⇒ 第二条断言红。
+#[test]
+fn set_state_is_idempotent_and_marks_the_root_for_paint_when_it_changes() {
+    let mut window = window();
+    let root = window.tree().root();
+    window.tree_mut().clear_paint(root);
+    assert!(!window.tree().has_paint_work(), "前置：根节点已清脏");
+
+    let unchanged = window.state();
+    assert!(!window.set_state(unchanged), "同值必须是 no-op");
+    assert!(!window.tree().has_paint_work(), "同值不得标 PAINT");
+
+    let changed = WindowState {
+        maximized: true,
+        ..unchanged
+    };
+    assert!(window.set_state(changed), "状态变化必须报告 true");
+    assert!(
+        window.tree().has_paint_work(),
+        "状态变化必须给根节点标 PAINT（I3：走与应用写信号同一条失效路径）"
+    );
+    assert!(window.state().maximized);
+}
+
+/// E6：`WindowOptions::icon` 只是建窗参数，三端都可设置；`PartialEq`（含 `Bytes`）保持可派生
+/// —— `WindowOptions` 的 clone/比较是平台层对账的基础。
+#[test]
+fn window_options_carry_an_optional_icon() {
+    assert_eq!(WindowOptions::default().icon, None);
+    let options = WindowOptions {
+        icon: Some(bytes::Bytes::from_static(&[1, 2, 3])),
+        ..WindowOptions::default()
+    };
+    assert_eq!(options.clone(), options);
+    assert!(options.icon.is_some());
+}
+
+// ── E5/§11.5：点 → 字节索引（`Window::text_byte_index_at`） ────────────────
+
+/// 文本节点 fixture：非零 border + padding（覆盖内容偏移换算）、固定内容宽（覆盖断行）、
+/// 左对齐且 `align_self: START`（根节点铺满窗口时文本盒仍然贴左上）。
+fn text_style(width: f32) -> Style {
+    let mut style = Style::default();
+    style.inner.align_self = Some(taffy::style::AlignSelf::START);
+    style.inner.size.width = taffy::style::Dimension::length(width);
+    style.inner.padding = taffy::geometry::Rect {
+        left: taffy::style::LengthPercentage::length(9.0),
+        right: taffy::style::LengthPercentage::length(0.0),
+        top: taffy::style::LengthPercentage::length(7.0),
+        bottom: taffy::style::LengthPercentage::length(0.0),
+    };
+    style.inner.border = taffy::geometry::Rect {
+        left: taffy::style::LengthPercentage::length(2.0),
+        right: taffy::style::LengthPercentage::length(0.0),
+        top: taffy::style::LengthPercentage::length(3.0),
+        bottom: taffy::style::LengthPercentage::length(0.0),
+    };
+    style
+}
+
+fn text_window(text: &str, width: f32) -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
+    text_window_with_style(text, width, TextStyle::new(16.0))
+}
+
+/// 同 [`text_window`]，但指定文本样式（对齐 / 字号等命中相关输入）。
+fn text_window_with_style(
+    text: &str,
+    width: f32,
+    content_style: TextStyle,
+) -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("current-thread runtime");
+    let mut app = App::new(rt.handle().clone());
+    let window = app.create_window(WindowOptions::default());
+    let node = {
+        let w = app.window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        NodeBuilder::text(text, content_style)
+            .style(text_style(width))
+            .build(w.tree_mut(), root)
+            .expect("挂载文本节点")
+    };
+    (rt, app, window, node)
+}
+
+fn commit_frame(app: &mut App, window: WindowId) {
+    let outcome = app.frame(window).expect("窗口存在").expect("帧成功");
+    assert!(matches!(outcome, FrameOutcome::Committed(_)), "{outcome:?}");
+}
+
+/// §11.5 规定的往返：`text_caret_rect` → 点 → `HitResult.local_point` → `text_byte_index_at`。
+fn assert_caret_round_trip(app: &App, window: WindowId, node: NodeId, byte_index: usize) {
+    let window = app.window(window).expect("窗口存在");
+    let caret = window
+        .text_caret_rect(node, byte_index)
+        .expect("caret 矩形");
+    let point = Point::new(
+        caret.origin.x + caret.size.width * 0.5,
+        caret.origin.y + caret.size.height * 0.5,
+    );
+    let hit = window.tree().hit_test(point).expect("caret 点必须命中");
+    assert_eq!(hit.node, node, "fixture 必须让文本节点成为最上层命中目标");
+    let index = window
+        .text_byte_index_at(node, hit.local_point)
+        .expect("点 → 字节索引");
+    assert_eq!(
+        index, byte_index,
+        "caret({byte_index}) 的窗口点 {hit:?} 往返后必须是 {byte_index}"
+    );
+}
+
+/// 单行 LTR：往返一致 + 入参是 border box 局部坐标（caret 绝对坐标已含 border/padding/原点）。
+#[test]
+fn text_byte_index_at_round_trips_with_caret_rect() {
+    let (_rt, mut app, window, node) = text_window("hello world", 200.0);
+    commit_frame(&mut app, window);
+    let window_ref = app.window(window).expect("窗口存在");
+
+    let bounds = window_ref.tree().get(node).expect("节点").layout().bounds;
+    let content_offset = window_ref.tree().content_offset(node);
+    assert!(content_offset.x > 0.0 && content_offset.y > 0.0);
+    let caret = window_ref.text_caret_rect(node, 0).expect("caret");
+    assert!(
+        (caret.origin.x - bounds.origin.x - content_offset.x).abs() < 0.01,
+        "caret 绝对 x 必须含 border + padding：{caret:?} vs {content_offset:?}"
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(content_offset.x, content_offset.y))
+            .expect("盒首"),
+        0,
+        "文本盒左上角 → 0"
+    );
+
+    for index in [0usize, 1, 5, 11] {
+        assert_caret_round_trip(&app, window, node, index);
+    }
+}
+
+/// 数字快速路径（单行 ASCII，不走 parley）也必须给出同一套语义：半簇取整 + 垂直 clamp。
+#[test]
+fn text_byte_index_at_round_trips_the_numeric_fast_path() {
+    let (_rt, mut app, window, node) = text_window("1234567890", 200.0);
+    let report = app
+        .refresh_text(window)
+        .expect("窗口存在")
+        .expect("文本 pass");
+    assert!(
+        report.fast_path_shaped >= 1,
+        "fixture 必须命中数字快速路径（报告：{report:?}）"
+    );
+    commit_frame(&mut app, window);
+    let window_ref = app.window(window).expect("窗口存在");
+
+    for index in [0usize, 1, 5, 10] {
+        assert_caret_round_trip(&app, window, node, index);
+    }
+
+    let bounds = window_ref.tree().get(node).expect("节点").layout().bounds;
+    let caret = window_ref.text_caret_rect(node, 0).expect("caret");
+    let line_center_y = (caret.origin.y - bounds.origin.y) + caret.size.height * 0.5;
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(0.0, -1.0))
+            .expect("盒上方"),
+        0
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(0.0, bounds.size.height + 50.0))
+            .expect("盒下方"),
+        "1234567890".len()
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(bounds.size.width + 100.0, line_center_y))
+            .expect("行右越界"),
+        "1234567890".len()
+    );
+}
+
+/// 多行：每一行的行首都往返一致（点落在哪一行就命中哪一行）。
+#[test]
+fn text_byte_index_at_round_trips_every_line_of_wrapped_text() {
+    let (_rt, mut app, window, node) = text_window("alpha beta gamma delta", 70.0);
+    commit_frame(&mut app, window);
+    let window_ref = app.window(window).expect("窗口存在");
+    let line_count = window_ref
+        .tree()
+        .text_line(node)
+        .expect("文本 pass 必须已经建好 ShapedLine")
+        .lines
+        .len();
+    assert!(line_count >= 3, "fixture 必须折成多行，实际 {line_count}");
+
+    let mut seen_lines: Vec<i32> = Vec::new();
+    let bounds_origin_y = window_ref
+        .tree()
+        .get(node)
+        .expect("节点")
+        .layout()
+        .bounds
+        .origin
+        .y;
+    for index in 0..="alpha beta gamma delta".len() {
+        let caret = window_ref.text_caret_rect(node, index).expect("caret");
+        let line_key = (caret.origin.y - bounds_origin_y).round() as i32;
+        if seen_lines.contains(&line_key) {
+            continue;
+        }
+        seen_lines.push(line_key);
+        assert_caret_round_trip(&app, window, node, index);
+    }
+    assert_eq!(seen_lines.len(), line_count, "每行至少要抽样一个行首");
+}
+
+/// clamp：点落在文本盒外时 —— 上方 `0`、下方 `len`、行内水平越界取行首/行尾；负坐标不 panic。
+#[test]
+fn text_byte_index_at_clamps_in_border_box_local_coordinates() {
+    let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
+    commit_frame(&mut app, window);
+    let window_ref = app.window(window).expect("窗口存在");
+    let bounds = window_ref.tree().get(node).expect("节点").layout().bounds;
+    let content_offset = window_ref.tree().content_offset(node);
+    let caret = window_ref.text_caret_rect(node, 0).expect("caret");
+    let line_center_y = content_offset.y + caret.size.height * 0.5;
+
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(0.0, 0.0))
+            .expect("盒上方"),
+        0,
+        "border box 顶部在文本盒上方 ⇒ 0"
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(0.0, bounds.size.height + 50.0))
+            .expect("盒下方"),
+        6,
+        "border box 下方 ⇒ text.len()"
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(-100.0, line_center_y))
+            .expect("行左越界"),
+        0
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(bounds.size.width + 100.0, line_center_y))
+            .expect("行右越界"),
+        6
+    );
+    assert_eq!(
+        window_ref
+            .text_byte_index_at(node, Point::new(-100.0, -100.0))
+            .expect("负坐标"),
+        0
+    );
+}
+
+/// CJK / emoji：命中点必须吸附到字素簇边界（多字节字符内部不是合法返回）。
+#[test]
+fn text_byte_index_at_never_splits_cjk_or_emoji_clusters() {
+    let text = "a中b🌍";
+    let (_rt, mut app, window, node) = text_window(text, 200.0);
+    commit_frame(&mut app, window);
+    let window_ref = app.window(window).expect("窗口存在");
+    let bounds = window_ref.tree().get(node).expect("节点").layout().bounds;
+    let caret_zero = window_ref.text_caret_rect(node, 0).expect("caret");
+    let line_center_y = (caret_zero.origin.y - bounds.origin.y) + caret_zero.size.height * 0.5;
+    let local_x = |index: usize| {
+        window_ref
+            .text_caret_rect(node, index)
+            .expect("caret")
+            .origin
+            .x
+            - bounds.origin.x
+    };
+
+    for index in [0usize, 1, 4, 5, 9] {
+        assert_caret_round_trip(&app, window, node, index);
+    }
+
+    // 3 字节 CJK 字符中点：只能落在 1 或 4。
+    let cjk_middle = Point::new((local_x(1) + local_x(4)) * 0.5, line_center_y);
+    let cjk_index = window_ref
+        .text_byte_index_at(node, cjk_middle)
+        .expect("CJK 中点");
+    assert!(
+        cjk_index == 1 || cjk_index == 4,
+        "CJK 簇中点必须吸附到边界，实际 {cjk_index}"
+    );
+    // 4 字节 emoji 中点：只能落在 5 或 9。
+    let emoji_middle = Point::new((local_x(5) + local_x(9)) * 0.5, line_center_y);
+    let emoji_index = window_ref
+        .text_byte_index_at(node, emoji_middle)
+        .expect("emoji 中点");
+    assert!(
+        emoji_index == 5 || emoji_index == 9,
+        "emoji 簇中点必须吸附到边界，实际 {emoji_index}"
+    );
+    for index in [cjk_index, emoji_index] {
+        assert!(text.is_char_boundary(index), "返回 {index} 不是合法边界");
+    }
+}
+
+/// 错误：非文本节点 / 文本尚未 shape（窗口还没有文本 pass）/ 已卸载节点 → `StaleNode`，
+/// 且绝不 panic。
+#[test]
+fn text_byte_index_at_rejects_non_text_and_unshaped_nodes() {
+    let (_rt, mut app, window, node) = text_window("abc", 100.0);
+    let point = Point::new(1.0, 1.0);
+
+    // 首帧之前：文本节点还没有 ShapedLine。
+    assert!(matches!(
+        app.window(window)
+            .expect("窗口存在")
+            .text_byte_index_at(node, point),
+        Err(EngineError::StaleNode { node: reported }) if reported == node
+    ));
+
+    commit_frame(&mut app, window);
+    let root = app.window(window).expect("窗口").tree().root();
+    assert!(matches!(
+        app.window(window)
+            .expect("窗口存在")
+            .text_byte_index_at(root, point),
+        Err(EngineError::StaleNode { node: reported }) if reported == root
+    ));
+
+    let (canvas, removed) = {
+        let w = app.window_mut(window).expect("窗口存在");
+        let root = w.tree().root();
+        let canvas = NodeBuilder::canvas(Canvas::default())
+            .build(w.tree_mut(), root)
+            .expect("挂载 Canvas");
+        let removed = NodeBuilder::boxed()
+            .build(w.tree_mut(), root)
+            .expect("挂载盒子");
+        assert!(w.tree_mut().remove(removed).is_ok(), "卸载盒子");
+        (canvas, removed)
+    };
+    let window_ref = app.window(window).expect("窗口存在");
+    assert!(matches!(
+        window_ref.text_byte_index_at(canvas, point),
+        Err(EngineError::StaleNode { node: reported }) if reported == canvas
+    ));
+    assert!(matches!(
+        window_ref.text_byte_index_at(removed, point),
+        Err(EngineError::StaleNode { node: reported }) if reported == removed
+    ));
+}
+
+/// I6：只读 —— 调用前后帧请求数与节点脏位都不变（不登记依赖、不请求帧、不改状态）。
+#[test]
+fn text_byte_index_at_is_read_only() {
+    let (_rt, mut app, window, node) = text_window("read only", 120.0);
+    commit_frame(&mut app, window);
+    let requests_before = app.frame_requests();
+    let dirty_before = app
+        .window(window)
+        .expect("窗口存在")
+        .tree()
+        .get(node)
+        .expect("节点")
+        .dirty();
+
+    {
+        let window_ref = app.window(window).expect("窗口存在");
+        for _ in 0..4 {
+            let index = window_ref
+                .text_byte_index_at(node, Point::new(5.0, 12.0))
+                .expect("命中");
+            assert!(index <= "read only".len());
+        }
+    }
+
+    assert_eq!(
+        app.frame_requests(),
+        requests_before,
+        "I6：点 → 字节索引不得请求帧"
+    );
+    let tree = app.window(window).expect("窗口存在").tree();
+    assert_eq!(
+        tree.get(node).expect("节点").dirty(),
+        dirty_before,
+        "I6：点 → 字节索引不得改脏位"
+    );
+    assert!(!tree.has_paint_work(), "I6：不得留下待绘制工作");
+}
+
+// ── E5b/§11.5：命中前的就绪判据（F2）+ 对齐/空文本（F4/F6）──────────────
+
+/// 「当前快照不能作为命中目标」：必须是 `StaleNode { node }`（不是旧快照的索引、不 panic）。
+fn assert_stale_byte_index_at(app: &App, window: WindowId, node: NodeId) {
+    let window_ref = app.window(window).expect("窗口存在");
+    assert!(
+        matches!(
+            window_ref.text_byte_index_at(node, Point::new(1.0, 1.0)),
+            Err(EngineError::StaleNode { node: reported }) if reported == node
+        ),
+        "文本 pass 之后输入变了却返回旧快照索引（必须 StaleNode）"
+    );
+}
+
+/// 帧门禁只在有唤醒/脏位时推进：改完内容后显式请求一帧，再走完整帧让文本 pass 追上。
+fn commit_frame_after_repaint(app: &mut App, window: WindowId) {
+    app.request_repaint(window).expect("窗口存在");
+    commit_frame(app, window);
+}
+
+/// 就绪判据 ①：文本内容在文本 pass 之后变了（旧 `ShapedLine` 文本不一致）。
+#[test]
+fn text_byte_index_at_rejects_text_changed_after_the_text_pass() {
+    let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
+    commit_frame(&mut app, window);
+    {
+        let w = app.window_mut(window).expect("窗口存在");
+        assert!(
+            w.tree_mut()
+                .set_text_content(node, TextContent::new("abc", TextStyle::new(16.0))),
+            "替换文本载荷"
+        );
+    }
+    assert_stale_byte_index_at(&app, window, node);
+
+    // 下一帧文本 pass 之后即可命中新内容（不是永久失效）。
+    commit_frame_after_repaint(&mut app, window);
+    let index = app
+        .window(window)
+        .expect("窗口存在")
+        .text_byte_index_at(node, Point::new(1.0, 1.0))
+        .expect("新文本 pass 后必须可命中");
+    assert!(index <= 3, "命中不得越过新文本长度，实际 {index}");
+}
+
+/// 就绪判据 ②：样式（shaping 输入）在文本 pass 之后变了。
+#[test]
+fn text_byte_index_at_rejects_style_changed_after_the_text_pass() {
+    let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
+    commit_frame(&mut app, window);
+    {
+        let w = app.window_mut(window).expect("窗口存在");
+        assert!(
+            w.tree_mut()
+                .set_text_content(node, TextContent::new("abcdef", TextStyle::new(24.0))),
+            "替换文本样式"
+        );
+    }
+    assert_stale_byte_index_at(&app, window, node);
+
+    commit_frame_after_repaint(&mut app, window);
+    assert!(
+        app.window(window)
+            .expect("窗口存在")
+            .text_byte_index_at(node, Point::new(1.0, 1.0))
+            .is_ok(),
+        "新样式完成文本 pass 后必须可命中"
+    );
+}
+
+/// 就绪判据 ③：行内盒在文本 pass 之后变了。
+#[test]
+fn text_byte_index_at_rejects_inline_boxes_changed_after_the_text_pass() {
+    let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
+    commit_frame(&mut app, window);
+    let spec = InlineBoxSpec {
+        id: 31,
+        index: 1,
+        size: Size::new(8.0, 8.0),
+        baseline: None,
+        align: InlineAlign::Baseline,
+        paint: None,
+    };
+    {
+        let w = app.window_mut(window).expect("窗口存在");
+        assert!(
+            w.tree_mut().set_text_content(
+                node,
+                TextContent::new("abcdef", TextStyle::new(16.0)).with_inline_boxes([spec]),
+            ),
+            "追加行内盒"
+        );
+    }
+    assert_stale_byte_index_at(&app, window, node);
+
+    commit_frame_after_repaint(&mut app, window);
+    assert!(
+        app.window(window)
+            .expect("窗口存在")
+            .text_byte_index_at(node, Point::new(1.0, 1.0))
+            .is_ok(),
+        "行内盒完成文本 pass 后必须可命中"
+    );
+}
+
+/// 就绪判据 ④：断行宽度（taffy 内容宽）在文本 pass 之后变了。
+#[test]
+fn text_byte_index_at_rejects_layout_width_changed_after_the_text_pass() {
+    let (_rt, mut app, window, node) = text_window("abcdef", 200.0);
+    commit_frame(&mut app, window);
+    {
+        let w = app.window_mut(window).expect("窗口存在");
+        assert!(
+            w.tree_mut().set_style(node, text_style(120.0)).is_ok(),
+            "改窄文本节点"
+        );
+        w.compute_layout().expect("布局");
+    }
+    assert_stale_byte_index_at(&app, window, node);
+
+    commit_frame_after_repaint(&mut app, window);
+    assert!(
+        app.window(window)
+            .expect("窗口存在")
+            .text_byte_index_at(node, Point::new(1.0, 1.0))
+            .is_ok(),
+        "按新宽度重排后必须可命中"
+    );
+}
+
+/// F4：数字快速路径的 Center/Right 对齐偏移必须参与命中（删掉 offset 后往返变红）。
+#[test]
+fn text_byte_index_at_guards_the_numeric_fast_path_alignment_offset() {
+    for alignment in [TextAlign::Center, TextAlign::Right] {
+        let (_rt, mut app, window, node) = text_window_with_style(
+            "1234567890",
+            200.0,
+            TextStyle::new(16.0).with_alignment(alignment),
+        );
+        let report = app
+            .refresh_text(window)
+            .expect("窗口存在")
+            .expect("文本 pass");
+        assert!(
+            report.fast_path_shaped >= 1,
+            "{alignment:?} fixture 必须命中数字快速路径（报告：{report:?}）"
+        );
+        commit_frame(&mut app, window);
+        let window_ref = app.window(window).expect("窗口存在");
+        let bounds = window_ref.tree().get(node).expect("节点").layout().bounds;
+        let content_offset = window_ref.tree().content_offset(node);
+        let caret = window_ref.text_caret_rect(node, 0).expect("caret");
+        assert!(
+            caret.origin.x - bounds.origin.x - content_offset.x > 1.0,
+            "{alignment:?} 的快速路径对齐偏移必须非零（否则本用例测不到 offset）"
+        );
+
+        // Right 对齐的末尾 caret 恰好落在 border box 右边界（`Rect` 半开区间不含右边界），
+        // 用它做 round-trip 会先命中剪枝而不是对齐偏移 ⇒ 跳过末尾（用 9 替代 10）。
+        let last = if matches!(alignment, TextAlign::Right) {
+            9
+        } else {
+            10
+        };
+        for index in 0..=last {
+            assert_caret_round_trip(&app, window, node, index);
+        }
+    }
+}
+
+/// F6：Window 层空文本 —— 文本 pass 之后任意点（含盒外/负坐标）恒 `0`。
+#[test]
+fn text_byte_index_at_returns_zero_for_empty_text_at_window_level() {
+    let (_rt, mut app, window, node) = text_window("", 100.0);
+    commit_frame(&mut app, window);
+    let window_ref = app.window(window).expect("窗口存在");
+    for point in [
+        Point::new(0.0, 0.0),
+        Point::new(-5.0, -5.0),
+        Point::new(500.0, 500.0),
+        Point::new(1.0, 1.0),
+    ] {
+        assert_eq!(
+            window_ref
+                .text_byte_index_at(node, point)
+                .expect("空文本必须可命中"),
+            0,
+            "{point:?}"
+        );
+    }
 }

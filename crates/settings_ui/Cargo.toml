@@ -6,35 +6,28 @@ edition.workspace = true
 
 [dependencies]
 ahash = { workspace = true }
-gpui-kit = { workspace = true }
-i18n = { workspace = true }
-log = { workspace = true }
-network = { workspace = true }
-smol_str = { workspace = true }
-url = { workspace = true }
-widget_tokio_runtime = { workspace = true }
-
-# Workspace members
 app_config = { workspace = true }
 app_config_provider = { workspace = true }
 base_ui = { workspace = true }
 download_provider = { workspace = true }
+i18n = { workspace = true }
+log = { workspace = true }
 market_participants_connector = { workspace = true }
 market_participants_model = { workspace = true }
-# The layer that names a venue in the reader's language.
+network = { workspace = true }
+smol_str = { workspace = true }
+tokio = { workspace = true }
+ui_core = { workspace = true }
+url = { workspace = true }
 widget = { workspace = true }
 
 [dev-dependencies]
 # The connection seam a widget test connects a venue through: the crate's own
 # `test-support` feature, which is never enabled for a release build.
 market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
-hyper = { workspace = true, features = ["http1", "server"] }
-hyper-util = { workspace = true, features = ["tokio"] }
 tempfile = { workspace = true }
-# The download manager tests drive a real HTTP server, which the product code no
-# longer does: the transfers are the provider's.
-tokio = { workspace = true }
+# The engine's test host (`ui_core::test_support`), which the settings harness is built on.
+ui_core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -2451,21 +2451,10 @@ fn draw_ops(
                             draw.id.generation()
                         ),
                     })?;
-                let chunk = draw.snapshot.chunk(draw.chunk).ok_or_else(|| {
-                    EngineError::GeometryRegister {
-                        detail: smol_str::format_smolstr!(
-                            "geometry {}:{} has no chunk {}",
-                            draw.id.index(),
-                            draw.id.generation(),
-                            draw.chunk
-                        ),
-                    }
-                })?;
+                // 三端唯一的参数入口：校验裁剪后的区间并推导 `first_index/count/base_vertex`
+                // （纯函数 `draw_indexed_params` 的返回值，三端单测钉住）。
+                let args = draw.draw_indexed(entry.index_count())?;
                 let uniform = geometry_root(root, draw, clip_index, clip_rect);
-                debug_assert!(
-                    chunk.index_first + chunk.index_count <= entry.index_count(),
-                    "geometry chunk range must stay inside the uploaded index buffer"
-                );
                 let push_bytes = bytemuck::cast_slice::<f32, u8>(uniform.words());
                 // SAFETY: 顶点/索引缓冲由 `GeometryRegistry` 持有到本帧结束；
                 // push constant 范围由 pipeline layout 声明。
@@ -2491,13 +2480,14 @@ fn draw_ops(
                         0,
                         entry.index_type(),
                     );
-                    // 分块绘制：`first_index` 是块内第一个索引（不是字节偏移）。
+                    // E4 / §11.4：`first_index` 是 UI 线程按 `GeometryDraw.range` ∩ 块表裁剪后
+                    // 的索引元素区间起点（不是块内相对偏移，也不是字节偏移）；base vertex 恒 0。
                     shared.raw().cmd_draw_indexed(
                         command,
-                        chunk.index_count,
+                        args.count,
                         1,
-                        chunk.index_first,
-                        0,
+                        args.first_index,
+                        args.base_vertex,
                         0,
                     );
                 }

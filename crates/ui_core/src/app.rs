@@ -8,6 +8,8 @@
 
 mod a11y;
 mod animation;
+#[cfg(feature = "automation")]
+mod automation;
 #[cfg(feature = "hud")]
 mod debug;
 mod event_queue;
@@ -22,11 +24,15 @@ mod scroll;
 mod signal_api;
 mod style_pass;
 mod text_pass;
+mod timer;
 mod virtual_list;
 mod window_set;
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -40,11 +46,11 @@ use crate::{
     },
     interaction::{
         ActionCtx, AnimatedValue, AnimationId, AnimationSpec, DragInfo, DragState, Easing,
-        InputThresholds, Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement, ScrollConfig,
-        ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
+        InputThresholds, ItemAlign, Overlay, OverlayDismiss, OverlayOptions, OverlayPlacement,
+        ScrollConfig, ScrollHandle, ScrollState, VirtualList, VirtualListConfig, VirtualListState,
     },
     layout::hit_test::HitResult,
-    math::{Point, Rect, Size},
+    math::{Point, Rect, Scale, Size},
     node::{
         builder::NodeBuilder,
         dependency::{DependencyGraph, EvalStack, ReadCtx},
@@ -59,8 +65,9 @@ use crate::{
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::{DecodeState, PendingResource, ResourceCache},
     text::{
-        FontStack, FontStackStatus, TextDiagnostic, TextLayoutReport, TextPassReport,
-        atlas::GlyphAtlas, context::TextContext, raster::GlyphRasterizer,
+        FontStack, FontStackStatus, InlineBoxSpec, ShapedInlineBox, ShapedTextHandle,
+        TextDiagnostic, TextLayoutReport, TextPassReport, TextStyle, atlas::GlyphAtlas,
+        context::TextContext, raster::GlyphRasterizer,
     },
     window::{FrameOutcome, FramePresentation, FrameTicket, Window, WindowId, WindowOptions},
 };
@@ -93,6 +100,30 @@ pub struct StylePassReport {
     pub text_evaluated: usize,
     /// 本次文本值**真的变了**的节点数。
     pub text_changed: usize,
+}
+
+/// 一次节点子树卸载的清理计数（[`App::remove_node`] / [`App::remove_node_with_scope`]）。
+///
+/// 只做**诊断 / 断言**用：计数描述「引擎替应用清掉了什么」，不是业务状态。没有可清理的条目
+/// 时为零（例如叶子节点没有任何 scoped 绑定 / 定时器 / 动画）。
+///
+/// **计数口径不同**：`scoped_key_bindings` / `timers` 按「作用域已不在树里」判定（会把其它
+/// 路径遗留的死作用域一并收口，不能归属到本次删除）；`animations` 只按本次 `removed` 集合
+/// 归属（共享动画保留）；`released_values` 来自显式作用域释放。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// 被卸载的节点数（含整棵子树）。
+    pub removed_nodes: usize,
+    /// 自动清除的焦点作用域化键绑定条数（`App::bind_key_scoped`）。
+    pub scoped_key_bindings: usize,
+    /// 自动取消的一次性定时器条数（`App::after_scoped`）。
+    pub timers: usize,
+    /// 自动取消的动画槽条数（重绘节点全部落在被卸载子树内 / 滚动动画目标节点被卸载 /
+    /// 作用域释放路径取消）。
+    pub animations: usize,
+    /// [`App::remove_node_with_scope`] 释放的信号作用域值槽位数（信号 + 瞬态值；
+    /// [`App::remove_node`] 恒为 0）。
+    pub released_values: usize,
 }
 
 /// 引擎侧全部状态。字段全私有（`field_scoped_visibility_modifiers` 禁止字段级可见性）。
@@ -129,12 +160,37 @@ pub struct App {
     text_layout_scratch: Vec<crate::node::id::NodeId>,
     /// 每窗口「图集已同步到的 `scale_epoch`」（DPI 变化 ⇒ 图集换代）。
     scale_epochs: ahash::HashMap<WindowId, u32>,
+    /// 每窗口「图片内在尺寸已按哪个 `scale_epoch` 解析」（E7；DPI 变化 ⇒ 重解析 + 重排）。
+    image_scale_epochs: ahash::HashMap<WindowId, u32>,
     /// 已按其重绘过文本的图集代际（P1-2.6）。
     ///
     /// 图集是进程级共享的：任一窗口 DPI 变化或字形容量逃逸都会让 `generation` 递增、
     /// 页内所有 tile 重排。文本 lane 里存的是旧 `AtlasTile`（旧 UV），所以代际一变就必须
     /// 让**所有窗口**的文本节点重绘；否则画的是旧 UV（错字/花字）。
     atlas_generation_seen: u32,
+    /// 图集租约：`ShapedTextHandle::is_stale` 与 `Canvas::push_shaped_text` 读取的
+    /// **当前** `(generation, eviction_epoch)`（单一真源仍是图集本身：`atlas.generation()` 与
+    /// `glyph_atlas.eviction_epoch()`，打包见 [`crate::text::pack_atlas_lease`]）。
+    ///
+    /// 任何可能改变图集状态的入口（`layout_text` 的扩容/清空/逐 tile 淘汰、`set_font_stack`、
+    /// `reload_system_fonts`、`shape_text` 自身）返回后都由
+    /// `App::sync_atlas_generation_lease` 写入，因此独立于窗口的 shaping 句柄也能在图集换代
+    /// **或**任一 tile 被淘汰后立即判定失活（D-5：不画旧 UV）。
+    atlas_generation_lease: Arc<AtomicU64>,
+    /// canvas 文本的**App 级默认光栅 scale**（v2.1 E1b，`§11.1`）：默认 1.0，焦点窗口的 DPI
+    /// 变化时跟随（`App::note_window_focus` / `App::note_window_dpi`），可被
+    /// [`App::set_text_scale`] 显式覆盖。
+    ///
+    /// 节点文本不用它（节点路径按各自窗口的 `Window::scale` 光栅）；它只服务
+    /// `App::shape_text` 的无窗口 shaping。
+    default_text_scale: f32,
+    /// 应用显式覆盖的文本 scale（`None` = 跟随焦点窗口 DPI）。
+    text_scale_override: Option<f32>,
+    /// 当前持有键盘焦点的窗口（`Event::FocusChanged` 维护；`None` = 没有窗口有焦点）。
+    ///
+    /// 只用于「焦点窗口 DPI → canvas 文本默认 scale」这一条派生；无焦点时保留上一次的
+    /// `default_text_scale`（最后一个焦点窗口的 DPI，语义见 [`App::text_scale`]）。
+    focused_window: Option<WindowId>,
     /// 累积的图集脏矩形（P09 的增量上传输入；`layout_text` 合并、上传后清空；R06-3 起是 AOI 矩形）。
     pending_dirty: crate::render::DirtyRects,
     /// 字形页整页缓冲上次按哪个页尺寸重建（`None` = 还没建 / 刚清空）。
@@ -185,10 +241,26 @@ pub struct App {
     close_handlers: ahash::HashMap<WindowId, CloseHandler>,
     /// 键盘绑定表（线性扫描：默认 3 条 + 应用若干）。
     bindings: Vec<KeyBinding>,
+    /// **焦点作用域化**的键盘绑定（线性扫描；只在焦点落在 `scope` 子树内时消费）。
+    ///
+    /// 与全局 `bindings` 表的区别是「谁有资格吃这个键」：全局绑定（`Ctrl+S` / `Tab` / `Esc`）
+    /// 是应用级语义；而文本框的编辑键、树的方向键这类只在**某个实例聚焦时**成立。放在全局表里
+    /// 会吞掉其它控件的默认键盘行为（引擎在命中绑定后不再走 `default_key_scroll`）。
+    /// 生命周期：`App::remove_node` 卸载 scope 子树时自动清除，`App::close_window` 清空该窗口
+    /// 全部条目；组件也可显式 `unbind_key_scoped` / `unbind_scope_keys`。
+    scoped_bindings: Vec<ScopedKeyBinding>,
     /// 输入判定阈值（probe 真值；平台在 `platform_init` 覆盖）。
     thresholds: InputThresholds,
     /// 引擎时钟（生产由平台每轮 `sync_clock`，测试由 `TestApp::advance` 推进）。
     clock: Instant,
+    /// 一次性定时器的登记基准是否取**登记瞬间的真实时间**（活时钟模式）。
+    ///
+    /// E10c-R01：真正的语义不能以「泵是否启动过」为准 —— 应用在 `Application::run` **之前**
+    /// 就能建窗并登记定时器，那也必须「只晚不早」。因此 `App::new` 的生产默认就是置位；
+    /// 测试宿主 `TestApp` 构造后显式关闭（`TestApp::advance` 是唯一推进源，deadline 必须能
+    /// 精确断言）。平台泵通过 [`App::sync_clock_live`] 每轮刷新时钟并保持置位；
+    /// `App::dispatch` 的 `sync_clock` 不置位（测试也会派发输入）。
+    clock_live: bool,
     /// 每个窗口最近一次 a11y 交付的时钟值（节流用，P2-6）。
     ///
     /// 高频实时数据（行情数字）会让 A11Y 脏位每帧都为真，而每次交付都要全树扫描 +
@@ -205,6 +277,20 @@ pub struct App {
     animations: Vec<AnimationSlot>,
     /// 下一个动画 id（单调；`AnimationId` 的代际）。
     next_animation: u32,
+    /// 动画终止事件的待派发队列（自然完成 / 取消 / 替换 / 目标释放；E10）。
+    ///
+    /// 事件在**产生它的那一帧内**（自然完成：tick 之后、样式/布局/绘制之前）或**下一帧入口**
+    /// （帧外产生的取消 / 替换 / 释放 / 0 ms 动画）派发 —— 见 [`App::on_animation_complete`]
+    /// 的时序契约。
+    animation_completions: std::collections::VecDeque<AnimationCompletion>,
+    /// 应用注册的动画完成回调（单槽：重复注册替换上一个，与 [`App::on_frame`] 同口径）。
+    animation_complete_handler: Option<Box<dyn FnMut(&mut App, AnimationCompletion)>>,
+    /// 正在派发完成事件：回调里再次取消 / 注册动画时，事件排队等外层循环派发（不重入）。
+    dispatching_animation_completions: bool,
+    /// 一次性定时器表（`App::after` / `App::after_scoped`；按注册顺序，id 单调）。
+    timers: Vec<timer::TimerEntry>,
+    /// 下一个定时器 id（单调；`TimerId` 的代际）。
+    next_timer: u32,
     /// 待推给平台的光标变化（`None` = 没变）。
     /// 待推给平台的**光标变化**（带窗口 id：光标是每窗口状态，P2 复审）。
     cursor_pending: Option<(WindowId, Cursor)>,
@@ -219,8 +305,10 @@ pub struct App {
     /// `ImmAssociateContext`（Windows）。用集合而不是单槽：一轮内多个窗口各自关一次 IME
     /// 时单槽会丢请求。
     ime_disabled: ahash::HashSet<WindowId>,
-    /// 待执行的 Linux 客户端装饰窗口控制（自绘标题栏的按钮 / 拖动）。
-    #[cfg(target_os = "linux")]
+    /// 待执行的窗口控制请求（自绘标题栏的按钮 / 拖动 / 缩放；E6 起三端共用）。
+    ///
+    /// Linux 由 Wayland 事件循环在同一轮执行；Windows/macOS 由各自的泵在下一轮执行
+    /// （`show` / `performMiniaturize:` 等系统调用不能发生在持有 `&mut App` 的借用里）。
     window_control: Option<(WindowId, crate::window::WindowControl)>,
     /// a11y 动作的 handler 表（P11；同 `A11yAction` 后写覆盖）。
     a11y_handlers: ahash::HashMap<
@@ -255,6 +343,22 @@ struct ClickRecord {
     position: Point,
     at: Instant,
     count: u8,
+}
+
+/// 一条焦点作用域化的键盘绑定（`App::bind_key_scoped`）。
+///
+/// 命中条件 = `(key, modifiers)` 精确匹配 **且** 该窗口的焦点节点在 `scope` 子树内（含
+/// `scope` 自身）。不满足焦点条件时**不消费**，继续走全局绑定 / 默认键盘行为。
+///
+/// 多个 scope 同时命中（嵌套）时由 `app::input::on_key` 从焦点向上**由内向外**尝试；
+/// 表本身不排序 —— 查找顺序由祖先链决定，因此「后写覆盖」只针对同一个 scope。
+struct ScopedKeyBinding {
+    /// 绑定所属窗口（焦点是每窗口状态；同一 `NodeId` 不会跨窗口）。
+    window: WindowId,
+    /// 焦点作用域根：焦点必须是它或它的后代。
+    scope: NodeId,
+    /// 实际绑定（键 + 修饰键 + 动作）。
+    binding: KeyBinding,
 }
 
 /// 一个动画槽（`tick_animations` 推进；`t == 1.0` 时删槽）。
@@ -313,6 +417,78 @@ impl AnimationTarget {
             }
             _ => false,
         }
+    }
+
+    /// 是否驱动 `ids` 里的某个瞬态值（作用域释放时取消动画用）。
+    ///
+    /// **扩展点（必须同步）**：给 [`AnimationTarget`] 新增任何「引用 `Transient`」的变体时，
+    /// 必须在这里把它纳入判据，并同步 [`App::animate`] 的注册路径 —— 否则作用域释放后
+    /// `tick_animations` 会继续写已回收的槽位（引擎不变量被破坏，见 `signal_api::release_scope`）。
+    /// 不引用瞬态值的变体（如 `Scroll`）返回 `false`。
+    fn targets_any(&self, ids: &[SignalId]) -> bool {
+        match self {
+            Self::Scalar { transient, .. } => ids.contains(&transient.id()),
+            Self::Color { transient, .. } => ids.contains(&transient.id()),
+            Self::Scroll { .. } => false,
+        }
+    }
+}
+
+/// 动画终止原因（[`AnimationCompletion`] 的载荷；E10）。
+///
+/// 只描述**这次注册的动画**为什么结束；应用可据此区分「正常收尾」与「被中止」，不需要轮询
+/// `App::animations_running`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AnimationEndKind {
+    /// 到达终值：`t >= 1.0`（终值已写入目标 `Transient`）或 0 时长动画的立即到位。
+    ///
+    /// **只有**这一种是「完成」；取消 / 替换 / 目标释放是另外三种（见 [`App::on_animation_complete`]）。
+    Finished,
+    /// 被 [`App::cancel_animation`] 取消（终值**没有**写入）。
+    Cancelled,
+    /// 同一目标上注册了新动画，旧槽被替换（新动画继续驱动同一个值）。
+    Replaced,
+    /// 驱动值所属作用域被释放（`App::release_scope`）—— 目标已回收，旧槽同批取消。
+    Released,
+    /// 动画的重绘节点 / 滚动目标所在子树被 [`App::remove_node`] 卸载（E16）。
+    ///
+    /// 与 [`AnimationEndKind::Cancelled`] 区分：应用没有持有 [`AnimationId`] 主动取消，是引擎
+    /// 在卸载路径上替它收尾（[`RemoveOutcome::animations`] 也给出条数）。终值**没有**写入。
+    Removed,
+}
+
+/// 一次动画终止事件（[`App::on_animation_complete`] 的载荷；E10）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AnimationCompletion {
+    /// 结束的动画句柄（`App::animate` 的返回值；`AnimationId` 带窗口身份）。
+    pub id: AnimationId,
+    /// 终止原因。
+    pub kind: AnimationEndKind,
+}
+
+/// 一次性定时器句柄（`Copy`；`(window, generation)` 唯一，取消 / 到期后旧句柄失效）。
+///
+/// 由 [`App::after`] / [`App::after_scoped`] 铸造，[`App::cancel_timer`] 消费。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TimerId {
+    window: WindowId,
+    /// 单调代际（`App::cancel_timer` 只认这一对 `(window, generation)`）。
+    generation: u32,
+}
+
+impl TimerId {
+    pub(crate) fn new(window: WindowId, generation: u32) -> Self {
+        Self { window, generation }
+    }
+
+    /// 所属窗口。
+    #[must_use]
+    pub fn window(&self) -> WindowId {
+        self.window
+    }
+
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation
     }
 }
 
@@ -424,6 +600,15 @@ impl App {
         // `GetMessageW`/`poll`，没有唤醒就永远不会有人调 `poll()`）。字段顺序要求它先于
         // `resources` 构造，因此提到结构体字面量之前。
         let dispatcher = Dispatcher::new();
+        // 图集构造在字面量之前：代际租约的初值必须与图集的初始代际一致。
+        let atlas = AtlasAllocator::with_page(
+            crate::paint::atlas::AtlasKind::Glyph,
+            (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
+        );
+        let atlas_generation_lease = Arc::new(AtomicU64::new(crate::text::pack_atlas_lease(
+            atlas.generation(),
+            0,
+        )));
         Self {
             store: StateStore::with_capacity(64, 16),
             graph: DependencyGraph::new(),
@@ -434,10 +619,7 @@ impl App {
             runtime: runtime.clone(),
             text: TextContext::new(),
             raster: GlyphRasterizer::new(),
-            atlas: AtlasAllocator::with_page(
-                crate::paint::atlas::AtlasKind::Glyph,
-                (MIN_ATLAS_PAGE, MIN_ATLAS_PAGE),
-            ),
+            atlas,
             resources: ResourceCache::new(runtime, Arc::clone(&dispatcher)),
             pending_resource_results: Vec::new(),
             geometry: crate::paint::geometry_store::GeometryStore::new(),
@@ -445,7 +627,12 @@ impl App {
             text_dirty_scratch: Vec::new(),
             text_layout_scratch: Vec::new(),
             scale_epochs: ahash::HashMap::default(),
+            image_scale_epochs: ahash::HashMap::default(),
             atlas_generation_seen: 0,
+            atlas_generation_lease,
+            default_text_scale: 1.0,
+            text_scale_override: None,
+            focused_window: None,
             pending_dirty: crate::render::DirtyRects::default(),
             glyph_page_extent: None,
             image_array_established: None,
@@ -459,17 +646,25 @@ impl App {
             handlers: ahash::HashMap::default(),
             close_handlers: ahash::HashMap::default(),
             bindings: default_bindings(),
+            scoped_bindings: Vec::new(),
             thresholds: InputThresholds::platform_default(),
             clock: Instant::now(),
+            // E10c-R01：生产默认活时钟（首次泵启动前登记的定时器也以登记瞬间为基准）；
+            // `TestApp` 在构造后显式关闭（见 `TestApp::with_options`）。
+            clock_live: true,
             a11y_delivered: ahash::HashMap::default(),
             a11y_delivered_round: false,
             last_click: None,
             animations: Vec::new(),
             next_animation: 1,
+            animation_completions: std::collections::VecDeque::new(),
+            animation_complete_handler: None,
+            dispatching_animation_completions: false,
+            timers: Vec::new(),
+            next_timer: 1,
             cursor_pending: None,
             capture_requests: ahash::HashMap::default(),
             ime_disabled: ahash::HashSet::default(),
-            #[cfg(target_os = "linux")]
             window_control: None,
             a11y_handlers: ahash::HashMap::default(),
             a11y_diagnostics: Vec::new(),
@@ -490,11 +685,27 @@ impl App {
         resources::on_frame(self, hook)
     }
 
+    /// 单槽是否已被 `App::on_frame` 占用。
+    ///
+    /// `on_frame` 是单槽（后注册覆盖先注册），静默替换会让先安装的帧钩子停摆；安装协议因此
+    /// 需要一个「槽是否空闲」的读点。消费者：`widget::frame::FrameRouter::new` / `install`，
+    /// 它们在槽被占用时返回 [`EngineError::FrameHookInstalled`]。
+    #[must_use]
+    pub fn frame_hook_installed(&self) -> bool {
+        self.frame_hook.is_some()
+    }
+
     /// 调用一次帧钩子（crate 私有；临时 take 以避免 `&mut self` 与闭包参数重叠）。
     ///
     /// D-6 起钩子之前先轮询一次异步解码结果（`App::poll_resources`）：平台泵每轮都会调用本函数，
     /// 因此解码完成（工作线程已 `Dispatcher::wake`）后，结果会在这一轮交付并请求一帧。
+    ///
+    /// **E10**：在应用钩子之前先派发两类引擎事件 —— 已到期的**一次性定时器**与上一轮之后产生的
+    /// **动画终止事件**。顺序保证应用钩子（`App::on_frame`）在同一轮就能看到定时器 / 完成回调
+    /// 造成的新状态；钩子仍然是「平台事件已落地、提交本帧之前」的唯一应用同步点。
     pub(crate) fn run_frame_hook(&mut self) {
+        timer::run_due(self);
+        animation::dispatch_completions(self);
         resources::run_frame_hook(self)
     }
 
@@ -512,8 +723,30 @@ impl App {
     /// 应用在 `on_frame` 钩子里取走并把 `Ready(ResourceImage)` 应用到节点（例如
     /// `Window::set_canvas`）或对 `Failed(DecodeCause)` 画占位/记录；每项只交付一次。
     /// 任务仍在途时返回空列表（稍后的轮次再交付）。
+    ///
+    /// **E7**：引用 `PendingResource` 的图片节点由引擎在 `poll_resources` 里**自动**改成
+    /// 已就绪（内在尺寸 + 失效重绘），应用不需要为它们再处理本列表。
     pub fn take_resource_results(&mut self) -> Vec<(PendingResource, DecodeState)> {
         resources::take_resource_results(self)
+    }
+
+    /// 释放一个图片资源并让所有引用它的图片节点失效重绘（E7）。
+    ///
+    /// 资源 tile 的契约是「恒有效直到 unload」（`资源 §11.8 R-12`）：卸载后若继续复用上一帧
+    /// 的 lane，会把已回收的 tile（可能已被别的图复用）画出来。本入口把 unload 与节点失效
+    /// 合成一步 —— 应用应使用它而不是直接 `resources_mut().unload()`。
+    ///
+    /// 返回 `false` = 资源不存在（已释放 / 陈旧句柄）。
+    pub fn unload_resource(&mut self, id: crate::resources::ResourceId) -> bool {
+        resources::unload_resource(self, id)
+    }
+
+    /// E7：在布局之前解析图片节点的内在尺寸（`App::frame` 内部调用；低频）。
+    ///
+    /// 触发条件：新挂载的图片节点 / `set_image_resource` / 窗口 DPI 变化。没有图片节点或
+    /// 没有变化时是 O(1) 早退（不扫描树，I3 的空闲路径不受影响）。
+    pub(crate) fn refresh_images(&mut self, window: WindowId) -> usize {
+        resources::refresh_images(self, window)
     }
 
     /// 跨线程句柄（`AppHandle`）。
@@ -534,6 +767,22 @@ impl App {
     #[must_use]
     pub fn drain_events(&mut self) -> Vec<(WindowId, Event)> {
         resources::drain_events(self)
+    }
+
+    /// 只取走 `keep` 认可的平台事件，其余**留在队列里**（原顺序，丢弃计数不变）。
+    ///
+    /// 给「只拥有事件的一部分」的消费者：一个模态对话框把**自己窗口的文本 / 按键 / IME**交给
+    /// 自己的输入框（kit 的契约是「外壳 `drain_events` 之后逐条转发给 `InputNode::dispatch`」），
+    /// 而其它窗口、以及指针 / 尺寸 / 焦点 / 关闭这类**引擎自己已经分发过**的事件仍留在观测队列
+    /// 里，组合根照常读到它们 —— 对话框因此不会把应用的事件吞掉。
+    ///
+    /// 队列有界（同 [`App::drain_events`]）；被取走的事件不影响累计的丢弃计数。
+    #[must_use]
+    pub fn drain_events_where(
+        &mut self,
+        keep: impl FnMut(WindowId, &Event) -> bool,
+    ) -> Vec<(WindowId, Event)> {
+        resources::drain_events_where(self, keep)
     }
 
     /// 累计被丢弃的事件条数（队列溢出诊断；单调递增）。
@@ -731,6 +980,20 @@ impl App {
         geometry::truncate(self, geometry, vertices, indices)
     }
 
+    /// 仅测试（`test-support`）：值槽位表的分配统计（分配过 / 存活 / 空闲）。
+    ///
+    /// 公开入口是 `test_support::diagnostics::signal_slot_stats`：作用域释放后槽位归还空闲栈，
+    /// 「反复开关一个面板后槽位总数 / 存活数不增长」因此可断言（R03-6 的泄漏面）。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn signal_slot_counts_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.store.slot_count_for_test(),
+            self.store.live_slot_count_for_test(),
+            self.store.free_slot_count_for_test(),
+        )
+    }
+
     /// 依赖图（只读；`test-support` 的 `diagnostics::dependency_dump` 用）。
     #[cfg(feature = "test-support")]
     pub(crate) fn dependency_graph(&self) -> &DependencyGraph {
@@ -805,14 +1068,21 @@ impl App {
         signal_api::signal_scoped(self, scope, initial)
     }
 
-    /// 释放信号作用域：其值**立即回收**（槽位归还空闲栈、代际 +1），依赖图里以它们为键的边被
-    /// **立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
+    /// 释放信号作用域：其值（信号 / 瞬态值）**立即回收**（槽位归还空闲栈、代际 +1），依赖图里
+    /// 以它们为键的边被**立即**删除；此后旧句柄的读 panic、写/更新是 no-op（见 [`SignalScope`]）。
+    /// 引用该作用域瞬态值的动画槽同批取消，不会在下一帧写死槽位；取消后这些动画不再请求帧
+    /// （**I3**：静止即回 Idle）。
     ///
     /// **派生侧**：根作用域派生的闭包若捕获了本作用域的句柄，释放后既不会再被失效（缓存永久
     /// 陈旧），又会在下次重算时读死句柄 panic。引擎无法检测不透明闭包，因此这是应用层硬契约
     /// （禁止跨作用域捕获，见 [`App::derived`] 与 [`Derived`]）。
     ///
-    /// 返回被释放的信号数（重复释放返回 0；根作用域不可释放）。
+    /// **节点侧**：`bind_style` / `bind_text` / `bind_a11y` 闭包捕获的句柄在释放后一求值就
+    /// panic。组件先卸载自己的节点、再释放作用域（`base_ui` 组件的 `release` 即此顺序契约）。
+    ///
+    /// 返回被释放的值槽位数（信号 + 瞬态值；重复释放返回 0；根作用域不可释放）。计数口径是
+    /// 「回收了多少个值」，不是「有多少个节点读它们」—— 调用方只能把它用于诊断/断言，不得
+    /// 反推业务状态。
     pub fn release_scope(&mut self, scope: SignalScope) -> usize {
         signal_api::release_scope(self, scope)
     }
@@ -820,6 +1090,40 @@ impl App {
     /// 建一个瞬态值（读不登记、写不失效）。
     pub fn transient<T: Clone + 'static>(&mut self, initial: T) -> Transient<T> {
         signal_api::transient(self, initial)
+    }
+
+    /// 在指定作用域里注册瞬态值（随 [`App::release_scope`] 一起回收）。
+    ///
+    /// # 语义
+    ///
+    /// 与 [`App::transient`] 完全相同（读不登记依赖、写不失效、不进依赖图 —— **I3** 的
+    /// 「高频状态不污染依赖图」），唯一区别是**归属**：值槽位记在 `scope` 名下，作用域释放时
+    /// 与普通信号一起立即回收（槽位归还空闲栈、代际 +1）。
+    ///
+    /// 这是动态创建 / 销毁组件（滚动条淡出、拖拽快照、列表滚动状态）的必需入口：用
+    /// [`App::transient`] 会落在**根作用域**、永不释放，长期 churn 会把槽位峰值推高。
+    ///
+    /// # 释放语义
+    ///
+    /// [`App::release_scope`] 之后：
+    /// - 旧 `Transient` 句柄的**读 / 写都 panic**（确定性失败，绝不读到槽位复用后的新值；
+    ///   见 `node::signal` 模块文档〈作用域回收与句柄失效〉）；
+    /// - 引用它的动画槽**同批取消**（`AnimationTarget::targets_any`）：否则下一帧
+    ///   `tick_animations` 会写已回收的槽位。取消发生在槽位回收之后、同一调用内，中间没有帧
+    ///   推进；取消后不再因该动画请求帧（I3）。
+    ///
+    /// 组件契约为「**先卸载节点、再释放作用域**」：`bind_style` / `bind_text` 闭包捕获的句柄
+    /// 在释放后一求值就 panic（见 [`App::release_scope`]）。
+    ///
+    /// # Panics
+    ///
+    /// `scope` 已释放（引擎误用：释放后不可再 mint 值）。
+    pub fn transient_scoped<T: Clone + 'static>(
+        &mut self,
+        scope: SignalScope,
+        initial: T,
+    ) -> Transient<T> {
+        signal_api::transient_scoped(self, scope, initial)
     }
 
     /// 注册一个派生值（**不**立即求值；环在运行期检测）。
@@ -904,8 +1208,14 @@ impl App {
 
     /// 写一个瞬态值：**不**失效、**不**请求唤醒（滚动偏移/悬浮态，§3.7）。
     ///
+    /// 与 [`App::write`] 的失效句柄语义**不同**：普通信号在作用域释放后的迟到写是 no-op
+    /// （返回 `false`，R03-6 的僵尸唤醒防护），而瞬态值没有「返回 false」的第二形态 —— 读
+    /// 会 panic，写同样 panic，绝不静默丢弃或写到槽位复用后的新值。
+    ///
     /// # Panics
-    /// 该瞬态值存在活跃读守卫。
+    ///
+    /// - 该瞬态值存在活跃读守卫；
+    /// - 该句柄已失效（所属作用域已释放 / 槽位已回收）：与读同口径的**确定性失败**。
     pub fn write_transient<T: 'static>(&mut self, transient: &Transient<T>, value: T) {
         signal_api::write_transient(self, transient, value)
     }
@@ -997,7 +1307,10 @@ impl App {
     /// 不生效时定位到这一点。
     ///
     /// 批处理内（[`App::batch`]）只登记推迟位，由最外层批处理结束时合并成**一次**请求。
-    fn request_frame(&mut self) {
+    ///
+    /// E6 起的额外消费者：三端泵在窗口 chrome 状态变化（最大化 / 还原）时请求一帧 —— 根节点
+    /// 的 `PAINT` 已由 [`Window::set_state`] 标好（§8.6.4 / I3，与应用写信号同一路径）。
+    pub(crate) fn request_frame(&mut self) {
         if self.batch_depth > 0 {
             self.batch_wake = true;
             return;
@@ -1016,9 +1329,109 @@ impl App {
         style_pass::off_action(self, action)
     }
 
+    /// 仅测试（`test-support`）：某个动作当前是否注册了处理器。
+    ///
+    /// 组件 `release` 清理的直接证据面：泄漏的 handler 不一定会 panic（指针路径对死句柄是
+    /// no-op、滚动条 handler 只写引擎滚动状态），「重放输入不 panic」不能证明表项被摘掉。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn has_action_handler(&self, action: &Action) -> bool {
+        style_pass::has_action_handler(self, action)
+    }
+
+    /// 仅测试（`test-support`）：某个 `(window, scope)` 上剩余的焦点作用域化键绑定条数。
+    ///
+    /// `App::unbind_scope_keys` 的直接证据面（`Tree::release`）：handler 被摘但绑定残留时，
+    /// 重放按键既不 panic 也不消费（回落到默认行为），只能直接观察表项。
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn scoped_key_binding_count(&self, window: WindowId, scope: NodeId) -> usize {
+        style_pass::scoped_binding_count(self, window, scope)
+    }
+
     /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
+    ///
+    /// 这是**应用级**绑定：不论焦点落在哪个控件上都命中（`Ctrl+S` / `Tab` / `Esc`）。
+    /// 只在某个实例聚焦时才成立的键（文本编辑键、树方向键）用 [`App::bind_key_scoped`]。
     pub fn bind_key(&mut self, binding: KeyBinding) {
         style_pass::bind_key(self, binding)
+    }
+
+    /// 添加/替换一条**焦点作用域化**的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
+    ///
+    /// # 语义
+    ///
+    /// 只有该窗口的**焦点节点落在 `scope` 子树内**（含 `scope` 自身）时，绑定才命中并消费按键；
+    /// 否则按键继续走全局绑定（[`App::bind_key`]）与默认键盘行为（方向键滚动等）。
+    ///
+    /// 求值顺序（`app::input::on_key` 的 ③a/③b/④）：
+    ///
+    /// 1. **scoped 绑定**：从焦点节点向上到根，逐个 scope 找 `(key, modifiers)` 精确匹配的绑定，
+    ///    由**内向外**依次尝试 —— 焦点在嵌套 scope（如树里的文本域）内时**内层优先**；
+    /// 2. **全局绑定**：scoped 无命中 / 命中的 action 没有 `on_action` handler 时回落；
+    /// 3. **默认键盘行为**：全局也无绑定时的方向键滚动等。
+    ///
+    /// 「消费」= 该 `Action` 注册了 handler 且分派返回 `true`。绑定存在但 handler 被
+    /// [`App::off_action`] 移除时不消费、不吞键 —— 组件 `release` 先摘 handler 再解绑，
+    /// 中间窗口不会出现「按键被吃但没有响应」。
+    ///
+    /// # 防泄漏与生命周期
+    ///
+    /// - 同 `(window, scope, key, modifiers)` **后写覆盖**：重复注册不会增长表项；
+    /// - [`App::remove_node`] 卸载 `scope` 所在子树 ⇒ 该 scope 的绑定**自动清除**；
+    ///   只卸载后代节点不影响祖先 scope 的绑定；
+    /// - [`App::close_window`] ⇒ 该窗口的全部 scoped 绑定清除；
+    /// - 组件需要主动清理（不卸载节点 / 不关窗）用 [`App::unbind_scope_keys`] 或
+    ///   [`App::unbind_key_scoped`]。
+    ///
+    /// 绑定不写状态、不标脏、不请求帧（**I3**）；`scope` 与 handler 读到的状态都由调用方在
+    /// Action handler 内经 `ActionCtx` 改写（**I6**：可见状态只经 Signal/Action 写入）。
+    ///
+    /// 焦点经 [`App::focused`] 过滤：已卸载节点的陈旧焦点、模态浮层作用域外的焦点都被视为
+    /// 无焦点 ⇒ 陈旧 `NodeId` 与多窗口下「另一窗口的陈旧焦点」都不会误触本窗口的绑定
+    /// （`NodeId` 本身携带窗口身份，跨窗口注册在 [`App::bind_key_scoped`] 里就被拒绝）。
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::UnknownWindow`]：窗口不存在（`WindowId` 单调不复用，注册给未知窗口的
+    ///   绑定永远不会命中，必须在注册期拒绝）；
+    /// - [`EngineError::StaleNode`]：`scope` 不在该窗口的节点树中（已卸载 / 从未挂载 /
+    ///   属于另一窗口）。
+    ///
+    /// # Panics
+    ///
+    /// 无。`scope` 之后被卸载是正常生命周期：绑定随 [`App::remove_node`] 自动清除。
+    pub fn bind_key_scoped(
+        &mut self,
+        window: WindowId,
+        scope: NodeId,
+        binding: KeyBinding,
+    ) -> Result<(), EngineError> {
+        style_pass::bind_key_scoped(self, window, scope, binding)
+    }
+
+    /// 删除一条**焦点作用域化**的键盘绑定（返回是否真的删了）。
+    ///
+    /// 与 [`App::bind_key_scoped`] 对称的显式清理；窗口 / `scope` 已不存在时按「没有这条绑定」
+    /// 处理（返回 `false`，不 panic）。同 `(window, scope, key, modifiers)` 后写覆盖保证至多
+    /// 一条匹配 ⇒ 删除是幂等的。
+    pub fn unbind_key_scoped(
+        &mut self,
+        window: WindowId,
+        scope: NodeId,
+        key: KeyCode,
+        modifiers: Modifiers,
+    ) -> bool {
+        style_pass::unbind_key_scoped(self, window, scope, key, modifiers)
+    }
+
+    /// 删除某个 `scope` 在某个窗口上的**全部**焦点作用域化绑定，返回删除条数。
+    ///
+    /// 组件 `release` 的清理入口：调用方不需要复述自己绑定过哪些键（键表可能随组件参数变化）。
+    /// 幂等；窗口 / `scope` 已不存在时返回 0。节点卸载与关窗已有自动清理，本方法是
+    /// **不卸载节点就释放组件**（例如复用节点树、热切换控件）时的显式出口。
+    pub fn unbind_scope_keys(&mut self, window: WindowId, scope: NodeId) -> usize {
+        style_pass::unbind_scope_keys(self, window, scope)
     }
 
     /// 删除一条键盘绑定（返回是否真的删了）。
@@ -1275,21 +1688,47 @@ impl App {
         focus::validate_focus(self, window)
     }
 
-    /// 当前的**焦点作用域根**（R02-12）：最上层带 `trap_focus` 的模态浮层子树根。
+    /// 当前窗口的**模态作用域根**（最上层带 `trap_focus` 的浮层子树根）。
     ///
-    /// `None` = 没有模态浮层，整棵树都在作用域内。
+    /// `None` = 没有模态浮层，整棵树都可交互 / 可读。`Some(scope)` 时引擎把作用域外的一切
+    /// 当作 `inert`（Blink `<dialog showModal>` 的 top layer + inert 背景、Qt 模态对话框、
+    /// GTK modal 的同一语义）：
+    /// - 指针按下 / 滚动 / hover 被挡住（[`App::hovered`] 返回 `None`，背景不产生 `:hover`）；
+    /// - 焦点陷阱：[`App::set_focus`] / Tab 序只在作用域内；
+    /// - a11y 树把作用域外节点标 `hidden`（AT 读不到背景）；
+    /// - 作用域 = 模态子树 **∪** 经 `opener` 链属于该模态的弹出层（对话框里的下拉/菜单）。
+    ///
+    /// 调用方可以据此判断「某个交互是否属于当前模态」（例如应用自己的 tooltip / 快捷键
+    /// 路由）。作用域在模态浮层打开/关闭 / 提层时变化。
     #[must_use]
-    pub(crate) fn focus_scope(&self, window: WindowId) -> Option<NodeId> {
+    pub fn modal_scope(&self, window: WindowId) -> Option<NodeId> {
         focus::focus_scope(self, window)
     }
 
-    /// 指针当前悬停的节点（R02-4；`None` = 空白处 / 窗口外 / 节点已卸载）。
+    /// 指针当前悬停的节点（R02-4；`None` = 空白处 / 窗口外 / 节点已卸载 / **模态作用域外**）。
     ///
     /// 悬停变化时引擎会派生 [`Event::HoverChanged`]、给变化节点标 `PAINT` 并请求一帧，因此
     /// 应用可以在 `bind_style` 里读一个由悬停事件驱动的信号来实现 `:hover` 高亮。
+    ///
+    /// 模态浮层（`trap_focus`）打开后，落在作用域外的悬停读作 `None`（E12）：背景的
+    /// `:hover` / tooltip 不得出现在模态之上；模态内部的悬停（含属于该模态的弹出层）照常。
     #[must_use]
     pub fn hovered(&self, window: WindowId) -> Option<NodeId> {
         focus::hovered(self, window)
+    }
+
+    /// 窗口的**最新指针位置**（逻辑客户区坐标；E17）—— [`Window::pointer_position`] 的
+    /// 便捷读点（`None` = 窗口不存在，或该窗口从未收到过指针事件）。
+    ///
+    /// **保留最后值**语义：指针离开窗口 / 窗口失焦后**不**清除、不重算（离开点是平台事件自带
+    /// 的最后位置）；坐标**不裁剪**到客户区（捕获期间可以是窗口外坐标）。完整语义（坐标域 /
+    /// 触摸与手势 / I3 帧语义 / 三端生产者）见 [`Window::pointer_position`]。
+    ///
+    /// 纯读取：**不请求帧**，不影响悬停 / 焦点 / 光标。需要「指针在不在窗口内」请读
+    /// [`Self::hovered`] 或 `InputEvent::PointerEnter` / `PointerLeave`。
+    #[must_use]
+    pub fn pointer_position(&self, window: WindowId) -> Option<Point> {
+        self.window(window).and_then(Window::pointer_position)
     }
 
     /// 取得**指针捕获**（R02-8）：请求平台继续把指针事件投递给本窗口，直到
@@ -1492,8 +1931,17 @@ impl App {
 
     /// 让一个滚动容器变成虚拟列表（要求 `Clip::Bounds` + `position: relative`）。
     ///
+    /// # 行生命周期（应用契约）
+    ///
+    /// 已挂载的行**只能由引擎回收**：滚动 / 视口变化（`rewindow_virtual`）与
+    /// [`App::set_virtual_items`] 负责挂载 / 回收，行上的 scoped 键绑定、`after_scoped` 定时器
+    /// 与动画槽随回收一并清理。应用**不得**对已挂载行调用 [`App::remove_node`] —— 容器的
+    /// `mounted` 索引不会随之更新，该条目此后永不再挂载（视觉空洞）。需要删除条目时改数据源
+    /// 后调用 [`App::set_virtual_items`]；删除容器本身可以用 [`App::remove_node`]（行随容器
+    /// 一起消失）。
+    ///
     /// # Errors
-    /// `StaleNode` / `NotVirtualList`。
+    /// `StaleNode` / `NotVirtualList` / `InvalidVirtualExtent`（预置行高非法）。
     pub fn make_virtual_list(
         &mut self,
         window: WindowId,
@@ -1526,6 +1974,35 @@ impl App {
     #[must_use]
     pub fn virtual_row_index(&self, list: &VirtualList, row: NodeId) -> Option<usize> {
         virtual_list::virtual_row_index(self, list, row)
+    }
+
+    /// 逐项高度**整体替换**（E3；`extents.len()` 必须等于当前条目数）。
+    ///
+    /// 引擎重算前缀和（O(n)），并按锚点补偿滚动偏移：替换前的「首个可见 index + 行内偏移」
+    /// 在替换后保持不变（同一调用内完成，不额外请求帧，I3）。与旧高度逐项相同时是纯 no-op。
+    ///
+    /// # Errors
+    /// `NotVirtualList`（list 失效 / 未 `make_virtual_list`）；`VirtualListExtents`（长度与
+    /// 条目数不符）；`InvalidVirtualExtent`（逐项高度非有限、为负或累计溢出）。
+    pub fn set_virtual_extents(
+        &mut self,
+        list: &VirtualList,
+        extents: &[f32],
+    ) -> Result<(), EngineError> {
+        virtual_list::set_virtual_extents(self, list, extents)
+    }
+
+    /// 把第 `index` 项按 `align` 对齐到视口（E3）；`Nearest` = 已完全可见则不滚。
+    ///
+    /// # Errors
+    /// `NotVirtualList`（list 失效）；`VirtualListExtents`（`index` 越界）。
+    pub fn scroll_to_item(
+        &mut self,
+        list: &VirtualList,
+        index: usize,
+        align: ItemAlign,
+    ) -> Result<(), EngineError> {
+        virtual_list::scroll_to_item(self, list, index, align)
     }
 
     /// 布局后/视口变化后修复所有虚拟列表的可见窗口（幂等：区间不变则零工作）。
@@ -1591,11 +2068,122 @@ impl App {
         overlay::dismiss_overlay(self, window)
     }
 
-    /// 卸载一棵子树（浮层关闭 / 虚拟列表回收 / 应用主动移除的公共出口）。
+    /// 卸载一棵子树，并**自动清理挂在这棵子树上的引擎级生命周期资源**（R-21 引擎下沉，E16）。
     ///
-    /// 只接受**该窗口**的节点句柄：跨窗口句柄在 `NodeTree::get` 处确定性失败（返回 `false`）。
-    pub(crate) fn remove_node(&mut self, window: WindowId, node: NodeId) -> bool {
+    /// 这是应用卸载容器 / 面板 / 浮层的**唯一入口**。`NodeTree::remove` / `Window::tree_mut`
+    /// 是引擎内部原语：不经本方法会留下 scoped 键绑定、`after_scoped` 定时器与动画槽（见这
+    /// 两个 API 的文档）。
+    ///
+    /// # 清理顺序（不可交换）
+    ///
+    /// 1. 校验窗口与节点 —— **错误路径不产生任何副作用**；
+    /// 2. 记取浮层 opener / 模态状态，并收尾「捕获目标落在子树内」的指针会话（派发
+    ///    `PointerCancel`、请求平台释放捕获、清按压 / 拖拽 / 悬停）；
+    /// 3. 记取**悬停链**（必须删树前完成：删后 `update_hover` 的 `previous` 会把死节点过滤成
+    ///    「无悬停」，补调 `revalidate_hover` 派生不出 leave 事件）；
+    /// 4. `NodeTree::remove`（结构 + lane 回收 + 容器登记 + damage），逐条 detach 被删节点的
+    ///    信号依赖边；
+    /// 5. **指针状态收尾**：落在被删集合里的悬停 / 按压 / 待定拖拽 / 最近命中清掉；悬停链被
+    ///    卸载时派生 [`Event::HoverChanged`]（`hovered: None`，`left` 是删前链由内到外）并把
+    ///    光标复位为默认 —— 应用侧的 tooltip / `:hover` 不得残留到下一次指针移动；
+    /// 6. **scoped 键绑定**（[`App::bind_key_scoped`]）：`scope` 落在被卸载子树内的条目删除，
+    ///    祖先 scope 的绑定保留；
+    /// 7. **`after_scoped` 定时器**（[`App::after_scoped`]）：`scope` 落在被卸载子树内的条目取消，
+    ///    未派发的回调不会再跑在「组件已不存在」的状态上；
+    /// 8. **动画槽**（[`App::animate`]）：重绘节点**全部**落在被卸载子树内、或滚动动画的
+    ///    `ScrollHandle` 节点被卸载的槽取消，并按 [`AnimationEndKind::Removed`] 入队完成事件；
+    ///    部分重绘节点存活的槽保留并剔除死节点（共享动画不被误杀）；
+    /// 9. 模态浮层关闭的 a11y 背景语义恢复 + 焦点还给 opener（与 `App::close_overlay` 同路径）；
+    /// 10. 若由 [`App::remove_node_with_scope`] 调用，在节点已卸载之后 `release_scope`：其瞬态值
+    ///     被回收，引用它们的动画同批取消（[`AnimationEndKind::Released`]）；
+    /// 11. 请求一帧（卸载改变了像素；`App::request_frame` 是合并位，重复请求无副作用）。
+    ///
+    /// 顺序不可交换：先卸载节点再释放作用域，保证释放发生时节点已不在树里、且同一动画槽只会
+    /// 被一条路径取消 / 计数（`remove` 内部不求值任何 `bind_*` 闭包；真正的保证是「释放后不在
+    /// 同一次调用内留下可能被求值的闭包窗口」）。
+    ///
+    /// # 不清理的部分（应用义务，最小安全边界）
+    ///
+    /// - **Action handler**（[`App::on_action`]）：按 `Action` 全局索引，同一个动作可能被多个
+    ///   组件 / 窗口共享，引擎无法把它归属到一棵子树。自动摘除会静默破坏其它存活组件，因此
+    ///   仍由调用方 [`App::off_action`]；
+    /// - **全局键绑定**（[`App::bind_key`]）：同理，按 `(key, modifiers)` 全局索引；
+    /// - **a11y Action handler**（[`App::on_a11y_action`]）：与 `on_action` 同构，按
+    ///   `A11yAction` 全局索引（同一动作可被多个组件共享），同样不会被自动摘除；组件卸载后
+    ///   需要调用方 [`App::off_a11y_action`]；
+    /// - **`SignalScope`**：节点的生命周期与信号作用域是两套正交句柄（E8）。`remove_node`
+    ///   不释放作用域；需要一次调用完成「卸载 + 回收」时用
+    ///   [`App::remove_node_with_scope`]，或随后自行 [`App::release_scope`]（幂等）。
+    ///
+    /// # 虚拟列表行（应用契约）
+    ///
+    /// **已挂载的虚拟行只能由引擎回收**（`App::set_virtual_items` 与滚动回收，见
+    /// [`App::make_virtual_list`]）。对已挂载行调用本方法会把它从树里删掉，但容器的
+    /// `NodeId → 条目下标` 索引（`App::virtual_list_state` 的 `mounted`）不会更新 —— 该条目
+    /// 此后**永不再挂载**（视觉空洞），`App::virtual_row_index` 也仍把死句柄当作已挂载。删除
+    /// 条目请改数据源后调用 `App::set_virtual_items`；删除容器本身不受此限制（行随容器一起
+    /// 消失）。debug 构建里本方法对「删除已挂载行」直接 `debug_assert` 失败（release 下只靠
+    /// 文档：引擎看不到应用意图）。
+    ///
+    /// # 语义
+    ///
+    /// - **重复删除**：第二次返回 [`EngineError::StaleNode`] 且不产生副作用（显式失败，不是
+    ///   静默 no-op）；
+    /// - **祖先删除**：整个子树（含所有后代 scope / 定时器 / 动画）一并清理；只删除后代不影响
+    ///   祖先 scope 的绑定与定时器；
+    /// - **root 不可删除**（[`EngineError::StaleNode`]）；
+    /// - 跨窗口句柄返回 [`EngineError::StaleNode`]，不会触碰其真正宿主窗口；
+    /// - **I3**：取消定时器 / 动画不请求帧、不让平台进入连续帧；`animations_running` 随动画
+    ///   取消回落。只有第 11 步的「树变了要重画」会请求**一帧**。
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::UnknownWindow`]：窗口不存在（已关闭 / 从未创建）；
+    /// - [`EngineError::StaleNode`]：`node` 不在该窗口的节点树中（已卸载 / 从未挂载 / 属于另一
+    ///   窗口）或是 root。
+    pub fn remove_node(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+    ) -> Result<RemoveOutcome, EngineError> {
         window_set::remove_node(self, window, node)
+    }
+
+    /// 卸载子树并在**节点已卸载之后**释放组件的信号作用域
+    /// （= [`App::remove_node`] + [`App::release_scope`] 的同调用组合）。
+    ///
+    /// 适用于「一个组件 = 一棵子树 + 一个 `SignalScope`」的常规形态：先卸节点、再回收作用域值
+    /// 的顺序由引擎保证（`bind_*` 闭包不会在本调用内被求值到已回收的句柄）。作用域里的瞬态值
+    /// 被回收时，引用它们的动画槽同批取消（[`AnimationEndKind::Released`]），计入返回值的
+    /// `animations`。
+    ///
+    /// # 契约：`scope` 必须属于该子树
+    ///
+    /// `SignalScope` 与 `NodeId` 是两套**正交**句柄（E8 设计），引擎没有
+    /// `NodeId → SignalScope` 映射，因此无法完整校验归属；但引擎会拒绝**可证明的错配**：
+    ///
+    /// - **子树之外仍有存活读者**（依赖图里该作用域的存活信号被子树外的节点读取，依赖边来自
+    ///   已求值的 `bind_*`）⇒ [`EngineError::ScopeOwnershipMismatch`]：释放必然打断那个存活
+    ///   绑定，因此在任何副作用之前失败 —— 节点**不会**被卸载，作用域**不会**被释放；
+    /// - 传入**已释放**的作用域：幂等（`released_values == 0`），节点删除照常完成；
+    /// - 传入**没有存活读者**（或读者全在被删子树内）的错配作用域：引擎无法识别 —— 它的值会
+    ///   被真实释放（不可恢复，`released_values > 0`），引用这些值的存活组件随后读信号会
+    ///   确定性 panic。调用方必须保证 `scope` 正是该子树所属组件的作用域；不确定时请改用
+    ///   [`App::remove_node`] + 显式 [`App::release_scope`]，把两件事分开写。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`App::remove_node`]，另有：
+    /// - [`EngineError::ScopeOwnershipMismatch`]：`scope` 的存活信号被子树之外的节点读取
+    ///   （可证明的错配）。**错误发生在任何清理之前**，节点与作用域都保持原状。
+    #[must_use = "scope 错配会不可恢复地释放其它组件的值（引擎只能拒绝可证明的错配），必须检查返回的 RemoveOutcome"]
+    pub fn remove_node_with_scope(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        scope: SignalScope,
+    ) -> Result<RemoveOutcome, EngineError> {
+        window_set::remove_node_with_scope(self, window, node, scope)
     }
 
     /// 当前拖拽会话。
@@ -1631,6 +2219,141 @@ impl App {
         animation::animate(self, window, value, nodes, spec)
     }
 
+    /// 注册**动画完成回调**（E10）：动画到达终值 / 被取消 / 被替换 / 目标作用域释放时通知。
+    ///
+    /// **单槽**：重复注册替换上一个（与 [`App::on_frame`] 同口径）；不需要时注册一个空闭包即可。
+    /// 因此 **kit 层（overlay / tooltip 等）必须统一路由**到同一个回调（按 [`AnimationId`] /
+    /// 窗口分发给各消费者），**不得各自注册** —— 后注册者会静默覆盖先注册者，表现为某条收尾
+    /// 永远不发生（E10-R02 裁决：引擎保持单槽，路由责任在 kit 层）。
+    /// 回调形态是 `FnMut(&mut App, AnimationCompletion)`：可以读 / 写状态、建树、再注册动画
+    /// （回调里产生的新的取消 / 替换事件由**同一派发循环**继续消费，不会重入派发）。
+    ///
+    /// # 时序契约（与 [`App::on_frame`] 的关系）
+    ///
+    /// 1. **自然完成**（[`AnimationEndKind::Finished`]）：在**产生终值的那一帧内**派发 ——
+    ///    `tick_animations` 写入终值、标记 `BIND | PAINT` 之后，样式 / 布局 / 绘制之前。
+    ///    因此回调里做的收尾（卸载节点 / 关浮层）**参与本帧绘制**；回调里改状态触发的重绘
+    ///    由应用按常规方式请求（`App::write` 自动请求）或由下一轮补上。
+    /// 2. **帧外终止**（[`AnimationEndKind::Cancelled`] / [`AnimationEndKind::Replaced`] /
+    ///    [`AnimationEndKind::Released`] / [`AnimationEndKind::Removed`] / 0 ms 动画的
+    ///    `Finished`）：在**下一帧入口**（或平台泵
+    ///    下一轮的钩子步骤）派发 —— 调用点只入队 + 唤醒泵一次（`Dispatcher::wake`，**不请求
+    ///    帧**，I3）；因此应用最迟在「下一帧开始前」观测到。
+    /// 3. **与 `on_frame` 的关系**：`on_frame` 钩子在帧**之前**运行，看不到本帧刚写入的终值。
+    ///    引擎在动画自然完成时唤醒泵一次（不提交空帧），保证**下一轮钩子**一定能看到终值 ——
+    ///    这是给「只在钩子里同步状态」的应用的兜底，不需要轮询 `App::animations_running`。
+    /// 4. 取消 / 替换**不**派发 `Finished`：只有真正到达终值的动画报告 `Finished`。
+    ///
+    /// 回调在 UI 线程（持有 `&mut App`）内运行；不得在回调里再次调用 `Application::run` /
+    /// 嵌套帧循环（与 `on_frame` 同一约束）。
+    pub fn on_animation_complete(
+        &mut self,
+        handler: impl FnMut(&mut App, AnimationCompletion) + 'static,
+    ) {
+        self.animation_complete_handler = Some(Box::new(handler));
+    }
+
+    /// 注册一个**一次性定时器**（E10）：`delay` 之后在 UI 线程回调一次。
+    ///
+    /// `delay` 的基准是**登记瞬间**（生产取真实时间，E10c-R01；测试宿主 `TestApp` 取引擎
+    /// 时钟，见 `TestApp::advance`）—— **首次泵启动之前**登记同样成立（`Application::run`
+    /// 之前建窗 → 初始化 → 登记，初始化耗时不折算进 `delay`）。
+    ///
+    /// 定时器归属 `window`：窗口关闭时自动取消（不会在关窗后再跑应用闭包）。到期前**不请求帧、
+    /// 不让平台进入连续帧**（I3）；平台泵把阻塞等待截止到 `App::next_wake_deadline()` 并在到点
+    /// 唤醒**一次**。派发点 = 平台泵每轮的钩子步骤（`App::run_frame_hook`）或 `App::frame` 入口，
+    /// 因此回调最迟在到期后的**下一个引擎轮次**运行（**不会早于** `delay`）。
+    ///
+    /// 不新建线程：复用平台泵已有的定时器（Windows `SetTimer` / macOS `CFRunLoopTimer` /
+    /// Linux calloop timeout）与引擎时钟；`App` 的 tokio runtime 不参与。
+    ///
+    /// 组件生命周期建议用 [`App::after_scoped`]（节点卸载自动取消）；显式取消用
+    /// [`App::cancel_timer`]（幂等）。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]：窗口不存在（关窗后再注册的定时器没有派发轮次）。
+    pub fn after(
+        &mut self,
+        window: WindowId,
+        delay: Duration,
+        callback: impl FnOnce(&mut App) + 'static,
+    ) -> Result<TimerId, EngineError> {
+        timer::after(self, window, None, delay, callback)
+    }
+
+    /// 注册一个**节点作用域**的一次性定时器（E8 scoped 语义）：窗口关闭或 `scope` 子树被卸载
+    /// （`App::remove_node`）时自动取消。
+    ///
+    /// `scope` 可以是组件自己的任何存活节点（通常是面板根 / 触发器）；注册期校验窗口与节点
+    /// 归属（[`EngineError::UnknownWindow`] / [`EngineError::StaleNode`]），与
+    /// [`App::bind_key_scoped`] 同口径。
+    ///
+    /// 其余语义与 [`App::after`] 完全相同。
+    ///
+    /// # Errors
+    /// 同 [`App::after`]。
+    pub fn after_scoped(
+        &mut self,
+        window: WindowId,
+        scope: NodeId,
+        delay: Duration,
+        callback: impl FnOnce(&mut App) + 'static,
+    ) -> Result<TimerId, EngineError> {
+        timer::after(self, window, Some(scope), delay, callback)
+    }
+
+    /// 取消一个一次性定时器（幂等）。返回 `false` = 已到期派发 / 已取消 / 窗口已关闭。
+    pub fn cancel_timer(&mut self, id: &TimerId) -> bool {
+        timer::cancel(self, id)
+    }
+
+    /// 最近一个一次性定时器的到期时刻（平台泵的阻塞等待截止时刻；E10）。
+    ///
+    /// 消费者：三端事件循环（Windows 一次性 `SetTimer` / macOS 一次性 `CFRunLoopTimer` /
+    /// Linux calloop timeout）。`None` = 没有待派发定时器 —— 平台保持原有空闲阻塞（I3）。
+    /// Linux 的实现同时并入「被帧预算门禁推迟的帧」的到期时刻（`Window::frame_budget_deadline`）。
+    pub(crate) fn next_wake_deadline(&self) -> Option<Instant> {
+        #[cfg(target_os = "linux")]
+        {
+            let frames = self
+                .windows()
+                .filter_map(|(_, window)| window.frame_budget_deadline())
+                .min();
+            match (timer::next_deadline(self), frames) {
+                (Some(timer), Some(frame)) => Some(timer.min(frame)),
+                (Some(timer), None) => Some(timer),
+                (None, Some(frame)) => Some(frame),
+                (None, None) => None,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            timer::next_deadline(self)
+        }
+    }
+
+    /// 仅测试：待派发定时器条数（泄漏 / 清理的证据面）。
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn timer_count_for_test(&self) -> usize {
+        timer::count(self)
+    }
+
+    /// 仅测试：取走平台泵的「有一帧要画」唤醒位（E10 完成唤醒 / 定时器唤醒的证据面）。
+    ///
+    /// 取走即清零，测试应在需要模拟「泵消费一次唤醒」的位置调用。
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn take_pump_wake_for_test(&self) -> bool {
+        self.dispatcher.take_frame_wake()
+    }
+
+    /// 仅测试：待派发的动画终止事件条数。
+    #[cfg(all(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn pending_animation_completions_for_test(&self) -> usize {
+        self.animation_completions.len()
+    }
+
     /// 取消动画（幂等）。
     pub fn cancel_animation(&mut self, id: &AnimationId) -> bool {
         animation::cancel_animation(self, id)
@@ -1643,7 +2366,8 @@ impl App {
     }
 
     /// 全部窗口是否还有未完成的动画（`needs_continuous_frames` 的组成部分：连续帧由平台泵的
-    /// 合成器节拍线程 `FramePacer` 提供，`SetTimer` 只剩 a11y 补发兜底）。
+    /// 合成器节拍线程 `FramePacer` 提供；`SetTimer` 只保留 a11y 补发与 E10 一次性截止时刻，
+    /// 空闲无动画且无待派发定时器时不挂表）。
     pub(crate) fn has_animations(&self) -> bool {
         animation::has_animations(self)
     }
@@ -1657,19 +2381,11 @@ impl App {
     /// 是否有窗口的帧请求正被预算门禁推迟（A5）：平台据此挂一次性唤醒。
     ///
     /// 消费者：Windows 泵 / macOS 泵（按刷新率挂一次性定时器）；Linux 的补帧走
-    /// `next_deferred_deadline` + calloop timeout，不需要这个布尔查询。
+    /// `next_wake_deadline` + calloop timeout，不需要这个布尔查询。
     #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn has_deferred_frames(&self) -> bool {
         self.windows()
             .any(|(_, window)| window.frame_budget_deferred())
-    }
-
-    /// 所有被推迟帧里最早的放行时刻（A5）：Linux calloop timeout 的到期时刻。
-    #[cfg(target_os = "linux")]
-    pub(crate) fn next_deferred_deadline(&self) -> Option<Instant> {
-        self.windows()
-            .filter_map(|(_, window)| window.frame_budget_deadline())
-            .min()
     }
 
     fn mark_nodes_paint(&mut self, window: WindowId, nodes: &[NodeId]) {
@@ -1684,6 +2400,26 @@ impl App {
     /// 把引擎时钟推进到真实时间（平台泵每轮一次；测试用 `TestApp::advance`）。
     pub(crate) fn sync_clock(&mut self) {
         animation::sync_clock(self)
+    }
+
+    /// 平台泵的轮首时钟同步：推进到真实时间并**标记为活时钟**（E10c）。
+    ///
+    /// 与 [`App::sync_clock`] 的区别是置 `clock_live`：一次性定时器的登记基准据此选择
+    /// 「登记瞬间真实时间」（生产）还是「引擎时钟」（测试宿主）。生产在 `App::new` 就已是
+    /// 活时钟（E10c-R01：首次泵启动前登记也必须只晚不早）；平台泵（Windows/macOS/Linux）
+    /// 每轮调用本方法以刷新时钟；`App::dispatch` 里的时钟同步**不**置位（测试也会派发输入）。
+    pub(crate) fn sync_clock_live(&mut self) {
+        animation::sync_clock_live(self)
+    }
+
+    /// 测试宿主专用：把定时器登记基准切回**引擎时钟**（`TestApp::advance` 是唯一推进源，
+    /// deadline 必须能精确断言）。
+    ///
+    /// 生产默认是活时钟（`App::new` 即置位，E10c-R01），因此测试宿主必须显式关闭；该方法只在
+    /// 测试基建（`test-support`，不进发布物）里存在。
+    #[cfg(feature = "test-support")]
+    pub(crate) fn use_engine_clock(&mut self) {
+        self.clock_live = false;
     }
 
     /// 推进测试时钟（`TestApp::advance` 的唯一实现；只在测试构建里存在）。
@@ -1799,15 +2535,28 @@ impl App {
         window_set::close_window(self, id)
     }
 
-    /// 请求一次 Linux 客户端装饰的窗口控制（自绘标题栏专用）。
+    /// 请求一次窗口控制（自绘标题栏的系统按钮 / 拖动 / 缩放；E6 起三端统一入口）。
     ///
-    /// 请求由 Wayland 事件循环在**同一轮**内执行；`BeginMove` / `BeginResize` 使用最近一次
-    /// 指针按键的 serial，因此只应从输入事件的动作处理器里调用（拖动/点击的 handler）。
-    /// 其它平台有原生标题栏，不提供本入口。
+    /// 请求是**异步**的：只登记目标，平台泵在同一轮 / 下一轮执行（Linux Wayland 事件循环、
+    /// Windows 泵、macOS 泵）。最终状态一律以 [`Window::state`] 为准 —— 不得假设请求一定生效
+    /// （compositor / 系统可以拒绝或改变请求，I10）。
+    ///
+    /// 平台能力差异（完整表见 [`crate::window::WindowControl`]）：
+    /// - **Windows**：`Minimize` / `ToggleMaximize` 原生（`ShowWindow`）；`ToggleFullscreen` /
+    ///   `BeginMove` / `BeginResize` 无等价请求 ⇒ `UnsupportedWindowCapability`（拖动 / 缩放由
+    ///   [`Self::set_drag_regions`] + 系统命中码承担）。
+    /// - **macOS**：`Minimize` / `ToggleMaximize` / `ToggleFullscreen` 原生
+    ///   （`performMiniaturize:` / `performZoom:` / `toggleFullScreen:`）；`BeginMove` /
+    ///   `BeginResize` 没有可用的 `NSEvent` ⇒ `UnsupportedWindowCapability`。
+    /// - **Linux/Wayland**：全部由 `xdg_toplevel` 请求承担；`BeginMove` / `BeginResize` 使用最近
+    ///   一次指针按键的 serial，因此只应从输入事件的动作处理器里调用。
+    ///
+    /// **关闭不在本入口**：应用自己决策（[`Self::close_window`] / [`Self::on_close`]，§8.6.3），
+    /// 引擎不为「关闭」提供平台请求。
     ///
     /// # Errors
-    /// `EngineError::UnknownWindow`：窗口不存在（已经关闭）。
-    #[cfg(target_os = "linux")]
+    /// - [`EngineError::UnknownWindow`]：窗口不存在（已经关闭）。
+    /// - [`EngineError::UnsupportedWindowCapability`]：该端没有这个控制（见上表）。
     pub fn request_window_control(
         &mut self,
         window: WindowId,
@@ -1816,12 +2565,61 @@ impl App {
         window_set::request_window_control(self, window, control)
     }
 
-    /// 取走待执行的窗口控制请求（Wayland 事件循环的唯一读点）。
-    #[cfg(target_os = "linux")]
+    /// 取走待执行的窗口控制请求（三端泵的唯一读点）。
     pub(crate) fn take_window_control(
         &mut self,
     ) -> Option<(WindowId, crate::window::WindowControl)> {
         window_set::take_window_control(self)
+    }
+
+    // ── E6（P1-E6）：窗口 chrome 的运行时 API（独立区块，便于与并行批次合并） ──
+
+    /// 运行时改窗口标题（三端生效：Windows `SetWindowTextW` / macOS `setTitle:` /
+    /// Linux `xdg_toplevel.set_title`）。
+    ///
+    /// 只写窗口参数并唤醒平台泵：**下一轮泵**对账到原生窗口（同值 no-op，不重复系统调用）。
+    /// 平台原生调用失败由平台层记诊断（窗口仍可用，标题保持旧值；不 panic），未知窗口是强类型
+    /// 错误。
+    ///
+    /// # Errors
+    /// [`EngineError::UnknownWindow`]：窗口不存在（已经关闭）。
+    pub fn set_title(
+        &mut self,
+        window: WindowId,
+        title: smol_str::SmolStr,
+    ) -> Result<(), EngineError> {
+        window_set::set_title(self, window, title)
+    }
+
+    /// macOS：设置三个原生交通灯的位置（其它平台返回 [`EngineError::UnsupportedWindowCapability`]，
+    /// 不静默降级）。
+    ///
+    /// `inset` 是**逻辑点**（客户区左上原点、y 向下）：交通灯分组的左上角落在该点，按钮之间
+    /// 保持系统间距。与 [`Self::traffic_light_inset`] 是同一几何的写 / 读两端：应用据此把可点击
+    /// 控件放到交通灯之外（§8.6.5 —— 应用**不能**把可点击控件放到交通灯下面，会与系统按钮抢命中）。
+    ///
+    /// **set-once（§8.6.5 文档化限制）**：位置只在建窗时决定一次；首次调用生效后，运行期再次
+    /// 调用不会改变已应用的位置（AppKit 在 resize / 全屏转场后的重排不追回）。本 API **没有**
+    /// 「恢复系统默认位置」的入口 —— 引擎不保存 AppKit 系统按钮布局的副本。
+    ///
+    /// # Errors
+    /// - [`EngineError::UnknownWindow`]：窗口不存在。
+    /// - [`EngineError::UnsupportedWindowCapability`]：非 macOS。
+    pub fn set_traffic_light_position(
+        &mut self,
+        window: WindowId,
+        inset: crate::math::Point,
+    ) -> Result<(), EngineError> {
+        window_set::set_traffic_light_position(self, window, inset)
+    }
+
+    /// macOS：交通灯占用的**安全区**（逻辑点，客户区左上原点、y 向下；应用按返回值留白）。
+    ///
+    /// `None` = 非 macOS，或原生全屏下系统隐藏了交通灯（§8.6.5），或窗口不存在。这是只读查询，
+    /// 与 setter 同层；应用不需要自己猜按钮位置，也不应把可点击控件放进该区域。
+    #[must_use]
+    pub fn traffic_light_inset(&self, window: WindowId) -> Option<crate::math::Point> {
+        window_set::traffic_light_inset(self, window)
     }
 
     /// 遍历全部窗口（顺序不保证）并带出 `WindowId`。
@@ -1903,6 +2701,25 @@ impl App {
     /// 删除 a11y 动作的处理器（返回是否真的删了）。
     pub fn off_a11y_action(&mut self, action: crate::a11y::A11yAction) -> bool {
         a11y::off_a11y_action(self, action)
+    }
+
+    /// 写一个节点的**动态** a11y 补丁并登记交付（应用通道；E15b F3/F5 收敛）。
+    ///
+    /// 详细语义见 `app::a11y::set_a11y_patch`（与 `bind_a11y` 共用差分、`affects_descendants`
+    /// 子树标记、请求帧、覆盖关系）。**公开面保留**：E15 已把本通道登记为 base_ui
+    /// `List::set_row_a11y` 静态快照的动态失效面（spec-delta E15 §4/D4，消费者在 base_ui 后续
+    /// 批），不是"未来可能需要"的预留 API；`A11yPatch::affects_descendants` 则收敛为
+    /// `pub(crate)`（只有引擎内部消费者）。
+    ///
+    /// # Errors
+    /// `EngineError::UnknownWindow`（窗口已关闭）/ `EngineError::StaleNode`（节点已卸载）。
+    pub fn set_a11y_patch(
+        &mut self,
+        window: WindowId,
+        node: NodeId,
+        patch: crate::a11y::A11yPatch,
+    ) -> Result<(), EngineError> {
+        a11y::set_a11y_patch(self, window, node, patch)
     }
 
     /// a11y 诊断（与 `text_diagnostics` 同型；上限 `A11Y_DIAGNOSTIC_CAPACITY`，超出丢最旧）。
@@ -2094,7 +2911,232 @@ impl App {
         &mut self,
         window: WindowId,
     ) -> Option<Result<TextLayoutReport, EngineError>> {
-        text_pass::layout_text(self, window)
+        let result = text_pass::layout_text(self, window);
+        self.sync_atlas_generation_lease();
+        result
+    }
+
+    /// 无节点归属的文本 shaping（v2.1 E1，`§11.1`）：canvas 内文本的公开入口。
+    ///
+    /// 按 `style` 与 `max_width` 塑形、断行并光栅/装箱，返回**可长期持有**的句柄。同一文本 +
+    /// 同一 shaping 输入命中形状缓存（与 `refresh_text` 同一份 `ShapeKey`），不重复塑形；
+    /// `max_width = None` = 不限宽（单行），`Some(w)` = 按 `w` 断行（等价
+    /// `break_all_lines(Some(w))`）。
+    ///
+    /// **颜色不在 shaping 输入里**（R12-11）：同一文本换成另一种 `style.color` 仍命中同一份布局
+    /// 快照（不重复塑形），但返回的句柄按**本次** `style.color` 光栅 —— Canvas 内文本没有节点
+    /// 绘制期的 `foreground` 重上色，这是 halo 副本 / 多色标签能真正换色的唯一通道（E24）。
+    ///
+    /// `inline_boxes` 与节点路径同源（`TextContent.inline_boxes`）：落点经
+    /// [`App::shaped_inline_boxes`] 读取；传空切片 = 无行内盒。E1 只保证落点可读，
+    /// `InlineBoxPaint` 的绘制归 E2（`§11.2`）。
+    ///
+    /// 句柄带**图集租约** `(generation, eviction_epoch)`：图集换代**或**任一 tile 被 LRU 淘汰后
+    /// [`ShapedTextHandle::is_stale`] 为真，[`crate::paint::canvas::Canvas::push_shaped_text`]
+    /// 返回 `false` 且不编码旧 UV（D-5）；应用应丢弃句柄并重新调用本方法。
+    ///
+    /// 光栅 scale 取 [`App::text_scale`]（焦点窗口 DPI / 显式覆盖），句柄可用
+    /// [`ShapedTextHandle::scale`] 读回。**应用义务**：窗口 DPI 变化 / 跨屏移动 / 焦点切换后
+    /// 必须重新 shape（引擎不会自动重光栅已有句柄）。
+    ///
+    /// # Errors
+    /// - [`EngineError::TextShapeStandalone`]：`max_width` 非有限 / 为负，或字体栈为空；
+    /// - [`EngineError::AtlasExhausted`]：字形图集在扩容 + LRU 淘汰后仍放不下本次工作集。
+    ///
+    /// # Panics: none
+    pub fn shape_text(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+        inline_boxes: &[InlineBoxSpec],
+    ) -> Result<ShapedTextHandle, EngineError> {
+        let App {
+            text: text_context,
+            raster,
+            atlas,
+            glyph_atlas,
+            pending_dirty,
+            atlas_generation_lease,
+            default_text_scale,
+            windows,
+            ..
+        } = self;
+        let scale = *default_text_scale;
+        let result = crate::text::standalone::shape(
+            text_context,
+            raster,
+            atlas,
+            glyph_atlas,
+            pending_dirty,
+            atlas_generation_lease,
+            text,
+            style,
+            max_width,
+            inline_boxes,
+            scale,
+        );
+        // 本次 shape 可能触发扩容 / 满页清空 / 逐 tile 淘汰：进程级图集的状态变化会让**所有
+        // 窗口**已发布的 `ShapedLine` 与 Canvas 图元烘焙旧 UV（D-5）。收尾必须**无条件**执行
+        // —— 失败路径（`AtlasExhausted` 等）同样可能已经淘汰了节点文本的 tile、前进了租约，
+        // 用 `?` 早退会让节点文本继续画被复用的旧 UV、并让旧句柄短暂「假活」。
+        let evicted = glyph_atlas.take_evicted();
+        if evicted > 0 {
+            for window in windows.values_mut() {
+                window.tree_mut().invalidate_text_lines();
+                window.tree_mut().mark_canvas_nodes_paint();
+            }
+        }
+        // 租约同步同样无条件执行：失败路径上发生的换代 / 淘汰必须立即对已发出的句柄可见。
+        self.sync_atlas_generation_lease();
+        result
+    }
+
+    /// 仅测试：本进程真正跑 parley 塑形的次数（E24 的「换色命中缓存」断言面）。
+    #[cfg(test)]
+    pub(crate) fn shape_count_for_test(&self) -> u32 {
+        self.text.shape_count()
+    }
+
+    /// 行内盒落点（v2.1 E1，`§11.1`）：顺序与 `shape_text` 传入的 `inline_boxes` 一一对应，
+    /// `id` 原样保留；供应用画 `<img>` / `<kbd>`。
+    ///
+    /// 坐标是**文本盒局部**逻辑像素（与 `handle.line()` 的字形位置同域）：应用画图时加上文本盒
+    /// 在窗口中的绝对原点。空切片 = 无行内盒。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn shaped_inline_boxes<'a>(&self, handle: &'a ShapedTextHandle) -> &'a [ShapedInlineBox] {
+        handle.inline_boxes()
+    }
+
+    /// 让代际租约与图集对齐：任何可能改变图集状态的 App 入口返回后调用（`shaped_text` 句柄的
+    /// `is_stale` 依赖它）。原语是 `(atlas.generation(), glyph_atlas.eviction_epoch())`，这里只是
+    /// 把同一真源打包写进共享槽。
+    fn sync_atlas_generation_lease(&self) {
+        self.atlas_generation_lease.store(
+            crate::text::pack_atlas_lease(
+                self.atlas.generation(),
+                self.glyph_atlas.eviction_epoch(),
+            ),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// canvas 文本的当前**默认光栅 scale**（v2.1 E1b，`§11.1`）。
+    ///
+    /// 语义：默认 1.0；焦点窗口获得焦点 / 其 DPI 变化时跟随该窗口的 `Window::scale()`（DPI
+    /// 变化用 `Event::DpiChanged.scale` 这个权威值，三端事件顺序不同但结果一致）；没有
+    /// 焦点窗口时保留上一次的值；[`App::set_text_scale`] 可显式覆盖（离屏 / 测试 / 固定 DPI）。
+    ///
+    /// [`App::shape_text`] 用它光栅，句柄用 [`ShapedTextHandle::scale`] 记录。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn text_scale(&self) -> f32 {
+        self.default_text_scale
+    }
+
+    /// 显式覆盖 canvas 文本的光栅 scale（`§11.1`，v2.1 E1b）。
+    ///
+    /// 覆盖一旦设置就**不再跟随**焦点窗口 DPI（多窗口不同 DPI 下应用应显式 `shape_text` 时
+    /// 用哪个 scale）；调用 [`App::clear_text_scale_override`] 恢复跟随。已有的
+    /// [`ShapedTextHandle`] 不会自动重新光栅 —— 应用须丢弃并重新 `shape_text`。
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidTextScale`]：`scale` 非有限值或 `<= 0`（光栅 ppem = 字号 × scale，
+    /// 非法值会让 parley/swash 得到 NaN 尺寸；不静默钳制）。
+    ///
+    /// # Panics: none
+    pub fn set_text_scale(&mut self, scale: f32) -> Result<(), EngineError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(EngineError::InvalidTextScale { scale });
+        }
+        self.text_scale_override = Some(scale);
+        self.default_text_scale = scale;
+        Ok(())
+    }
+
+    /// 取消 [`App::set_text_scale`] 的显式覆盖，恢复「跟随焦点窗口 DPI」。
+    ///
+    /// 当前有焦点窗口 ⇒ 立即采用它的 DPI；没有焦点窗口 ⇒ 保留当前值（与「无窗口时保持上次值」
+    /// 同口径）。已有句柄不会自动重新光栅（应用须重新 `shape_text`）。
+    ///
+    /// # Panics: none
+    pub fn clear_text_scale_override(&mut self) {
+        self.text_scale_override = None;
+        self.follow_focused_window_scale();
+    }
+
+    /// 事件：窗口焦点变化（`Event::FocusChanged` 的唯一处理点，v2.1 E1b）。
+    ///
+    /// 获得焦点 ⇒ 记录焦点窗口并跟随其 DPI 作为 canvas 文本默认 scale；失去焦点 ⇒ 只清焦点
+    /// 窗口记录、**保留**当前 scale（「无窗口时保持上次值」）。
+    pub(crate) fn note_window_focus(&mut self, window: WindowId, focused: bool) {
+        if focused {
+            self.focused_window = Some(window);
+            self.follow_focused_window_scale();
+        } else if self.focused_window == Some(window) {
+            self.focused_window = None;
+        }
+    }
+
+    /// 事件：窗口 DPI 变化。只有焦点窗口的 DPI 变化才更新 canvas 文本默认 scale；显式覆盖期间
+    /// 不跟随。
+    ///
+    /// 用**事件自带的** `scale`（`Event::DpiChanged.scale` 是本次变化的权威值），不读
+    /// `Window::scale`：Wayland 的事件循环在派发事件**之后**才镜像 `Window::set_scale`
+    /// （`platform/linux/event_loop.rs` 的「① 事件 → ② 平台真值镜像」顺序），读窗口会落后一次
+    /// DPI。Windows / macOS 先写 `Window::scale` 再派发，两种顺序下结果一致。
+    pub(crate) fn note_window_dpi(&mut self, window: WindowId, scale: Scale) {
+        if self.focused_window == Some(window) {
+            self.apply_text_scale(scale.factor());
+        }
+    }
+
+    /// 让 `default_text_scale` 采用 `scale`（显式覆盖期间是 no-op）。
+    fn apply_text_scale(&mut self, scale: f32) {
+        if self.text_scale_override.is_some() {
+            return;
+        }
+        self.default_text_scale = scale;
+    }
+
+    /// 让 `default_text_scale` 跟随焦点窗口的当前 DPI（显式覆盖期间是 no-op）。
+    fn follow_focused_window_scale(&mut self) {
+        let Some(window) = self.focused_window else {
+            return;
+        };
+        let scale = self
+            .windows
+            .get(&window)
+            .map(|target| target.scale().factor());
+        if let Some(scale) = scale {
+            self.apply_text_scale(scale);
+        }
+    }
+
+    /// 仅测试（E1b F1/F3 回归）：把字形图集页档钉到 `page` 并同步清空字形缓存。
+    ///
+    /// `cap_page_for_test` 本身会换代（`clear` ⇒ `generation + 1`），这里同步把两级缓存的记录
+    /// 清掉、租约前进 —— 之后的小页分配即可在几十个 tile 内触发逐 tile LRU 淘汰。
+    #[cfg(test)]
+    pub(crate) fn cap_glyph_atlas_page_for_test(&mut self, page: u32) {
+        self.atlas.cap_page_for_test(page);
+        self.glyph_atlas.clear();
+        self.sync_atlas_generation_lease();
+    }
+
+    /// 仅测试：当前字形图集代际。
+    #[cfg(test)]
+    pub(crate) fn glyph_atlas_generation_for_test(&self) -> u32 {
+        self.atlas.generation()
+    }
+
+    /// 仅测试：当前累计淘汰纪元。
+    #[cfg(test)]
+    pub(crate) fn glyph_atlas_eviction_epoch_for_test(&self) -> u32 {
+        self.glyph_atlas.eviction_epoch()
     }
 
     /// 当前字体栈。
@@ -2123,12 +3165,16 @@ impl App {
     /// 换字体栈：版本 +1、字体代际 +1、清形状缓存与字形图集、所有窗口的文本节点
     /// `LAYOUT | PAINT`。返回新版本号。
     pub fn set_font_stack(&mut self, stack: FontStack) -> u32 {
-        text_pass::set_font_stack(self, stack)
+        let version = text_pass::set_font_stack(self, stack);
+        self.sync_atlas_generation_lease();
+        version
     }
 
     /// 系统字体安装/卸载/语言切换后调用：重载 + 与 [`App::set_font_stack`] 相同的失效。
     pub fn reload_system_fonts(&mut self) -> u32 {
-        text_pass::reload_system_fonts(self)
+        let version = text_pass::reload_system_fonts(self);
+        self.sync_atlas_generation_lease();
+        version
     }
 
     /// 数字快速路径开关（`DigitFastPath`，R12 的性能项）。
@@ -2159,7 +3205,8 @@ impl App {
     ///
     /// 对照 Skia：glyph atlas / strike cache 换代时会让所有引用旧 strike 的绘制数据失效。
     fn repaint_text_if_atlas_changed(&mut self) {
-        text_pass::repaint_text_if_atlas_changed(self)
+        text_pass::repaint_text_if_atlas_changed(self);
+        self.sync_atlas_generation_lease();
     }
 
     fn invalidate_all_text(&mut self) {
@@ -2175,6 +3222,56 @@ impl App {
     #[cfg(test)]
     pub(crate) fn eval_stack_is_empty_for_test(&self) -> bool {
         signal_api::eval_stack_is_empty_for_test(self)
+    }
+
+    // ── automation：生产可见的注入 / 观测面（P6-1 / E25）──────────────────────
+    //
+    // 这一组方法属于 `automation` feature：给真实窗口的脚本化自检（kytrix
+    // `--acceptance`）一个注入输入、读取绘制结果的面。它不是测试基建（`test-support`
+    // 不进发布物），也不改变任何引擎语义：注入走与平台泵相同的 `dispatch_input`，
+    // 读取只读已有状态。
+
+    /// 注入一次输入事件（与平台泵同一条 [`App::dispatch_input`] 路径，回执即返回值）。
+    ///
+    /// 注入**可能**请求帧（指针改变 hover / 焦点、按键触发动作时），这是输入路径本身的
+    /// 语义；不需要重绘的注入（例如指针在空白处移动）不产生帧。
+    ///
+    /// I3 只约束读取面：[`Self::frame_index`] / [`Self::painted_primitives`] /
+    /// [`Self::texts`] 都不请求帧。
+    #[cfg(feature = "automation")]
+    pub fn inject_input(
+        &mut self,
+        window: WindowId,
+        event: crate::event::InputEvent,
+    ) -> crate::event::InputOutcome {
+        automation::inject_input(self, window, event)
+    }
+
+    /// 窗口最近一次**提交**的帧序号（`None` = 窗口不存在；`FrameIndex::default()` = 从未提交）。
+    #[cfg(feature = "automation")]
+    #[must_use]
+    pub fn frame_index(&self, window: WindowId) -> Option<crate::window::FrameIndex> {
+        automation::frame_index(self, window)
+    }
+
+    /// 窗口当前场景里的图元数（**最近一帧绘制了什么**的只读观测面；`0` = 窗口不存在或空场景）。
+    ///
+    /// 空场景 / 首帧之前是 `0`；它不随帧变化重置（场景跨帧保留），因此一个「重绘后仍有内容」
+    /// 的断言应该配 [`Self::frame_index`] 的推进一起用。
+    #[cfg(feature = "automation")]
+    #[must_use]
+    pub fn painted_primitives(&self, window: WindowId) -> usize {
+        automation::painted_primitives(self, window)
+    }
+
+    /// 窗口节点树里全部文本节点的文本（树序）。
+    ///
+    /// 它是「这一帧会画出的文字」的只读快照：验收自检用它断言语言切换后文案真的换了
+    /// （`bind_text` 的重算结果是节点载荷），不依赖像素读回。
+    #[cfg(feature = "automation")]
+    #[must_use]
+    pub fn texts(&self, window: WindowId) -> Vec<smol_str::SmolStr> {
+        automation::texts(self, window)
     }
 }
 
@@ -2195,3 +3292,40 @@ mod resources_tests;
 /// R01-16：按节点 / 按窗口请求重绘的失效范围（子树 + 祖先链校验、不放大到整窗）。
 #[cfg(test)]
 mod invalidate_tests;
+
+/// E7：`NodeKind::Image` 的布局 / 绘制 / 资源生命周期 / DPI / a11y 集成用例。
+///
+/// 断言面依赖 `test_support`（`FrameRecord::primitives` 的图片 bounds / 调制 / UV 与 a11y
+/// 快照），因此只在 `--features test-support` 的 lib 测试里编译。
+#[cfg(all(test, feature = "test-support"))]
+mod image_tests;
+/// E8：焦点作用域化键绑定（`App::bind_key_scoped`）与作用域瞬态值
+/// （`App::transient_scoped`）的引擎级用例。
+#[cfg(test)]
+mod scoped_tests;
+
+/// E10：动画完成回调 + 一次性定时器的引擎级用例。
+///
+/// 断言面走 `test_support`（`TestApp` 的帧记录 / 探针），并且用「钩子 → 帧」的真实泵序推进
+/// （`App::run_frame_hook` 在 `TestApp::advance` 之后手动调用）—— 这正是 P2-4b 审查 R01/R02
+/// 缺失的时序面。
+#[cfg(all(test, feature = "test-support"))]
+mod e10_tests;
+
+/// E17：公开指针位置（`Window::pointer_position` / `App::pointer_position`）的引擎级用例。
+///
+/// 断言面走 `test_support`（`TestApp` 的指针注入 + 帧记录），与平台泵同一条
+/// `App::dispatch_input` 路径。
+#[cfg(all(test, feature = "test-support"))]
+mod e17_tests;
+
+/// E16：节点子树卸载的自动清理（R-21 引擎下沉）—— 清理计数 / 语义边界 / 1000 轮 churn /
+/// 关窗路径不变 / I3。断言面用到 `test-support` 的观测入口（`timer_count_for_test` /
+/// `has_action_handler` / `scoped_key_binding_count`），因此只在特性开启时编译。
+#[cfg(all(test, feature = "test-support"))]
+mod removal_tests;
+
+/// E25 / P6-1：`automation` feature 的注入与观测面（注入走同一个 `dispatch_input`，
+/// 读取不请求帧）。断言面只用公开 API + 本 feature 的读点，不依赖 `test-support`。
+#[cfg(all(test, feature = "automation"))]
+mod automation_tests;

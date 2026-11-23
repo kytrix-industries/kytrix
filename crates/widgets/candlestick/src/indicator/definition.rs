@@ -6,8 +6,8 @@
 //! completed with. Everything here is `const` data — no `OnceLock`, no runtime
 //! lookup table — so a lookup is an array scan over six entries.
 
-use gpui_kit::{Hsla, rgba};
 use serde::{Deserialize, Serialize};
+use ui_core::paint::color::Color;
 
 use super::config::{
     IndicatorLineConfig, IndicatorSettings, LineColor, LineListConfig, PERIOD_MAX, PERIOD_MIN,
@@ -173,7 +173,7 @@ fn lines_from(periods: &[u32]) -> IndicatorSettings {
     })
 }
 
-/// The fixed colours of the default lines, as big-endian RGBA.
+/// The fixed colours of the default lines, as sRGB bytes.
 ///
 /// These are the colours a configuration starts with — the shipped chart's amber,
 /// violet and cyan. A line the user adds takes a snapshot of the current
@@ -182,15 +182,20 @@ fn lines_from(periods: &[u32]) -> IndicatorSettings {
 /// the theme afterwards.
 ///
 /// They are compile-time constants rather than theme roles because `Default` has
-/// no `App` to read a theme from, and `CandlestickConfig::default()` is called
-/// exactly where there is no `cx` (`VersionedWidgetConfig::decode`, tests).
-const DEFAULT_LINE_COLOR_RGBA: [u32; 3] = [0xE8A83CFF, 0x8A6CE8FF, 0x3CB8C8FF];
+/// no application to read a theme from, and `CandlestickConfig::default()` is
+/// called exactly where there is no context (`VersionedWidgetConfig::decode`,
+/// tests).
+const DEFAULT_LINE_COLORS: [[u8; 4]; 3] = [
+    [0xE8, 0xA8, 0x3C, 0xFF],
+    [0x8A, 0x6C, 0xE8, 0xFF],
+    [0x3C, 0xB8, 0xC8, 0xFF],
+];
 
 /// The default colour of the line at `index`, cycling through the three fixed
 /// colours.
 pub(crate) fn default_line_color(index: usize) -> LineColor {
-    let color = rgba(DEFAULT_LINE_COLOR_RGBA[index % DEFAULT_LINE_COLOR_RGBA.len()]);
-    LineColor::from(Hsla::from(color))
+    let color = Color::from_rgba8(DEFAULT_LINE_COLORS[index % DEFAULT_LINE_COLORS.len()]);
+    LineColor::from(color)
 }
 
 fn ma_default_settings() -> IndicatorSettings {

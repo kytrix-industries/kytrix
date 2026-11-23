@@ -38,7 +38,7 @@ use market_participants_connector::{
     runtime::MarketParticipantNetworkSnapshot,
     test_support::{
         DirectoryAnswer, NASDAQ_LISTED_SAMPLE, OTHER_LISTED_SAMPLE, SymbolDirectoryFixture,
-        fixture_config,
+        fixture_config, test_handle,
     },
 };
 use market_participants_model::{
@@ -54,7 +54,6 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use widget_tokio_runtime::runtime::Runtime;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -279,7 +278,7 @@ fn connector_with(venues: &[&str], origin: &str) -> (MarketParticipantsConnector
     let catalog = Arc::new(Catalog::new());
     let connector = MarketParticipantsConnector::new_with_catalog(
         MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), notification)
-            .with_runtime(Runtime::for_test()),
+            .with_runtime(test_handle()),
         Arc::clone(&catalog),
     )
     .expect("the market participants root builds from the fixture configuration");

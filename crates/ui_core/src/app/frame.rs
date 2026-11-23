@@ -58,6 +58,13 @@ pub(crate) fn frame(
     window: WindowId,
     forced: bool,
 ) -> Option<Result<FrameOutcome, EngineError>> {
+    // E10：帧外产生的动画终止事件与已到期的一次性定时器在帧入口兜底派发。
+    //
+    // 平台泵的正常路径已经在钩子步骤（`App::run_frame_hook`）派发过；这里覆盖 headless /
+    // 自驱帧宿主（没有泵钩子）以及「事件在钩子之后、帧之前入队」的窗口。两者都是 O(1)
+    // 空表早退，空闲帧（I3）不受影响。
+    super::timer::run_due(app);
+    super::animation::dispatch_completions(app);
     if !app.windows.contains_key(&window) {
         return None;
     }
@@ -183,6 +190,9 @@ pub(crate) fn frame(
     // 共享的，页内 tile 已全部重排，而各窗口文本 lane 里存的是旧 `AtlasTile` —— 必须让
     // **所有窗口**的文本节点重绘。放在 `layout_text` 之前：本帧就会用新 UV 重建 lane。
     app.repaint_text_if_atlas_changed();
+    // E7：图片节点的内在尺寸在布局之前解析（首帧挂载 / DPI 换档 / 资源句柄替换）。
+    // 无变化时 O(1) 早退（不扫描树，I3 的空闲路径不受影响）。
+    app.refresh_images(window);
     let layout = match app.windows.get_mut(&window).map(Window::layout_if_dirty) {
         Some(Ok(report)) => report,
         Some(Err(error)) => {
@@ -217,17 +227,21 @@ pub(crate) fn frame(
     }
     // 图集页上传（P13：逐窗口分发，两张页分开、顺序固定以便帧记录复现）。
     app.upload_atlas_pages();
-    // D-5：图集代际在本帧 paint 之前取一次（`paint_frame` 的绘制前硬校验用）。
-    let atlas_generation = app.atlas.generation();
-    // 借用拆分：`windows` 与 `geometry` 是不同字段，可同时借出（几何表只读）。
+    // D-5 / E1d：图集句柄在本帧 paint 之前取一次（`paint_frame` 的绘制前硬校验与编码期
+    // 逐 tile 存活校验都用它）。
+    // 借用拆分：`windows` / `geometry` / `atlas` 是不同字段，可同时借出（几何表与图集只读）。
     // 先取结果、结束后再处理错误 —— 解构 `self` 期间不能再调 `self.abort_frame`。
     let painted = {
         let App {
-            windows, geometry, ..
+            windows,
+            geometry,
+            atlas,
+            resources,
+            ..
         } = app;
         windows
             .get_mut(&window)
-            .map(|target| target.paint_frame(geometry, Some(atlas_generation)))
+            .map(|target| target.paint_frame(geometry, Some(&*atlas), Some(&*resources)))
     };
     let mut paint = match painted {
         Some(Ok(report)) => report,
@@ -291,6 +305,24 @@ pub(crate) fn frame(
     };
     // D-5：绘制前硬校验跳过的旧代际文本行先取出来（commit_frame 会消费 paint）。
     let stale_text = core::mem::take(&mut paint.stale_text);
+    // E1b F2：Canvas 内被编码期安全网丢弃的失效 run 数（Canvas 归应用所有，引擎只能止损 +
+    // 诊断，不能重建 —— 压一条 `TextDiagnostic` 让「少字」不静默）。
+    let stale_canvas_runs = paint.stale_canvas_runs;
+    // v2.1 E2（`§11.2`）：行内盒图片资源未加载 / 已卸载 ⇒ 本帧跳过图元。引擎不画占位图，
+    // 但必须让「跳过」可观测（D17）：逐 id 压一条文本诊断。
+    //
+    // E2b（审查 F12）：**不必在这里做帧级去重** —— `TextContext::push_diagnostics` 按诊断值
+    // 去重（D-4：同一条只保留一份、重复时移到最新），因此同一 id 每帧重压不会让 64 条环增长，
+    // 也不会挤掉其它诊断。paint 侧同帧内也已按 id 去重（`skipped_inline_images`）。
+    if !paint.skipped_inline_images.is_empty() {
+        app.text.push_diagnostics(
+            paint
+                .skipped_inline_images
+                .iter()
+                .map(|id| crate::text::TextDiagnostic::InlineBoxImageMissing { id: *id })
+                .collect(),
+        );
+    }
     let outcome = target.commit_frame(ticket, paint);
     // HUD 是纯观察者：提交成功后只清掉已经落进 paint 的待写文本（没有帧就保持上一次文本）。
     #[cfg(feature = "hud")]
@@ -311,6 +343,27 @@ pub(crate) fn frame(
             }
         }
         app.request_frame();
+    }
+    // E1b F2 + E1d：canvas 文本的编码期安全网丢掉了失效 run（整页换代 **或** 逐 tile LRU 淘汰
+    // 导致 tile 已被复用；少字优于花字）。Canvas 归应用所有，引擎不能替它重建 —— 用文本诊断把
+    // 「少字」变成可观测事实（D17），应用据此重新 `shape_text` 并重建 Canvas。诊断环有界 +
+    // 同值去重，不会随帧数增长。
+    // E1c F13：应用的重建义务只有在**下一帧**的 `on_frame` 钩子里才可执行；静态窗口在下一次
+    // 平台唤醒前不会再出帧 ⇒ 不补帧的话 canvas 文本会无限期缺失（与节点文本的 D-5 补齐路径
+    // 对称）。每个图集代际至多补一帧：应用忽略义务时同一代际的后续帧不再请求（I3 不空转）。
+    if stale_canvas_runs > 0 {
+        app.text
+            .push_diagnostics(vec![crate::text::TextDiagnostic::CanvasTextStale {
+                runs: stale_canvas_runs,
+            }]);
+        let generation = app.atlas.generation();
+        let follow_up = app
+            .windows
+            .get_mut(&window)
+            .is_some_and(|target| target.note_stale_canvas_followup(generation));
+        if follow_up {
+            app.request_frame();
+        }
     }
     // 图集行/整页没赶上本帧（窗口的共享槽还在消费上一笔）：这一帧会以旧图集呈现，因此
     // 立刻再要一帧（全量 damage），槽空后把内容补发——否则静态窗口会把缺字的画面一直

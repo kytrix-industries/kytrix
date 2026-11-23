@@ -1,23 +1,20 @@
 //! The taker-volume chart: buy and sell volume as paired bars.
 //!
-//! Both series are the same interval's volume split by which side crossed the
-//! spread, so they share one axis and stand side by side rather than over each
-//! other: a stacked bar would say the interval traded their sum, which is exactly
-//! what the two sides are not.
+//! Both series are the same interval's volume split by which side crossed the spread, so
+//! they share one axis and stand side by side rather than over each other: a stacked bar
+//! would say the interval traded their sum, which is exactly what the two sides are not.
 
 use std::sync::Arc;
 
-use gpui_kit::{App, Bounds, Pixels, Point, SharedString};
-use i18n::t;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_model::listing::rules::ListingPrecision;
 use smol_str::SmolStr;
 use time::UtcOffset;
-use widget::time_zone::data_time_zone;
 
 use super::{
-    ChartData,
     axes::{AxisScale, ChartLayout, bar_domain},
-    paint::{FrameKey, Hover, Prepared, Tooltip, TooltipEntry, prepare_taker_volume, time_labels},
+    canvas::ChartData,
+    paint::{Prepared, Tooltip, TooltipEntry, prepare_taker_volume, time_labels},
     palette::{Series, SeriesLabel},
     text::{
         format_axis_time, format_compact, format_quantity, format_tooltip_time, label_with_unit,
@@ -26,37 +23,22 @@ use super::{
 };
 use crate::model::{StatisticsPoints, TakerVolumePoint, quantity_as_f64};
 
-/// The names this chart shows, resolved from the active locale.
+/// The names this chart shows, resolved from the active language.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Labels {
-    pub buy: SmolStr,
-    pub sell: SmolStr,
-    pub volume: SmolStr,
+struct Labels {
+    buy: SmolStr,
+    sell: SmolStr,
+    volume: SmolStr,
 }
 
 impl Labels {
-    /// Resolves the series names from the active locale.
-    pub(super) fn resolve(cx: &App) -> Self {
+    /// Resolves the series names from the active language.
+    fn resolve(translate: &Translate) -> Self {
         Self {
-            buy: SmolStr::new(t!(cx, "widget.perpetual_statistics.buy_volume").as_ref()),
-            sell: SmolStr::new(t!(cx, "widget.perpetual_statistics.sell_volume").as_ref()),
-            volume: SmolStr::new(t!(cx, "widget.perpetual_statistics.volume").as_ref()),
+            buy: t_smol!(translate, "widget.perpetual_statistics.buy_volume"),
+            sell: t_smol!(translate, "widget.perpetual_statistics.sell_volume"),
+            volume: t_smol!(translate, "widget.perpetual_statistics.volume"),
         }
-    }
-
-    /// The names as a legend, in the order the series are drawn.
-    fn legend(&self) -> Box<[SeriesLabel]> {
-        vec![
-            SeriesLabel {
-                series: Series::Long,
-                label: self.buy.clone(),
-            },
-            SeriesLabel {
-                series: Series::Short,
-                label: self.sell.clone(),
-            },
-        ]
-        .into_boxed_slice()
     }
 }
 
@@ -67,25 +49,28 @@ pub(crate) struct TakerVolumeChart {
     /// The asset the volume is measured in, which a tooltip names.
     base: SmolStr,
     labels: Labels,
+    locale: LanguageCode,
     revision: u64,
     volume: AxisScale,
     time_labels: Box<[SmolStr]>,
     tooltips: Arc<[Tooltip]>,
+    legend: Box<[SeriesLabel]>,
+    volume_title: SmolStr,
     /// The zone the axis labels and tooltips were written in.
     zone: UtcOffset,
 }
 
 impl TakerVolumeChart {
     /// Builds an empty chart of `instrument`'s taker volume.
-    pub(super) fn new(cx: &App, base: &str) -> Self {
-        let labels = Labels::resolve(cx);
+    pub(crate) fn new(translate: &Translate, base: &str, zone: UtcOffset) -> Self {
         Self::build(
             Arc::from(Vec::new()),
             None,
             0,
             SmolStr::new(base),
-            labels,
-            data_time_zone(cx),
+            Labels::resolve(translate),
+            translate.language(),
+            zone,
         )
     }
 
@@ -95,6 +80,7 @@ impl TakerVolumeChart {
         revision: u64,
         base: SmolStr,
         labels: Labels,
+        locale: LanguageCode,
         zone: UtcOffset,
     ) -> Self {
         let quantity_tick = metadata.map(|metadata| metadata.quantity_tick);
@@ -148,8 +134,21 @@ impl TakerVolumeChart {
         Self {
             points,
             metadata,
+            legend: vec![
+                SeriesLabel {
+                    series: Series::Long,
+                    label: labels.buy.clone(),
+                },
+                SeriesLabel {
+                    series: Series::Short,
+                    label: labels.sell.clone(),
+                },
+            ]
+            .into_boxed_slice(),
+            volume_title: label_with_unit(labels.volume.as_str(), base.as_str()),
             base,
             labels,
+            locale,
             revision,
             volume,
             time_labels,
@@ -177,40 +176,24 @@ impl ChartData for TakerVolumeChart {
         self.revision
     }
 
-    fn frame_key(&self, bounds: Bounds<Pixels>) -> FrameKey {
-        FrameKey::new(bounds, self.revision, self.metadata.is_some(), self.zone)
+    fn scales(&self) -> (Option<&AxisScale>, &AxisScale) {
+        (None, &self.volume)
     }
 
-    fn scales(&self) -> (Option<&AxisScale>, &AxisScale, Option<&AxisScale>) {
-        (None, &self.volume, None)
+    fn legend(&self) -> &[SeriesLabel] {
+        &self.legend
     }
 
-    fn legend(&self, _cx: &App) -> Box<[SeriesLabel]> {
-        self.labels.legend()
-    }
-
-    fn axis_titles(&self, _cx: &App) -> (Option<SharedString>, SharedString) {
-        (
-            None,
-            SharedString::new(label_with_unit(
-                self.labels.volume.as_str(),
-                self.base.as_str(),
-            )),
-        )
-    }
-
-    fn hover_point(
-        &self,
-        index: usize,
-        cursor: Point<Pixels>,
-        _layout: ChartLayout,
-    ) -> Option<Hover> {
-        let index = (index < self.points.len()).then_some(index)?;
-        Some(Hover { index, cursor })
+    fn axis_titles(&self) -> (&str, &str) {
+        ("", self.volume_title.as_str())
     }
 
     fn prepare(&self, layout: ChartLayout) -> Prepared {
         prepare_taker_volume(&self.points, &self.volume, &self.time_labels, layout)
+    }
+
+    fn hover_point(&self, index: usize) -> Option<usize> {
+        (index < self.points.len()).then_some(index)
     }
 
     fn tooltip(&self, index: usize) -> Option<Tooltip> {
@@ -218,18 +201,40 @@ impl ChartData for TakerVolumeChart {
     }
 
     /// Rewrites the labels in another display zone.
-    ///
-    /// Returns whether anything moved: the same zone is the same labels, and the
-    /// chart is left exactly as it was.
     fn set_time_zone(&mut self, zone: UtcOffset) -> bool {
         if self.zone == zone {
             return false;
         }
-        let points = Arc::clone(&self.points);
-        let metadata = self.metadata;
-        let base = self.base.clone();
-        let labels = self.labels.clone();
-        *self = Self::build(points, metadata, self.revision, base, labels, zone);
+        let (points, metadata, base, labels, locale, revision) = (
+            Arc::clone(&self.points),
+            self.metadata,
+            self.base.clone(),
+            self.labels.clone(),
+            self.locale,
+            self.revision,
+        );
+        *self = Self::build(points, metadata, revision, base, labels, locale, zone);
+        true
+    }
+
+    fn set_locale(&mut self, translate: &Translate) -> bool {
+        if self.locale == translate.language() {
+            return false;
+        }
+        let labels = Labels::resolve(translate);
+        if labels == self.labels {
+            self.locale = translate.language();
+            return false;
+        }
+        let (points, metadata, base, locale, revision, zone) = (
+            Arc::clone(&self.points),
+            self.metadata,
+            self.base.clone(),
+            translate.language(),
+            self.revision,
+            self.zone,
+        );
+        *self = Self::build(points, metadata, revision, base, labels, locale, zone);
         true
     }
 
@@ -239,8 +244,6 @@ impl ChartData for TakerVolumeChart {
         metadata: Option<ListingPrecision>,
         points: Arc<Self::Slice>,
     ) -> bool {
-        // A revision that moved is a new window even when its points are the same
-        // values: the pane asked for this one, and it is the one it is now showing.
         if revision < self.revision
             || (revision == self.revision
                 && Arc::ptr_eq(&self.points, &points)
@@ -248,9 +251,13 @@ impl ChartData for TakerVolumeChart {
         {
             return false;
         }
-        let base = self.base.clone();
-        let labels = self.labels.clone();
-        *self = Self::build(points, metadata, revision, base, labels, self.zone);
+        let (base, labels, locale, zone) = (
+            self.base.clone(),
+            self.labels.clone(),
+            self.locale,
+            self.zone,
+        );
+        *self = Self::build(points, metadata, revision, base, labels, locale, zone);
         true
     }
 }

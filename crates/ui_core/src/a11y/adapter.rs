@@ -34,10 +34,13 @@ use crate::{
     a11y::{
         A11yDiagnostic, A11yLabelSource, A11yNode, A11yNodeId, A11yRole, A11yTreeSnapshot,
         identity::A11yIds,
-        mapping::{action_to_accesskit, live_to_accesskit, role_to_accesskit, sort_to_accesskit},
+        mapping::{
+            action_to_accesskit, live_to_accesskit, orientation_to_accesskit, role_to_accesskit,
+            sort_to_accesskit,
+        },
         textrun,
         tree::{
-            TableSemanticsCache, collect_subtree, node_a11y_with_cache, push_ancestors,
+            CollectionSemanticsCache, collect_subtree, node_a11y_with_cache, push_ancestors,
             resolve_focus,
         },
     },
@@ -143,7 +146,7 @@ pub(crate) struct A11yBridge {
     /// 稳定身份分配器（跨帧不变；逻辑行重建后不变）。
     ids: A11yIds,
     /// 表级语义索引（每笔交付重建一次；同一笔内所有 cell 共享 O(1) 查询）。
-    tables: TableSemanticsCache,
+    tables: CollectionSemanticsCache,
     /// 上次交付的焦点（已解析到存在的节点）。
     last_focus: Option<NodeId>,
     /// 已经交付给消费端的引擎节点（用于 `children` 过滤与分批的"父先于子"）。
@@ -189,7 +192,7 @@ impl A11yBridge {
             #[cfg(feature = "test-support")]
             a11y_only_frames: 0,
             ids: A11yIds::new(),
-            tables: TableSemanticsCache::default(),
+            tables: CollectionSemanticsCache::default(),
             last_focus: None,
             delivered: ahash::HashSet::default(),
             queue: Vec::new(),
@@ -864,6 +867,12 @@ pub(crate) fn to_accesskit(record: &crate::a11y::A11yNode) -> accesskit::Node {
         node.set_scroll_y_min(0.0);
         node.set_scroll_x_max(f64::from(scroll.x_max));
         node.set_scroll_y_max(f64::from(scroll.y_max));
+    }
+    // 方向（E15）：显式声明优先（滑条 / 色盘等轴向控件），否则滚动容器按轴向推导。
+    // 两个生产者共存时显式声明胜出 —— 应用的语义声明不该被「顺带带出来的滚动轴」覆盖。
+    if let Some(orientation) = record.orientation {
+        node.set_orientation(orientation_to_accesskit(orientation));
+    } else if let Some(scroll) = record.scroll {
         node.set_orientation(if scroll.vertical {
             accesskit::Orientation::Vertical
         } else {
@@ -1956,5 +1965,312 @@ mod tests {
         assert_eq!(rest.nodes.len(), EXTRA, "积压必须被交付，不能丢");
         assert_eq!(bridge.refresh_backlog(), 0);
         assert!(!bridge.pending(&tree, None), "清空之后不得再有工作");
+    }
+    /// E9：虚拟化表格的**增量**交付 —— 行一直在 `Table` 下，行挂载 / 卸载只重发变更行与
+    /// 它的逻辑祖先（不是全树），拖动窗口不丢行、也不重复发整棵树。
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_virtualized_table_keeps_rows_under_the_table_across_incremental_updates() {
+        use crate::{
+            a11y::A11yRole,
+            interaction::VirtualSlot,
+            test_support::a11y::{ShadowTree, assert_contract_holds},
+        };
+
+        fn mount_row(tree: &mut NodeTree, viewport: NodeId, item: usize) -> (NodeId, NodeId) {
+            let row = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Row),
+                    label: Some(smol_str::format_smolstr!("row {item}")),
+                    ..A11yOverride::default()
+                })
+                .build(tree, viewport)
+                .expect("row");
+            let column = NodeBuilder::boxed().build(tree, row).expect("column");
+            let cell = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(A11yRole::Cell),
+                    label: Some(smol_str::SmolStr::new_static("42")),
+                    ..A11yOverride::default()
+                })
+                .build(tree, column)
+                .expect("cell");
+            (row, cell)
+        }
+
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let table = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::Table),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("table");
+        let list = NodeBuilder::boxed().build(&mut tree, table).expect("list");
+        let viewport = NodeBuilder::boxed()
+            .build(&mut tree, list)
+            .expect("viewport");
+        let (row0, _cell0) = mount_row(&mut tree, viewport, 0);
+        let (row1, _cell1) = mount_row(&mut tree, viewport, 1);
+        let mut slot = VirtualSlot::new(20.0, 0);
+        slot.count = 50;
+        slot.mounted = vec![(0, row0), (1, row1)];
+        tree.ensure_interaction(viewport)
+            .expect("viewport interaction")
+            .virtual_list = Some(slot);
+
+        let mut bridge = A11yBridge::new();
+        let mut shadow = ShadowTree::new();
+        let mut stable: ahash::HashMap<NodeId, crate::a11y::A11yNodeId> = ahash::HashMap::default();
+        // 首笔全树受预算约束 ⇒ 分几笔发完，每一笔都必须合法。
+        let mut batches = 0usize;
+        while let Some(snapshot) = take(&mut bridge, &mut tree, None) {
+            batches += 1;
+            assert!(batches < 16, "首笔全树的分批没有收敛");
+            for record in &snapshot.nodes {
+                stable.insert(record.engine, record.id);
+            }
+            assert_contract_holds(&mut shadow, &to_tree_update(&snapshot));
+        }
+        assert!(stable.contains_key(&table) && stable.contains_key(&row0));
+
+        // 改一行的 label：增量 = 变更行 + 物理祖先链（其中含逻辑父 Table），不是全树。
+        tree.set_a11y_patch(
+            row0,
+            A11yPatch {
+                label: Some(smol_str::SmolStr::new_static("row 0（改）")),
+                ..A11yPatch::default()
+            },
+        );
+        tree.mark_a11y(row0);
+        let patch = take(&mut bridge, &mut tree, None).expect("增量笔");
+        assert!(!patch.full, "单行变化不得退化成全树");
+        assert!(
+            patch.nodes.len() <= 8,
+            "增量只带变更行 + 祖先链（实际 {} 个节点）",
+            patch.nodes.len()
+        );
+        let row_record = patch.node_for(row0).expect("变更行必须在本笔");
+        let table_record = patch
+            .node(row_record.parent.expect("行必须有 a11y 父"))
+            .expect("逻辑父（Table）必须与变更行同批");
+        assert_eq!(table_record.engine, table);
+        assert_eq!(
+            table_record.role,
+            A11yRole::Table,
+            "行的 a11y 父角色必须是 Table（不是 List 行窗口）"
+        );
+        assert_contract_holds(&mut shadow, &to_tree_update(&patch));
+
+        // 行窗口滚一行：挂载新行 ⇒ 表必须重发 children 且新行在表下。
+        let (row2, _cell2) = mount_row(&mut tree, viewport, 2);
+        tree.virtual_slot_mut(viewport)
+            .expect("virtual slot")
+            .mounted
+            .push((2, row2));
+        let patch = take(&mut bridge, &mut tree, None).expect("挂载行笔");
+        assert!(!patch.full);
+        let table_record = patch.node_for(table).expect("表必须重发 children");
+        let row2_record = patch.node_for(row2).expect("新行必须在本笔");
+        assert!(
+            table_record.children.contains(&row2_record.id),
+            "新行的 a11y 父必须是表（表的 children 必须包含它）"
+        );
+        assert_contract_holds(&mut shadow, &to_tree_update(&patch));
+
+        // 行窗口滚出：卸载行 ⇒ 表重发 children 且不含该行，整笔仍满足 AccessKit 契约。
+        let gone = stable.get(&row1).copied();
+        tree.remove(row1).expect("unmount row");
+        tree.virtual_slot_mut(viewport)
+            .expect("virtual slot")
+            .mounted
+            .retain(|(_, row)| *row != row1);
+        let patch = take(&mut bridge, &mut tree, None).expect("卸载行笔");
+        let table_record = patch.node_for(table).expect("表必须重发 children");
+        assert!(
+            !table_record
+                .children
+                .iter()
+                .any(|child| patch.node(*child).is_some_and(|node| node.engine == row1)),
+            "被卸载的行不得再出现在表的 children 里"
+        );
+        assert_contract_holds(&mut shadow, &to_tree_update(&patch));
+        if let Some(gone) = gone {
+            assert!(
+                !shadow
+                    .summaries()
+                    .contains_key(&accesskit::NodeId(gone.get())),
+                "被卸载行的 a11y 节点必须从影子树里消失"
+            );
+        }
+    }
+
+    /// E15：新增角色必须真的落进 `accesskit::Node`（平台 adapter 只按 `accesskit::Role` 映射）。
+    #[test]
+    fn the_new_roles_materialize_into_accesskit_nodes() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let mut ids = crate::a11y::identity::A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let mut tables = crate::a11y::tree::CollectionSemanticsCache::default();
+        for (role, expected) in [
+            (A11yRole::ComboBox, accesskit::Role::ComboBox),
+            (A11yRole::ListBox, accesskit::Role::ListBox),
+            (
+                A11yRole::MenuItemCheckBox,
+                accesskit::Role::MenuItemCheckBox,
+            ),
+            (A11yRole::MenuItemRadio, accesskit::Role::MenuItemRadio),
+            (A11yRole::ColorWell, accesskit::Role::ColorWell),
+        ] {
+            let node = NodeBuilder::boxed()
+                .a11y(A11yOverride {
+                    role: Some(role),
+                    label: Some(SmolStr::new_static("控件")),
+                    ..A11yOverride::default()
+                })
+                .build(&mut tree, root)
+                .expect("node");
+            tree.set_a11y_patch(
+                node,
+                A11yPatch {
+                    checked: Some(true),
+                    ..A11yPatch::default()
+                },
+            );
+            let record = crate::a11y::tree::node_a11y_with_cache(
+                &tree,
+                node,
+                scale(),
+                "",
+                &mut ids,
+                &mut tables,
+                &mut diagnostics,
+            )
+            .expect("record");
+            let ak = to_accesskit(&record);
+            assert_eq!(ak.role(), expected, "{role:?} 的 accesskit 角色");
+            // 可勾选菜单项的勾选态走 `Toggled`（UIA TogglePattern / SelectionItemPattern，
+            // macOS value，AT-SPI checked）—— 不是 `selected`。
+            assert_eq!(
+                ak.toggled(),
+                Some(accesskit::Toggled::True),
+                "{role:?} 的 checked 必须落进 Toggled"
+            );
+        }
+    }
+
+    /// E15：`ColorWell` 的值通道（当前颜色文本）必须进 `accesskit::Node` 的 value。
+    #[test]
+    fn a_color_well_reports_its_color_through_value() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let well = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ColorWell),
+                label: Some(SmolStr::new_static("主题色")),
+                value: Some(SmolStr::new_static("#336699")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("color well");
+        let mut ids = crate::a11y::identity::A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let mut tables = crate::a11y::tree::CollectionSemanticsCache::default();
+        let record = crate::a11y::tree::node_a11y_with_cache(
+            &tree,
+            well,
+            scale(),
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("record");
+        let ak = to_accesskit(&record);
+        assert_eq!(ak.role(), accesskit::Role::ColorWell);
+        assert_eq!(ak.value(), Some("#336699"));
+    }
+
+    /// E15：显式 `orientation` 优先于滚动容器自动推导的轴向（应用声明不该被滚动轴覆盖）。
+    #[test]
+    fn explicit_orientation_wins_over_the_scroll_axis() {
+        let mut tree = NodeTree::new();
+        let root = tree.root();
+        let scrolling = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ScrollView),
+                label: Some(SmolStr::new_static("列表")),
+                // 垂直滚动容器，但应用显式声明水平（构造一个反例钉住优先级）。
+                orientation: Some(crate::a11y::A11yOrientation::Horizontal),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("scroll node");
+        tree.ensure_interaction(scrolling)
+            .expect("interaction")
+            .scroll = Some(crate::interaction::ScrollSlot {
+            offset: crate::math::Point::ZERO,
+            content: crate::math::Size::new(10.0, 100.0),
+            axis: crate::interaction::ScrollAxis::Vertical,
+            line_height: 40.0,
+        });
+        let mut ids = crate::a11y::identity::A11yIds::new();
+        let mut diagnostics = Vec::new();
+        let mut tables = crate::a11y::tree::CollectionSemanticsCache::default();
+        let record = crate::a11y::tree::node_a11y_with_cache(
+            &tree,
+            scrolling,
+            scale(),
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("record");
+        assert_eq!(
+            record.orientation,
+            Some(crate::a11y::A11yOrientation::Horizontal)
+        );
+        assert_eq!(
+            to_accesskit(&record).orientation(),
+            Some(accesskit::Orientation::Horizontal),
+            "显式声明必须胜过 scroll.vertical 推导"
+        );
+
+        // 没有显式声明时仍按滚动轴推导（旧行为不变）。
+        let derived = NodeBuilder::boxed()
+            .a11y(A11yOverride {
+                role: Some(A11yRole::ScrollView),
+                label: Some(SmolStr::new_static("列表")),
+                ..A11yOverride::default()
+            })
+            .build(&mut tree, root)
+            .expect("derived scroll node");
+        tree.ensure_interaction(derived)
+            .expect("interaction")
+            .scroll = Some(crate::interaction::ScrollSlot {
+            offset: crate::math::Point::ZERO,
+            content: crate::math::Size::new(10.0, 100.0),
+            axis: crate::interaction::ScrollAxis::Vertical,
+            line_height: 40.0,
+        });
+        let record = crate::a11y::tree::node_a11y_with_cache(
+            &tree,
+            derived,
+            scale(),
+            "",
+            &mut ids,
+            &mut tables,
+            &mut diagnostics,
+        )
+        .expect("record");
+        assert_eq!(record.orientation, None);
+        assert_eq!(
+            to_accesskit(&record).orientation(),
+            Some(accesskit::Orientation::Vertical),
+            "滚动容器无显式方向 ⇒ 按 vertical 轴推导"
+        );
     }
 }

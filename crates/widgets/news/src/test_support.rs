@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::{App, TestAppContext};
 use kytrix_service_provider::service::engine::{
     ErrorCode, KytrixServiceError, NewsEvent, NewsKind,
 };
@@ -30,30 +29,6 @@ use crate::{
 
 /// The account every fixture scope belongs to.
 pub(crate) const ACCOUNT: &str = "test-account";
-
-/// Lets a widget and its service run until what a test is waiting for has happened.
-///
-/// Two executors are involved: a widget sends its commands from GPUI's own, and the
-/// service answers on the application runtime. So both are given a turn — the widget
-/// first, because a command that has not been sent is a service with nothing to answer.
-pub(crate) fn settle_until(cx: &mut TestAppContext, what: &str, ready: impl Fn(&App) -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        cx.run_until_parked();
-        let handle = cx.update(runtime_handle);
-        handle.block_on(async { tokio::task::yield_now().await });
-        if cx.update(|cx| ready(cx)) {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline, "{what} should happen");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// The installed application runtime's handle.
-fn runtime_handle(cx: &mut App) -> tokio::runtime::Handle {
-    widget_tokio_runtime::global::handle(cx).handle().clone()
-}
 
 /// One reported item.
 pub(crate) fn event(timestamp: i64) -> NewsEvent {
@@ -268,49 +243,39 @@ impl NewsEventSubscription for FakeSubscription {
 ///
 /// Whether a clip would be audible is the machine's business, so this answers for a device
 /// that is always there and records the plays instead: what a pane decides is whether to ask.
+#[derive(Default)]
 pub(crate) struct RecordedSound {
-    plays: Mutex<Vec<()>>,
+    plays: AtomicUsize,
     /// The device a pane reads, which is there from the start: a sound that is not one the
     /// pane may be heard on is what the tests that say so send through it.
-    device: watch::Sender<bool>,
-}
-
-impl Default for RecordedSound {
-    fn default() -> Self {
-        let (device, _) = watch::channel(true);
-
-        Self {
-            plays: Mutex::new(Vec::new()),
-            device,
-        }
-    }
+    available: AtomicBool,
 }
 
 impl RecordedSound {
+    pub(crate) fn with_device() -> Arc<Self> {
+        let sound = Arc::new(Self::default());
+        sound.set_available(true);
+
+        sound
+    }
+
     /// How many plays the pane asked for.
     pub(crate) fn plays(&self) -> usize {
-        self.plays
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.plays.load(Ordering::SeqCst)
+    }
+
+    /// Says whether this sound is one a device could be heard on.
+    pub(crate) fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::SeqCst);
     }
 }
 
 impl NotificationSound for Arc<RecordedSound> {
     fn play(&self) {
-        self.plays
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(());
+        self.plays.fetch_add(1, Ordering::SeqCst);
     }
 
     fn is_available(&self) -> bool {
-        *self.device.borrow()
-    }
-
-    /// A device that is there from the start is one a pane has nothing to wait for: the
-    /// predicate already holds, so a pane watching this settles rather than parking.
-    fn ready(&self) -> watch::Receiver<bool> {
-        self.device.subscribe()
+        self.available.load(Ordering::SeqCst)
     }
 }

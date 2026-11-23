@@ -5,6 +5,12 @@
 //! in every locale until somebody reuses the name for something else. The sources are read here
 //! as text rather than through a declaration of the pages, because the pages are native UI: a
 //! literal is the one statement of a key every page already has to write.
+//!
+//! # Keeping the list of sources honest
+//!
+//! The list below is the crate's production sources, spelled out by hand and held to the
+//! directory: a source that is missing from it would silently escape both halves of the guard.
+//! A new file in `src/` therefore has to be added here, and the first test says so.
 
 use std::path::Path;
 
@@ -19,8 +25,9 @@ const TEST_SOURCES_DIRECTORY: &str = "settings_tests";
 ///
 /// The list is spelled out by hand and held to the directory below: a source that is not in it
 /// would silently escape both halves of the guard.
-const SETTINGS_SOURCES: [(&str, &str); 29] = [
+const SETTINGS_SOURCES: [(&str, &str); 31] = [
     ("appearance.rs", include_str!("../appearance.rs")),
+    ("host.rs", include_str!("../host.rs")),
     ("layout.rs", include_str!("../layout.rs")),
     ("lib.rs", include_str!("../lib.rs")),
     ("pages/about.rs", include_str!("../pages/about.rs")),
@@ -34,6 +41,7 @@ const SETTINGS_SOURCES: [(&str, &str); 29] = [
         include_str!("../pages/data_format.rs"),
     ),
     ("pages/mod.rs", include_str!("../pages/mod.rs")),
+    ("pages/page.rs", include_str!("../pages/page.rs")),
     (
         "pages/proxy/editor.rs",
         include_str!("../pages/proxy/editor.rs"),
@@ -188,7 +196,7 @@ fn every_settings_source_should_be_read_by_the_key_guard() {
 /// Every key the settings name is one every locale defines, and renders as something.
 #[test]
 fn every_key_the_settings_name_should_be_defined_in_every_locale() {
-    let i18n = i18n::global::embedded::load().expect("embedded locales should load");
+    let i18n = i18n::embedded::load().expect("embedded locales should load");
     let keys = declared_keys();
 
     assert!(
@@ -211,7 +219,7 @@ fn every_key_the_settings_name_should_be_defined_in_every_locale() {
 /// Every key a locale defines for the settings is one the settings name.
 #[test]
 fn every_settings_key_is_named_by_a_source() {
-    let i18n = i18n::global::embedded::load().expect("embedded locales should load");
+    let i18n = i18n::embedded::load().expect("embedded locales should load");
     let drawn = declared_keys();
 
     for language in i18n.languages() {

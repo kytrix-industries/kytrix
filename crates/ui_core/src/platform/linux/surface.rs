@@ -612,6 +612,14 @@ impl WaylandState {
     ///   `eprintln!` 诊断；
     /// - `modal` / `always_on_top`：Wayland **没有**对应原生协议 —— 模态由 `App` 层输入拦截
     ///   承担（本端只有上面的 parent 提示），置顶明确降级为无操作；见下方调用点的注释。
+    /// - `decorations`（E6）：`Decorations::None`（frameless）在 Wayland **没有等价协议** ——
+    ///   `zxdg_toplevel_decoration_v1` 只有 client / server side 两种模式，没有「无装饰」态；
+    ///   且 CSD 的 surface 本来就铺满整个窗口（引擎不自绘标题栏，装饰是应用自己画的像素）。
+    ///   因此 `None` 与 `Native` 的协议请求相同（下文请求 `ClientSide`），应用自行决定画不画
+    ///   标题栏；**最终模式以 compositor 的 configure 为准**（`WindowState::client_decoration`）。
+    ///   这是文档化降级（I10），不是静默忽略：字段文档与本节写明了原因。
+    /// - `icon`（E6）：xdg-shell **没有窗口图标协议**（`set_app_id` 是应用身份，不是任务栏图标）
+    ///   ⇒ 文档化降级（忽略）。应用图标归桌面环境的应用菜单，不在窗口协议内。
     /// - `position`：**有意忽略** —— 这是 Wayland 的协议事实而不是遗漏：`xdg_toplevel` 没有
     ///   任何定位请求（只有
     ///   set_parent/set_title/set_app_id/show_window_menu/move/resize/set_max_size/set_min_size/
@@ -703,6 +711,10 @@ impl WaylandState {
 
         // 装饰：请求 CLIENT_SIDE（没有该扩展时 compositor 自行决定）。**必须在首次 commit
         // 之前**创建，`configure` 事件里的 `mode` 才是权威的最终模式（R10-4）。
+        //
+        // E6：`WindowOptions::decorations` 在本端不改变这个请求 —— Wayland 没有「无装饰」态
+        // （见 [`Self::add_window`] 的 `WindowOptions` 消费清单）；`Decorations::None` 是
+        // 文档化降级，应用仍按 `WindowState::client_decoration` 决定是否自绘标题栏。
         let decoration = self.decoration_manager.as_ref().map(|manager| {
             let decoration = manager.get_toplevel_decoration(&toplevel, &self.queue_handle, ());
             decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ClientSide);
@@ -1242,6 +1254,15 @@ impl WaylandState {
             return;
         }
         self.windows[index].toplevel.set_minimized();
+    }
+
+    /// 运行时改标题（E6：`App::set_title` → `xdg_toplevel.set_title`）。
+    ///
+    /// 标题是 toplevel 的**双缓冲状态**：请求在下一次 `wl_surface.commit` 时生效（GPU 线程的
+    /// present 会 commit，因此最迟下一帧生效）。同值 no-op 由调用方（泵的 `WindowMirror`）
+    /// 负责；协议没有失败回报，compositor 可忽略（文档化语义，不是静默降级）。
+    pub(crate) fn set_title(&self, index: usize, title: &str) {
+        self.windows[index].toplevel.set_title(title.to_owned());
     }
 
     /// 最大化 / 还原切换；最终状态以 compositor 的 configure 为准。

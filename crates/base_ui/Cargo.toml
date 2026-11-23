@@ -5,19 +5,24 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
+bytes = { workspace = true }
 color = { workspace = true }
 comrak = { workspace = true }
-either = { workspace = true }
-gpui-kit = { workspace = true }
 image = { workspace = true }
-rust-embed = { workspace = true }
-smallvec = { workspace = true }
 smol_str = { workspace = true }
+taffy = { workspace = true }
+ui_core = { workspace = true }
 
+
+[build-dependencies]
+image = { workspace = true }
+resvg = { workspace = true }
+usvg = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
-i18n = { workspace = true }
+tokio = { workspace = true }
+ui_core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

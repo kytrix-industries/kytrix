@@ -7,8 +7,9 @@
 //! wants a venue's statically declared scopes loaded reaches it through the
 //! helpers below. The third is the root itself: every test that drives a load
 //! builds the same root over the snapshot it wants and the transport it owns,
-//! and a GPUI test installs one over its fixture catalogue through
-//! [`install_root`].
+//! Third, the process's shared test runtime: a root is built over a `tokio` handle
+//! like the application's, and one runtime for every test in the process keeps a
+//! root's tasks alive for as long as a peer drives them.
 
 use std::sync::Arc;
 #[cfg(test)]
@@ -21,17 +22,19 @@ use ahash::AHashSet;
 use app_config::{market_participants::fixture::FixtureInstallation, settings::Config};
 #[cfg(test)]
 use app_config::{market_participants::origins::OriginPair, network::ResolvedProxy};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use app_config_provider::notification::ConfigNotification;
 use market_participants_model::identifier::VenueId;
 #[cfg(test)]
 use network::transport::http::HttpClientClass;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use network::transport::hub::{TransportHub, TransportPolicy};
 #[cfg(any(test, feature = "test-support"))]
 use parking_lot::{Mutex, RwLock};
 #[cfg(test)]
 use smol_str::SmolStr;
+#[cfg(any(test, feature = "test-support"))]
+use tokio::runtime::Handle;
 #[cfg(any(test, feature = "test-support"))]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -39,13 +42,11 @@ use tokio::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use url::Url;
-#[cfg(any(test, feature = "test-support"))]
-use widget_tokio_runtime::runtime::Runtime;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use crate::runtime::MarketParticipantNetworkSnapshot;
 use crate::venue::definition::{VenueDefinition, definition_of};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use crate::{
     catalog::store::Catalog,
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
@@ -67,34 +68,27 @@ pub fn definitions(venues: &[VenueId]) -> Vec<VenueDefinition> {
         .collect()
 }
 
-/// Installs a root over one catalogue as the GPUI global.
+/// The handle of the runtime every test in the process shares.
 ///
-/// A GPUI test installs this once and then drives the widget against the route,
-/// the listing keys and the catalogue the fixture hands back. The application
-/// runtime is the installed one when a test has one, so a fetch driven through
-/// the root crosses the same boundary the application uses.
-#[cfg(any(test, feature = "test-support"))]
-pub fn install_root(cx: &mut gpui_kit::App, catalog: Arc<Catalog>) -> MarketParticipantsConnector {
-    let runtime = widget_tokio_runtime::global::try_handle(cx).unwrap_or_else(Runtime::for_test);
-    let root = root_over_with(catalog, runtime);
-    root.attach_events(cx);
-    cx.set_global(root.clone());
-    root
-}
+/// A runtime built inside one test would be shut down when that test ends, cancelling
+/// the transfers a still-running peer started; one runtime per process is what makes the
+/// handle a stand-in for the application runtime rather than a second one.
+///
+/// # Panics
+///
+/// Panics when the operating system cannot provide the runtime's worker threads.
+pub fn test_handle() -> Handle {
+    static SHARED: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
-#[cfg(any(test, feature = "test-support"))]
-fn root_over_with(catalog: Arc<Catalog>, runtime: Runtime) -> MarketParticipantsConnector {
-    let notification =
-        ConfigNotification::new(Arc::new(MarketParticipantNetworkSnapshot::default()));
-    MarketParticipantsConnector::new_with_catalog(
-        MarketParticipantsConnectorInput::new(
-            Arc::new(TransportHub::new(TransportPolicy::default())),
-            notification,
-        )
-        .with_runtime(runtime),
-        catalog,
-    )
-    .expect("the fixture root builds from typed runtime inputs")
+    SHARED
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("a test runtime must build")
+        })
+        .handle()
+        .clone()
 }
 
 /// The settings snapshot one fixture installation belongs to.
@@ -139,7 +133,7 @@ pub(crate) fn connector_over(
     let catalog = Arc::new(Catalog::new());
     let connector = MarketParticipantsConnector::new_with_catalog(
         MarketParticipantsConnectorInput::new(Arc::new(TransportHub::new(policy)), notification)
-            .with_runtime(Runtime::for_test()),
+            .with_runtime(test_handle()),
         Arc::clone(&catalog),
     )
     .expect("the market participants root builds from the fixture configuration");

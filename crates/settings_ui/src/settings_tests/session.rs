@@ -1,364 +1,341 @@
-//! The tests of writing the settings: at once, after a failure, and on the way out.
+//! The tests of the settings session: what one write stores, and what it refuses.
 
-use std::fs;
+use std::{error::Error as _, io, path::PathBuf};
 
 use app_config::{
-    market_participants::credentials::OkxCredentials,
-    settings::{Appearance, Config, Language},
-    ui::SidebarMode,
+    network::{KytrixServiceCapability, ProxyConfig, ProxyRoute, ServiceTarget},
+    settings::{AccountConfig, AccountWalletKind, Appearance, Language},
+    translation::{DownloadSite, TranslationModel},
 };
-use app_config_provider::{manager::ConfigManager, store::ConfigPersistenceError};
-use gpui_kit::TestAppContext;
-use i18n::{language::codes::LanguageCode, t};
+use app_config_provider::store::ConfigPersistenceError;
 use market_participants_model::identifier::VenueId;
 use smol_str::SmolStr;
 
-use super::test_support::*;
-use crate::session::SettingsChange;
+use crate::{session::SettingsChange, settings_tests::test_support::Harness};
 
-/// The alert a rejected commit raises says what went wrong, in either language.
-///
-/// The message is only worth raising if the user can read the reason, so both locales have
-/// to carry the placeholder the reason is written into, and the reason has to arrive in the
-/// text the alert is given.
-///
-/// The copy is centered when it is drawn, which it says with a `<p align="center">` tag pair:
-/// that pair is how the message opens and how it ends, so both readings here skip it and ask
-/// about the sentence inside it.
-///
-/// A key that is missing from a locale translates to an empty string rather than failing,
-/// which is what makes "the message is not empty" the thing this has to check: a typo in a
-/// key would otherwise reach the user as an alert with nothing in it.
-#[gpui_kit::test]
-fn the_failure_alert_should_name_the_reason_in_both_languages(cx: &mut TestAppContext) {
-    let (mut manager, _blocking, _directory) = manager_behind_a_file(cx);
-    let mut candidate = manager.read().as_ref().clone();
-    candidate.appearance = Appearance::Dark;
-    let reason: ConfigPersistenceError = cx.update(|cx| {
-        manager
-            .write(candidate, cx)
-            .expect_err("storing behind a file should fail")
-    });
+/// The settings a session writes are stored at once, not held for a later confirmation.
+#[test]
+fn a_change_should_reach_the_settings_at_once() {
+    let mut harness = Harness::new();
 
-    cx.update(|cx| {
-        i18n::global::embedded::install(cx).expect("embedded locales should load");
-    });
-
-    for (language, title, opening) in [
-        (
-            LanguageCode::En,
-            "The settings could not be saved",
-            "The settings were not written to disk: ",
-        ),
-        (LanguageCode::ZhCn, "设置保存失败", "设置未能写入磁盘："),
-    ] {
-        cx.update(|cx| {
-            cx.set_global(language);
-        });
-
-        let (declared, drawn_title, message, filling) = cx.read(|cx| {
-            let i18n = cx.global::<i18n::translator::types::I18n>();
-
-            (
-                i18n.try_translate(language, "settings_ui.save_failed.message")
-                    .is_some(),
-                t!(cx, "settings_ui.save_failed.title"),
-                t!(cx, "settings_ui.save_failed.message", reason = reason),
-                // The same message with a reason that is a word of its own, which is what
-                // says the placeholder of this locale was filled rather than dropped.
-                t!(cx, "settings_ui.save_failed.message", reason = "the-reason"),
-            )
-        });
-
-        assert!(
-            declared,
-            "both locales should define the message a failed commit raises"
-        );
-        assert!(
-            !drawn_title.is_empty(),
-            "the title of {language:?} should not be an empty string"
-        );
-        assert!(
-            !message.is_empty(),
-            "the message of {language:?} should not be an empty string"
-        );
-        // The message is centered markdown, so the reason is followed by the align tag pair's
-        // closing tag rather than by the end of the sentence.
-        assert!(
-            filling.contains("the-reason</p>"),
-            "the message of {language:?} should write the reason where its placeholder is: {filling}"
-        );
-        assert_eq!(
-            drawn_title.as_ref(),
-            title,
-            "the title should be written in {language:?}"
-        );
-        assert!(
-            message
-                .trim_start_matches("<p align=\"center\">")
-                .starts_with(opening),
-            "the message should be written in {language:?}: {message}"
-        );
-        assert!(
-            message.contains(&reason.to_string()),
-            "the message should carry the reason {reason}: {message}"
-        );
-        assert!(
-            !message.contains("%{"),
-            "every placeholder should be filled in: {message}"
-        );
-    }
-}
-
-/// A write that could not be stored is not one the settings treat as stored: once the
-/// reason is gone, the same change reaches the file.
-///
-/// What this is about is the retry: the file was never written, so the settings in memory
-/// are the ones the user started with and the page still holds their choice — asking again
-/// has to store it rather than report it as already stored.
-#[gpui_kit::test]
-fn a_write_that_could_not_be_stored_should_be_stored_when_it_is_tried_again(
-    cx: &mut TestAppContext,
-) {
-    let (manager, blocking, _directory) = manager_behind_a_file(cx);
-    let path = blocking.join("config.json");
-    let (panel, cx) = settings_over(manager, Language::En, cx);
-
-    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
-
-    assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_some(),
-        "the failure should be reported before anything is tried again"
-    );
-    assert!(
-        !path.exists(),
-        "a write that failed must not have left a file behind: {path:?}"
-    );
-    assert_eq!(
-        stored(cx).appearance,
-        Appearance::System,
-        "a write that failed must not change the settings in memory"
-    );
-
-    // Reading the alert is what leaves the page to be asked again.
-    click(cx, "BASE_UI_ALERT_OK");
-    assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_none(),
-        "the alert should be gone once it has been read"
-    );
-
-    fs::remove_file(&blocking).expect("the blocking file should be removable");
-
-    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
+    harness
+        .write(SettingsChange::edit(|config| {
+            config.language = Language::ZhCn
+        }))
+        .expect("an in-memory session stores every settings change");
 
     assert_eq!(
-        stored(cx).appearance,
-        Appearance::Dark,
-        "the retry should store what the user chose"
+        harness.config().language,
+        Language::ZhCn,
+        "the change should be the settings of the moment it was written"
     );
-    assert!(
-        cx.debug_bounds("SETTINGS_PAGE").is_some(),
-        "the retry should leave the page open"
-    );
-    assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_none(),
-        "a stored change is nothing to report"
-    );
-
-    let written = fs::read_to_string(&path).expect("the retry should have written a file");
-    assert!(
-        written.contains("\"appearance\": \"Dark\""),
-        "the file should hold what the user chose: {written}"
-    );
-    let reloaded = cx
-        .update(|_, cx| ConfigManager::from_path(&path, cx))
-        .expect("the stored settings should load");
     assert_eq!(
-        reloaded.read().as_ref(),
-        &stored(cx),
-        "what was stored should load as the settings the application is running with"
+        harness.writes().len(),
+        1,
+        "one write publishes one snapshot"
     );
 }
 
-/// Work that writes the settings while the page is open is not the page's to undo.
-///
-/// An avatar is generated in the background and a workspace layout is persisted on a
-/// delay, so the settings of the moment a change is made are not the settings the page was
-/// opened with: what the user changes is applied to the settings of that moment rather than
-/// published as the snapshot the page started from.
-#[gpui_kit::test]
-fn a_background_write_should_survive_the_next_settings_write(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
+/// A change is applied to the settings as they are when it is written, so what another subsystem
+/// wrote while the page was open survives it.
+#[test]
+fn a_change_should_keep_what_was_written_while_the_page_was_open() {
+    let mut harness = Harness::new();
+    harness.update_config(|config| {
+        config.avatar = Some("<svg>generated-while-open</svg>".to_owned());
+        config.account = Some(AccountConfig {
+            user_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            wallet_address: "0xfeed".to_owned(),
+            wallet_kind: AccountWalletKind::Ethereum,
+        });
+    });
 
-    write_while_open(cx);
-    settle(cx);
+    harness
+        .write(SettingsChange::edit(|config| {
+            config.appearance = Appearance::Dark
+        }))
+        .expect("an in-memory session stores every settings change");
 
-    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
-
-    let published = stored(cx);
+    let stored = harness.config();
+    assert_eq!(stored.appearance, Appearance::Dark);
     assert_eq!(
-        published.appearance,
-        Appearance::Dark,
-        "the change the user chose should be the one that is stored"
-    );
-    assert_eq!(
-        published.avatar.as_deref(),
+        stored.avatar.as_deref(),
         Some("<svg>generated-while-open</svg>"),
-        "a change must not roll back the avatar the background wrote"
+        "a change must not roll back the avatar another subsystem wrote"
     );
     assert_eq!(
-        published
+        stored
             .account
             .as_ref()
             .map(|account| account.user_id.as_str()),
         Some("22222222-2222-4222-8222-222222222222"),
         "a change must not roll back the account another subsystem signed in"
     );
+}
+
+fn proxy(port: u16) -> ProxyConfig {
+    ProxyConfig {
+        addr: SmolStr::new_static("127.0.0.1"),
+        port,
+        ..ProxyConfig::default()
+    }
+}
+
+fn service_target() -> ServiceTarget {
+    ServiceTarget::KytrixService {
+        capability: KytrixServiceCapability::News,
+    }
+}
+
+/// Adding an entry is one commit: the settings hold it as soon as the change is written.
+#[test]
+fn adding_a_proxy_should_store_it_at_once() {
+    let mut harness = Harness::new();
+
+    harness
+        .write(SettingsChange::AddProxy {
+            name: SmolStr::new_static("hk"),
+            proxy: proxy(1080),
+        })
+        .expect("an in-memory session stores every settings change");
+
     assert_eq!(
-        published.workspaces.active.as_deref(),
-        Some("written-while-open"),
-        "a change must not roll back a workspace layout persisted while it was open"
+        harness.config().proxies.get("hk").map(|proxy| proxy.port),
+        Some(1080)
     );
 }
 
-/// The sidebar state is stored beside the settings the page owns, so a change made while the
-/// state moved has to write the state of that moment: replaying the snapshot the page was
-/// opened with would put the sidebar back where it was when the page opened.
-#[gpui_kit::test]
-fn a_background_sidebar_state_should_survive_the_next_settings_write(cx: &mut TestAppContext) {
-    let (panel, cx) = settings(configured_settings(), cx);
-
-    write_while_open(cx);
-    settle(cx);
-
-    edit_settings(&panel, |config| config.appearance = Appearance::Dark, cx);
-
-    assert_eq!(
-        stored(cx).ui.sidebar,
-        SidebarMode::IconOnly,
-        "a change must not roll back the sidebar state written while it was open"
-    );
-    assert_eq!(
-        stored(cx).appearance,
-        Appearance::Dark,
-        "the change the user chose should be the one that is stored"
-    );
-}
-
-/// A reason a write failed is not lost when the page is left before the frame that reports it:
-/// whoever leaves the page asks for it, and it is handed over once.
-#[gpui_kit::test]
-fn a_write_failure_waiting_to_be_reported_should_be_handed_to_whoever_leaves(
-    cx: &mut TestAppContext,
-) {
-    let (manager, _blocking, _directory) = manager_behind_a_file(cx);
-    let (panel, cx) = settings_over(manager, Language::En, cx);
-
-    // One turn's worth of state: the write fails, and nothing has drawn the page that would
-    // report it before the leave asks for the reason.
-    let reason = panel.update(cx, |panel, cx| {
-        panel.session_for_test().update(cx, |session, cx| {
-            let _ = session.write(
-                SettingsChange::edit(|config| config.appearance = Appearance::Dark),
-                cx,
-            );
-        });
-        panel.take_write_failure(cx)
+/// Renaming an entry moves every named route with it, in the same commit.
+#[test]
+fn replacing_a_proxys_name_should_move_the_routes_bound_to_it() {
+    let mut harness = Harness::new();
+    harness.update_config(|config| {
+        config
+            .proxies
+            .insert(SmolStr::new_static("hk"), proxy(1080));
+        config.proxy_default = ProxyRoute::named("hk");
+        config
+            .proxy_applications
+            .insert(service_target(), ProxyRoute::named("hk"));
+        config.set_venue_proxy(&VenueId::Okx, Some(ProxyRoute::named("hk")));
     });
 
+    harness
+        .write(SettingsChange::ReplaceProxy {
+            original: SmolStr::new_static("hk"),
+            name: SmolStr::new_static("osaka"),
+            proxy: proxy(1081),
+        })
+        .expect("an in-memory session stores every settings change");
+
+    let stored = harness.config();
     assert!(
-        reason.is_some_and(|reason| !reason.is_empty()),
-        "the reason the write failed should be handed to whoever leaves the page"
+        !stored.proxies.contains_key("hk") && stored.proxies.contains_key("osaka"),
+        "the entry should have moved to its new name"
+    );
+    assert_eq!(stored.proxies["osaka"].port, 1081);
+    assert_eq!(stored.proxy_default, ProxyRoute::named("osaka"));
+    assert_eq!(
+        stored.proxy_applications[&service_target()],
+        ProxyRoute::named("osaka"),
+        "a service route bound to the entry should follow the rename"
     );
     assert_eq!(
-        stored(cx).appearance,
-        Appearance::System,
-        "settings that could not be stored must not be published as if they had been"
+        stored.venue(&VenueId::Okx).and_then(|venue| venue.proxy()),
+        Some(ProxyRoute::named("osaka")),
+        "a venue bound to the entry should follow the rename"
+    );
+}
+
+/// Removing an entry resets every route that named it, in the same commit.
+#[test]
+fn removing_a_proxy_should_reset_the_routes_bound_to_it() {
+    let mut harness = Harness::new();
+    harness.update_config(|config| {
+        config
+            .proxies
+            .insert(SmolStr::new_static("hk"), proxy(1080));
+        config.proxy_default = ProxyRoute::named("hk");
+        config
+            .proxy_applications
+            .insert(service_target(), ProxyRoute::named("hk"));
+        config.set_venue_proxy(&VenueId::Okx, Some(ProxyRoute::named("hk")));
+    });
+
+    harness
+        .write(SettingsChange::RemoveProxy {
+            name: SmolStr::new_static("hk"),
+        })
+        .expect("an in-memory session stores every settings change");
+
+    let stored = harness.config();
+    assert!(stored.proxies.is_empty(), "the entry should be gone");
+    assert_eq!(
+        stored.proxy_default,
+        ProxyRoute::Direct,
+        "a default line naming the removed entry falls back to the direct line"
     );
     assert!(
-        panel
-            .update(cx, |panel, cx| panel.take_write_failure(cx))
-            .is_none(),
+        stored.proxy_applications.is_empty(),
+        "every service route naming the removed entry should be reset"
+    );
+    assert!(
+        stored
+            .venue(&VenueId::Okx)
+            .is_some_and(|venue| venue.proxy().is_none()),
+        "a venue naming the removed entry should follow the default line again"
+    );
+}
+
+/// A directory change and the selection it invalidates are applied to one candidate, so the
+/// snapshot the settings publish holds the new directory and no selection naming the old one.
+#[test]
+fn a_directory_change_should_clear_the_selection_it_invalidates() {
+    let first = tempfile::tempdir().expect("a temporary directory should be created");
+    let second = tempfile::tempdir().expect("a temporary directory should be created");
+    let mut harness = Harness::new();
+    harness.update_config(|config| {
+        config.translation.model_directory = Some(first.path().to_path_buf());
+        config.translation.selected_model = Some(TranslationModel::HyMt218BQ4Km);
+    });
+    let before = harness.config();
+
+    harness
+        .write_all([
+            SettingsChange::TranslationModelDirectory {
+                directory: second.path().to_path_buf(),
+            },
+            SettingsChange::TranslationModelSelected { model: None },
+        ])
+        .expect("an in-memory session stores every settings change");
+
+    let after = harness.config();
+    assert_eq!(
+        after.translation.model_directory,
+        Some(second.path().to_path_buf())
+    );
+    assert_eq!(after.translation.selected_model, None);
+    assert_eq!(
+        after.translation.download_site,
+        DownloadSite::HuggingFace,
+        "the rest of the translation settings should be left alone"
+    );
+    assert_ne!(
+        before.translation.model_directory, after.translation.model_directory,
+        "the two changes land in one published snapshot"
+    );
+    assert_eq!(
+        harness.writes().len(),
+        1,
+        "the changes are stored as one configuration"
+    );
+}
+
+/// A write that cannot be stored leaves the settings alone and keeps its reason until the page
+/// takes it, once.
+#[test]
+fn a_write_that_cannot_be_stored_should_be_kept_for_the_page_once() {
+    let mut harness = Harness::new();
+    let before = harness.config();
+    harness.fail_next_write(crate::session::SettingsWriteError::new(
+        ConfigPersistenceError::CreateDirectory {
+            path: PathBuf::from("unwritable"),
+            source: io::Error::other("the directory cannot be created"),
+        },
+    ));
+
+    let error = harness
+        .write(SettingsChange::edit(|config| {
+            config.appearance = Appearance::Dark
+        }))
+        .expect_err("the session reports the store's failure");
+
+    assert_eq!(
+        harness.config(),
+        before,
+        "a write that could not be stored must leave the snapshot alone"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("the directory cannot be created"),
+        "the displayed reason should be the store's own: {message}"
+    );
+    assert!(
+        error.source().is_some(),
+        "the write error should expose the store's failure"
+    );
+    assert!(
+        harness.store().take_failure().is_some(),
+        "the page should be handed the reason of the failed write"
+    );
+    assert!(
+        harness.store().take_failure().is_none(),
         "one failure should be reported once"
     );
-    click(cx, "SETTINGS_ENTRY_appearance");
+}
+
+/// A change that stores what is stored already is not a write and has no reason to report.
+#[test]
+fn an_unchanged_change_should_be_accepted_without_a_report() {
+    let mut harness = Harness::new();
+    let before = harness.config();
+    let language = before.language;
+
+    harness
+        .write(SettingsChange::edit(move |config| {
+            config.language = language
+        }))
+        .expect("a change that stores nothing is accepted");
+    harness
+        .write_all([])
+        .expect("a write of nothing is accepted");
+
     assert_eq!(
-        current_page(&panel, cx),
-        "appearance",
-        "a failed write must not leave the page unable to move"
+        harness.config(),
+        before,
+        "a change that stores what is stored already is not a write"
+    );
+    assert!(
+        harness.store().take_failure().is_none(),
+        "a change that stores nothing is nothing to report"
     );
 }
 
-/// A choice that could not be stored keeps the old value, reports why, and leaves the page
-/// open.
-#[gpui_kit::test]
-fn a_failed_select_write_should_keep_the_old_value_and_report(cx: &mut TestAppContext) {
-    let (manager, _blocking, _directory) = manager_behind_a_file(cx);
-    let (panel, cx) = settings_over(manager, Language::ZhCn, cx);
-
-    edit_settings(&panel, |config| config.language = Language::En, cx);
-
-    assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_some(),
-        "a write that could not be stored should tell the user"
-    );
-    assert_eq!(
-        stored(cx).language,
-        Language::ZhCn,
-        "settings that could not be stored must not be published as if they had been"
-    );
-    assert_eq!(
-        cx.read(|cx| *cx.global::<LanguageCode>()),
-        LanguageCode::ZhCn,
-        "an interface the settings did not move should stay where it was"
-    );
-    assert!(
-        cx.debug_bounds("SETTINGS_PAGE").is_some(),
-        "the settings should stay open so the user can try again"
-    );
-    let shown = panel.read_with(cx, |panel, cx| {
-        panel.session_for_test().read(cx).config(cx).language
+/// A setter that refuses its value leaves the settings as they are; the user's choice is kept as
+/// the old value and there is nothing to report.
+#[test]
+fn a_change_a_setter_refuses_should_be_accepted_without_a_report() {
+    let mut harness = Harness::new();
+    harness.update_config(|config| {
+        // A venue this build does not hold a row for is the one shape whose setter writes nothing:
+        // the settings have no place for the value the dialog stands for.
+        config.venues.remove(&VenueId::Okx);
     });
-    assert_eq!(
-        shown,
-        Language::ZhCn,
-        "the control should be drawn from the settings that are still stored"
-    );
-}
+    let before = harness.config();
 
-/// A value a setter refuses is the user's choice kept as the old value: it is not a failure
-/// and there is nothing to report.
-#[gpui_kit::test]
-fn a_setter_that_rejects_the_value_should_keep_the_old_value_without_a_report(
-    cx: &mut TestAppContext,
-) {
-    let mut config = Config::default();
-    config.venues.remove(&VenueId::Okx);
-    let (panel, cx) = settings(config, cx);
-    let before = stored(cx);
-
-    edit_settings(
-        &panel,
-        |config| {
+    harness
+        .write(SettingsChange::edit(|config| {
             config.set_okx_credentials(
                 &VenueId::Okx,
-                Some(OkxCredentials {
-                    api_key: SmolStr::new_static("typed-key"),
-                    secret_key: SmolStr::new_static("typed-secret"),
-                    passphrase: SmolStr::new_static("typed-passphrase"),
-                }),
+                Some(
+                    app_config::market_participants::credentials::OkxCredentials {
+                        api_key: SmolStr::new_static("typed-key"),
+                        secret_key: SmolStr::new_static("typed-secret"),
+                        passphrase: SmolStr::new_static("typed-passphrase"),
+                    },
+                ),
             );
-        },
-        cx,
-    );
+        }))
+        .expect("a value the settings cannot hold is not a failure");
 
     assert_eq!(
-        stored(cx),
-        before,
-        "a refused value must leave the settings exactly as they were"
+        harness.config().venues.len(),
+        before.venues.len(),
+        "a refused value leaves the settings exactly as they were"
     );
     assert!(
-        cx.debug_bounds("BASE_UI_ALERT").is_none(),
-        "a value the settings refused is not a failure to report"
+        harness.store().take_failure().is_none(),
+        "a refused value is the user's choice, not a failure to report"
     );
+    assert_eq!(harness.writes().len(), 0, "a refused value stores nothing");
 }

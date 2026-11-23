@@ -3,15 +3,20 @@
 //! `Canvas` 内部持有一个 crate 私有的绘制桶（`scene::Lane`），公开的 `push_*` 方法把引擎图元写进去；
 //! 引擎在 P03/P07 把它包成 `Primitive::Canvas` 嵌进真实 lane。所有权与 API 契约见
 
+use std::sync::Arc;
+
 use crate::{
-    math::Rect,
+    math::{Point, Rect},
     paint::{
         atlas::AtlasKind,
         primitive::{
-            ClipOp, ClipRect, GeometryDraw, GlyphRun, Image, Path, Primitive, Quad, Shadow,
+            ClipOp, ClipRect, GeometryDraw, GlyphRun, Image, Path, PositionedGlyph, Primitive,
+            Quad, Shadow,
         },
         scene::{Lane, MAX_CLIP_DEPTH},
     },
+    render::AtlasAllocator,
+    text::{ShapedTextHandle, ShapedTextItem},
 };
 
 /// §7.4 C4：clip 矩形的坐标/尺寸/圆角都必须是有限值，尺寸非负。
@@ -68,6 +73,115 @@ impl Canvas {
             "glyph run contains a tile from a non-glyph atlas or non-zero layer"
         );
         self.lane.push(Primitive::GlyphRun(run));
+    }
+
+    /// 应用层画文本的**唯一**合法入口（v2.1 E1，`§11.1`）：按 run 拆 `Primitive::GlyphRun`，
+    /// 每个字形的落点平移 `origin`。
+    ///
+    /// `origin` 是文本盒左上角的**绝对窗口逻辑像素**（与 `Canvas` 内其它图元同一坐标系，
+    /// §5.9）；多行文本的所有行一起偏移。字形来自 [`ShapedTextHandle`]，应用不接触
+    /// `AtlasTile` / `GlyphRun` 的构造。
+    ///
+    /// **引擎负责租约校验**（等价 D-5 的「唯一重光栅入口」）：句柄在图集换代**或**其 tile
+    /// 被逐 tile 淘汰后已失效时**不产生任何图元**并返回 `false` —— 绝不把旧 UV 编码进图元
+    /// （那正是 D-5 修掉的花字）。应用收到 `false` 应丢弃句柄并重新 `App::shape_text`。
+    ///
+    /// push **之后**才发生的图集换代**或逐 tile LRU 淘汰**（不换代）由 paint 的编码期安全网
+    /// 兜底（[`Canvas::without_stale_glyph_runs`]：逐 tile 判活，失效 run 不编码）；但 Canvas
+    /// 内容归应用所有，应用仍须在句柄失效后重建 Canvas（`§11.1` 的应用义务）。
+    ///
+    /// 空文本（0 行）返回 `true` 且不产生图元：句柄本身有效，只是没有可画内容。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub fn push_shaped_text(&mut self, handle: &ShapedTextHandle, origin: Point) -> bool {
+        if handle.is_stale() {
+            return false;
+        }
+        for shaped_line in &handle.line().lines {
+            for item in &shaped_line.items {
+                let ShapedTextItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                if run.glyphs.is_empty() {
+                    continue;
+                }
+                let mut glyphs = Vec::with_capacity(run.glyphs.len());
+                for glyph in &run.glyphs {
+                    glyphs.push(PositionedGlyph {
+                        tile: glyph.tile,
+                        position: Point::new(
+                            origin.x + glyph.position.x,
+                            origin.y + glyph.position.y,
+                        ),
+                        size: glyph.size,
+                    });
+                }
+                self.push_text(GlyphRun {
+                    color: run.color,
+                    glyphs,
+                });
+            }
+        }
+        true
+    }
+
+    /// 编码期安全网（v2.1 E1b + E1d，`§11.1` 的「不允许画旧 UV」）：按图集**当前状态**过滤
+    /// Canvas 内的字形 run。
+    ///
+    /// [`Canvas::push_shaped_text`] 只在 **push 时**校验句柄租约；push 之后发生的图集换代
+    /// （`layout_text` 扩容 / 清空、换字体栈）**或逐 tile LRU 淘汰**（不换代）都会让已写入的
+    /// `AtlasTile` 指向旧 UV。paint 在 emit 本 Canvas 前调用本方法：逐 tile 用
+    /// [`AtlasAllocator::is_alive`]（代际 + 槽位分配身份 `(slot, slot_epoch)`，O(1)）校验，
+    /// 任一 tile 已失效的 run **整段丢弃**（少字优于花字，与节点文本的 D-5 编码期硬校验同口径），
+    /// 其余图元（含 clip 括号）原样保留、顺序不变。
+    ///
+    /// 返回 `None` = 没有失效 run（调用方复用原值，零分配）；否则返回过滤后的 Canvas 与
+    /// **丢弃的 run 数**（`PaintReport::stale_canvas_runs` 的诊断计数）。
+    ///
+    /// # Panics: none
+    #[must_use]
+    pub(crate) fn without_stale_glyph_runs(
+        &self,
+        atlas: &AtlasAllocator,
+    ) -> Option<(Canvas, usize)> {
+        let mut filtered = Lane::new();
+        let mut dropped = 0usize;
+        let mut changed = false;
+        for primitive in self.lane.primitives() {
+            match primitive {
+                Primitive::GlyphRun(run) => {
+                    // 逐 tile 判活：整页换代（generation 前进）与逐 tile 淘汰（槽位纪元前进）
+                    // 都由 `is_alive` 覆盖，且都是 O(1)。
+                    if run.glyphs.iter().any(|glyph| !atlas.is_alive(&glyph.tile)) {
+                        dropped += 1;
+                        changed = true;
+                    } else {
+                        filtered.push(primitive.clone());
+                    }
+                }
+                // 嵌套 Canvas（应用构造不出口，但值语义下可能经其它路径出现）：递归过滤。
+                Primitive::Canvas(inner) => match inner.without_stale_glyph_runs(atlas) {
+                    Some((sanitized, inner_dropped)) => {
+                        dropped += inner_dropped;
+                        changed = true;
+                        filtered.push(Primitive::Canvas(Arc::new(sanitized)));
+                    }
+                    None => filtered.push(primitive.clone()),
+                },
+                _ => filtered.push(primitive.clone()),
+            }
+        }
+        if !changed {
+            return None;
+        }
+        Some((
+            Canvas {
+                bounds: self.bounds,
+                lane: filtered,
+            },
+            dropped,
+        ))
     }
 
     /// debug 构建断言 `image.tile.atlas == AtlasKind::Image` 且页号 < `MAX_IMAGE_PAGES`（页号上限；
@@ -180,7 +294,8 @@ mod tests {
             atlas::{AtlasKind, AtlasTile},
             color::Color,
             primitive::{
-                ClipRect, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
+                ClipOp, ClipRect, GlyphRun, Image, PositionedGlyph, Primitive, Quad, QuadPaint,
+                Shadow,
             },
             scene::MAX_CLIP_DEPTH,
         },
@@ -227,6 +342,8 @@ mod tests {
                 u1: 1.0,
                 v1: 1.0,
                 generation: 0,
+                slot: 0,
+                slot_epoch: 0,
             },
             modulation: Color::WHITE,
         }
@@ -254,6 +371,8 @@ mod tests {
                     u1: 0.5,
                     v1: 0.5,
                     generation: 0,
+                    slot: 0,
+                    slot_epoch: 0,
                 },
                 position: Point::new(2.0, 3.0),
                 size: Size::new(8.0, 8.0),
@@ -411,5 +530,274 @@ mod tests {
         let mut run = glyph_run();
         run.glyphs[0].tile.page = 1;
         canvas.push_text(run);
+    }
+
+    /// v2.1 E1b：`push_shaped_text` 的唯一入口语义 —— 图集租约校验 + origin 偏移 + 按 run 拆图元。
+    ///
+    /// `(generation, eviction_epoch)` 是句柄构造时的租约，`current` 是共享租约里的当前值：
+    /// 任一不等 ⇒ 句柄已失效（整页换代与逐 tile 淘汰都算）。
+    fn shaped_handle(
+        generation: u32,
+        eviction_epoch: u32,
+        current: (u32, u32),
+    ) -> crate::text::ShapedTextHandle {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        use crate::text::{
+            ShapedGlyphRun, ShapedLine, ShapedTextHandle, ShapedTextItem, ShapedTextLine,
+            pack_atlas_lease,
+        };
+
+        let glyph = PositionedGlyph {
+            tile: AtlasTile {
+                atlas: AtlasKind::Glyph,
+                page: 0,
+                u0: 0.0,
+                v0: 0.0,
+                u1: 0.5,
+                v1: 0.5,
+                generation,
+                slot: 0,
+                slot_epoch: 0,
+            },
+            position: Point::new(2.0, 3.0),
+            size: Size::new(8.0, 8.0),
+        };
+        let line = ShapedLine {
+            text: smol_str::SmolStr::new_static("e1"),
+            lines: vec![ShapedTextLine {
+                text_range: 0..2,
+                baseline: 12.0,
+                line_height: 14.0,
+                advance: 10.0,
+                items: vec![ShapedTextItem::GlyphRun(ShapedGlyphRun {
+                    color: Color::BLACK,
+                    text_range: 0..2,
+                    glyphs: vec![glyph],
+                })],
+                decorations: Vec::new(),
+            }],
+            width: 10.0,
+            height: 14.0,
+            first_baseline: Some(12.0),
+            atlas_generation: generation,
+            font_stack_version: 1,
+            scale: 1.0,
+        };
+        ShapedTextHandle::new(
+            Arc::new(line),
+            Box::new([]),
+            generation,
+            eviction_epoch,
+            1.0,
+            Arc::new(AtomicU64::new(pack_atlas_lease(current.0, current.1))),
+        )
+    }
+
+    #[test]
+    fn push_shaped_text_offsets_glyphs_by_the_origin() {
+        let mut canvas = Canvas::new(bounds());
+        let handle = shaped_handle(7, 2, (7, 2));
+        assert!(
+            canvas.push_shaped_text(&handle, Point::new(10.0, 20.0)),
+            "当前代际的句柄必须能编码"
+        );
+        assert_eq!(canvas.primitives().len(), 1);
+        let Primitive::GlyphRun(run) = &canvas.primitives()[0] else {
+            panic!("push_shaped_text 只能产生 GlyphRun 图元");
+        };
+        let glyph = run.glyphs[0];
+        assert_eq!(
+            glyph.position,
+            Point::new(10.0 + 2.0, 20.0 + 3.0),
+            "origin 是文本盒左上角的绝对窗口逻辑像素"
+        );
+        assert_eq!(glyph.size, Size::new(8.0, 8.0));
+        assert_eq!(glyph.tile.generation, 7);
+        assert_eq!(run.color, Color::BLACK);
+    }
+
+    #[test]
+    fn push_shaped_text_refuses_a_stale_handle() {
+        let mut canvas = Canvas::new(bounds());
+        canvas.push_quad(quad());
+        let before = canvas.primitives().len();
+        // 句柄记录 7 代，图集已经到 8 代 ⇒ 旧 UV 已失效。
+        let stale = shaped_handle(7, 0, (8, 0));
+        assert!(stale.is_stale());
+        assert!(
+            !canvas.push_shaped_text(&stale, Point::ZERO),
+            "stale 句柄必须返回 false"
+        );
+        assert_eq!(
+            canvas.primitives().len(),
+            before,
+            "stale push 不得产生任何图元（不画旧 UV）"
+        );
+        // E1b F1：代际不变、但句柄构造后发生过逐 tile 淘汰 ⇒ 同样失效。
+        let evicted = shaped_handle(7, 2, (7, 3));
+        assert!(
+            evicted.is_stale(),
+            "淘汰纪元前进必须让句柄失效（tile 已被别的字形复用）"
+        );
+        assert!(
+            !canvas.push_shaped_text(&evicted, Point::ZERO),
+            "淘汰后的句柄不得编码旧 UV"
+        );
+        assert_eq!(canvas.primitives().len(), before);
+    }
+
+    #[test]
+    fn push_shaped_text_splits_multiple_runs_into_multiple_primitives() {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        use crate::text::{
+            ShapedGlyphRun, ShapedLine, ShapedTextHandle, ShapedTextItem, ShapedTextLine,
+            pack_atlas_lease,
+        };
+
+        let run = |x: f32| ShapedGlyphRun {
+            color: Color::BLACK,
+            text_range: 0..1,
+            glyphs: vec![PositionedGlyph {
+                tile: AtlasTile {
+                    atlas: AtlasKind::Glyph,
+                    page: 0,
+                    u0: x / 8.0,
+                    v0: 0.0,
+                    u1: (x + 8.0) / 8.0,
+                    v1: 1.0,
+                    generation: 3,
+                    slot: 0,
+                    slot_epoch: 0,
+                },
+                position: Point::new(x, 0.0),
+                size: Size::new(8.0, 8.0),
+            }],
+        };
+        let line = ShapedLine {
+            text: smol_str::SmolStr::new_static("ab"),
+            lines: vec![ShapedTextLine {
+                text_range: 0..2,
+                baseline: 12.0,
+                line_height: 14.0,
+                advance: 16.0,
+                items: vec![
+                    ShapedTextItem::GlyphRun(run(0.0)),
+                    ShapedTextItem::InlineBox(crate::text::ShapedInlineBox {
+                        id: 5,
+                        rect: Rect::new(4.0, 0.0, 8.0, 8.0),
+                        baseline: None,
+                    }),
+                    ShapedTextItem::GlyphRun(run(8.0)),
+                ],
+                decorations: Vec::new(),
+            }],
+            width: 16.0,
+            height: 14.0,
+            first_baseline: Some(12.0),
+            atlas_generation: 3,
+            font_stack_version: 1,
+            scale: 1.0,
+        };
+        let handle = ShapedTextHandle::new(
+            Arc::new(line),
+            Box::new([]),
+            3,
+            0,
+            1.0,
+            Arc::new(AtomicU64::new(pack_atlas_lease(3, 0))),
+        );
+        let mut canvas = Canvas::new(bounds());
+        assert!(canvas.push_shaped_text(&handle, Point::new(1.0, 2.0)));
+        assert_eq!(
+            canvas.primitives().len(),
+            2,
+            "按 run 拆图元：行内盒不产生图元（E1 只保证落点可读）"
+        );
+        let positions: Vec<Point> = canvas
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::GlyphRun(run) => run.glyphs.first().map(|glyph| glyph.position),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, vec![Point::new(1.0, 2.0), Point::new(9.0, 2.0)]);
+    }
+
+    /// E1d（F15 方案①）：编码期安全网按**分配身份**逐 tile 判活。
+    ///
+    /// 这里直接构造「已被复用槽位」的旧 tile（`generation` **不变**）：这正是 E1b 的代际过滤
+    /// 无法检测、F15 记录的场景 —— 逐 tile LRU 淘汰后旧 `GlyphRun` 仍在 Canvas 值里。
+    ///
+    /// 变异守卫：`is_alive` 恒真（或过滤删掉 `is_alive`）⇒ 本用例的「丢弃 1 条 / 保持顺序」
+    /// 断言变红。
+    #[test]
+    fn without_stale_glyph_runs_drops_evicted_tiles_and_keeps_live_ones() {
+        let mut atlas = crate::render::AtlasAllocator::with_page(AtlasKind::Glyph, (64, 64));
+        let kept = atlas.allocate((8, 8)).expect("fits");
+        let evicted = atlas.allocate((8, 8)).expect("fits");
+        let run_with = |tile: AtlasTile| GlyphRun {
+            color: Color::BLACK,
+            glyphs: vec![PositionedGlyph {
+                tile,
+                position: Point::new(1.0, 2.0),
+                size: Size::new(8.0, 8.0),
+            }],
+        };
+        let mut canvas = Canvas::new(bounds());
+        assert!(canvas.push_clip(clip()));
+        canvas.push_text(run_with(evicted.tile));
+        canvas.push_text(run_with(kept.tile));
+        assert!(canvas.pop_clip());
+        canvas.push_quad(quad());
+
+        // 5. 正常路径：全部 tile 活着 ⇒ 零过滤（调用方复用原值、零分配）。
+        assert!(
+            canvas.without_stale_glyph_runs(&atlas).is_none(),
+            "无失效 tile 时不得产生任何过滤（回归：正常路径零额外过滤）"
+        );
+
+        // 1. 逐 tile 淘汰（generation 不变）：槽位被新分配复用、纪元前进 ⇒ 旧 tile 失效。
+        let generation = atlas.generation();
+        atlas.deallocate(evicted.id);
+        let replacement = atlas.allocate((8, 8)).expect("淘汰出的槽位会被复用");
+        assert_eq!(
+            replacement.tile.slot, evicted.tile.slot,
+            "本页只放得下两块：淘汰出的槽位必然被复用"
+        );
+        assert_ne!(
+            replacement.tile.slot_epoch, evicted.tile.slot_epoch,
+            "槽位复用必须换纪元"
+        );
+        assert_eq!(
+            atlas.generation(),
+            generation,
+            "F15 的关键前提：逐 tile 淘汰不换代"
+        );
+
+        let (filtered, dropped) = canvas
+            .without_stale_glyph_runs(&atlas)
+            .expect("失效 tile 的 run 必须被过滤");
+        assert_eq!(dropped, 1, "只丢弃失效的那一条 run（诊断计数 +1）");
+        // 2. 未淘汰 tile 的 run 正常保留；顺序与 clip 括号、非字形图元原样不变。
+        let kinds: Vec<(u8, bool)> = filtered
+            .primitives()
+            .iter()
+            .map(|primitive| match primitive {
+                Primitive::Clip(ClipOp::Push(_)) => (0, false),
+                Primitive::GlyphRun(run) => (1, run.glyphs[0].tile == kept.tile),
+                Primitive::Clip(ClipOp::Pop) => (2, false),
+                Primitive::Quad(_) => (3, false),
+                _ => (9, false),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![(0, false), (1, true), (2, false), (3, false)],
+            "过滤后顺序 = 原顺序，clip 括号与非字形图元保留，只剩有效 tile 的 run"
+        );
+        assert_eq!(filtered.bounds(), canvas.bounds(), "bounds 不变");
     }
 }

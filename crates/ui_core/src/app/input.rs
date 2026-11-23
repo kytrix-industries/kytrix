@@ -70,7 +70,7 @@ pub(crate) fn dispatch_action(
         action,
         Action::FocusNext | Action::FocusPrev | Action::Dismiss
     ) {
-        let scope = app.focus_scope(window);
+        let scope = app.modal_scope(window);
         let in_scope = app
             .windows
             .get(&window)
@@ -162,6 +162,26 @@ pub(crate) fn dispatch_input(app: &mut App, window: WindowId, event: InputEvent)
     let mut outcome = InputOutcome::default();
     if !app.windows.contains_key(&window) {
         return outcome;
+    }
+    // E17：记下「最新指针位置」（`Window::pointer_position` 的唯一写入点）。
+    //
+    // 纯记账：不标脏、不请求帧（I3）；悬停 / 光标 / 拖拽仍按各自路径派生。带窗口逻辑坐标的
+    // 指针事件都算 —— `PointerLeave` 自带离开点（三端都提供），因此离开后保留的最后值就是
+    // 离开点；`Scroll` 的位置同样是指针位置。触摸 / 手势（`Magnify` / `Rotate` /
+    // `SmartMagnify`）没有指针语义，不更新。
+    let position = match &event {
+        InputEvent::PointerEnter { position, .. }
+        | InputEvent::PointerMove { position, .. }
+        | InputEvent::PointerDown { position, .. }
+        | InputEvent::PointerUp { position, .. }
+        | InputEvent::PointerLeave { position, .. }
+        | InputEvent::Scroll { position, .. } => Some(*position),
+        _ => None,
+    };
+    if let Some(position) = position
+        && let Some(target) = app.windows.get_mut(&window)
+    {
+        target.note_pointer_position(position);
     }
     app.validate_focus(window);
     match event {
@@ -267,7 +287,8 @@ pub(crate) fn on_pointer_down(
             target.pointer_mut().press = None;
             target.pointer_mut().pending_drag = None;
         }
-        app.remove_node(window, node);
+        // 节点已由别的路径卸载时不再重复收尾：本次按下仍然整体消费（不落到下层控件）。
+        let _ = app.remove_node(window, node);
         return;
     }
     // ② 模态浮层的焦点作用域（R02-12）：作用域外的按下整体消费 —— 不抢焦点、不激活下层
@@ -276,7 +297,7 @@ pub(crate) fn on_pointer_down(
     //    作用域 = 模态子树 **∪ 属于该模态的浮层链**：`create_overlay` 恒把浮层挂 root，所以
     //    对话框里的下拉/菜单必然落在模态子树之外；它们的 `opener` 在模态内（可嵌套递归），
     //    因此仍属于可交互范围（`in_modal_scope`）。旧实现只认子树 ⇒ 菜单项永远点不动。
-    if let Some(scope) = app.focus_scope(window) {
+    if let Some(scope) = app.modal_scope(window) {
         let inside = app.windows.get(&window).is_some_and(|target| {
             hit.is_some_and(|result| {
                 overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
@@ -547,7 +568,7 @@ pub(crate) fn on_scroll(
     };
     // 模态作用域（R02-12）：作用域外的滚动整体消费 —— `inert` 的背景不得被滚轮/触控板滚动
     //（与按下同一条判定，含「属于该模态的弹出层」）。
-    if let Some(scope) = app.focus_scope(window) {
+    if let Some(scope) = app.modal_scope(window) {
         let inside = app.windows.get(&window).is_some_and(|target| {
             overlay_util::in_modal_scope(target.tree(), result.node, Some(scope))
         });
@@ -692,7 +713,7 @@ pub(crate) fn on_key(
         //    背景按钮收不到 Enter；这里再显式校验一次作用域，防止焦点在两次读取之间变化。
         if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
             let focused = app.focused(window);
-            let scope = app.focus_scope(window);
+            let scope = app.modal_scope(window);
             let activation = app.windows.get(&window).and_then(|target| {
                 focused
                     .filter(|node| focus::in_scope(target.tree(), *node, scope))
@@ -717,7 +738,54 @@ pub(crate) fn on_key(
                 return;
             }
         }
-        // ③ 全局绑定（精确匹配 key + modifiers）。
+        // ③a 焦点作用域化绑定（E8）：只有本窗口焦点落在 `scope` 子树内时才命中并消费；
+        //     焦点不在作用域内时**不消费**，继续走 ③b 全局绑定与 ④ 默认键盘行为。
+        //     这是「树的方向键只在自己聚焦时吃掉」与「文本框编辑键」的机制；放在全局绑定
+        //     之前，因此实例级绑定优先于应用级快捷键。
+        //
+        //     嵌套 scope：从焦点节点向上到根逐个 scope 匹配，**由内向外**尝试；第一个
+        //     `Action` 有 handler 且分派成功的消费按键。全部未命中（或无 handler）则回落
+        //     全局绑定 —— 内层显式不处理时外层实例仍有机会，语义与事件冒泡一致。
+        let focused = app.focused(window);
+        let mut scoped_actions: SmallVec<[Action; 4]> = SmallVec::new();
+        if let Some(focused) = focused
+            && let Some(tree) = app.windows.get(&window).map(Window::tree)
+        {
+            let mut cursor = Some(focused);
+            while let Some(scope) = cursor {
+                if let Some(action) = app
+                    .scoped_bindings
+                    .iter()
+                    .find(|scoped| {
+                        scoped.window == window
+                            && scoped.scope == scope
+                            && scoped.binding.key == code
+                            && scoped.binding.modifiers == modifiers
+                    })
+                    .map(|scoped| scoped.binding.action.clone())
+                {
+                    scoped_actions.push(action);
+                }
+                cursor = tree.get(scope).ok().and_then(|target| target.parent());
+            }
+        }
+        if let Some(node) = focused {
+            for action in scoped_actions {
+                if app.dispatch_action_with_hit(
+                    window,
+                    node,
+                    action.clone(),
+                    ActionSource::Key,
+                    None,
+                    modifiers,
+                ) {
+                    outcome.action = Some(action);
+                    outcome.target = Some(node);
+                    return;
+                }
+            }
+        }
+        // ③b 全局绑定（精确匹配 key + modifiers）。
         //
         //    绑定是**应用级**语义（`Ctrl+S`、`Tab`、`Esc`），不是「激活某个节点」：它不受模态
         //    作用域限制（对话框里仍要能按 Esc 关闭、Tab 遍历模态内控件）。target 只是
@@ -729,9 +797,8 @@ pub(crate) fn on_key(
             .find(|binding| binding.key == code && binding.modifiers == modifiers)
             .map(|binding| binding.action.clone());
         if let Some(action) = binding {
-            let node = app
-                .focused(window)
-                .or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
+            let node =
+                focused.or_else(|| app.windows.get(&window).map(|target| target.tree().root()));
             let Some(node) = node else {
                 return;
             };
@@ -923,7 +990,13 @@ pub(crate) fn cancel_pointer_session(app: &mut App, window: WindowId) {
 // ── 悬停（R02-4） ──────────────────────────────────────────────────────────
 
 /// 从 `node` 到根的祖先链（由外到内）。悬停链就是 CSS `:hover` 的作用集合。
-fn hover_chain(tree: &crate::node::tree::NodeTree, node: Option<NodeId>) -> SmallVec<[NodeId; 8]> {
+///
+/// 消费者：`update_hover`、`revalidate_hover`、`window_set::remove`（子树卸载前记取悬停链；
+/// 见 [`cleanup_removed_pointer_state`]）。
+pub(crate) fn hover_chain(
+    tree: &crate::node::tree::NodeTree,
+    node: Option<NodeId>,
+) -> SmallVec<[NodeId; 8]> {
     let mut chain = SmallVec::new();
     let mut cursor = node;
     while let Some(current) = cursor {
@@ -938,12 +1011,21 @@ fn hover_chain(tree: &crate::node::tree::NodeTree, node: Option<NodeId>) -> Smal
 }
 
 /// 更新悬停节点；有迁移时派生 [`Event::HoverChanged`]、标 `PAINT` 并请求一帧。
-fn update_hover(app: &mut App, window: WindowId, next: Option<NodeId>) {
+///
+/// **受模态作用域约束**（E12）：作用域外的命中视为「没有悬停」。旧 `BlockMouse` 的 hitbox
+/// 同时挡住命中与 hover；引擎的模态作用域必须给出同一语义，否则对话框打开时背景的
+/// `:hover` 与 tooltip 仍会亮起、并画在对话框之上（P2-4b R07）。
+fn update_hover(app: &mut App, window: WindowId, mut next: Option<NodeId>) {
     let (left, entered) = {
         let Some(target) = app.windows.get(&window) else {
             return;
         };
         let tree = target.tree();
+        // 模态作用域外 ⇒ 无悬停；作用域内（模态子树 / 属于模态的弹出层）照常。
+        let scope = overlay_util::focus_scope_root(tree, tree.root());
+        next = next.filter(|node| {
+            tree.get(*node).is_ok() && overlay_util::in_modal_scope(tree, *node, scope)
+        });
         // 陈旧节点（已被卸载）视为「无悬停」：虚拟列表回收行之后旧 id 会留在槽里。
         let previous = target
             .pointer()
@@ -1002,10 +1084,105 @@ fn update_hover(app: &mut App, window: WindowId, next: Option<NodeId>) {
     app.request_frame();
 }
 
+/// 模态作用域变化（模态浮层打开 / 关闭 / 提层）后重算悬停。
+///
+/// 作用域外的悬停必须**立刻结束**：应用可能用 `App::hovered` 驱动 tooltip / `:hover`
+/// 样式，而指针没有移动就不会有新的 `PointerMove` —— 不重算的话背景 tooltip 会一直显示到
+/// 用户移动鼠标（P2-4b R07 的「tooltip 画在模态之上」）。消费者：`create_overlay` /
+/// `bring_overlay_to_front`（只在 `trap_focus` 浮层发生变化时调用）。
+pub(crate) fn revalidate_hover(app: &mut App, window: WindowId) {
+    let next = app
+        .windows
+        .get(&window)
+        .and_then(|target| target.pointer().hovered);
+    update_hover(app, window, next);
+}
+
+/// 子树卸载后的指针会话收尾（E16b / F1）：清掉落在被删集合里的悬停 / 按压 / 待定拖拽 / 最近
+/// 命中，并为「悬停链被卸载」派生一条 [`Event::HoverChanged`]（`hovered: None`，`left` 是删前
+/// 链由内到外）。消费者：`window_set::remove`。
+///
+/// `removed_hover_chain` 必须由调用方在**删树前**用 [`hover_chain`] 记取（`None` = 悬停不在
+/// 被删子树，只做前三项清理）：[`update_hover`] 的 `previous` 会把已卸载节点过滤成 `None`，
+/// 删后补调 [`revalidate_hover`] 会因 `previous == next == None` 早退 —— 应用侧的 tooltip /
+/// `:hover` 状态会残留到下一次指针移动。删除后引擎不再知道指针位置，因此悬停直接结束
+/// （`hovered: None`）而不是猜测新目标（与模态作用域变化的收尾口径一致）。
+pub(crate) fn cleanup_removed_pointer_state(
+    app: &mut App,
+    window: WindowId,
+    removed: &ahash::HashSet<NodeId>,
+    removed_hover_chain: Option<SmallVec<[NodeId; 8]>>,
+) {
+    let Some(target) = app.windows.get_mut(&window) else {
+        return;
+    };
+    {
+        let pointer = target.pointer_mut();
+        // 按下 / 待定拖拽 / 最近命中落在被删子树 ⇒ 作废：否则抬起会把 click / `DragPhase`
+        // 派发到已经不存在的节点上。捕获路径已由 `cancel_pointer_session` 收尾，这里是
+        // 「没有捕获的悬停 / 捕获在别处」路径的兜底。
+        if pointer
+            .press
+            .is_some_and(|press| press.node.is_some_and(|node| removed.contains(&node)))
+        {
+            pointer.press = None;
+        }
+        if pointer
+            .pending_drag
+            .as_ref()
+            .is_some_and(|pending| removed.contains(&pending.node))
+        {
+            pointer.pending_drag = None;
+        }
+        if pointer
+            .last_hit
+            .is_some_and(|hit| removed.contains(&hit.node))
+        {
+            pointer.last_hit = None;
+        }
+    }
+    let Some(chain) = removed_hover_chain else {
+        return;
+    };
+    target.pointer_mut().hovered = None;
+    // 存活的祖先也失去悬停：`:hover` / `bind_style` 必须重算（与 `update_hover` 同一口径 ——
+    // 只标挂了动态绑定的节点，死节点无法再标脏）。
+    let marked: SmallVec<[NodeId; 8]> = chain
+        .iter()
+        .copied()
+        .filter(|node| {
+            target
+                .tree()
+                .get(*node)
+                .is_ok_and(|slot| slot.has_bindings())
+        })
+        .collect();
+    for node in marked {
+        target.tree_mut().mark_bind(node);
+        target.tree_mut().mark_paint(node);
+    }
+    let left: Vec<NodeId> = chain.iter().rev().copied().collect();
+    app.events.push(
+        window,
+        Event::HoverChanged {
+            hovered: None,
+            left,
+            entered: Vec::new(),
+        },
+    );
+    // 光标同样来自被卸载的悬停链：没有指针位置可以重算 ⇒ 回到默认（下一次移动会纠正）。
+    update_cursor(app, window, None);
+    app.request_frame();
+}
+
 /// 悬停变化后重新解析光标（只有变化时才推给平台）。
 fn update_cursor(app: &mut App, window: WindowId, hit: Option<HitResult>) {
     let cursor = app.windows.get(&window).map_or(Cursor::Default, |target| {
-        focus::resolve_cursor(target.tree(), hit.map(|result| result.node))
+        let tree = target.tree();
+        // 模态作用域外不解析指针形状：背景的手型/缩放光标不得在对话框上显示（与 hover 同源）。
+        let scope = overlay_util::focus_scope_root(tree, tree.root());
+        let hit = hit.filter(|result| overlay_util::in_modal_scope(tree, result.node, scope));
+        focus::resolve_cursor(tree, hit.map(|result| result.node))
     });
     let mut changed = false;
     if let Some(target) = app.windows.get_mut(&window) {

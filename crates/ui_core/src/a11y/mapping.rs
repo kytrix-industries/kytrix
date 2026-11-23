@@ -41,7 +41,12 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::ListBoxOption => Role::ListBoxOption,
         R::Table => Role::Table,
         R::Grid => Role::Grid,
+        // 树（E9）：三端 adapter 都直接按角色映射（Windows `UIA_TreeControlTypeId` /
+        // macOS `NSAccessibilityOutlineRole` + outline row subrole / AT-SPI `tree`/`tree item`），
+        // 平台层不需要额外接线。
+        R::Tree => Role::Tree,
         R::Row => Role::Row,
+        R::TreeItem => Role::TreeItem,
         R::Cell => Role::Cell,
         // 表头（R13-3）：UIA 的 `ITableItemProvider::GetColumnHeaderItems` / AT-SPI 的
         // `getColumnHeader` 由角色推导，缺这两个角色时交易表格的列名永远到不了 AT。
@@ -56,7 +61,23 @@ pub(crate) const fn role_to_accesskit(role: A11yRole) -> accesskit::Role {
         R::MenuBar => Role::MenuBar,
         R::MenuItem => Role::MenuItem,
         R::Dialog => Role::Dialog,
+        // E12：警告对话框 / 标签页 / 分隔符（AccessKit 0.25 同名同义）。
+        R::AlertDialog => Role::AlertDialog,
         R::Tooltip => Role::Tooltip,
+        R::TabList => Role::TabList,
+        R::Tab => Role::Tab,
+        // AccessKit 0.25 **没有** `Role::Separator`：ARIA `separator` 的等价角色是 `Splitter`
+        // （`accesskit_windows` 映射 `UIA_SeparatorControlTypeId`、`accesskit_atspi_common`
+        // 映射 `AtspiRole::Separator`、`accesskit_macos` 映射 `NSAccessibilitySplitterRole`）。
+        R::Separator => Role::Splitter,
+        // E15：组合控件 / 颜色控件。AccessKit 0.25 有同名角色，三端 adapter 直接按角色映射
+        // （见 `A11yRole` 各变体的文档；`ColorWell` 在 UIA/AT-SPI 上退化为按钮语义）。
+        R::ComboBox => Role::ComboBox,
+        R::ListBox => Role::ListBox,
+        // AccessKit 0.25 的拼写是 `MenuItemCheckBox`（大写 B，与本项目既有 `CheckBox` 一致）。
+        R::MenuItemCheckBox => Role::MenuItemCheckBox,
+        R::MenuItemRadio => Role::MenuItemRadio,
+        R::ColorWell => Role::ColorWell,
     }
 }
 
@@ -137,6 +158,16 @@ pub(crate) const fn sort_to_accesskit(sort: crate::a11y::A11ySort) -> accesskit:
     }
 }
 
+/// 方向 → `accesskit::Orientation`（E15；滑条 / 色盘等轴向控件用）。
+pub(crate) const fn orientation_to_accesskit(
+    orientation: crate::a11y::A11yOrientation,
+) -> accesskit::Orientation {
+    match orientation {
+        crate::a11y::A11yOrientation::Horizontal => accesskit::Orientation::Horizontal,
+        crate::a11y::A11yOrientation::Vertical => accesskit::Orientation::Vertical,
+    }
+}
+
 /// 窗口客户区相对、**物理像素**的边界盒（逻辑 × scale，逐边 round；含祖先滚动偏移的屏幕化）。
 ///
 /// 三个平台桥接都要求这个坐标系（逐条核对过上游实现）：
@@ -178,8 +209,15 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         // 种类**自动推导**的（虚拟列表的每一行），无脑声明 Click 会让没有任何点击处理的
         // 行也暴露 Invoke 模式 —— 用户按下去什么都不会发生（复审 P2-4）。
         // 真实能力由 `effective_actions` 统一补：节点声明了 `on_click`/`on_action` 就会得到
-        // `Click`，与角色无关。
-        R::CheckBox | R::Switch | R::RadioButton | R::MenuItem | R::ListBoxOption => Vec::new(),
+        // `Click`，与角色无关。E15 的可勾选菜单项（`MenuItemCheckBox` / `MenuItemRadio`）
+        // 与 `MenuItem` 同纪律：勾选态走 `checked`，激活能力由真实接线决定。
+        R::CheckBox
+        | R::Switch
+        | R::RadioButton
+        | R::MenuItem
+        | R::MenuItemCheckBox
+        | R::MenuItemRadio
+        | R::ListBoxOption => Vec::new(),
         // 滑块：数值通过 `numeric_value` 通道暴露，写值走 `SetValue`（UIA 的
         // `RangeValuePattern.SetValue` 带 `NumericValue` payload），步进走
         // Increment/Decrement（P2-8 / review P2-5）。
@@ -192,6 +230,13 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
         R::TextInput | R::MultilineTextInput => vec![A::SetValue],
         // 文本运行：选区是它唯一的原生动作（选择不改变数据，`read_only` 不剔除）。
         R::TextRun => vec![A::SetTextSelection],
+        // E12：`Dialog` / `Menu` **不再**默认宣告 `Expand`/`Collapse`。
+        //
+        // `aria-expanded` 属于「展开触发器」（combo box / menu button / tree item），不属于
+        // 被展开的对话框或菜单本身；旧表让每个浮层包装节点都暴露 Expand/Collapse，AT 会为
+        // 任何浮层读出「可展开」的死动作（P2-4b R12）。真实的展开能力由节点声明
+        // `on_click`/`on_action` 或显式 `A11yOverride::actions` 给出。
+        R::Dialog | R::AlertDialog | R::Menu => Vec::new(),
         R::ScrollView => vec![
             A::ScrollUp,
             A::ScrollDown,
@@ -200,10 +245,13 @@ pub(crate) fn default_actions(role: A11yRole) -> Vec<A11yAction> {
             A::ScrollIntoView,
             A::SetScrollOffset,
         ],
-        R::Dialog | R::Menu => vec![A::Expand, A::Collapse],
         // 表格/网格的 `ScrollIntoView` 由 `effective_actions` 按「是否真的有滚动容器」补
         // （无滚动祖先时该动作必然失败）。
         R::Table | R::Grid => Vec::new(),
+        // E15：组合框 / 列表框 / 色块也没有「无接线就成立」的默认动作 —— 展开/收起是真实状态机
+        // （`on_click` + `A11yPatch::expanded`），色块打开取色器同样是普通 Action；能力由
+        // `effective_actions` 按真实接线补（与 `Dialog` / `Menu` 同纪律，避免死 Expand）。
+        R::ComboBox | R::ListBox | R::ColorWell => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -216,7 +264,7 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
         return R::Window;
     }
     match target.kind() {
-        NodeKind::Canvas(_) | NodeKind::Geometry(_) => return R::Image,
+        NodeKind::Canvas(_) | NodeKind::Geometry(_) | NodeKind::Image(_) => return R::Image,
         // 文本节点的角色取决于父节点：文本输入框里的文本是 **`TextRun`**（AccessKit 的
         // `TextPosition.node` 硬性要求 `Role::TextRun` 才承认 `text_selection`），其余场合
         // 是 `Label`（可访问名走 `value`）。
@@ -231,13 +279,27 @@ pub(crate) fn role_by_kind(tree: &NodeTree, node: NodeId, target: &Node) -> A11y
     }
     // 虚拟列表**先判**：它也带滚动槽，但语义是 `List`（滚动动作由 `effective_actions` 补）。
     if tree.virtual_slot(node).is_some() {
+        // E15：集合语义容器（Table/Grid/Tree/ListBox/Menu）内部的**虚拟窗口**不再自动声明
+        // `List`（E9 残余 R2）。窗口只是布局实现细节；`GenericContainer` 会被平台的
+        // `common_filter` 透明上提，AT 因此看到干净的 `Table → Row` / `Tree → TreeItem` /
+        // `ListBox → ListBoxOption` / `Menu → MenuItem`。
+        if crate::a11y::tree::is_suppressed_list_window(tree, node) {
+            return R::GenericContainer;
+        }
         return R::List;
     }
     if tree.scroll_slot(node).is_some() {
         return R::ScrollView;
     }
+    // 浮层包装节点**不推导语义角色**（E12）：它只是布局/命中容器，真实语义由应用在创建时
+    // 显式声明（`OverlayOptions::a11y`）或落在子树的语义节点上。旧实现把所有浮层包装推导成
+    // `Dialog`，连菜单 / tooltip 都被 AT 读成对话框（P2-4b R12）。无声明 ⇒ `GenericContainer`
+    // （平台 `common_filter` 会把纯泛型容器透明上提，不会多出一层噪声）。
+    //
+    // 注意 `hidden` 是另一条通道：包装节点若显式 `hidden = true` 会沿 a11y 子树隐藏**整个
+    // 浮层内容**（AccessKit 的 hidden 向下继承）——「透明容器」不等于「隐藏容器」。
     if tree.overlay_slot(node).is_some() {
-        return R::Dialog;
+        return R::GenericContainer;
     }
     if is_virtual_row(tree, node) {
         return R::ListBoxOption;
@@ -318,19 +380,23 @@ pub(crate) fn effective_actions(
         .and_then(|patch| patch.actions.clone())
         .or_else(|| over.and_then(|over| over.actions.clone()))
         .unwrap_or_else(|| default_actions(role));
-    // 带滚动槽的节点（含虚拟列表容器）总能接受滚动动作，与角色无关。
-    if tree.scroll_slot(node).is_some() {
+    // 带滚动槽的节点（含虚拟列表容器）总能接受滚动动作，与角色无关。E15b/F4：集合根在
+    // 「自己的虚拟行窗口被平台过滤」时接管窗口的滚动语义 ⇒ 它也必须宣告同一套滚动动作，
+    // 否则 AT 读到 `scroll` 属性却没有任何可执行动作。
+    let lifted_scroll = crate::a11y::tree::lifted_scroll_window(tree, node);
+    if tree.scroll_slot(node).is_some() || lifted_scroll.is_some() {
         for action in default_actions(A11yRole::ScrollView) {
             if !actions.contains(&action) {
                 actions.push(action);
             }
         }
     }
-    // 表格/网格只有在**真的有滚动容器**（自身滚动槽或滚动祖先）时才提供
+    // 表格/网格只有在**真的有滚动容器**（自身滚动槽 / 上提的虚拟窗口 / 滚动祖先）时才提供
     // `ScrollIntoView`：没有滚动容器时该动作必然失败，暴露出去等于给 AT 一个死按钮
     // （复审 P2-4）。
     if matches!(role, A11yRole::Table | A11yRole::Grid)
         && (tree.scroll_slot(node).is_some()
+            || lifted_scroll.is_some()
             || crate::interaction::scroll::scroll_ancestor(tree, node).is_some())
         && !actions.contains(&A11yAction::ScrollIntoView)
     {
@@ -422,7 +488,9 @@ pub(crate) fn action_allowed(tree: &NodeTree, node: NodeId, action: A11yAction) 
         | A11yAction::ScrollRight
         | A11yAction::ScrollIntoView
         | A11yAction::SetScrollOffset => {
-            let Some(container) = scroll_container(tree, node) else {
+            // 与派发共用同一份目标解析（`a11y_scroll_target`）：不能出现「能力判据解析到
+            // 窗口、派发却解析到别的容器」的分叉。
+            let Some(container) = crate::a11y::tree::a11y_scroll_target(tree, node) else {
                 return false;
             };
             effective_actions_of(tree, container).contains(&action)
@@ -503,14 +571,6 @@ fn custom_action_registered(tree: &NodeTree, node: NodeId, id: i32) -> bool {
             .map_or(&[][..], |over| over.custom_actions.as_slice()),
     };
     registered.iter().any(|custom| custom.id == id)
-}
-
-/// 滚动动作的目标收敛（自身有滚动槽就用自身，否则最近的滚动祖先）。
-fn scroll_container(tree: &NodeTree, node: NodeId) -> Option<NodeId> {
-    if tree.scroll_slot(node).is_some() {
-        return Some(node);
-    }
-    crate::interaction::scroll::scroll_ancestor(tree, node).map(|(container, _)| container)
 }
 
 /// 节点的 a11y "禁用"状态（`node_a11y` 与动作分发**共用同一判据**）。
@@ -626,10 +686,25 @@ pub(crate) fn is_hidden(
     if matches!(target.style().inner.display, taffy::style::Display::None) {
         return true;
     }
-    // 自绘节点必须有替代文本，否则 hidden + 诊断（§7.4 / §5.4）。
-    matches!(target.kind(), NodeKind::Canvas(_) | NodeKind::Geometry(_))
-        && label.is_none()
+    // 自绘 / 图片节点必须有替代文本，否则 hidden（§7.4 / §5.4）。E7：图片节点的可访问名只能
+    // 来自 `A11yOverride::label`（`ImageContent` 不承载 alt），没有则视为装饰图。注意这是
+    // **兜底** hidden：显式 `A11yOverride { hidden: true }` 才是装饰声明（免 `MissingAltText`，
+    // 见 `a11y::tree` 的诊断判定），两者对 `hidden` 的结论相同、对诊断的结论不同。
+    matches!(
+        target.kind(),
+        NodeKind::Canvas(_) | NodeKind::Geometry(_) | NodeKind::Image(_)
+    ) && label.is_none()
         && role == A11yRole::Image
+}
+
+/// 图片节点的**显式装饰声明**（P2-1b3 裁决）：`A11yOverride { hidden: true }`。
+///
+/// 与 [`is_hidden`] 的兜底区分：没有 label 的图片本来就会被兜底标 `hidden`，但只有**显式**
+/// hidden 才是「这是装饰图、不需要可访问名」的语义声明 —— 免 `MissingAltText` 诊断；兜底
+/// hidden 的图片仍记诊断（应用应给 label 或显式声明装饰）。`Canvas` / `Geometry` 不适用
+/// （它们的替代文本是必需语义，hidden 不是装饰声明）。
+pub(crate) fn is_decorative_image(target: &Node, over: Option<&A11yOverride>) -> bool {
+    over.is_some_and(|over| over.hidden) && matches!(target.kind(), NodeKind::Image(_))
 }
 
 /// 禁用判定：动态/静态声明，或 `interactive == Some(false)`（与 `focusable` 同源）。
@@ -648,11 +723,12 @@ mod tests {
     use super::{
         a11y_disabled, a11y_read_only, action_allowed, action_from_accesskit, action_to_accesskit,
         bounds_of, default_actions, effective_actions, is_disabled, is_hidden, is_value_mutation,
-        role_by_kind, role_to_accesskit, sort_to_accesskit,
+        orientation_to_accesskit, role_by_kind, role_to_accesskit, sort_to_accesskit,
     };
     use crate::{
         a11y::{
-            A11yAction, A11yLabel, A11yLabelSource, A11yOverride, A11yPatch, A11yRole, A11ySort,
+            A11yAction, A11yLabel, A11yLabelSource, A11yOrientation, A11yOverride, A11yPatch,
+            A11yRole, A11ySort,
         },
         layout::hit_test::HitShape,
         math::{PhysicalRect, Scale},
@@ -696,7 +772,9 @@ mod tests {
                 | A11yRole::ListBoxOption
                 | A11yRole::Table
                 | A11yRole::Grid
+                | A11yRole::Tree
                 | A11yRole::Row
+                | A11yRole::TreeItem
                 | A11yRole::Cell
                 | A11yRole::ColumnHeader
                 | A11yRole::RowHeader
@@ -708,7 +786,17 @@ mod tests {
                 | A11yRole::MenuBar
                 | A11yRole::MenuItem
                 | A11yRole::Dialog
-                | A11yRole::Tooltip => 1,
+                | A11yRole::AlertDialog
+                | A11yRole::Tooltip
+                | A11yRole::TabList
+                | A11yRole::Tab
+                | A11yRole::Separator
+                // E15：组合控件 / 颜色控件。
+                | A11yRole::ComboBox
+                | A11yRole::ListBox
+                | A11yRole::MenuItemCheckBox
+                | A11yRole::MenuItemRadio
+                | A11yRole::ColorWell => 1,
             }
         }
 
@@ -748,6 +836,88 @@ mod tests {
             role_to_accesskit(A11yRole::TextRun),
             accesskit::Role::TextRun
         );
+        // 树（E9）：`Tree` / `TreeItem` 与 AccessKit 0.25 同名同义；三端 adapter 都按角色
+        // 直接映射（Windows UIA tree/tree item、macOS outline/outline row、AT-SPI tree/tree item）。
+        assert_eq!(role_to_accesskit(A11yRole::Tree), accesskit::Role::Tree);
+        assert_eq!(
+            role_to_accesskit(A11yRole::TreeItem),
+            accesskit::Role::TreeItem
+        );
+        // `ALL` 必须真的收录树角色（漏列 ⇒ 上面的求和断言红，这里给出更直接的失败面）。
+        assert!(
+            A11yRole::ALL.contains(&A11yRole::Tree),
+            "A11yRole::ALL 必须包含 Tree"
+        );
+        assert!(
+            A11yRole::ALL.contains(&A11yRole::TreeItem),
+            "A11yRole::ALL 必须包含 TreeItem"
+        );
+        // E12 浮层 / 标签页角色：AccessKit 0.25 同名映射（`Separator` 对应 0.25 的
+        // `Splitter` —— 见 `role_to_accesskit` 的注释）。
+        assert_eq!(
+            role_to_accesskit(A11yRole::AlertDialog),
+            accesskit::Role::AlertDialog
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::TabList),
+            accesskit::Role::TabList
+        );
+        assert_eq!(role_to_accesskit(A11yRole::Tab), accesskit::Role::Tab);
+        assert_eq!(
+            role_to_accesskit(A11yRole::Separator),
+            accesskit::Role::Splitter,
+            "ARIA separator → AccessKit 0.25 Splitter（UIA Separator/AT-SPI separator）"
+        );
+        for role in [
+            A11yRole::AlertDialog,
+            A11yRole::TabList,
+            A11yRole::Tab,
+            A11yRole::Separator,
+        ] {
+            assert!(
+                A11yRole::ALL.contains(&role),
+                "A11yRole::ALL 必须包含 E12 新增角色 {role:?}"
+            );
+        }
+        // E15：组合控件 / 颜色控件 —— AccessKit 0.25 同名映射（`MenuItemCheckBox` 是 0.25 的
+        // 精确拼写；`ColorWell` 在 UIA/AT-SPI 上退化为按钮语义，见 `A11yRole::ColorWell` 文档）。
+        assert_eq!(
+            role_to_accesskit(A11yRole::ComboBox),
+            accesskit::Role::ComboBox,
+            "下拉/选择器触发器（UIA ComboBox / macOS PopUpButton / AT-SPI comboBox）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::ListBox),
+            accesskit::Role::ListBox,
+            "列表框容器（UIA List / macOS List / AT-SPI list box）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::MenuItemCheckBox),
+            accesskit::Role::MenuItemCheckBox,
+            "可勾选菜单项（UIA CheckBox ControlType + menuitemcheckbox / AT-SPI check menu item）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::MenuItemRadio),
+            accesskit::Role::MenuItemRadio,
+            "单选菜单项（UIA RadioButton ControlType + menuitemradio / AT-SPI radio menu item）"
+        );
+        assert_eq!(
+            role_to_accesskit(A11yRole::ColorWell),
+            accesskit::Role::ColorWell,
+            "色块（macOS 有专用 ColorWell；UIA/AT-SPI 退化为按钮 + 值）"
+        );
+        for role in [
+            A11yRole::ComboBox,
+            A11yRole::ListBox,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
+            A11yRole::ColorWell,
+        ] {
+            assert!(
+                A11yRole::ALL.contains(&role),
+                "A11yRole::ALL 必须包含 E15 新增角色 {role:?}"
+            );
+        }
     }
 
     /// `aria-sort` 的三个状态都必须有映射（UIA/AT-SPI 靠它播报"按价格升序"）。
@@ -765,6 +935,19 @@ mod tests {
             sort_to_accesskit(A11ySort::None),
             accesskit::SortDirection::Other,
             "AccessKit 没有 None 变体：未排序 = Other"
+        );
+    }
+
+    /// E15：方向的两个取值都必须有映射（滑条 / 色盘的轴向语义；三端读同一属性）。
+    #[test]
+    fn orientations_map_to_accesskit() {
+        assert_eq!(
+            orientation_to_accesskit(A11yOrientation::Horizontal),
+            accesskit::Orientation::Horizontal
+        );
+        assert_eq!(
+            orientation_to_accesskit(A11yOrientation::Vertical),
+            accesskit::Orientation::Vertical
         );
     }
 
@@ -806,8 +989,37 @@ mod tests {
         assert_eq!(default_actions(A11yRole::Button), vec![A11yAction::Click]);
         assert!(default_actions(A11yRole::TextInput).contains(&A11yAction::SetValue));
         assert!(default_actions(A11yRole::ScrollView).contains(&A11yAction::ScrollIntoView));
-        assert!(default_actions(A11yRole::Dialog).contains(&A11yAction::Expand));
+        // E12：对话框 / 菜单 / 警告对话框**不再**默认宣告 Expand/Collapse —— `aria-expanded`
+        // 属于展开触发器，不属于被展开的容器本身（P2-4b R12）。真实能力由节点声明补。
+        for role in [
+            A11yRole::Dialog,
+            A11yRole::AlertDialog,
+            A11yRole::Menu,
+            A11yRole::TabList,
+            A11yRole::Tab,
+            A11yRole::Separator,
+        ] {
+            assert!(
+                default_actions(role).is_empty(),
+                "{role:?} 的默认动作表必须为空（不暴露死 Expand/Collapse）"
+            );
+        }
         assert!(default_actions(A11yRole::Label).is_empty());
+        // E15：组合框 / 列表框 / 色块 / 可勾选菜单项也没有「无接线就成立」的默认动作（展开态是
+        // 真实状态机、激活能力由 on_click 接线决定；勾选态走 checked 通道）—— 避免死 Expand /
+        // 死按钮（与 Dialog / Menu 同纪律）。
+        for role in [
+            A11yRole::ComboBox,
+            A11yRole::ListBox,
+            A11yRole::ColorWell,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
+        ] {
+            assert!(
+                default_actions(role).is_empty(),
+                "{role:?} 的默认动作表必须为空（能力由 effective_actions 按真实接线补）"
+            );
+        }
     }
 
     /// P2-4：可勾选控件的 `Click` 必须由**真实能力**决定（节点声明了 on_click 才有），
@@ -820,6 +1032,8 @@ mod tests {
             A11yRole::Switch,
             A11yRole::RadioButton,
             A11yRole::MenuItem,
+            A11yRole::MenuItemCheckBox,
+            A11yRole::MenuItemRadio,
             A11yRole::ListBoxOption,
         ] {
             let actions = default_actions(role);

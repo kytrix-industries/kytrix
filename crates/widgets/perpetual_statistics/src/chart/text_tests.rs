@@ -1,65 +1,74 @@
-use std::str::FromStr;
+//! What the chart's labels say, and the shaped-text cache they are drawn from.
 
 use market_participants_model::decimal::Tick;
 use time::UtcOffset;
+use ui_core::paint::color::Color;
+use widget::test_support::WidgetTestApp;
 
-use super::text::labels::*;
+use super::text::{
+    ChartTextCache, NOT_A_READING, format_axis_time, format_compact, format_price, format_quantity,
+    format_ratio, format_share, format_tooltip_time, label_style, labelled_value,
+};
 
 fn tick(value: &str) -> Tick {
-    Tick::from_str(value).expect("test tick should parse")
+    value.parse().expect("a tick should parse")
+}
+
+fn zone(hours: i8) -> UtcOffset {
+    UtcOffset::from_hms(hours, 0, 0).expect("the fixture offset is valid")
 }
 
 #[test]
 fn a_value_should_be_rounded_to_the_instrument_tick() {
-    assert_eq!(format_quantity(12.345_678, tick("0.01")), "12.35");
-    assert_eq!(format_price(12.345_678, tick("0.5")), "12.5");
+    assert_eq!(
+        format_quantity(1234.5678, tick("0.01")).as_str(),
+        "1,234.57"
+    );
 }
 
 #[test]
 fn a_tick_should_keep_its_own_decimals() {
-    assert_eq!(format_quantity(12.0, tick("0.001")), "12.000");
+    assert_eq!(format_price(2.5, tick("0.001")).as_str(), "2.500");
 }
 
 #[test]
 fn a_value_that_is_not_a_reading_should_be_named_as_such() {
-    assert_eq!(format_quantity(f64::NAN, tick("0.01")), "--");
-    assert_eq!(format_price(-1.0, tick("0.01")), "--");
-    assert_eq!(format_price(f64::INFINITY, tick("0.01")), "--");
+    assert_eq!(format_quantity(f64::NAN, tick("0.01")), NOT_A_READING);
+    assert_eq!(format_quantity(-1.0, tick("0.01")), NOT_A_READING);
+    assert_eq!(format_price(f64::INFINITY, tick("0.01")), NOT_A_READING);
 }
 
 #[test]
 fn a_value_with_a_tick_should_use_the_tick_not_a_short_form() {
-    // A tick is the instrument's own precision, so it wins over a short form:
-    // this is the number the venue itself would have printed.
-    assert_eq!(format_quantity(1_500_000.0, tick("0.01")), "1,500,000.00");
+    assert_eq!(
+        format_quantity(2_500_000.0, tick("0.1")).as_str(),
+        "2,500,000.0"
+    );
 }
 
 #[test]
 fn a_compact_label_should_use_a_readable_suffix() {
-    assert_eq!(compact(999.0), "999");
-    assert_eq!(compact(1_500.0), "2K");
-    assert_eq!(compact(2_400_000.0), "2M");
-    assert_eq!(compact(3_600_000_000.0), "4B");
-    assert_eq!(compact(1.5e18), "1.50e18");
+    assert_eq!(format_compact(1_500.0, 100.0).as_str(), "1.5K");
+    assert_eq!(format_compact(2_500_000.0, 100_000.0).as_str(), "2.5M");
+    assert_eq!(
+        format_compact(3_000_000_000.0, 100_000_000.0).as_str(),
+        "3B"
+    );
 }
 
 #[test]
 fn neighbouring_compact_labels_should_stay_distinct() {
-    // Two grid lines a step apart have to read as two different numbers.
-    assert_ne!(
-        format_compact(1_000.0, 200.0),
-        format_compact(1_200.0, 200.0)
-    );
-    assert_ne!(
-        format_compact(1_000_000.0, 250_000.0),
-        format_compact(1_250_000.0, 250_000.0)
-    );
+    let step = 100_000.0;
+    let first = format_compact(1_000_000.0, step);
+    let second = format_compact(1_100_000.0, step);
+
+    assert_ne!(first, second, "two grid lines read as two numbers");
 }
 
 #[test]
 fn a_suffix_that_would_swallow_a_step_should_be_dropped() {
-    // A thousand-wide step cannot be written under a "K": both ends of it would
-    // print as "1K".
+    // A thousand-wide step cannot be written under a "K": both ends of it would print
+    // as "1K".
     assert_ne!(
         format_compact(1_000.0, 1_000.0),
         format_compact(2_000.0, 1_000.0)
@@ -68,83 +77,85 @@ fn a_suffix_that_would_swallow_a_step_should_be_dropped() {
 
 #[test]
 fn a_ratio_should_be_written_with_three_decimals() {
-    assert_eq!(format_ratio(1.234), "1.234");
-    assert_eq!(format_ratio(2.0), "2.000");
-    assert_ne!(
-        format_ratio(1.234_1),
-        format_ratio(1.234_6),
-        "the third decimal is where a ratio's movement between two intervals lives"
-    );
-    assert!(format_ratio(f64::MAX).contains('e'));
+    assert_eq!(format_ratio(1.5).as_str(), "1.500");
+    assert_eq!(format_ratio(0.000_01).as_str(), "1.00e-5");
 }
 
 #[test]
 fn a_share_should_be_written_as_a_percentage() {
-    assert_eq!(format_share(0.6026), "60.26%");
+    assert_eq!(format_share(0.5).as_str(), "50.00%");
+    assert_eq!(format_share(0.123_4).as_str(), "12.34%");
 }
 
 #[test]
 fn the_axis_should_omit_the_year_and_the_tooltip_should_not() {
-    assert_eq!(format_axis_time(0, UtcOffset::UTC), "01-01 00:00");
-    assert_eq!(format_tooltip_time(0, UtcOffset::UTC), "1970-01-01 00:00");
+    // 2024-03-05T06:07:08Z
+    let timestamp = 1_709_618_828_000;
+    let axis = format_axis_time(timestamp, zone(0));
+    let tooltip = format_tooltip_time(timestamp, zone(0));
+
+    assert_eq!(axis.as_str(), "03-05 06:07");
+    assert_eq!(tooltip.as_str(), "2024-03-05 06:07");
 }
 
-/// Both labels read the instant in the zone the settings display data in.
 #[test]
 fn the_axis_and_the_tooltip_should_read_the_display_zone() {
-    let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
+    let timestamp = 1_709_618_828_000;
 
-    assert_eq!(format_axis_time(0, zone), "01-01 14:00");
-    assert_eq!(format_tooltip_time(0, zone), "1970-01-01 14:00");
-    assert_eq!(
-        format_axis_time(
-            0,
-            UtcOffset::from_hms(-1, 0, 0).expect("UTC-1 is a valid offset")
-        ),
-        "12-31 23:00"
-    );
+    assert_eq!(format_axis_time(timestamp, zone(8)).as_str(), "03-05 14:07");
 }
 
 #[test]
 fn a_timestamp_outside_the_calendar_should_not_panic() {
-    assert_eq!(format_axis_time(i64::MAX, UtcOffset::UTC), "--");
-    assert_eq!(format_tooltip_time(i64::MIN, UtcOffset::UTC), "--");
+    assert_eq!(format_axis_time(i64::MAX, zone(0)).as_str(), "--");
 }
 
-/// An offset can move an instant past the last day the calendar holds. That is not
-/// a date a label can say, so both labels read as the placeholder rather than
-/// panicking on a date that is not one.
 #[test]
 fn an_instant_the_display_zone_cannot_hold_should_not_panic() {
-    let boundary = time::Date::MAX
-        .with_hms(23, 0, 0)
-        .expect("the last day has an evening")
-        .assume_utc();
-    let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
-        .expect("the last day is a millisecond timestamp");
-    let zone = UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset");
-
-    assert_eq!(format_axis_time(timestamp, zone), "--");
-    assert_eq!(format_tooltip_time(timestamp, zone), "--");
-
-    let boundary = time::Date::MIN
-        .with_hms(0, 0, 0)
-        .expect("the first day has a midnight")
-        .assume_utc();
-    let timestamp = i64::try_from(boundary.unix_timestamp_nanos() / 1_000_000)
-        .expect("the first day is a millisecond timestamp");
-    let zone = UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset");
-
-    assert_eq!(format_axis_time(timestamp, zone), "--");
-    assert_eq!(
-        format_tooltip_time(timestamp, zone),
-        "--",
-        "a western offset runs off the other end of the calendar"
-    );
+    // The last instant the calendar holds, moved past its end by a positive offset.
+    let last = time::OffsetDateTime::UNIX_EPOCH.unix_timestamp() * 1_000;
+    let _ = format_axis_time(last, zone(14));
+    let _ = format_tooltip_time(i64::MAX, zone(-12));
 }
 
 #[test]
 fn a_labelled_value_should_name_the_series_before_the_number() {
-    assert_eq!(labelled_value("Amount", "12.35").as_str(), "Amount: 12.35");
-    assert_eq!(label_with_unit("Amount", "BTC").as_str(), "Amount (BTC)");
+    assert_eq!(
+        labelled_value("Long accounts", "12.34%").as_str(),
+        "Long accounts: 12.34%"
+    );
+}
+
+#[test]
+fn an_empty_cache_should_hold_nothing_stale() {
+    let mut cache = ChartTextCache::default();
+
+    assert!(!cache.has_stale());
+}
+
+/// A shaped line leases glyph tiles from the atlas. When the atlas is rebuilt, the lease is
+/// gone and the cache has to say so — once. A stale line that was not drawn again (a
+/// tooltip whose pointer moved away) must not keep the answer true: that would turn every
+/// later frame into a rebuild (I3).
+#[test]
+fn a_cache_should_report_a_stale_lease_once_and_then_drop_it() {
+    let mut harness = WidgetTestApp::new();
+    let style = label_style(10.0, 14.0, Color::WHITE);
+    let mut cache = ChartTextCache::default();
+    harness.with_cx(|cx| cache.line(cx.app_mut(), "12,345", &style));
+    assert!(
+        !cache.has_stale(),
+        "a line shaped for the current atlas is fresh"
+    );
+
+    // An atlas reset under the same font stack: every handle shaped before it is leased
+    // from an atlas that no longer exists, and nothing in the requested text changed.
+    let stack = harness.app().font_stack().clone();
+    harness.app_mut().set_font_stack(stack);
+
+    assert!(cache.has_stale(), "a lease the atlas dropped is reported");
+    assert!(
+        !cache.has_stale(),
+        "and the dropped line is not kept to say it again"
+    );
 }

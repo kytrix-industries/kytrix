@@ -82,6 +82,31 @@ pub(crate) fn mark_subtree_paint(tree: &mut NodeTree, node: NodeId) -> usize {
     touched
 }
 
+// 消费者：`impl NodeTree::mark_subtree_a11y` 的薄委托（外部调用点见该方法文档）。
+/// 整棵子树标 `A11Y`（不冒泡、**不产生像素工作**：无 damage、不清 `REUSABLE`）。
+///
+/// 用于「引擎内部状态变化让**后代**的 a11y 语义整体失效」。三个消费者：
+/// - `a11y::tree::write_a11y_patch`（`bind_a11y` 的两个写点 + `App::set_a11y_patch`）：
+///   `role` / `hidden` 变化改变后代的推导角色 / 领养 / 隐藏继承；
+/// - `app::style_pass::refresh_styles`：`visible` / `interactive` 变化改变后代的隐式
+///   `Focus` / `Click` / `disabled` 能力；
+/// - `app::virtual_list::set_virtual_items`：条目数变化让表格/树的行数、行号、集合位置等
+///   派生字段整体失效（E9c：变化点只标行窗口 + 物理祖先链 ⇒ 表头行/单元格等兄弟分支不会
+///   重进增量笔，AT 会长期读到旧总数）。
+///
+/// 只标 `A11Y`：这些派生的是快照字段，不是布局/像素输入。
+pub(crate) fn mark_subtree_a11y(tree: &mut NodeTree, node: NodeId) -> usize {
+    let mut ids: Vec<NodeId> = Vec::new();
+    tree.for_each_subtree(node, |id| ids.push(id));
+    let mut touched = 0;
+    for id in ids {
+        if tree.touch(id, DirtyFlags::A11Y) {
+            touched += 1;
+        }
+    }
+    touched
+}
+
 // 消费者：`impl NodeTree::clear_bind` 的薄委托（外部调用点见该方法文档）。
 /// 消费 `BIND`（`refresh_styles` 求值完一个节点后调用：唯一清除点）。
 pub(crate) fn clear_bind(tree: &mut NodeTree, node: NodeId) -> bool {

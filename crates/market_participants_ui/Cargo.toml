@@ -6,37 +6,25 @@ edition.workspace = true
 
 [dependencies]
 ahash.workspace = true
-gpui-kit.workspace = true
+futures.workspace = true
 i18n.workspace = true
 log.workspace = true
 smol_str.workspace = true
+taffy.workspace = true
 thiserror.workspace = true
-# The type of a task that did not finish, which the menu reports as its own failure.
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 # Workspace members
 base_ui.workspace = true
 market_participants_connector.workspace = true
 market_participants_model.workspace = true
-# `LocalizedError`: the workspace's one spelling of "this failure, in the user's
-# language", including the catalog errors a failed fetch reports.
+ui_core.workspace = true
 widget.workspace = true
-widget_tokio_runtime.workspace = true
 
 [dev-dependencies]
-# The connection seam a test connects a venue through: the crate's own
-# `test-support` feature, which is never enabled for a release build.
-market_participants_connector = { workspace = true, features = ["test-support"] }
-gpui-kit = { workspace = true, features = ["test-support"] }
-# The market participants root a test builds from typed runtime inputs names the application
-# settings and the transport hub those inputs are made of.
-app_config.workspace = true
-# The configuration notification the root's snapshot handoff is built from.
-app_config_provider.workspace = true
-network.workspace = true
-# The origin a harness points a venue at is a URL, which is what the venue configuration stores.
-url.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+# The headless engine host (`ui_core::test_support::TestApp`) and its probe. Only the
+# test build opens the feature.
+ui_core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

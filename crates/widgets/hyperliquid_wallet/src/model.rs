@@ -27,8 +27,7 @@
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
-use gpui_kit::{App, SharedString};
-use i18n::t;
+use i18n::{t_smol, translate::Translate};
 use market_participants_connector::{
     account::{
         domain::{
@@ -55,7 +54,7 @@ use market_participants_model::{
 use smol_str::{SmolStr, format_smolstr};
 use thiserror::Error;
 use widget::{
-    error::LocalizedError,
+    error::TranslatedError,
     venue::{VenueDisplay as _, route_display_string},
 };
 
@@ -152,30 +151,30 @@ pub(super) enum WalletDataError {
     Codec { operation: &'static str },
 }
 
-impl LocalizedError for WalletDataError {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for WalletDataError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         // The venue this widget reads is named by the catalogue rather than spelled
         // into each message, so a sentence about it follows a rename of it.
-        let market = VenueId::Hyperliquid.display_string(cx);
+        let market = VenueId::Hyperliquid.display_string(translate);
         match self {
-            Self::RouteMismatch { route } => t!(
-                cx,
+            Self::RouteMismatch { route } => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_route_mismatch",
                 market = market,
-                route = route_display_string(route, cx)
+                route = route_display_string(route, translate)
             ),
             // The listing a reading could not be valued for is an identity this
             // message does not print: the row it belongs to was already drawn from
             // the reading, so the failure states what the catalog lacks rather than
             // naming a listing by a key that has no published name here.
-            Self::ListingMissing { route, .. } => t!(
-                cx,
+            Self::ListingMissing { route, .. } => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_listing_missing",
                 market = market,
-                route = route_display_string(route, cx)
+                route = route_display_string(route, translate)
             ),
-            Self::Codec { operation } => t!(
-                cx,
+            Self::Codec { operation } => t_smol!(
+                translate,
                 "widget.hyperliquid_wallet.error_codec",
                 market = market,
                 operation = operation
@@ -443,9 +442,9 @@ impl DisplayPrecision {
     /// A generation that does not name the asset is drawn as the localized unknown:
     /// a digest is not a name, and a name invented here would disagree with every
     /// other pane about the same asset.
-    pub(super) fn asset_label(&self, asset: &AssetId, cx: &App) -> SmolStr {
+    pub(super) fn asset_label(&self, asset: &AssetId, translate: &Translate) -> SmolStr {
         self.asset_name(asset)
-            .unwrap_or_else(|| SmolStr::new(t!(cx, "error.display.unknown_asset").as_ref()))
+            .unwrap_or_else(|| t_smol!(translate, "error.display.unknown_asset"))
     }
 
     /// The published display name of one asset, when the generation names it.
@@ -462,13 +461,13 @@ impl DisplayPrecision {
     pub(super) fn quantity_unit_label(
         &self,
         unit: &market_participants_model::market::units::QuantityUnit,
-        cx: &App,
+        translate: &Translate,
     ) -> Option<SmolStr> {
         use market_participants_model::market::units::QuantityUnit;
 
         match unit {
             QuantityUnit::AssetUnits { asset } | QuantityUnit::Notional { asset } => {
-                Some(self.asset_label(asset, cx))
+                Some(self.asset_label(asset, translate))
             }
             QuantityUnit::Contracts => Some(SmolStr::new_static("contracts")),
             QuantityUnit::OutcomeTokens { .. } => None,
@@ -490,9 +489,13 @@ impl DisplayPrecision {
     /// themselves come from the generation the reading was taken under — this index is
     /// built from that generation's catalogs — so the fallback is the same shared
     /// message every other pane falls back to, not a second wording of its own.
-    pub(super) fn listing_label(&self, listing: &VenueListingKey, cx: &App) -> SmolStr {
+    pub(super) fn listing_label(
+        &self,
+        listing: &VenueListingKey,
+        translate: &Translate,
+    ) -> SmolStr {
         self.listing_name(listing)
-            .unwrap_or_else(|| SmolStr::new(t!(cx, "error.display.unknown_listing").as_ref()))
+            .unwrap_or_else(|| t_smol!(translate, "error.display.unknown_listing"))
     }
 
     /// The published display name of one listing, when the reading describes it.
@@ -518,9 +521,13 @@ impl DisplayPrecision {
     /// for in its quote asset, so the collateral of a listing is the asset its own terms name.
     /// A listing the reading does not describe has no collateral to name, which is a missing
     /// value rather than an unknown name.
-    pub(super) fn listing_collateral_label(&self, listing: &VenueListingKey, cx: &App) -> SmolStr {
+    pub(super) fn listing_collateral_label(
+        &self,
+        listing: &VenueListingKey,
+        translate: &Translate,
+    ) -> SmolStr {
         match self.listing_settlement_asset(listing) {
-            Some(asset) => self.asset_label(asset, cx),
+            Some(asset) => self.asset_label(asset, translate),
             None => SmolStr::new_static("-"),
         }
     }
@@ -1316,7 +1323,7 @@ pub(super) fn now_millis() -> Option<i64> {
 /// When a fill, an order or a transfer happened, read in `zone`, to the second.
 ///
 /// It is what a relative age is a summary of, so it is written the same way for every row.
-pub(super) fn absolute_time(timestamp: i64, zone: time::UtcOffset) -> SharedString {
+pub(super) fn absolute_time(timestamp: i64, zone: time::UtcOffset) -> SmolStr {
     use time::OffsetDateTime;
 
     // The offset can move an instant past the last date the calendar holds — a
@@ -1326,19 +1333,16 @@ pub(super) fn absolute_time(timestamp: i64, zone: time::UtcOffset) -> SharedStri
         .ok()
         .and_then(|time| time.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--"),
+            || SmolStr::new_static("--"),
             |time| {
-                SharedString::new(
-                    format_smolstr!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        time.year(),
-                        u8::from(time.month()),
-                        time.day(),
-                        time.hour(),
-                        time.minute(),
-                        time.second()
-                    )
-                    .as_str(),
+                format_smolstr!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    time.year(),
+                    u8::from(time.month()),
+                    time.day(),
+                    time.hour(),
+                    time.minute(),
+                    time.second()
                 )
             },
         )
@@ -1346,7 +1350,9 @@ pub(super) fn absolute_time(timestamp: i64, zone: time::UtcOffset) -> SharedStri
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::TestAppContext;
+    use std::rc::Rc;
+
+    use i18n::{language::codes::LanguageCode, translate::Translate};
     use market_participants_connector::account::domain::HyperliquidOpenOrder;
 
     use super::*;
@@ -1355,6 +1361,14 @@ mod tests {
         perpetual_state, position, precision_for, precision_of, published_perpetual,
         published_spot, spot_entry, spot_pair, spot_route, spot_state, token, wallet_balance,
     };
+
+    /// The translator the product ships, in the language a test asks for.
+    fn translate(language: LanguageCode) -> Translate {
+        Translate::new(
+            Rc::new(i18n::embedded::load().expect("the embedded locales load")),
+            language,
+        )
+    }
 
     /// The perpetual listing the tests are about, as the fixture publishes it.
     fn perpetual_listing() -> VenueListingKey {
@@ -2169,7 +2183,7 @@ mod tests {
     #[test]
     fn absolute_time_should_be_read_in_the_display_zone_to_the_second() {
         assert_eq!(
-            absolute_time(1_700_000_000_000, time::UtcOffset::UTC).as_ref(),
+            absolute_time(1_700_000_000_000, time::UtcOffset::UTC).as_str(),
             "2023-11-14 22:13:20"
         );
         assert_eq!(
@@ -2177,10 +2191,10 @@ mod tests {
                 1_700_000_000_000,
                 time::UtcOffset::from_hms(8, 0, 0).expect("UTC+8 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "2023-11-15 06:13:20"
         );
-        assert_eq!(absolute_time(i64::MIN, time::UtcOffset::UTC).as_ref(), "--");
+        assert_eq!(absolute_time(i64::MIN, time::UtcOffset::UTC).as_str(), "--");
     }
 
     /// The display offset can move an instant past the last day the calendar holds.
@@ -2199,7 +2213,7 @@ mod tests {
                 timestamp,
                 time::UtcOffset::from_hms(14, 0, 0).expect("UTC+14 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "--"
         );
 
@@ -2215,7 +2229,7 @@ mod tests {
                 timestamp,
                 time::UtcOffset::from_hms(-12, 0, 0).expect("UTC-12 is a valid offset")
             )
-            .as_ref(),
+            .as_str(),
             "--",
             "a western offset runs off the other end of the calendar"
         );
@@ -2238,53 +2252,45 @@ mod tests {
     /// disagree with every other pane about the same asset.
     #[test]
     fn an_unpublished_asset_should_be_named_as_unknown() {
-        let cx = TestAppContext::single();
+        let translate = translate(LanguageCode::En);
 
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("the embedded locales load");
+        let precision = money();
+        let unpublished = token("NOWHERE");
+        let label = precision.asset_label(&unpublished, &translate);
+        let identity = unpublished.to_string();
 
-            let precision = money();
-            let unpublished = token("NOWHERE");
-            let label = precision.asset_label(&unpublished, cx);
-            let identity = unpublished.to_string();
-
-            assert_eq!(
-                label.as_str(),
-                t!(cx, "error.display.unknown_asset").as_ref()
-            );
-            assert_ne!(
-                label.as_str(),
-                identity.as_str(),
-                "a canonical identity is not a name"
-            );
-            assert!(
-                !label.contains("crypto-token") && !label.contains("v1/"),
-                "the label is a name, not an identity: {label}"
-            );
-        });
+        assert_eq!(
+            label.as_str(),
+            t_smol!(&translate, "error.display.unknown_asset").as_str()
+        );
+        assert_ne!(
+            label.as_str(),
+            identity.as_str(),
+            "a canonical identity is not a name"
+        );
+        assert!(
+            !label.contains("crypto-token") && !label.contains("v1/"),
+            "the label is a name, not an identity: {label}"
+        );
     }
 
     /// The same read for a listing: a listing the reading does not describe is the
     /// localized unknown rather than its identity.
     #[test]
     fn a_listing_no_generation_names_should_be_the_localized_unknown() {
-        let cx = TestAppContext::single();
+        let translate = translate(LanguageCode::En);
 
-        cx.update(|cx| {
-            i18n::global::embedded::install(cx).expect("the embedded locales load");
+        let precision = money();
+        let listing = crate::test_support::published_spot("BTC", "USDT");
+        let label = precision.listing_label(&listing, &translate);
 
-            let precision = money();
-            let listing = crate::test_support::published_spot("BTC", "USDT");
-            let label = precision.listing_label(&listing, cx);
-
-            assert_eq!(
-                label.as_str(),
-                t!(cx, "error.display.unknown_listing").as_ref()
-            );
-            assert!(
-                !label.contains("listing-id/v1/"),
-                "an identity is not a name: {label}"
-            );
-        });
+        assert_eq!(
+            label.as_str(),
+            t_smol!(&translate, "error.display.unknown_listing").as_str()
+        );
+        assert!(
+            !label.contains("listing-id/v1/"),
+            "an identity is not a name: {label}"
+        );
     }
 }

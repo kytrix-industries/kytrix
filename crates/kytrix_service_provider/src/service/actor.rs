@@ -31,12 +31,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use url::Url;
-#[cfg(test)]
-use widget_tokio_runtime::runtime::Runtime;
 use yawc::{Frame, OpCode};
 
 #[cfg(test)]
 use crate::auth::test_support::{test_transport, test_transport_policy};
+#[cfg(test)]
+use crate::test_support::test_handle;
 use crate::{
     account_profile::AccountProfile,
     auth::model::SessionAvailability,
@@ -94,7 +94,7 @@ impl ServiceSessionActor {
                 cancellation,
                 wake,
                 transport_policy: test_transport_policy(),
-                runtime: Runtime::for_test(),
+                runtime: test_handle(),
             },
             ResolvedProxy::NoProxy,
             0,
@@ -126,7 +126,7 @@ impl ServiceSessionActor {
                 cancellation,
                 wake,
                 transport_policy: test_transport_policy(),
-                runtime: Runtime::for_test(),
+                runtime: test_handle(),
             },
             ResolvedProxy::NoProxy,
             0,
@@ -897,10 +897,7 @@ impl ServiceSessionActor {
     /// resolves.
     ///
     /// The fence compares against the latest *published* owner projection, not
-    /// against the settings a write already holds: `ConfigEventBridge` publishes
-    /// during the GPUI effect flush, so a configuration write made inside the
-    /// current `App::update` becomes visible to this fence at the end of that
-    /// update, not synchronously.
+    /// against the settings a write already holds: the owner publishes the network\r\n    /// projection after it has committed the write (`ConfigNotification::publish`),\r\n    /// so a configuration write becomes visible to this fence when that publication\r\n    /// lands, not synchronously.
     ///
     /// The fence must consult the current configuration, not only the subscriber
     /// map: `Command::Reconfigure` is what retires a route that a publication

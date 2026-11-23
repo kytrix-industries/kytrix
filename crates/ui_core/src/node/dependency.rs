@@ -101,6 +101,31 @@ impl DependencyGraph {
         }
     }
 
+    /// 某个信号集合里是否存在**不在 `removed` 内**的节点读者；返回第一个（诊断用）。
+    ///
+    /// 消费者：`window_set::remove` 的「作用域归属」校验 —— `remove_node_with_scope` 要释放
+    /// 子树的作用域时，若该作用域的存活信号仍被子树外的节点读取，释放必然破坏那个存活绑定
+    /// （可证明的作用域错配），必须拒绝。
+    pub(crate) fn node_reader_outside(
+        &self,
+        signals: &[SignalId],
+        removed: &ahash::HashSet<NodeId>,
+    ) -> Option<NodeId> {
+        for signal in signals {
+            let Some(owners) = self.dependents.get(signal) else {
+                continue;
+            };
+            for owner in owners {
+                if let Owner::Node { node, .. } = owner
+                    && !removed.contains(node)
+                {
+                    return Some(*node);
+                }
+            }
+        }
+        None
+    }
+
     /// 删除整条表项（空集合清理；`App::write` 的 `retain` 之后）。
     pub(crate) fn remove_signal(&mut self, id: SignalId) -> Option<OwnerSet> {
         self.dependents.remove(&id)

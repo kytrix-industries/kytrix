@@ -20,7 +20,6 @@ members = [
     "crates/profile_ui",
     "crates/settings_ui",
     "crates/updater_ui",
-    "crates/widget_tokio_runtime",
     "crates/widget",
     "crates/widget_gallery_ui",
     "crates/widget_registry",
@@ -94,11 +93,13 @@ dispatch2 = "0.3.1"
 ed25519-dalek = "3.0.0"
 either = "1.19.0"
 embed-resource = "3.0.12"
+# P4-5：应用日志 sink。外壳不再由工具包提供初始化，`log` 宏需要实现；
+# env_logger 由 `RUST_LOG` 配置，未设置时按 `info` 输出到 stderr。
+env_logger = "0.11.12"
 etagere = "0.3.0"
 flate2 = "1.1.11"
 fontique = "0.12.0"
 futures = "0.3.34"
-gpui-kit = { version = "0.9.1", default-features = false }
 hmac = "0.13.0"
 http = "1.5.0"
 hyper = "1.12.0"
@@ -122,6 +123,9 @@ libc = "0.2.191"
 llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
+# W6：`global_shipping_chokepoint` 的海岸线资产要在装载期三角化（偶奇填充、带洞）。
+# 只有该 widget 消费 lyon；引擎与 base_ui 都不做 tessellation（设计 §5.5）。
+lyon = "1.0.19"
 # P13 图片色彩管理（D-8）：image 0.25.10 的**非可选**依赖（`Cargo.lock` 已在 0.8.1），
 # 这里只是把它提到直接依赖；不引入新的编译单元。
 moxcms = "0.8.1"
@@ -232,7 +236,11 @@ rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false }
 rmp-serde = "1.3.1"
 rodio = { version = "0.23.0", default-features = false }
-rust-embed = "8.13.0"
+# P2-1b：`base_ui` 的 build.rs 在**构建期**把 Phosphor SVG 光栅化成白色字形 PNG（设计 §8.5 / §5.6：
+# 引擎不依赖 usvg / resvg，图标转换归应用层）。resvg 与 usvg 同版 0.46.0，只引入一对编译单元；
+# 关掉默认特性（text / system-fonts / raster-images）——图标是纯路径，不需要字体与内嵌位图解码。
+resvg = { version = "0.46.0", default-features = false }
+usvg = { version = "0.46.0", default-features = false }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde-saphyr = { version = "2.1.1", default-features = false, features = [
@@ -267,7 +275,7 @@ unicode-segmentation = "1.13.3"
 # 依赖 0.1.5），这里提为直接依赖，不引入新编译单元。
 unicode-linebreak = "0.1.5"
 url = "2.5.8"
-uuid = "1.29.2"
+uuid = { version = "1.29.2", features = ["v4"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = [
     "client",
@@ -312,14 +320,16 @@ prediction_market = { path = "crates/widgets/prediction_market" }
 profile_ui = { path = "crates/profile_ui" }
 settings_ui = { path = "crates/settings_ui" }
 solana_wallet = { path = "crates/widgets/solana_wallet" }
+ui_core = { path = "crates/ui_core" }
 updater_ui = { path = "crates/updater_ui" }
 volume_heatmap = { path = "crates/widgets/volume_heatmap" }
 watch_list = { path = "crates/widgets/watch_list" }
 x = { path = "crates/widgets/x" }
-widget_tokio_runtime = { path = "crates/widget_tokio_runtime" }
 widget = { path = "crates/widget" }
 widget_gallery_ui = { path = "crates/widget_gallery_ui" }
-widget_registry = { path = "crates/widget_registry" }
+# The registry's default enables the notification audio backend; the application's `audio`
+# feature decides whether its build has one (the acceptance build may run without ALSA).
+widget_registry = { path = "crates/widget_registry", default-features = false }
 
 [workspace.lints.clippy]
 self_named_module_files = "allow"

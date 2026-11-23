@@ -67,6 +67,23 @@ pub(crate) mod macos_owner;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_drag;
 
+/// macOS 交通灯安全区的**平台无关纯逻辑**（E6 §8.6.5）：三个 `standardWindowButton:` 在内容区
+/// 坐标系里的 frame → 应用需要留白的外边界（`App::traffic_light_inset` 的数据来源）。
+///
+/// 与 [`macos_placement`] 同一模式：`platform::macos` 整模块 macOS-only，而「安全区多大」是纯
+/// 几何，必须在开发机（Windows）单测（空集 / 部分按钮缺失 / 零矩形 / 半像素）。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_chrome;
+
+/// macOS 泵的**空闲轮判定**（E10c）：哪些 run loop 轮次需要跑完整应用轮（`on_frame` / 帧 /
+/// 任务），哪些只是 display link 的 vsync tick（只做 pacing + a11y 对账）。
+///
+/// 与 [`macos_owner`] 同一模式：`platform::macos` 整模块 macOS-only，而「等待定时器期间不得
+/// 有空转的应用轮」是 I3 的核心判据，必须在开发机（Windows）单测（每个输入单独为真、全部为
+/// 假时为空闲）。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod macos_pump;
+
 /// Wayland 协议层的纯逻辑（`wl_data_source` 生命周期、IME 焦点路由、光标形状/主题、
 /// `xdg_toplevel` 状态机）。
 ///

@@ -8,7 +8,6 @@ edition.workspace = true
 ahash.workspace = true
 app_config.workspace = true
 app_config_provider.workspace = true
-gpui-kit.workspace = true
 log.workspace = true
 network.workspace = true
 reqwest.workspace = true
@@ -18,10 +17,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-widget_tokio_runtime.workspace = true
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 tempfile.workspace = true

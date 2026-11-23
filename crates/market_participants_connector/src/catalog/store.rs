@@ -23,7 +23,7 @@ use market_participants_model::{
 };
 use parking_lot::RwLock;
 use smol_str::SmolStr;
-use widget_tokio_runtime::runtime::Runtime;
+use tokio::runtime::Handle;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::catalog::{
@@ -76,12 +76,9 @@ struct CatalogShared {
     ///
     /// A fetch reaches the venue through the market-participants gateway, which resolves the
     /// route's proxy through [`network::proxy`]: that resolution must run its OS and
-    /// PAC work on a real blocking pool, and a caller's thread that runs no runtime
-    /// — a GPUI test's frame thread — has none to give it. The runtime therefore
-    /// travels with the catalogue instead of being discovered on whichever thread
-    /// happens to drive the fetch. Production fetches do not read it: the connection
+    /// PAC work on a real blocking pool, and a caller's thread that runs no runtime\r\n    /// — a test's frame thread, for one — has none to give it. The runtime therefore\r\n    /// travels with the catalogue instead of being discovered on whichever thread\r\n    /// happens to drive the fetch. Production fetches do not read it: the connection
     /// action drives a venue's own fetch on the load transaction's runtime.
-    runtime: RwLock<Option<Runtime>>,
+    runtime: RwLock<Option<Handle>>,
 }
 
 impl Catalog {
@@ -97,14 +94,12 @@ impl Catalog {
     /// [`crate::connector::MarketParticipantsConnector::new`] calls this when it builds the
     /// catalogue, so a fetch driven through `Self::refresh_for_test` resolves the
     /// venue's proxy on the application's runtime instead of on the caller's
-    /// executor. A catalogue without one — a unit test, a non-GPUI embedder — runs
-    /// that fetch on the caller's executor, which is what such a caller has always
-    /// done.
+    /// executor. A catalogue without one — a unit test, an embedder that hands no\r\n    /// runtime in — runs that fetch on the caller's executor, which is what such a\r\n    /// caller has always done.
     ///
     /// The verb is crate-private like every other write on this catalogue: the
     /// type is public because its reads are, and no caller outside this crate can
     /// reach a state change through it.
-    pub(crate) fn set_runtime(&self, runtime: Runtime) {
+    pub(crate) fn set_runtime(&self, runtime: Handle) {
         *self.shared.runtime.write() = Some(runtime);
     }
 
@@ -772,14 +767,10 @@ impl Catalog {
     ///
     /// A fetch reaches the venue through the market-participants gateway, which resolves the
     /// route's proxy through [`network::proxy`]: that resolution crosses into a
-    /// blocking pool, and a caller's thread that runs no runtime — a GPUI task —
-    /// has none to give it. Running the fetch on the runtime instead of on the
-    /// caller's executor is therefore what makes a cold read work from a pane,
+    /// blocking pool, and a caller's thread that runs no runtime — a frame thread —\r\n    /// has none to give it. Running the fetch on the runtime instead of on the\r\n    /// caller's executor is therefore what makes a cold read work from a pane,
     /// and it is also what keeps the venue's IO off the frame thread.
     ///
-    /// A catalogue with no runtime attached — a unit test, an embedder without
-    /// GPUI — runs the fetch on the caller's executor, which is what such a
-    /// caller has always done.
+    /// A catalogue with no runtime attached — a unit test, an embedder that hands no\r\n    /// runtime in — runs the fetch on the caller's executor, which is what such a\r\n    /// caller has always done.
     #[cfg(any(test, feature = "test-support"))]
     async fn fetch_from_source(
         &self,
@@ -790,7 +781,7 @@ impl Catalog {
             return source.fetch_catalog(context).await;
         };
         runtime
-            .run(source.fetch_catalog(context))
+            .spawn(source.fetch_catalog(context))
             .await
             .unwrap_or(Err(SourceError::Lost))
     }

@@ -1,6 +1,6 @@
 //! Tests for the indicator configuration and its normalization.
 
-use gpui_kit::{Hsla, Rgba, hsla};
+use ui_core::paint::color::Color;
 
 use super::{
     config::{
@@ -37,24 +37,25 @@ fn line_list_of(config: &CandlestickIndicatorConfig, id: IndicatorId) -> &LineLi
 /// The old format stored exactly these bytes, so this is how the fixed defaults
 /// are compared with the colours the design recorded.
 fn srgba_bytes(color: LineColor) -> [u8; 4] {
-    let color = Rgba::from(Hsla::from(color));
-    [
-        (color.r * 255.0).round() as u8,
-        (color.g * 255.0).round() as u8,
-        (color.b * 255.0).round() as u8,
-        (color.a * 255.0).round() as u8,
-    ]
+    let Color::Srgb { r, g, b, alpha } = Color::from(color) else {
+        unreachable!("a line colour is stored as HSL, so it converts to sRGB");
+    };
+    let quantize = |component: f32| (component.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [quantize(r), quantize(g), quantize(b), quantize(alpha)]
 }
 
 /// Six clearly distinct colours, deliberately not the theme's six.
-fn synthetic_palette() -> [Hsla; 6] {
+///
+/// The engine has no HSL constructor, so these are the sRGB values (to two decimal
+/// places) of the six HSL colours the palette used to be spelled with.
+fn synthetic_palette() -> [Color; 6] {
     [
-        hsla(0.0, 0.2, 0.3, 1.0),
-        hsla(0.1, 0.3, 0.4, 0.9),
-        hsla(0.2, 0.4, 0.5, 0.8),
-        hsla(0.3, 0.5, 0.6, 0.7),
-        hsla(0.4, 0.6, 0.7, 0.6),
-        hsla(0.5, 0.7, 0.8, 0.5),
+        Color::srgb(0.36, 0.24, 0.24, 1.0),
+        Color::srgb(0.52, 0.42, 0.28, 0.9),
+        Color::srgb(0.62, 0.70, 0.30, 0.8),
+        Color::srgb(0.48, 0.80, 0.40, 0.7),
+        Color::srgb(0.52, 0.88, 0.66, 0.6),
+        Color::srgb(0.66, 0.94, 0.94, 0.5),
     ]
 }
 
@@ -801,7 +802,7 @@ fn macd_and_kdj_defaults_should_use_the_fixed_line_colours() {
 #[test]
 fn line_colour_conversions_should_preserve_alpha() {
     assert_eq!(
-        LineColor::from(hsla(0.25, 0.5, 0.5, 0.75)),
+        LineColor::from(Color::srgb(0.5, 0.75, 0.25, 0.75)),
         LineColor {
             h: 0.25,
             s: 0.5,
@@ -810,13 +811,30 @@ fn line_colour_conversions_should_preserve_alpha() {
         }
     );
     assert_eq!(
-        Hsla::from(LineColor {
+        Color::from(LineColor {
             h: 0.25,
             s: 0.5,
             l: 0.5,
             a: 0.75,
         }),
-        hsla(0.25, 0.5, 0.5, 0.75)
+        Color::srgb(0.5, 0.75, 0.25, 0.75)
+    );
+}
+
+/// A colour of another colour space is stored as the sRGB the engine paints.
+///
+/// The chart-series palette a new line takes its colour from is spelled in Oklch,
+/// while a stored line is HSL over sRGB. The conversion therefore has to resolve
+/// the colour and encode it back — reading the Oklch numbers as if they were sRGB
+/// would store a different colour than the pane beside the chart draws.
+#[test]
+fn a_wide_gamut_colour_should_be_stored_as_the_srgb_the_engine_paints() {
+    let stored = LineColor::from(Color::oklch(0.62, 0.14, 62.0, 1.0));
+
+    assert_eq!(
+        srgba_bytes(stored),
+        [0xC0, 0x6F, 0x0A, 0xFF],
+        "the amber chart-series colour resolves to this sRGB"
     );
 }
 
@@ -955,7 +973,7 @@ fn setting_a_switch_colour_should_write_its_own_field() {
     ];
 
     for (index, (id, key)) in cases.iter().enumerate() {
-        let color = LineColor::from(hsla(index as f32 / 10.0, 0.5, 0.5, 0.75));
+        let color = LineColor::from(Color::srgb(index as f32 / 10.0, 0.5, 0.5, 0.75));
         assert!(config.set_color(*id, *key, color));
         assert_eq!(
             entry_of(&config, *id).settings.color(*key),
@@ -968,7 +986,7 @@ fn setting_a_switch_colour_should_write_its_own_field() {
         !config.set_color(
             IndicatorId::Macd,
             SettingKey::ShortPeriod,
-            LineColor::from(hsla(0.0, 0.0, 0.0, 1.0))
+            LineColor::from(Color::BLACK)
         ),
         "a period key names no colour"
     );
@@ -976,7 +994,7 @@ fn setting_a_switch_colour_should_write_its_own_field() {
         !config.set_color(
             IndicatorId::Macd,
             SettingKey::KColor,
-            LineColor::from(hsla(0.0, 0.0, 0.0, 1.0))
+            LineColor::from(Color::BLACK)
         ),
         "a colour field of another shape is not written"
     );
@@ -984,7 +1002,7 @@ fn setting_a_switch_colour_should_write_its_own_field() {
         !config.set_color(
             IndicatorId::Ma,
             SettingKey::DifColor,
-            LineColor::from(hsla(0.0, 0.0, 0.0, 1.0))
+            LineColor::from(Color::BLACK)
         ),
         "an entry without that colour field is not written"
     );

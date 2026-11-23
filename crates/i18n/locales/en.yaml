@@ -618,7 +618,6 @@ widget:
     country: Country
     day_label: '%{weekday}, %{month} %{day}, %{year}'
     filter_choice: '%{filter}: %{value}'
-    filter_tooltip: Filter by %{filter}
     importance: Importance
     importance_level:
       high: High
@@ -994,6 +993,7 @@ widget:
     account_ratio: Account Ratio
     amount: Amount
     buy_volume: Buy Volume
+    chart: Perpetual statistics chart
     contracts_unit: Contracts
     interval: Statistics interval
     long_accounts: Long Accounts
@@ -1040,15 +1040,12 @@ widget:
     protected: Protected
     refresh: Refresh monitored accounts
     reposted: '%{name} reposted'
-    scroll_tweets: Scroll tweets
     search_placeholder: username
     search_users: Search X accounts
     searching_users: Searching X accounts
     stream_unavailable: The X timeline stream is not connected
     success_title: Success
-    timeline_end: There are currently no more tweets.
     tweet: 'Tweet by %{author} at %{time}'
-    waiting: <p align="center">Waiting for tweets</p>
   volume_heatmap:
     choose_venue: Choose a market participant
     refresh_now: Refresh the volume heat map now
@@ -1166,6 +1163,11 @@ window:
     rename: Rename
     settings: Settings
     toggle: Toggle sidebar
+  system:
+    close: Close
+    maximize: Maximize
+    minimize: Minimize
+    restore: Restore
   updater:
     available: Update available
     download: Update

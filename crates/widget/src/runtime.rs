@@ -112,7 +112,7 @@ impl<P: WidgetProtocol> WidgetRuntime<P> {
         self.client.clone()
     }
 
-    /// Takes the single reliable-event receiver used by the GPUI view.
+    /// Takes the single reliable-event receiver used by the widget binding.
     pub fn take_reliable_stream(&mut self) -> Option<ReliableStream<P>> {
         self.reliable_stream.take()
     }

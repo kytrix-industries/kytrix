@@ -146,6 +146,34 @@ pub(crate) fn text_layout_dirty_len(tree: &NodeTree) -> usize {
     tree.text_layout_dirty.len()
 }
 
+// 消费者：`impl NodeTree::mark_canvas_nodes_paint` 的薄委托（外部调用点见该方法文档）。
+/// 让所有 `Canvas` 节点的 lane 重建（v2.1 E1b：图集换代后的 canvas 编码期安全网入口；
+/// E1d 起逐 tile LRU 淘汰的收尾同样调用它）。
+///
+/// Canvas 图元里的 `GlyphRun` 同样烘焙了 `AtlasTile`（应用经 `Canvas::push_shaped_text` 写入）。
+/// 图集换代 / 逐 tile 淘汰后 lane 里缓存的 Canvas 值仍是旧 UV，而 `invalidate_text_lines` 只遍历
+/// 文本节点 —— 不标 PAINT 的话 paint 会整桶复用它，编码期逐 tile 判活（`paint/pass.rs`）根本
+/// 不会执行。标 PAINT 让 paint 重新 emit：失效 run 被丢弃（少字优于花字），节点计入诊断计数。
+///
+/// 返回被标记的节点数（0 = 场景里没有 Canvas 节点，冷路径不产生额外开销）。
+pub(crate) fn mark_canvas_nodes_paint(tree: &mut NodeTree) -> usize {
+    let mut nodes: Vec<NodeId> = Vec::new();
+    tree.for_each_dfs(|node| {
+        if tree
+            .arena
+            .get(node)
+            .is_some_and(|target| matches!(target.kind(), NodeKind::Canvas(_)))
+        {
+            nodes.push(node);
+        }
+    });
+    let marked = nodes.len();
+    for node in nodes {
+        tree.mark_paint(node);
+    }
+    marked
+}
+
 // 消费者：`impl NodeTree::invalidate_text_lines` 的薄委托（外部调用点见该方法文档）。
 /// 让所有文本节点的 `ShapedLine` 失效并进入重排队列（图集逐 tile 淘汰 / 字体换代用）。
 ///
@@ -240,6 +268,25 @@ pub(crate) fn set_text_shaped(
     } else {
         tree.mark_paint(node)
     }
+}
+
+// 消费者：`impl NodeTree::install_text_line_for_test` 的薄委托（仅测试）。
+/// 仅测试：把 `ShapedLine` 直接装进文本槽（paint 测试只消费快照，不需要真 shaping）。
+#[cfg(test)]
+pub(crate) fn install_text_line_for_test(
+    tree: &mut NodeTree,
+    node: NodeId,
+    content: &TextContent,
+    line: Rc<ShapedLine>,
+    width: f32,
+) -> bool {
+    let shaped = Rc::new(crate::text::shape::ShapedText::blank_for_text_test(
+        content.text.clone(),
+        content.style.clone(),
+    ));
+    let key = crate::text::cache::ShapeKey::new(content, 1);
+    let _ = set_text_shaped(tree, node, shaped, key, 1, Size::ZERO, false);
+    set_text_line(tree, node, line, width, 0)
 }
 
 // 消费者：`impl NodeTree::set_text_line` 的薄委托（外部调用点见该方法文档）。
@@ -369,7 +416,7 @@ pub(crate) fn text_caret_rect(
     };
     let text = content.text.as_str();
     if shaped.text() != text
-        || !shaped.same_shaping_inputs(&content.style)
+        || !shaped.same_shaping_inputs(&content.style, content.runs())
         || shaped.inline_boxes() != content.inline_boxes.as_ref()
     {
         return Err(EngineError::TextShape {
@@ -424,6 +471,50 @@ fn expected_layout_width(tree: &NodeTree, shaped: &ShapedText, node: NodeId) -> 
     } else {
         shaped.max_content_size().width
     }
+}
+
+// 消费者：`impl NodeTree::text_byte_index_at` 的薄委托（外部调用点见该方法文档）。
+/// 文本盒局部坐标（与 [`NodeTree::text_caret_rect`] 的输出同域）→ 最近合法字节边界（E5/§11.5）。
+///
+/// 只读：不登记依赖、不改任何节点/帧状态（I6）；断行与对齐在快照的 parley 布局上现场重跑
+/// （与 `caret_rect` / `selection_rects` 同一条路径）。快速路径文本（单行 ASCII）不经过 parley，
+/// 但返回同一套「半簇取整 + 垂直 clamp」语义。
+///
+/// # Errors
+/// `StaleNode`：节点不存在 / 不是 `NodeKind::Text` / 尚未 shape 或 `ShapedLine` 尚未重建 /
+/// 文本内容、样式或断行宽度在该次文本 pass 之后又变了（等下一帧再查）。
+pub(crate) fn text_byte_index_at(
+    tree: &NodeTree,
+    node: NodeId,
+    local_point: Point,
+) -> Result<usize, EngineError> {
+    let Some(target) = tree.arena.get(node) else {
+        return Err(EngineError::StaleNode { node });
+    };
+    if target.kind.text().is_none() {
+        return Err(EngineError::StaleNode { node });
+    }
+    let Some(slot) = tree.text_slot(node) else {
+        return Err(EngineError::StaleNode { node });
+    };
+    let Some(content) = tree.text_content(node) else {
+        return Err(EngineError::StaleNode { node });
+    };
+    let shaped = slot.shaped();
+    // 「尚无 ShapedLine」与「快照不是当前内容」都不能作为命中目标（§11.5 的错误语义）：
+    // 返回旧快照算出的索引会让应用把光标锚到错误的字符上。
+    if tree.text_line(node).is_none()
+        || shaped.text() != content.text.as_str()
+        || !shaped.same_shaping_inputs(&content.style, content.runs())
+        || shaped.inline_boxes() != content.inline_boxes.as_ref()
+    {
+        return Err(EngineError::StaleNode { node });
+    }
+    let width = expected_layout_width(tree, shaped, node);
+    if slot.laid_width_bits() != width.to_bits() {
+        return Err(EngineError::StaleNode { node });
+    }
+    Ok(shaped.byte_index_at(width, content.style.alignment, local_point))
 }
 
 // 消费者：`impl NodeTree::invalidate_text_line` 的薄委托（外部调用点见该方法文档）。
@@ -724,13 +815,15 @@ pub(crate) fn set_lane_offset(tree: &mut NodeTree, node: NodeId, offset: Point) 
 ///
 /// `screen_offset` 是**祖先滚动偏移的累计值**（屏幕 = 内容 − offset；`clip_bounds` 用它）；
 /// `bake_offset` 是图元真正烘焙用的偏移（**不含本节点所属滚动槽自己的偏移**，滚动因此不
-/// 重建 lane）；`clip_key` 是本帧当前的祖先 clip 上下文。
+/// 重建 lane）；`clip_key` 是本帧当前的祖先 clip 上下文；`inherited_opacity` 是祖先链累计的
+/// 不透明度（E13 组不透明度，调用方保证已 clamp）。
 pub(crate) fn paint_state(
     tree: &NodeTree,
     node: NodeId,
     screen_offset: Point,
     bake_offset: Point,
     clip_key: (u8, Option<PhysicalRect>),
+    inherited_opacity: f32,
 ) -> Option<super::PaintNodeState> {
     let target = tree.arena.get(node)?;
     let hidden = matches!(target.style.inner.display, taffy::style::Display::None)
@@ -745,9 +838,17 @@ pub(crate) fn paint_state(
     } else {
         bake_offset
     };
+    // 组不透明度（E13）：自身补丁 × 祖先链；NaN 视作 0（与逐图元的旧钳制口径一致）。
+    let opacity = inherited_opacity
+        * match target.style_patch().opacity {
+            Some(value) if value.is_nan() => 0.0,
+            Some(value) => value.clamp(0.0, 1.0),
+            None => 1.0,
+        };
     let reusable = target.dirty.contains(DirtyFlags::REUSABLE)
         && tree.clip_key(node) == Some(clip_key)
-        && target.lane_offset == effective_bake;
+        && target.lane_offset == effective_bake
+        && target.paint_opacity == opacity;
     let clip_bounds = (target.style.clip == crate::paint::style::Clip::Bounds).then(|| {
         target
             .layout
@@ -773,7 +874,16 @@ pub(crate) fn paint_state(
         clip_bounds,
         scroll,
         screen_baked,
+        opacity,
     })
+}
+
+// 消费者：`impl NodeTree::set_paint_opacity` 的薄委托（外部调用点见该方法文档）。
+/// 写回本节点 lane 实际乘进图元的有效不透明度（E13：paint 的组不透明度复用戳）。
+pub(crate) fn set_paint_opacity(tree: &mut NodeTree, node: NodeId, opacity: f32) {
+    if let Some(target) = tree.arena.get_mut(node) {
+        target.paint_opacity = opacity;
+    }
 }
 
 // 消费者：`impl NodeTree::clip_key` 的薄委托（外部调用点见该方法文档）。

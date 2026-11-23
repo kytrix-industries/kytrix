@@ -3,20 +3,19 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use gpui_kit::SharedString;
 use market_participants_model::{
     decimal::UnixMillis,
     listing::rules::ListingPrecision,
     market::{book::ListingTrade, units::MarketTradeId},
 };
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
 
 /// How many trades the tape keeps. Older ones are evicted as newer arrive.
 pub(super) const MAX_TRADES: usize = 200;
 
 /// An immutable, cheap-to-clone view of the retained trades, oldest first.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct MarketTradeSnapshot {
     rows: Arc<[Arc<MarketTradeRow>]>,
 }
@@ -30,6 +29,21 @@ impl MarketTradeSnapshot {
         self.rows.len()
     }
 }
+
+/// Two snapshots are the same read exactly when they share the retained rows.
+///
+/// The tape only rebuilds its row storage when an insert changed what it holds, so
+/// pointer equality is the honest answer to "is this the same tape": a re-read of
+/// an unchanged retention set shares the storage, which is what lets
+/// [`Signal<MarketTradeSnapshot>`](ui_core::node::signal::Signal) skip the write and
+/// the frame it would schedule (AGENTS §3, I3).
+impl PartialEq for MarketTradeSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rows, &other.rows)
+    }
+}
+
+impl Eq for MarketTradeSnapshot {}
 
 /// One retained trade, with the labels it is drawn with filled in on demand.
 #[derive(Debug)]
@@ -80,28 +94,22 @@ impl MarketTradeRow {
 /// rather than as the canonical form that drops the zeroes.
 #[derive(Debug)]
 pub(super) struct MarketTradeDisplay {
-    pub price: SharedString,
-    pub quantity: SharedString,
-    pub time: SharedString,
+    pub price: SmolStr,
+    pub quantity: SmolStr,
+    pub time: SmolStr,
 }
 
 impl MarketTradeDisplay {
     fn new(trade: &ListingTrade, precision: ListingPrecision, zone: UtcOffset) -> Self {
         Self {
-            price: SharedString::new(
-                trade
-                    .price
-                    .value
-                    .format_and_round_tick(precision.price_tick)
-                    .as_str(),
-            ),
-            quantity: SharedString::new(
-                trade
-                    .quantity
-                    .value
-                    .format_and_round_tick(precision.quantity_tick)
-                    .as_str(),
-            ),
+            price: trade
+                .price
+                .value
+                .format_and_round_tick(precision.price_tick),
+            quantity: trade
+                .quantity
+                .value
+                .format_and_round_tick(precision.quantity_tick),
             time: format_time(trade.timestamp, zone),
         }
     }
@@ -213,7 +221,7 @@ impl MarketTradeState {
 }
 
 /// The time of a trade, read in the zone the settings display data in.
-fn format_time(timestamp: UnixMillis, zone: UtcOffset) -> SharedString {
+fn format_time(timestamp: UnixMillis, zone: UtcOffset) -> SmolStr {
     // The offset can move an instant past the last date the calendar holds — a
     // timestamp at the far end of the range is one the service cannot publish, and
     // it is written as a placeholder rather than taken to a date that is not one.
@@ -221,17 +229,14 @@ fn format_time(timestamp: UnixMillis, zone: UtcOffset) -> SharedString {
         .ok()
         .and_then(|datetime| datetime.checked_to_offset(zone))
         .map_or_else(
-            || SharedString::new_static("--:--:--.---"),
+            || SmolStr::new_static("--:--:--.---"),
             |datetime| {
-                SharedString::new(
-                    format_smolstr!(
-                        "{:02}:{:02}:{:02}.{:03}",
-                        datetime.hour(),
-                        datetime.minute(),
-                        datetime.second(),
-                        datetime.millisecond()
-                    )
-                    .as_str(),
+                format_smolstr!(
+                    "{:02}:{:02}:{:02}.{:03}",
+                    datetime.hour(),
+                    datetime.minute(),
+                    datetime.second(),
+                    datetime.millisecond()
                 )
             },
         )
@@ -414,6 +419,24 @@ mod tests {
         assert!(Arc::ptr_eq(&before.rows, &after.rows));
     }
 
+    /// Two reads of an unchanged retention set are the same snapshot; a trade that
+    /// became a row makes a different one.
+    ///
+    /// The table's cells read the snapshot through a signal, so this equality is what
+    /// keeps a repeated publication of an unchanged tape from rewriting the signal and
+    /// scheduling a frame (I3).
+    #[test]
+    fn an_unchanged_snapshot_should_be_the_same_read() {
+        let mut trades = state(2);
+        trades.merge([trade(10, 10, 100), trade(11, 11, 101)]);
+        let first = trades.snapshot();
+        let second = trades.snapshot();
+
+        assert_eq!(first, second);
+        assert!(trades.insert(&trade(12, 12, 102)));
+        assert_ne!(first, trades.snapshot());
+    }
+
     #[test]
     fn an_id_evicted_from_the_tape_should_be_accepted_again() {
         let mut trades = state(2);
@@ -499,9 +522,9 @@ mod tests {
 
         assert_eq!(
             [
-                display.price.as_ref(),
-                display.quantity.as_ref(),
-                display.time.as_ref(),
+                display.price.as_str(),
+                display.quantity.as_str(),
+                display.time.as_str(),
             ],
             ["90000.00", "1.000", "00:00:01.000"]
         );
@@ -528,9 +551,9 @@ mod tests {
 
         assert_eq!(
             [
-                display.price.as_ref(),
-                display.quantity.as_ref(),
-                display.time.as_ref(),
+                display.price.as_str(),
+                display.quantity.as_str(),
+                display.time.as_str(),
             ],
             ["123.46", "0.000", "00:00:01.000"]
         );

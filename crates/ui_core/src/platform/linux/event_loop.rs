@@ -84,6 +84,8 @@ struct WindowMirror {
     id: WindowId,
     scale: Scale,
     size: Size,
+    /// 最近一次下发的标题（`App::set_title` → `xdg_toplevel.set_title`；同值 no-op，E6）。
+    title: smol_str::SmolStr,
 }
 
 /// `Application::run` 的平台入口。
@@ -255,13 +257,23 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                     window.set_frame_refresh_hz(hz);
                 }
                 // RA-5：不可见窗口不参与帧循环（`frame_windows` 过滤掉它），推迟标记必须清掉；
-                // 否则 `next_deferred_deadline()` 一直返回已过期时刻 ⇒ calloop timeout=0 空转。
+                // 否则 `next_wake_deadline()` 一直返回已过期时刻 ⇒ calloop timeout=0 空转。
                 if !state.is_visible(index) {
                     window.clear_frame_budget_deferred();
                 }
                 // ③ R10-4 / R10-15：compositor 侧的窗口状态（装饰模式、最大化/全屏、可用能力）
-                // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。
-                window.set_state(state.window_state(index));
+                // 镜像给应用 —— 自绘标题栏据此决定是否画、按钮是否可用。值变化时
+                // `Window::set_state` 已给根节点标 `PAINT`，这里再请求一帧（§8.6.4 / I3）。
+                if window.set_state(state.window_state(index)) {
+                    dispatcher.wake();
+                }
+                // E6：运行时标题（`App::set_title`）对账到 `xdg_toplevel.set_title`；同值 no-op。
+                // 标题是双缓冲 toplevel 状态，随下一次 commit（present）生效。
+                let title = window.options().title.clone();
+                if title != mirrored.title {
+                    state.set_title(index, &title);
+                    mirrored.title = title;
+                }
             }
             // ②b 焦点状态 → a11y（键盘焦点窗口可能不同于指针进入窗口）。
             for window_a11y in &mut a11ys {
@@ -313,7 +325,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                 return Ok(());
             }
 
-            app.sync_clock();
+            app.sync_clock_live();
             app.run_frame_hook();
             // ③b 自绘标题栏的窗口控制：与触发它的输入事件同一轮执行，`serial` 仍是按下时的值。
             if let Some((window, control)) = app.take_window_control()
@@ -397,7 +409,7 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
                             }
                             // A5：本帧被帧预算门禁推迟（不是空闲：脏位保留）⇒ 记进
                             // `deferred_frames`，到期后**不依赖新唤醒**补一帧（下面的 timeout 会
-                            // 压到 `next_deferred_deadline`）。
+                            // 压到 `next_wake_deadline`）。
                             if budget_deferred && !deferred_frames.contains(&id) {
                                 deferred_frames.push(id);
                             }
@@ -496,7 +508,9 @@ pub(crate) fn run(app: App) -> Result<(), EngineError> {
             // A5：被帧预算门禁推迟的帧到期后必须自己醒来（不依赖下一次无关事件；与 Windows
             // 的 FramePacer / macOS 连续帧定时器同义）。RA-5：不可见窗口的推迟标记已在上面
             // 清掉；这里再夹一个 1 ms 下限，避免已过期 deadline 让 calloop timeout=0 空转。
-            let timeout = match app.next_deferred_deadline() {
+            // E10：同一条 timeout 也承载**一次性定时器**的到期时刻（`App::after`）—— 定时器
+            // 等待期间不请求帧、不进连续帧模式，只在到点时唤醒一次泵。
+            let timeout = match app.next_wake_deadline() {
                 Some(deadline) => timeout
                     .min(deadline.saturating_duration_since(Instant::now()))
                     .max(Duration::from_millis(1)),
@@ -675,7 +689,12 @@ fn sync_windows(
         window.set_surface(physical);
         // R10-4 / R10-15：首次写入 compositor 侧状态（装饰模式 / 最大化 / 全屏 / 可用能力）。
         window.set_state(state.window_state(index));
-        mirrors.push(WindowMirror { id, scale, size });
+        mirrors.push(WindowMirror {
+            id,
+            scale,
+            size,
+            title: window.options().title.clone(),
+        });
     }
     Ok(())
 }

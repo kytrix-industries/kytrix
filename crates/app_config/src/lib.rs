@@ -6,8 +6,8 @@
 //! [`widget`] config envelope, and the [`workspace`] pane layouts, so every consumer reads one
 //! configuration vocabulary.
 //!
-//! Loading, atomic persistence, the settings manager and its per-domain events live
-//! in `app_config_provider`, which also installs the manager in GPUI global state.
+//! Loading, atomic persistence, the settings manager and its per-domain change
+//! events live in `app_config_provider`.
 //! Runtime credential resolution, market-participants routing, adapters, and
 //! connection pools remain outside this crate in `market_participants_connector`;
 //! `app_config` never creates or owns those runtime resources.

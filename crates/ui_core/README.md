@@ -5,9 +5,8 @@ Kytrix 自研跨平台 GUI 引擎（主设计：[`design/custom-gui-engine-desig
 
 > 本 crate `publish = false`：它是产品的一部分，不是独立发布的库。
 >
-> **依赖状态**：引擎子树（`ui_core`）的依赖已清零 —— `cargo tree -p ui_core`
-> 里**没有** `gpui-*` / `wgpu` / `winit` / Vello。workspace 的产品侧（`crates/kytrix`、`base_ui` 等）**仍有**
-> `gpui-kit` / `gpui-pre-*`，那是 M8 的迁移范围，不在本 crate 的验收面内。
+> **依赖状态**：`cargo tree` 全域已清零 —— workspace 里**没有** `gpui-*` / `wgpu` / `winit` / Vello；
+> 产品侧（`crates/kytrix`、`base_ui`、各 widget）与引擎一样只依赖本仓自研的 UI 引擎。
 
 ## 快速开始
 

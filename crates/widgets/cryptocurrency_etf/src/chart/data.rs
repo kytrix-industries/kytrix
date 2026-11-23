@@ -17,8 +17,7 @@
 
 use std::sync::Arc;
 
-use gpui_kit::{App, SharedString};
-use i18n::{language::codes::LanguageCode, t};
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::SmolStr;
 
 use super::{
@@ -34,15 +33,15 @@ use crate::model::{
 pub(crate) struct PreparedPoint {
     /// The day, written in full, which is the tooltip's title and the pane's own
     /// date field.
-    pub header_date: SharedString,
+    pub header_date: SmolStr,
     /// The day, written for the time axis.
     pub date_label: SmolStr,
     /// What the funds moved that day, in millions of dollars.
     pub flow: f64,
     /// The flow, as a person reads an amount of money.
-    pub flow_label: SharedString,
+    pub flow_label: SmolStr,
     /// The flow, named as an inflow or an outflow.
-    pub flow_caption: SharedString,
+    pub flow_caption: SmolStr,
     /// The flow, in a tooltip: what the day's reading is called, written with the
     /// separator its amount follows.
     ///
@@ -50,11 +49,11 @@ pub(crate) struct PreparedPoint {
     /// a tooltip draws the day's direction in its own text colour and the amount in
     /// the colour the day went, so the reading is kept as the two runs it is drawn
     /// from.
-    pub flow_tooltip_caption: SharedString,
+    pub flow_tooltip_caption: SmolStr,
     /// What the funds hold after that day.
     pub net_assets: f64,
-    pub net_assets_label: SharedString,
-    pub net_assets_tooltip: SharedString,
+    pub net_assets_label: SmolStr,
+    pub net_assets_tooltip: SmolStr,
 }
 
 /// Everything one chart draws, and everything it says about it.
@@ -68,8 +67,8 @@ pub(crate) struct PreparedData {
     pub locale: LanguageCode,
     /// What each axis counts, and the unit its numbers are read in. The numbers on
     /// an axis are bare, so the title is the only thing that says what they are.
-    pub left_axis_title: SharedString,
-    pub right_axis_title: SharedString,
+    pub left_axis_title: SmolStr,
+    pub right_axis_title: SmolStr,
     pub points: Box<[PreparedPoint]>,
     pub flow: AxisScale,
     /// The net-asset axis, which only a chart of every fund has: a single fund has
@@ -85,24 +84,24 @@ pub(crate) struct PreparedData {
 /// already the reader's.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Metrics {
-    pub date: SharedString,
-    pub caption: SharedString,
-    pub flow: SharedString,
+    pub date: SmolStr,
+    pub caption: SmolStr,
+    pub flow: SmolStr,
     pub flow_value: f64,
-    pub net_assets: Option<SharedString>,
+    pub net_assets: Option<SmolStr>,
 }
 
 impl PreparedData {
     /// Resolves one view of one history.
     pub(crate) fn new(
-        cx: &App,
+        translate: &Translate,
         source: Arc<CryptocurrencyEtfDataset>,
         selection: CryptocurrencyEtfFundSelection,
         window: CryptocurrencyEtfWindow,
     ) -> Self {
-        let locale = *cx.global::<i18n::language::codes::LanguageCode>();
-        let left_axis_title = t!(cx, "widget.cryptocurrency_etf.flow_axis");
-        let right_axis_title = t!(cx, "widget.cryptocurrency_etf.net_assets_axis");
+        let locale = translate.language();
+        let left_axis_title = t_smol!(translate, "widget.cryptocurrency_etf.flow_axis");
+        let right_axis_title = t_smol!(translate, "widget.cryptocurrency_etf.net_assets_axis");
         // A fund the asset does not have is a view of no data rather than of the
         // total: showing the total under a fund's name would report a number the
         // user did not ask for and cannot tell apart from the one they did.
@@ -118,8 +117,8 @@ impl PreparedData {
             &[]
         };
         let flow_name = match &selection {
-            CryptocurrencyEtfFundSelection::All => SharedString::new_static("ETF"),
-            CryptocurrencyEtfFundSelection::Named(name) => SharedString::new(name.as_str()),
+            CryptocurrencyEtfFundSelection::All => SmolStr::new_static("ETF"),
+            CryptocurrencyEtfFundSelection::Named(name) => name.clone(),
         };
         let show_net_assets = matches!(&selection, CryptocurrencyEtfFundSelection::All);
 
@@ -133,33 +132,33 @@ impl PreparedData {
                 SmolStr::new_static("--")
             };
             let net_assets_tooltip = if show_net_assets {
-                t!(
-                    cx,
+                t_smol!(
+                    translate,
                     "widget.cryptocurrency_etf.value",
-                    label = right_axis_title.as_ref(),
+                    label = right_axis_title.as_str(),
                     value = net_assets_label.as_str()
                 )
             } else {
-                SharedString::new_static("--")
+                SmolStr::new_static("--")
             };
-            let full_date = SharedString::new(format_header_date(day.date).as_str());
+            let full_date = format_header_date(day.date);
             points.push(PreparedPoint {
-                header_date: full_date.clone(),
+                header_date: full_date,
                 date_label: format_date(day.date),
                 flow,
-                flow_caption: flow_caption(cx, flow, flow_name.as_str()),
+                flow_caption: flow_caption(translate, flow, flow_name.as_str()),
                 // The caption is the label half of the reading the pane writes
                 // everywhere else: the template that says how a label and its amount
                 // are read together, with the amount left off.
-                flow_tooltip_caption: t!(
-                    cx,
+                flow_tooltip_caption: t_smol!(
+                    translate,
                     "widget.cryptocurrency_etf.value",
-                    label = day_caption(cx, flow).as_str(),
+                    label = day_caption(translate, flow).as_str(),
                     value = ""
                 ),
-                flow_label: SharedString::new(flow_label.as_str()),
+                flow_label,
                 net_assets: day.net_assets,
-                net_assets_label: SharedString::new(net_assets_label.as_str()),
+                net_assets_label,
                 net_assets_tooltip,
             });
         }
@@ -215,13 +214,21 @@ impl PreparedData {
 
 /// What one day's flow is called: a direction when it has one, and its name when
 /// it does not.
-fn flow_caption(cx: &App, value: f64, name: &str) -> SharedString {
+fn flow_caption(translate: &Translate, value: f64, name: &str) -> SmolStr {
     if value > 0.0 {
-        t!(cx, "widget.cryptocurrency_etf.net_inflow", name = name)
+        t_smol!(
+            translate,
+            "widget.cryptocurrency_etf.net_inflow",
+            name = name
+        )
     } else if value < 0.0 {
-        t!(cx, "widget.cryptocurrency_etf.net_outflow", name = name)
+        t_smol!(
+            translate,
+            "widget.cryptocurrency_etf.net_outflow",
+            name = name
+        )
     } else {
-        t!(cx, "widget.cryptocurrency_etf.net_flow", name = name)
+        t_smol!(translate, "widget.cryptocurrency_etf.net_flow", name = name)
     }
 }
 
@@ -232,12 +239,12 @@ fn flow_caption(cx: &App, value: f64, name: &str) -> SharedString {
 /// to, because the row is what a reader compares against the pane's own controls; a
 /// tooltip has the date on the line above, so the only thing left for it to name is
 /// which way that day went.
-fn day_caption(cx: &App, value: f64) -> SharedString {
+fn day_caption(translate: &Translate, value: f64) -> SmolStr {
     if value > 0.0 {
-        t!(cx, "widget.cryptocurrency_etf.day_net_inflow")
+        t_smol!(translate, "widget.cryptocurrency_etf.day_net_inflow")
     } else if value < 0.0 {
-        t!(cx, "widget.cryptocurrency_etf.day_net_outflow")
+        t_smol!(translate, "widget.cryptocurrency_etf.day_net_outflow")
     } else {
-        t!(cx, "widget.cryptocurrency_etf.day_net_flow")
+        t_smol!(translate, "widget.cryptocurrency_etf.day_net_flow")
     }
 }

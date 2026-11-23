@@ -15,7 +15,6 @@ use futures::{
     StreamExt,
     future::{select_all, try_join_all},
 };
-use gpui_kit::SharedString;
 use market_participants_connector::{
     catalog::store::Catalog,
     market::{
@@ -290,7 +289,7 @@ where
                 label: display
                     .listing_instrument(&listing)
                     .ok()
-                    .map(|name| SharedString::new(name.as_str())),
+                    .map(|name| SmolStr::new(name.as_str())),
                 precision: display.listing_precision(&listing),
             };
             listings.insert(listing, named);
@@ -1020,14 +1019,13 @@ mod tests {
             panic!("latest value should be a force-order snapshot");
         };
         let label = snapshot.orders()[0]
-            .display(time::UtcOffset::UTC)
-            .listing
+            .listing_label()
             .clone()
             .expect("the injected generation names the row");
 
-        assert_eq!(label.as_ref(), published.as_str());
+        assert_eq!(label.as_str(), published.as_str());
         assert_ne!(
-            label.as_ref(),
+            label.as_str(),
             "BTCUSDT",
             "the venue's own symbol is not the name of the listing"
         );
@@ -1087,7 +1085,7 @@ mod tests {
         let display = snapshot.orders()[0].display(time::UtcOffset::UTC);
 
         assert_eq!(
-            [display.price.as_ref(), display.quantity.as_ref()],
+            [display.price.as_str(), display.quantity.as_str()],
             ["100.00", "1.000"]
         );
         runtime.shutdown().await;
@@ -1145,10 +1143,7 @@ mod tests {
             "the fixture really published no name for the listing"
         );
         assert!(
-            snapshot.orders()[0]
-                .display(time::UtcOffset::UTC)
-                .listing
-                .is_none(),
+            snapshot.orders()[0].listing_label().is_none(),
             "a listing the generation does not name keeps no label"
         );
         runtime.shutdown().await;

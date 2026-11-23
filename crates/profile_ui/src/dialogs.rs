@@ -1,116 +1,147 @@
 //! What a sign-in says while it happens, and the one question a sign-out asks.
 //!
-//! A sign-in is finished in the browser, so all three things the desktop half has to say
-//! about it are reports: the callback is being waited for, the account came back, it did
-//! not. Each is one alert — a title, a message and the button that says the message was
-//! read — because none of them asks anything: what ends the wait is the callback the
-//! browser delivers, or the attempt's own expiry. The one about the wait carries the way
-//! out of it as well, because an alert is the only thing the user has to answer while the
-//! attempt runs: its button is the cancellation, and reading it ends what it reports.
+//! A sign-in is finished in the browser, so all three things the desktop half has to say about it
+//! are reports: the callback is being waited for, the account came back, it did not. Each is one
+//! alert — a title, a message and the button that says the message was read — because none of
+//! them asks anything: what ends the wait is the callback the browser delivers, or the attempt's
+//! own expiry. The one about the wait carries the way out of it as well, because an alert is the
+//! only thing the user has to answer while the attempt runs: its button is the cancellation, and
+//! reading it ends what it reports.
 //!
-//! Signing out is the one question here, and it is the same alert with a cancel entry: it
-//! is the only thing on this menu with two answers, and its ok and cancel buttons are how
-//! both of them are given.
+//! Signing out is the one question here, and it is the same alert with a cancel entry: it is the
+//! only thing on this feature with two answers, and its ok and cancel buttons are how both of
+//! them are given.
+//!
+//! # Where the words come from
+//!
+//! The title, the message and the button text are resolved by the caller, in the language the
+//! moment is reported in — a failure that is still on screen when the language changes keeps the
+//! words it was reported in (that is what the user is looking at). A report whose message is one
+//! of the `error.account.*` sentences gets it from the failure's [`TranslatedError`]
+//! implementation, never from a `Display` string.
+//!
+//! [`TranslatedError`]: widget::error::TranslatedError
 
-use base_ui::layer::LayerExt;
-use gpui_kit::*;
-use i18n::t;
-use tokio::task::AbortHandle;
+use std::rc::Rc;
 
-/// Shows the alert that says the sign-in has to be finished in the browser.
+use base_ui::kit::{
+    alert::AlertBuilder,
+    dialog::{Dialog, DialogBuilder},
+};
+use smol_str::SmolStr;
+use ui_core::app::App;
+
+use crate::host::ProfileHost;
+
+/// What one of an alert's buttons does besides closing it.
+pub(crate) type AlertAction = Rc<dyn Fn(&mut App)>;
+
+/// What an alert says and what its buttons do.
 ///
-/// The alert is the whole of what the user can do about the wait, so it is also what ends
-/// it: its one button says the report was read, and reading it aborts `sign_in` — the
-/// attempt this alert is the report of. That handle is the only thing it knows about the
-/// attempt, which is why the way to end one is handed to it rather than reached for.
-///
-/// Ending the attempt there is what keeps the control honest: an alert that could be
-/// dismissed while the attempt behind it stayed open would be a control offering a sign-in
-/// that does nothing, for as long as the abandoned attempt lived.
-pub(crate) fn show_awaiting_authorization(window: &mut Window, cx: &mut App, sign_in: AbortHandle) {
-    let title = t!(cx, "window.account.sign_in");
-    let message = t!(cx, "window.account.awaiting_authorization");
-    let cancel = t!(cx, "window.account.cancel_sign_in");
-
-    window.alert(cx, move |alert, _, _| {
-        alert
-            .ok(title, message)
-            .ok_text(cancel)
-            .ok_action(move |_, _, _| sign_in.abort())
-    });
+/// The buttons close the alert before they run their action: reading a report is the end of what
+/// it reports, and a sign-out that closed its own confirmation afterwards would be answering a
+/// question the user can still see.
+pub(crate) enum AlertContent {
+    /// One button that says the report was read.
+    Report {
+        /// The alert's title (what it is about).
+        title: SmolStr,
+        /// The sentence the report is made of.
+        message: SmolStr,
+        /// The text of the one button.
+        confirm: SmolStr,
+        /// What reading the report does besides closing it.
+        on_confirm: Option<AlertAction>,
+    },
+    /// Two answers: the ok button agrees, the cancel button declines.
+    Question {
+        /// The alert's title (the question's subject).
+        title: SmolStr,
+        /// The sentence the question is asked in.
+        message: SmolStr,
+        /// The text of the agreeing button.
+        confirm: SmolStr,
+        /// The text of the declining button.
+        cancel: SmolStr,
+        /// What agreeing does.
+        on_confirm: AlertAction,
+    },
 }
 
-/// Shows why the sign-in the user was just watching did not finish.
-///
-/// It replaces the alert that was waiting for the browser rather than closing it and
-/// reporting somewhere else: that alert is where the user is looking, and a failure that
-/// has to be found by opening a menu is a failure the user does not see. The attempt is
-/// over by the time this is drawn — the loopback port is already released — so there is
-/// nothing left to do but read the reason.
-pub(crate) fn show_authorization_failed(window: &mut Window, cx: &mut App, reason: SharedString) {
-    let title = t!(cx, "window.account.sign_in");
-    let confirm = t!(cx, "common.confirm");
-
-    window.alert(cx, move |alert, _, _| {
-        alert.ok(title, reason).ok_text(confirm)
-    });
+impl AlertContent {
+    /// The title, which the dialog's own a11y name is declared with.
+    fn title(&self) -> SmolStr {
+        match self {
+            Self::Report { title, .. } | Self::Question { title, .. } => title.clone(),
+        }
+    }
 }
 
-/// Shows why the account dashboard could not be opened.
-pub(crate) fn show_account_open_failed(window: &mut Window, cx: &mut App, reason: SharedString) {
-    let title = t!(cx, "window.account.open_account");
-    let confirm = t!(cx, "common.confirm");
-
-    window.alert(cx, move |alert, _, _| {
-        alert.ok(title, reason).ok_text(confirm)
-    });
+/// Builds the alert `content` describes (closed; the caller opens it).
+///
+/// `key` is the control's per-instance alert key: kit keys are application-level action
+/// identities, so two controls in one application must not share one (`crates/widgets/AGENTS.md`
+/// §1-11).
+pub(crate) fn build(
+    app: &mut App,
+    host: &ProfileHost,
+    key: SmolStr,
+    content: AlertContent,
+) -> Dialog {
+    let content = Rc::new(content);
+    let title = content.title();
+    DialogBuilder::alert(title, move |dialog, _theme| {
+        alert(dialog.clone(), Rc::clone(&content))
+    })
+    .build(
+        app,
+        host.theme().clone(),
+        host.layer().clone(),
+        host.animation(),
+        key,
+    )
 }
 
-/// Shows the alert that reports the account that was just authorized.
-///
-/// The message is one line of copy — what the account is, the wallet family it belongs to,
-/// and its address — and it is a message of its own rather than one assembled here, so that
-/// the centring every other alert message carries is on this one too.
-pub(crate) fn show_authorization_complete(
-    window: &mut Window,
-    cx: &mut App,
-    wallet_address: SharedString,
-    wallet_kind_label: SharedString,
-) {
-    let title = t!(cx, "window.account.authorization_complete");
-    let message = t!(
-        cx,
-        "window.account.authorization_complete_message",
-        wallet = wallet_address,
-        kind = wallet_kind_label
-    );
-    let confirm = t!(cx, "common.confirm");
-
-    window.alert(cx, move |alert, _, _| {
-        alert.ok(title, message).ok_text(confirm)
-    });
-}
-
-/// Asks whether the current account should be signed out.
-///
-/// The answer is the caller's to act on: a confirmation that signed out on its own
-/// could not be reasoned about from the menu that opened it. Answering the alert is the
-/// whole decision — the ok button is the sign-out and the cancel button is the way of
-/// saying no — so nothing here ends the session.
-pub(crate) fn show_sign_out_confirmation(
-    window: &mut Window,
-    cx: &mut App,
-    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
-) {
-    let title = t!(cx, "window.account.sign_out");
-    let message = t!(cx, "window.account.sign_out_confirm");
-    let cancel = t!(cx, "common.cancel");
-
-    window.alert(cx, move |alert, _, _| {
-        alert
-            .ok_cancel(title.clone(), message)
-            .ok_text(title)
-            .cancel_text(cancel)
-            .ok_action(move |_, window, cx| on_confirm(window, cx))
-    });
+/// The content of one alert: its sentence, its button texts and what the buttons do.
+fn alert(dialog: Dialog, content: Rc<AlertContent>) -> AlertBuilder {
+    match &*content {
+        AlertContent::Report {
+            title,
+            message,
+            confirm,
+            on_confirm,
+        } => {
+            let action = on_confirm.clone();
+            AlertBuilder::new()
+                .ok(title.clone(), message.clone())
+                .ok_text(confirm.clone())
+                .ok_action(move |_, app| {
+                    dialog.close(app);
+                    if let Some(action) = &action {
+                        action(app);
+                    }
+                })
+        }
+        AlertContent::Question {
+            title,
+            message,
+            confirm,
+            cancel,
+            on_confirm,
+        } => {
+            let action = Rc::clone(on_confirm);
+            let closing = dialog.clone();
+            AlertBuilder::new()
+                .ok_cancel(title.clone(), message.clone())
+                .ok_text(confirm.clone())
+                .cancel_text(cancel.clone())
+                .ok_action(move |_, app| {
+                    dialog.close(app);
+                    action(app);
+                })
+                .cancel_action(move |app| {
+                    closing.close(app);
+                })
+        }
+    }
 }

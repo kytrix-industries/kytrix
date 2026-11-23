@@ -5,9 +5,10 @@
 //! 产品前提是「不用定时器驱动刷新」+「resize 必须真实重排 + 重绘，不能拉伸旧帧」，所以重排 /
 //! 重绘必须由**模态循环分派的消息**直接驱动，而不是由引擎的顶层消息循环驱动。
 //!
-//! 交互本身仍归系统（`WM_NCLBUTTONDOWN` 的 8 个命中码照常 `DefWindowProcW`）：Aero Snap /
-//! Win11 Snap Layouts / 双击边框 / `Alt+Space` → 大小 / 拖动中切换显示器全部免费，且与
-//! Chrome / Qt 的实际做法一致（Qt 的 `QWindow::startSystemResize` 在 Windows 上就是
+//! 交互本身仍归系统（`WM_NCLBUTTONDOWN` 的 8 个命中码照常 `DefWindowProcW`）：Aero Snap（拖边）/
+//! 双击边框 / `Alt+Space` → 大小 / 拖动中切换显示器全部免费（Win11 Snap Layouts 的悬停浮层
+//! 需要 `HTMAXBUTTON`，本批未实现），且与 Chrome / Qt 的实际做法一致（Qt 的
+//! `QWindow::startSystemResize` 在 Windows 上就是
 //! `PostMessage(WM_SYSCOMMAND, SC_SIZE…)`，把交互交还系统）。
 //!
 //! 本模块只做「一条 `WM_SIZE` → 一步帧」的适配，顺序与泵的 ②b′/④ 相同：

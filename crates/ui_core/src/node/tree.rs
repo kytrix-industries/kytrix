@@ -17,6 +17,7 @@
 mod arena;
 mod content;
 mod dirty;
+mod image;
 mod layout;
 #[cfg(test)]
 mod tests;
@@ -43,6 +44,7 @@ use crate::{
         dependency::ReadCtx,
         dirty::{DirtyFlags, DirtySet},
         id::{Arena, NodeId},
+        image::ImageContent,
         signal::SignalId,
     },
     paint::{
@@ -51,6 +53,7 @@ use crate::{
         scene::LaneId,
         style::{Clip, PaintSpec, Style, StylePatch},
     },
+    resources::ResourceId,
     text::{ShapedLine, TextContent},
 };
 
@@ -83,14 +86,23 @@ pub enum NodeKind {
     ///
     /// 在首次 `refresh_text` 之前它的 measure 为 `0×0`（`NodeBuilder::text` 不伪造闭包）。
     Text(Box<TextContent>),
+    /// 图片叶子（E7）：载荷是 [`ImageContent`]（资源 + `fit` + 调制 + 内在尺寸）。
+    ///
+    /// 装箱理由同 `Text`：`ImageContent` 约 40 B，内联会把 `Node` 顶出尺寸预算（≤336 B）。
+    /// 尺寸解析与 measure 安装由 `App::refresh_images` 在布局之前完成 —— 在首次刷新之前
+    /// measure 为 `0×0`（与文本同型：`NodeBuilder::image` 不伪造与资源不一致的尺寸）。
+    Image(Box<ImageContent>),
 }
 
 impl NodeKind {
-    /// 叶子节点（`Canvas`/`Geometry`/`Text`）不布局子节点 —— 消费者：`depends_on_children`、
-    /// `NodeBuilder::build` 的 debug 断言。
+    /// 叶子节点（`Canvas`/`Geometry`/`Text`/`Image`）不布局子节点 —— 消费者：
+    /// `depends_on_children`、`NodeBuilder::build` 的 debug 断言。
     #[must_use]
     pub(crate) fn is_leaf(&self) -> bool {
-        matches!(self, Self::Canvas(_) | Self::Geometry(_) | Self::Text(_))
+        matches!(
+            self,
+            Self::Canvas(_) | Self::Geometry(_) | Self::Text(_) | Self::Image(_)
+        )
     }
 
     /// 静态几何节点（唯一会被 per-draw `Transform` 影响的种类；命中走逆变换）。
@@ -104,6 +116,15 @@ impl NodeKind {
     pub(crate) fn text(&self) -> Option<&TextContent> {
         match self {
             Self::Text(content) => Some(content),
+            _ => None,
+        }
+    }
+
+    /// 图片载荷（E7：paint 分派、`App::refresh_images` 与 a11y 的唯一读入口）。
+    #[must_use]
+    pub(crate) fn image(&self) -> Option<&ImageContent> {
+        match self {
+            Self::Image(content) => Some(content),
             _ => None,
         }
     }
@@ -206,6 +227,11 @@ pub struct Node {
     interaction: Option<Box<NodeInteraction>>,
     /// 该节点 lane 上次生成时的**累计滚动偏移**（paint 的复用判据，§7.6）。`Point::ZERO` = 未滚动。
     lane_offset: Point,
+    /// 上次重建 lane 时**实际乘进图元**的有效不透明度（自身补丁 × 祖先链；E13 组不透明度的复用戳）。
+    ///
+    /// paint 的复用判据之一：与本次遍历算出的继承值不等 ⇒ 本节点（及其子树）必须重建。
+    /// 初值 `1.0`（无补丁、无祖先调光）。
+    paint_opacity: f32,
 }
 
 /// **手写 `Debug`**（N4）：`bind_style` / `measure` / `hit_shape` 是闭包（不实现 `Debug`），
@@ -239,6 +265,7 @@ impl fmt::Debug for Node {
             .field("dirty", &self.dirty)
             .field("interaction", &self.interaction)
             .field("lane_offset", &self.lane_offset)
+            .field("paint_opacity", &self.paint_opacity)
             .finish()
     }
 }
@@ -402,6 +429,11 @@ pub(crate) struct PaintNodeState {
     /// 坐标），因此这两类节点的 lane 不能登记滚动槽：它们留在屏幕坐标里，祖先/自身滚动时
     /// 照旧重建（正确性优先，成本只落在自绘节点上）。
     pub screen_baked: bool,
+    /// 本节点的**有效**不透明度（自身补丁 × 全部祖先链，已 clamp 到 `[0, 1]`；E13 组不透明度）。
+    ///
+    /// 既是乘进本节点图元的值，也是子节点继承的父值；`reusable` 里与节点上的
+    /// `paint_opacity` 戳比较（不等 ⇒ 子树要重建）。
+    pub opacity: f32,
 }
 
 /// 几何节点一条**块 lane** 上次烘焙时的块状态（X5）。
@@ -479,6 +511,11 @@ pub struct NodeTree {
     subtree_bounds: Vec<Rect>,
     /// a11y 载荷旁表（`NodeBuilder::{a11y,bind_a11y}`；按 arena 槽位，槽位复用不继承）。
     a11y_slots: Vec<Option<Box<crate::a11y::tree::NodeA11y>>>,
+    /// 图片节点「需要在布局前重解析内在尺寸」的标记（E7）。
+    ///
+    /// 置位点：图片节点挂载（`arena::insert_child`）、资源句柄替换（`set_image_resource`）。
+    /// 消费点：`App::refresh_images`（`App::frame` 在布局之前取走，未置位时 O(1) 早退）。
+    images_need_refresh: bool,
     /// 动态属性待重算（`BIND`）的节点集合。消费者：`App::refresh_styles`。
     dirty_bind: DirtySet,
     /// 待重排（`LAYOUT`）的节点集合。消费者：`layout_if_dirty` 门禁 + taffy 布局；
@@ -643,6 +680,15 @@ impl NodeTree {
         arena::insert_child(self, parent, spec)
     }
     /// 实现见子模块 `arena::remove`（本文件只保留签名）。
+    ///
+    /// # 引擎内部原语：**不做 scoped 清理**
+    ///
+    /// 只删节点、回收 lane / damage / 容器登记并交还被删节点的信号依赖边。**不会**清理
+    /// 挂在被删子树上的 scoped 键绑定（`App::bind_key_scoped`）、`after_scoped` 定时器、
+    /// 动画槽、指针捕获会话与浮层焦点恢复 —— 应用侧卸载必须用
+    /// [`App::remove_node`](crate::app::App::remove_node)（它返回 [`crate::app::RemoveOutcome`]
+    /// 清理计数）；直接经 `Window::tree_mut()` 调本方法会留下永不命中的绑定 / 到期回调跑在
+    /// 死节点上的定时器 / 给死节点标脏的动画（R-21 应用义务，E16 已把应用入口下沉到引擎）。
     pub fn remove(
         &mut self,
         node: NodeId,
@@ -707,7 +753,11 @@ impl NodeTree {
     pub fn hit_test_skips(&self) -> u64 {
         content::hit_test_skips(self)
     }
-    fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+    /// `ancestor` 是否是 `node` 的（严格）祖先。
+    ///
+    /// 消费者：纯滚动帧的快路径判定（`window::paint::sync_scroll_offsets`：本次偏移变化
+    /// 的容器子树里是否还有别的滚动槽）。
+    pub(crate) fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
         traverse::is_ancestor(self, ancestor, node)
     }
     pub(crate) fn hoisted_clear(&mut self, node: NodeId) {
@@ -878,6 +928,19 @@ impl NodeTree {
     /// 消费者：`App::request_node_repaint`（R01-16 的节点级重绘：子树重建 lane）。
     pub(crate) fn mark_subtree_paint(&mut self, node: NodeId) -> usize {
         dirty::mark_subtree_paint(self, node)
+    }
+    /// 整棵子树标 `A11Y`（不冒泡、不产生像素工作）。
+    ///
+    /// 用于「本节点的变化会改变**后代**的 a11y 语义、但后代没有自己的脏位」：
+    /// - `app::virtual_list::set_virtual_items`：条目数变化 ⇒ 行数 / 行号 / 集合位置等派生字段
+    ///   整体失效，必须重进下一笔增量交付；
+    /// - `a11y::tree::write_a11y_patch`（E15b F2/F3，`bind_a11y` 两个写点 +
+    ///   `App::set_a11y_patch` 共用）：`role` / `hidden` 变化 ⇒ 后代派生角色（`TextRun` ↔
+    ///   `Label`）、集合领养、被跳过祖先的隐藏声明整体失效；
+    /// - `app::style_pass::refresh_styles`：`StylePatch::{visible, interactive}` 变化 ⇒ 后代的
+    ///   隐式 `Focus` / `Click` / `disabled` 能力翻转（祖先链输入）。
+    pub(crate) fn mark_subtree_a11y(&mut self, node: NodeId) -> usize {
+        dirty::mark_subtree_a11y(self, node)
     }
     pub(crate) fn clear_bind(&mut self, node: NodeId) -> bool {
         dirty::clear_bind(self, node)
@@ -1123,6 +1186,52 @@ impl NodeTree {
         content::set_canvas(self, node, canvas)
     }
 
+    // ── image（E7）：实现见 `image` 子模块的自由函数 ──
+    /// 取走「图片节点需要在布局前重解析内在尺寸」的标记（`App::refresh_images` 的 O(1) 门禁）。
+    pub(crate) fn take_images_need_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.images_need_refresh)
+    }
+    /// 解析所有图片节点的内在尺寸并安装 measure（返回尺寸真的变了的节点数）。
+    pub(crate) fn refresh_image_intrinsics(
+        &mut self,
+        resources: &crate::resources::ResourceCache,
+        scale: f32,
+    ) -> usize {
+        image::refresh_intrinsics(self, resources, scale)
+    }
+    /// 把异步解码交付的 `Ready` 结果写回图片节点（返回改写的节点数）。
+    pub(crate) fn resolve_pending_images(
+        &mut self,
+        resolved: &ahash::HashMap<
+            crate::resources::PendingResource,
+            crate::resources::ResourceImage,
+        >,
+        scale: f32,
+    ) -> usize {
+        image::resolve_pending(self, resolved, scale)
+    }
+    /// 标记所有引用 `resource` 的图片节点重绘（资源释放后的失效入口）。
+    pub(crate) fn invalidate_images_with_resource(&mut self, resource: ResourceId) -> usize {
+        image::invalidate_with_resource(self, resource)
+    }
+    /// 标记所有引用「已不在缓存里」的资源的图片节点重绘（关窗释放后的悬垂防护）。
+    pub(crate) fn invalidate_dead_images(
+        &mut self,
+        resources: &crate::resources::ResourceCache,
+    ) -> usize {
+        image::invalidate_dead(self, resources)
+    }
+    /// 替换图片节点的资源句柄（E7：DPI 换档 / 换图的引擎实现，公开入口是
+    /// `Window::set_image_resource`；与 `set_canvas` 同型）。
+    ///
+    /// 只改载荷并标该节点 `LAYOUT | PAINT`（尺寸可能变）：新资源的内在尺寸由**下一次**
+    /// `App::refresh_images` 在布局之前重解析。帧外（非 `on_frame` 钩子）调用后需配
+    /// [`App::request_repaint`](crate::app::App::request_repaint) 才会出帧，见
+    /// `Window::set_image_resource` 的文档。返回 `false` = 节点不是图片节点。
+    pub(crate) fn set_image_resource(&mut self, node: NodeId, resource: ResourceId) -> bool {
+        image::set_resource(self, node, resource)
+    }
+
     pub(crate) fn set_text_content(&mut self, node: NodeId, content: TextContent) -> bool {
         content::set_text_content(self, node, content)
     }
@@ -1149,6 +1258,10 @@ impl NodeTree {
     pub(crate) fn invalidate_text_lines(&mut self) -> usize {
         content::invalidate_text_lines(self)
     }
+    /// 让所有 `Canvas` 节点的 lane 重建（图集换代后的 canvas 编码期安全网入口；v2.1 E1b）。
+    pub(crate) fn mark_canvas_nodes_paint(&mut self) -> usize {
+        content::mark_canvas_nodes_paint(self)
+    }
     pub(crate) fn set_text_shaped(
         &mut self,
         node: NodeId,
@@ -1159,6 +1272,16 @@ impl NodeTree {
         size_changed: bool,
     ) -> bool {
         content::set_text_shaped(self, node, shaped, key, scale_epoch, measured, size_changed)
+    }
+    #[cfg(test)]
+    pub(crate) fn install_text_line_for_test(
+        &mut self,
+        node: NodeId,
+        content: &crate::text::TextContent,
+        line: Rc<ShapedLine>,
+        width: f32,
+    ) -> bool {
+        content::install_text_line_for_test(self, node, content, line, width)
     }
     pub(crate) fn set_text_line(
         &mut self,
@@ -1193,6 +1316,14 @@ impl NodeTree {
     /// 实现见子模块 `content::text_caret_rect`（本文件只保留签名）。
     pub fn text_caret_rect(&self, node: NodeId, byte_index: usize) -> Result<Rect, EngineError> {
         content::text_caret_rect(self, node, byte_index)
+    }
+    /// 实现见子模块 `content::text_byte_index_at`（本文件只保留签名）。
+    pub(crate) fn text_byte_index_at(
+        &self,
+        node: NodeId,
+        local_point: Point,
+    ) -> Result<usize, EngineError> {
+        content::text_byte_index_at(self, node, local_point)
     }
     /// 让单个文本节点的 ShapedLine 失效并进入重排队列（D-5 绘制前硬校验用）。
     pub(crate) fn invalidate_text_line(&mut self, node: NodeId) {
@@ -1325,18 +1456,31 @@ impl NodeTree {
     pub(crate) fn clip_key(&self, node: NodeId) -> Option<(u8, Option<PhysicalRect>)> {
         content::clip_key(self, node)
     }
+    /// 写回节点的有效不透明度戳（paint 重建 lane 时调用；E13 组不透明度的复用判据）。
+    pub(crate) fn set_paint_opacity(&mut self, node: NodeId, opacity: f32) {
+        content::set_paint_opacity(self, node, opacity)
+    }
     /// 一次取全 paint 所需的只读状态（消费者：`paint::pass::paint_node`）。
     ///
     /// `screen_offset` = 完整祖先滚动位移（屏幕 = 内容 − 它）；`bake_offset` = 图元烘焙偏移
-    /// （不含本节点所属滚动槽自己的位移，见 `paint/pass.rs` 的 `paint_node`）。
+    /// （不含本节点所属滚动槽自己的位移，见 `paint/pass.rs` 的 `paint_node`）；
+    /// `inherited_opacity` = 祖先链累计的不透明度（不含本节点自己的补丁值）。
     pub(crate) fn paint_state(
         &self,
         node: NodeId,
         screen_offset: Point,
         bake_offset: Point,
         clip_key: (u8, Option<PhysicalRect>),
+        inherited_opacity: f32,
     ) -> Option<PaintNodeState> {
-        content::paint_state(self, node, screen_offset, bake_offset, clip_key)
+        content::paint_state(
+            self,
+            node,
+            screen_offset,
+            bake_offset,
+            clip_key,
+            inherited_opacity,
+        )
     }
     pub(crate) fn set_clip_key(&mut self, node: NodeId, key: (u8, Option<PhysicalRect>)) {
         content::set_clip_key(self, node, key)

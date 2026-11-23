@@ -12,4 +12,5 @@
 //! `.review/diag/verify_native_resize.ps1` 验收。
 
 mod placement_tests;
+mod pointer_tests;
 mod wndproc_tests;

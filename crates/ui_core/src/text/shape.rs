@@ -43,9 +43,9 @@ use smol_str::{SmolStr, format_smolstr};
 use taffy::AvailableSpace;
 
 use super::{
-    InlineBoxSpec, ShapedGlyphRun, ShapedInlineBox, ShapedLine, ShapedTextItem, ShapedTextLine,
-    TextAlign, TextContent, TextDiagnostic, TextDirection, TextLineBreak, TextOverflow, TextSlant,
-    TextStyle, TextWrap,
+    InlineBoxSpec, ShapedDecoration, ShapedGlyphRun, ShapedInlineBox, ShapedLine, ShapedTextItem,
+    ShapedTextLine, TextAlign, TextContent, TextDecoration, TextDiagnostic, TextDirection,
+    TextLineBreak, TextOverflow, TextRun, TextSlant, TextStyle, TextWrap,
     atlas::{GlyphAtlas, GlyphAtlasStats},
     fast_path::SimpleShaped,
     inline_flow,
@@ -105,6 +105,12 @@ pub(crate) struct ShapedText {
     text: SmolStr,
     /// 生成快照时的样式（**只保留 shaping 输入**：颜色/对齐每次使用现场给）。
     style: TextStyle,
+    /// 富文本 runs（v2.1 E2）：`ShapeKey` 与缓存命中判据都包含它（run 的颜色/装饰被烘进
+    /// `ShapedLine`：逐 run 的 `ShapedGlyphRun.color`、`ShapedTextLine.decorations`）。
+    runs: Box<[TextRun]>,
+    /// 构造期被归一化的 run 数（`TextDiagnostic::InvalidTextRun` 的计数来源；也进缓存键与
+    /// 命中判据 —— 诊断随快照复用，不能让「有诊断的内容」命中「没诊断的快照」）。
+    normalized_runs: u16,
     font_stack_version: u32,
     kind: ShapedKind,
     /// 行内盒的边界/超宽诊断（shape 期间产生，随 `rasterize` 交给 `TextContext`）。
@@ -211,15 +217,30 @@ impl ShapedText {
     ///
     /// 坐标是**逻辑像素**：`ranged_builder(..., 1.0, true)`（`quantize` 让行盒吸附到逻辑整像素，
     /// 与旧实现在 100% DPI 下逐位一致）。
+    ///
+    /// v2.1 E2：`content.runs` 按区间逐个 `push`（字号/字重/倾斜/家族/字距/行高/特性/变体轴/
+    /// 断行/颜色），parley 因此在样式边界处切分 run；run 的段落级字段（对齐/溢出/行数/方向）
+    /// 不参与 —— 它们由 `content.style` 决定。`run_families` 是 `TextContext` 预解析好的
+    /// 「区间 → 家族列表」（run 里 `family` 覆盖 base 时才非空）。
     pub(crate) fn shape(
         font_cx: &mut FontContext,
         layout_cx: &mut LayoutContext<ColorBrush>,
         family: &parley::FontFamily<'static>,
         content: &TextContent,
         font_stack_version: u32,
+        run_families: &[(core::ops::Range<usize>, parley::FontFamily<'static>)],
     ) -> Self {
         let style = &content.style;
         let mut inline_diagnostics: Vec<TextDiagnostic> = Vec::new();
+        // `§11.2` 的非法 runs 语义（E2 审查 F4，Lead 裁定 b）：构造期归一化 + 诊断。归一化
+        // 发生在 `TextContent::with_runs` / `NodeBuilder::runs`，这里把改动计数压成一条诊断
+        // （不逐 run 刷屏；`TextContext` 诊断环按值去重）。归一化后的 runs 已合法，因此不再
+        // 需要形状期防御校验（旧的逐 run `InvalidTextRun{start,end}` 路径不可达，已删除）。
+        if content.normalized_runs() > 0 {
+            inline_diagnostics.push(TextDiagnostic::InvalidTextRun {
+                runs: usize::from(content.normalized_runs()),
+            });
+        }
         let mut builder = layout_cx.ranged_builder(font_cx, &content.text, 1.0, true);
         builder.set_base_direction(match style.direction {
             TextDirection::Auto => parley::BaseDirection::Auto,
@@ -228,6 +249,13 @@ impl ShapedText {
         });
         builder.push_default(StyleProperty::FontFamily(family.clone()));
         push_shaping_defaults(&mut builder, style);
+        for run in content.runs() {
+            let run_family = run_families
+                .iter()
+                .find(|(range, _)| *range == run.range)
+                .map_or_else(|| family.clone(), |(_, family)| family.clone());
+            push_run_style(&mut builder, &run.style, run_family, run.range.clone());
+        }
         for spec in &content.inline_boxes {
             let (inline_box, diagnostic) = inline_flow::to_inline_box(spec, &content.text);
             if let Some(diagnostic) = diagnostic {
@@ -239,6 +267,8 @@ impl ShapedText {
         Self {
             text: content.text.clone(),
             style: style.clone(),
+            runs: content.runs().to_vec().into_boxed_slice(),
+            normalized_runs: content.normalized_runs(),
             font_stack_version,
             kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(layout, style.max_lines()))),
             inline_diagnostics,
@@ -248,15 +278,21 @@ impl ShapedText {
         }
     }
 
-    /// 由数字快速路径的结果建快照（单行）。
+    /// 由数字快速路径的结果建快照（单行；**无 runs**：带 runs 的内容不走快速路径）。
     pub(crate) fn simple(
         content: &TextContent,
         simple: SimpleShaped,
         font_stack_version: u32,
     ) -> Self {
+        debug_assert!(
+            content.runs().is_empty(),
+            "数字快速路径不接受富文本 runs（TextContext::shape_cached 已拒绝）"
+        );
         Self {
             text: content.text.clone(),
             style: content.style.clone(),
+            runs: Box::new([]),
+            normalized_runs: 0,
             font_stack_version,
             kind: ShapedKind::Simple(simple),
             inline_diagnostics: Vec::new(),
@@ -264,6 +300,17 @@ impl ShapedText {
             measure_memo: RefCell::new(None),
             measure_breaks: Cell::new(0),
         }
+    }
+
+    /// 富文本 runs（`§11.2`；缓存命中判据的一部分）。
+    #[cfg(test)]
+    pub(crate) fn runs(&self) -> &[TextRun] {
+        &self.runs
+    }
+
+    /// 该快照对应的「构造期归一化 run 数」（缓存命中判据的一部分）。
+    pub(crate) fn normalized_runs(&self) -> u16 {
+        self.normalized_runs
     }
 
     pub(crate) fn inline_boxes(&self) -> &[InlineBoxSpec] {
@@ -278,12 +325,33 @@ impl ShapedText {
         &self.style
     }
 
-    /// 该快照的 shaping 输入是否与 `style` 等价（`color`/`alignment` 不参与形状）。
+    /// 仅测试：空布局的占位快照（`paint` 测试直接注入 `ShapedLine` 时用来创建文本槽）。
+    #[cfg(test)]
+    pub(crate) fn blank_for_text_test(text: SmolStr, style: TextStyle) -> Self {
+        Self {
+            text,
+            style: style.clone(),
+            runs: Box::new([]),
+            normalized_runs: 0,
+            font_stack_version: 1,
+            kind: ShapedKind::Parley(RefCell::new(ParleySnapshot::new(
+                parley::Layout::new(),
+                style.max_lines(),
+            ))),
+            inline_diagnostics: Vec::new(),
+            inline_boxes: Box::new([]),
+            measure_memo: RefCell::new(None),
+            measure_breaks: Cell::new(0),
+        }
+    }
+
+    /// 该快照的 shaping 输入是否与 `style` + `runs` 等价（`color`/`alignment` 不参与形状）。
     ///
     /// 缓存命中后仍要逐字段比较（防哈希碰撞）：比较必须用**与缓存键相同的等价关系**，
-    /// 否则「同键不同色」会被判成 miss，缓存形同虚设。
-    pub(crate) fn same_shaping_inputs(&self, style: &TextStyle) -> bool {
-        self.style.same_shaping_inputs(style)
+    /// 否则「同键不同色」会被判成 miss，缓存形同虚设。v2.1 E2 起 runs 全量参与比较：
+    /// run 的颜色/装饰被烘进 `ShapedLine`（逐 run 颜色、装饰几何），不能复用旧快照。
+    pub(crate) fn same_shaping_inputs(&self, style: &TextStyle, runs: &[TextRun]) -> bool {
+        self.style.same_shaping_inputs(style) && self.runs.as_ref() == runs
     }
 
     /// 快照里所有行内所有 run 是否都**不是** RTL（bidi level 为偶数）。
@@ -417,6 +485,18 @@ impl ShapedText {
         };
         let inline_boxes = core::mem::size_of_val(self.inline_boxes.as_ref());
         let inline_diagnostics = self.inline_diagnostics.capacity() * 64;
+        let runs_bytes: usize = self
+            .runs
+            .iter()
+            .map(|run| {
+                core::mem::size_of::<TextRun>()
+                    + run
+                        .style
+                        .extras
+                        .as_deref()
+                        .map_or(0, core::mem::size_of_val)
+            })
+            .sum();
         let extras = self
             .style
             .extras
@@ -429,11 +509,14 @@ impl ShapedText {
             + inline_boxes
             + inline_diagnostics
             + extras
+            + runs_bytes
     }
 
     /// 光栅 + 装箱，产出只读快照（`content_width` 是 taffy 算出的内容宽，逻辑像素）。
     ///
-    /// `color`/`alignment` 由当前内容与样式现场给出（不在形状缓存键里）。`ellipsis` 只在
+    /// `color`/`alignment` 由当前内容与样式现场给出（不在形状缓存键里）。`color` 是本次的
+    /// **基础文本色**：parley 路径按它重写未被 `TextRun` 覆盖的 run（E24，见
+    /// [`current_run_color`]），数字快速路径与装饰/省略号本来就用它。`ellipsis` 只在
     /// `style.overflow == Ellipsis` 时使用。
     pub(crate) fn rasterize(
         &self,
@@ -498,6 +581,8 @@ impl ShapedText {
                     width,
                     &self.text,
                     color,
+                    &self.runs,
+                    &self.style,
                     ctx,
                     &self.inline_diagnostics,
                 )?;
@@ -576,6 +661,34 @@ impl ShapedText {
         .unwrap_or_default()
     }
 
+    /// 文本盒局部坐标 → 最近合法字节边界（[`Self::caret_rect`] 的逆向，E5/§11.5）。
+    ///
+    /// 与 `caret_rect` 共用同一断行/对齐状态（`break_and_align(width, alignment)`），因此
+    /// 「矩形 → 点 → 矩形」在两次调用之间保持一致；快速路径（单行 ASCII）用同一套半簇取整规则
+    /// 解析，不走 parley。垂直 clamp 由两条路径各自实现 —— 上方 `0`、下方 `text.len()`。
+    pub(crate) fn byte_index_at(&self, width: f32, alignment: TextAlign, point: Point) -> usize {
+        if let ShapedKind::Simple(simple) = &self.kind {
+            if point.y < 0.0 {
+                return 0;
+            }
+            let metrics = simple.metrics();
+            if point.y > metrics.line_height {
+                return simple.text_len();
+            }
+            let offset = super::fast_path::simple_alignment_offset(
+                simple.size().width,
+                width,
+                alignment,
+                self.style.direction,
+            );
+            return simple.byte_index_at(point.x - offset);
+        }
+        self.with_broken_layout(width, alignment, |layout| {
+            inline_flow::byte_index_at(layout, self.text.as_str(), point)
+        })
+        .unwrap_or_default()
+    }
+
     /// 仅测试：当前快照的 parley 布局（共享借用；调用期间不得再触发 `measure`/`rasterize`）。
     #[cfg(test)]
     pub(crate) fn layout(&self) -> std::cell::Ref<'_, parley::Layout<ColorBrush>> {
@@ -632,6 +745,10 @@ pub(super) fn push_shaping_defaults<'a>(
     builder: &mut parley::RangedBuilder<'a, ColorBrush>,
     style: &TextStyle,
 ) {
+    // v2.1 E2：默认画刷 = 兜底样式的文本色（逐 run 的 `push_run_style` 会覆盖自己区间）。
+    // 光栅期**不读**这里的画刷来决定基础色：`ShapeKey` 不含颜色，命中的布局可能来自另一种
+    // 基础色，`rasterize_parley` 按本次请求的 `style.color` 重写基础 run（E24）。
+    builder.push_default(StyleProperty::Brush(ColorBrush { color: style.color }));
     builder.push_default(StyleProperty::FontSize(style.size));
     builder.push_default(StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(
         style.weight,
@@ -699,6 +816,115 @@ pub(super) fn push_shaping_defaults<'a>(
         TextWrap::Anywhere => {
             builder.push_default(StyleProperty::WordBreak(ParleyWordBreak::BreakAll));
             builder.push_default(StyleProperty::OverflowWrap(ParleyOverflowWrap::Anywhere));
+        }
+    }
+}
+
+/// 把一个富文本 run 的覆盖样式压进 `RangedBuilder` 的 `range`（v2.1 E2，`§11.2`）。
+///
+/// 与 [`push_shaping_defaults`] 同一组属性（`push_default` → `push(range)`），差异是每个属性都
+/// 作用在 run 区间上。**段落级字段**（`alignment` / `overflow` / `max_lines` / `direction`）
+/// 不在这里：它们由整段的 `TextContent.style` 决定（`§11.2` 的覆盖语义）。
+fn push_run_style<'a>(
+    builder: &mut parley::RangedBuilder<'a, ColorBrush>,
+    style: &TextStyle,
+    family: parley::FontFamily<'static>,
+    range: core::ops::Range<usize>,
+) {
+    builder.push(StyleProperty::FontFamily(family), range.clone());
+    builder.push(
+        StyleProperty::Brush(ColorBrush { color: style.color }),
+        range.clone(),
+    );
+    builder.push(StyleProperty::FontSize(style.size), range.clone());
+    builder.push(
+        StyleProperty::FontWeight(ParleyFontWeight::new(f32::from(style.weight))),
+        range.clone(),
+    );
+    builder.push(
+        StyleProperty::FontStyle(match style.slant {
+            TextSlant::Normal => ParleyFontStyle::Normal,
+            TextSlant::Italic => ParleyFontStyle::Italic,
+            TextSlant::Oblique => ParleyFontStyle::Oblique(None),
+        }),
+        range.clone(),
+    );
+    builder.push(
+        StyleProperty::LetterSpacing(style.letter_spacing),
+        range.clone(),
+    );
+    builder.push(
+        StyleProperty::LineHeight(match style.line_height {
+            None => ParleyLineHeight::NORMAL,
+            Some(factor) => ParleyLineHeight::FontSizeRelative(factor),
+        }),
+        range.clone(),
+    );
+    if let Some(features) = style.font_features() {
+        let features: Vec<parley::FontFeature> = features
+            .iter()
+            .map(|feature| {
+                parley::FontFeature::new(
+                    parley::setting::Tag::from_bytes(feature.tag),
+                    feature.value,
+                )
+            })
+            .collect();
+        builder.push(
+            StyleProperty::FontFeatures(parley::FontFeatures::List(Cow::Owned(features))),
+            range.clone(),
+        );
+    }
+    if let Some(stretch) = style.stretch() {
+        builder.push(
+            StyleProperty::FontWidth(parley::FontWidth::from_percentage(f32::from(stretch))),
+            range.clone(),
+        );
+    }
+    if let Some(word_spacing) = style.word_spacing() {
+        builder.push(StyleProperty::WordSpacing(word_spacing), range.clone());
+    }
+    if let Some(locale) = style.locale()
+        && let Ok(language) = parley::Language::parse(locale)
+    {
+        builder.push(StyleProperty::Locale(Some(language)), range.clone());
+    }
+    if let Some(variations) = style.font_variations() {
+        let variations: Vec<parley::FontVariation> = variations
+            .iter()
+            .map(|variation| parley::FontVariation {
+                tag: parley::setting::Tag::from_bytes(variation.tag),
+                value: variation.value,
+            })
+            .collect();
+        builder.push(
+            StyleProperty::FontVariations(parley::FontVariations::List(Cow::Owned(variations))),
+            range.clone(),
+        );
+    }
+    if let Some(line_break) = style.line_break() {
+        builder.push(
+            StyleProperty::LineBreak(parley_line_break(line_break)),
+            range.clone(),
+        );
+    }
+    match style.wrap {
+        TextWrap::Wrap => {}
+        TextWrap::NoWrap => {
+            builder.push(
+                StyleProperty::TextWrapMode(ParleyTextWrapMode::NoWrap),
+                range,
+            );
+        }
+        TextWrap::Anywhere => {
+            builder.push(
+                StyleProperty::WordBreak(ParleyWordBreak::BreakAll),
+                range.clone(),
+            );
+            builder.push(
+                StyleProperty::OverflowWrap(ParleyOverflowWrap::Anywhere),
+                range,
+            );
         }
     }
 }
@@ -777,12 +1003,173 @@ fn parley_line_break(kind: TextLineBreak) -> parley::LineBreak {
     }
 }
 
+/// 下划线中心相对基线的偏移（em，向下为正）。
+const UNDERLINE_OFFSET_EM: f32 = 0.10;
+/// 删除线中心相对基线的偏移（em，向上为正）。
+const STRIKETHROUGH_OFFSET_EM: f32 = 0.30;
+
+/// 一行的**内容区间终点**：去掉行尾硬换行符（`\n` / `\r\n`）。
+///
+/// parley 的 `Line::text_range()` 对硬换行行**包含行尾换行符**，而换行符不是可见字符：
+/// 装饰（下划线/删除线）不能画到换行符上，否则行尾会多出一小段线；更重要的是旧实现把
+/// 「末字符是换行」当成整段不可映射直接丢弃，导致**整行**装饰消失（E2 审查 F1）。
+fn line_content_end(text: &str, line_range: &core::ops::Range<usize>) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = line_range.end.min(text.len());
+    while end > line_range.start && matches!(bytes.get(end - 1), Some(b'\n' | b'\r')) {
+        end -= 1;
+    }
+    end
+}
+
+/// 一行内的文本装饰几何（v2.1 E2，`§11.2`）。
+///
+/// 绘制序：**兜底样式的装饰在前**（覆盖未被装饰 run 占用的区间），run 的装饰在后（后者覆盖
+/// 前者，与 CSS 的 text-decoration 传播直觉一致）。坐标是文本盒局部逻辑像素；py 由 `baseline`
+/// 与装饰所属样式的字号决定，x 由区间内 cluster 的 `visual_offset`（已含行对齐偏移）极值映射。
+fn decoration_segments(
+    line: &parley::Line<'_, ColorBrush>,
+    baseline: f32,
+    text: &str,
+    runs: &[TextRun],
+    base_style: &TextStyle,
+    base_color: Color,
+) -> Vec<ShapedDecoration> {
+    let line_range = line.text_range();
+    // 硬换行行：行尾的 `\n` / `\r\n` 不属于装饰范围（F1）。
+    let line_end = line_content_end(text, &line_range);
+    // (区间, 装饰, 该 run 的字号, 文本色)
+    let decorated: Vec<(core::ops::Range<usize>, TextDecoration, f32, Color)> = runs
+        .iter()
+        .filter_map(|run| {
+            let decoration = run.style.decoration()?;
+            if !decoration.is_visible() {
+                return None;
+            }
+            let start = run.range.start.max(line_range.start);
+            let end = run.range.end.min(line_end);
+            (start < end).then_some((start..end, decoration, run.style.size, run.style.color))
+        })
+        .collect();
+
+    let mut segments: Vec<(core::ops::Range<usize>, TextDecoration, f32, Color)> = Vec::new();
+    // 兜底样式的装饰：覆盖「未被装饰 run 占用」的区间（run 的装饰优先，不叠加）。
+    if let Some(decoration) = base_style.decoration()
+        && decoration.is_visible()
+    {
+        let mut cursor = line_range.start;
+        for (range, ..) in &decorated {
+            if range.start > cursor {
+                segments.push((cursor..range.start, decoration, base_style.size, base_color));
+            }
+            cursor = cursor.max(range.end);
+        }
+        if cursor < line_end {
+            segments.push((cursor..line_end, decoration, base_style.size, base_color));
+        }
+    }
+    segments.extend(decorated);
+
+    let mut out = Vec::with_capacity(segments.len());
+    for (range, decoration, em, text_color) in segments {
+        let Some((left, width)) = decoration_span(line, text, range) else {
+            continue;
+        };
+        let thickness = decoration.thickness();
+        let (top, color) = match decoration {
+            TextDecoration::Underline { color, .. } => (
+                baseline + em * UNDERLINE_OFFSET_EM,
+                color.unwrap_or(text_color),
+            ),
+            TextDecoration::Strikethrough { color, .. } => (
+                baseline - em * STRIKETHROUGH_OFFSET_EM,
+                color.unwrap_or(text_color),
+            ),
+        };
+        out.push(ShapedDecoration {
+            rect: Rect::new(left, top - thickness * 0.5, width, thickness),
+            color,
+        });
+    }
+    out
+}
+
+/// 字节区间 → 行内 x 跨度（`left, width`）；区间为空 / 没有可映射字符时 `None`。
+///
+/// 取区间内**所有** cluster 的视觉并集：[`min(visual_offset)`, `max(visual_offset + advance)`]。
+/// 不能只取「逻辑首/末字符所属 cluster」的端点（E2 审查 F2）：`visual_offset` 是**视觉左边缘**，
+/// RTL 片段里逻辑首字符在视觉右端、逻辑末字符在视觉左端，端点法会只画出中间一段（两端各少
+/// 一个 cluster 的宽度）；bidi 混排（一行内多个方向段）同理。区间内 cluster 按视觉顺序遍历，
+/// 第一个 = 最左、最后一个 = 最右。
+fn decoration_span(
+    line: &parley::Line<'_, ColorBrush>,
+    text: &str,
+    range: core::ops::Range<usize>,
+) -> Option<(f32, f32)> {
+    let start = range.start.min(text.len());
+    let end = range.end.min(text.len());
+    if start >= end {
+        return None;
+    }
+    let mut first: Option<parley::Cluster<'_, ColorBrush>> = None;
+    let mut last: Option<parley::Cluster<'_, ColorBrush>> = None;
+    for run in line.runs() {
+        for cluster in run.visual_clusters() {
+            let cluster_range = cluster.text_range();
+            if cluster_range.end <= start || cluster_range.start >= end {
+                continue;
+            }
+            first.get_or_insert(cluster);
+            last = Some(cluster);
+        }
+    }
+    let first = first?;
+    let last = last?;
+    let x0 = first.visual_offset()?;
+    let x1 = last.visual_offset()? + last.advance();
+    let left = x0.min(x1);
+    let width = (x1 - x0).abs();
+    (width > 0.0 && left.is_finite() && width.is_finite()).then_some((left, width))
+}
+
+/// 一个 style run 的**当前**文本色（E24，W6b 审查 F22）。
+///
+/// `ShapeKey` 不含基础色（R12-11：颜色不改变 glyph id / advance / 断行，红/绿两态共享一份
+/// 快照）；parley 布局里烘的却是 shape 期画刷。节点文本绘制期由 `bind_style.foreground` 重上色，
+/// Canvas 文本没有这条通道 ⇒ 旧实现里「同字符串换色（halo 副本）」永远画第一次的颜色。
+/// 光栅期按本次请求的 `base_color` 重算：
+///
+/// - style run **完全被某个 `TextRun` 覆盖** ⇒ 用 run 自己的颜色（E2：run 的颜色是具体值，
+///   换基础色不得覆盖它）；
+/// - style run 与所有 `TextRun` **不相交** ⇒ 用本次请求的 `base_color`（F22 的修复点）；
+/// - 与部分 run 相交（相邻同色 run 被 parley 合并成一个 style run）⇒ 没有唯一正确答案，
+///   保留 shaping 期画刷：至少不会把显式颜色擦成基础色。
+///
+/// 首次光栅（缓存 miss）三条分支都等价于 shaping 期画刷，因此不改变既有输出。
+fn current_run_color(
+    runs: &[TextRun],
+    range: &core::ops::Range<usize>,
+    shaped_color: Color,
+    base_color: Color,
+) -> Color {
+    let mut overlaps = false;
+    for run in runs {
+        if run.range.start <= range.start && range.end <= run.range.end {
+            return run.style.color;
+        }
+        overlaps |= run.range.start < range.end && range.start < run.range.end;
+    }
+    if overlaps { shaped_color } else { base_color }
+}
+
 /// 光栅一份已就位的 parley 布局。
 fn rasterize_parley(
     layout: &parley::Layout<ColorBrush>,
     content_width: f32,
     text: &SmolStr,
     color: Color,
+    runs: &[TextRun],
+    base_style: &TextStyle,
     ctx: &mut RasterCtx<'_>,
     inline_diagnostics: &[TextDiagnostic],
 ) -> Result<(ShapedLine, Vec<TextDiagnostic>), EngineError> {
@@ -792,28 +1179,82 @@ fn rasterize_parley(
     for line in layout.lines() {
         let metrics = line.metrics();
         let mut items = Vec::new();
+        // v2.1 E2（`§11.2`）：parley 的 `GlyphRun` 按**字体**切分，不按 `Brush` 切；同一个字体里
+        // 多个 TextRun（不同颜色）共享一个 `GlyphRun`，而 `Line::items()` 会按 style run 再切成
+        // 多个 item（每个 item 只覆盖一种解析样式）。item 不暴露自己的文本区间，因此这里用
+        // 「该 run 的 visual cluster 表 + 逐 item 消耗 cluster」还原 item 的字节区间。
+        // 这样 `ShapedGlyphRun.text_range` 与 `TextContent.runs[].range` 一致，颜色按
+        // [`current_run_color`] 取**本次**请求的颜色（run 覆盖区间取 run 颜色，其余取基础色）。
+        let mut cluster_cache: Option<(
+            core::ops::Range<usize>,
+            Vec<(core::ops::Range<usize>, usize)>,
+        )> = None;
+        let mut cluster_cursor: Option<(core::ops::Range<usize>, usize)> = None;
         for item in line.items() {
             match item {
                 PositionedLayoutItem::GlyphRun(run) => {
-                    let font = run.run().font().clone();
+                    let parley_run = run.run();
+                    let font = parley_run.font().clone();
+                    let run_text_range = parley_run.text_range();
+                    // item 的字节区间：消耗该 run 的 visual cluster 直到覆盖 item 的字形数。
+                    let (cached_range, clusters) = cluster_cache.get_or_insert_with(|| {
+                        let clusters: Vec<(core::ops::Range<usize>, usize)> = parley_run
+                            .visual_clusters()
+                            .map(|cluster| (cluster.text_range(), cluster.glyphs().count()))
+                            .collect();
+                        (run_text_range.clone(), clusters)
+                    });
+                    if *cached_range != run_text_range {
+                        *cached_range = run_text_range.clone();
+                        *clusters = parley_run
+                            .visual_clusters()
+                            .map(|cluster| (cluster.text_range(), cluster.glyphs().count()))
+                            .collect();
+                    }
+                    let mut cursor = match &cluster_cursor {
+                        Some((range, cursor)) if *range == run_text_range => *cursor,
+                        _ => 0,
+                    };
+                    let item_glyph_count = run.glyphs().count();
+                    let mut item_range = run_text_range.clone();
+                    let mut remaining = item_glyph_count;
+                    let mut first = true;
+                    while remaining > 0 {
+                        let Some((cluster_range, cluster_glyphs)) = clusters.get(cursor) else {
+                            break;
+                        };
+                        cursor += 1;
+                        if first {
+                            item_range = cluster_range.clone();
+                            first = false;
+                        } else {
+                            item_range.start = item_range.start.min(cluster_range.start);
+                            item_range.end = item_range.end.max(cluster_range.end);
+                        }
+                        remaining = remaining.saturating_sub(*cluster_glyphs);
+                    }
+                    cluster_cursor = Some((run_text_range, cursor));
+                    // E24（F22）：颜色**不**取 shape 期烘进布局的画刷 —— `ShapeKey` 不含
+                    // `color`（R12-11），命中的快照可能是在另一种基础色下塑形的。按本次请求的
+                    // 基础色 + 该 style run 是否被 `TextRun` 覆盖现场重算。
+                    let item_color =
+                        current_run_color(runs, &item_range, run.style().brush.color, color);
                     // 光栅 ppem = parley 的 `Run::font_size()`（逻辑字号）× 设备 scale，
                     // **保留小数**：14 px @125% → 17.5 ppem。
-                    let ppem = (run.run().font_size() * scale).clamp(1.0, 512.0);
-                    let text_range = run.run().text_range();
-                    if run.run().synthesis().any() {
+                    let ppem = (parley_run.font_size() * scale).clamp(1.0, 512.0);
+                    if parley_run.synthesis().any() {
                         diagnostics.push(TextDiagnostic::SyntheticStyle {
-                            text_range: text_range.clone(),
+                            text_range: item_range.clone(),
                         });
                     }
-                    let normalized_coords: Vec<i16> = run
-                        .run()
+                    let normalized_coords: Vec<i16> = parley_run
                         .normalized_coords()
                         .iter()
                         .map(|coord| coord.to_bits())
                         .collect();
                     let variation =
-                        GlyphVariation::of(&normalized_coords, run.run().synthesis(), ppem);
-                    let mut glyphs = Vec::new();
+                        GlyphVariation::of(&normalized_coords, parley_run.synthesis(), ppem);
+                    let mut glyphs = Vec::with_capacity(item_glyph_count);
                     for glyph in run.positioned_glyphs() {
                         if glyph.id == 0 {
                             // 缺字形**不能静默跳过**：与 Chrome/Skia 一致，画该 run 字体的
@@ -824,7 +1265,7 @@ fn rasterize_parley(
                             diagnostics.push(TextDiagnostic::MissingGlyph {
                                 font: font_label(&font),
                                 glyph: glyph.id,
-                                text_range: text_range.clone(),
+                                text_range: item_range.clone(),
                             });
                         }
                         let Some((positioned, color_glyph)) =
@@ -838,14 +1279,14 @@ fn rasterize_parley(
                             diagnostics.push(TextDiagnostic::ColorGlyphMonochrome {
                                 font: font_label(&font),
                                 glyph: glyph.id,
-                                text_range: text_range.clone(),
+                                text_range: item_range.clone(),
                             });
                         }
                         glyphs.push(positioned);
                     }
                     items.push(ShapedTextItem::GlyphRun(ShapedGlyphRun {
-                        color,
-                        text_range,
+                        color: item_color,
+                        text_range: item_range,
                         glyphs,
                     }));
                 }
@@ -866,12 +1307,15 @@ fn rasterize_parley(
                 }
             }
         }
+        let decorations =
+            decoration_segments(&line, metrics.baseline, text, runs, base_style, color);
         lines.push(ShapedTextLine {
             text_range: line.text_range(),
             baseline: metrics.baseline,
             line_height: metrics.line_height,
             advance: metrics.advance,
             items,
+            decorations,
         });
     }
     let shaped = ShapedLine {
@@ -962,6 +1406,11 @@ fn apply_overflow(
             ctx,
             line_offset,
         )?;
+        // 截断后的可见区间只到 `line_offset + last.advance`：装饰不能画到省略号之外
+        // （否则 lane 里会出现一条越过内容盒的线，damage/命中都按它算）。
+        if let Some(last) = shaped.lines.last_mut() {
+            clamp_line_decorations(last, line_offset);
+        }
     }
     // 重新汇总尺寸（截断后行数与宽度都变了）。
     shaped.width = shaped
@@ -971,6 +1420,24 @@ fn apply_overflow(
         .fold(0.0f32, f32::max);
     shaped.height = shaped.lines.iter().map(|line| line.line_height).sum();
     Ok(())
+}
+
+/// 把一行的装饰几何夹到可见水平区间 `[line_offset, line_offset + advance]`（省略号截断后）。
+fn clamp_line_decorations(line: &mut ShapedTextLine, line_offset: f32) {
+    let min = line_offset;
+    let max = line_offset + line.advance;
+    for decoration in &mut line.decorations {
+        let left = decoration.rect.origin.x.max(min);
+        let right = (decoration.rect.origin.x + decoration.rect.size.width).min(max);
+        if right > left {
+            decoration.rect.origin.x = left;
+            decoration.rect.size.width = right - left;
+        } else {
+            decoration.rect.size.width = 0.0;
+        }
+    }
+    line.decorations
+        .retain(|decoration| decoration.rect.size.width > 0.0);
 }
 
 /// `max_lines` 作用后的可见行数（截断与「取末行对齐偏移」共用同一口径）。
@@ -1156,7 +1623,7 @@ mod tests {
     use super::family_list;
     use crate::text::{
         FontStack, InlineAlign, InlineBoxSpec, ShapedTextItem, TextAlign, TextContent,
-        TextDiagnostic, TextDirection, TextStyle, TextWrap,
+        TextDecoration, TextDiagnostic, TextDirection, TextRun, TextStyle, TextWrap,
     };
 
     struct Harness {
@@ -1185,12 +1652,17 @@ mod tests {
             inline: &[InlineBoxSpec],
         ) -> super::ShapedText {
             let content = TextContent::new(text, style).with_inline_boxes(inline.to_vec());
+            self.shape_content(&content)
+        }
+
+        fn shape_content(&mut self, content: &TextContent) -> super::ShapedText {
             super::ShapedText::shape(
                 &mut self.font_cx,
                 &mut self.layout_cx,
                 &self.family,
-                &content,
+                content,
                 1,
+                &[],
             )
         }
     }
@@ -1478,6 +1950,27 @@ mod tests {
                 &mut ctx,
                 None,
             )
+            .expect("rasterize")
+            .0
+    }
+
+    /// E24：用指定**基础色**光栅同一份快照（颜色不在形状缓存键里，一份布局可被多种颜色复用）。
+    fn rasterize_line_in_color(
+        shaped: &super::ShapedText,
+        width: f32,
+        color: crate::paint::color::Color,
+    ) -> crate::text::ShapedLine {
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let generation = atlas.generation();
+        let mut ctx = super::RasterCtx {
+            raster: &mut raster,
+            glyph_atlas: &mut glyphs,
+            atlas: &mut atlas,
+            generation,
+            scale: 1.0,
+        };
+        shaped
+            .rasterize(width, shaped.style().alignment, color, &mut ctx, None)
             .expect("rasterize")
             .0
     }
@@ -1847,6 +2340,7 @@ mod tests {
             size: crate::math::Size::new(20.0, 18.0),
             baseline: None,
             align: InlineAlign::Baseline,
+            paint: None,
         };
         let boxes: Vec<InlineBoxSpec> = (0..8)
             .map(|index| InlineBoxSpec { index, ..spec })
@@ -1869,6 +2363,7 @@ mod tests {
             size: crate::math::Size::new(20.0, 18.0),
             baseline: None,
             align: InlineAlign::Baseline,
+            paint: None,
         };
         let shaped = harness.shape_with("abcd", TextStyle::new(16.0), &[spec]);
 
@@ -1879,6 +2374,581 @@ mod tests {
             .filter(|item| matches!(item, parley::PositionedLayoutItem::InlineBox(_)))
             .count();
         assert_eq!(boxes, 1, "one inline box must be placed");
+    }
+
+    /// v2.1 E2（`§11.2`）：多 run 按区间切分 parley run，逐 run 的文本色从画刷烘焙进
+    /// `ShapedGlyphRun.color`；run 边界 == `TextRun.range`。
+    #[test]
+    fn runs_split_glyph_runs_and_keep_per_run_colors() {
+        use crate::paint::color::Color;
+
+        let red = Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let blue = Color::Srgb {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            alpha: 1.0,
+        };
+        let mut harness = Harness::new();
+        let content = TextContent::new("abcdef", TextStyle::new(16.0)).with_runs([
+            TextRun::new(0..3, TextStyle::new(16.0).with_color(red)),
+            TextRun::new(3..6, TextStyle::new(16.0).with_color(blue)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        assert_eq!(shaped.runs().len(), 2, "快照必须保存 runs（缓存命中判据）");
+
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let runs: Vec<_> = line.glyph_runs().collect();
+        assert_eq!(runs.len(), 2, "两个 TextRun 必须切成两个字形 run");
+        assert_eq!(runs[0].text_range, 0..3);
+        assert_eq!(runs[1].text_range, 3..6);
+        assert_eq!(
+            runs[0].color, red,
+            "第一个 run 的文本色来自 run.style.color"
+        );
+        assert_eq!(runs[1].color, blue);
+        assert!(!runs[0].glyphs.is_empty() && !runs[1].glyphs.is_empty());
+    }
+
+    /// E24（W6b 审查 F22）：基础色不在形状缓存键里，光栅期必须按**本次**基础色重写
+    /// 未被 `TextRun` 覆盖的 style run；`TextRun` 自己的颜色是具体值，不得被基础色覆盖。
+    ///
+    /// 变异守护：把 `rasterize_parley` 的 `item_color` 改回 `run.style().brush.color`
+    /// （shape 期画刷）后本用例必须变红。
+    #[test]
+    fn base_color_recolor_keeps_explicit_run_colors() {
+        use crate::paint::color::Color;
+
+        let red = Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let green = Color::Srgb {
+            r: 0.0,
+            g: 1.0,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let blue = Color::Srgb {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            alpha: 1.0,
+        };
+        let mut harness = Harness::new();
+        // base = green（shape 期颜色），run 0..3 显式 red；3..6 未被 run 覆盖。
+        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_color(green))
+            .with_runs([TextRun::new(0..3, TextStyle::new(16.0).with_color(red))]);
+        let shaped = harness.shape_content(&content);
+        let width = shaped.max_content_size().width;
+
+        // 换基础色（blue）光栅同一份快照：未覆盖区间跟随 blue，run 区间保持 red。
+        let blue_line = rasterize_line_in_color(&shaped, width, blue);
+        let blue_runs: Vec<_> = blue_line.glyph_runs().collect();
+        assert_eq!(blue_runs.len(), 2, "两个 style run：{:?}", blue_line);
+        assert_eq!(blue_runs[0].text_range, 0..3);
+        assert_eq!(blue_runs[1].text_range, 3..6);
+        assert_eq!(
+            blue_runs[0].color, red,
+            "TextRun 的颜色是具体值，换基础色不得覆盖它"
+        );
+        assert_eq!(
+            blue_runs[1].color, blue,
+            "未被 run 覆盖的区间必须用本次基础色（缓存命中仍画首次颜色的回归点）"
+        );
+
+        // 换回 shape 期基础色：未覆盖区间跟 green，run 仍是 red；布局（字形落点）逐位不变。
+        let green_line = rasterize_line_in_color(&shaped, width, green);
+        let green_runs: Vec<_> = green_line.glyph_runs().collect();
+        assert_eq!(green_runs[0].color, red);
+        assert_eq!(green_runs[1].color, green);
+        assert_eq!(
+            all_glyph_positions(&blue_line),
+            all_glyph_positions(&green_line),
+            "同一份布局快照只换颜色，字形落点必须逐位相同"
+        );
+    }
+
+    /// v2.1 E2：下划线/删除线的几何来自行 baseline + 装饰所属样式的字号；默认线色跟随文本色。
+    #[test]
+    fn decoration_geometry_follows_baseline_and_run_span() {
+        use crate::paint::color::Color;
+
+        let ink = Color::Srgb {
+            r: 0.1,
+            g: 0.2,
+            b: 0.3,
+            alpha: 1.0,
+        };
+        let explicit = Color::Srgb {
+            r: 0.9,
+            g: 0.9,
+            b: 0.0,
+            alpha: 1.0,
+        };
+        let mut harness = Harness::new();
+        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_color(ink)).with_runs([
+            TextRun::new(
+                0..3,
+                TextStyle::new(16.0)
+                    .with_color(ink)
+                    .with_decoration(TextDecoration::underline(1.0)),
+            ),
+            TextRun::new(
+                3..6,
+                TextStyle::new(16.0)
+                    .with_color(ink)
+                    .with_decoration(TextDecoration::strikethrough(2.0).with_color(Some(explicit))),
+            ),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.decorations.len(),
+            2,
+            "每个有装饰的 run 一条装饰几何：{:?}",
+            shaped_line.decorations
+        );
+        let underline = shaped_line.decorations[0];
+        let strike = shaped_line.decorations[1];
+        assert!(
+            underline.rect.origin.y > shaped_line.baseline,
+            "下划线在基线下方：{} vs baseline {}",
+            underline.rect.origin.y,
+            shaped_line.baseline
+        );
+        assert!(
+            strike.rect.origin.y < shaped_line.baseline,
+            "删除线在基线上方：{} vs baseline {}",
+            strike.rect.origin.y,
+            shaped_line.baseline
+        );
+        assert!((underline.rect.size.height - 1.0).abs() < 1e-4);
+        assert!((strike.rect.size.height - 2.0).abs() < 1e-4);
+        assert_eq!(underline.color, ink, "默认线色跟随 run 文本色");
+        assert_eq!(strike.color, explicit, "显式线色优先");
+        assert!(underline.rect.size.width > 0.0 && strike.rect.size.width > 0.0);
+        assert!(
+            underline.rect.origin.x < strike.rect.origin.x,
+            "LTR 下前一个 run 的装饰在左：{:?}",
+            shaped_line.decorations
+        );
+        // 单 run 回归：没有装饰的普通文本不产生装饰几何。
+        let plain = harness.shape("abcdef", TextStyle::new(16.0));
+        let (plain_line, _, _) = rasterize_line(
+            &plain,
+            plain.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert!(plain_line.lines[0].decorations.is_empty());
+    }
+
+    /// v2.1 E2：兜底样式的装饰只覆盖「没有装饰 run」的区间（run 的装饰优先，不叠加双线）。
+    #[test]
+    fn base_style_decoration_covers_uncovered_text_only() {
+        let underline = TextDecoration::underline(1.0);
+        let strike = TextDecoration::strikethrough(2.0);
+        let mut harness = Harness::new();
+        let content = TextContent::new("abcdef", TextStyle::new(16.0).with_decoration(underline))
+            .with_runs([TextRun::new(
+                0..3,
+                TextStyle::new(16.0).with_decoration(strike),
+            )]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let decorations = &line.lines[0].decorations;
+        assert_eq!(
+            decorations.len(),
+            2,
+            "删除线 run + 兜底下划线区间：{decorations:?}"
+        );
+        // 绘制序：兜底装饰在前（这里覆盖 3..6 的剩余区间），run 装饰在后。
+        let base = decorations[0];
+        let run = decorations[1];
+        assert!(
+            base.rect.origin.y > line.lines[0].baseline,
+            "兜底装饰 = 下划线（基线下方）：{base:?}"
+        );
+        assert!(
+            run.rect.origin.y < line.lines[0].baseline,
+            "run 装饰 = 删除线（基线上方）：{run:?}"
+        );
+        assert!(
+            base.rect.origin.x >= run.rect.origin.x + run.rect.size.width - 1e-3,
+            "兜底下划线不得覆盖已由 run 装饰的区间：{decorations:?}"
+        );
+    }
+
+    /// v2.1 E2：CJK + emoji 混排的多 run 不 panic、按字节边界切分。
+    #[test]
+    fn cjk_and_emoji_mixed_runs_keep_boundaries() {
+        let mut harness = Harness::new();
+        // 「价格」= 6 B（2×3），「🌍」= 4 B，`ab` = 2 B。
+        let content = TextContent::new("价格🌍ab", TextStyle::new(16.0)).with_runs([
+            TextRun::new(
+                0..6,
+                TextStyle::new(16.0).with_decoration(TextDecoration::underline(1.0)),
+            ),
+            TextRun::new(6..10, TextStyle::new(18.0)),
+            TextRun::new(10..12, TextStyle::new(16.0).with_weight(700)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        assert_eq!(shaped.runs().len(), 3);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(line.lines.len(), 1, "不限宽 ⇒ 单行");
+        assert!(
+            line.glyph_runs().count() >= 2,
+            "CJK/emoji/ASCII 至少两个 run"
+        );
+        assert_eq!(line.lines[0].decorations.len(), 1, "只有第一个 run 有装饰");
+        assert!(line.lines[0].decorations[0].rect.size.width > 0.0);
+        // run 边界落在字节边界（emoji 是 4 B 的 char，不能被切开）。
+        for run in line.glyph_runs() {
+            assert!(
+                "价格🌍ab".is_char_boundary(run.text_range.start)
+                    && "价格🌍ab".is_char_boundary(run.text_range.end),
+                "字形 run 边界必须落在 char boundary：{:?}",
+                run.text_range
+            );
+        }
+    }
+
+    /// v2.1 E2：装饰跨换行时为每行各产出一条装饰几何（行内可见跨度）。
+    #[test]
+    fn decoration_across_wrap_creates_one_segment_per_line() {
+        let mut harness = Harness::new();
+        let content = TextContent::new(
+            "alpha beta gamma",
+            TextStyle::new(16.0).with_decoration(TextDecoration::underline(1.0)),
+        );
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let width = 40.0;
+        let (line, _diagnostics, _stats) =
+            rasterize_line(&shaped, width, 1.0, &mut raster, &mut glyphs, &mut atlas);
+        assert!(
+            line.lines.len() > 1,
+            "40 px 内容宽必须换行：{:?}",
+            line.lines
+        );
+        assert_eq!(
+            line.lines
+                .iter()
+                .map(|line| line.decorations.len())
+                .sum::<usize>(),
+            line.lines.len(),
+            "每行一条装饰（兜底样式覆盖整段）：{:?}",
+            line.lines
+        );
+        for shaped_line in &line.lines {
+            for decoration in &shaped_line.decorations {
+                assert!(
+                    decoration.rect.origin.x >= -1e-3
+                        && decoration.rect.origin.x + decoration.rect.size.width
+                            <= shaped_line.advance + 1e-3,
+                    "装饰不得超出该行推进：{decoration:?} / advance {}",
+                    shaped_line.advance
+                );
+            }
+        }
+    }
+
+    /// v2.1 E2b（审查 F1）：硬换行（`\n` / `\r\n`）行不得整行丢装饰 —— 装饰按「行内容区间」
+    /// 裁剪（行尾换行符不画线），空行/连续换行没有装饰。
+    #[test]
+    fn decoration_survives_hard_line_breaks() {
+        let underline = TextDecoration::underline(1.0);
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        for (text, expected) in [
+            ("ab\ncd", vec![1usize, 1]),
+            ("ab\r\ncd", vec![1, 1]),
+            ("ab\n\ncd", vec![1, 0, 1]),
+            ("ab\n", vec![1, 0]),
+        ] {
+            let content = TextContent::new(text, TextStyle::new(16.0).with_decoration(underline));
+            let shaped = harness.shape_content(&content);
+            let (line, _diagnostics, _stats) = rasterize_line(
+                &shaped,
+                shaped.max_content_size().width,
+                1.0,
+                &mut raster,
+                &mut glyphs,
+                &mut atlas,
+            );
+            let counts: Vec<usize> = line
+                .lines
+                .iter()
+                .map(|shaped_line| shaped_line.decorations.len())
+                .collect();
+            assert_eq!(
+                counts, expected,
+                "硬换行行尾不属于装饰范围（也不得整行丢弃）：{text:?} -> {line:?}"
+            );
+            for shaped_line in &line.lines {
+                for decoration in &shaped_line.decorations {
+                    assert!(
+                        decoration.rect.size.width > 0.0,
+                        "装饰必须有正宽度：{decoration:?}"
+                    );
+                    assert!(
+                        decoration.rect.origin.x >= -1e-3
+                            && decoration.rect.origin.x + decoration.rect.size.width
+                                <= shaped_line.advance + 1e-3,
+                        "装饰不得超出该行内容推进：{decoration:?} / advance {}",
+                        shaped_line.advance
+                    );
+                }
+            }
+        }
+    }
+
+    /// v2.1 E2b（审查 F1）：行的「装饰可用区间」必须排除行尾硬换行符（`\n` / `\r\n`）。
+    ///
+    /// 这是 F1 的直接守护：变异「`line_content_end` 退化为 `line_range.end`」会让本测试红
+    /// （端到端数值之所以看不出来：parley 的换行 cluster advance 恒为 0）。
+    #[test]
+    fn decoration_range_excludes_the_hard_break_tail() {
+        assert_eq!(super::line_content_end("ab\ncd", &(0..3)), 2);
+        assert_eq!(super::line_content_end("ab\r\ncd", &(0..4)), 2);
+        assert_eq!(
+            super::line_content_end("ab\n\ncd", &(3..4)),
+            3,
+            "空行没有内容"
+        );
+        assert_eq!(super::line_content_end("\n", &(0..1)), 0);
+        assert_eq!(
+            super::line_content_end("ab", &(0..2)),
+            2,
+            "末行无换行时原样保留"
+        );
+        assert_eq!(
+            super::line_content_end("ab\t", &(0..3)),
+            3,
+            "非换行字符不裁剪"
+        );
+    }
+
+    /// v2.1 E2b（审查 F1）：run 装饰覆盖到硬换行时，两行各自得到自己的装饰几何，而不是整段
+    /// 丢弃；第二行的跨度 = 该行内容（`cd`）的 cluster 推进。
+    #[test]
+    fn run_decoration_clipped_at_hard_line_break() {
+        let underline = TextDecoration::underline(1.0);
+        let mut harness = Harness::new();
+        // "ab\ncd"：run 覆盖全部 5 字节 ⇒ 行 0 与行 1 各一条装饰。
+        let content = TextContent::new("ab\ncd", TextStyle::new(16.0)).with_runs([TextRun::new(
+            0..5,
+            TextStyle::new(16.0).with_decoration(underline),
+        )]);
+        let shaped = harness.shape_content(&content);
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let counts: Vec<usize> = line
+            .lines
+            .iter()
+            .map(|shaped_line| shaped_line.decorations.len())
+            .collect();
+        assert_eq!(
+            counts,
+            vec![1, 1],
+            "跨硬换行的 run 装饰必须逐行生成：{line:?}"
+        );
+        let second = &line.lines[1];
+        let decoration = second.decorations[0];
+        assert!(
+            decoration.rect.origin.x.abs() < 1e-2
+                && (decoration.rect.size.width - second.advance).abs() < 1e-2,
+            "第二行装饰跨度 = 内容区间（不含行尾换行）：{decoration:?} / advance {}",
+            second.advance
+        );
+    }
+
+    /// v2.1 E2b（审查 F2）：RTL 装饰跨度必须取区间内**所有** cluster 的视觉并集，而不是
+    /// 「逻辑首/末字符」端点（旧实现只覆盖中间一段，两端各少一个 cluster）。
+    #[test]
+    fn rtl_decoration_covers_the_full_visual_span() {
+        let underline = TextDecoration::underline(1.0);
+        let rtl = TextStyle::new(16.0).with_direction(TextDirection::Rtl);
+        let mut harness = Harness::new();
+        let (mut raster, mut glyphs, mut atlas) = glyph_runner();
+
+        // 纯 RTL 整段兜底装饰：必须覆盖 [0, advance]。
+        let content = TextContent::new("שלום עולם", rtl.clone().with_decoration(underline));
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        assert_eq!(line.lines.len(), 1, "不限宽 ⇒ 单行");
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.decorations.len(),
+            1,
+            "整段兜底装饰一条：{:?}",
+            shaped_line.decorations
+        );
+        let decoration = shaped_line.decorations[0];
+        let right = decoration.rect.origin.x + decoration.rect.size.width;
+        assert!(
+            decoration.rect.origin.x <= 1.0,
+            "RTL 装饰必须从行左边缘开始（旧实现从中间开始）：{decoration:?}"
+        );
+        assert!(
+            (right - shaped_line.advance).abs() <= 1.0,
+            "RTL 装饰必须覆盖到行推进末端：{decoration:?} / advance {}",
+            shaped_line.advance
+        );
+
+        // RTL 跨 run：两个 run 各带装饰（视觉右半 / 左半），并集仍覆盖整行。
+        let content = TextContent::new("שלום עולם", rtl.clone()).with_runs([
+            TextRun::new(0..4, rtl.clone().with_decoration(underline)),
+            TextRun::new(4..8, rtl.with_decoration(underline)),
+        ]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(
+            shaped_line.decorations.len(),
+            2,
+            "两个 RTL run 各一条装饰：{:?}",
+            shaped_line.decorations
+        );
+        let left = shaped_line
+            .decorations
+            .iter()
+            .map(|decoration| decoration.rect.origin.x)
+            .fold(f32::INFINITY, f32::min);
+        let right = shaped_line
+            .decorations
+            .iter()
+            .map(|decoration| decoration.rect.origin.x + decoration.rect.size.width)
+            .fold(f32::NEG_INFINITY, f32::max);
+        // 两个 run 合起来覆盖逻辑前 8 字节（= 视觉右半的词）；旧端点法每个 run 只剩内部
+        // 一小段（宽度接近 0），并集会明显缩水。
+        assert!(
+            shaped_line
+                .decorations
+                .iter()
+                .all(|decoration| decoration.rect.size.width > 10.0),
+            "每个 RTL run 的装饰必须覆盖整段视觉宽度（旧实现只剩中间）：{:?}",
+            shaped_line.decorations
+        );
+        assert!(
+            left <= 40.0,
+            "跨 run 的 RTL 装饰必须覆盖到词左端：{shaped_line:?}"
+        );
+        assert!(
+            (right - shaped_line.advance).abs() <= 1.0,
+            "跨 run 的 RTL 装饰必须覆盖到行推进末端：{shaped_line:?}"
+        );
+
+        // LTR 段落里的 RTL run：装饰必须贴合该 run 的字形落点（旧实现两端各少约一个 cluster）。
+        let content =
+            TextContent::new("abc שלום def", TextStyle::new(16.0)).with_runs([TextRun::new(
+                4..12,
+                TextStyle::new(16.0).with_decoration(underline),
+            )]);
+        let shaped = harness.shape_content(&content);
+        let (line, _diagnostics, _stats) = rasterize_line(
+            &shaped,
+            shaped.max_content_size().width,
+            1.0,
+            &mut raster,
+            &mut glyphs,
+            &mut atlas,
+        );
+        let shaped_line = &line.lines[0];
+        assert_eq!(shaped_line.decorations.len(), 1, "只有 RTL run 有装饰");
+        let decoration = shaped_line.decorations[0];
+        let (run_left, run_right) = shaped_line
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ShapedTextItem::GlyphRun(run) if run.text_range == (4..12) => {
+                    let left = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.position.x)
+                        .fold(f32::INFINITY, f32::min);
+                    let right = run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.position.x + glyph.size.width)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    Some((left, right))
+                }
+                ShapedTextItem::GlyphRun(_) | ShapedTextItem::InlineBox(_) => None,
+            })
+            .expect("RTL run 必须存在");
+        assert!(
+            decoration.rect.origin.x <= run_left + 1.5,
+            "LTR 段落里的 RTL run：装饰左端不得从 run 内部开始：{decoration:?} vs run {run_left}..{run_right}"
+        );
+        assert!(
+            decoration.rect.origin.x + decoration.rect.size.width >= run_right - 1.5,
+            "LTR 段落里的 RTL run：装饰右端不得止于 run 内部：{decoration:?} vs run {run_left}..{run_right}"
+        );
     }
 
     #[test]
@@ -3066,6 +4136,7 @@ mod tests {
                 size: crate::math::Size::new(30.0, 40.0),
                 baseline: None,
                 align: InlineAlign::Baseline,
+                paint: None,
             },
             InlineBoxSpec {
                 id: 2,
@@ -3073,6 +4144,7 @@ mod tests {
                 size: crate::math::Size::new(30.0, 60.0),
                 baseline: None,
                 align: InlineAlign::Baseline,
+                paint: None,
             },
         ];
         let shaped = harness.shape_with(

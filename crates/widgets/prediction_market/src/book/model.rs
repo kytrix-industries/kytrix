@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use base_ui::format::group_digits;
+use base_ui::kit::format::group_digits;
 use market_participants_model::{
     decimal::{Fraction, Price, Quantity, Ratio, Tick},
     prediction::{PredictionBookLevel, PredictionOrderBook},

@@ -26,6 +26,20 @@
 //! 逐 tile 释放不递增 `generation`（只由扩容/整页重建递增）：`generation` 的语义是「页尺寸/
 //! 整页内容换代」，与单个 tile 的生死无关。被淘汰 tile 的矩形由**分配器的脏行**覆盖
 //! （`allocate` 会 `mark_written`），所以上传路径不需要额外处理。
+//!
+//! # 淘汰纪元 `eviction_epoch`（v2.1 E1b，§11.1）
+//!
+//! 逐 tile LRU 淘汰**不**换代，却会让旧 `ShapedLine` / `Canvas` 里烘焙的 `AtlasTile` 指向
+//! 已被别的字形复用的矩形（静默花字）。`generation` 无法表达这件事，因此本模块另维护一个
+//! **累计**的 `eviction_epoch`：每淘汰一个 tile 就 +1，只增不减。`ShapedTextHandle` 同时记录
+//! `(generation, eviction_epoch)`，任一变化都判定失效 —— 句柄因此不会把被复用的 UV 编码上屏。
+//!
+//! 纪元是**进程级**的（图集是进程级共享），与 `generation` 同一真源：`App::sync_atlas_generation_lease`
+//! 把两者打包写进租约。`Canvas` 内已编码的图元不受句柄保护（句柄在 push 后就不在 Canvas 里），
+//! 由**编码期逐 tile 判活**兜底（v2.1 E1d / F15 方案①）：`AtlasTile` 携带分配身份
+//! `(slot, slot_epoch)`，paint 编码 `Primitive::Canvas` 前用 `AtlasAllocator::is_alive` 逐 tile
+//! 校验，失效 run 不编码并计入 `stale_canvas_runs` / [`crate::text::TextDiagnostic::CanvasTextStale`]。
+//! 应用义务不变：句柄 `is_stale()` 为真后重新 `shape_text` 并重建 Canvas（少字优于花字）。
 
 use super::raster::{FontKey, GlyphRasterizer};
 use crate::{
@@ -132,6 +146,11 @@ pub(crate) struct GlyphAtlas {
     pass: u32,
     /// 自上次 [`GlyphAtlas::take_evicted`] 以来被淘汰的 tile 数。
     evicted: u32,
+    /// **累计**淘汰纪元（只增不减）：每淘汰一个 tile +1。
+    ///
+    /// `generation` 只表达「整页换代」；逐 tile LRU 淘汰不换代，却让旧 `AtlasTile` 失效。
+    /// 句柄的租约因此同时携带 `(generation, eviction_epoch)`（见模块文档）。
+    eviction_epoch: u32,
     /// 连续多少个文本 pass 以「软失败」收尾（[`GlyphAtlas::note_soft_fail`] 维护；一次
     /// `skipped == 0` 的 pass 清零，达到 [`ATLAS_FULL_ESCALATION_FRAMES`] 时抛出错误并清零）。
     consecutive_soft_fail_passes: u32,
@@ -146,6 +165,7 @@ impl GlyphAtlas {
             cleared: false,
             pass: 0,
             evicted: 0,
+            eviction_epoch: 0,
             consecutive_soft_fail_passes: 0,
         }
     }
@@ -188,6 +208,11 @@ impl GlyphAtlas {
     /// `App::layout_text` 据此重跑 pass 并让其它窗口重排）。
     pub(crate) fn take_evicted(&mut self) -> u32 {
         core::mem::take(&mut self.evicted)
+    }
+
+    /// **累计**淘汰纪元（只增不减；每淘汰一个 tile +1，与 `generation` 一起构成句柄租约）。
+    pub(crate) fn eviction_epoch(&self) -> u32 {
+        self.eviction_epoch
     }
 
     /// 取字形 tile；未命中则光栅 + 装箱。
@@ -356,6 +381,7 @@ impl GlyphAtlas {
                 if let Some(record) = self.records.remove(&key) {
                     atlas.deallocate(record.alloc);
                     self.evicted = self.evicted.wrapping_add(1);
+                    self.eviction_epoch = self.eviction_epoch.wrapping_add(1);
                     self.stats.evictions += 1;
                 }
             }
@@ -982,6 +1008,46 @@ mod tests {
             !glyphs.missing.contains(&key),
             "软失败的字形永远不能出现在负缓存里"
         );
+    }
+
+    /// E1b F1：逐 tile LRU 淘汰**不**换代（`generation` 不变），但必须前进累计淘汰纪元
+    /// `eviction_epoch` —— `ShapedTextHandle` 的租约靠它感知「tile 已被别的字形复用」。
+    #[test]
+    fn lru_eviction_advances_the_eviction_epoch_without_bumping_the_generation() {
+        let Some(font) = probe_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let mut raster = GlyphRasterizer::new();
+        let mut atlas = AtlasAllocator::with_page(AtlasKind::Glyph, (32, 32));
+        atlas.cap_page_for_test(32);
+        let mut glyphs = GlyphAtlas::new();
+        let generation = atlas.generation();
+        assert_eq!(glyphs.eviction_epoch(), 0);
+
+        // pass 1：把 32² 页塞满。
+        glyphs.begin_pass();
+        for glyph_id in 36..48u32 {
+            let _ = glyphs
+                .ensure(&mut raster, &mut atlas, &font, glyph_id, 16.0, 0, None)
+                .expect("容量压力绝不该变成错误");
+        }
+        assert_eq!(glyphs.eviction_epoch(), 0, "只填充不淘汰 ⇒ 纪元不动");
+
+        // pass 2：新字形挤占 ⇒ 只能淘汰上一 pass 的 tile。
+        glyphs.begin_pass();
+        for glyph_id in 200..224u32 {
+            let _ = glyphs
+                .ensure(&mut raster, &mut atlas, &font, glyph_id, 16.0, 0, None)
+                .expect("LRU 淘汰保证 ensure 永不失败");
+        }
+        assert!(glyphs.take_evicted() > 0, "必须真的发生过淘汰");
+        assert_eq!(
+            atlas.generation(),
+            generation,
+            "逐 tile 淘汰不换代（正是 epoch 存在的理由）"
+        );
+        assert!(glyphs.eviction_epoch() > 0, "每淘汰一个 tile 纪元 +1");
     }
 
     /// P1-① 的可见失败兜底：连续 [`ATLAS_FULL_ESCALATION_FRAMES`] 个 pass 都软失败才升级为

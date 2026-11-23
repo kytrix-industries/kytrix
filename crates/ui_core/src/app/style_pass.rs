@@ -36,6 +36,33 @@ pub(crate) fn off_action(app: &mut App, action: &Action) -> bool {
     app.handlers.remove(action).is_some()
 }
 
+/// 仅测试（`test-support`）：某个动作当前是否注册了处理器。
+///
+/// 组件 `release` 清理的**直接证据面**：泄漏的 handler 不一定会 panic（`ctx.update` 对死
+/// 句柄是 no-op、滚动条 handler 只写引擎状态），所以「重放输入不 panic」不足以证明表项被摘掉。
+/// 消费者：`App::has_action_handler`（base_ui release 测试）。
+#[cfg(feature = "test-support")]
+pub(crate) fn has_action_handler(app: &App, action: &Action) -> bool {
+    app.handlers.contains_key(action)
+}
+
+/// 仅测试（`test-support`）：某个 `(window, scope)` 上剩余的焦点作用域化键绑定条数。
+///
+/// `App::unbind_scope_keys` 的直接证据面（树 release）：只删除绑定时重放按键不会 panic
+/// （handler 已摘 ⇒ 不消费、回落默认行为），因此必须观察表项本身。
+/// 消费者：`App::scoped_key_binding_count`（base_ui `Tree::release` 测试）。
+#[cfg(feature = "test-support")]
+pub(crate) fn scoped_binding_count(
+    app: &App,
+    window: WindowId,
+    scope: crate::node::id::NodeId,
+) -> usize {
+    app.scoped_bindings
+        .iter()
+        .filter(|binding| binding.window == window && binding.scope == scope)
+        .count()
+}
+
 /// 添加/替换一条键盘绑定（同 `(key, modifiers)` 后写覆盖）。
 /// 消费者：`App::bind_key`。
 pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
@@ -43,6 +70,69 @@ pub(crate) fn bind_key(app: &mut App, binding: KeyBinding) {
         !(existing.key == binding.key && existing.modifiers == binding.modifiers)
     });
     app.bindings.push(binding);
+}
+
+/// 添加/替换一条焦点作用域化的键盘绑定（同 `(window, scope, key, modifiers)` 后写覆盖）。
+///
+/// 注册前校验窗口与 `scope` 节点：**永不命中**的绑定必须在注册期拒绝（否则表项会一直留到
+/// 窗口关闭，见 `App::bind_key_scoped` 的清理契约）。
+/// 消费者：`App::bind_key_scoped`。
+pub(crate) fn bind_key_scoped(
+    app: &mut App,
+    window: crate::window::WindowId,
+    scope: crate::node::id::NodeId,
+    binding: KeyBinding,
+) -> Result<(), crate::error::EngineError> {
+    use crate::error::EngineError;
+    let Some(target) = app.windows.get(&window) else {
+        return Err(EngineError::UnknownWindow { window });
+    };
+    // `NodeId` 携带窗口身份：另一窗口的节点在这里确定性失败（`StaleNode`），不会串窗命中。
+    target.tree().get(scope)?;
+    app.scoped_bindings.retain(|existing| {
+        !(existing.window == window
+            && existing.scope == scope
+            && existing.binding.key == binding.key
+            && existing.binding.modifiers == binding.modifiers)
+    });
+    app.scoped_bindings.push(super::ScopedKeyBinding {
+        window,
+        scope,
+        binding,
+    });
+    Ok(())
+}
+
+/// 删除一条 scoped 绑定（返回是否真的删了）。
+/// 消费者：`App::unbind_key_scoped`。
+pub(crate) fn unbind_key_scoped(
+    app: &mut App,
+    window: crate::window::WindowId,
+    scope: crate::node::id::NodeId,
+    key: KeyCode,
+    modifiers: Modifiers,
+) -> bool {
+    let before = app.scoped_bindings.len();
+    app.scoped_bindings.retain(|existing| {
+        !(existing.window == window
+            && existing.scope == scope
+            && existing.binding.key == key
+            && existing.binding.modifiers == modifiers)
+    });
+    app.scoped_bindings.len() != before
+}
+
+/// 删除某个 scope 在某个窗口上的**全部** scoped 绑定，返回删除条数。
+/// 消费者：`App::unbind_scope_keys`（组件 `release` 不需要复述自己绑定过哪些键）。
+pub(crate) fn unbind_scope_keys(
+    app: &mut App,
+    window: crate::window::WindowId,
+    scope: crate::node::id::NodeId,
+) -> usize {
+    let before = app.scoped_bindings.len();
+    app.scoped_bindings
+        .retain(|existing| !(existing.window == window && existing.scope == scope));
+    before - app.scoped_bindings.len()
 }
 
 /// 删除一条键盘绑定（返回是否真的删了）。
@@ -87,6 +177,7 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
         store,
         graph,
         windows,
+        text,
         eval_stack,
         ..
     } = app;
@@ -168,7 +259,13 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 tree.mark_layout(node);
             }
             if a11y_changed {
-                tree.mark_a11y(node);
+                // E15：`visible` / `interactive` 是**沿祖先链生效**的 a11y 输入 —— `focusable`
+                // （隐式 `Focus` 能力）与 `is_hidden` 都向上看祖先。祖先切换可见/可交互后，
+                // 后代的 `Focus` / `Click` 能力会翻转，但后代自己没有脏位；只标本节点时增量笔
+                // 与全树分叉（P2-4c2 / P2-4d2 的「增量缺 Focus」证据：浮层根 `visible` 一翻，
+                // 面板里的 `Tab` / `List` 容器在增量笔里仍是没有 Focus 的旧记录）。
+                // 整棵子树标 `A11Y`：只重发 a11y 快照字段，不产生像素工作、不清 `REUSABLE`。
+                tree.mark_subtree_a11y(node);
             }
         }
         let mut text_changed_here = false;
@@ -183,28 +280,35 @@ pub(crate) fn refresh_styles(app: &mut App, window: WindowId) -> Option<StylePas
                 .text_content(node)
                 .is_none_or(|content| content.text != value);
             if changed {
-                // 只换 text/style，**保留** inline_boxes（N1 回归）。
+                // v2.1 E2（`§11.2`）：只换整段 text/style，**保留** runs 与 inline_boxes
+                // （静态载荷不被动态文本清空）。新文本更短时按新长度裁剪 / 丢弃越界 runs，
+                // 并压诊断 —— 不静默改变样式归属（`clip_runs_to_text` 的返回值就是被改动的
+                // run 数）。
                 let mut content = tree
                     .text_content(node)
                     .cloned()
                     .unwrap_or_else(|| TextContent::new(value.clone(), style.clone()));
                 content.text = value;
                 content.style = style;
+                let clipped_runs = content.clip_runs_to_text();
+                if clipped_runs > 0 {
+                    text.push_diagnostics(vec![crate::text::TextDiagnostic::TextRunClipped {
+                        runs: clipped_runs,
+                    }]);
+                }
                 tree.set_text_content(node, content);
                 text_changed += 1;
                 text_changed_here = true;
             }
         }
         // P11：`bind_a11y` 的差分与写回（与 `bind_style` 同一个依赖集，见方法文档）。
+        //
+        // E15b F2：这里是 `bind_a11y` 在**普通帧**里的第二份写点（节点同时有
+        // `bind_style`/`bind_text` 时帧走本 pass，不进 a11y-only pass）。必须与
+        // `refresh_a11y_bindings` 共用 `write_a11y_patch`：角色 / 隐藏变化会改变后代的
+        // 推导语义，只标本节点会让增量笔与全树分叉。
         if let Some(bind) = bind_a11y {
-            let previous = tree
-                .a11y_of(node)
-                .map_or_else(crate::a11y::A11yPatch::default, |slot| slot.patch.clone());
-            if a11y_value != previous {
-                tree.set_a11y_patch(node, a11y_value);
-                // 只标 `A11Y`：不产生视觉 damage、不清 `REUSABLE`（P03 §9.3 表第 9 行）。
-                tree.mark_a11y(node);
-            }
+            let _ = crate::a11y::tree::write_a11y_patch(tree, node, a11y_value);
             tree.put_bind_a11y(node, bind);
         }
         // `BIND` 的唯一清除点：本 pass 求值完即消费（`PAINT` 不归这里管）。
@@ -316,5 +420,139 @@ pub(crate) fn invalidate(app: &mut App, signal: SignalId) {
     if marked > 0 {
         // 批处理内只登记推迟位（最外层 `App::batch` 结束时合并成一次请求）。
         app.request_frame();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smol_str::SmolStr;
+
+    use super::{App, refresh_styles};
+    use crate::{
+        node::builder::NodeBuilder,
+        text::{InlineAlign, InlineBoxSpec, TextRun, TextStyle},
+        window::WindowOptions,
+    };
+
+    fn new_app() -> (tokio::runtime::Runtime, App) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let app = App::new(runtime.handle().clone());
+        (runtime, app)
+    }
+
+    /// v2.1 E2（`§11.2`）：`bind_text` 只换整段文本，**保留** runs（静态载荷不被清空）。
+    #[test]
+    fn bind_text_preserves_runs() {
+        use crate::paint::color::Color;
+
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(SmolStr::new_static("abcdef"));
+        let bold = TextStyle::new(16.0).with_weight(700);
+        let red = TextStyle::new(16.0).with_color(Color::WHITE);
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("abcdef", TextStyle::new(16.0))
+                .runs([
+                    TextRun::new(0..2, bold.clone()),
+                    TextRun::new(2..6, red.clone()),
+                ])
+                .bind_text(move |cx| cx.read(&signal).clone())
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh_styles(&mut app, window);
+        let content = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .text_content(node)
+            .expect("text")
+            .clone();
+        assert_eq!(content.runs().len(), 2, "runs 在 bind_text 后必须保留");
+        assert_eq!(content.runs()[0].range, 0..2);
+        assert_eq!(content.runs()[0].style, bold);
+        assert_eq!(content.runs()[1].range, 2..6);
+        assert_eq!(content.runs()[1].style, red);
+    }
+
+    /// v2.1 E2：新文本更短时按新长度裁剪 runs（不越界），并压 `TextRunClipped` 诊断
+    /// （不静默改变样式归属）。
+    #[test]
+    fn bind_text_crops_runs_to_the_new_text_and_diagnoses() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(SmolStr::new_static("abcdef"));
+        let bold = TextStyle::new(16.0).with_weight(700);
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("abcdef", TextStyle::new(16.0))
+                .runs([TextRun::new(0..2, bold.clone()), TextRun::new(2..6, bold)])
+                .bind_text(move |cx| cx.read(&signal).clone())
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh_styles(&mut app, window);
+        app.write(&signal, SmolStr::new_static("abc"));
+        let _ = refresh_styles(&mut app, window);
+        let content = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .text_content(node)
+            .expect("text")
+            .clone();
+        assert_eq!(content.text, "abc");
+        assert_eq!(content.runs().len(), 2, "裁剪保留 run（只内收区间）");
+        assert_eq!(content.runs()[1].range, 2..3, "越界端点按新文本内收");
+        assert!(
+            app.text_diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                crate::text::TextDiagnostic::TextRunClipped { runs } if *runs == 1
+            )),
+            "裁剪必须可观测：{:?}",
+            app.text_diagnostics()
+        );
+    }
+
+    /// v2.1 E2：inline_boxes 与 runs 在同一段文本上共存（静态载荷不互相覆盖）。
+    #[test]
+    fn bind_text_preserves_runs_and_inline_boxes_together() {
+        let (_runtime, mut app) = new_app();
+        let window = app.create_window(WindowOptions::default());
+        let signal = app.signal(SmolStr::new_static("a b"));
+        let spec = InlineBoxSpec {
+            id: 9,
+            index: 2,
+            size: crate::math::Size::new(8.0, 8.0),
+            baseline: None,
+            align: InlineAlign::Baseline,
+            paint: None,
+        };
+        let node = {
+            let w = app.window_mut(window).expect("window");
+            let root = w.tree().root();
+            NodeBuilder::text("a b", TextStyle::new(16.0))
+                .runs([TextRun::new(0..1, TextStyle::new(16.0).with_weight(700))])
+                .inline_boxes([spec])
+                .bind_text(move |cx| cx.read(&signal).clone())
+                .build(w.tree_mut(), root)
+                .expect("build")
+        };
+        let _ = refresh_styles(&mut app, window);
+        let content = app
+            .window(window)
+            .expect("window")
+            .tree()
+            .text_content(node)
+            .expect("text")
+            .clone();
+        assert_eq!(content.text, "a b");
+        assert_eq!(content.runs().len(), 1);
+        assert_eq!(content.inline_boxes.len(), 1);
     }
 }

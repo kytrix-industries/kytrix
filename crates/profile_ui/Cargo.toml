@@ -5,33 +5,36 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
-base64.workspace = true
-bytes.workspace = true
-dicebear-core.workspace = true
+app_config = { workspace = true }
+base64 = { workspace = true }
+base_ui = { workspace = true }
+bytes = { workspace = true }
+dicebear-core = { workspace = true }
 dicebear-styles = { workspace = true, features = ["gaze"] }
-futures.workspace = true
-gpui-kit.workspace = true
-log.workspace = true
-rand.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-smol_str.workspace = true
-thiserror.workspace = true
+futures = { workspace = true }
+i18n = { workspace = true }
+image = { workspace = true }
+kytrix_service_provider = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+resvg = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
-url.workspace = true
-zeroize.workspace = true
-
-# Workspace members
-app_config.workspace = true
-app_config_provider.workspace = true
-base_ui.workspace = true
-i18n.workspace = true
-kytrix_service_provider.workspace = true
-widget_tokio_runtime.workspace = true
+ui_core = { workspace = true }
+url = { workspace = true }
+usvg = { workspace = true }
+widget = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
-gpui-kit = { workspace = true, features = ["test-support"] }
+# The tokio test runtime (`#[tokio::test(start_paused = true)]`) the OAuth attempt tests own.
 tokio = { workspace = true, features = ["test-util"] }
+# The headless engine host (`ui_core::test_support::TestApp`) plus its layout probe and frame
+# record. Only the test build opens the feature.
+ui_core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

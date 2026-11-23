@@ -3,7 +3,7 @@ use smallvec::smallvec;
 use super::{LayoutBox, Node, NodeKind, NodeSpec, NodeTree};
 use crate::{
     error::EngineError,
-    math::{Edges, Rect},
+    math::{Edges, Point, Rect},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId, signal::SignalId},
     paint::style::{Clip, Style, StylePatch},
 };
@@ -184,14 +184,18 @@ fn node_and_handle_sizes() {
         "size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>() = {}",
         size_of::<Option<Box<crate::a11y::tree::NodeA11y>>>()
     );
-    assert!(
-        node_size <= 336,
-        "Node 尺寸超预算: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B）"
+    // E13（审查 F6）：**精确 pin** 实测值，而不是只 pin 上界 —— 336 B 是当前上限且**已无余量**，
+    // 任何让 Node 变小的改动都应该同步改这条基线（否则「无余量」结论会悄悄失效）。
+    assert_eq!(
+        node_size, 336,
+        "Node 尺寸基线: {node_size} B（上限 336 B：冷字段必须装箱，见 R03-3；X5 起多 lane 集合占 24 B；\
+         E13 的组不透明度戳 `paint_opacity` +4 B ⇒ 补齐到 336 B，**已无余量**，后续加字段须先装箱搬走冷字段）"
     );
     assert_eq!(
         size_of::<crate::text::TextContent>(),
-        96,
-        "TextContent 的尺寸基线（P1-2.3：family + font_features 收进 TextStyleExtras 后从 112 降到 96）"
+        112,
+        "TextContent 的尺寸基线（v2.1 E2 的 `runs: Option<Box<ThinSlice>>` +8；E2b 的归一化诊断 \
+         计数 +8。`NodeKind::Text` 装箱持有 TextContent ⇒ Node 336 B，上限 336 B）"
     );
     assert_eq!(
         size_of::<Option<NodeId>>(),
@@ -513,6 +517,51 @@ fn text_caret_rect_reports_preconditions() {
     assert!(matches!(error, EngineError::TextShape { .. }));
 }
 
+/// E5/§11.5：点 → 字节索引的前置条件全部收敛到 `StaleNode`（语义 =「该节点不能作为文本命中
+/// 目标」）：未 shape 的文本 / 非文本节点（盒子、Canvas）/ 已卸载节点。
+#[test]
+fn text_byte_index_at_reports_preconditions() {
+    let (mut tree, node) = text_tree("abcdef");
+    let root = tree.root();
+    let point = Point::new(1.0, 1.0);
+
+    let error = tree
+        .text_byte_index_at(node, point)
+        .expect_err("尚未 shape 的文本节点必须报错");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == node
+    ));
+
+    let error = tree
+        .text_byte_index_at(root, point)
+        .expect_err("盒子节点不是文本命中目标");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == root
+    ));
+
+    let canvas = NodeBuilder::canvas(crate::paint::canvas::Canvas::default())
+        .build(&mut tree, root)
+        .expect("挂载 Canvas 节点");
+    let error = tree
+        .text_byte_index_at(canvas, point)
+        .expect_err("Canvas 节点不是文本命中目标");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == canvas
+    ));
+
+    assert!(tree.remove(node).is_ok());
+    let error = tree
+        .text_byte_index_at(node, point)
+        .expect_err("已卸载节点必须报错");
+    assert!(matches!(
+        error,
+        EngineError::StaleNode { node: reported } if reported == node
+    ));
+}
+
 #[test]
 fn text_content_updates_only_text_nodes() {
     let (mut tree, node) = text_tree("one");
@@ -682,11 +731,7 @@ fn canvas_referenced_geometries_are_bound_and_unbound() {
     let first = GeometryId::for_test(1, 1);
     let second = GeometryId::for_test(2, 1);
     let third = GeometryId::for_test(3, 1);
-    let draw = |id| GeometryDraw {
-        id,
-        transform: crate::math::Transform::IDENTITY,
-        color: Color::WHITE,
-    };
+    let draw = |id| GeometryDraw::full(id, crate::math::Transform::IDENTITY, Color::WHITE);
     let path = |id| Path {
         bounds: Rect::new(0.0, 0.0, 8.0, 8.0),
         geometry: id,
@@ -797,9 +842,11 @@ fn node_size_after_p06() {
     // （`Node.id` 与 `Node.parent` 各 +4 B；`Option<NodeId>` 靠 NonZeroU32 的 niche 保持 12 B）。
     // X5 起 `Node.lane: Option<LaneId>` 改为 `SmallVec<[LaneId; 2]>`（几何节点每块一条块 lane），
     // 集合本身 24 B，预算 +16 B（328 B 实测；仍是「冷字段必须装箱」的同一约束）。
-    assert!(
-        size <= 336,
-        "Node 超预算：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
+    // E13 的组不透明度复用戳 `Node.paint_opacity: f32` 再 +4 B ⇒ **336 B（= 上限，已无余量）**。
+    // E13（审查 F6）：精确 pin（不是上界）。336 B = 上限且已无余量，缩小也必须同步基线。
+    assert_eq!(
+        size, 336,
+        "Node 尺寸基线：{size} B（备选瘦身：删掉未被读取的 `Node.id` 字段）"
     );
 }
 

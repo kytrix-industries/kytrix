@@ -456,6 +456,8 @@ mod tests {
                 u1: 1.0,
                 v1: 1.0,
                 generation: 0,
+                slot: 0,
+                slot_epoch: 0,
             },
             modulation: Color::WHITE,
         })

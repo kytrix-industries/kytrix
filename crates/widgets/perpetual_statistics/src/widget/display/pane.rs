@@ -1,78 +1,103 @@
 //! How every perpetual-statistics pane behaves.
 //!
-//! The five widgets differ only in which series they plot, so everything else is
-//! here: the scope, the instrument picker, the interval, the countdown, the manual
-//! refresh, and the body.
+//! The five widgets differ only in which series they plot, so everything else is here:
+//! the scope, the instrument picker, the interval, the countdown, the manual refresh, and
+//! the body.
 //!
 //! # What this pane is
 //!
-//! These series are a bounded history rather than a stream, so "live" means poll:
-//! the service fetches the most recent window once a minute, and the pane counts
-//! down to the next fetch so a number that has not moved can be told apart from a
-//! pane that has stopped. A manual refresh resets that schedule rather than
-//! running alongside it.
+//! These series are a bounded history rather than a stream, so "live" means poll: the
+//! service fetches the most recent window once a minute, and the pane counts down to the
+//! next fetch so a number that has not moved can be told apart from a pane that has
+//! stopped. A manual refresh resets that schedule rather than running alongside it.
 //!
 //! # What it does with a failure
 //!
-//! A failed fetch is a failure the user sees: the pane reports it through the
-//! framework, which puts a banner over the chart that is still on screen. The
-//! service stops its schedule at that point, so the banner's recovery is what
-//! starts it again — a venue that is briefly unreachable does not turn into a
-//! request every minute until someone notices.
+//! A failed fetch is a failure the user sees: the pane reports it through the framework,
+//! which puts a banner over the chart that is still on screen. The service stops its
+//! schedule at that point, so the banner's recovery is what starts it again — a venue that
+//! is briefly unreachable does not turn into a request every minute until someone notices.
+//!
+//! # Where the market comes from
+//!
+//! The loaded venues, the published catalogue and the names a chart is labelled in are all
+//! the directory's answers: the connector the composition root injects in the application,
+//! and a fixture in a test (see [`StatisticsDirectory`]). A directory generation written
+//! into `services.catalog_generation` is the one signal that says the directory moved, so
+//! the pane compares it in `sync` and re-reads the directory when it did (AGENTS §8.3). A
+//! publication keeps the window the user is reading: it re-runs the gate and the directory's
+//! answers, and the stream that is polling the window stays as it is, because that is what
+//! keeps a published catalogue from counting the window on screen as one the pane has
+//! already overtaken (see [`StatisticsWidget::reload`]). The pane never loads the directory,
+//! never polls the catalogue and never subscribes to a venue event.
+//!
+//! # Why replies are matched by request identity
+//!
+//! Two commands share one inbox — a load/retry and a manual refresh. The framework hands
+//! each `call` a [`RequestId`], which the reply carries back; the pane keeps the command
+//! table ([`Pending`]) and applies a reply only to the identity it belongs to. An identity
+//! it does not know is a reply the replacement already overtook: it is dropped and counted
+//! ([`Pending::dropped`]) rather than applied to the command now in flight (AGENTS §8.2).
+//!
+//! # The body is a chart, and the chart is a canvas
+//!
+//! The engine's only self-drawing entry point is a `Canvas` node, and the chart is the one
+//! thing in this pane that needs it. [`WidgetView::body`] therefore builds the chart's
+//! canvas node (and the empty-window overlay); after that, `sync` rebuilds the canvas when
+//! what it would draw moved ([`ChartDispatch`]). A chart that is dropped and re-created is
+//! rebuilt into the same host node, because the body is built only once.
 
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, rc::Rc, sync::Arc};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
 use base_ui::{
-    button::Button,
-    empty_state::EmptyState,
-    icon::{Icon, IconKind},
-    interactive::InteractiveVariantExt,
-    menu::{MenuItem, MenuItemAction},
-    select::Select,
-    size::UnifiedSizable,
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::IconKind,
+        select::{Select, SelectItem, SelectOptions},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
 };
-use gpui_kit::{
-    AnyElement, App, AppContext, Context, ElementId, Entity, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window,
-    base::Disableable, div,
-};
-use i18n::t;
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use instrument_selector_ui::{
-    instrument_button::InstrumentButton,
+    host::SelectorHost,
+    instrument_button::{InstrumentButton, InstrumentButtonHandle},
     instrument_selector::{
         InstrumentFilters, InstrumentKindFilter, InstrumentStatusFilter, LoadedScope, offers_route,
     },
 };
-use market_participants_connector::{
-    catalog::{display::catalog::DisplaySnapshot, error::CatalogError, store::Catalog},
-    connector::MarketParticipantsConnector,
-    market::timeframe::StatisticsTimeFrame,
-    venue::loaded::VenuesUpdated,
-};
-use market_participants_model::{
-    asset::AssetId,
-    identifier::VenueId,
-    instrument::InstrumentKind,
-    listing::{route::VenueListingKey, rules::TradingRules},
-    market::{selection::InstrumentSelection, units::QuantityUnit},
-    routing::CapabilityId,
-};
+use market_participants_connector::market::timeframe::StatisticsTimeFrame;
+use market_participants_model::market::selection::InstrumentSelection;
 use smol_str::SmolStr;
+use ui_core::{
+    a11y::A11yPatch,
+    app::{App, TimerId},
+    error::EngineError,
+    event::{Event, InputEvent},
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::style::StylePatch,
+    text::TextStyle,
+    window::WindowId,
+};
 use widget::{
-    binding::{WidgetBinding, WidgetRpcResult},
+    binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,
     config::WidgetConfigChange,
-    error::{LocalizedError, market_is_catalog_not_loaded},
+    cx::WidgetCx,
+    error::TranslatedError,
     identity::{WidgetId, WidgetInstanceId},
+    protocol::RequestId,
     rpc::RpcCallError,
-    status::{Notice, WidgetAction, WidgetState, WidgetStatus, WidgetStatusExt},
-    time_zone::{data_time_zone, notify_on_data_time_zone_change},
+    status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     util::{format_countdown, unix_millis},
-    view::{WidgetHeader, WidgetView},
+    view::{HeaderGroup, ReloadHandle, WidgetView},
 };
-use widget_tokio_runtime::global;
 
+use super::directory::{
+    ChartUnits, ConnectorDirectory, ListingSupport, StatisticsDirectory, market_venues,
+};
 use crate::{
     chart::ChartDispatch,
     model::MetricKind,
@@ -85,15 +110,15 @@ use crate::{
 
 /// How often the pane re-reads the window it is showing.
 ///
-/// It is not a fetch: it only re-checks the clock behind the countdown. A quarter
-/// of a second is faster than the label's own resolution and cheaper than a frame.
-pub(crate) const COUNTDOWN_TICK: Duration = Duration::from_millis(250);
+/// It is not a fetch: it only re-checks the clock behind the countdown. A quarter of a
+/// second is faster than the label's own resolution and cheaper than a frame.
+pub(crate) const COUNTDOWN_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The intervals the picker offers, and the only ones a pane can poll.
 ///
 /// A stored interval outside this list is one this build cannot fetch: the picker cannot
-/// draw it and the request would name a window the service does not serve, so the pane
-/// puts it back to the default instead.
+/// draw it and the request would name a window the service does not serve, so the pane puts
+/// it back to the default instead.
 pub(crate) const TIMEFRAMES: [StatisticsTimeFrame; 9] = [
     StatisticsTimeFrame::Minute5,
     StatisticsTimeFrame::Minute15,
@@ -106,11 +131,16 @@ pub(crate) const TIMEFRAMES: [StatisticsTimeFrame; 9] = [
     StatisticsTimeFrame::Day1,
 ];
 
+/// The kit key suffixes the header controls are minted from.
+const INSTRUMENT_KEY_SUFFIX: &str = "perpetual_statistics.header.instrument";
+const REFRESH_KEY_SUFFIX: &str = "perpetual_statistics.header.refresh";
+const TIMEFRAME_KEY_SUFFIX: &str = "perpetual_statistics.header.timeframe";
+
 /// The series one widget plots, and the wording that is its own.
 ///
-/// This trait is the whole of what separates the five widgets: an id that is
-/// persisted, a name, and the series that answers. Both are constants, which is
-/// why a widget is a type rather than a value.
+/// This trait is the whole of what separates the five widgets: an id that is persisted, a
+/// name, and the series that answers. Both are constants, which is why a widget is a type
+/// rather than a value.
 pub trait StatisticsMetric: Sized + 'static {
     /// The persistent identity of this pane. It is stored, so it cannot change.
     const ID: WidgetId;
@@ -126,11 +156,10 @@ pub trait StatisticsMetric: Sized + 'static {
 
 /// Which venue, instrument and interval a pane follows.
 ///
-/// The scope is optional because a pane exists before the user has chosen
-/// anything: it then asks for an instrument rather than plotting a default one
-/// nobody asked for. Another series, another venue or another interval is another
-/// chart, so all three are part of the scope and all three replace what is on
-/// screen.
+/// The scope is optional because a pane exists before the user has chosen anything: it then
+/// asks for an instrument rather than plotting a default one nobody asked for. Another
+/// series, another venue or another interval is another chart, so all three are part of the
+/// scope and all three replace what is on screen.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatisticsConfig {
     pub selection: Option<InstrumentSelection>,
@@ -147,168 +176,247 @@ impl Default for StatisticsConfig {
 }
 
 impl WidgetConfig for StatisticsConfig {
-    /// The first persisted schema version, and the only one: the scope is an
-    /// optional listing and the interval is one of [`TIMEFRAMES`].
+    /// The first persisted schema version, and the only one: the scope is an optional
+    /// listing and the interval is one of [`TIMEFRAMES`].
     const SCHEMA_VERSION: WidgetConfigSchemaVersion = WidgetConfigSchemaVersion::V1;
-}
-
-/// What the program knows about a listing this pane is configured to follow.
-///
-/// The three are kept apart because only one of them is an answer: a question
-/// that could not be put proves nothing about the listing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ListingSupport {
-    /// The catalog holds the listing, the route still serves these statistics,
-    /// and the listing is a perpetual — with the rules its units are read from.
-    Supported(Box<TradingRules>),
-    /// The program answered that it does not serve this listing: the route left
-    /// the registry, the route publishes no perpetual statistics, the catalog
-    /// does not hold the listing, or the listing is not a perpetual contract.
-    Unsupported,
-    /// The question could not be answered.
-    Unknown,
-}
-
-/// Asks the program whether it still serves `listing`, and in which units.
-///
-/// The route registry answers first because it is the only source of what a route
-/// publishes, and the catalog answers for the listing itself. These endpoints
-/// exist for perpetual contracts only, so a listing of any other product is an
-/// unsupported one here — the provider refuses it at the capability boundary, and
-/// this is the same refusal made before a window is asked for. A catalog failure
-/// is reported as the unknown answer it is: a venue that did not reply is not a
-/// venue that delisted the contract.
-fn listing_support(
-    catalog: &Catalog,
-    routes: &[LoadedScope],
-    listing: &VenueListingKey,
-    capability: CapabilityId,
-) -> ListingSupport {
-    if !offers_route(routes, &listing.route, capability) {
-        return ListingSupport::Unsupported;
-    }
-    match catalog.resolve_listing(listing) {
-        Ok(resolved)
-            if resolved.instrument.kind() != InstrumentKind::Perpetual
-                || resolved.status.is_terminal() =>
-        {
-            ListingSupport::Unsupported
-        }
-        Ok(resolved) => ListingSupport::Supported(Box::new(resolved.rules)),
-        Err(CatalogError::ListingNotFound { .. } | CatalogError::RouteNotRegistered { .. }) => {
-            ListingSupport::Unsupported
-        }
-        Err(error) => {
-            log::warn!(
-                "asking the catalog whether it still lists `{}` failed; the pane asks for the \
-                 window anyway: {error}",
-                listing.listing_id.as_str()
-            );
-            ListingSupport::Unknown
-        }
-    }
 }
 
 /// A failure a pane reports that is not already a stream error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StatisticsFailure {
     Fetch(StatisticsFetchError),
+    /// The application installed no market-participants directory, so this pane has
+    /// nothing it could ever read.
+    Unavailable,
     Rpc(RpcCallError<StatisticsServiceError>),
 }
 
-impl LocalizedError for StatisticsFailure {
-    fn localized_message(&self, cx: &App) -> SharedString {
+impl TranslatedError for StatisticsFailure {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
         match self {
-            Self::Fetch(error) => error.localized_message(cx),
-            Self::Rpc(error) => error.localized_message(cx),
+            Self::Fetch(error) => error.translated_message(translate),
+            Self::Unavailable => t_smol!(translate, "error.statistics.stream_unavailable"),
+            Self::Rpc(error) => error.translated_message(translate),
         }
     }
 }
 
-/// Whether this failure is the directory answering "this route's catalog is not in
-/// memory yet" rather than reporting something wrong.
+impl TranslatedError for StatisticsFetchError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::MarketParticipant(error) => error.translated_message(translate),
+            Self::Timeout(timeout) => {
+                t_smol!(
+                    translate,
+                    "error.statistics.timeout",
+                    seconds = timeout.as_secs()
+                )
+            }
+        }
+    }
+}
+
+impl TranslatedError for StatisticsServiceError {
+    fn translated_message(&self, translate: &Translate) -> SmolStr {
+        match self {
+            Self::StreamClosed | Self::StreamBusy => {
+                t_smol!(translate, "error.statistics.stream_unavailable")
+            }
+        }
+    }
+}
+
+/// Whether this failure is the directory answering "this route's catalog is not in memory
+/// yet" rather than reporting something wrong.
 ///
-/// The pane's own gate asks that question before it reads anything, so this is the
-/// answer changing underneath the request — a venue re-discovering its scopes is what
-/// does it. It is a wait, not a failure: loading the market again is what
-/// puts the catalog back. The pane's own service errors are refusals about the stream
-/// it is running, so only the market read can carry the directory's answer.
+/// The pane's own gate asks that question before it reads anything, so this is the answer
+/// changing underneath the request — a venue re-discovering its scopes is what does it. It
+/// is a wait, not a failure: loading the market again is what puts the catalog back. The
+/// pane's own service errors are refusals about the stream it is running, so only the
+/// market read can carry the directory's answer.
 fn is_waiting_for_a_catalog(failure: &StatisticsFailure) -> bool {
     matches!(
         failure,
         StatisticsFailure::Fetch(StatisticsFetchError::MarketParticipant(error))
-            if market_is_catalog_not_loaded(error)
+            if widget::error::market_is_catalog_not_loaded(error)
     )
 }
 
-impl LocalizedError for StatisticsFetchError {
-    fn localized_message(&self, cx: &App) -> SharedString {
-        match self {
-            Self::MarketParticipant(error) => error.localized_message(cx),
-            Self::Timeout(timeout) => {
-                t!(cx, "error.statistics.timeout", seconds = timeout.as_secs())
+/// Which command an in-flight reply belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingCommand {
+    /// A load or a retry of the configured scope.
+    Load,
+    /// A manual refresh of the scope already loaded.
+    Refresh,
+}
+
+/// What a header control reports to the next `sync`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HeaderRequest {
+    Refresh,
+    Selection(InstrumentSelection),
+    Timeframe(StatisticsTimeFrame),
+}
+
+/// The countdown the header draws, and the one-shot timer that keeps it moving.
+///
+/// It is shared with the timer callback (`Rc`), which has only `&mut App`: the deadline the
+/// label counts to lives in a `Cell`, the label itself is a signal, and the callback re-arms
+/// the timer. Every deadline change goes through `update`, which cancels the pending tick
+/// before it writes the label and arms the next chain — a deadline that flickers cannot
+/// leave two chains ticking (I3: the pane is woken once per tick, not twice), and `release`
+/// cancels through the same path.
+struct Countdown {
+    /// The window the timer belongs to.
+    window: WindowId,
+    /// The wall-clock millisecond the next read is due at, or nothing worth counting to (a
+    /// read in flight, a failure, a schedule that stopped).
+    deadline: std::cell::Cell<Option<i64>>,
+    /// The time left, as the header's text node draws it.
+    label: Signal<Option<SmolStr>>,
+    /// The wall clock, which is what a deadline published in Unix milliseconds is
+    /// comparable against; a test hands in a clock it can move.
+    now: Rc<dyn Fn() -> i64>,
+    /// The tick this pane is waiting for, if any. Holding the id is what makes a deadline
+    /// change and `release` able to cancel it instead of leaving it to fire.
+    timer: std::cell::RefCell<Option<TimerId>>,
+}
+
+/// The collaborators a pane is built over that are the same however its answer is sourced.
+pub(crate) struct PaneScaffold {
+    pub status: WidgetStatus,
+    pub config_change: WidgetConfigChange,
+    pub recovery: WidgetAction,
+    /// The wall clock, which a test hands in so it can move it.
+    pub now: Rc<dyn Fn() -> i64>,
+}
+
+impl Countdown {
+    fn new(cx: &mut WidgetCx<'_>, now: Rc<dyn Fn() -> i64>) -> Self {
+        Self {
+            window: cx.window(),
+            deadline: std::cell::Cell::new(None),
+            label: cx.signal(None),
+            now,
+            timer: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The deadline the label is counting to.
+    fn deadline(&self) -> Option<i64> {
+        self.deadline.get()
+    }
+
+    /// Moves the countdown to a new deadline (or stops it), and re-arms the timer.
+    fn update(self: &Rc<Self>, app: &mut App, deadline: Option<i64>) {
+        self.deadline.set(deadline);
+        if let Some(id) = self.timer.borrow_mut().take() {
+            app.cancel_timer(&id);
+        }
+        self.write_label(app);
+        if deadline.is_some() {
+            self.arm(app);
+        }
+    }
+
+    /// Recomputes the label from the clock; returns whether it changed.
+    fn write_label(&self, app: &mut App) -> bool {
+        app.write(
+            &self.label,
+            countdown_label(self.deadline.get(), (self.now)()),
+        )
+    }
+
+    /// Arms the one-shot tick for the next interval, if there is anything to count to.
+    fn arm(self: &Rc<Self>, app: &mut App) {
+        if self.deadline.get().is_none() {
+            return;
+        }
+        let this = Rc::clone(self);
+        match app.after(self.window, COUNTDOWN_TICK, move |app| this.tick(app)) {
+            Ok(id) => *self.timer.borrow_mut() = Some(id),
+            Err(error) => {
+                log::error!("the statistics countdown could not arm its next tick: {error}")
             }
         }
+    }
+
+    /// One tick: write the label and re-arm the next one.
+    fn tick(self: &Rc<Self>, app: &mut App) {
+        *self.timer.borrow_mut() = None;
+        self.write_label(app);
+        self.arm(app);
     }
 }
 
-impl LocalizedError for StatisticsServiceError {
-    fn localized_message(&self, cx: &App) -> SharedString {
-        match self {
-            Self::StreamClosed | Self::StreamBusy => {
-                t!(cx, "error.statistics.stream_unavailable")
-            }
-        }
-    }
+/// The header controls one group holds, and the copy they were built with.
+///
+/// A kit button's label and a picker's items are chosen when the control is built, so a
+/// language switch — or a selection or interval that the stored copy no longer states —
+/// rebuilds the group (AGENTS §15.1). Its node is the widget's own row inside the group the
+/// pane made.
+struct HeaderEntry {
+    root: NodeId,
+    parent: NodeId,
+    language: LanguageCode,
+    selection: Option<InstrumentSelection>,
+    timeframe: StatisticsTimeFrame,
+    generation: u64,
+    instrument: Option<InstrumentButtonHandle>,
+    refresh: Option<Button>,
+    select: Option<Select>,
 }
 
 /// One pane: the scope it follows, the chart it draws, and its header controls.
 pub struct StatisticsWidget<M: StatisticsMetric> {
     pub config: StatisticsConfig,
-    binding: WidgetBinding<StatisticsProtocol>,
-    pub status: Entity<WidgetStatus>,
-    pub recovery: WidgetAction,
+    binding: Option<WidgetBinding<StatisticsProtocol>>,
+    pub status: WidgetStatus,
+    recovery: WidgetAction,
     config_change: WidgetConfigChange,
     chart: Option<ChartDispatch>,
-    /// Whether a window has been accepted since this scope began, which is what
-    /// makes the chart content rather than a place waiting for it.
-    pub accepted: bool,
-    /// The revision of the window the pane has reported as ready, so readiness is
-    /// published at the protocol's own boundary rather than per snapshot.
-    pub ready: Option<u64>,
+    /// Whether a window has been accepted since this scope began, which is what makes the
+    /// chart content rather than a place waiting for it.
+    accepted: bool,
+    /// The revision of the window the pane has reported as ready, so readiness is published
+    /// at the protocol's own boundary rather than per snapshot.
+    ready: Option<u64>,
     /// When the next automatic fetch is due, as the service's own deadline.
-    pub next_refresh_at: Option<i64>,
-    pub countdown: Option<SharedString>,
-    /// Whether a refresh command this pane sent has been answered *and its round
-    /// reported*.
-    ///
-    /// It is set by the click and cleared when the service says what it did with the
-    /// command, which is what closes the window between the two: the service holds
-    /// its gate for the whole round, and the round is announced after the command is
-    /// acknowledged — so a control that trusted the acknowledgement alone would be
-    /// live again for the moment in between.
+    next_refresh_at: Option<i64>,
+    countdown: Rc<Countdown>,
+    /// Whether a refresh command this pane sent has been answered *and its round reported*.
     refresh_pending: bool,
-    /// The assets the chart's series are measured in, read from the listing's own
-    /// rules once the program has answered what it lists.
+    /// The commands this pane is waiting for, by the identity their replies carry.
+    pending: Pending<PendingCommand>,
+    /// The assets the chart's series are measured in, read from the listing's own rules once
+    /// the program has answered what it lists.
     units: ChartUnits,
-    directory_generation: u64,
+    /// The loaded market directory, or nothing when the host installed no directory root
+    /// (the framework's headless host is one).
+    directory: Option<Rc<dyn StatisticsDirectory>>,
+    /// The directory generation this pane last acted on.
+    seen_generation: u64,
     /// Whether the chart is waiting for its market rather than reading it.
     ///
-    /// The pane keeps its stream while it waits — the alternative is cancelling the
-    /// binding, which is terminal, and this pane has to be able to read the market
-    /// again once the user loads it — so a window that was in flight when the route
-    /// went away can still arrive. Accepting it would put a snapshot back and make the
-    /// pane report content over the notice the framework is drawing, so every message
-    /// entry refuses while this is set. The stream key cannot do this job: it says
-    /// which scope a window belongs to, and this one belongs to the scope the notice is
-    /// about.
-    ///
-    /// Crate-visible because the pane's tests live in `pane_tests.rs` beside this module, and
-    /// what the header controls refuse input on is this flag.
-    pub awaiting_market: bool,
-    _countdown_task: Task<()>,
-    /// Wakes the pane when the zone its timestamps are read in moves.
-    _time_zone: Option<Subscription>,
+    /// The pane keeps its stream while it waits — the alternative is cancelling the binding,
+    /// which is terminal, and this pane has to be able to read the market again once the
+    /// user loads it — so a window that was in flight when the route went away can still
+    /// arrive. Accepting it would put a snapshot back and make the pane report content over
+    /// the notice the framework is drawing, so every message entry refuses while this is
+    /// set. The stream key cannot do this job: it says which scope a window belongs to, and
+    /// this one belongs to the scope the notice is about.
+    awaiting_market: bool,
+    /// The node the chart's canvas lives in, once the body exists.
+    chart_host: Option<NodeId>,
+    /// Whether the window on screen is an empty one, which the body's overlay draws.
+    empty: Signal<bool>,
+    /// The sentence the empty-window overlay draws, bound so a language switch is a write.
+    empty_text: Signal<SmolStr>,
+    /// Where a header control hands over what the user did.
+    requests: Signal<Option<HeaderRequest>>,
+    left_header: Option<HeaderEntry>,
+    right_header: Option<HeaderEntry>,
     _metric: PhantomData<fn() -> M>,
 }
 
@@ -327,66 +435,267 @@ where
     fn new(
         _instance_id: WidgetInstanceId,
         config: Self::Config,
-        status: Entity<WidgetStatus>,
-        _reload: impl Fn(&mut App) + 'static,
+        status: WidgetStatus,
+        _reload: ReloadHandle,
         config_change: WidgetConfigChange,
         recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self {
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<Self, EngineError> {
+        let directory: Option<Rc<dyn StatisticsDirectory>> =
+            cx.services().market_participants().map(|connector| {
+                Rc::new(ConnectorDirectory::new(
+                    connector.clone(),
+                    M::METRIC.capability(),
+                )) as Rc<dyn StatisticsDirectory>
+            });
+        // The answer is read through the directory the composition root injects; a host
+        // without one leaves the source absent and `load` reports that.
         let source = cx
-            .global::<market_participants_connector::connector::MarketParticipantsConnector>()
-            .market();
-        Self::new_with_source(config, source, status, config_change, recovery, cx)
+            .services()
+            .market_participants()
+            .map(market_participants_connector::connector::MarketParticipantsConnector::market);
+        Ok(Self::assemble(
+            config,
+            source,
+            directory,
+            PaneScaffold {
+                status,
+                config_change,
+                recovery,
+                now: Rc::new(unix_millis),
+            },
+            cx,
+        ))
     }
 
-    fn load(&mut self, cx: &mut Context<Self>) {
-        // The market this pane follows has to be loaded before anything else
-        // happens here, and the check is first on purpose: a route the user never
-        // loaded, or one a shrinking commit has since taken away, leaves the
-        // pane waiting for it instead of reaching the branches below, which settle
-        // the selection the user stored.
+    fn load(&mut self, cx: &mut WidgetCx<'_>) {
+        // Nothing a host without a directory installs can ever be loaded, so that is a
+        // failure rather than a wait.
+        if self.directory.is_none() {
+            self.report_unavailable(cx);
+            return;
+        }
+        // The market this pane follows has to be loaded before anything else happens here,
+        // and the check is first on purpose: a route the user never loaded, or one a
+        // shrinking commit has since taken away, leaves the pane waiting for it instead of
+        // reaching the branches below, which settle the selection the user stored.
         if !self.market_ready(cx) {
             self.wait_for_market(cx);
             return;
         }
         // A pane that was waiting — nothing selected, or a scope that is in memory again —
         // carries no reading over, so what it starts is a load rather than a retry. What a
-        // recovery carries over is the window the pane has accepted, and only that: a pane that
-        // failed before a window arrived — the first read of a scope it has just followed — has
-        // nothing to keep, so starting over is what stands the connecting placeholder in front of
-        // an empty chart instead of reporting the window it never received as "no data".
-        let retry = self.status.is_failed(cx) && self.accepted;
+        // recovery carries over is the window the pane has accepted, and only that: a pane
+        // that failed before a window arrived has nothing to keep, so starting over is what
+        // stands the connecting placeholder in front of an empty chart instead of reporting
+        // the window it never received as "no data".
+        let retry = self.status.is_failed(cx.app()) && self.accepted;
         self.start(retry, cx);
     }
 
-    /// The options this widget persists.
-    ///
-    /// The framework asks for these to write the pane back, so this answers with the
-    /// field itself rather than computing anything.
+    /// The options this widget persists, asked for by the framework to write the pane back.
     fn config(&self) -> Option<&Self::Config> {
         Some(&self.config)
     }
 
     /// A pane is content once it has accepted a window.
     ///
-    /// Having a chart is not the same thing: a chart is built as soon as an
-    /// instrument is chosen, and an empty chart is not content — it is a pane that
-    /// has asked for something and is waiting for it. An *empty window* is the
-    /// different thing, and it is content: it is what "this instrument has
-    /// published nothing yet" looks like, and the chart says so itself.
+    /// Having a chart is not the same thing: a chart is built as soon as an instrument is
+    /// chosen, and an empty chart is not content — it is a pane that has asked for something
+    /// and is waiting for it. An *empty window* is the different thing, and it is content:
+    /// it is what "this instrument has published nothing yet" looks like, and the chart says
+    /// so itself.
     fn has_content(&self) -> bool {
         self.chart.is_some() && self.accepted
     }
 
-    /// The scope on the left, and the interval and refresh on the right.
-    ///
-    /// Neither group is usable before the market participant's metadata is: the two right-hand controls
-    /// refuse input while the pane waits for its market, and the instrument picker disables itself
-    /// whenever the loaded venues offer it nothing to select from.
-    fn header(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> WidgetHeader {
-        WidgetHeader::empty()
-            .left(self.instrument_button(cx))
-            .right(self.drawing_controls(cx))
+    fn body(&mut self, parent: NodeId, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let root = NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS")
+            .style(
+                StyleBuilder::new()
+                    .flex_col()
+                    .size_full()
+                    .min_width_0()
+                    .min_height_0()
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        let host = NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS_CHART_HOST")
+            .style(
+                StyleBuilder::new()
+                    .flex_1()
+                    .min_width_0()
+                    .min_height_0()
+                    .relative()
+                    .build(),
+            )
+            .build(cx.tree_mut(), root)?;
+
+        // The canvas is the host's first child on purpose: the empty-window overlay below
+        // is built after it, so the sentence is drawn over the axes rather than under them
+        // (the old body appended its overlay last for the same reason).
+        self.chart_host = Some(host);
+        if let Some(chart) = self.chart.as_mut() {
+            chart.build(cx, host)?;
+        }
+
+        // A window the venue published with no interval in it draws axes and nothing else,
+        // which reads exactly like a chart that has not arrived: the overlay says which of
+        // the two it is, over the plot.
+        let empty = self.empty;
+        let empty_hidden = self.empty;
+        let overlay = NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS_EMPTY")
+            .style(
+                StyleBuilder::new()
+                    .absolute()
+                    .top(0.0)
+                    .left(0.0)
+                    .right(0.0)
+                    .bottom(0.0)
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .build(),
+            )
+            .bind_style(move |read| StylePatch {
+                visible: Some(*read.read(&empty)),
+                ..StylePatch::default()
+            })
+            .bind_a11y(move |read| A11yPatch {
+                hidden: Some(!*read.read(&empty_hidden)),
+                ..A11yPatch::default()
+            })
+            .build(cx.tree_mut(), host)?;
+        let theme = cx.theme().clone();
+        EmptyState::new(theme, "StatisticsEmpty")
+            .bind_text(self.empty_text)
+            .build(cx.tree_mut(), overlay)?;
+        Ok(())
+    }
+
+    fn sync(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        // What the service delivered is drained before anything in this frame can replace a
+        // command: an answer that arrived before the frame belongs to the command that was
+        // in flight when it arrived.
+        self.drain_inbox(cx);
+
+        // The published directory generation is the one signal that says the directory
+        // moved. A change can matter in either direction — the market this pane waits for
+        // has been loaded, or the one it was reading has gone — and `reload` is what decides
+        // which, because it re-runs the precondition; a pane that is already showing a
+        // window keeps it.
+        let generation = cx.services().catalog_generation;
+        let generation = *cx.read(&generation);
+        if generation != self.seen_generation {
+            self.seen_generation = generation;
+            // A failure is terminal: a directory publication does not revive a failed
+            // pane — only the user's own recovery does.
+            if !self.status.is_failed(cx.app()) {
+                self.reload(cx);
+            }
+        }
+
+        // A window's labels were written when it arrived, so a display zone or a language
+        // that moved while the pane was open rewrites them here, on the frame that reads the
+        // new setting — before anything is drawn from the chart.
+        let zone = cx.data_time_zone();
+        if let Some(chart) = self.chart.as_mut() {
+            chart.set_time_zone(zone);
+        }
+        let translate = cx.translate().clone();
+        if let Some(chart) = self.chart.as_mut() {
+            chart.set_locale(&translate);
+        }
+
+        // A header control owns no `&mut self`; it asks for the transition it was used for,
+        // and this is where the request becomes one. The read is taken out of the signal
+        // before the write: an engine signal is not copied on read, so a write while a read
+        // guard is alive would alias the value it is reading.
+        let request = cx.read(&self.requests).clone();
+        if let Some(request) = request {
+            cx.write(&self.requests, None);
+            self.apply_header_request(request, cx);
+        }
+
+        // The body is built by the framework from the answer `has_content` gives, and it
+        // asks that question before this hook runs: content that first appeared here is one
+        // frame away, so ask for that frame.
+        if self.has_content() && self.chart_host.is_none() {
+            cx.request_frame()?;
+        }
+
+        self.sync_chart(cx)?;
+
+        // The countdown follows the schedule the state now states. Comparing first is what
+        // keeps a steady frame from cancelling and re-arming the same tick.
+        let deadline = self.countdown_deadline(cx.app());
+        if deadline != self.countdown.deadline() {
+            Countdown::update(&self.countdown, cx.app_mut(), deadline);
+        }
+        self.sync_header(cx)?;
+        Ok(())
+    }
+
+    fn header(
+        &mut self,
+        group: HeaderGroup,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        // The pane may rebuild the row it calls this for: the controls this widget built
+        // into the previous one are the widget's, so they go before the new ones are built.
+        self.release_header(group, true, cx);
+        match group {
+            HeaderGroup::Left => self.build_instrument_header(parent, cx),
+            HeaderGroup::Right => self.build_drawing_header(parent, cx),
+        }
+    }
+
+    fn dispatch(&mut self, event: &Event, cx: &mut WidgetCx<'_>) -> bool {
+        let Event::Input(input) = event else {
+            return false;
+        };
+        let Some(chart) = self.chart.as_mut() else {
+            return false;
+        };
+        // A pointer that is over the plot follows the reading under it; one that left says
+        // so. Either way only a *reading* that moved is a change worth a frame: a pointer
+        // that moved a pixel inside one interval is the same drawing.
+        let moved = match input {
+            InputEvent::PointerMove { position, .. }
+            | InputEvent::PointerEnter { position, .. } => chart.point_at(*position),
+            InputEvent::PointerLeave { .. } => chart.clear_hover(),
+            _ => return false,
+        };
+        if moved {
+            let _ = cx.request_frame();
+        }
+        true
+    }
+
+    fn release(&mut self, cx: &mut WidgetCx<'_>) {
+        // Dropping the bridge aborts its forwarding tasks and cancels the service.
+        self.binding = None;
+        // The header rows belong to the pane, which removes them: only the components'
+        // signal scopes and action handlers are this widget's to release.
+        self.release_header(HeaderGroup::Left, false, cx);
+        self.release_header(HeaderGroup::Right, false, cx);
+        // The chart's canvas node lives in the body, which the framework removes after this
+        // hook; the geometry it registered is the chart's own, so it goes here.
+        if let Some(mut chart) = self.chart.take() {
+            chart.release(cx);
+        }
+        // The countdown tick is this widget's: the framework's subtree teardown does not own
+        // it, so release is where it is cancelled.
+        Countdown::update(&self.countdown, cx.app_mut(), None);
+        self.pending.clear();
+        self.chart_host = None;
+        self.accepted = false;
+        self.ready = None;
+        self.next_refresh_at = None;
     }
 }
 
@@ -394,62 +703,284 @@ impl<M> StatisticsWidget<M>
 where
     M: StatisticsMetric,
 {
-    /// Messages are reported through the binding, which a test drives by hand: it
-    /// is cancelled first so the service behind it cannot answer at the same time.
-    #[cfg(test)]
-    pub(crate) fn cancel_binding(&self) {
-        self.binding.cancel();
+    /// Assembles a pane over the collaborators a caller hands it.
+    ///
+    /// The source and the directory are arguments because the pane has no opinion about
+    /// where its answers come from: the production constructor answers them with the
+    /// injected connector, and a test with a fixture.
+    fn assemble<S>(
+        config: StatisticsConfig,
+        source: Option<S>,
+        directory: Option<Rc<dyn StatisticsDirectory>>,
+        scaffold: PaneScaffold,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self
+    where
+        S: StatisticsSource,
+    {
+        let binding = source.map(|source| WidgetBinding::spawn(cx, StatisticsService::new(source)));
+        let countdown = Rc::new(Countdown::new(cx, scaffold.now));
+        let generation = cx.services().catalog_generation;
+        let seen_generation = *cx.read(&generation);
+        Self {
+            config,
+            binding,
+            status: scaffold.status,
+            recovery: scaffold.recovery,
+            config_change: scaffold.config_change,
+            chart: None,
+            accepted: false,
+            ready: None,
+            next_refresh_at: None,
+            countdown,
+            refresh_pending: false,
+            pending: Pending::new(),
+            units: ChartUnits::default(),
+            directory,
+            seen_generation,
+            awaiting_market: false,
+            chart_host: None,
+            empty: cx.signal(false),
+            empty_text: cx.signal(SmolStr::default()),
+            requests: cx.signal(None),
+            left_header: None,
+            right_header: None,
+            _metric: PhantomData,
+        }
     }
 
-    /// Whether a chart exists at all, which is not the same as having content: a
-    /// chart is built as soon as an instrument is chosen.
+    /// Builds a pane over a source and a directory a test drives.
+    ///
+    /// The framework's headless host cannot build a market-participants connector, so the
+    /// seam a test answers through is here: the same assembly the production constructor
+    /// runs, with the directory and the source handed in.
     #[cfg(test)]
-    pub(crate) const fn has_chart(&self) -> bool {
-        self.chart.is_some()
+    pub(crate) fn with_source<S>(
+        config: StatisticsConfig,
+        source: S,
+        directory: Option<Rc<dyn StatisticsDirectory>>,
+        scaffold: PaneScaffold,
+        cx: &mut WidgetCx<'_>,
+    ) -> Self
+    where
+        S: StatisticsSource,
+    {
+        Self::assemble(config, Some(source), directory, scaffold, cx)
     }
 
-    /// The token [`Self::start`] mints once per start, which a test reads to tell a pane
-    /// that started over from one that only re-checked its precondition.
-    #[cfg(test)]
-    pub(crate) const fn generation_for_test(&self) -> u64 {
-        self.directory_generation
+    /// The scope this pane would accept a message from.
+    ///
+    /// Absent until an instrument is chosen: nothing is being polled, so nothing is in
+    /// scope.
+    pub(crate) fn current_key(&self) -> Option<StatisticsStreamKey> {
+        self.config.selection.as_ref().map(|selection| {
+            StatisticsStreamKey::new(M::METRIC, selection.listing.clone(), self.config.timeframe)
+        })
     }
 
-    /// The assets the chart is labelled in, which a test reads to tell the rules of one
-    /// generation from another's.
-    #[cfg(test)]
-    pub(crate) const fn units_for_test(&self) -> &ChartUnits {
-        &self.units
+    /// Re-reads the directory after it published a new generation (AGENTS §8.3).
+    ///
+    /// A publication says the catalogue behind a window moved, not that the readings in it
+    /// did: the window on screen is the same listing over the same interval, and the stream
+    /// that is filling it resolves the listing against the catalogue on every fetch, so its
+    /// next fetch is the published generation's. Replacing that stream is what a reload
+    /// here must *not* do: the service numbers the windows of one stream, so a replacement
+    /// starts again at its first revision, and the window on screen would be counted as one
+    /// the pane had already overtaken — the chart would freeze on the old window until the
+    /// new stream's numbering caught up.
+    ///
+    /// What a publication does re-run is the pane's gate and the answers it takes from the
+    /// directory: the route's question about the stored listing, and the units its labels
+    /// are written in. Content is dropped here only when the directory says the pane can no
+    /// longer read it — the market it follows is not loaded (the neutral notice), or the
+    /// route no longer publishes the listing (nothing chosen). A fetch that fails after the
+    /// publication is the ordinary failure path, which keeps the chart under the banner.
+    fn reload(&mut self, cx: &mut WidgetCx<'_>) {
+        if self.directory.is_none() {
+            self.report_unavailable(cx);
+            return;
+        }
+        if !self.market_ready(cx) {
+            self.wait_for_market(cx);
+            return;
+        }
+        // A pane with no window of its own has nothing to keep: what it was waiting for is
+        // what the publication may have settled, so it starts over the way a load does.
+        if !self.has_content() {
+            self.start(false, cx);
+            return;
+        }
+        let Some(selection) = self.config.selection.clone() else {
+            return;
+        };
+        let support = self
+            .directory
+            .as_ref()
+            .map(|directory| directory.listing_support(&selection.listing))
+            .unwrap_or(ListingSupport::Unknown);
+        self.settle_selection(&selection, support, cx);
     }
 
-    /// Puts the selection back to "nothing chosen" when the program no longer
-    /// serves the listing it names.
+    /// Whether this pane has something to fetch.
+    fn has_scope(&self) -> bool {
+        !self.awaiting_market && self.current_key().is_some()
+    }
+
+    /// Whether a pane would enable its drawing controls, which is what a test asserts
+    /// instead of reaching into a control it cannot read back.
+    #[cfg(test)]
+    pub(crate) fn has_scope_for_test(&self) -> bool {
+        self.has_scope()
+    }
+
+    /// The deadline this pane counts down to, if it has one to count down to.
+    ///
+    /// A countdown belongs to a pane that is *ready*: it counts down the time left until the
+    /// next automatic fetch of the window that is on screen. While a fetch is in flight
+    /// there is nothing to count down to, and a pane with no scope has no deadline either.
+    fn countdown_deadline(&self, app: &App) -> Option<i64> {
+        let status = self.status.state(app);
+        if status.is_busy() || status.is_failed() {
+            return None;
+        }
+        self.next_refresh_at
+    }
+
+    /// Whether the refresh control has nothing to do.
+    ///
+    /// It is live exactly when the countdown is: a pane that is connecting, fetching or
+    /// failed has nothing to bring forward, and so has one that is waiting for its market.
+    /// The pending half is not decoration: the service refuses a second refresh while one is
+    /// in flight and the framework shows a refusal as a failure.
+    pub(crate) fn refresh_is_disabled(&self, app: &App) -> bool {
+        self.awaiting_market || self.refresh_pending || self.countdown_deadline(app).is_none()
+    }
+
+    /// Reports that the host installed no directory root, which this pane cannot read
+    /// without.
+    fn report_unavailable(&mut self, cx: &mut WidgetCx<'_>) {
+        let recovery = self.recovery.clone();
+        self.status.report(
+            cx.app_mut(),
+            WidgetState::failed(Arc::new(StatisticsFailure::Unavailable), recovery),
+        );
+    }
+
+    /// Whether what this pane needs is in memory: at least one market that answers with
+    /// these statistics, and the route of the stored selection among them.
+    fn market_ready(&self, _cx: &WidgetCx<'_>) -> bool {
+        let Some(directory) = self.directory.as_ref() else {
+            return false;
+        };
+        if !directory.any_market_loaded() {
+            return false;
+        }
+        let Some(selection) = self.config.selection.as_ref() else {
+            return true;
+        };
+        directory.is_loaded(&selection.listing.route)
+    }
+
+    /// Builds the chart of the configured listing, or drops the one that was there.
+    ///
+    /// The labels come from the listing the program answered with, and a listing it could
+    /// not answer for is drawn with none: the series are still worth plotting, and the axes
+    /// fall back to naming nothing rather than naming the wrong asset.
+    fn rebuild_chart(&mut self, cx: &mut WidgetCx<'_>) {
+        let zone = cx.data_time_zone();
+        let translate = cx.translate().clone();
+        let chart = self.config.selection.as_ref().and_then(|selection| {
+            let directory = self.directory.as_ref()?;
+            let scopes = directory.loaded_scopes();
+            if !offers_route(&scopes, &selection.listing.route, M::METRIC.capability()) {
+                return None;
+            }
+            ChartDispatch::for_metric(
+                &translate,
+                self.units.base.as_str(),
+                self.units.quote.as_str(),
+                zone,
+                M::METRIC,
+            )
+        });
+        if let Some(mut previous) = self.chart.take() {
+            previous.release(cx);
+        }
+        self.chart = chart;
+    }
+
+    /// Settles the stored scope against the directory, and starts polling it.
+    ///
+    /// The question is **advisory**: it only ever takes the scope away, and only when the
+    /// program answered that it does not serve the listing. A question that could not be put
+    /// leaves the scope alone, and the poll reports the failure that is really there.
+    fn start(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
+        // The pane reached here only past its own gate, so the market it was waiting for is
+        // in memory again and messages belong to it once more.
+        self.awaiting_market = false;
+        self.ready = None;
+        self.next_refresh_at = None;
+        // The commands that were in flight belong to the generation this call is replacing,
+        // so their answers are not something to wait for any more.
+        self.pending.clear();
+        self.refresh_pending = false;
+        // An interval this build does not offer is settled before anything is asked for it.
+        if !TIMEFRAMES.contains(&self.config.timeframe) {
+            self.config.timeframe = StatisticsConfig::default().timeframe;
+            log::warn!(
+                "the interval stored for this pane is not one this build offers; it fell back \
+                 to {:?}",
+                self.config.timeframe
+            );
+            self.config_change.publish(cx.app_mut());
+        }
+        let Some(selection) = self.config.selection.clone() else {
+            self.nothing_chosen(cx);
+            return;
+        };
+        // A retry keeps the window the user is still reading; an explicit load rebuilds the
+        // chart for the scope it now follows.
+        if !retry {
+            self.rebuild_chart(cx);
+        }
+        self.accepted = retry && self.chart.is_some();
+        self.status.report(cx.app_mut(), WidgetState::Connecting);
+        let support = self
+            .directory
+            .as_ref()
+            .map(|directory| directory.listing_support(&selection.listing))
+            .unwrap_or(ListingSupport::Unknown);
+        if !self.settle_selection(&selection, support, cx) {
+            return;
+        }
+        self.poll(retry, cx);
+        let _ = cx.request_frame();
+    }
+
+    /// Applies the directory's answer about the stored listing.
     ///
     /// Returns whether this answer still describes the scope the pane follows, which is what
-    /// decides whether the poll for it starts. The question is **advisory**, and it is only
-    /// ever a reset: only an answer that *names* the listing as unsupported takes the scope
-    /// away. Everything else it cannot answer leaves the scope alone — the venue may simply
-    /// be quiet — and the poll that follows reports its own failure, which the user can
-    /// recover from. The poll is the authoritative request: the connector resolves the listing
-    /// inside it, so a catalog that could not be read is reported as the failure it is, and
-    /// never as a listing the venue does not carry. A selection the user has changed since is
-    /// theirs, and it started a poll of its own.
+    /// decides whether the poll for it starts.
     fn settle_selection(
         &mut self,
         asked: &InstrumentSelection,
         support: ListingSupport,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) -> bool {
         if self.config.selection.as_ref() != Some(asked) {
             return false;
         }
         match support {
             ListingSupport::Supported(rules) => {
-                // The labels name the assets of the listing the program answered
-                // with, so a chart that has not drawn a window yet is rebuilt with
-                // them. A chart that is already showing one keeps it: a retry is not
-                // a reason to blank a screen of data away.
-                let units = ChartUnits::of(&rules, cx);
+                // The labels name the assets of the listing the program answered with, so a
+                // chart that has not drawn a window yet is rebuilt with them. A chart that
+                // is already showing one keeps it: a retry is not a reason to blank a screen
+                // of data away.
+                let units = self
+                    .directory
+                    .as_ref()
+                    .map(|directory| directory.units(&rules, cx.translate()))
+                    .unwrap_or_default();
                 if self.units != units {
                     self.units = units;
                     if !self.accepted {
@@ -466,412 +997,211 @@ where
                     asked.listing.route
                 );
                 self.config.selection = None;
-                self.config_change.publish(cx);
+                self.config_change.publish(cx.app_mut());
+                self.nothing_chosen(cx);
                 true
             }
             ListingSupport::Unknown => true,
         }
     }
 
-    /// The box and offset the chart's own horizontal viewport has, which is what a
-    /// test reads to see how a pane narrower than the chart behaves.
-    #[cfg(test)]
-    pub(crate) fn chart_horizontal_scroll(&self) -> Option<gpui_kit::ScrollHandle> {
-        self.chart.as_ref().map(ChartDispatch::horizontal_scroll)
-    }
-
-    /// The seam a test can answer through: `new` only picks the production source.
-    pub fn new_with_source<S>(
-        config: StatisticsConfig,
-        source: S,
-        status: Entity<WidgetStatus>,
-        config_change: WidgetConfigChange,
-        recovery: WidgetAction,
-        cx: &mut Context<Self>,
-    ) -> Self
-    where
-        S: StatisticsSource,
-    {
-        let service = StatisticsService::new(source);
-        let binding = WidgetBinding::spawn_conditionally(
-            global::handle(cx).handle(),
-            service,
-            cx,
-            Self::apply_reliable,
-            Self::apply_latest,
-        );
-        let countdown_task = cx.spawn(async move |this, cx| {
-            loop {
-                if this
-                    .update(cx, |this, cx| {
-                        this.tick_countdown(cx);
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                cx.background_executor().timer(COUNTDOWN_TICK).await;
-            }
-        });
-        // The pane recovers from the market it waits for without polling: a venue commit is
-        // the one event that can change what may be read, and a change that arrives while the
-        // pane has nothing to show is a reason to load again.
-        let events = cx.global::<MarketParticipantsConnector>().venues().events();
-        cx.subscribe(&events, |this, _, event: &VenuesUpdated, cx| {
-            this.on_venues_updated(event, cx);
-        })
-        .detach();
-        let mut widget = Self {
-            config,
-            binding,
-            status,
-            recovery,
-            config_change,
-            chart: None,
-            accepted: false,
-            ready: None,
-            next_refresh_at: None,
-            countdown: None,
-            refresh_pending: false,
-            units: ChartUnits::default(),
-            directory_generation: 0,
-            awaiting_market: false,
-            _countdown_task: countdown_task,
-            _time_zone: notify_on_data_time_zone_change(cx),
-            _metric: PhantomData,
-        };
-        widget.rebuild_chart(cx);
-        widget
-    }
-
-    /// The scope this pane would accept a message from.
-    ///
-    /// Absent until an instrument is chosen: nothing is being polled, so nothing
-    /// is in scope.
-    pub(crate) fn current_key(&self) -> Option<StatisticsStreamKey> {
-        self.config.selection.as_ref().map(|selection| {
-            StatisticsStreamKey::new(M::METRIC, selection.listing.clone(), self.config.timeframe)
-        })
-    }
-
-    /// Whether this pane has something to fetch.
-    ///
-    /// Both header controls read this rather than deciding for themselves: an
-    /// interval is only worth choosing when there is a window to fetch over it, so
-    /// the picker and the refresh are enabled and disabled together.
-    ///
-    /// A pane that is waiting for its market has nothing to fetch either, however it was
-    /// scoped before the market went away: the intervals it would offer are the route's, and
-    /// a route whose market is not in memory cannot be asked. The wait is therefore part of
-    /// having a scope rather than a second condition beside it.
-    fn has_scope(&self) -> bool {
-        !self.awaiting_market && self.current_key().is_some()
-    }
-
-    /// Whether a pane would enable its drawing controls, which is what a test
-    /// asserts instead of reaching into a control it cannot read back.
-    #[cfg(test)]
-    pub(crate) fn has_scope_for_test(&self) -> bool {
-        self.has_scope()
-    }
-
-    /// The deadline this pane counts down to, if it has one to count down to.
-    ///
-    /// A countdown belongs to a pane that is *ready*: it counts down the time left
-    /// until the next automatic fetch of the window that is on screen. While a fetch
-    /// is in flight there is nothing to count down to — the deadline the service
-    /// announced belongs to the fetch after the one being waited for — so a number
-    /// that started moving then would be counting down to a window the pane has not
-    /// received. A pane with no scope has no deadline either: it is not polling.
-    fn countdown_deadline(&self, cx: &impl AppContext) -> Option<i64> {
-        let status = self.status.state(cx);
-        if status.is_busy() || status.is_failed() {
-            return None;
-        }
-        self.next_refresh_at
-    }
-
-    /// Whether the refresh control has nothing to do.
-    ///
-    /// It is live exactly when the countdown is: a pane that is connecting, fetching
-    /// or failed has nothing to bring forward — the first two are already waiting on
-    /// data, and a failure is a state the framework offers its own recovery over,
-    /// above the chart — and so has one that is waiting for its market, which is not
-    /// polling anything and says so with a placeholder of its own. So the control is an
-    /// icon alone and refuses input the rest of the time, and carries the countdown only
-    /// while there is one.
-    ///
-    /// The pending half is not decoration: the service refuses a second refresh while
-    /// one is in flight and the framework shows a refusal as a failure, so a control
-    /// that forwarded the click while its own command was still unanswered would
-    /// answer a fast double click with a banner.
-    ///
-    /// It is crate-visible rather than private to this module because the pane's
-    /// tests live in `pane_tests.rs` beside it, which is a module of its own.
-    pub(crate) fn refresh_is_disabled(&self, cx: &impl AppContext) -> bool {
-        self.awaiting_market || self.refresh_pending || self.countdown_deadline(cx).is_none()
-    }
-
-    /// Builds the chart of the configured listing, or drops the one that was
-    /// there.
-    ///
-    /// The labels come from the listing the program answered with, and a listing it
-    /// could not answer for is drawn with none: the series are still worth plotting,
-    /// and the axes fall back to naming nothing rather than naming the wrong asset.
-    fn rebuild_chart(&mut self, cx: &mut App) {
-        self.chart = self.config.selection.as_ref().and_then(|selection| {
-            if !route_serves_statistics(cx, &selection.listing.route, M::METRIC.capability()) {
-                return None;
-            }
-            ChartDispatch::for_metric(
-                cx,
-                self.units.base.as_str(),
-                self.units.quote.as_str(),
-                M::METRIC,
-            )
-        });
-    }
-
-    /// Settles the stored scope against the program, and starts polling it.
-    ///
-    /// A retry keeps the chart the user is still reading — blanking it to reconnect would
-    /// flash a screen of data away — while an explicit load starts over, because the pane
-    /// cannot vouch for what it was showing.
-    ///
-    /// The question this starts with is **advisory**: it only ever takes the scope away, and
-    /// only when the program answered that it does not serve the listing — the route left the
-    /// registry, the route publishes no perpetual statistics, the catalog does not hold the
-    /// listing, or the listing is not a perpetual contract. The poll below is the
-    /// authoritative request, and it resolves the listing inside the connector, so a catalog
-    /// that could not be read is reported as the failure it is rather than as a listing that
-    /// cannot be named.
-    fn start(&mut self, retry: bool, cx: &mut Context<Self>) {
-        // The pane reached here only past its own gate, so the market it was waiting
-        // for is in memory again and messages belong to it once more.
-        self.awaiting_market = false;
-        self.directory_generation = self.directory_generation.wrapping_add(1);
-        let generation = self.directory_generation;
-        self.ready = None;
-        self.next_refresh_at = None;
-        self.countdown = None;
-        // The command that was in flight belongs to the generation this call is
-        // replacing, so its answer is not something to wait for any more.
-        self.refresh_pending = false;
-        // An interval this build does not offer is settled before anything is asked for
-        // it: the picker could not draw it, and the request would name a window the
-        // service does not serve.
-        if !TIMEFRAMES.contains(&self.config.timeframe) {
-            self.config.timeframe = StatisticsConfig::default().timeframe;
-            log::warn!(
-                "the interval stored for this pane is not one this build offers; \
-                 it fell back to {:?}",
-                self.config.timeframe
-            );
-            self.config_change.publish(cx);
-        }
-        let Some(selection) = self.config.selection.clone() else {
-            self.nothing_chosen(cx);
-            return;
-        };
-        // A retry keeps the window the user is still reading; an explicit load
-        // rebuilds the chart for the scope it now follows.
-        if !retry {
-            self.rebuild_chart(cx);
-        }
-        self.accepted = retry && self.chart.is_some();
-        // A listing the program no longer serves goes back to "nothing chosen" before
-        // anything is asked for it: a window for a listing nobody publishes fails about a
-        // scope the user cannot return to anyway. Only that answer does — a question that
-        // could not be put leaves the scope alone and the poll reports the failure that is
-        // really there. The question is work this pane is doing, so it reports connecting
-        // while it is in flight — the request that follows is what asks for a window.
-        self.status.report(WidgetState::Connecting, cx);
-        cx.notify();
-        let catalog = cx.global::<MarketParticipantsConnector>().catalog();
-        let routes = LoadedScope::all(cx.global::<MarketParticipantsConnector>().venues());
-        let support = listing_support(catalog, &routes, &selection.listing, M::METRIC.capability());
-        cx.spawn(async move |this, cx| {
-            let _ = this.update(cx, |this, cx| {
-                // An answer about a scope the user has left is not this pane's to apply:
-                // their own choice started a poll of its own.
-                if this.directory_generation != generation
-                    || !this.settle_selection(&selection, support, cx)
-                {
-                    return;
-                }
-                this.poll(retry, cx);
-            });
-        })
-        .detach();
-    }
-
     /// Asks the service for the window of the scope the config now holds.
-    fn poll(&mut self, retry: bool, cx: &mut Context<Self>) {
+    fn poll(&mut self, retry: bool, cx: &mut WidgetCx<'_>) {
         let Some(selection) = self.config.selection.clone() else {
             self.nothing_chosen(cx);
             return;
         };
-        self.binding.call(
-            StatisticsRequest::from_scope(
-                M::METRIC,
-                selection.listing,
-                self.config.timeframe,
-                retry,
-            ),
-            cx,
-            Self::apply_load_result,
+        let request = StatisticsRequest::from_scope(
+            M::METRIC,
+            selection.listing,
+            self.config.timeframe,
+            retry,
         );
-        cx.notify();
+        let Some(binding) = self.binding.as_mut() else {
+            self.report_unavailable(cx);
+            return;
+        };
+        let request_id = binding.call(cx, request);
+        self.pending.track(request_id, PendingCommand::Load);
+        let _ = cx.request_frame();
     }
 
     /// Says what a pane with nothing to follow is waiting for.
-    fn nothing_chosen(&mut self, cx: &mut Context<Self>) {
-        // There is nothing to draw yet, so there is nothing to poll. The pane has no
-        // content of its own, so it says what it is waiting for.
-        self.chart = None;
+    fn nothing_chosen(&mut self, cx: &mut WidgetCx<'_>) {
+        if let Some(mut chart) = self.chart.take() {
+            chart.release(cx);
+        }
         self.accepted = false;
+        self.ready = None;
+        self.next_refresh_at = None;
+        self.pending.clear();
+        self.refresh_pending = false;
         self.report_notice(cx);
-        cx.notify();
+        let _ = cx.request_frame();
     }
 
-    fn apply_load_result(
-        &mut self,
-        result: WidgetRpcResult<StatisticsProtocol>,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(StatisticsResponse::StreamStarted | StatisticsResponse::RefreshQueued) => {}
-            Err(error) => {
-                let recovery = self.recovery.clone();
-                self.status.report(
-                    WidgetState::failed(Arc::new(StatisticsFailure::Rpc(error)), recovery),
-                    cx,
-                );
+    /// Consumes what the binding delivered, in arrival order.
+    fn drain_inbox(&mut self, cx: &mut WidgetCx<'_>) {
+        let messages = self
+            .binding
+            .as_ref()
+            .map(WidgetBinding::take)
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                Inbound::Reliable { key, message } => self.apply_reliable(key, message, cx),
+                Inbound::Latest { key, message } => self.apply_latest(key, message, cx),
+                Inbound::Rpc { request_id, result } => self.apply_rpc(request_id, result, cx),
             }
         }
     }
 
-    fn apply_refresh_result(
+    /// Applies one RPC reply to the command whose identity it carries.
+    ///
+    /// An identity this pane does not hold is a reply the replacement overtook: it is
+    /// dropped and counted rather than applied to the command now in flight.
+    pub(crate) fn apply_rpc(
         &mut self,
+        request_id: RequestId,
         result: WidgetRpcResult<StatisticsProtocol>,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) {
-        // An accepted command stays pending until the round it started is reported:
-        // the acknowledgement and the round are two different messages, and the gate
-        // the service holds spans both.
-        if let Err(error) = result {
-            self.refresh_pending = false;
-            let recovery = self.recovery.clone();
-            self.status.report(
-                WidgetState::failed(Arc::new(StatisticsFailure::Rpc(error)), recovery),
-                cx,
+        // A failure is terminal, and every entry point has to say so: the reply to a command
+        // the recovery replaced would otherwise report the same failure again over the
+        // banner the user is reading.
+        if self.status.is_failed(cx.app()) {
+            return;
+        }
+        let Some(command) = self.pending.take(request_id) else {
+            log::debug!(
+                "the statistics pane ignored reply {request_id}: it is not a command this pane \
+                 is waiting for"
             );
+            return;
+        };
+        match command {
+            PendingCommand::Load => match result {
+                Ok(StatisticsResponse::StreamStarted | StatisticsResponse::RefreshQueued) => {}
+                Err(error) => {
+                    let recovery = self.recovery.clone();
+                    self.status.report(
+                        cx.app_mut(),
+                        WidgetState::failed(Arc::new(StatisticsFailure::Rpc(error)), recovery),
+                    );
+                }
+            },
+            PendingCommand::Refresh => {
+                // An accepted command stays pending until the round it started is reported:
+                // the acknowledgement and the round are two different messages, and the gate
+                // the service holds spans both.
+                if let Err(error) = result {
+                    self.refresh_pending = false;
+                    let recovery = self.recovery.clone();
+                    self.status.report(
+                        cx.app_mut(),
+                        WidgetState::failed(Arc::new(StatisticsFailure::Rpc(error)), recovery),
+                    );
+                }
+            }
         }
     }
 
     /// Applies a status the stream reported.
-    ///
-    /// Returns whether anything a frame draws changed; a status is drawn by the
-    /// framework around the body, so publishing it is enough.
     pub(crate) fn apply_reliable(
         &mut self,
         key: StatisticsStreamKey,
         message: Arc<StatisticsStreamMessage>,
-        cx: &mut Context<Self>,
-    ) -> bool {
+        cx: &mut WidgetCx<'_>,
+    ) {
         if self.current_key().as_ref() != Some(&key)
-            || self.status.is_failed(cx)
+            || self.status.is_failed(cx.app())
             || self.awaiting_market
         {
-            return false;
+            return;
         }
         let StatisticsStreamMessage::Status(status) = message.as_ref() else {
-            return false;
+            return;
         };
         self.next_refresh_at = status.next_refresh_at();
         match status {
-            StatisticsStatus::Connecting => self.status.report(WidgetState::Connecting, cx),
+            StatisticsStatus::Connecting => {
+                self.status.report(cx.app_mut(), WidgetState::Connecting);
+            }
             StatisticsStatus::Refreshing { .. } => {
                 self.refresh_pending = false;
-                self.status.report(WidgetState::Loading, cx);
+                self.status.report(cx.app_mut(), WidgetState::Loading);
             }
             StatisticsStatus::Ready { revision, .. } => {
                 self.refresh_pending = false;
                 self.ready = Some(*revision);
-                // The reliable channel and the latest one have no order between
-                // them, so this can arrive before the window it describes:
-                // claiming readiness now would be claiming a chart the pane does
-                // not have.
+                // The reliable channel and the latest one have no order between them, so
+                // this can arrive before the window it describes: claiming readiness now
+                // would be claiming a chart the pane does not have.
                 if self.chart_revision().is_some_and(|held| held >= *revision) {
-                    self.status.report(WidgetState::Ready, cx);
+                    self.status.report(cx.app_mut(), WidgetState::Ready);
                 } else {
-                    self.status.report(WidgetState::Loading, cx);
+                    self.status.report(cx.app_mut(), WidgetState::Loading);
                 }
             }
             StatisticsStatus::Failed { error } => {
                 self.refresh_pending = false;
                 let failure = StatisticsFailure::Fetch(error.clone());
-                // A read the directory answered "not loaded" to is a market that is no
-                // longer loaded rather than a failure: the pane goes back to its
-                // neutral notice, and the directory's next publication is what brings it
-                // out of it.
+                // A read the directory answered "not loaded" to is a market that is no longer
+                // loaded rather than a failure: the pane goes back to its neutral notice, and
+                // the directory's next publication is what brings it out of it.
                 if is_waiting_for_a_catalog(&failure) {
                     self.wait_for_market(cx);
-                    return false;
+                    return;
                 }
                 let recovery = self.recovery.clone();
-                self.status
-                    .report(WidgetState::failed(Arc::new(failure), recovery), cx);
+                self.status.report(
+                    cx.app_mut(),
+                    WidgetState::failed(Arc::new(failure), recovery),
+                );
             }
         }
-        false
     }
 
     /// Applies a window the stream published.
-    ///
-    /// Returns whether anything a frame draws changed, which is what the framework
-    /// turns into a repaint: the body is cached, and a window that folds into the
-    /// same pixels is not worth a frame.
     pub(crate) fn apply_latest(
         &mut self,
         key: StatisticsStreamKey,
         message: Arc<StatisticsStreamMessage>,
-        cx: &mut Context<Self>,
-    ) -> bool {
+        cx: &mut WidgetCx<'_>,
+    ) {
         if self.current_key().as_ref() != Some(&key)
-            || self.status.is_failed(cx)
+            || self.status.is_failed(cx.app())
             || self.awaiting_market
         {
-            return false;
+            return;
         }
         let StatisticsStreamMessage::Snapshot(snapshot) = message.as_ref() else {
-            return false;
+            return;
         };
-        // A window the pane has already overtaken would only make the chart jump
-        // backwards: within one generation the service's revision only moves
-        // forwards, so a smaller one can only be a window a status has replaced.
+        // A window the pane has already overtaken would only make the chart jump backwards:
+        // within one generation the service's revision only moves forwards, so a smaller one
+        // can only be a window a status has replaced.
         if self
             .chart_revision()
             .is_some_and(|held| snapshot.revision < held)
         {
-            return false;
+            return;
         }
         let Some(chart) = self.chart.as_mut() else {
-            return false;
+            return;
         };
-        let changed = chart.set_snapshot(message.as_ref());
-
+        chart.set_snapshot(message.as_ref());
         self.accepted = true;
-        // Readiness is published at the protocol's own boundary: a complete window
-        // is not the same thing as the window a status said was complete, and this
-        // is where the two meet.
+        // Readiness is published at the protocol's own boundary: a complete window is not the
+        // same thing as the window a status said was complete, and this is where the two
+        // meet.
         if self
             .ready
             .is_some_and(|ready| snapshot.revision >= ready && chart.revision() >= ready)
         {
-            self.status.report(WidgetState::Ready, cx);
+            self.status.report(cx.app_mut(), WidgetState::Ready);
         }
-        changed
+        let _ = cx.request_frame();
     }
 
     /// The revision of the window the chart is showing.
@@ -879,71 +1209,9 @@ where
         self.chart.as_ref().map(ChartDispatch::revision)
     }
 
-    /// How many intervals the window on screen holds, which is what a test reads to
-    /// tell an empty window from one that never arrived.
-    #[cfg(test)]
-    pub(crate) fn chart_point_count(&self) -> Option<usize> {
-        self.chart.as_ref().map(ChartDispatch::point_count)
-    }
-
-    /// Whether what this pane needs is in memory: at least one market that answers with
-    /// these statistics, and the route of the stored selection among them.
-    ///
-    /// A pane that follows nothing still needs a market: the picker is drawn from the
-    /// loaded venues, so with none of them loaded there is nothing to choose from — the
-    /// pane waits for the market participant's metadata and says so, rather than offering a choice
-    /// that is not there. Once one is loaded, a pane that still follows nothing is the
-    /// "select an instrument" notice's business and this answers `true` for it.
-    ///
-    /// Reading a market is only possible once the user has loaded it, and "not
-    /// loaded" is a wait rather than a failure. One question answers each route: a
-    /// scope in the loaded venues is a scope whose catalog committed with it.
-    fn market_ready(&self, cx: &App) -> bool {
-        if !self.any_market_loaded(cx) {
-            return false;
-        }
-
-        let Some(route) = self
-            .config
-            .selection
-            .as_ref()
-            .map(|selection| &selection.listing.route)
-        else {
-            return true;
-        };
-
-        cx.global::<MarketParticipantsConnector>()
-            .venues()
-            .scope(route)
-            .is_some()
-    }
-
-    /// Whether any market this pane could read is loaded, whatever the user selected.
-    ///
-    /// The venues are the ones this pane's metric exists on, read off the definition table
-    /// rather than off what happens to be loaded — the same answer
-    /// [`Self::listed_venues`] gives the notice.
-    fn any_market_loaded(&self, cx: &App) -> bool {
-        let loaded = cx.global::<MarketParticipantsConnector>().venues();
-        Self::listed_venues()
-            .iter()
-            .any(|venue| loaded.loaded(venue).is_some())
-    }
-
-    /// Reports what this pane is waiting for: the market it follows, or the instrument
-    /// it has nothing chosen for.
-    ///
-    /// The list the sentence ends with is every venue that answers with these statistics —
-    /// the capability this pane is defined by, read off the definition table rather than off
-    /// what happens to be loaded — and the venue it waits for is the one behind the
-    /// selection, or the whole list while nothing is chosen and no single venue can be named.
-    ///
-    /// This is the one place that reference is produced — [`Self::wait_for_market`] and
-    /// [`Self::nothing_chosen`] call this rather than holding one of their own. Waiting for
-    /// the market is what the flag says — the path that drops the chart for it sets it, the
-    /// one that starts reading again clears it. The sentence is the framework's to resolve,
-    /// in the language showing on the frame that draws it.
-    fn report_notice(&self, cx: &mut Context<Self>) {
+    /// Reports what this pane is waiting for: the market it follows, or the instrument it has
+    /// nothing chosen for.
+    fn report_notice(&self, cx: &mut WidgetCx<'_>) {
         if self.awaiting_market {
             let venues = self
                 .config
@@ -952,238 +1220,400 @@ where
                 .map(|selection| vec![selection.listing.route.venue])
                 .unwrap_or_else(Self::listed_venues);
             self.status.report(
+                cx.app_mut(),
                 WidgetState::waiting(Notice::MarketNotLoaded {
                     venues,
                     supported: Self::listed_venues(),
                 }),
-                cx,
             );
         } else if self.config.selection.is_none() {
             self.status.report(
+                cx.app_mut(),
                 WidgetState::waiting(Notice::message(
                     "widget.perpetual_statistics.select_instrument_prompt",
                 )),
-                cx,
             );
         }
     }
 
     /// The venues the waiting notice lists: every venue whose loader can answer with these
     /// statistics.
-    ///
-    /// A pane reads one venue — the one behind the instrument the user followed — so the
-    /// market it waits for follows the selection. What it can read at all does not: every
-    /// metric this pane can draw is served by one venue set, which is the open-interest
-    /// capability's off the definition table, and that is the same answer whether or not
-    /// anything is loaded and whichever metric is picked.
-    pub(crate) fn listed_venues() -> Vec<VenueId> {
-        market_participants_connector::venue::definition::venues_supporting(
-            CapabilityId::OpenInterest,
-        )
+    pub(crate) fn listed_venues() -> Vec<market_participants_model::identifier::VenueId> {
+        market_venues(M::METRIC.capability())
     }
 
-    /// Reports the neutral notice for the market this pane follows, and drops the
-    /// chart it was drawing.
-    ///
-    /// The route behind that chart is gone, so nothing on screen is backed by a
-    /// market any more, and the framework only draws the notice while the pane
-    /// reports no content — which is why the pane also stops accepting messages: the
-    /// stream it was reading is still alive, and a window that was already in flight
-    /// would otherwise put content back over the notice. The stored selection is left
-    /// alone: it is the user's, and loading the market again is what brings it back.
-    fn wait_for_market(&mut self, cx: &mut Context<Self>) {
+    /// Reports the neutral notice for the market this pane follows, and drops the chart it
+    /// was drawing.
+    fn wait_for_market(&mut self, cx: &mut WidgetCx<'_>) {
         self.awaiting_market = true;
+        if let Some(mut chart) = self.chart.take() {
+            chart.release(cx);
+        }
         self.accepted = false;
-        self.chart = None;
         self.ready = None;
         self.next_refresh_at = None;
-        self.countdown = None;
+        self.pending.clear();
         self.refresh_pending = false;
         self.report_notice(cx);
-        cx.notify();
+        let _ = cx.request_frame();
     }
 
-    /// Runs the load a venue commit may have unblocked.
-    ///
-    /// A commit can matter to this pane for either of two reasons. The first is that it changes
-    /// whether the market it needs is in memory, and the pane already holds that answer in the two
-    /// things it maintains anyway: `awaiting_market` says it is not reading because a market it
-    /// needs is missing, and `market_ready` says everything it needs is there now. A pane that is
-    /// waiting for one and can now read starts over rather than re-checking; a pane that was
-    /// reading one that is gone goes back to waiting.
-    ///
-    /// The second is that it landed on the venue behind the stored selection, which is the user
-    /// loading or refreshing the market this pane reads: the catalog generation the live stream
-    /// resolved its units and precision against is replaced, so the pane starts over. Nothing is
-    /// remembered for it the way the other panes remember a reload — this protocol has one request
-    /// per scope, and the service answers a `Load` by replacing whatever stream that scope is on
-    /// (`StatisticsService::run`), because a poll that ended rather than failed would otherwise
-    /// answer a stream that is gone. So the plain `Load` [`Self::load`] sends is already the
-    /// request that opens a new stream. A commit of any other venue is neither reason, and leaves
-    /// the pane and its poll exactly as they are. A failure is terminal: the event does not revive
-    /// a failed pane, only the user's own recovery does.
-    fn on_venues_updated(&mut self, event: &VenuesUpdated, cx: &mut Context<Self>) {
-        if self.status.is_failed(cx) {
-            return;
-        }
-        // A commit on the venue the stored selection is on is this pane's own market being loaded
-        // again, so the pane cannot keep polling the stream it holds.
-        if self
-            .config
-            .selection
-            .as_ref()
-            .is_some_and(|selection| selection.listing.route.venue == event.venue)
-        {
-            self.load(cx);
-            return;
-        }
-        if self.awaiting_market {
-            if self.market_ready(cx) {
-                self.load(cx);
+    /// Rebuilds the chart's canvas from what the pane now shows.
+    fn sync_chart(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        if let (Some(host), Some(chart)) = (self.chart_host, self.chart.as_mut()) {
+            if chart.node().is_none() {
+                chart.build(cx, host)?;
+                // The node has no box until the frame that lays it out, so this frame cannot
+                // draw it. Ask for that frame here rather than relying on another write in
+                // this hook to schedule one.
+                cx.request_frame()?;
             }
-            return;
+            chart.sync(cx)?;
         }
-        if !self.market_ready(cx) {
-            self.wait_for_market(cx);
+        let empty = self.accepted
+            && self
+                .chart
+                .as_ref()
+                .is_some_and(|chart| chart.point_count() == 0);
+        cx.write(&self.empty, empty);
+        // The sentence is the catalogue's, so the bound slot is rewritten in the language
+        // showing now — a language switch is one write to this signal, not a rebuild.
+        let text = t_smol!(cx.translate(), "common.no_data");
+        cx.write(&self.empty_text, text);
+        Ok(())
+    }
+
+    /// Applies what a header control reported.
+    fn apply_header_request(&mut self, request: HeaderRequest, cx: &mut WidgetCx<'_>) {
+        match request {
+            HeaderRequest::Refresh => self.refresh(cx),
+            HeaderRequest::Selection(selection) => {
+                self.select_selection(selection, cx);
+            }
+            HeaderRequest::Timeframe(timeframe) => self.select_timeframe(timeframe, cx),
         }
     }
 
-    /// The control that opens the instrument picker.
+    /// The filters the picker is built with.
     ///
-    /// Before anything is chosen it offers the choice rather than reporting a
-    /// scope, because there is no scope yet. What it states once a listing is
-    /// followed — the published name and the route it is on — is the control's own
-    /// text, so the pane and the dialog cannot disagree about which listing is
-    /// followed.
-    fn instrument_button(&self, cx: &Context<Self>) -> AnyElement {
-        let widget = cx.entity().downgrade();
+    /// The loaded venues are read here, where the control is built, rather than kept: a
+    /// scope loaded after this pane started reading is a scope the user may select, and one
+    /// a shrinking commit withdrew is not.
+    fn instrument_filters(&self) -> InstrumentFilters {
+        InstrumentFilters {
+            // These series exist for perpetual markets only, so the picker offers nothing
+            // else: a spot listing would be a scope no endpoint here can answer.
+            kind_filter: InstrumentKindFilter::Perpetual,
+            status_filter: InstrumentStatusFilter::Any,
+            required_capability: M::METRIC.capability(),
+            entry_predicate: None,
+            routes: self.directory.as_ref().map_or_else(
+                || Arc::from(Vec::<LoadedScope>::new()),
+                |directory| directory.loaded_scopes(),
+            ),
+        }
+    }
 
-        InstrumentButton::new(
-            ElementId::Name(SharedString::new_static("StatisticsInstrument")),
+    /// The selector host the instrument control opens its dialog through.
+    ///
+    /// The host owns the services rather than borrowing them, so it takes the shared handle
+    /// the composition root handed over — the same aggregate the widget works over, not a
+    /// second one assembled from its fields.
+    fn selector_host(&self, cx: &WidgetCx<'_>) -> SelectorHost {
+        SelectorHost::new(Rc::clone(cx.services_rc()))
+    }
+
+    /// Builds the instrument control into the header's left group.
+    fn build_instrument_header(
+        &mut self,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        let language = *cx.read(&cx.language());
+        let row = NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS_HEADER_INSTRUMENT")
+            .style(
+                StyleBuilder::new()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .gap(4.0)
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        let host = self.selector_host(cx);
+        let filters = self.instrument_filters();
+        let requests = self.requests;
+        let button = InstrumentButton::new(
+            cx.unique_key(INSTRUMENT_KEY_SUFFIX),
             self.config.selection.clone(),
-            // These series exist for perpetual markets only, so the picker offers
-            // nothing else: a spot listing would be a scope no endpoint here can
-            // answer.
-            InstrumentFilters {
-                kind_filter: InstrumentKindFilter::Perpetual,
-                status_filter: InstrumentStatusFilter::Any,
-                required_capability: M::METRIC.capability(),
-                entry_predicate: None,
-                routes: LoadedScope::all(cx.global::<MarketParticipantsConnector>().venues()),
-            },
+            filters,
             "widget.perpetual_statistics.select_instrument",
-            move |selection, _, app| {
-                // The selector does not keep the pane alive: a pane gone by the
-                // time an instrument is confirmed has nothing left to select into.
-                let _ = widget.update(app, |this, cx| {
-                    this.select_selection(selection, cx);
-                });
-            },
-        )
-        .into_any_element()
-    }
-
-    /// The interval and the refresh, in the header's right group.
-    ///
-    /// There is no separate countdown any more: it is the refresh button's own
-    /// label, because the two are one control's worth of information — when the
-    /// next fetch is due, and the way to bring it forward.
-    fn drawing_controls(&self, cx: &Context<Self>) -> AnyElement {
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(self.refresh_button(cx))
-            .child(self.timeframe_select(cx))
-            .into_any_element()
-    }
-
-    /// The interval picker.
-    ///
-    /// It is disabled without a scope, exactly like the refresh: the interval only
-    /// says which window to fetch, so with nothing to fetch it changes nothing.
-    /// A pane waiting for its market is one of those: `has_scope` answers `false` for it,
-    /// so a pane that cannot refresh cannot present itself as able to re-scope either.
-    fn timeframe_select(&self, cx: &Context<Self>) -> Select {
-        let disabled = !self.has_scope();
-        let selected = self.config.timeframe;
-        let select = TIMEFRAMES.iter().copied().fold(
-            Select::new(ElementId::Name(SharedString::new_static(
-                "StatisticsTimeframe",
-            )))
-            .placeholder(SharedString::new(selected.label()))
-            .ghost()
-            .small()
-            .disabled(disabled)
-            .selected_item(Some(SharedString::new(selected.label())))
-            .aria_label(t!(cx, "widget.perpetual_statistics.interval")),
-            |select, timeframe| {
-                select.menu_item(MenuItem::Action(MenuItemAction::new(
-                    SharedString::new(timeframe.label()),
-                    SharedString::new(timeframe.label()),
-                )))
+            move |selection: InstrumentSelection, app: &mut App, window: WindowId| {
+                app.write(&requests, Some(HeaderRequest::Selection(selection)));
+                let _ = app.request_repaint(window);
             },
         );
-
-        select.on_change({
-            let widget = cx.entity();
-            move |timeframe, _, app| {
-                // The picker identifies an interval by the label it shows, which is
-                // the only name the menu entries carry.
-                let Some(timeframe) = timeframe
-                    .as_deref()
-                    .and_then(|label| TIMEFRAMES.iter().copied().find(|it| it.label() == label))
-                else {
-                    return;
-                };
-                widget.update(app, |this, cx| this.select_timeframe(timeframe, cx));
-            }
-        })
+        let window = cx.window();
+        let control = button.build(&host, cx.app_mut(), window, row)?;
+        self.left_header = Some(HeaderEntry {
+            root: row,
+            parent,
+            language,
+            selection: self.config.selection.clone(),
+            timeframe: self.config.timeframe,
+            generation: self.seen_generation,
+            instrument: Some(control),
+            refresh: None,
+            select: None,
+        });
+        Ok(())
     }
 
-    /// The control that fetches the current scope again, and the time left until
-    /// the next automatic fetch.
-    ///
-    /// The countdown is the button's own label rather than a word beside it: it is
-    /// the number that says the pane is still alive, and the control that resets
-    /// it is the one place a reader would look for it. A pane with no scope has no
-    /// schedule to count down to, so the button is bare and disabled.
-    fn refresh_button(&self, cx: &Context<Self>) -> Button {
-        let disabled = self.refresh_is_disabled(cx);
-        Button::new(ElementId::Name(SharedString::new_static(
-            "StatisticsRefresh",
-        )))
-        .ghost()
-        .small()
-        .disabled(disabled)
-        .aria_label(t!(cx, "widget.perpetual_statistics.refresh_now"))
-        .child(Icon::new(IconKind::ArrowsClockwise).size_3())
-        .children(self.countdown.clone())
-        .on_click({
-            let widget = cx.entity();
-            move |_, _, app| {
-                widget.update(app, |this, cx| this.refresh(cx));
-            }
+    /// Builds the interval picker and the refresh into the header's right group.
+    fn build_drawing_header(
+        &mut self,
+        parent: NodeId,
+        cx: &mut WidgetCx<'_>,
+    ) -> Result<(), EngineError> {
+        let language = *cx.read(&cx.language());
+        let theme = cx.theme().clone();
+        let row = NodeBuilder::boxed()
+            .id("TEST_PERPETUAL_STATISTICS_HEADER_DRAWING")
+            .style(
+                StyleBuilder::new()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .gap(4.0)
+                    .build(),
+            )
+            .build(cx.tree_mut(), parent)?;
+        let refresh = self.build_refresh_button(cx, row)?;
+        let countdown = self.countdown.label;
+        NodeBuilder::text(
+            SmolStr::default(),
+            TextStyle::new(UnifiedSize::Small.text_size()),
+        )
+        .id("TEST_PERPETUAL_STATISTICS_COUNTDOWN")
+        .bind_text(move |read| {
+            let label: Option<SmolStr> = read.read(&countdown).clone();
+            label.unwrap_or_default()
         })
+        .bind_style(move |read| StylePatch {
+            foreground: Some(theme.role(read, base_ui::theme::role::Role::FgDefault)),
+            ..StylePatch::default()
+        })
+        .build(cx.tree_mut(), row)?;
+        let select = self.build_timeframe_select(cx, row)?;
+        self.right_header = Some(HeaderEntry {
+            root: row,
+            parent,
+            language,
+            selection: self.config.selection.clone(),
+            timeframe: self.config.timeframe,
+            generation: self.seen_generation,
+            instrument: None,
+            refresh: Some(refresh),
+            select: Some(select),
+        });
+        Ok(())
+    }
+
+    /// Builds the refresh control, in the state the pane is in now.
+    fn build_refresh_button(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<Button, EngineError> {
+        let requests = self.requests;
+        let label = t_smol!(cx.translate(), "widget.perpetual_statistics.refresh_now");
+        let disabled = self.refresh_is_disabled(cx.app());
+        let key = cx.unique_key(REFRESH_KEY_SUFFIX);
+        let theme = cx.theme().clone();
+        let window = cx.window();
+        let button = Button::new(cx.app_mut(), theme, key)
+            .ghost()
+            .small()
+            .icon(IconKind::ArrowsClockwise)
+            .disabled(disabled)
+            .a11y_label(label.clone())
+            .tooltip_text(label)
+            .on_click(move |ctx| {
+                // A button handler owns no widget: it asks the next sync for the refresh.
+                ctx.update(&requests, |request| *request = Some(HeaderRequest::Refresh));
+                let window = ctx.window();
+                let _ = ctx.app_mut().request_repaint(window);
+            });
+        button.build(cx.app_mut(), window, parent)?;
+        Ok(button)
+    }
+
+    /// Builds the interval picker, in the state the pane is in now.
+    fn build_timeframe_select(
+        &self,
+        cx: &mut WidgetCx<'_>,
+        parent: NodeId,
+    ) -> Result<Select, EngineError> {
+        let requests = self.requests;
+        let label = t_smol!(cx.translate(), "widget.perpetual_statistics.interval");
+        let selected = self.config.timeframe;
+        let options = SelectOptions::default()
+            .size(UnifiedSize::Small)
+            .label(label)
+            .placeholder(SmolStr::new_static(selected.label()));
+        let items = TIMEFRAMES
+            .iter()
+            .map(|timeframe| {
+                let label = SmolStr::new_static(timeframe.label());
+                SelectItem::new(label.clone(), label)
+            })
+            .collect::<Vec<_>>();
+        let theme = cx.theme().clone();
+        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
+        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let window = cx.window();
+        let key = cx.unique_key(TIMEFRAME_KEY_SUFFIX);
+        let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
+            move |app, chosen| {
+                // The picker identifies an interval by the label it shows, which is the only
+                // name the menu entries carry.
+                let Some(timeframe) = chosen.first().and_then(|id| {
+                    TIMEFRAMES
+                        .iter()
+                        .copied()
+                        .find(|it| it.label() == id.as_str())
+                }) else {
+                    return;
+                };
+                app.write(&requests, Some(HeaderRequest::Timeframe(timeframe)));
+                let _ = app.request_repaint(window);
+            },
+        );
+        select
+            .set_items(cx.app_mut(), items)
+            .unwrap_or_else(|error| {
+                log::warn!("the statistics interval picker could not set its items: {error}");
+            });
+        select.set_chosen(cx.app_mut(), [selected.label()], false);
+        let _ = select.set_disabled(cx.app_mut(), !self.has_scope());
+        select.build(cx.app_mut(), window, parent)?;
+        Ok(select)
+    }
+
+    /// Keeps the header controls in step with what they should state.
+    fn sync_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        self.sync_instrument_header(cx)?;
+        self.sync_drawing_header(cx)
+    }
+
+    /// Rebuilds the instrument control when its copy moved, and drops it when its row is gone.
+    fn sync_instrument_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(header) = self.left_header.as_ref() else {
+            return Ok(());
+        };
+        // The pane rebuilds the row it calls `header` for, so the row this widget built into
+        // may already be gone — and it took the control with it. Touching a stale node would
+        // fail the whole synchronization, so a row that is missing is a release and nothing
+        // else.
+        if cx.tree().get(header.root).is_err() {
+            self.release_header(HeaderGroup::Left, false, cx);
+            return Ok(());
+        }
+        let moved = header.language != *cx.read(&cx.language())
+            || header.selection.as_ref() != self.config.selection.as_ref()
+            || header.generation != self.seen_generation;
+        if !moved {
+            return Ok(());
+        }
+        let parent = header.parent;
+        self.release_header(HeaderGroup::Left, true, cx);
+        self.build_instrument_header(parent, cx)
+    }
+
+    /// Rebuilds the drawing controls when their copy moved, and keeps their state current.
+    fn sync_drawing_header(&mut self, cx: &mut WidgetCx<'_>) -> Result<(), EngineError> {
+        let Some(header) = self.right_header.as_ref() else {
+            return Ok(());
+        };
+        if cx.tree().get(header.root).is_err() {
+            self.release_header(HeaderGroup::Right, false, cx);
+            return Ok(());
+        }
+        let moved = header.language != *cx.read(&cx.language())
+            || header.timeframe != self.config.timeframe
+            || header.generation != self.seen_generation;
+        if moved {
+            let parent = header.parent;
+            self.release_header(HeaderGroup::Right, true, cx);
+            self.build_drawing_header(parent, cx)?;
+        }
+        let disabled = !self.has_scope();
+        let refresh_disabled = self.refresh_is_disabled(cx.app());
+        let timeframe = SmolStr::new_static(self.config.timeframe.label());
+        let Some(header) = self.right_header.as_ref() else {
+            return Ok(());
+        };
+        if let Some(button) = header.refresh.as_ref() {
+            button.sync(cx.app_mut())?;
+            let _ = button.set_disabled(cx.app_mut(), refresh_disabled);
+        }
+        if let Some(select) = header.select.as_ref() {
+            let stated = select.chosen(cx.app());
+            if stated.len() != 1 || stated.first() != Some(&timeframe) {
+                select.set_chosen(cx.app_mut(), [timeframe.as_str()], false);
+            }
+            let _ = select.set_disabled(cx.app_mut(), disabled);
+            select.sync(cx.app_mut())?;
+        }
+        Ok(())
+    }
+
+    /// Takes a header group's controls down: the widget's own row, and the components' scopes
+    /// and handlers.
+    ///
+    /// `remove_node` is true when the pane's group node is still there and the widget is
+    /// replacing its own row in it; a row the pane already took down needs no node removal
+    /// (`StaleNode`). The components outlive their nodes, so they are released in either case.
+    fn release_header(&mut self, group: HeaderGroup, remove_node: bool, cx: &mut WidgetCx<'_>) {
+        let entry = match group {
+            HeaderGroup::Left => self.left_header.take(),
+            HeaderGroup::Right => self.right_header.take(),
+        };
+        let Some(header) = entry else {
+            return;
+        };
+        if remove_node && cx.tree().get(header.root).is_ok() {
+            let window = cx.window();
+            let _ = cx.app_mut().remove_node(window, header.root);
+        }
+        if let Some(control) = header.instrument {
+            let _ = control.release(cx.app_mut());
+        }
+        if let Some(button) = header.refresh {
+            let _ = button.release(cx.app_mut());
+        }
+        if let Some(select) = header.select {
+            let _ = select.release(cx.app_mut());
+        }
     }
 
     /// Follows another listing.
     ///
-    /// Returns whether the selection was accepted. A selection names the exact
-    /// listing, so there is nothing to check about which market it belongs to: the
-    /// picker offers perpetual listings of routes that publish these statistics,
-    /// and a stored or linked selection that is not one is settled in `load`.
+    /// Returns whether the selection was accepted. A selection names the exact listing, so
+    /// there is nothing to check about which market it belongs to: the picker offers
+    /// perpetual listings of routes that publish these statistics, and a stored or linked
+    /// selection that is not one is settled in `load`.
     pub(crate) fn select_selection(
         &mut self,
         selection: InstrumentSelection,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) -> bool {
-        if self.config.selection.as_ref() == Some(&selection) && !self.status.is_failed(cx) {
+        if self.config.selection.as_ref() == Some(&selection) && !self.status.is_failed(cx.app()) {
             return false;
         }
         self.config.selection = Some(selection);
-        self.config_change.publish(cx);
+        self.config_change.publish(cx.app_mut());
         self.start(false, cx);
         true
     }
@@ -1191,179 +1621,120 @@ where
     pub(crate) fn select_timeframe(
         &mut self,
         timeframe: StatisticsTimeFrame,
-        cx: &mut Context<Self>,
+        cx: &mut WidgetCx<'_>,
     ) {
         if self.config.timeframe == timeframe {
             return;
         }
         self.config.timeframe = timeframe;
-        self.config_change.publish(cx);
+        self.config_change.publish(cx.app_mut());
         self.start(false, cx);
     }
 
     /// Fetches the current scope without waiting for the next interval.
     ///
-    /// Only a ready pane gets here, so the command it sends is one the loop answers:
-    /// a failure is recovered through the framework's own control, above the chart.
-    ///
-    /// It is crate-visible for the same reason the predicate above is: the tests
-    /// that press it live in `pane_tests.rs`.
-    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.refresh_is_disabled(cx) {
+    /// Only a ready pane gets here, so the command it sends is one the loop answers: a
+    /// failure is recovered through the framework's own control, above the chart.
+    pub(crate) fn refresh(&mut self, cx: &mut WidgetCx<'_>) {
+        if self.refresh_is_disabled(cx.app()) {
             return;
         }
         self.refresh_pending = true;
-        self.binding
-            .call(StatisticsRequest::Refresh, cx, Self::apply_refresh_result);
-        cx.notify();
-    }
-
-    /// Rebuilds the countdown, asking for the frame that draws it.
-    ///
-    /// The countdown is the only thing this pane draws that moves on its own, and
-    /// it moves once a second: the task wakes four times a second so a second is
-    /// never missed, and only the write that changed it asks for a frame. The
-    /// header is not cached, so nothing else here has to announce itself.
-    ///
-    /// The label is the deadline of a ready pane and nothing else, so leaving the
-    /// ready state — a fetch starting, a failure, a reload — takes the countdown off
-    /// the button in the same tick that greys it.
-    fn tick_countdown(&mut self, cx: &mut Context<Self>) {
-        let label = self.countdown_deadline(cx).map(|due| {
-            SharedString::new(format_countdown(due.saturating_sub(unix_millis())).as_str())
-        });
-        if self.countdown == label {
+        let Some(binding) = self.binding.as_mut() else {
+            self.refresh_pending = false;
+            self.report_unavailable(cx);
             return;
-        }
-        self.countdown = label;
-        cx.notify();
-    }
-
-    /// Runs one countdown tick, which a test drives instead of the clock.
-    #[cfg(test)]
-    pub(crate) fn tick_countdown_for_test(&mut self, cx: &mut Context<Self>) {
-        self.tick_countdown(cx);
-    }
-}
-
-impl<M> Render for StatisticsWidget<M>
-where
-    M: StatisticsMetric,
-{
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A window's time labels and tooltips are written when it arrives, so a zone
-        // that moved while the pane was open is rewritten here, on the frame that
-        // reads the new setting — before anything is drawn from the chart.
-        if let Some(chart) = self.chart.as_mut() {
-            chart.set_time_zone(data_time_zone(cx));
-        }
-        // The body is only embedded while the pane has content, so this is the
-        // ready state and nothing else. Everything the pane is *doing* is drawn by
-        // the framework around this.
-        let Some(chart) = self.chart.as_ref() else {
-            return div().size_full().min_h_0().into_any_element();
         };
-        // A window the venue published with no interval in it draws axes and nothing
-        // else, which reads exactly like a chart that has not arrived: the pane says
-        // which of the two it is over the plot.
-        let empty = (self.accepted && chart.point_count() == 0).then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(EmptyState::new("StatisticsEmpty", t!(cx, "common.no_data")))
-        });
-        // The chart owns everything below this line — its minimum size, its two
-        // scroll containers and the room its axes need — so the pane imposes no
-        // width or height of its own here: a pane narrower than the axes need
-        // scrolls inside the chart rather than clipping an axis nobody can reach.
-        div()
-            .relative()
-            .size_full()
-            .min_h_0()
-            .child(chart.entity())
-            .children(empty)
-            .into_any_element()
+        let request_id = binding.call(cx, StatisticsRequest::Refresh);
+        self.pending.track(request_id, PendingCommand::Refresh);
+        let _ = cx.request_frame();
+    }
+
+    /// The countdown label the header draws, as a test reads it back.
+    #[cfg(test)]
+    pub(crate) fn countdown_label(&self, app: &App) -> Option<SmolStr> {
+        self.countdown.label(app)
+    }
+
+    /// Whether the countdown is waiting for a tick to fire, as a test reads the cancellation
+    /// of one back: a cancelled countdown is a pane that is woken by nothing.
+    #[cfg(test)]
+    pub(crate) fn countdown_is_armed_for_test(&self) -> bool {
+        self.countdown.is_armed()
+    }
+
+    /// Whether the pane reports a pending refresh, as a test reads it back.
+    #[cfg(test)]
+    pub(crate) fn refresh_pending_for_test(&self) -> bool {
+        self.refresh_pending
+    }
+
+    /// How many replies this pane discarded as answers it was no longer waiting for.
+    #[cfg(test)]
+    pub(crate) fn dropped_answers_for_test(&self) -> usize {
+        self.pending.dropped()
+    }
+
+    /// Whether the pane is waiting for no reply at all.
+    #[cfg(test)]
+    pub(crate) fn pending_is_empty_for_test(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The action identities the header's right group registered, as a test reads the
+    /// per-instance keys back.
+    #[cfg(test)]
+    pub(crate) fn header_actions_for_test(&self) -> Vec<ui_core::event::Action> {
+        let mut actions = Vec::new();
+        if let Some(header) = self.right_header.as_ref()
+            && let Some(button) = header.refresh.as_ref()
+            && let Some(action) = button.action_identity()
+        {
+            actions.push(action);
+        }
+        actions
+    }
+
+    /// The chart, as a test drives its hover and canvas.
+    #[cfg(test)]
+    pub(crate) fn chart_for_test(&self) -> Option<&ChartDispatch> {
+        self.chart.as_ref()
+    }
+
+    /// Whether the pane is waiting for its market, as a test reads it back.
+    #[cfg(test)]
+    pub(crate) fn awaiting_market_for_test(&self) -> bool {
+        self.awaiting_market
+    }
+
+    /// The interval this pane follows, as a test reads it back.
+    #[cfg(test)]
+    pub(crate) fn timeframe_for_test(&self) -> StatisticsTimeFrame {
+        self.config.timeframe
     }
 }
 
-/// Whether a route is one these panes can read.
+/// The label beside the refresh button for `deadline` at `now`.
 ///
-/// These endpoints exist for perpetual markets only, and a route publishes one
-/// series per capability, so the loaded venues are asked rather than the selection
-/// trusted.
-pub(crate) fn route_serves_statistics(
-    cx: &App,
-    route: &market_participants_model::listing::route::VenueRoute,
-    capability: CapabilityId,
-) -> bool {
-    cx.global::<MarketParticipantsConnector>()
-        .venues()
-        .scope(route)
-        .is_some_and(|scope| {
-            scope
-                .capabilities
-                .iter()
-                .any(|support| support.capability == capability)
-        })
+/// A deadline that has already passed counts as `00:00` rather than as a negative wait,
+/// which is the same rule [`format_countdown`] applies: the pane never shows a countdown
+/// that has run out as anything but zero.
+fn countdown_label(deadline: Option<i64>, now: i64) -> Option<SmolStr> {
+    deadline.map(|deadline| format_countdown(deadline.saturating_sub(now)))
 }
 
-/// The assets one chart's series are measured in, named the way the catalog names
-/// them.
-///
-/// The size of a series is the listing's own traded quantity and its worth is a
-/// monetary amount, so the two names come from the listing's quantity rule and
-/// from its price rule: no field name is read as a unit, and a quantity the
-/// listing counts in contracts is named as contracts rather than as an asset.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub(crate) struct ChartUnits {
-    pub base: SmolStr,
-    pub quote: SmolStr,
-}
-
-impl ChartUnits {
-    /// Reads the two names from one listing's own rules.
-    pub(crate) fn of(rules: &TradingRules, cx: &App) -> Self {
-        // One capture names both axes, so a chart never mixes two publications even
-        // if the catalog is republished while it is labelled.
-        let generation = cx
-            .global::<MarketParticipantsConnector>()
-            .catalog()
-            .cached_display();
-        Self {
-            base: quantity_unit_label(&rules.common.quantity.unit, &generation, cx),
-            quote: asset_display(&generation, &rules.common.price.quote_asset, cx),
-        }
+#[cfg(test)]
+impl Countdown {
+    /// The label this countdown's node is drawing.
+    fn label(&self, app: &App) -> Option<SmolStr> {
+        app.read(&self.label).clone()
     }
-}
 
-/// The display code of one asset, as the captured generation published it.
-///
-/// Only the display catalog knows what an asset is called: the canonical identity
-/// of a token is a digest, and the code it publishes is the whole name of the
-/// asset. An asset the captured generation does not name is
-/// the localized unknown rather than an identity digest, because a reader cannot
-/// use a hash and a name invented here would disagree with every other pane.
-fn asset_display(generation: &DisplaySnapshot, asset: &AssetId, cx: &App) -> SmolStr {
-    generation.resolver().asset_code(asset).map_or_else(
-        |_| SmolStr::new(t!(cx, "error.display.unknown_asset").as_ref()),
-        |code| SmolStr::new(code.as_str()),
-    )
-}
-
-/// The label of what one quantity counts.
-fn quantity_unit_label(unit: &QuantityUnit, generation: &DisplaySnapshot, cx: &App) -> SmolStr {
-    match unit {
-        QuantityUnit::AssetUnits { asset } | QuantityUnit::Notional { asset } => {
-            asset_display(generation, asset, cx)
-        }
-        QuantityUnit::Contracts => {
-            SmolStr::new(t!(cx, "widget.perpetual_statistics.contracts_unit").as_ref())
-        }
-        QuantityUnit::OutcomeTokens { .. } => {
-            SmolStr::new(t!(cx, "widget.perpetual_statistics.outcome_tokens_unit").as_ref())
-        }
+    /// Whether a tick is waiting to fire.
+    ///
+    /// The id is what a deadline change and `release` cancel, so holding one is exactly the
+    /// "a tick will wake this pane" the cancellation tests assert against.
+    fn is_armed(&self) -> bool {
+        self.timer.borrow().is_some()
     }
 }

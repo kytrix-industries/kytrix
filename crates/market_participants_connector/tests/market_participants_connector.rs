@@ -4,10 +4,10 @@ use app_config_provider::notification::ConfigNotification;
 use market_participants_connector::{
     connector::{MarketParticipantsConnector, MarketParticipantsConnectorInput},
     runtime::MarketParticipantNetworkSnapshot,
+    test_support::test_handle,
 };
 use market_participants_model::identifier::VenueId;
 use network::transport::hub::{TransportHub, TransportPolicy};
-use widget_tokio_runtime::runtime::Runtime;
 
 fn connector() -> MarketParticipantsConnector {
     let snapshot = Arc::new(MarketParticipantNetworkSnapshot::default());
@@ -17,7 +17,7 @@ fn connector() -> MarketParticipantsConnector {
             Arc::new(TransportHub::new(TransportPolicy::default())),
             notification,
         )
-        .with_runtime(Runtime::for_test()),
+        .with_runtime(test_handle()),
     )
     .expect("MarketParticipantsConnector should build from typed runtime inputs")
 }

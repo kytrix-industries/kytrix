@@ -3,23 +3,36 @@
 //! Shaping is the expensive part of drawing this chart: a frame draws up to a dozen
 //! axis labels and, while the pointer is over it, one label per series plus the
 //! hovered time. Nothing about those changes while the pointer stays put, so shaped
-//! lines are cached for the last [`TEXT_CACHE_CAPACITY`] combinations of text, size,
-//! weight and colour. A cache miss is the pointer moving onto a new sample; a cache
-//! hit is everything else.
+//! lines are cached for the last [`TEXT_CACHE_CAPACITY`] combinations of text and
+//! style. A cache miss is the pointer moving onto a new sample; a cache hit is
+//! everything else.
 //!
 //! Formatting lives here too, and it is deliberately pure: a timestamp, the label
-//! unit chosen with the axis step, a zone and the catalogue in, strings out. The
-//! language showing decides the month spelling, the date order and whether the clock
-//! is a twelve- or twenty-four-hour one, so switching the interface language relabels
-//! the axis and the hovered time on the next frame. The year appears only where the
-//! chosen unit needs it: the month labels of a multi-year window.
+//! unit chosen with the axis step, a zone and the translation context in, strings out.
+//! The language showing decides the month spelling, the date order and whether the
+//! clock is a twelve- or twenty-four-hour one, so switching the interface language
+//! relabels the axis and the hovered time on the next frame. The year appears only
+//! where the chosen unit needs it: the month labels of a multi-year window.
+//!
+//! # The atlas lease
+//!
+//! A shaped line is a handle that leases glyph tiles from the process-wide atlas. The
+//! engine refuses to encode a run whose lease is gone (`Canvas::push_shaped_text`
+//! answers `false`), so a handle that has been evicted must be shaped again rather
+//! than drawn: the cache checks [`ShapedTextHandle::is_stale`] on every hit, and the
+//! chart's whole-frame short circuit is guarded by the handles the canvas on screen
+//! was actually built from.
 
 use std::sync::Arc;
 
-use gpui_kit::{FontWeight, Hsla, Pixels, ShapedLine, SharedString, TextRun, TextStyle, Window};
-use i18n::{language::codes::LanguageCode, translator::types::I18n};
+use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use time::OffsetDateTime;
+use ui_core::{
+    app::App,
+    paint::color::Color,
+    text::{ShapedTextHandle, TextAlign, TextStyle},
+};
 
 use super::geometry::{TimeLabelKind, local_datetime};
 
@@ -34,7 +47,9 @@ pub(crate) const LABEL_FONT_SIZE: f32 = 12.0;
 pub(crate) const TIME_LABEL_FONT_SIZE: f32 = 12.0;
 
 /// The weight the hover's own labels are set in; the axes stay regular.
-pub(crate) const STRONG_WEIGHT: FontWeight = FontWeight::SEMIBOLD;
+pub(crate) const STRONG_WEIGHT: u16 = 600;
+/// The weight the axis labels are set in.
+pub(crate) const REGULAR_WEIGHT: u16 = 400;
 
 /// The message key each month is named by.
 const MONTH_KEYS: [&str; 12] = [
@@ -52,107 +67,100 @@ const MONTH_KEYS: [&str; 12] = [
     "widget.prediction_market.month.december",
 ];
 
-/// One font a chart line is shaped in.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ChartFont {
-    pub size: Pixels,
-    pub weight: FontWeight,
-    pub color: Hsla,
+/// One shaped line, kept until its lease is gone or it falls out of the cache.
+struct CachedText {
+    text: SmolStr,
+    style: TextStyle,
+    handle: Arc<ShapedTextHandle>,
 }
 
-impl ChartFont {
-    /// A font at the window's own family, in the given size, weight and colour.
-    pub(crate) fn new(size: f32, weight: FontWeight, color: Hsla) -> Self {
-        Self {
-            size: gpui_kit::px(size),
-            weight,
-            color,
-        }
-    }
-}
-
-/// A line of text shaped once and kept.
-struct CachedLine {
-    text: SharedString,
-    font: ChartFont,
-    line: Arc<ShapedLine>,
-}
-
-/// Shaped labels, keyed by their text and font.
+/// Shaped labels, keyed by their text and the style they were shaped in.
 pub(crate) struct ChartTextCache {
-    text_style: Option<TextStyle>,
-    entries: Vec<CachedLine>,
+    entries: Vec<CachedText>,
 }
 
 impl Default for ChartTextCache {
     fn default() -> Self {
         Self {
-            text_style: None,
             entries: Vec::with_capacity(TEXT_CACHE_CAPACITY),
         }
     }
 }
 
 impl ChartTextCache {
-    /// Shapes `text` in `font`, or returns the line that was shaped before.
+    /// Shapes `text` in `style`, or returns the line that was shaped before.
     ///
-    /// The window's text style is part of the identity of every line: a family or
-    /// rem-size change makes the cached lines wrong even though no number moved, so
-    /// the whole cache is dropped when it changes.
+    /// A handle whose atlas lease is gone is dropped and shaped again: the glyphs it
+    /// named have been reused, so drawing it would be drawing another line's pixels.
+    /// The style is part of the identity of every line — a weight, a size or a colour
+    /// change makes the cached line wrong even though its text did not move.
     pub(crate) fn line(
         &mut self,
-        text: SharedString,
-        font: ChartFont,
-        window: &Window,
-    ) -> Arc<ShapedLine> {
-        let text_style = window.text_style();
-        if self.text_style.as_ref() != Some(&text_style) {
-            self.text_style = Some(text_style.clone());
-            self.entries.clear();
-        }
+        app: &mut App,
+        text: &str,
+        style: &TextStyle,
+    ) -> Arc<ShapedTextHandle> {
         if let Some(index) = self
             .entries
             .iter()
-            .position(|entry| entry.text == text && entry.font == font)
+            .position(|entry| entry.text == text && entry.style == *style)
         {
-            // Moving the entry to the back is what makes the capacity evict the
-            // least recently used label.
+            // Refreshing recency by moving the entry to the back is what makes the
+            // capacity below evict the least recently used label.
             let entry = self.entries.remove(index);
-            let line = entry.line.clone();
-            self.entries.push(entry);
-            return line;
+            if !entry.handle.is_stale() {
+                let handle = Arc::clone(&entry.handle);
+                self.entries.push(entry);
+                return handle;
+            }
         }
-
-        let text_len = text.len();
-        let line = Arc::new(window.text_system().shape_line(
-            text.clone(),
-            font.size,
-            &[TextRun {
-                len: text_len,
-                font: gpui_kit::Font {
-                    weight: font.weight,
-                    ..text_style.font()
-                },
-                color: font.color,
-                ..Default::default()
-            }],
-            None,
-        ));
+        let handle = Arc::new(app.shape_text(text, style, None, &[]).unwrap_or_else(|_| {
+            // Text that cannot be shaped at all is drawn as nothing rather than
+            // failing the frame: an axis label is not worth a dropped frame, and the
+            // next frame tries again.
+            app.shape_text("", style, None, &[])
+                .expect("an empty line always shapes")
+        }));
         if self.entries.len() == TEXT_CACHE_CAPACITY {
             self.entries.remove(0);
         }
-        self.entries.push(CachedLine {
-            text,
-            font,
-            line: line.clone(),
+        self.entries.push(CachedText {
+            text: SmolStr::new(text),
+            style: style.clone(),
+            handle: Arc::clone(&handle),
         });
-        line
+        handle
     }
 
-    /// The width `text` occupies when shaped in `font`.
-    pub(crate) fn width(&mut self, text: &str, font: ChartFont, window: &Window) -> Pixels {
-        self.line(SharedString::new(text), font, window).width()
+    /// The width `text` occupies when shaped in `style`.
+    pub(crate) fn width(&mut self, app: &mut App, text: &str, style: &TextStyle) -> f32 {
+        self.line(app, text, style).size().width
     }
+
+    /// How many lines the cache holds.
+    #[cfg(test)]
+    pub(crate) fn cached_len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The style one chart label is shaped in.
+///
+/// Alignment is *not* part of it: this chart places every label itself, from the
+/// measured width the shaped line reports, so that a label sits where its own box says
+/// it does rather than where a wrapping rule would put it.
+pub(crate) fn label_style(
+    font_size: f32,
+    line_height: f32,
+    color: Color,
+    weight: u16,
+) -> TextStyle {
+    let mut style = TextStyle::new(font_size);
+    style.color = color;
+    style.weight = weight;
+    style.line_height = Some(line_height / font_size);
+    style.alignment = TextAlign::Start;
+    style
 }
 
 /// How a timestamp reads on the time axis.
@@ -164,30 +172,25 @@ pub(crate) fn format_axis_time(
     timestamp: i64,
     label: TimeLabelKind,
     zone: time::UtcOffset,
-    i18n: &I18n,
-    language: LanguageCode,
+    translate: &Translate,
 ) -> SmolStr {
     let Some(datetime) = local_datetime(timestamp, zone) else {
         return SmolStr::new_static("");
     };
     match label {
-        TimeLabelKind::Clock => format_clock(datetime, i18n, language),
-        TimeLabelKind::Day => translated(
-            i18n,
-            language,
+        TimeLabelKind::Clock => format_clock(datetime, translate),
+        TimeLabelKind::Day => translate.translate_with(
             "widget.prediction_market.date.day",
             &[
-                ("month", &month_name(datetime, i18n, language)),
+                ("month", &month_name(datetime, translate)),
                 ("day", &datetime.day()),
             ],
         ),
-        TimeLabelKind::Month => month_name(datetime, i18n, language),
-        TimeLabelKind::MonthYear => translated(
-            i18n,
-            language,
+        TimeLabelKind::Month => month_name(datetime, translate),
+        TimeLabelKind::MonthYear => translate.translate_with(
             "widget.prediction_market.date.month_year",
             &[
-                ("month", &month_name(datetime, i18n, language)),
+                ("month", &month_name(datetime, translate)),
                 ("year", &datetime.year()),
             ],
         ),
@@ -204,13 +207,12 @@ pub(crate) fn format_axis_labels(
     timestamps: &[i64],
     label: TimeLabelKind,
     zone: time::UtcOffset,
-    i18n: &I18n,
-    language: LanguageCode,
+    translate: &Translate,
 ) -> Vec<SmolStr> {
     if label != TimeLabelKind::Clock {
         return timestamps
             .iter()
-            .map(|timestamp| format_axis_time(*timestamp, label, zone, i18n, language))
+            .map(|timestamp| format_axis_time(*timestamp, label, zone, translate))
             .collect();
     }
     let mut seen: Vec<(u8, u8)> = Vec::with_capacity(timestamps.len());
@@ -227,7 +229,7 @@ pub(crate) fn format_axis_labels(
                 return SmolStr::new_static("");
             }
             seen.push(key);
-            format_clock(datetime, i18n, language)
+            format_clock(datetime, translate)
         })
         .collect()
 }
@@ -236,20 +238,17 @@ pub(crate) fn format_axis_labels(
 pub(crate) fn format_hover_time(
     timestamp: i64,
     zone: time::UtcOffset,
-    i18n: &I18n,
-    language: LanguageCode,
+    translate: &Translate,
 ) -> SmolStr {
     let Some(datetime) = local_datetime(timestamp, zone) else {
         return SmolStr::new_static("");
     };
-    translated(
-        i18n,
-        language,
+    translate.translate_with(
         "widget.prediction_market.date.hover",
         &[
-            ("month", &month_name(datetime, i18n, language)),
+            ("month", &month_name(datetime, translate)),
             ("day", &datetime.day()),
-            ("time", &format_clock(datetime, i18n, language)),
+            ("time", &format_clock(datetime, translate)),
         ],
     )
 }
@@ -259,13 +258,13 @@ pub(crate) fn format_percent_one_decimal(percent: f64) -> SmolStr {
     format_smolstr!("{percent:.1}%")
 }
 
-/// A probability rounded to the whole percent the y axis and the legend use.
+/// A probability rounded to the whole percent the y axis uses.
 pub(crate) fn format_percent_integer(percent: f64) -> SmolStr {
     format_smolstr!("{percent:.0}%")
 }
 
 /// A clock time in the language's own shape, e.g. `8:00 AM` or `08:00`.
-fn format_clock(datetime: OffsetDateTime, i18n: &I18n, language: LanguageCode) -> SmolStr {
+fn format_clock(datetime: OffsetDateTime, translate: &Translate) -> SmolStr {
     let hour = datetime.hour();
     let hour12 = match hour {
         0 => 12,
@@ -275,17 +274,12 @@ fn format_clock(datetime: OffsetDateTime, i18n: &I18n, language: LanguageCode) -
     };
     let hour24 = format_smolstr!("{hour:02}");
     let minute = format_smolstr!("{:02}", datetime.minute());
-    let meridiem = i18n.translate(
-        language,
-        if hour < 12 {
-            "widget.prediction_market.date.am"
-        } else {
-            "widget.prediction_market.date.pm"
-        },
-    );
-    translated(
-        i18n,
-        language,
+    let meridiem = translate.translate(if hour < 12 {
+        "widget.prediction_market.date.am"
+    } else {
+        "widget.prediction_market.date.pm"
+    });
+    translate.translate_with(
         "widget.prediction_market.date.clock",
         &[
             ("hour12", &hour12),
@@ -297,19 +291,6 @@ fn format_clock(datetime: OffsetDateTime, i18n: &I18n, language: LanguageCode) -
 }
 
 /// The month's name in the language showing.
-fn month_name(datetime: OffsetDateTime, i18n: &I18n, language: LanguageCode) -> SmolStr {
-    SmolStr::new(
-        i18n.translate(language, MONTH_KEYS[datetime.month() as usize - 1])
-            .as_str(),
-    )
-}
-
-/// One catalogue template with its arguments filled in.
-fn translated(
-    i18n: &I18n,
-    language: LanguageCode,
-    key: &'static str,
-    arguments: &[(&str, &dyn std::fmt::Display)],
-) -> SmolStr {
-    SmolStr::new(i18n.translate_with(language, key, arguments).as_str())
+fn month_name(datetime: OffsetDateTime, translate: &Translate) -> SmolStr {
+    translate.translate(MONTH_KEYS[datetime.month() as usize - 1])
 }

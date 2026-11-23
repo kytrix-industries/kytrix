@@ -539,13 +539,16 @@ pub(crate) fn frame(window: &mut Window) -> Result<FrameOutcome, EngineError> {
     static NO_GEOMETRY: std::sync::OnceLock<crate::paint::geometry_store::GeometryStore> =
         std::sync::OnceLock::new();
     let geometry = NO_GEOMETRY.get_or_init(crate::paint::geometry_store::GeometryStore::new);
-    let report = match window.paint_frame(geometry, None) {
+    let report = match window.paint_frame(geometry, None, None) {
         Ok(report) => report,
         Err(error) => {
             window.abort_frame(ticket);
             return Err(error);
         }
     };
+    // F11（D17）：这条路径没有 ResourceCache，`InlineBoxPaint::Image` 一定被跳过；不能静默
+    // ——把本帧的缺失 id 记进窗口级诊断（App::frame 路径有 TextContext 诊断环，不走这里）。
+    window.note_skipped_inline_images(&report.skipped_inline_images);
     Ok(window.commit_frame(ticket, report))
 }
 

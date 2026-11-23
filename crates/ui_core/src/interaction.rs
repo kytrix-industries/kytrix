@@ -16,6 +16,7 @@ pub mod virtual_list;
 use std::time::{Duration, Instant};
 
 use crate::{
+    a11y::A11yOverride,
     app::App,
     event::{Action, ActionSource, Modifiers, PointerButton},
     layout::hit_test::HitResult,
@@ -336,13 +337,36 @@ impl VirtualList {
     }
 }
 
-/// 虚拟列表参数（v1 只支持均匀行高）。
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// 虚拟列表参数（v2.1 / E3：可选逐项高度）。
+///
+/// `extents = None` ⇒ 与 v1 逐字节一致（行位置 `index * extent`、内容高度 `count * extent`）；
+/// `extents = Some(..)` ⇒ 逐项高度，`extent` 仅作为条目数变化后新高度尚未送达时的回落值。
+///
+/// 创建时就已知行高时可在 `make_virtual_list` 里给 `extents`：引擎先记住它，`set_virtual_items`
+/// 的条目数与之匹配时生效；不匹配则丢弃（应用随后用 [`crate::app::App::set_virtual_extents`]
+/// 整体替换）。
+#[derive(Clone, Debug, PartialEq)]
 pub struct VirtualListConfig {
     /// 每行高度（逻辑像素，`> 0`）。
     pub extent: f32,
+    /// 逐项高度（逻辑像素，每项有限且 `>= 0`，累计高度必须有限）：`Some` 时以它为准
+    /// （条目数变化丢弃后回落到 `extent`）。
+    pub extents: Option<Box<[f32]>>,
     /// 视口外多挂几行（上下一侧各 `overscan`）。
     pub overscan: usize,
+}
+
+/// `scroll_to_item` 的对齐方式（E3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ItemAlign {
+    /// 条目顶边贴视口顶边。
+    Start,
+    /// 条目中心对齐视口中心。
+    Center,
+    /// 条目底边贴视口底边。
+    End,
+    /// 已完全可见则不滚，否则滚到最近的边界。
+    Nearest,
 }
 
 /// 虚拟列表状态快照（也供 a11y 计算 `pos_in_set` / `set_size`）。
@@ -364,8 +388,15 @@ pub struct VirtualListState {
 
 /// 虚拟列表槽（`Node.interaction.virtual_list`）。
 pub(crate) struct VirtualSlot {
-    /// 行高。
+    /// 行高（`extents = None` 或逐项高度尚未与条目数对齐时的回落值）。
     pub extent: f32,
+    /// 逐项高度（E3）。`Some` 时 `prefix` 同步可用。
+    pub extents: Option<Box<[f32]>>,
+    /// `extents` 的前缀和缓存（`len == extents.len() + 1`、`prefix[0] = 0`）。
+    ///
+    /// **只在 `set_extents` / `clear_extents` 里重建**：滚动帧只做二分查询（O(log n)），
+    /// 不每帧重算（I3 的预算前提）。
+    prefix: Vec<f32>,
     /// overscan。
     pub overscan: usize,
     /// 条目总数。
@@ -376,10 +407,61 @@ pub(crate) struct VirtualSlot {
     pub mounted: Vec<(usize, NodeId)>,
 }
 
+impl VirtualSlot {
+    /// 空槽（`make_virtual_list` 的唯一构造点；`prefix` 只随 [`VirtualSlot::set_extents`] 变化）。
+    pub(crate) fn new(extent: f32, overscan: usize) -> Self {
+        Self {
+            extent,
+            extents: None,
+            prefix: Vec::new(),
+            overscan,
+            count: 0,
+            builder: None,
+            mounted: Vec::new(),
+        }
+    }
+
+    /// 整体替换逐项高度并重算前缀和（O(n)）。
+    pub(crate) fn set_extents(&mut self, extents: Box<[f32]>) {
+        self.prefix.clear();
+        self.prefix.reserve(extents.len() + 1);
+        self.prefix.push(0.0);
+        let mut total = 0.0;
+        for &height in &extents {
+            total += height;
+            self.prefix.push(total);
+        }
+        self.extents = Some(extents);
+    }
+
+    /// 丢弃逐项高度，回落到单一 [`VirtualSlot::extent`]。
+    pub(crate) fn clear_extents(&mut self) {
+        self.extents = None;
+        self.prefix.clear();
+    }
+
+    /// 当前**生效**的逐项高度：`Some` ⇔ 长度与 [`VirtualSlot::count`] 一致。
+    ///
+    /// 不一致只出现在「`make_virtual_list` 预置高度 → `set_virtual_items`」之间：那段时间
+    /// 没有行、也没有帧，按单一 `extent` 处理。
+    pub(crate) fn active_extents(&self) -> Option<&[f32]> {
+        self.extents
+            .as_deref()
+            .filter(|extents| extents.len() == self.count)
+    }
+
+    /// 前缀和缓存（长度 `count + 1`；仅当 [`VirtualSlot::active_extents`] 为 `Some` 时可用）。
+    pub(crate) fn prefix(&self) -> &[f32] {
+        &self.prefix
+    }
+}
+
 impl std::fmt::Debug for VirtualSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VirtualSlot")
             .field("extent", &self.extent)
+            .field("extents", &self.extents.as_deref().map(<[f32]>::len))
+            .field("prefix", &self.prefix.len())
             .field("overscan", &self.overscan)
             .field("count", &self.count)
             .field("builder", &self.builder.as_ref().map(|_| "<closure>"))
@@ -427,7 +509,7 @@ pub enum OverlayPlacement {
 }
 
 /// 浮层参数。
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OverlayOptions {
     /// 定位。
     pub placement: OverlayPlacement,
@@ -439,10 +521,10 @@ pub struct OverlayOptions {
     /// `QDialog` 的对话框焦点作用域、GTK `GtkWindow` 的 modal）：
     /// - Tab / Shift+Tab 只在作用域内循环（含**属于该模态的弹出层**）；
     /// - [`crate::app::App::set_focus`] 拒绝作用域外的节点；
-    /// - 浮层外的指针按下 / 滚动被**消费**（不抢焦点、不触发下层动作、不滚背景）；
+    /// - 浮层外的指针**按下 / 滚动 / 悬停**都被挡住：按下与滚动被消费（不抢焦点、不触发下层
+    ///   动作、不滚背景），悬停被过滤成 `None`（背景 `:hover` 与 tooltip 不会在模态之上出现）；
     /// - Enter / Space 激活与 a11y 动作（`ActionRequest`，**全部**动作类型）拒绝作用域外目标；
-    ///   注意作用域只约束**动作**：a11y 树本身仍向外暴露背景节点（读屏可以读到它们，只是
-    ///   操作会被拒绝）—— 把背景置 `inert`（accesskit `hidden`）尚未实现（AR1b N2）；
+    /// - a11y 树把作用域外节点标 `hidden`（`inert` / `aria-hidden` 语义，E12），AT 读不到背景；
     /// - 作用域外的焦点在下一次输入/焦点操作时移入模态内第一个可聚焦节点（子节点在
     ///   `create_overlay` 返回之后才挂载，创建瞬间求值不到候选）；**完全没有焦点**时同样
     ///   补一个落点（AR1b N1b）。
@@ -451,6 +533,8 @@ pub struct OverlayOptions {
     /// 内（可嵌套递归）就仍属于作用域（[`crate::interaction::overlay::in_modal_scope`]）。
     /// 这是 Qt 模态对话框的「子窗口/弹窗归属」与 Chrome top layer 的同一语义；旧实现只认
     /// 子树，于是对话框里的下拉菜单永远点不动（AR1 探针 1）。
+    ///
+    /// 查询面：[`crate::app::App::modal_scope`]（当前作用域根）。
     pub trap_focus: bool,
     /// 关闭时是否把焦点还给**打开者**（R02-12）。
     ///
@@ -458,6 +542,19 @@ pub struct OverlayOptions {
     /// 外部点击）后若该节点仍存在且可聚焦就恢复。平台与 a11y 的惯例是「焦点回到 opener」：
     /// Blink 的 `<dialog>` 关闭、Qt `QDialog::done`、GTK `GtkPopover` 的 `autohide` 都这样做。
     pub restore_focus: bool,
+    /// 浮层**包装节点**的 a11y 声明（E12；角色 / 可访问名 / 动作 / 显式 hidden）。
+    ///
+    /// 包装节点只是布局/命中容器：**没有 `role` 时按 `GenericContainer` 处理**（平台
+    /// `common_filter` 透明上提），引擎不再猜测成 `Dialog`。真实语义有两种声明方式：
+    /// - 在包装节点上声明（适合「整个浮层就是一个对话框/菜单」）：`A11yOverride { role:
+    ///   Some(A11yRole::Dialog | AlertDialog | Menu | Tooltip), label: …, .. }`；
+    /// - 或在子树里放语义节点（适合包装层还需要承载遮罩等结构时），包装保持默认。
+    ///
+    /// `modal` 不需要（也不应该）在这里声明：浮层包装的 a11y `aria-modal` 跟引擎真值
+    /// `trap_focus` 走（动态 `A11yPatch::modal` 可覆盖，用于测试/特例）。
+    ///
+    /// 注意 `hidden = true` 会沿 a11y 子树隐藏**整个浮层内容**（与普通节点的 hidden 同义）。
+    pub a11y: A11yOverride,
 }
 
 impl Default for OverlayOptions {
@@ -467,6 +564,7 @@ impl Default for OverlayOptions {
             dismiss: OverlayDismiss::OutsideClick,
             trap_focus: false,
             restore_focus: false,
+            a11y: A11yOverride::default(),
         }
     }
 }
