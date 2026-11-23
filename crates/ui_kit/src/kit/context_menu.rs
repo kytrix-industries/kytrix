@@ -282,6 +282,7 @@ mod tests {
         interaction::ScrollConfig,
         math::{Point, Rect, Size},
         node::{builder::NodeBuilder, id::NodeId},
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
         window::WindowId,
     };
@@ -294,7 +295,6 @@ mod tests {
             overlay::AnimationRouter,
             test_support::{a11y_snapshot_without_oracle, overlay_wrapper},
         },
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 

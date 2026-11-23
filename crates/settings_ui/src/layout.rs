@@ -9,6 +9,7 @@ use ui_core::{
     paint::{
         primitive::Border,
         style::{PaintSpec, Style, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     text::{TextStyle, TextWrap},
     window::WindowId,
@@ -18,7 +19,6 @@ use ui_kit::{
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
         select::{Select, SelectItem, SelectOptions},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 

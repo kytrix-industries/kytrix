@@ -21,13 +21,12 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::{NodeKind, NodeTree},
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     window::{FrameIndex, WindowId},
 };
 
 use crate::{
     kit::scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -1428,6 +1427,7 @@ mod ui_tests {
         error::EngineError,
         event::{InputEvent, Modifiers, PointerButton},
         node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, tree::NodeTree},
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
         text::TextStyle,
     };
@@ -1435,7 +1435,6 @@ mod ui_tests {
     use super::{List, ListOptions, RowHeight, SelectionMode};
     use crate::{
         kit::test_support::a11y_of,
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -2705,15 +2704,13 @@ mod deque_tests {
         error::EngineError,
         interaction::ItemAlign,
         node::{builder::NodeBuilder, tree::NodeTree},
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
         text::TextStyle,
     };
 
     use super::{List, ListOptions};
-    use crate::{
-        style_builder::StyleBuilder,
-        theme::{appearance::Appearance, handle::ThemeHandle},
-    };
+    use crate::theme::{appearance::Appearance, handle::ThemeHandle};
 
     const BOX_WIDTH: f32 = 200.0;
     const BOX_HEIGHT: f32 = 120.0;
@@ -2999,22 +2996,22 @@ mod deque_tests {
             assert_eq!(tree.debug_id(separator), Some(expected_id.as_str()));
             let style = tree.get(separator).expect("separator").style();
             assert_eq!(
-                style.inner.size.height.into_option(),
+                style.inner().size.height.into_option(),
                 Some(1.0),
                 "分隔线 1 px 高"
             );
             assert_eq!(
-                style.inner.position,
+                style.inner().position,
                 taffy::style::Position::Absolute,
                 "分隔线绝对定位（不参与行内容布局）"
             );
             assert_eq!(
-                style.inner.inset.top,
+                style.inner().inset.top,
                 taffy::style::LengthPercentageAuto::length(0.0),
                 "分隔线贴行顶部"
             );
             assert_eq!(
-                tree.get(row).expect("row").style().inner.position,
+                tree.get(row).expect("row").style().inner().position,
                 taffy::style::Position::Absolute,
                 "虚拟行绝对定位 ⇒ 行容器是分隔线的包含块"
             );

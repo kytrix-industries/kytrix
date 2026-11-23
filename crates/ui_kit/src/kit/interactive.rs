@@ -17,13 +17,13 @@ use ui_core::{
         color::{Color, ColorResolver},
         primitive::Border,
         style::{Cursor, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     window::WindowId,
 };
 
 use crate::{
     kit::size::{UnifiedSizable, UnifiedSize},
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{
         components::{
             ComponentColors, InteractiveElementColors, InteractiveState, InteractiveStateColors,
@@ -758,8 +758,7 @@ pub(crate) fn mount_dynamic_icon(
         scale,
     )?;
     let mut style = ui_core::paint::style::Style::default();
-    style.inner.size.width = taffy::style::Dimension::length(size);
-    style.inner.size.height = taffy::style::Dimension::length(size);
+    style.size_length(size, size);
     NodeBuilder::image(resource.id, ui_core::node::image::ImageFit::Fill)
         .style(style)
         .bind_style(bind_style)
@@ -1323,11 +1322,11 @@ mod tests {
         let tree = app.app().window(window).expect("window").tree();
         let layout = tree.get(node).expect("node").style();
         assert_eq!(
-            layout.inner.size.height,
+            layout.inner().size.height,
             Dimension::length(UnifiedSize::Large.h())
         );
         assert_eq!(
-            layout.inner.padding.left,
+            layout.inner().padding.left,
             taffy::style::LengthPercentage::length(10.0)
         );
         let bounds = app.probe().bounds(node).expect("bounds");

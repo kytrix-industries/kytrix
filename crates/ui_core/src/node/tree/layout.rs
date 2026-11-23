@@ -79,17 +79,17 @@ pub(crate) fn set_virtual_row(tree: &mut NodeTree, node: NodeId, top: f32, heigh
     let Some(target) = tree.arena.get_mut(node) else {
         return false;
     };
-    target.style.inner.position = taffy::style::Position::Absolute;
-    target.style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(0.0),
-        right: taffy::style::LengthPercentageAuto::length(0.0),
-        top: taffy::style::LengthPercentageAuto::length(top),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
-    target.style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::auto(),
-        height: taffy::style::Dimension::length(height),
-    };
+    target
+        .style
+        .position(taffy::style::Position::Absolute)
+        .inset(
+            taffy::style::LengthPercentageAuto::length(top),
+            taffy::style::LengthPercentageAuto::length(0.0),
+            taffy::style::LengthPercentageAuto::auto(),
+            taffy::style::LengthPercentageAuto::length(0.0),
+        )
+        .width(taffy::style::Dimension::auto())
+        .height(taffy::style::Dimension::length(height));
     tree.invalidate_layout(node)
 }
 
@@ -97,22 +97,28 @@ pub(crate) fn set_absolute_inset(tree: &mut NodeTree, node: NodeId, origin: Poin
     let Some(target) = tree.arena.get_mut(node) else {
         return false;
     };
-    target.style.inner.position = taffy::style::Position::Absolute;
-    target.style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(origin.x),
-        right: taffy::style::LengthPercentageAuto::auto(),
-        top: taffy::style::LengthPercentageAuto::length(origin.y),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
+    target
+        .style
+        .position(taffy::style::Position::Absolute)
+        .inset(
+            taffy::style::LengthPercentageAuto::length(origin.y),
+            taffy::style::LengthPercentageAuto::auto(),
+            taffy::style::LengthPercentageAuto::auto(),
+            taffy::style::LengthPercentageAuto::length(origin.x),
+        );
     tree.invalidate_layout(node)
 }
 
 pub(crate) fn taffy_style(tree: &NodeTree, node: NodeId) -> &taffy::Style<SmolStr> {
     match tree.arena.get(node) {
-        Some(target) => &target.style.inner,
+        Some(target) => target.style.inner(),
         None => {
             debug_assert!(false, "taffy queried a stale node's style");
-            &tree.arena.get(tree.root).expect("根节点恒存活").style.inner
+            tree.arena
+                .get(tree.root)
+                .expect("根节点恒存活")
+                .style
+                .inner()
         }
     }
 }
@@ -186,8 +192,8 @@ pub(crate) fn layout_override_of(tree: &NodeTree, node: NodeId) -> Option<Layout
 
 pub(crate) fn is_out_of_flow(tree: &NodeTree, node: NodeId) -> bool {
     tree.arena.get(node).is_some_and(|target| {
-        target.style.inner.position.is_out_of_flow()
-            && !matches!(target.style.inner.display, taffy::style::Display::None)
+        target.style.inner().position.is_out_of_flow()
+            && !matches!(target.style.inner().display, taffy::style::Display::None)
     })
 }
 
@@ -231,7 +237,8 @@ pub(crate) fn place_subtree(
     let Some(target) = tree.arena.get(node) else {
         return;
     };
-    let hidden = parent_hidden || matches!(target.style.inner.display, taffy::style::Display::None);
+    let hidden =
+        parent_hidden || matches!(target.style.inner().display, taffy::style::Display::None);
     let layout_leaf = target.layout_override.is_some() || target.kind.is_leaf();
     let children_hidden = hidden || layout_leaf;
     let local = if hidden {
@@ -547,25 +554,15 @@ impl LayoutStats {
 
 #[cfg(test)]
 mod tests {
-    use taffy::style::Dimension;
-
     use crate::{
         layout::LayoutOverride,
         math::Rect,
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
-        paint::style::{Clip, Style},
+        paint::{style::Style, style_builder::StyleBuilder},
     };
 
     fn fixed(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: Dimension::length(width),
-            height: Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     fn add(tree: &mut NodeTree, parent: NodeId, style: Style) -> NodeId {

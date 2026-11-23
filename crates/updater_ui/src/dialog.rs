@@ -17,7 +17,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextStyle},
     window::WindowId,
 };
@@ -33,7 +33,6 @@ use ui_kit::{
         size::UnifiedSize,
         spinner::Spinner,
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::services::WidgetServices;

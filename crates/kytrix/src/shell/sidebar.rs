@@ -6,11 +6,11 @@ use ui_core::{
     error::EngineError,
     event::Event,
     node::{id::NodeId, signal::Signal},
+    paint::style_builder::StyleBuilder,
     window::WindowId,
 };
 use ui_kit::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 

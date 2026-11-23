@@ -13,14 +13,13 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
     window::WindowId,
 };
 
 use crate::{
     kit::list::{List, ListOptions, RowHeight, SelectionMode},
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -977,6 +976,7 @@ mod ui_tests {
         interaction::ScrollConfig,
         math::Size,
         node::{builder::NodeBuilder, tree::NodeKind},
+        paint::style_builder::StyleBuilder,
         test_support::{a11y::assert_incremental_within, app::TestApp},
     };
 
@@ -985,7 +985,6 @@ mod ui_tests {
         kit::test_support::{
             A11yUpdates, a11y_id, a11y_of, assert_single_parent_per_node, frame_a11y, full_a11y,
         },
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
     };
 

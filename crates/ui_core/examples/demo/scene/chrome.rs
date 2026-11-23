@@ -262,14 +262,16 @@ fn absolute_style(
     use taffy::style::LengthPercentageAuto;
 
     let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.inset = taffy::geometry::Rect {
-        left: left.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-        top: top.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-        right: right.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-        bottom: bottom.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
-    };
-    style.inner.size = taffy::geometry::Size { width, height };
+    style
+        .position(taffy::style::Position::Absolute)
+        .width(width)
+        .height(height)
+        .inset(
+            top.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
+            right.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
+            bottom.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
+            left.map_or_else(LengthPercentageAuto::auto, LengthPercentageAuto::length),
+        );
     style
 }
 

@@ -11,10 +11,7 @@ use crate::{
         id::NodeId,
         signal::{Signal, Transient},
     },
-    paint::{
-        color::Color,
-        style::{Clip, Style},
-    },
+    paint::{color::Color, style::Clip, style_builder::StyleBuilder},
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -37,11 +34,7 @@ fn root(app: &App, window: WindowId) -> NodeId {
 }
 
 fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(40.0),
-        height: taffy::style::Dimension::length(40.0),
-    };
+    let style = StyleBuilder::new().size(40.0, 40.0).build();
     NodeBuilder::boxed()
         .style(style)
         .on_click(Action::custom("focusable"))
@@ -54,11 +47,7 @@ fn mount_scope(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
 }
 
 fn mount_scroll_container(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(150.0),
-    };
+    let mut style = StyleBuilder::new().size(200.0, 150.0).build();
     style.clip = Clip::Bounds;
     NodeBuilder::boxed()
         .style(style)

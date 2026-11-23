@@ -9,13 +9,13 @@ use ui_core::{
     paint::{
         color::Color,
         style::{Style, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     text::TextStyle,
     window::WindowId,
 };
 use ui_kit::{
     kit::separator::Separator,
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 

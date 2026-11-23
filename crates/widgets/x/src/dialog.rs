@@ -23,7 +23,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::{color::Color, style::StylePatch},
+    paint::{color::Color, style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextOverflow, TextStyle},
     window::WindowId,
 };
@@ -41,7 +41,6 @@ use ui_kit::{
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{cx::WidgetCx, error::TranslatedError, rpc::RpcCallError, status::WidgetAction};

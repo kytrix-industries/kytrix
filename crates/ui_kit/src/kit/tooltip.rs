@@ -9,7 +9,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
     window::WindowId,
 };
@@ -22,7 +22,6 @@ use crate::{
             OverlaySurface, Placement,
         },
     },
-    style_builder::StyleBuilder,
     theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
 };
 
@@ -468,6 +467,7 @@ mod tests {
         event::{Action, InputEvent, KeyCode, Modifiers},
         math::{Point, Rect},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
         window::{FrameOutcome, WindowId},
     };
@@ -481,7 +481,6 @@ mod tests {
                 OverlaySurface, Placement,
             },
         },
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 

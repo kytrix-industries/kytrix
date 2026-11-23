@@ -6,7 +6,7 @@ use ui_core::{
     app::App,
     math::{Point, Scale, Size},
     node::{builder::NodeBuilder, id::NodeId},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     window::{WindowId, WindowOptions},
 };
 
@@ -33,15 +33,7 @@ fn fixture(handle: &tokio::runtime::Handle) -> (App, WindowId) {
 }
 
 fn fixed(width: f32, height: f32) -> ui_core::paint::style::Style {
-    let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-    inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(width),
-        height: taffy::style::Dimension::length(height),
-    };
-    ui_core::paint::style::Style {
-        inner,
-        clip: ui_core::paint::style::Clip::None,
-    }
+    StyleBuilder::new().size(width, height).build()
 }
 
 fn mount_grid(app: &mut App, window: WindowId) -> Vec<NodeId> {

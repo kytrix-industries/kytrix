@@ -671,17 +671,13 @@ mod tests {
             })
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("mount");
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(100.0),
-            height: taffy::style::Dimension::length(80.0),
-        };
-        inner.position = taffy::style::Position::Relative;
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .relative()
+            .size(100.0, 80.0)
+            .build();
+        style.clip = crate::paint::style::Clip::Bounds;
         let container = NodeBuilder::boxed()
-            .style(crate::paint::style::Style {
-                inner,
-                clip: crate::paint::style::Clip::Bounds,
-            })
+            .style(style)
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("container");
         let handle = app
@@ -1169,17 +1165,13 @@ mod tests {
     fn scroll_unit_moves_the_container() {
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(100.0),
-            height: taffy::style::Dimension::length(80.0),
-        };
-        inner.position = taffy::style::Position::Relative;
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .relative()
+            .size(100.0, 80.0)
+            .build();
+        style.clip = crate::paint::style::Clip::Bounds;
         let container = NodeBuilder::boxed()
-            .style(crate::paint::style::Style {
-                inner,
-                clip: crate::paint::style::Clip::Bounds,
-            })
+            .style(style)
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("container");
         let handle = app
@@ -1551,17 +1543,13 @@ mod tests {
     fn scroll_actions_converge_to_the_scroll_container() {
         let (_runtime, mut app, window) = setup();
         let root = app.window(window).expect("window").tree().root();
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(100.0),
-            height: taffy::style::Dimension::length(80.0),
-        };
-        inner.position = taffy::style::Position::Relative;
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .relative()
+            .size(100.0, 80.0)
+            .build();
+        style.clip = crate::paint::style::Clip::Bounds;
         let container = NodeBuilder::boxed()
-            .style(crate::paint::style::Style {
-                inner,
-                clip: crate::paint::style::Clip::Bounds,
-            })
+            .style(style)
             .build(app.window_mut(window).expect("window").tree_mut(), root)
             .expect("container");
         let row = NodeBuilder::boxed()

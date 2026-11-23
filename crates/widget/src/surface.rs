@@ -6,14 +6,13 @@ use ui_core::{
     error::EngineError,
     event::Event,
     node::{builder::NodeBuilder, id::NodeId},
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::TextStyle,
 };
-use ui_kit::{
-    kit::button::Button,
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::role::Role,
-};
+use ui_kit::{kit::button::Button, theme::role::Role};
 
 use crate::{
     cx::WidgetCx,

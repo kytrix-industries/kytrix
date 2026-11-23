@@ -18,7 +18,10 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::{PaintSpec, StylePatch},
+    paint::{
+        style::{PaintSpec, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -31,7 +34,6 @@ use ui_kit::{
         size::{UnifiedSizable, UnifiedSize},
         table::{Column, ColumnAlign, Table, TableOptions},
     },
-    style_builder::StyleBuilder,
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 use widget::{

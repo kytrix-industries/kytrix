@@ -277,25 +277,19 @@ impl LayoutBlockContainer for NodeTree {
 mod tests {
     use std::cell::Cell;
 
-    use taffy::style::{Dimension, Display, Position};
+    use taffy::style::{Dimension, Display};
 
     use crate::{
         layout::{LayoutOverride, LayoutReport},
         math::{Rect, Size},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
-        paint::{
-            canvas::Canvas,
-            style::{Clip, Style},
-        },
+        paint::{canvas::Canvas, style::Style, style_builder::StyleBuilder},
     };
 
     fn style_with(width: Dimension, height: Dimension) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size { width, height };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        let mut style = Style::default();
+        style.width(width).height(height);
+        style
     }
 
     fn fixed(width: f32, height: f32) -> Style {
@@ -347,12 +341,8 @@ mod tests {
             style_with(Dimension::percent(1.0), Dimension::percent(1.0)),
         );
         {
-            let mut style = fixed(10.0, 10.0);
-            style.inner.flex_direction = taffy::style::FlexDirection::Column;
-            style.inner.size = taffy::geometry::Size {
-                width: Dimension::length(100.0),
-                height: Dimension::length(100.0),
-            };
+            let mut style = fixed(100.0, 100.0);
+            style.flex_direction(taffy::style::FlexDirection::Column);
             let column = add(&mut tree, row, style);
             let first = add(&mut tree, column, fixed(10.0, 10.0));
             let second = add(&mut tree, column, fixed(10.0, 20.0));
@@ -384,14 +374,7 @@ mod tests {
                 taffy::style::TrackSizingFunction::from_length(70.0_f32),
             ),
         ];
-        let grid = add(
-            &mut tree,
-            root,
-            Style {
-                inner: container,
-                clip: Clip::None,
-            },
-        );
+        let grid = add(&mut tree, root, Style::from_taffy(container));
         let left = add(&mut tree, grid, fixed(5.0, 5.0));
         let right = add(&mut tree, grid, fixed(5.0, 5.0));
 
@@ -411,14 +394,7 @@ mod tests {
             width: Dimension::length(100.0),
             height: Dimension::length(100.0),
         };
-        let block = add(
-            &mut tree,
-            root,
-            Style {
-                inner: container,
-                clip: Clip::None,
-            },
-        );
+        let block = add(&mut tree, root, Style::from_taffy(container));
         let first = add(&mut tree, block, fixed(10.0, 10.0));
         let second = add(&mut tree, block, fixed(10.0, 20.0));
 
@@ -443,24 +419,10 @@ mod tests {
     fn padding_offsets_child_origin() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut outer = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        outer.size = taffy::geometry::Size {
-            width: Dimension::length(100.0),
-            height: Dimension::length(100.0),
-        };
-        outer.padding = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(4.0),
-            right: taffy::style::LengthPercentage::length(4.0),
-            top: taffy::style::LengthPercentage::length(4.0),
-            bottom: taffy::style::LengthPercentage::length(4.0),
-        };
         let outer = add(
             &mut tree,
             root,
-            Style {
-                inner: outer,
-                clip: Clip::None,
-            },
+            StyleBuilder::new().size(100.0, 100.0).padding(4.0).build(),
         );
         let inner = add(&mut tree, outer, fixed(10.0, 10.0));
 
@@ -474,30 +436,14 @@ mod tests {
     fn border_and_padding_offset_child_origin() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut outer = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        outer.size = taffy::geometry::Size {
-            width: Dimension::length(100.0),
-            height: Dimension::length(100.0),
-        };
-        outer.padding = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(3.0),
-            right: taffy::style::LengthPercentage::length(3.0),
-            top: taffy::style::LengthPercentage::length(3.0),
-            bottom: taffy::style::LengthPercentage::length(3.0),
-        };
-        outer.border = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(2.0),
-            right: taffy::style::LengthPercentage::length(2.0),
-            top: taffy::style::LengthPercentage::length(2.0),
-            bottom: taffy::style::LengthPercentage::length(2.0),
-        };
         let outer = add(
             &mut tree,
             root,
-            Style {
-                inner: outer,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .size(100.0, 100.0)
+                .padding(3.0)
+                .border(2.0)
+                .build(),
         );
         let inner = add(&mut tree, outer, fixed(10.0, 10.0));
 
@@ -522,16 +468,10 @@ mod tests {
     fn min_max_size_clamp_measured_leaf() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut style = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        style.max_size = taffy::geometry::Size {
-            width: taffy::style::LengthPercentageAuto::length(50.0),
-            height: taffy::style::LengthPercentageAuto::auto(),
-        };
+        let mut style = Style::default();
+        style.max_width(taffy::style::LengthPercentageAuto::length(50.0));
         let node = NodeBuilder::boxed()
-            .style(Style {
-                inner: style,
-                clip: Clip::None,
-            })
+            .style(style)
             .measure(Box::new(|_known, _available| Size::new(200.0, 10.0)))
             .build(&mut tree, root)
             .expect("挂载成功");
@@ -565,20 +505,9 @@ mod tests {
     fn display_none_zeroes_subtree() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut hidden = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        hidden.display = Display::None;
-        hidden.size = taffy::geometry::Size {
-            width: Dimension::length(50.0),
-            height: Dimension::length(50.0),
-        };
-        let hidden = add(
-            &mut tree,
-            root,
-            Style {
-                inner: hidden,
-                clip: Clip::None,
-            },
-        );
+        let mut hidden = fixed(50.0, 50.0);
+        hidden.display(Display::None);
+        let hidden = add(&mut tree, root, hidden);
         let child = add(&mut tree, hidden, fixed(10.0, 10.0));
 
         let _ = layout(&mut tree, 100.0, 100.0);
@@ -624,39 +553,20 @@ mod tests {
     fn absolute_child_relative_to_positioned_ancestor() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut container = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        container.position = Position::Relative;
-        container.size = taffy::geometry::Size {
-            width: Dimension::length(100.0),
-            height: Dimension::length(100.0),
-        };
         let parent = add(
             &mut tree,
             root,
-            Style {
-                inner: container,
-                clip: Clip::None,
-            },
+            StyleBuilder::new().relative().size(100.0, 100.0).build(),
         );
-        let mut absolute = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        absolute.position = Position::Absolute;
-        absolute.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(12.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(8.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        absolute.size = taffy::geometry::Size {
-            width: Dimension::length(10.0),
-            height: Dimension::length(10.0),
-        };
         let child = add(
             &mut tree,
             parent,
-            Style {
-                inner: absolute,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(12.0)
+                .top(8.0)
+                .size(10.0, 10.0)
+                .build(),
         );
 
         let _ = layout(&mut tree, 200.0, 200.0);
@@ -668,46 +578,25 @@ mod tests {
     fn out_of_flow_hoisted_to_ancestor_uses_containing_block() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut container_style = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        container_style.position = Position::Relative;
-        container_style.size = taffy::geometry::Size {
-            width: Dimension::length(100.0),
-            height: Dimension::length(100.0),
-        };
-        container_style.padding = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(10.0),
-            right: taffy::style::LengthPercentage::length(10.0),
-            top: taffy::style::LengthPercentage::length(10.0),
-            bottom: taffy::style::LengthPercentage::length(10.0),
-        };
         let container = add(
             &mut tree,
             root,
-            Style {
-                inner: container_style,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .relative()
+                .size(100.0, 100.0)
+                .padding(10.0)
+                .build(),
         );
         let static_mid = add(&mut tree, container, fixed(50.0, 50.0));
-        let mut abs_style = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        abs_style.position = Position::Absolute;
-        abs_style.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(5.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(7.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        abs_style.size = taffy::geometry::Size {
-            width: Dimension::length(20.0),
-            height: Dimension::length(20.0),
-        };
         let absolute = add(
             &mut tree,
             static_mid,
-            Style {
-                inner: abs_style,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(5.0)
+                .top(7.0)
+                .size(20.0, 20.0)
+                .build(),
         );
 
         let _ = layout(&mut tree, 200.0, 200.0);
@@ -867,12 +756,8 @@ mod tests {
             .build(&mut tree, root)
             .expect("挂载成功");
         {
-            let mut style = fixed(0.0, 0.0);
-            style.inner.align_items = taffy::style::AlignItems::FLEX_START;
-            style.inner.size = taffy::geometry::Size {
-                width: Dimension::length(200.0),
-                height: Dimension::length(100.0),
-            };
+            let mut style = fixed(200.0, 100.0);
+            style.align_items(taffy::style::AlignItems::FLEX_START);
             let _ = tree.set_style(root, style);
         }
         let _ = layout(&mut tree, 200.0, 100.0);
@@ -895,7 +780,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(200.0, 200.0);
-        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        root_style.flex_direction(taffy::style::FlexDirection::Column);
         tree.set_style(root, root_style).expect("root 存活");
         let spacer = add(&mut tree, root, fixed(200.0, 40.0));
         let pane = add(&mut tree, root, fixed(100.0, 100.0));
@@ -928,16 +813,9 @@ mod tests {
     fn hidden_override_has_no_ghost_box() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut hidden = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        hidden.display = Display::None;
-        let pane = add(
-            &mut tree,
-            root,
-            Style {
-                inner: hidden,
-                clip: Clip::None,
-            },
-        );
+        let mut hidden = Style::default();
+        hidden.display(Display::None);
+        let pane = add(&mut tree, root, hidden);
         let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
             .layout_override(Rect::new(10.0, 20.0, 30.0, 30.0))
             .build(&mut tree, pane)
@@ -957,25 +835,15 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let pane = add(&mut tree, root, fixed(100.0, 100.0));
-        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        abs.position = Position::Absolute;
-        abs.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(40.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(40.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        abs.size = taffy::geometry::Size {
-            width: Dimension::length(20.0),
-            height: Dimension::length(20.0),
-        };
         let absolute = add(
             &mut tree,
             pane,
-            Style {
-                inner: abs,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(40.0)
+                .top(40.0)
+                .size(20.0, 20.0)
+                .build(),
         );
         let _ = layout(&mut tree, 200.0, 200.0);
         assert_eq!(
@@ -984,16 +852,9 @@ mod tests {
             "可见时正常"
         );
 
-        let mut hidden = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        hidden.display = Display::None;
-        tree.set_style(
-            pane,
-            Style {
-                inner: hidden,
-                clip: Clip::None,
-            },
-        )
-        .expect("存活");
+        let mut hidden = Style::default();
+        hidden.display(Display::None);
+        tree.set_style(pane, hidden).expect("存活");
         let _ = layout(&mut tree, 200.0, 200.0);
 
         assert!(
@@ -1007,20 +868,9 @@ mod tests {
     fn flow_root_lays_out_children_like_block() {
         let mut tree = NodeTree::new();
         let root = tree.root();
-        let mut container = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        container.display = Display::FlowRoot;
-        container.size = taffy::geometry::Size {
-            width: Dimension::length(100.0),
-            height: Dimension::length(100.0),
-        };
-        let flow = add(
-            &mut tree,
-            root,
-            Style {
-                inner: container,
-                clip: Clip::None,
-            },
-        );
+        let mut flow_style = fixed(100.0, 100.0);
+        flow_style.display(Display::FlowRoot);
+        let flow = add(&mut tree, root, flow_style);
         let first = add(&mut tree, flow, fixed(10.0, 10.0));
         let second = add(&mut tree, flow, fixed(10.0, 20.0));
 
@@ -1046,13 +896,13 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(1000.0, 1000.0);
-        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        root_style.flex_direction(taffy::style::FlexDirection::Column);
         tree.set_style(root, root_style).expect("root 存活");
         let mut rows = Vec::with_capacity(100);
         let mut leaves = Vec::with_capacity(100);
         for _ in 0..100 {
             let mut row_style = fixed(1000.0, 8.0);
-            row_style.inner.flex_direction = taffy::style::FlexDirection::Row;
+            row_style.flex_direction(taffy::style::FlexDirection::Row);
             let row = add(&mut tree, root, row_style);
             rows.push(row);
             for _ in 0..100 {
@@ -1085,33 +935,23 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(200.0, 200.0);
-        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        root_style.flex_direction(taffy::style::FlexDirection::Column);
         tree.set_style(root, root_style).expect("root 存活");
         let spacer = add(&mut tree, root, fixed(200.0, 20.0));
 
         let mut container_style = fixed(100.0, 100.0);
-        container_style.inner.position = taffy::style::Position::Relative;
+        container_style.position(taffy::style::Position::Relative);
         let container = add(&mut tree, root, container_style);
         let static_mid = add(&mut tree, container, fixed(50.0, 50.0));
-        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        abs.position = taffy::style::Position::Absolute;
-        abs.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(5.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(7.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        abs.size = taffy::geometry::Size {
-            width: taffy::Dimension::length(20.0),
-            height: taffy::Dimension::length(20.0),
-        };
         let out_of_flow = add(
             &mut tree,
             static_mid,
-            Style {
-                inner: abs,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(5.0)
+                .top(7.0)
+                .size(20.0, 20.0)
+                .build(),
         );
         let canvas = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 1.0, 1.0)))
             .layout_override(Rect::new(10.0, 10.0, 30.0, 30.0))

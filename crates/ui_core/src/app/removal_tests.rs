@@ -19,7 +19,10 @@ use crate::{
         id::NodeId,
         signal::{Signal, Transient},
     },
-    paint::style::{Clip, Style, StylePatch},
+    paint::{
+        style::{Clip, Style, StylePatch},
+        style_builder::StyleBuilder,
+    },
     window::{FrameOutcome, WindowId, WindowOptions},
 };
 
@@ -43,12 +46,7 @@ fn root(app: &App, window: WindowId) -> NodeId {
 }
 
 fn boxed_style(width: f32, height: f32) -> Style {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(width),
-        height: taffy::style::Dimension::length(height),
-    };
-    style
+    StyleBuilder::new().size(width, height).build()
 }
 
 fn mount_box(app: &mut App, window: WindowId, parent: NodeId) -> NodeId {
@@ -323,7 +321,7 @@ fn virtual_list_row_recycling_cleans_scoped_state_of_recycled_rows() {
     let root = root(&app, window);
     let mut style = boxed_style(200.0, 100.0);
     style.clip = Clip::Bounds;
-    style.inner.position = taffy::style::Position::Relative;
+    style.position(taffy::style::Position::Relative);
     let container = NodeBuilder::boxed()
         .style(style)
         .build(app.window_mut(window).expect("window").tree_mut(), root)
@@ -947,7 +945,7 @@ fn removing_a_mounted_virtual_row_is_rejected_without_side_effects() {
     let root = root(&app, window);
     let mut style = boxed_style(200.0, 100.0);
     style.clip = Clip::Bounds;
-    style.inner.position = taffy::style::Position::Relative;
+    style.position(taffy::style::Position::Relative);
     let container = NodeBuilder::boxed()
         .style(style)
         .build(app.window_mut(window).expect("window").tree_mut(), root)

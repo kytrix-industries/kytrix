@@ -22,7 +22,7 @@ pub(crate) fn make_virtual_list(
     };
     let node = target.tree().get(container)?;
     if node.clip() != Clip::Bounds
-        || node.style().inner.position != taffy::style::Position::Relative
+        || node.style().inner().position != taffy::style::Position::Relative
     {
         return Err(EngineError::NotVirtualList { node: container });
     }
@@ -430,7 +430,7 @@ fn validate_extents(extents: &[f32]) -> Result<(), EngineError> {
 
 fn row_matches(tree: &NodeTree, row: NodeId, top: f32, height: f32) -> bool {
     tree.get(row).is_ok_and(|node| {
-        let style = &node.style().inner;
+        let style = node.style().inner();
         style.position == taffy::style::Position::Absolute
             && style.inset.top == taffy::style::LengthPercentageAuto::length(top)
             && style.size.height == taffy::style::Dimension::length(height)
@@ -442,7 +442,7 @@ mod tests {
     use super::*;
     use crate::{
         math::{Rect, Scale},
-        paint::style::Style,
+        paint::style_builder::StyleBuilder,
         window::WindowOptions,
     };
 
@@ -463,12 +463,7 @@ mod tests {
             scale: Scale::ONE,
             ..WindowOptions::default()
         });
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        style.inner.position = taffy::style::Position::Relative;
+        let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
         style.clip = Clip::Bounds;
         let tree = app.window_mut(window).expect("window").tree_mut();
         let root = tree.root();
@@ -961,13 +956,8 @@ mod tests {
     fn table_fixture() -> TableFixture {
         use crate::a11y::{A11yOverride, A11yRole};
 
-        fn fixed_style(width: f32, height: f32) -> Style {
-            let mut style = Style::default();
-            style.inner.size = taffy::geometry::Size {
-                width: taffy::style::Dimension::length(width),
-                height: taffy::style::Dimension::length(height),
-            };
-            style
+        fn fixed_style(width: f32, height: f32) -> crate::paint::style::Style {
+            StyleBuilder::new().size(width, height).build()
         }
         fn role(role: A11yRole) -> A11yOverride {
             A11yOverride {
@@ -990,7 +980,7 @@ mod tests {
         let (table, header_row, header_cell, viewport, fillers) = {
             let tree = app.window_mut(window).expect("window").tree_mut();
             let mut table_style = fixed_style(200.0, 200.0);
-            table_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+            table_style.flex_direction(taffy::style::FlexDirection::Column);
             let table = NodeBuilder::boxed()
                 .a11y(role(A11yRole::Table))
                 .style(table_style)
@@ -1015,7 +1005,7 @@ mod tests {
                 .build(tree, header_row)
                 .expect("header cell");
             let mut viewport_style = fixed_style(200.0, 60.0);
-            viewport_style.inner.position = taffy::style::Position::Relative;
+            viewport_style.position(taffy::style::Position::Relative);
             viewport_style.clip = Clip::Bounds;
             let viewport = NodeBuilder::boxed()
                 .style(viewport_style)

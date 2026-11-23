@@ -10,13 +10,13 @@ use ui_core::{
     interaction::DragPhase,
     math::Rect,
     node::{builder::NodeBuilder, id::NodeId},
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     window::WindowId,
 };
-use ui_kit::{
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::handle::ThemeHandle,
-};
+use ui_kit::theme::handle::ThemeHandle;
 use widget::{config::WidgetConfigChange, identity::WidgetId};
 use widget_gallery_ui::gallery::WidgetGalleryEvent;
 use widget_registry::registry::WidgetRegistry;

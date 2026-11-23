@@ -5,8 +5,8 @@
 >
 > **v2.14 变更摘要（2026-11-23）**：**迁移完成归档**。`gui-engine-migration` 分支 HEAD `752d653`（P0–P6 全部完成；
 > 最终三端验收 P6-2/P6-3/P6-4 见 `.docs/gui-migration/final-report.md`）。本版做四件事：
-> ① **版本头与代码状态改为「迁移完成」**：全仓单一自研引擎（`ui_core` 引擎 + `ui_kit`（`theme/` + `kit/` +
-> `style_builder.rs`）+ `widget` 契约层 + `widget_registry`/`widget_gallery_ui` + 六个 `*_ui` + `kytrix` 外壳）；
+> ① **版本头与代码状态改为「迁移完成」**：全仓单一自研引擎（`ui_core` 引擎 + `ui_kit`（`theme/` + `kit/`；builder 在
+> `ui_core::paint::style_builder`）+ `widget` 契约层 + `widget_registry`/`widget_gallery_ui` + 六个 `*_ui` + `kytrix` 外壳）；
 > 依赖树 **零 `gpui`**（`Cargo.lock` 1,136→**760** 包；`gpui*`/`wgpu`/`x11rb`/`winit` 全 0），迁移期过渡开关
 > `KYTRIX_UI_CORE_MANIFEST` **已删除**（P5-3 `f1ff4944`）、`widget_tokio_runtime` **整 crate 删除**（P5-1 `61c08fb`）、
 > 旧 `ui_kit` 顶层模块 **37 个模块/目录 25,471 行已删除**（P5-2 `6239b84`）。
@@ -138,7 +138,7 @@
 > **代码状态**（v2.14 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
 > **引擎侧 E1–E21、E23–E25 全部已实现**（§11.1–§11.15；E21 `signal_slot_stats`、E23 canvas 读点、E24 文本换色、
 > E25 `automation` 面分别见 §13.8/§13.9、§6.3/§13.2、§4.5/§11.1、§12.12；**E22 仅登记、未实现**，见 §14.6）；
-> **应用层全部已实现并接线**：`ui_kit`（`theme/` + `kit/` + `style_builder.rs`，§12.1–§12.5）、`widget` 契约层（§13）、
+> **应用层全部已实现并接线**：`ui_kit`（`theme/` + `kit/`，§12.1–§12.5）、`ui_core::paint::style_builder`、`widget` 契约层（§13）、
 > 20 个 widget crate + `widget_registry` / `widget_gallery_ui`、六个 `*_ui` 与 `kytrix` 外壳（§12.11、§14.2）。
 > **迁移已完成**（P0–P6，`gui-engine-migration@752d653`）：gpui 全家桶已从 workspace 与 `Cargo.lock` 彻底删除（§14.1）。
 > Rust 片段分三类，各自必须显式标注：
@@ -148,7 +148,7 @@
 > 3. **接口草图**——固定语义与形状、非可编译实现。
 >
 > **P2 迁移口径（历史，P5 已闭合）**：① `ui_kit` 当时采取**模块级增量**（新 `theme/` / `kit/` 与旧模块并存）；旧模块已于
-> **P5-2**（`6239b84`）删除，`src/` 只剩 `kit/`、`theme/`、`style_builder.rs`、`lib.rs`（§12.1）；② 迁移期 `ui_core` 的进程清单与
+> **P5-2**（`6239b84`）删除，`src/` 只剩 `kit/`、`theme/`、`lib.rs`（`style_builder.rs` 已由 B1b 迁入 `ui_core`，§12.1）；② 迁移期 `ui_core` 的进程清单与
 > `gpui-pre` 冲突，曾用 `KYTRIX_UI_CORE_MANIFEST=0` 过渡（§12.6），该开关已由 **P5-3**（`f1ff4944`）删除 —— 终态**不存在**该环境变量，
 > `ui_core` 始终编译并链接本仓 PerMonitorV2 清单。
 >
@@ -417,14 +417,14 @@ pub(crate) use windows as backend;
 
 > **P2 已落地的应用层部分**（v2.3，§12）：`ui_kit` 的 `theme/`（`Palette` 61 → `RoleColors` **64 角色** → `ComponentTokens` →
 > `Theme` → `ThemeHandle`）与 `kit/`（33 个组件模块）已在 `ui_core` 之上实现；**薄 builder 的方法面已定稿为
-> `StyleBuilder` 35 个 + `PaintBuilder` 6 个**（§12.3）。旧 `ui_kit` 模块（`style/`、顶层组件文件、旧 `markdown/`）仍在，
-> **P2-5 当时不删（旧模块推迟到 P5）**；旧模块已由 **P5-2**（`6239b84`）删除，只留 `theme/` / `kit/` / `style_builder.rs`（§12.1 / §12.7）。
+> `StyleBuilder` 34 个 + `PaintBuilder` 5 个**（§12.3）。旧 `ui_kit` 模块（`style/`、顶层组件文件、旧 `markdown/`）仍在，
+> **P2-5 当时不删（旧模块推迟到 P5）**；旧模块已由 **P5-2**（`6239b84`）删除，只留 `theme/` / `kit/`；`style_builder.rs` 已由
+> **B1b** 迁入 `ui_core::paint::style_builder`（§12.1 / §12.7）。
 
-> **`ui_kit::StyleBuilder` 的落点（v2.1 新增要求；v2.3 已兑现）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
-> `ui_kit` 必须自己新建。**P2-1a 已交付**：`crates/ui_kit/Cargo.toml` 已含 `ui_core = { workspace = true }` 与
-> `taffy = { workspace = true }`（根 `Cargo.toml` 的 `[workspace.dependencies]` 已补 `ui_core` 行），
-> `StyleBuilder`（**35 方法** → `Style`）与 `PaintBuilder`（**6 方法** → `PaintSpec`）落在 `crates/ui_kit/src/style_builder.rs`
-> （§4.9.5、§12.3）。
+> **builder 的落点（v2.1 要求；B1b 已收口）**：`StyleBuilder`（**34 方法** → `Style`）与 `PaintBuilder`（**5 方法** →
+> `PaintSpec`）落在 `crates/ui_core/src/paint/style_builder.rs`；`ui_kit` 不再有 `style_builder` 模块，只引用
+> `ui_core::paint::style_builder`（§4.9.5、§12.3）。`Style` 提供 typed setter 与只读 `inner()`（仅 `test-support` 下公开，
+> 生产构建为 `pub(crate)`）；taffy 枚举仍作为 typed setter 入参出现在公开面（C1 收口）。
 
 ### 1.4 所有权与线程模型
 
@@ -1133,7 +1133,7 @@ impl taffy::TraversePartialTree for NodeTree {
     fn get_child_id(&self, parent: NodeId, index: usize) -> NodeId { self.node(parent).children[index] }
 }
 impl taffy::LayoutPartialTree for NodeTree {
-    fn get_style(&self, id: NodeId) -> &taffy::Style<SmolStr> { &self.node(id).style.inner }
+    fn get_style(&self, id: NodeId) -> &taffy::Style<SmolStr> { self.node(id).style.inner() }
     fn set_unrounded_layout(&mut self, id: NodeId, l: &taffy::Layout) { self.node_mut(id).layout = (*l).into(); }
     fn get_cache_mut(&mut self, id: NodeId) -> &mut taffy::Cache { &mut self.node_mut(id).layout_cache }
     fn compute_child_layout(&mut self, id: NodeId, input: taffy::LayoutInput) -> taffy::LayoutOutput { /* 分派 flex/grid/block/leaf */ }
@@ -1294,20 +1294,20 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 | `PaintSpec` | **静态绘制属性**：`background` / `border` / `corner_radius` / `shadows: Shadows`（v2.3 由单层 `shadow: Option<…>` 改为多层，**破坏性变更、无兼容层**；`MAX_SHADOWS = 4`）/ `gradient: Option<Gradient>` | `Node.paint`（`NodeBuilder::paint`） | 挂载期一次 | `PAINT` |
 | `StylePatch` | **动态属性增量**（8 字段）：`background` / `foreground` / `border` / `opacity`（v2.3 起为**组不透明度**）/ `visible` / `interactive` / `cursor` / `affects_layout` | `Node.style_patch`（`bind_style` 上次求值结果） | 每帧按依赖求值（`App::refresh_styles`） | `BIND` → 值变才 `PAINT`（`affects_layout` ⇒ 追加 `LAYOUT`） |
 
-**引擎不提供**任何构造器 / 访问器 / 链式 DSL / 宏 / `Styled` 形状的 trait；`Style` 只有 `Default`。布局属性由应用**直接构造
-`taffy::Style<SmolStr>` 再包一层**（`ui_kit` 需自行声明 `taffy = { workspace = true }`，版本由 workspace 精确钉住）。
+**引擎不提供**链式 DSL / 宏 / `Styled` 形状的 trait；`Style` 的字段私有，全部布局属性经 typed setter 与 `ui_core::paint::style_builder::{StyleBuilder, PaintBuilder}` 写入（**34 + 5** 个方法，清单见 §12.3）。只读访问器 `Style::inner()` 仅在 `test-support` 下公开，生产 API 不暴露 `taffy` 类型。`taffy` 仍是引擎内部布局实现，应用不需要声明该依赖。
 
 #### 4.9.1 三层职责边界
 
 | 层 | 职责 |
 |---|---|
 | **引擎** | 三个样式类型 + `bind_style` 依赖追踪入口 + `Color` / `ColorResolver`；**不做** DSL、不持有主题语义 |
-| **应用层 `ui_kit`** | ① 薄 `StyleBuilder`（只覆盖高频组合：间距 / 尺寸 / 颜色 / flex 常用组合）② 主题语义色 / 调色板 / 深浅色映射 ③ `typography_*` 之类的 `TextStyle` 预设 |
+| **引擎 `ui_core::paint::style_builder`** | ① 薄 `StyleBuilder` / `PaintBuilder`（只覆盖高频组合：间距 / 尺寸 / 颜色 / flex 常用组合） |
+| **应用层 `ui_kit`** | ① 主题语义色 / 调色板 / 深浅色映射 ② `typography_*` 之类的 `TextStyle` 预设 |
 
 **薄 builder 的硬边界**（写进 code review 约定，防止长成通用 DSL；迁移期（P2）曾有 13 处 `impl Styled`、14 处 `refine_style`、
 30 处 `.when(` 需按此重写，P5-2 删除旧模块后归零 —— 见 §6.10「禁止为过测试留兼容层」）：
 
-1. 只允许「字段直写 + 少量命名组合」，方法集合固定且设上限（**`StyleBuilder` 35 + `PaintBuilder` 6**，清单见 §12.3；旧文写的「约 26 个」已废止）。
+1. 只允许「字段直写 + 少量命名组合」，方法集合固定且设上限（**`StyleBuilder` 34 + `PaintBuilder` 5**，清单见 §12.3；旧文写的「约 26 个」已废止）。
 2. 不引入宏、字符串选择器、嵌套闭包 DSL、可插拔扩展 trait。
 3. 不提供 `.when()` / `.map()` / 条件样式；不实现 `Styled` / `StyleRefinement` 形状。
 4. 复杂布局（grid、多层嵌套、自定义 measure）、状态样式、clip / 渐变一律直接构造 `Style` / `PaintSpec` + `bind_style`。
@@ -1317,7 +1317,7 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 
 | 类别 | 例子 | 何时求值 | 变化通道 |
 |---|---|---|---|
-| **静态结构（布局）** | `display` / flex 方向 / `gap` / padding / `align_items` / grid 定义 | 挂载时一次写入 `Style.inner` | 只有结构变更（增删子节点、`LayoutOverride`）才重写并标 `LAYOUT` |
+| **静态结构（布局）** | `display` / flex 方向 / `gap` / padding / `align_items` / grid 定义 | 挂载时经 typed setter / `StyleBuilder` 一次写入 | 只有结构变更（增删子节点、`LayoutOverride`）才重写并标 `LAYOUT` |
 | **静态结构（裁剪）** | `Clip::{None, Bounds}` | 挂载时一次写入 `Style.clip` | 重写 `Style` ⇒ `LAYOUT` + 子树 lane 重建 |
 | **静态绘制** | 背景 / 内侧边框 / 圆角 / 阴影 / 渐变 | 挂载时一次写入 `PaintSpec` | 重新 `paint(..)` ⇒ `PAINT` |
 | **动态属性** | 背景色、文字色、透明度、`enabled` / `disabled`、hover / 焦点 / 选中态、可见性、光标、命中开关 | **依赖追踪按需重算**，只对被失效节点 | `Signal` / `Transient` + `bind_style` / `bind_text` / `bind_a11y`（§3.3 / §3.10） |
@@ -1329,18 +1329,19 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
   ⇒ 子图元 0.25）。**不作用于 `Canvas` 内容**（应用自己生成的图元，引擎不解其颜色；R1），**作用于** `GeometryDraw`
   （`color` 被乘）。没有隔离组（R2）：重叠的半透明子树按图元逐个相乘，视觉上比 CSS `isolation: isolate` 更「实」。
   详见 §11.14。
-- 内侧边框宽度是**绘制**宽度（编码期吸附成整数物理像素），**不参与布局**；要为边框留空间请用 `Style.inner.border`（taffy 布局边框）。
+- 内侧边框宽度是**绘制**宽度（编码期吸附成整数物理像素），**不参与布局**；要为边框留空间请用 `Style::border` / `StyleBuilder::border`（taffy 布局边框）。
 - `Clip` v1 只有 `None` / `Bounds`（直角、按 padding box、只裁子树）；圆角裁剪用图元 `ClipRect`（`Canvas::push_clip`）。
 - taffy 的 `calc()` 不解析：`Dimension::Calc` 在 v1 按 0 处理，应用层不要用 `calc`。
 
 #### 4.9.3 接口草图（与源码一致）
 
 ```rust
-// paint/style.rs —— 三个类型都只派生 Clone / Debug / Default / PartialEq，没有方法
+// paint/style.rs —— 三个类型派生 Clone / Debug / Default / PartialEq；布局字段私有，经 typed setter 写入
 pub struct Style {
-    pub inner: taffy::Style<SmolStr>,   // 布局属性（taffy 0.15.0，CustomIdent = SmolStr）
+    inner: taffy::Style<SmolStr>,       // taffy 0.15.0，CustomIdent = SmolStr；字段私有
     pub clip: Clip,                     // Clip::{None, Bounds}
 }
+// impl Style: display / position / flex / gap / padding / margin / border / size / inset / overflow … 共 39 个 typed setter
 pub struct PaintSpec {
     pub background: Color,              // Color::TRANSPARENT（默认）= 不画背景
     pub border: Option<Border>,         // 内侧边框（绘制宽度）
@@ -1365,7 +1366,7 @@ pub struct StylePatch {
 }
 
 // 挂载期：静态结构 + 静态绘制 + 动态补丁（三个入口，各司其职）
-let panel_style = StyleBuilder::new().flex_col().gap(8.0).px(16.0).build();   // ui_kit 薄 builder → Style（值）
+let panel_style = StyleBuilder::new().flex_col().gap(8.0).px(16.0).build();   // ui_core::paint::style_builder → Style（值）
 let panel_paint = PaintSpec {
     background: theme.role(Role::SurfaceRaised),                              // 挂载时解析成 Color
     corner_radius: [6.0; 4],
@@ -1385,8 +1386,9 @@ let panel = NodeBuilder::boxed()
     .build(tree, parent)?;
 ```
 
-> `StyleBuilder` 在 **`ui_kit`**，不在引擎：`NodeBuilder::style` 收的是**整值** `Style`。引擎侧没有任何 builder 方法，
-> 也没有 `Style::new` / 布局字段访问器。
+> `StyleBuilder` / `PaintBuilder` 在 **`ui_core::paint::style_builder`**（B1b 从 `ui_kit` 迁入）：`NodeBuilder::style` 收的是
+> **整值** `Style`。`Style` 提供 typed setter（`display` / `position` / `padding` / `gap` / `size` / `inset` …）与只读
+> `inner()`（仅 `test-support` 下公开）；`ui_kit` 与 widgets 只消费这些面，不再直接写 taffy 字段。
 
 #### 4.9.4 动态属性的失效流程（以 `disabled` 为例）
 
@@ -1442,13 +1444,13 @@ app.write(&disabled, true);   // → 一个节点 → 一个 lane → 一个 dam
 
 `full-refresh oracle`（§3.8）与 L1 布局测试（§6.2）用于证明「没有漏掉任何应更新的节点」。
 
-#### 4.9.5 `ui_kit::StyleBuilder` 落点（v2.1 新增要求）
+#### 4.9.5 `StyleBuilder` 落点（v2.1 要求；B1b 已迁入 `ui_core`）
 
 | 项 | 内容 |
 |---|---|
-| 依赖前置 | `crates/ui_kit/Cargo.toml` 增加 `ui_core = { workspace = true }` + `taffy = { workspace = true }`；根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补 |
-| 交付位置 | **P2-1a 的首个交付物**，先于任何 `ui_kit` 组件迁移（`style` 被约 100 处引用） |
-| 方法面 | **已定稿（v2.3 / P2-1a）**：`StyleBuilder` **35 个方法**（含 `new` / `build`；flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` …）+ `PaintBuilder` **6 个方法**（`new` / `background` / `rounded` / `border` / `shadow` / `build`）；两个 builder 拆开是因为 `Style` / `PaintSpec` 是两条独立失效通道（§12.3）。布局 `border` 与绘制 `border` **必须成对书写**（前者占位不画像素、后者画线不参与布局） |
+| 依赖前置 | `ui_core` 自带 `taffy`；`ui_kit` 保留 `taffy` 只为 9 个生产文件把 taffy 枚举作为 typed setter 入参（B1b 审查口径），不再持有 builder 模块 |
+| 交付位置 | `crates/ui_core/src/paint/style_builder.rs`（**B1b** 从 `ui_kit` 迁入；`crates/ui_kit/src/style_builder.rs` 已删除，无兼容层） |
+| 方法面 | `StyleBuilder` **34 个方法**（含 `new` / `build`；flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` …）+ `PaintBuilder` **5 个方法**（`new` / `background` / `rounded` / `border` / `build`）；单字段写入由 `Style` 的 typed setter 承担（`display` / `position` / `align_self` / 百分比尺寸 / `min_size` / `max_size` / `overflow` / `inset` / 单边 `gap` / padding），只读 `inner()` 仅 `test-support` 下公开。两个 builder 拆开是因为 `Style` / `PaintSpec` 是两条独立失效通道（§12.3）。布局 `border` 与绘制 `border` **必须成对书写**（前者占位不画像素、后者画线不参与布局） |
 | 禁止 | `Styled` / `StyleRefinement` / `refine_style` / `.when()` / `.map()` / 宏；不得返回可继续链式修改的对象 |
 | 验收 | `ui_kit` 内 `.when(`（30 处 / 13 文件）与 `refine_style`（14 处）全部改写成 `bind_style` + `Signal`，**不留兼容层** |
 
@@ -3705,7 +3707,7 @@ impl App {
 ## 12. 应用层实现规格（`ui_kit` / kit / kytrix 外壳 / 页面接线，已实现）
 
 > **状态：应用层全部完成并接线**（P2 `ui_kit` → P3 契约层 + 20 widgets → P4 六个 `*_ui` + kytrix 外壳 → P5 删除旧引擎 →
-> P6 三端验收）。`ui_kit` 只剩 `theme/` + `kit/` + `style_builder.rs`（P5-2 `6239b84` 删除 37 个旧模块/目录共 25,471 行）；
+> P6 三端验收）。`ui_kit` 只剩 `theme/` + `kit/`（P5-2 `6239b84` 删除 37 个旧模块/目录共 25,471 行；`style_builder.rs` 已由 B1b 迁入 `ui_core`）；
 > `gpui-kit` 与 gpui 全族已从 workspace / `Cargo.lock` 删除（P5-3 `f1ff4944`）；`KYTRIX_UI_CORE_MANIFEST` 过渡开关已删除
 > （§12.6 只作历史记录，终态不存在该变量）。
 > 本章是**应用层的实现后规格**：模块形态 / 主题基座 / 薄 builder / kit 组件契约 / 构建期资产 / 计划修正 /
@@ -3718,10 +3720,10 @@ impl App {
 | 项 | 事实 |
 |---|---|
 | 新模块 | `crates/ui_kit/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/ui_kit/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown/` 6 个模块 + `parse_tests`） |
-| 旧模块（已删除） | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/`（9 文件）共 **37 个模块/目录、25,471 行**，已由 **P5-2**（`6239b84`）删除；`src/` 只剩 `kit/`、`theme/`、`style_builder.rs`、`lib.rs`（§12.7） |
+| 旧模块（已删除） | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/`（9 文件）共 **37 个模块/目录、25,471 行**，已由 **P5-2**（`6239b84`）删除；`src/` 只剩 `kit/`、`theme/`、`lib.rs`（`style_builder.rs` 已由 B1b 迁入 `ui_core`，§12.7） |
 | 迁移形态裁决 | **模块级增量**：新模块用新路径与新 API，旧模块不改造、不桥接、不 re-export；**不是**公开 API 兼容层（AGENTS §1.1） |
 | 依赖 | `crates/ui_kit/Cargo.toml` 运行时只依赖 `ui_core`（构建期 `resvg`/`usvg`/`image`）；`gpui-kit` 已随 P5-2 删除，`grep -r gpui crates/ui_kit` = **0**（`cargo tree -p ui_kit \| grep gpui` 亦 0） |
-| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **772 passed**（P5-2 后；P2 时点 1,139） |
+| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **765 passed**（B1b 后实测；P2 时点 1,139） |
 
 ### 12.2 主题基座（`theme/`）
 
@@ -3737,14 +3739,15 @@ impl App {
 | gamut | 接受引擎 `ColorResolver` 的映射，用 golden 锁定；对比度地板 **58 条**全量移植（8 组 gamut golden + tonal 逐值 golden） |
 | 禁止 | 主题**不**持有资源、**不**做动画（切换动画归组件层）；旧 `style/` 的 `.hsla` 取值路径**已全删** |
 
-### 12.3 薄 builder（`style_builder.rs`）：`StyleBuilder` 35 + `PaintBuilder` 6
+### 12.3 薄 builder（`ui_core::paint::style_builder`）：`StyleBuilder` 34 + `PaintBuilder` 5
 
 两个 builder **分开**，因为 `Style` 与 `PaintSpec` 是两条独立失效通道（`LAYOUT` / `PAINT`），合并会让「只改颜色」误触布局。
 
 | 项 | 规格 |
 |---|---|
-| `StyleBuilder` | **35 个方法**（含 `new` / `build`）：flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` 等；`build() -> Style` |
-| `PaintBuilder` | **6 个方法**：`new` / `background` / `rounded` / `border` / `shadow` / `build`；`build() -> PaintSpec`（`shadow` 仍是**单层**入口：`Shadows::from(shadow)`，多层直接构造 `Shadows::new`） |
+| `StyleBuilder` | **34 个方法**（含 `new` / `build`）：flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` 等；`build() -> Style` |
+| `PaintBuilder` | **5 个方法**：`new` / `background` / `rounded` / `border` / `build`；`build() -> PaintSpec`（阴影直接构造 `Shadows`） |
+| `Style` typed setter | 单字段写入：`display` / `position` / `flex_direction` / `flex_grow` / `flex_shrink` / `align_items` / `align_self` / `justify_content` / `justify_center` / `overflow` / `gap_width` / `gap_height` / padding 四向 / `margin_sides` / `border` / `size_length` / `size_percent` / `width` / `width_length` / `height` / `height_length` / `height_percent` / `min_width` / `min_height` / `min_height_length` / `max_width` / `max_height` / `inset` / 四向 `inset_*`；只读 `inner()` 仅 `test-support` 下公开（生产 `pub(crate)`） |
 | 两套 border | `StyleBuilder::border` = **taffy 占位**（不画像素）；`PaintBuilder::border` = **画线**（不参与布局）。迁移旧 `.border_1()` **必须成对书写**，否则要么没线、要么错位 |
 | 不做 | 不提供 `text_size` / `font_weight` / `line_height`（直接用 `TextStyle`）；不处理 `StylePatch` 动态字段；**不自动置 `affects_layout`**；无宏 / 无字符串选择器 / 无嵌套闭包 DSL / 无可插拔扩展 trait / 无 `.when()` / 无 `Styled` |
 | 硬边界理由 | D24 + I17：builder 只在**挂载期调用一次**，返回值是 `Style` / `PaintSpec` **值**，不是可持续修改的对象；运行期变化只经 `Signal` → `StylePatch` |
@@ -3818,7 +3821,7 @@ impl App {
 | 3 | 「`Node` 328 B（硬上限 336 B）」（§11.2） | **`Node` 336 B = 上限，无余量** | `node/tree/tests.rs` 两处 `assert_eq!(size_of::<Node>(), 336)`；E13 的 `paint_opacity: f32` +4 B（**对齐后 +8 B**） |
 | 4 | `PaintSpec` 只有单层 `shadow` 字段（§4.9 / 附录草图形） | **`PaintSpec.shadows: Shadows`** + `MAX_SHADOWS = 4` + `ShadowSpec.spread` | `paint/style.rs`：`pub shadows: Shadows`、`pub const MAX_SHADOWS`、`pub struct ShadowSpec{.., spread, ..}` |
 | 5 | `StylePatch.opacity` = 「逐图元 alpha，不作用于 Geometry」（§4.9.2） | **组不透明度**（× 祖先链，作用于引擎图元含 `GeometryDraw.color`，**不**作用于 `Canvas`） | `paint/style.rs` 字段文档 + `node/tree/content.rs` 的折算 + `paint/pass.rs` 的传播 |
-| 6 | 薄 builder「约 26 个方法」（§1.3 / §4.9.5） | **`StyleBuilder` 35 + `PaintBuilder` 6** | `style_builder.rs` 的 `pub fn` 计数 + 文件头注释自述 |
+| 6 | 薄 builder「约 26 个方法」（§1.3 / §4.9.5） | **`StyleBuilder` 34 + `PaintBuilder` 5**（`ui_core/src/paint/style_builder.rs`） | `style_builder.rs` 的 `pub fn` 计数 + 文件头注释自述 |
 | 7 | §7.4「浮层 ⇒ `Menu`/`MenuItem`/`Dialog`」 | 浮层包装**默认 `GenericContainer`**，角色由 `OverlayOptions::a11y` 显式声明 | `a11y/mapping.rs`（`overlay_slot ⇒ GenericContainer`）；E12 审查 F1 |
 | 8 | §7.4「`A11yRole` 没有 `StaticText`」等映射缺口 | 补齐 E9/E12/E15 新角色行与集合语义（§7.4 新表） | §11.11 / §11.13 / §11.15 |
 | 9 | `Separator` 的 AccessKit 映射未说明 | 引擎枚举 `Separator` → AccessKit `Role::Splitter`（**引擎无 `Splitter` 变体**） | `a11y/mapping.rs` 注释 + 映射测试 |
@@ -4716,14 +4719,14 @@ kytrix（外壳）         widget_gallery_ui        market_participants_ui / pro
                        │                        │
                        └───────────┬────────────┴──────────┐
                                    ▼                       ▼
-                    ui_kit（设计系统：theme/ 64 角色 · kit/ 33 组件族 · style_builder 35+6 · build.rs 55 图标）
+                    ui_kit（设计系统：theme/ 64 角色 · kit/ 33 组件族 · build.rs 55 图标；builder 34+5 在 ui_core）
                                    │
                                    ▼
                     ui_core（引擎：app/window/layout/text/paint/geometry/render×3/a11y/platform；
                               features: test-support / hud / automation）
 ```
 
-- **单向依赖**：上层只见下层；`ui_kit` **只见引擎类型**（I9）；`widget` 只见 `ui_core` + `ui_kit::{kit,theme,style_builder}` + `i18n`；
+- **单向依赖**：上层只见下层；`ui_kit` **只见引擎类型**（I9）；`widget` 只见 `ui_core`（含 `paint::style_builder`）+ `ui_kit::{kit,theme}` + `i18n`；
   `*_ui` / `kytrix` 只见三者 + 业务服务 crate。`pub trait` 全仓仍为 **0**（组件用五段式约定，不用 trait）。
 - **workspace**：**42 个成员**（基线 43，`widget_tokio_runtime` 已删）；`crates/` 下 **23 个顶层目录**（含 `widgets/`，其下 **20 个 widget crate**）。
 - **零 gpui（判据与实测）**：
@@ -4781,10 +4784,10 @@ kytrix（外壳）         widget_gallery_ui        market_participants_ui / pro
 
 | 项 | 数字 | 来源 |
 |---|---|---|
-| `cargo test --workspace`（默认特性） | **8,581 passed / 0 failed / 36 ignored**（102 个测试二进制） | `.review/mig-p6-1-test-workspace.log`（P6-1 合并后；P5-3 时 8,556） |
-| `ui_core --lib`（`--features hud,test-support`） | **2,305 passed / 1 ignored**；`--test snapshot` **11 passed**，42 张 golden（3 平台 × 14）零 diff | `.review/mig-e24-g3-test.log`、E24 / P3-1j 台账 |
+| `cargo test --workspace`（默认特性） | **8,604 passed / 0 failed / 30 ignored**（102 个测试二进制；B1b 后实测） | `.review/mig-p6-1-test-workspace.log`（P6-1 合并后；P5-3 时 8,556） |
+| `ui_core --lib`（`--features hud,test-support`） | **2,344 passed / 1 ignored**（B1b 后实测）；`--test snapshot` **11 passed**，42 张 golden（3 平台 × 14）零 diff | `.review/mig-e24-g3-test.log`、E24 / P3-1j 台账 |
 | `ui_core` 自动化面 | **6** 条（`automation` feature，不依赖 test-support） | `test-ledger/p6-1.md` §2 |
-| `ui_kit --lib` | **772**（kit 715 / theme 49 / style_builder 8；P2 时点 1,139，P5-2 随旧模块删 −367） | `test-ledger/p5-2.md` |
+| `ui_kit --lib` | **765**（kit 716 / theme 49；`style_builder` 8 项随模块迁入 `ui_core`；B1b 后实测） | `test-ledger/p5-2.md` |
 | `widget` 契约层 | **183**（P3-1 起点 131） | §13.8 |
 | `widget_registry` / `widget_gallery_ui` | **28** / **33** | `test-ledger/p3-3a.md` / `p3-3b.md` |
 | 20 个 widget crate | 8（`empty`）… **353**（`candlestick`）；合计 **2,644** | `test-ledger/*.md`、`mig-p6-1-test-workspace.log` |

@@ -800,7 +800,7 @@ fn hidden_by_skipped_ancestors(tree: &NodeTree, node: NodeId, a11y_parent: Optio
             .unwrap_or_else(|| over.is_some_and(|over| over.hidden));
         if hidden
             || target.style_patch().visible == Some(false)
-            || matches!(target.style().inner.display, taffy::style::Display::None)
+            || matches!(target.style().inner().display, taffy::style::Display::None)
         {
             return true;
         }

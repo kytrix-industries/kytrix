@@ -27,7 +27,10 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
-    paint::style::{PaintSpec, StylePatch},
+    paint::{
+        style::{PaintSpec, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::TextStyle,
     window::WindowId,
 };
@@ -38,7 +41,6 @@ use ui_kit::{
         dialog::{Dialog, DialogBuilder},
         input::{self, InputNode, InputSpec, InputState},
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::venue::VenueDisplay;

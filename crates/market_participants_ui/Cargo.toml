@@ -10,7 +10,6 @@ futures.workspace = true
 i18n.workspace = true
 log.workspace = true
 smol_str.workspace = true
-taffy.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 

@@ -22,6 +22,7 @@ use ui_core::{
         color::{Color, ColorResolver},
         primitive::Border,
         style::{PaintSpec, Style, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     text::{TextStyle, TextWrap},
     window::{WindowId, WindowOptions},
@@ -56,7 +57,6 @@ use ui_kit::{
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
         tree::{Tree, TreeItem, TreeOptions},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{appearance::Appearance, components::ControlSize, handle::ThemeHandle, role::Role},
 };
 

@@ -8,11 +8,11 @@ use ui_core::{
     event::Event,
     math::Rect,
     node::id::NodeId,
+    paint::style_builder::StyleBuilder,
     window::{WindowId, WindowState},
 };
 use ui_kit::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::StyleBuilder,
     theme::handle::ThemeHandle,
 };
 use updater_ui::{indicator::UpdateIndicator, updater::Updater};

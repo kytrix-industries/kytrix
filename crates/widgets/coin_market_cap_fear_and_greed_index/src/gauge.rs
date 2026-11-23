@@ -301,7 +301,7 @@ impl Gauge {
         parent: NodeId,
     ) -> Result<NodeId, EngineError> {
         let theme = cx.theme().clone();
-        let style = ui_kit::style_builder::StyleBuilder::new()
+        let style = ui_core::paint::style_builder::StyleBuilder::new()
             .flex_1()
             .min_width_0()
             .min_height_0()

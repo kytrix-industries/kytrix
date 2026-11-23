@@ -2,10 +2,9 @@ use i18n::language::codes::LanguageCode;
 use ui_core::{
     math::Point,
     node::{builder::NodeBuilder, id::NodeId},
-    paint::primitive::Primitive,
+    paint::{primitive::Primitive, style_builder::StyleBuilder},
     window::WindowId,
 };
-use ui_kit::style_builder::StyleBuilder;
 use widget::test_support::WidgetTestApp;
 
 use super::{

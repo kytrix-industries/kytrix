@@ -9,9 +9,10 @@ use ui_core::{
         color::Color,
         primitive::{ClipRect, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::StyleBuilder,
     },
 };
-use ui_kit::{style_builder::StyleBuilder, theme::handle::ThemeHandle};
+use ui_kit::theme::handle::ThemeHandle;
 use widget::cx::WidgetCx;
 
 use super::model::{GroupedLevel, WINDOW_SIZES, interpolated_ratio};

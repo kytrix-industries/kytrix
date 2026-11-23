@@ -23,6 +23,7 @@ use ui_core::{
     paint::{
         color::Color,
         style::{FocusRing, PaintSpec, Style},
+        style_builder::StyleBuilder,
     },
     text::TextStyle,
     window::{WindowId, WindowOptions},
@@ -125,88 +126,64 @@ pub(crate) fn ring() -> FocusRing {
 }
 
 fn root_style() -> Style {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::percent(1.0),
-    };
-    style.inner.flex_direction = taffy::style::FlexDirection::Column;
-    style.inner.align_items = taffy::style::AlignItems::START;
-    style.inner.padding = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentage::length(ROOT_SIDE_PADDING),
-        right: taffy::style::LengthPercentage::length(ROOT_SIDE_PADDING),
-        top: taffy::style::LengthPercentage::length(WINDOW_TOP_INSET + ROOT_TOP_PADDING),
-        bottom: taffy::style::LengthPercentage::length(ROOT_BOTTOM_PADDING),
-    };
+    let mut style = StyleBuilder::new()
+        .size_full()
+        .flex_col()
+        .padding_sides(
+            WINDOW_TOP_INSET + ROOT_TOP_PADDING,
+            ROOT_SIDE_PADDING,
+            ROOT_BOTTOM_PADDING,
+            ROOT_SIDE_PADDING,
+        )
+        .build();
+    style.align_items(taffy::style::AlignItems::START);
     style
 }
 
 fn background_style() -> Style {
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(0.0),
-        top: taffy::style::LengthPercentageAuto::length(0.0),
-        right: taffy::style::LengthPercentageAuto::auto(),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::percent(1.0),
-    };
-    style
+    StyleBuilder::new()
+        .absolute()
+        .left(0.0)
+        .top(0.0)
+        .size_full()
+        .build()
 }
 
 fn header_style() -> Style {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::length(HEADER_HEIGHT),
-    };
-    style.inner.flex_direction = taffy::style::FlexDirection::Column;
-    style.inner.align_items = taffy::style::AlignItems::START;
-    style.inner.gap = taffy::geometry::Size {
-        width: taffy::style::LengthPercentage::length(0.0),
-        height: taffy::style::LengthPercentage::length(HEADER_GAP),
-    };
-    style.inner.padding.left = taffy::style::LengthPercentage::length(HEADER_LEFT_INSET);
+    let mut style = StyleBuilder::new()
+        .width_full()
+        .height(HEADER_HEIGHT)
+        .flex_col()
+        .build();
+    style
+        .align_items(taffy::style::AlignItems::START)
+        .gap_height(HEADER_GAP)
+        .padding_sides(0.0, 0.0, 0.0, HEADER_LEFT_INSET);
     style
 }
 
 fn text_line_style(height: f32) -> Style {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::length(height),
-    };
-    style
+    StyleBuilder::new().width_full().height(height).build()
 }
 
 fn content_style() -> Style {
-    let mut style = Style::default();
-    style.inner.size.width = taffy::style::Dimension::length(CONTENT_WIDTH);
-    style.inner.flex_direction = taffy::style::FlexDirection::Column;
-    style.inner.align_items = taffy::style::AlignItems::START;
-    style.inner.gap = taffy::geometry::Size {
-        width: taffy::style::LengthPercentage::length(0.0),
-        height: taffy::style::LengthPercentage::length(ROW_GAP),
-    };
-    style.inner.margin.top = taffy::style::LengthPercentageAuto::length(CONTENT_MARGIN_TOP);
+    let mut style = StyleBuilder::new().width(CONTENT_WIDTH).flex_col().build();
+    style
+        .align_items(taffy::style::AlignItems::START)
+        .gap_height(ROW_GAP)
+        .margin_sides(CONTENT_MARGIN_TOP, 0.0, 0.0, 0.0);
     style
 }
 
 fn row_style(height: f32) -> Style {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::length(height),
-    };
-    style.inner.flex_direction = taffy::style::FlexDirection::Row;
-    style.inner.align_items = taffy::style::AlignItems::START;
-    style.inner.gap = taffy::geometry::Size {
-        width: taffy::style::LengthPercentage::length(COLUMN_GAP),
-        height: taffy::style::LengthPercentage::length(0.0),
-    };
+    let mut style = StyleBuilder::new()
+        .width_full()
+        .height(height)
+        .flex_row()
+        .build();
+    style
+        .align_items(taffy::style::AlignItems::START)
+        .gap_width(COLUMN_GAP);
     style
 }
 

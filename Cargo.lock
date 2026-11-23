@@ -3866,7 +3866,6 @@ dependencies = [
  "market_participants_connector",
  "market_participants_model",
  "smol_str",
- "taffy",
  "thiserror 2.0.21",
  "tokio",
  "ui_core",

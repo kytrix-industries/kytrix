@@ -49,10 +49,7 @@ use crate::{
         id::NodeId,
         signal::{Derived, Signal, SignalId, SignalRef, SignalScope, StateStore, Transient},
     },
-    paint::{
-        color::Color,
-        style::{Clip, Cursor},
-    },
+    paint::{color::Color, style::Cursor, style_builder::StyleBuilder},
     platform::dispatcher::{Dispatcher, UserTask},
     render::{AtlasAllocator, MIN_ATLAS_PAGE},
     resources::{DecodeState, PendingResource, ResourceCache},
@@ -291,18 +288,11 @@ fn default_bindings() -> Vec<KeyBinding> {
 }
 
 fn overlay_style(origin: Point) -> crate::paint::style::Style {
-    let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-    inner.position = taffy::style::Position::Absolute;
-    inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(origin.x),
-        right: taffy::style::LengthPercentageAuto::auto(),
-        top: taffy::style::LengthPercentageAuto::length(origin.y),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
-    crate::paint::style::Style {
-        inner,
-        clip: Clip::None,
-    }
+    StyleBuilder::new()
+        .absolute()
+        .left(origin.x)
+        .top(origin.y)
+        .build()
 }
 
 #[derive(Clone)]

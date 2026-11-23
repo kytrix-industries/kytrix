@@ -26,13 +26,11 @@ use ui_core::{
         color::Color,
         primitive::{Border, ClipRect, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::StyleBuilder,
     },
     text::{ShapedTextHandle, TextStyle},
 };
-use ui_kit::{
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
-};
+use ui_kit::theme::{handle::ThemeHandle, resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
 
 use super::model::{AgeBucket, DisplayPrecision, TimelineSnapshot, age_bucket, now_millis};

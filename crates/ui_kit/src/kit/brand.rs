@@ -1,7 +1,6 @@
 use std::fmt;
 
 use smol_str::SmolStr;
-use taffy::style::Dimension;
 use ui_core::{
     a11y::A11yOverride,
     app::App,
@@ -147,8 +146,7 @@ impl Brand {
         let resource = self.resource_for(app, window, scale)?;
 
         let mut style = Style::default();
-        style.inner.size.width = Dimension::length(frame.width);
-        style.inner.size.height = Dimension::length(frame.height);
+        style.size_length(frame.width, frame.height);
         let mut builder = NodeBuilder::image(resource.id, ImageFit::Contain)
             .image_modulation(Color::WHITE)
             .style(style);

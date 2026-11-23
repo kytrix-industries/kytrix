@@ -14,6 +14,7 @@ use crate::{
         color::Color,
         primitive::{Border, Gradient, GradientKind, Image},
         style::{Clip, PaintSpec, ShadowSpec, Shadows, Style},
+        style_builder::StyleBuilder,
     },
     test_support::app::TestApp,
     window::WindowOptions,
@@ -598,21 +599,14 @@ fn style_node(
 }
 
 fn abs_style(rect: Rect, clip: Clip) -> Style {
-    let inner = taffy::Style::<SmolStr> {
-        position: taffy::style::Position::Absolute,
-        size: taffy::geometry::Size {
-            width: taffy::style::Dimension::length(rect.size.width),
-            height: taffy::style::Dimension::length(rect.size.height),
-        },
-        inset: taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(rect.origin.x),
-            top: taffy::style::LengthPercentageAuto::length(rect.origin.y),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        },
-        ..taffy::Style::<SmolStr>::DEFAULT
-    };
-    Style { inner, clip }
+    let mut style = StyleBuilder::new()
+        .absolute()
+        .left(rect.origin.x)
+        .top(rect.origin.y)
+        .size(rect.size.width, rect.size.height)
+        .build();
+    style.clip = clip;
+    style
 }
 
 fn build_backdrop(app: &mut TestApp, root: NodeId, palette: &Palette) {

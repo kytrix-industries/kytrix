@@ -13,6 +13,7 @@ use crate::{
     paint::{
         color::Color,
         style::{Clip, FocusRing, PaintSpec, Style, StylePatch},
+        style_builder::StyleBuilder,
     },
     test_support::{
         app::TestApp,
@@ -1292,19 +1293,12 @@ fn container(app: &mut TestApp, parent: NodeId, rect: Rect, clip: Clip) -> NodeI
 }
 
 fn absolute_style(rect: Rect) -> Style {
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(rect.size.width),
-        height: taffy::style::Dimension::length(rect.size.height),
-    };
-    style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(rect.origin.x),
-        top: taffy::style::LengthPercentageAuto::length(rect.origin.y),
-        right: taffy::style::LengthPercentageAuto::auto(),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
-    style
+    StyleBuilder::new()
+        .absolute()
+        .left(rect.origin.x)
+        .top(rect.origin.y)
+        .size(rect.size.width, rect.size.height)
+        .build()
 }
 
 fn color(rgba: [u8; 4]) -> Color {

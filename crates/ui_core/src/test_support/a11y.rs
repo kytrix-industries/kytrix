@@ -600,11 +600,10 @@ mod tests {
         app.enable_a11y_capture();
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
+        let mut container_style = Style::default();
+        container_style.clip = Clip::Bounds;
         let container = NodeBuilder::boxed()
-            .style(Style {
-                clip: Clip::Bounds,
-                ..Style::default()
-            })
+            .style(container_style)
             .layout_override(Rect::new(0.0, 0.0, 100.0, 80.0))
             .a11y(A11yOverride {
                 label: Some(smol_str::SmolStr::new_static("盘口")),

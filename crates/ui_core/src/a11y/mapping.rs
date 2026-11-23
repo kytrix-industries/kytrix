@@ -521,7 +521,7 @@ pub(crate) fn is_hidden(
     if target.style_patch().visible == Some(false) {
         return true;
     }
-    if matches!(target.style().inner.display, taffy::style::Display::None) {
+    if matches!(target.style().inner().display, taffy::style::Display::None) {
         return true;
     }
     matches!(

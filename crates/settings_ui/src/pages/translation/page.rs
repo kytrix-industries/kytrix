@@ -13,7 +13,7 @@ use ui_core::{
     error::EngineError,
     event::{Action, Event},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::PaintSpec,
+    paint::{style::PaintSpec, style_builder::StyleBuilder},
     window::WindowId,
 };
 use ui_kit::{
@@ -21,7 +21,6 @@ use ui_kit::{
         input::{self, InputNode, InputSpec, InputState},
         select::{Select, SelectItem, SelectOptions},
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, role::Role},
 };
 

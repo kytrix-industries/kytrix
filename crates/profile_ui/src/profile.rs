@@ -1212,7 +1212,7 @@ impl TriggerBuild<'_> {
         let face = NodeBuilder::boxed()
             .id(TRIGGER_AVATAR_ID)
             .style(
-                ui_kit::style_builder::StyleBuilder::new()
+                ui_core::paint::style_builder::StyleBuilder::new()
                     .size(face_size, face_size)
                     .items_center()
                     .justify_center()
@@ -1230,7 +1230,7 @@ impl TriggerBuild<'_> {
             Some(texture) => {
                 NodeBuilder::image_pending(texture.pending, ui_core::node::image::ImageFit::Cover)
                     .style(
-                        ui_kit::style_builder::StyleBuilder::new()
+                        ui_core::paint::style_builder::StyleBuilder::new()
                             .size(face_size, face_size)
                             .build(),
                     )

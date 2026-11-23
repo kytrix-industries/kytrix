@@ -32,7 +32,7 @@ impl GalleryPage {
             window,
             parent,
             WORKSPACE_PAGES,
-            ui_kit::style_builder::StyleBuilder::new()
+            ui_core::paint::style_builder::StyleBuilder::new()
                 .absolute()
                 .top(0.0)
                 .left(0.0)
@@ -46,7 +46,7 @@ impl GalleryPage {
             app,
             window,
             root,
-            ui_kit::style_builder::StyleBuilder::new()
+            ui_core::paint::style_builder::StyleBuilder::new()
                 .absolute()
                 .top(0.0)
                 .left(0.0)

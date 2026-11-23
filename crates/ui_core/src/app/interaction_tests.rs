@@ -17,6 +17,7 @@ use crate::{
         color::Color,
         primitive::Primitive,
         style::{Clip, FocusRing, PaintSpec, Style, StylePatch},
+        style_builder::StyleBuilder,
     },
     window::{FrameOutcome, WindowId, WindowOptions},
 };
@@ -94,11 +95,7 @@ fn mount_override(app: &mut App, window: WindowId, parent: NodeId, rect: Rect) -
 }
 
 fn mount_scroll_container(app: &mut App, window: WindowId, height: f32) -> NodeId {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(height),
-    };
+    let mut style = StyleBuilder::new().size(200.0, height).build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -210,14 +207,7 @@ fn app_registered_geometry_reaches_the_encoder() {
     let id = app.geometry_mut().insert(desc).expect("valid geometry");
     let root = app.window(window).expect("window").tree().root();
     NodeBuilder::geometry(id)
-        .style({
-            let mut style = Style::default();
-            style.inner.size = taffy::geometry::Size {
-                width: taffy::style::Dimension::length(100.0),
-                height: taffy::style::Dimension::length(100.0),
-            };
-            style
-        })
+        .style(StyleBuilder::new().size(100.0, 100.0).build())
         .build(app.window_mut(window).expect("window").tree_mut(), root)
         .expect("mount geometry");
     frame(&mut app, window);
@@ -555,11 +545,7 @@ fn text_caret_rect_follows_ancestor_scroll() {
 #[test]
 fn scroll_offset_is_clamped_in_the_same_frame_as_a_resize() {
     let (_rt, mut app, window) = setup();
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::percent(1.0),
-    };
+    let mut style = StyleBuilder::new().size_full().build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -685,17 +671,10 @@ fn a_one_pixel_scroll_frame_rebuilds_nothing_and_damages_only_the_viewport() {
 }
 
 fn mount_nested_scroll_container(app: &mut App, window: WindowId, outer: NodeId) -> NodeId {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
-    style.inner.margin = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(0.0),
-        right: taffy::style::LengthPercentageAuto::length(0.0),
-        top: taffy::style::LengthPercentageAuto::length(300.0),
-        bottom: taffy::style::LengthPercentageAuto::length(0.0),
-    };
+    let mut style = StyleBuilder::new()
+        .size(200.0, 100.0)
+        .margin_sides(300.0, 0.0, 0.0, 0.0)
+        .build();
     style.clip = Clip::Bounds;
     NodeBuilder::boxed()
         .style(style)
@@ -790,7 +769,7 @@ fn a_virtual_list_inside_a_page_scroll_stays_visible_after_scrolling_the_page() 
             .expect("inner")
             .style()
             .clone();
-        style.inner.position = taffy::style::Position::Relative;
+        style.position(taffy::style::Position::Relative);
         let _ = app
             .window_mut(window)
             .expect("window")
@@ -1404,11 +1383,7 @@ fn scrolling_moves_the_offset_into_the_slot_table_without_touching_lanes() {
 fn wheel_falls_through_to_the_outer_container_when_the_inner_cannot_scroll() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 150.0);
-    let mut inner_style = Style::default();
-    inner_style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
+    let mut inner_style = StyleBuilder::new().size(200.0, 100.0).build();
     inner_style.clip = Clip::Bounds;
     let inner = NodeBuilder::boxed()
         .style(inner_style)
@@ -1569,12 +1544,7 @@ fn scroll_never_reevaluates_bind_style() {
 
 fn virtual_app() -> (tokio::runtime::Runtime, App, WindowId, NodeId) {
     let (rt, mut app, window) = setup();
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
-    style.inner.position = taffy::style::Position::Relative;
+    let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -1684,12 +1654,7 @@ fn anchor_placement_converges_with_a_root_border() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
     let mut root_style = Style::default();
-    root_style.inner.border = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentage::length(1.0),
-        right: taffy::style::LengthPercentage::length(1.0),
-        top: taffy::style::LengthPercentage::length(1.0),
-        bottom: taffy::style::LengthPercentage::length(1.0),
-    };
+    root_style.border(1.0);
     app.window_mut(window)
         .expect("window")
         .tree_mut()
@@ -1713,12 +1678,7 @@ fn anchor_placement_converges_with_a_root_border() {
         )
         .expect("overlay");
     let overlay_node = overlay.node();
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(60.0),
-        height: taffy::style::Dimension::length(30.0),
-    };
+    let style = StyleBuilder::new().absolute().size(60.0, 30.0).build();
     app.window_mut(window)
         .expect("window")
         .tree_mut()
@@ -1771,12 +1731,7 @@ fn anchored_above_overlay_sits_above_the_anchor() {
         )
         .expect("overlay");
     let overlay_node = overlay.node();
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(60.0),
-        height: taffy::style::Dimension::length(30.0),
-    };
+    let style = StyleBuilder::new().absolute().size(60.0, 30.0).build();
     app.window_mut(window)
         .expect("window")
         .tree_mut()
@@ -1818,18 +1773,12 @@ fn overlay_is_last_and_closes_on_outside_click() {
         )
         .expect("overlay");
     let overlay_node = overlay.node();
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(200.0),
-        top: taffy::style::LengthPercentageAuto::length(10.0),
-        right: taffy::style::LengthPercentageAuto::auto(),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(80.0),
-        height: taffy::style::Dimension::length(80.0),
-    };
+    let style = StyleBuilder::new()
+        .absolute()
+        .left(200.0)
+        .top(10.0)
+        .size(80.0, 80.0)
+        .build();
     app.window_mut(window)
         .expect("window")
         .tree_mut()
@@ -2142,12 +2091,7 @@ fn stale_focus_is_cleared_and_tab_recovers() {
 #[test]
 fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
     let (_rt, mut app, window) = setup();
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
-    style.inner.position = taffy::style::Position::Relative;
+    let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -2185,12 +2129,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
         .expect("window")
         .tree_mut()
         .set_style(container, {
-            let mut style = Style::default();
-            style.inner.size = taffy::geometry::Size {
-                width: taffy::style::Dimension::length(200.0),
-                height: taffy::style::Dimension::length(200.0),
-            };
-            style.inner.position = taffy::style::Position::Relative;
+            let mut style = StyleBuilder::new().size(200.0, 200.0).relative().build();
             style.clip = Clip::Bounds;
             style
         })
@@ -2208,12 +2147,7 @@ fn virtual_list_mounts_rows_on_the_first_frame_and_grows_on_resize() {
 #[test]
 fn virtual_rows_are_laid_out_with_the_configured_extent() {
     let (_rt, mut app, window) = setup();
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(200.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
-    style.inner.position = taffy::style::Position::Relative;
+    let mut style = StyleBuilder::new().size(200.0, 100.0).relative().build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -2705,11 +2639,7 @@ fn secondary_button_neither_clicks_nor_takes_focus() {
 fn hover_transitions_are_observable_and_mark_paint() {
     let (_rt, mut app, window) = setup();
     let root = root_of(&app, window);
-    let mut outer_style = Style::default();
-    outer_style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(100.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
+    let outer_style = StyleBuilder::new().size(100.0, 100.0).build();
     let outer = NodeBuilder::boxed()
         .style(outer_style)
         .bind_style(|_| StylePatch::default())
@@ -3206,11 +3136,7 @@ fn click_count_uses_the_event_time_stamp() {
 }
 
 fn scrollable_container(app: &mut App, window: WindowId) -> NodeId {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(100.0),
-        height: taffy::style::Dimension::length(100.0),
-    };
+    let mut style = StyleBuilder::new().size(100.0, 100.0).build();
     style.clip = Clip::Bounds;
     let tree = app.window_mut(window).expect("window").tree_mut();
     let root = tree.root();
@@ -3808,11 +3734,7 @@ fn only_the_primary_button_drives_drag_sessions() {
 fn a_two_dimensional_wheel_delta_is_split_across_the_scroll_chain() {
     let (_rt, mut app, window) = setup();
     let outer = mount_scroll_container(&mut app, window, 100.0);
-    let mut inner_style = Style::default();
-    inner_style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(100.0),
-        height: taffy::style::Dimension::length(50.0),
-    };
+    let mut inner_style = StyleBuilder::new().size(100.0, 50.0).build();
     inner_style.clip = Clip::Bounds;
     let inner = NodeBuilder::boxed()
         .style(inner_style)

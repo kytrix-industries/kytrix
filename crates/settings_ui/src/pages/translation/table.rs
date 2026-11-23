@@ -8,7 +8,10 @@ use ui_core::{
     app::App,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId},
-    paint::style::{PaintSpec, StylePatch},
+    paint::{
+        style::{PaintSpec, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -18,7 +21,6 @@ use ui_kit::{
         icon::IconKind,
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 

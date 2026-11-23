@@ -38,9 +38,9 @@ use ui_core::{
     event::{Action, Event, InputEvent, Modifiers, PointerButton},
     math::{Point, Size},
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope},
+    paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
 };
-use ui_kit::style_builder::StyleBuilder;
 use widget::{
     binding::Inbound,
     config::WidgetConfigChange,

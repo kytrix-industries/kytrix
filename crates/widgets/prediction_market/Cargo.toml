@@ -16,9 +16,6 @@ market_participants_connector = { workspace = true }
 market_participants_model = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smol_str = { workspace = true }
-# The book region's percent height and its minimum are taffy lengths the engine has
-# no setter for (the same way the kit's own components express them).
-taffy = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
@@ -32,6 +29,7 @@ widget = { workspace = true }
 market_participants_connector = { workspace = true, features = ["test-support"] }
 # The persisted config is JSON, so the round-trip test encodes and decodes one.
 serde_json = { workspace = true }
+taffy = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # The engine's node/canvas inspection the chart and book tests read, and the
 # framework's headless host (`WidgetTestApp`), which is what every interface test

@@ -17,14 +17,12 @@ use ui_core::{
         color::Color,
         primitive::{Border, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::StyleBuilder,
     },
     window::WindowId,
 };
 
-use crate::{
-    style_builder::StyleBuilder,
-    theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
-};
+use crate::theme::{components::ComponentTokens, handle::ThemeHandle, role::Role};
 
 const ROTATION_TICKS: u32 = 6;
 

@@ -20,7 +20,12 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::{color::Color, primitive::Border, style::StylePatch},
+    paint::{
+        color::Color,
+        primitive::Border,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::TextStyle,
     window::WindowId,
 };
@@ -33,7 +38,6 @@ use ui_kit::{
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
         separator::Separator,
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
@@ -1439,9 +1443,9 @@ mod tests {
             id::NodeId,
             tree::{NodeKind, NodeTree},
         },
+        paint::style_builder::StyleBuilder,
         text::TextStyle,
     };
-    use ui_kit::style_builder::StyleBuilder;
     use widget::{
         any::AnyWidget,
         category::WidgetCategory,

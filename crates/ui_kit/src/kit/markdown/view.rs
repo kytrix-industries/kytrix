@@ -6,7 +6,11 @@ use ui_core::{
     error::EngineError,
     math::{Point, Size},
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
-    paint::{color::Color, style::StylePatch},
+    paint::{
+        color::Color,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     resources::ResourceCache,
     text::{InlineBoxPaint, TextAlign, TextStyle, TextWrap},
     window::{Window, WindowId},
@@ -18,7 +22,6 @@ use crate::{
         inline_flow::{FlowStyle, ImagePaintSource, LinkSpan, flow},
         source::{InlineImageFormat, MarkdownAssets},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
 };
 
@@ -711,6 +714,7 @@ mod tests {
         interaction::ScrollConfig,
         math::{Point, Size},
         node::{builder::NodeBuilder, tree::NodeKind},
+        paint::style_builder::StyleBuilder,
         test_support::{app::TestApp, probe::Selector},
         text::TextStyle,
     };
@@ -725,7 +729,6 @@ mod tests {
             inline_flow::{FlowStyle, InvisibleImages},
             source::InlineImageFormat,
         },
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
     };
 

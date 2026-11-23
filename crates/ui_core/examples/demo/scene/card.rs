@@ -6,6 +6,7 @@ use ui_core::{
     paint::{
         primitive::Border,
         style::{PaintSpec, Style},
+        style_builder::StyleBuilder,
     },
     text::TextStyle,
     window::WindowId,
@@ -21,29 +22,19 @@ pub(crate) fn tree(app: &mut App, window: WindowId) -> &mut NodeTree {
 }
 
 pub(crate) fn absolute_style(rect: Rect) -> Style {
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(rect.origin.x),
-        top: taffy::style::LengthPercentageAuto::length(rect.origin.y),
-        right: taffy::style::LengthPercentageAuto::auto(),
-        bottom: taffy::style::LengthPercentageAuto::auto(),
-    };
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(rect.size.width),
-        height: taffy::style::Dimension::length(rect.size.height),
-    };
-    style
+    StyleBuilder::new()
+        .absolute()
+        .left(rect.origin.x)
+        .top(rect.origin.y)
+        .size(rect.size.width, rect.size.height)
+        .build()
 }
 
 pub(crate) fn flow_style(size: Size) -> Style {
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Relative;
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(size.width),
-        height: taffy::style::Dimension::length(size.height),
-    };
-    style
+    StyleBuilder::new()
+        .relative()
+        .size(size.width, size.height)
+        .build()
 }
 
 pub(crate) fn container(app: &mut App, window: WindowId, parent: NodeId, style: Style) -> NodeId {

@@ -334,10 +334,9 @@ pub(crate) fn stretch_button(
         .ok_or(EngineError::UnknownWindow { window })?
         .tree_mut();
     let mut style = tree.get(node)?.style().clone();
-    style.inner.flex_grow = 1.0;
-    style.inner.flex_shrink = 1.0;
-    style.inner.flex_basis = Dimension::length(0.0);
-    style.inner.justify_content = JustifyContent::CENTER;
+    style
+        .flex(1.0, 1.0, Dimension::length(0.0))
+        .justify_content(JustifyContent::CENTER);
     tree.set_style(node, style)
 }
 
@@ -499,13 +498,13 @@ mod tests {
         let children = tree.get(harness.node).expect("node").children();
         let icon_style = tree.get(children[0]).expect("icon").style();
         assert_eq!(
-            icon_style.inner.size.width,
+            icon_style.inner().size.width,
             taffy::style::Dimension::length(16.0),
             "大号图标边长 16"
         );
         let label_style = tree.get(children[1]).expect("label").style();
         assert_eq!(
-            label_style.inner.size.height,
+            label_style.inner().size.height,
             taffy::style::Dimension::auto(),
             "文字节点高度由行高决定"
         );
@@ -521,7 +520,7 @@ mod tests {
             tree.get(children[0])
                 .expect("icon")
                 .style()
-                .inner
+                .inner()
                 .size
                 .width
                 .into_option()

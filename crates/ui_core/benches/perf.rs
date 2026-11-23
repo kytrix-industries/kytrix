@@ -609,7 +609,7 @@ fn bench_frame_full_10k(c: &mut Criterion) {
 fn bench_scroll_1px(c: &mut Criterion) {
     use ui_core::{
         interaction::{ScrollConfig, ScrollHandle},
-        paint::style::{Clip, Style},
+        paint::{style::Clip, style_builder::StyleBuilder},
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -626,16 +626,12 @@ fn bench_scroll_1px(c: &mut Criterion) {
                 let mut fixture = new_app(&handle);
                 let Fixture { app, window } = &mut fixture;
                 let root = app.window(*window).expect("window").tree().root();
-                let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-                inner.size = taffy::geometry::Size {
-                    width: taffy::style::Dimension::length(VIEWPORT.width),
-                    height: taffy::style::Dimension::length(VIEWPORT.height),
-                };
+                let mut style = StyleBuilder::new()
+                    .size(VIEWPORT.width, VIEWPORT.height)
+                    .build();
+                style.clip = Clip::Bounds;
                 let viewport = NodeBuilder::boxed()
-                    .style(Style {
-                        inner,
-                        clip: Clip::Bounds,
-                    })
+                    .style(style)
                     .build(app.window_mut(*window).expect("window").tree_mut(), root)
                     .expect("scroll viewport");
                 for index in 0..ROWS {

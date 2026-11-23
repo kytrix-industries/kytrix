@@ -23,13 +23,11 @@ use ui_core::{
         geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
         primitive::{ClipRect, Path, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::StyleBuilder,
     },
     text::TextStyle,
 };
-use ui_kit::{
-    style_builder::StyleBuilder,
-    theme::{components::ChartColors, resolved::Theme, role::Role},
-};
+use ui_kit::theme::{components::ChartColors, resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
 
 use super::{

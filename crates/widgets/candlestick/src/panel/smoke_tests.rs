@@ -5,12 +5,11 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     event::{Action, ActionSource, Event, InputEvent},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::color::Color,
+    paint::{color::Color, style_builder::StyleBuilder},
     test_support::diagnostics::SignalSlotStats,
 };
 use ui_kit::{
     kit::size::UnifiedSize,
-    style_builder::StyleBuilder,
     theme::{appearance::Appearance, resolved::Theme, role::Role},
 };
 use widget::test_support::WidgetTestApp;

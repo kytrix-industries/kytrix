@@ -23,6 +23,7 @@ use ui_core::{
         color::{Color, ColorResolver},
         primitive::{Border, Quad, QuadPaint},
         style::{Cursor, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     text::{TextAlign, TextStyle},
     window::WindowId,
@@ -38,7 +39,6 @@ use crate::{
         },
         size::UnifiedSize,
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{
         appearance::Appearance,
         components::{ControlSize, InteractiveElementColors, InteractiveStateColors},

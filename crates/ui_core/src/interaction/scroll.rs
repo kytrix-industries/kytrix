@@ -93,10 +93,8 @@ mod tests {
         tree: &mut NodeTree,
         parent: crate::node::id::NodeId,
     ) -> crate::node::id::NodeId {
-        let style = Style {
-            clip: Clip::Bounds,
-            ..Style::default()
-        };
+        let mut style = Style::default();
+        style.clip = Clip::Bounds;
         NodeBuilder::boxed()
             .style(style)
             .build(tree, parent)

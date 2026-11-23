@@ -29,6 +29,7 @@ use ui_core::{
         color::Color,
         primitive::{ClipRect, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::StyleBuilder,
     },
     text::{TextAlign, TextStyle},
     window::WindowId,
@@ -39,7 +40,6 @@ use ui_kit::{
         list::{List, ListOptions, SelectionMode},
         motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::cx::WidgetCx;

@@ -7,8 +7,8 @@ use ui_core::{
     event::{Event, InputEvent},
     math::Point,
     node::{builder::NodeBuilder, id::NodeId},
+    paint::style_builder::StyleBuilder,
 };
-use ui_kit::style_builder::StyleBuilder;
 use widget::{
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     test_support::WidgetTestApp,

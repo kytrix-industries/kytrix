@@ -16,7 +16,10 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
-    paint::style::{Style, StylePatch},
+    paint::{
+        style::{Style, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::{TextStyle, TextWrap},
     window::WindowId,
 };
@@ -28,7 +31,6 @@ use ui_kit::{
         select::{Select, SelectItem, SelectOptions},
         separator::Separator,
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 

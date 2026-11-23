@@ -1,7 +1,6 @@
 use std::{cell::RefCell, fmt, rc::Rc};
 
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::Dimension;
 use ui_core::{
     a11y::{A11yPatch, A11yRole},
     app::App,
@@ -9,7 +8,7 @@ use ui_core::{
     event::{Action, Event, KeyBinding, KeyCode, Modifiers},
     interaction::ActionCtx,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -26,7 +25,6 @@ use crate::{
         overlay::{Anchor, AnimationRouter, OverlayError, Placement},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 
@@ -745,10 +743,7 @@ impl Dropdown {
             if let Ok(current) = target.tree().get(node) {
                 let mut style = current.style().clone();
                 let side = if desired.is_some() { size } else { 0.0 };
-                style.inner.size = taffy::geometry::Size {
-                    width: Dimension::length(side),
-                    height: Dimension::length(side),
-                };
+                style.size_length(side, side);
                 let _ = target.tree_mut().set_style(node, style);
             }
             if let Some(resource) = resource {
@@ -817,6 +812,7 @@ mod tests {
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
         window::WindowId,
     };
@@ -829,7 +825,6 @@ mod tests {
             overlay::AnimationRouter,
             test_support::{a11y_snapshot_without_oracle, overlay_wrapper},
         },
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 
@@ -1031,7 +1026,7 @@ mod tests {
                     if matches!(target.kind(), NodeKind::Image(_))
                         && target
                             .style()
-                            .inner
+                            .inner()
                             .size
                             .width
                             .into_option()

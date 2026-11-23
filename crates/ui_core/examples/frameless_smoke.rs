@@ -9,10 +9,7 @@ use ui_core::{
     app::{App, Application},
     math::{Rect, Size},
     node::builder::NodeBuilder,
-    paint::{
-        color::Color,
-        style::{PaintSpec, Style},
-    },
+    paint::{color::Color, style::PaintSpec, style_builder::StyleBuilder},
     window::{Decorations, WindowControl, WindowId, WindowOptions},
 };
 
@@ -324,11 +321,7 @@ fn last_frame_index(app: &App, window: WindowId) -> Option<u32> {
 fn build_scene(app: &mut App, window: WindowId) {
     let tree = app.window_mut(window).expect("窗口存在").tree_mut();
     let root = tree.root();
-    let mut root_style = Style::default();
-    root_style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::percent(1.0),
-    };
+    let root_style = StyleBuilder::new().size_full().build();
     tree.set_style(root, root_style).expect("根样式");
     let _ = NodeBuilder::boxed()
         .layout_override(Rect::new(0.0, 0.0, 960.0, 640.0))

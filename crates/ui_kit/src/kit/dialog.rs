@@ -5,7 +5,7 @@ use std::{
 };
 
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::{LengthPercentageAuto, Position};
+use taffy::style::Position;
 use ui_core::{
     a11y::A11yPatch,
     app::App,
@@ -18,7 +18,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextStyle},
     window::WindowId,
 };
@@ -35,7 +35,6 @@ use crate::{
         },
         size::UnifiedSizable,
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -787,9 +786,10 @@ fn tree_mut(app: &mut App, window: WindowId) -> Result<&mut NodeTree, EngineErro
 fn position_close_button(app: &mut App, window: WindowId, node: NodeId) -> Result<(), EngineError> {
     let tree = tree_mut(app, window)?;
     let mut style = tree.get(node)?.style().clone();
-    style.inner.position = Position::Absolute;
-    style.inner.inset.top = LengthPercentageAuto::length(0.0);
-    style.inner.inset.right = LengthPercentageAuto::length(0.0);
+    style
+        .position(Position::Absolute)
+        .inset_top(0.0)
+        .inset_right(0.0);
     tree.set_style(node, style)
 }
 
@@ -808,6 +808,7 @@ mod tests {
         paint::{
             color::Color,
             primitive::{Primitive, QuadPaint},
+            style_builder::{PaintBuilder, StyleBuilder},
         },
         test_support::app::TestApp,
         window::{FrameOutcome, WindowId},
@@ -821,7 +822,6 @@ mod tests {
             overlay::{Anchor, AnimationRouter, DismissPolicy, Overlay, OverlayOptions, Placement},
             test_support::{a11y_of, full_a11y},
         },
-        style_builder::{PaintBuilder, StyleBuilder},
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 

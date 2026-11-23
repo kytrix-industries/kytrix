@@ -19,13 +19,11 @@ use ui_core::{
     error::EngineError,
     event::{Event, InputEvent, PointerButton},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::style_builder::StyleBuilder,
 };
-use ui_kit::{
-    kit::{
-        select::{Select, SelectItem, SelectOptions},
-        size::UnifiedSize,
-    },
-    style_builder::StyleBuilder,
+use ui_kit::kit::{
+    select::{Select, SelectItem, SelectOptions},
+    size::UnifiedSize,
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

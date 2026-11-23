@@ -7,10 +7,10 @@ use time::UtcOffset;
 use ui_core::{
     math::Point,
     node::{builder::NodeBuilder, id::NodeId},
-    paint::primitive::Primitive,
+    paint::{primitive::Primitive, style_builder::StyleBuilder},
     window::WindowId,
 };
-use ui_kit::{style_builder::StyleBuilder, theme::appearance::Appearance};
+use ui_kit::theme::appearance::Appearance;
 use widget::test_support::WidgetTestApp;
 
 use super::{canvas::Chart, open_interest::OpenInterestChart, paint::Hover, rect::RectExt};

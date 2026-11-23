@@ -10,6 +10,7 @@ use ui_core::{
         geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
         primitive::Border,
         style::{Clip, PaintSpec, Style, StylePatch},
+        style_builder::StyleBuilder,
     },
     text::{TextStyle, TextWrap},
     window::WindowId,
@@ -536,24 +537,12 @@ fn mono_style(size: f32, color: Color) -> TextStyle {
 }
 
 fn absolute_box(left: f32, top: f32, width: f32, height: f32) -> Style {
-    use taffy::{
-        geometry::Rect as TaffyRect,
-        style::{Dimension, LengthPercentageAuto, Position},
-    };
-
-    let mut style = Style::default();
-    style.inner.position = Position::Absolute;
-    style.inner.inset = TaffyRect {
-        left: LengthPercentageAuto::length(left),
-        top: LengthPercentageAuto::length(top),
-        right: LengthPercentageAuto::auto(),
-        bottom: LengthPercentageAuto::auto(),
-    };
-    style.inner.size = taffy::geometry::Size {
-        width: Dimension::length(width),
-        height: Dimension::length(height),
-    };
-    style
+    StyleBuilder::new()
+        .absolute()
+        .left(left)
+        .top(top)
+        .size(width, height)
+        .build()
 }
 
 fn viewport_style(left: f32, top: f32, width: f32, height: f32) -> Style {

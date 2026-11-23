@@ -280,12 +280,12 @@ mod ui_tests {
         interaction::{OverlayDismiss, OverlayOptions, OverlayPlacement},
         math::{Point, Size},
         node::{builder::NodeBuilder, id::NodeId},
+        paint::style_builder::{PaintBuilder, StyleBuilder},
         test_support::app::TestApp,
         window::{WindowId, WindowOptions},
     };
 
     use super::{Band, Layer};
-    use crate::style_builder::{PaintBuilder, StyleBuilder};
 
     const PANEL: Size = Size::new(120.0, 80.0);
 

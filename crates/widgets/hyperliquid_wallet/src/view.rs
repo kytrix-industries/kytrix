@@ -17,7 +17,10 @@ use ui_core::{
     event::{Action, Event, InputEvent},
     math::Point,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::{Cursor, StylePatch},
+    paint::{
+        style::{Cursor, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::{TextOverflow, TextStyle},
 };
 use ui_kit::{
@@ -27,7 +30,6 @@ use ui_kit::{
         list::{List, ListOptions, SelectionMode},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

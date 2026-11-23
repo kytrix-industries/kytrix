@@ -24,9 +24,9 @@ fn new_app() -> (tokio::runtime::Runtime, App) {
 
 fn text_style(width: Option<f32>) -> crate::paint::style::Style {
     let mut style = crate::paint::style::Style::default();
-    style.inner.align_self = Some(taffy::style::AlignSelf::START);
+    style.align_self(taffy::style::AlignSelf::START);
     if let Some(width) = width {
-        style.inner.size.width = taffy::style::Dimension::length(width);
+        style.width(taffy::style::Dimension::length(width));
     }
     style
 }
@@ -1567,18 +1567,9 @@ fn text_caret_rect_includes_border_padding_and_node_origin() {
     let window = app.create_window(WindowOptions::default());
     let root = app.window(window).expect("窗口").tree().root();
     let mut style = text_style(Some(200.0));
-    style.inner.padding = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentage::length(9.0),
-        right: taffy::style::LengthPercentage::length(0.0),
-        top: taffy::style::LengthPercentage::length(7.0),
-        bottom: taffy::style::LengthPercentage::length(0.0),
-    };
-    style.inner.border = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentage::length(2.0),
-        right: taffy::style::LengthPercentage::length(0.0),
-        top: taffy::style::LengthPercentage::length(3.0),
-        bottom: taffy::style::LengthPercentage::length(0.0),
-    };
+    style
+        .padding_sides(7.0, 0.0, 0.0, 9.0)
+        .border_sides(3.0, 0.0, 0.0, 2.0);
     let node = NodeBuilder::text("abc", crate::text::TextStyle::new(16.0))
         .style(style)
         .build(app.window_mut(window).expect("窗口").tree_mut(), root)

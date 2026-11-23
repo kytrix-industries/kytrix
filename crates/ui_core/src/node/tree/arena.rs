@@ -19,10 +19,7 @@ use crate::{
 
 pub(crate) fn new() -> NodeTree {
     let mut root_style = Style::default();
-    root_style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::percent(1.0),
-    };
+    root_style.size_percent(1.0, 1.0);
     let mut arena: Arena<Node> = Arena::new();
     let root = arena.insert_with(|id| Node {
         id,

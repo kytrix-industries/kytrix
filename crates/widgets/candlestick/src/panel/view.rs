@@ -9,7 +9,7 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
-    paint::{color::Color, style::StylePatch},
+    paint::{color::Color, style::StylePatch, style_builder::StyleBuilder},
 };
 use ui_kit::{
     kit::{
@@ -17,7 +17,6 @@ use ui_kit::{
         scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
         toggle::Toggle,
     },
-    style_builder::StyleBuilder,
     theme::role::Role,
 };
 use widget::cx::WidgetCx;

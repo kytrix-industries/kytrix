@@ -21,7 +21,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     window::WindowId,
 };
 use ui_kit::{
@@ -30,7 +30,6 @@ use ui_kit::{
         icon::IconKind,
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::handle::ThemeHandle,
 };
 use widget::{

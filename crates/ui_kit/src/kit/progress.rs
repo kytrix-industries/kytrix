@@ -11,14 +11,14 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
-    paint::style::{Style, StylePatch},
+    paint::{
+        style::{Style, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     window::WindowId,
 };
 
-use crate::{
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::handle::ThemeHandle,
-};
+use crate::theme::handle::ThemeHandle;
 
 const TRACK_HEIGHT: f32 = 8.0;
 
@@ -182,7 +182,7 @@ impl Progress {
 
 fn indicator_style(value: f32) -> Style {
     let mut style = StyleBuilder::new().height_full().min_width_0().build();
-    style.inner.size.width = Dimension::percent(clamp_percent(value) / 100.0);
+    style.width(Dimension::percent(clamp_percent(value) / 100.0));
     style
 }
 
@@ -196,13 +196,13 @@ fn clamp_percent(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use ui_core::{a11y::A11yRole, node::id::NodeId, test_support::app::TestApp};
+    use ui_core::{
+        a11y::A11yRole, node::id::NodeId, paint::style_builder::StyleBuilder,
+        test_support::app::TestApp,
+    };
 
     use super::Progress;
-    use crate::{
-        style_builder::StyleBuilder,
-        theme::{appearance::Appearance, handle::ThemeHandle},
-    };
+    use crate::theme::{appearance::Appearance, handle::ThemeHandle};
 
     struct Harness {
         app: TestApp,

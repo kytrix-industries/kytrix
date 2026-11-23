@@ -19,7 +19,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::{primitive::Border, style::StylePatch},
+    paint::{primitive::Border, style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
 };
 use ui_kit::{
@@ -30,7 +30,6 @@ use ui_kit::{
         size::UnifiedSizable,
         table::{Column, ColumnAlign, Table, TableOptions},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

@@ -6,12 +6,9 @@ use ui_core::{
     error::EngineError,
     math::{Point, Rect},
     node::{builder::NodeBuilder, id::NodeId},
-    paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch},
+    paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
 };
-use ui_kit::{
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, role::Role},
-};
+use ui_kit::theme::{appearance::Appearance, role::Role};
 use widget::cx::WidgetCx;
 
 use super::{

@@ -8,7 +8,6 @@ use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::connector::VenueLoadError;
 use market_participants_model::identifier::VenueId;
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::Dimension;
 use tokio::sync::mpsc;
 use ui_core::{
     a11y::{A11yOverride, A11yRole},
@@ -19,7 +18,7 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle},
     window::WindowId,
 };
@@ -39,7 +38,6 @@ use ui_kit::{
         spinner::Spinner,
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
     },
-    style_builder::StyleBuilder,
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 use widget::{error::TranslatedError, venue::VenueDisplay};
@@ -864,14 +862,11 @@ fn fix_width(app: &mut App, window: WindowId, node: NodeId, width: f32) -> Resul
         .ok_or(EngineError::UnknownWindow { window })?
         .tree_mut();
     let mut style = tree.get(node)?.style().clone();
-    style.inner.size.width = Dimension::length(width);
-    style.inner.flex_grow = 0.0;
-    style.inner.flex_shrink = 0.0;
-    style.inner.justify_content = StyleBuilder::new()
-        .justify_center()
-        .build()
-        .inner
-        .justify_content;
+    style
+        .width_length(width)
+        .flex_grow(0.0)
+        .flex_shrink(0.0)
+        .justify_center();
     tree.set_style(node, style)
 }
 

@@ -33,7 +33,7 @@ use ui_core::{
         signal::Signal,
         tree::NodeTree,
     },
-    paint::{color::Color, style::StylePatch},
+    paint::{color::Color, style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextOverflow, TextRun, TextStyle},
 };
 use ui_kit::{
@@ -44,7 +44,6 @@ use ui_kit::{
         list::{List, ListOptions, SelectionMode},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 use widget::{

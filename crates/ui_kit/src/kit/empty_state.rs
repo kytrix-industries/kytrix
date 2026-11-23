@@ -1,13 +1,12 @@
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
 };
 
 use crate::{
     kit::text_value::TextValue,
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -51,7 +50,7 @@ impl EmptyState {
             .min_width_0()
             .padding_x(16.0)
             .build();
-        style.inner.max_size.width = taffy::style::LengthPercentageAuto::percent(1.0);
+        style.max_width(taffy::style::LengthPercentageAuto::percent(1.0));
         let root = NodeBuilder::boxed()
             .id(format_smolstr!("{}:empty", self.key))
             .style(style)

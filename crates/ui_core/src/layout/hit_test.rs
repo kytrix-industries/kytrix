@@ -494,31 +494,21 @@ mod tests {
         paint::{
             canvas::Canvas,
             style::{Clip, Style, StylePatch},
+            style_builder::StyleBuilder,
         },
     };
 
     fn fixed(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(width),
-            height: taffy::style::Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     fn absolute(size: f32) -> Style {
-        let mut style = fixed(size, size);
-        style.inner.position = taffy::style::Position::Absolute;
-        style.inner.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(0.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(0.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        style
+        StyleBuilder::new()
+            .absolute()
+            .left(0.0)
+            .top(0.0)
+            .size(size, size)
+            .build()
     }
 
     fn add(tree: &mut NodeTree, parent: NodeId, style: Style) -> NodeId {
@@ -575,12 +565,7 @@ mod tests {
         let root = tree.root();
         let mut scroller_style = fixed(40.0, 40.0);
         scroller_style.clip = Clip::Bounds;
-        scroller_style.inner.border = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentage::length(2.0),
-            right: taffy::style::LengthPercentage::length(2.0),
-            top: taffy::style::LengthPercentage::length(2.0),
-            bottom: taffy::style::LengthPercentage::length(2.0),
-        };
+        scroller_style.border(2.0);
         let scroller = add(&mut tree, root, scroller_style);
         let overflowing = add(&mut tree, scroller, fixed(100.0, 100.0));
         layout(&mut tree);
@@ -706,12 +691,7 @@ mod tests {
         let node = NodeBuilder::boxed()
             .style({
                 let mut style = fixed(30.0, 30.0);
-                style.inner.margin = taffy::geometry::Rect {
-                    left: taffy::style::LengthPercentageAuto::length(10.0),
-                    right: taffy::style::LengthPercentageAuto::length(0.0),
-                    top: taffy::style::LengthPercentageAuto::length(20.0),
-                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
-                };
+                style.margin_sides(20.0, 0.0, 0.0, 10.0);
                 style
             })
             .hit_shape(HitShape::custom(|local: Point| {
@@ -733,7 +713,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut hidden = fixed(100.0, 100.0);
-        hidden.inner.display = taffy::style::Display::None;
+        hidden.display(taffy::style::Display::None);
         let _hidden = add(&mut tree, root, hidden);
         layout(&mut tree);
 
@@ -822,12 +802,7 @@ mod tests {
         let parent = add(&mut tree, root, fixed(100.0, 100.0));
         let node = add(&mut tree, parent, {
             let mut style = fixed(30.0, 40.0);
-            style.inner.margin = taffy::geometry::Rect {
-                left: taffy::style::LengthPercentageAuto::length(10.0),
-                right: taffy::style::LengthPercentageAuto::length(0.0),
-                top: taffy::style::LengthPercentageAuto::length(20.0),
-                bottom: taffy::style::LengthPercentageAuto::length(0.0),
-            };
+            style.margin_sides(20.0, 0.0, 0.0, 10.0);
             style
         });
         layout(&mut tree);
@@ -879,25 +854,15 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let parent = add(&mut tree, root, fixed(100.0, 100.0));
-        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        abs.position = taffy::style::Position::Absolute;
-        abs.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(150.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(10.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        abs.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(30.0),
-            height: taffy::style::Dimension::length(30.0),
-        };
         let overflow = add(
             &mut tree,
             parent,
-            Style {
-                inner: abs,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(150.0)
+                .top(10.0)
+                .size(30.0, 30.0)
+                .build(),
         );
         layout(&mut tree);
 
@@ -919,25 +884,15 @@ mod tests {
         let mut parent_style = fixed(100.0, 100.0);
         parent_style.clip = Clip::Bounds;
         let parent = add(&mut tree, root, parent_style);
-        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        abs.position = taffy::style::Position::Absolute;
-        abs.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(150.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(10.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        abs.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(30.0),
-            height: taffy::style::Dimension::length(30.0),
-        };
         let overflow = add(
             &mut tree,
             parent,
-            Style {
-                inner: abs,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(150.0)
+                .top(10.0)
+                .size(30.0, 30.0)
+                .build(),
         );
         layout(&mut tree);
 
@@ -958,25 +913,15 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let parent = add(&mut tree, root, fixed(100.0, 100.0));
-        let mut abs = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        abs.position = taffy::style::Position::Absolute;
-        abs.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(150.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(10.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
-        abs.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(30.0),
-            height: taffy::style::Dimension::length(30.0),
-        };
         let overflow = add(
             &mut tree,
             parent,
-            Style {
-                inner: abs,
-                clip: Clip::None,
-            },
+            StyleBuilder::new()
+                .absolute()
+                .left(150.0)
+                .top(10.0)
+                .size(30.0, 30.0)
+                .build(),
         );
         layout(&mut tree);
 
@@ -1001,7 +946,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut root_style = fixed(200.0, 200.0);
-        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+        root_style.flex_direction(taffy::style::FlexDirection::Column);
         tree.set_style(root, root_style).expect("root 存活");
         let spacer = add(&mut tree, root, fixed(200.0, 40.0));
         let pane = add(&mut tree, root, fixed(100.0, 100.0));
@@ -1248,12 +1193,7 @@ mod tests {
         let root = tree.root();
         let container = add(&mut tree, root, {
             let mut style = fixed(20.0, 20.0);
-            style.inner.margin = taffy::geometry::Rect {
-                left: taffy::style::LengthPercentageAuto::length(50.0),
-                right: taffy::style::LengthPercentageAuto::length(0.0),
-                top: taffy::style::LengthPercentageAuto::length(50.0),
-                bottom: taffy::style::LengthPercentageAuto::length(0.0),
-            };
+            style.margin_sides(50.0, 0.0, 0.0, 50.0);
             style
         });
         let node = NodeBuilder::canvas(Canvas::new(Rect::new(0.0, 0.0, 20.0, 20.0)))
@@ -1286,25 +1226,21 @@ mod tests {
         let mut tree = NodeTree::new();
         let root = tree.root();
         let mut parent_style = fixed(20.0, 20.0);
-        parent_style.inner.margin = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(50.0),
-            right: taffy::style::LengthPercentageAuto::length(0.0),
-            top: taffy::style::LengthPercentageAuto::length(50.0),
-            bottom: taffy::style::LengthPercentageAuto::length(0.0),
-        };
+        parent_style.margin_sides(50.0, 0.0, 0.0, 50.0);
         let parent = NodeBuilder::boxed()
             .style(parent_style)
             .hit_shape(HitShape::Rect(Rect::new(-20.0, -20.0, 60.0, 60.0)))
             .build(&mut tree, root)
             .expect("父节点挂载成功");
         let mut child_style = fixed(10.0, 10.0);
-        child_style.inner.position = taffy::style::Position::Absolute;
-        child_style.inner.inset = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(-30.0),
-            right: taffy::style::LengthPercentageAuto::auto(),
-            top: taffy::style::LengthPercentageAuto::length(-30.0),
-            bottom: taffy::style::LengthPercentageAuto::auto(),
-        };
+        child_style
+            .position(taffy::style::Position::Absolute)
+            .inset(
+                taffy::style::LengthPercentageAuto::length(-30.0),
+                taffy::style::LengthPercentageAuto::auto(),
+                taffy::style::LengthPercentageAuto::auto(),
+                taffy::style::LengthPercentageAuto::length(-30.0),
+            );
         let child = NodeBuilder::boxed()
             .style(child_style)
             .build(&mut tree, parent)
@@ -1455,14 +1391,12 @@ mod tests {
     #[test]
     fn interactive_criterion_is_shared_by_hit_focus_and_a11y() {
         fn absolute_at(x: f32, y: f32, width: f32, height: f32) -> Style {
-            let mut style = absolute(width.max(height));
-            style.inner.size = taffy::geometry::Size {
-                width: taffy::style::Dimension::length(width),
-                height: taffy::style::Dimension::length(height),
-            };
-            style.inner.inset.left = taffy::style::LengthPercentageAuto::length(x);
-            style.inner.inset.top = taffy::style::LengthPercentageAuto::length(y);
-            style
+            StyleBuilder::new()
+                .absolute()
+                .left(x)
+                .top(y)
+                .size(width, height)
+                .build()
         }
 
         let mut tree = NodeTree::new();

@@ -10,3 +10,4 @@ pub(crate) mod pass;
 pub mod primitive;
 pub mod scene;
 pub mod style;
+pub mod style_builder;

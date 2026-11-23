@@ -23,13 +23,13 @@ use ui_core::{
     paint::{
         color::Color,
         style::{ShadowSpec, Shadows, Style, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     window::{FrameIndex, WindowId},
 };
 
 use crate::{
     kit::layer::{Band, Layer, LayerSlot},
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ComponentTokens, handle::ThemeHandle, role::Role},
 };
 
@@ -1385,7 +1385,10 @@ mod ui_tests {
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect, Size},
         node::{builder::NodeBuilder, id::NodeId},
-        paint::color::Color,
+        paint::{
+            color::Color,
+            style_builder::{PaintBuilder, StyleBuilder},
+        },
         test_support::app::TestApp,
         window::{FrameOutcome, WindowId},
     };
@@ -1396,7 +1399,6 @@ mod ui_tests {
     };
     use crate::{
         kit::layer::Layer,
-        style_builder::{PaintBuilder, StyleBuilder},
         theme::{appearance::Appearance, components::ComponentTokens, handle::ThemeHandle},
     };
 

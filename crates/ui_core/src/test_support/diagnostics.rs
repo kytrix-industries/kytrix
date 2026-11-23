@@ -477,23 +477,14 @@ mod tests {
         rect: crate::math::Rect,
         clip: crate::paint::style::Clip,
     ) -> crate::paint::style::Style {
-        crate::paint::style::Style {
-            inner: taffy::Style::<smol_str::SmolStr> {
-                position: taffy::style::Position::Absolute,
-                size: taffy::geometry::Size {
-                    width: taffy::style::Dimension::length(rect.size.width),
-                    height: taffy::style::Dimension::length(rect.size.height),
-                },
-                inset: taffy::geometry::Rect {
-                    left: taffy::style::LengthPercentageAuto::length(rect.origin.x),
-                    top: taffy::style::LengthPercentageAuto::length(rect.origin.y),
-                    right: taffy::style::LengthPercentageAuto::auto(),
-                    bottom: taffy::style::LengthPercentageAuto::auto(),
-                },
-                ..taffy::Style::<smol_str::SmolStr>::DEFAULT
-            },
-            clip,
-        }
+        let mut style = crate::paint::style_builder::StyleBuilder::new()
+            .absolute()
+            .left(rect.origin.x)
+            .top(rect.origin.y)
+            .size(rect.size.width, rect.size.height)
+            .build();
+        style.clip = clip;
+        style
     }
 
     fn app_with_boxes(count: usize) -> TestApp {

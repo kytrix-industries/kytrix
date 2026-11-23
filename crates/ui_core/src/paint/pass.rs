@@ -456,7 +456,7 @@ fn rebuild_order_only(tree: &NodeTree, order: &mut Vec<LaneId>) {
         let Ok(target) = tree.get(node) else {
             continue;
         };
-        let own_hidden = matches!(target.style().inner.display, taffy::style::Display::None)
+        let own_hidden = matches!(target.style().inner().display, taffy::style::Display::None)
             || target.style_patch().visible == Some(false);
         if parent_hidden || own_hidden {
             continue;
@@ -1672,6 +1672,7 @@ mod tests {
             primitive::{Border, ClipOp, Gradient, GradientKind, Primitive, QuadPaint},
             scene::{LaneId, Scene},
             style::{Clip, FocusRing, PaintSpec, ShadowSpec, Shadows, Style, StylePatch},
+            style_builder::StyleBuilder,
         },
         render::damage::DamageAccumulator,
         text::{
@@ -1790,15 +1791,7 @@ mod tests {
     }
 
     fn fixed_style(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(width),
-            height: taffy::style::Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     fn with_white() -> PaintSpec {
@@ -4324,29 +4317,20 @@ mod tests {
     mod group_fade {
         use std::time::Duration;
 
-        use smol_str::SmolStr;
-
         use crate::{
             interaction::{AnimatedValue, AnimationSpec, Easing},
             math::{PhysicalRect, Point},
             node::{builder::NodeBuilder, dependency::ReadCtx},
             paint::{
                 color::Color,
-                style::{Clip, PaintSpec, ShadowSpec, Shadows, Style, StylePatch},
+                style::{PaintSpec, ShadowSpec, Shadows, Style, StylePatch},
+                style_builder::StyleBuilder,
             },
             test_support::app::TestApp,
         };
 
         fn sized(width: f32, height: f32) -> Style {
-            let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-            inner.size = taffy::geometry::Size {
-                width: taffy::style::Dimension::length(width),
-                height: taffy::style::Dimension::length(height),
-            };
-            Style {
-                inner,
-                clip: Clip::None,
-            }
+            StyleBuilder::new().size(width, height).build()
         }
 
         fn white() -> PaintSpec {

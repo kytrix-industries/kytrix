@@ -1,13 +1,10 @@
 use ui_core::{
     a11y::A11yOverride,
     node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
 };
 
-use crate::{
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
+use crate::theme::{handle::ThemeHandle, role::Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeparatorOrientation {
@@ -52,11 +49,11 @@ impl Separator {
             }
             SeparatorOrientation::Vertical => {
                 let mut style = StyleBuilder::new().width(1.0).build();
-                style.inner.align_self = Some(taffy::style::AlignSelf::STRETCH);
+                style.align_self(taffy::style::AlignSelf::STRETCH);
                 style
             }
         };
-        style.inner.flex_shrink = 0.0;
+        style.flex_shrink(0.0);
         let theme = self.theme.clone();
         NodeBuilder::boxed()
             .style(style)
@@ -76,15 +73,12 @@ impl Separator {
 mod tests {
     use ui_core::{
         node::{builder::NodeBuilder, id::NodeId},
-        paint::color::ColorResolver,
+        paint::{color::ColorResolver, style_builder::StyleBuilder},
         test_support::app::TestApp,
     };
 
     use super::{Separator, SeparatorOrientation};
-    use crate::{
-        style_builder::StyleBuilder,
-        theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
-    };
+    use crate::theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role};
 
     fn build(
         orientation: SeparatorOrientation,

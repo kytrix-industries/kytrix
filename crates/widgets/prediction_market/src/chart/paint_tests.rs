@@ -118,7 +118,7 @@ impl ChartHarness {
     fn resize(&mut self, width: f32, height: f32) {
         let page = self.page;
         self.app.with_cx(|cx| {
-            let style = ui_kit::style_builder::StyleBuilder::new()
+            let style = ui_core::paint::style_builder::StyleBuilder::new()
                 .width(width)
                 .height(height)
                 .flex_col()
@@ -137,7 +137,7 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> ui_core::node::id::
         ui_core::node::builder::NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_PAGE")
             .style(
-                ui_kit::style_builder::StyleBuilder::new()
+                ui_core::paint::style_builder::StyleBuilder::new()
                     .width(width)
                     .height(height)
                     .flex_col()

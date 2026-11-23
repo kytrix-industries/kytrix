@@ -228,7 +228,7 @@ impl NodeBuilder {
 
     #[must_use]
     pub fn layout_override(mut self, rect: Rect) -> Self {
-        self.style.inner.position = taffy::style::Position::Absolute;
+        self.style.position(taffy::style::Position::Absolute);
         self.layout_override = Some(LayoutOverride::new(rect));
         self
     }
@@ -512,7 +512,7 @@ mod tests {
 
         let node = tree.get(node).expect("存在");
         assert_eq!(
-            node.style().inner.position,
+            node.style().inner().position,
             taffy::style::Position::Absolute,
             "override 语义要求出流"
         );

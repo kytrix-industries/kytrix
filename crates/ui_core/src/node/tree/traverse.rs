@@ -37,7 +37,7 @@ pub(crate) fn for_each_subtree(tree: &NodeTree, root: NodeId, mut visit: impl Fn
 
 pub(crate) fn is_visible_locally(tree: &NodeTree, node: NodeId) -> bool {
     tree.arena.get(node).is_some_and(|target| {
-        !matches!(target.style.inner.display, taffy::style::Display::None)
+        !matches!(target.style.inner().display, taffy::style::Display::None)
             && target.style_patch().visible != Some(false)
     })
 }

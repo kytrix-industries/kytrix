@@ -8,10 +8,9 @@ use ui_core::{
     error::EngineError,
     math::{Point, Rect},
     node::{builder::NodeBuilder, id::NodeId},
-    paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch},
+    paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch, style_builder::StyleBuilder},
     text::ShapedTextHandle,
 };
-use ui_kit::style_builder::StyleBuilder;
 use widget::cx::WidgetCx;
 
 use super::{

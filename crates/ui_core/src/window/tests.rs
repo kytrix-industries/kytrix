@@ -9,7 +9,7 @@ use crate::{
     error::EngineError,
     math::{PhysicalRect, Point, Rect, Scale, Size},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId},
-    paint::{canvas::Canvas, color::Color, style::Style},
+    paint::{canvas::Canvas, color::Color, style::Style, style_builder::StyleBuilder},
     render::compositor::{DamageRects, Plan},
     text::{InlineAlign, InlineBoxSpec, TextAlign, TextContent, TextStyle},
 };
@@ -362,19 +362,11 @@ fn dpi_change_does_not_move_logical_boxes() {
     use crate::{
         math::Rect,
         node::builder::NodeBuilder,
-        paint::style::{Clip, Style},
+        paint::{style::Style, style_builder::StyleBuilder},
     };
 
     fn fixed(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(width),
-            height: taffy::style::Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     let mut window = Window::new(
@@ -414,19 +406,11 @@ fn dpi_change_does_not_move_logical_boxes() {
 fn layout_is_identical_at_every_device_scale() {
     use crate::{
         node::builder::NodeBuilder,
-        paint::style::{Clip, Style},
+        paint::{style::Style, style_builder::StyleBuilder},
     };
 
     fn fixed(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(width),
-            height: taffy::style::Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     let mut window = Window::new(
@@ -438,7 +422,7 @@ fn layout_is_identical_at_every_device_scale() {
     );
     let root = window.tree().root();
     let mut column = fixed(100.0, 50.0);
-    column.inner.flex_direction = taffy::style::FlexDirection::Column;
+    column.flex_direction(taffy::style::FlexDirection::Column);
     let column = NodeBuilder::boxed()
         .style(column)
         .build(window.tree_mut(), root)
@@ -476,10 +460,7 @@ fn layout_is_identical_at_every_device_scale() {
 
 #[test]
 fn resize_relayouts_percent_children() {
-    use crate::{
-        node::builder::NodeBuilder,
-        paint::style::{Clip, Style},
-    };
+    use crate::{node::builder::NodeBuilder, paint::style_builder::StyleBuilder};
 
     let mut window = Window::new(
         WindowId::for_test(1),
@@ -489,16 +470,9 @@ fn resize_relayouts_percent_children() {
         },
     );
     let root = window.tree().root();
-    let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-    inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::percent(1.0),
-        height: taffy::style::Dimension::percent(1.0),
-    };
+    let style = StyleBuilder::new().size_full().build();
     let child = NodeBuilder::boxed()
-        .style(Style {
-            inner,
-            clip: Clip::None,
-        })
+        .style(style)
         .build(window.tree_mut(), root)
         .expect("挂载成功");
     let _ = window.compute_layout().expect("布局成功");
@@ -1006,21 +980,13 @@ fn window_options_carry_an_optional_icon() {
 }
 
 fn text_style(width: f32) -> Style {
-    let mut style = Style::default();
-    style.inner.align_self = Some(taffy::style::AlignSelf::START);
-    style.inner.size.width = taffy::style::Dimension::length(width);
-    style.inner.padding = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentage::length(9.0),
-        right: taffy::style::LengthPercentage::length(0.0),
-        top: taffy::style::LengthPercentage::length(7.0),
-        bottom: taffy::style::LengthPercentage::length(0.0),
-    };
-    style.inner.border = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentage::length(2.0),
-        right: taffy::style::LengthPercentage::length(0.0),
-        top: taffy::style::LengthPercentage::length(3.0),
-        bottom: taffy::style::LengthPercentage::length(0.0),
-    };
+    let mut style = StyleBuilder::new()
+        .padding_sides(7.0, 0.0, 0.0, 9.0)
+        .build();
+    style
+        .align_self(taffy::style::AlignSelf::START)
+        .width(taffy::style::Dimension::length(width))
+        .border_sides(3.0, 0.0, 0.0, 2.0);
     style
 }
 

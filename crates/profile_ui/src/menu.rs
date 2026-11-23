@@ -6,7 +6,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, image::ImageFit, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextStyle, TextWrap},
     window::WindowId,
 };
@@ -21,7 +21,6 @@ use ui_kit::{
         size::{UnifiedSizable, UnifiedSize},
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 

@@ -31,7 +31,7 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextStyle},
     window::WindowId,
 };
@@ -45,7 +45,6 @@ use ui_kit::{
         separator::Separator,
         size::UnifiedSize,
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

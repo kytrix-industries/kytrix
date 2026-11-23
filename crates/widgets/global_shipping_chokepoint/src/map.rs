@@ -15,10 +15,11 @@ use ui_core::{
         color::Color,
         geometry::{GeometryDesc, GeometryId, GeometryPipeline, IndexType, Topology},
         primitive::{Border, ClipRect, GeometryDraw, Quad, QuadPaint},
+        style_builder::StyleBuilder,
     },
     text::{ShapedTextHandle, TextSlant, TextStyle},
 };
-use ui_kit::{kit::size::UnifiedSize, style_builder::StyleBuilder};
+use ui_kit::kit::size::UnifiedSize;
 use widget::cx::WidgetCx;
 
 use crate::{

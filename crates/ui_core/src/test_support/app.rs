@@ -499,6 +499,7 @@ mod tests {
         paint::{
             color::{Color, ColorResolver, LinearPremulRgba},
             style::{PaintSpec, StylePatch},
+            style_builder::StyleBuilder,
         },
         test_support::{
             probe::Selector,
@@ -782,22 +783,7 @@ mod tests {
         let mut app = TestApp::new();
         let window = app.window_id();
         let root = app.app().window(window).expect("窗口").tree().root();
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(80.0),
-            height: taffy::style::Dimension::length(40.0),
-        };
-        let pad = taffy::style::LengthPercentage::length(4.0);
-        inner.padding = taffy::geometry::Rect {
-            left: pad,
-            right: pad,
-            top: pad,
-            bottom: pad,
-        };
-        let style = crate::paint::style::Style {
-            inner,
-            clip: crate::paint::style::Clip::None,
-        };
+        let style = StyleBuilder::new().size(80.0, 40.0).padding(4.0).build();
         let node = NodeBuilder::text("MMM", TextStyle::new(12.0))
             .style(style)
             .id("label")
@@ -836,7 +822,10 @@ mod p10_tests {
         event::{Action, InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect},
         node::builder::NodeBuilder,
-        paint::style::{Clip, PaintSpec, Style, StylePatch},
+        paint::{
+            style::{Clip, PaintSpec, StylePatch},
+            style_builder::StyleBuilder,
+        },
     };
 
     fn app_with_button() -> (TestApp, crate::node::id::NodeId) {
@@ -884,11 +873,7 @@ mod p10_tests {
         let window = app.window_id();
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
-        let mut style = Style::default();
-        style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(100.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
+        let mut style = StyleBuilder::new().size(100.0, 100.0).build();
         style.clip = Clip::Bounds;
         let container = NodeBuilder::boxed()
             .style(style)
@@ -1014,27 +999,16 @@ mod p10_tests {
         let window = app.window_id();
         let tree = app.app_mut().window_mut(window).expect("window").tree_mut();
         let root = tree.root();
-        let mut outer_style = Style::default();
-        outer_style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(200.0),
-        };
+        let mut outer_style = StyleBuilder::new().size(200.0, 200.0).build();
         outer_style.clip = Clip::Bounds;
         let outer = NodeBuilder::boxed()
             .style(outer_style)
             .build(tree, root)
             .expect("outer");
-        let mut inner_style = Style::default();
-        inner_style.inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(200.0),
-        };
-        inner_style.inner.margin = taffy::geometry::Rect {
-            left: taffy::style::LengthPercentageAuto::length(0.0),
-            right: taffy::style::LengthPercentageAuto::length(0.0),
-            top: taffy::style::LengthPercentageAuto::length(100.0),
-            bottom: taffy::style::LengthPercentageAuto::length(0.0),
-        };
+        let mut inner_style = StyleBuilder::new()
+            .size(200.0, 200.0)
+            .margin_sides(100.0, 0.0, 0.0, 0.0)
+            .build();
         inner_style.clip = Clip::Bounds;
         let inner = NodeBuilder::boxed()
             .style(inner_style)
@@ -1161,6 +1135,7 @@ mod p11_tests {
             canvas::Canvas,
             color::Color,
             style::{Clip, PaintSpec, Style, StylePatch},
+            style_builder::StyleBuilder,
         },
         text::TextStyle,
         window::WindowOptions,
@@ -1188,28 +1163,13 @@ mod p11_tests {
     }
 
     fn scroll_container_style(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(width),
-            height: taffy::style::Dimension::length(height),
-        };
-        inner.position = taffy::style::Position::Relative;
-        Style {
-            inner,
-            clip: Clip::Bounds,
-        }
+        let mut style = StyleBuilder::new().relative().size(width, height).build();
+        style.clip = Clip::Bounds;
+        style
     }
 
     fn fixed_size_style(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(width),
-            height: taffy::style::Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     fn child_of(app: &TestApp, parent: NodeId) -> NodeId {
@@ -1589,18 +1549,11 @@ mod p11_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(100.0),
-            height: taffy::style::Dimension::length(80.0),
-        };
-        inner.position = taffy::style::Position::Relative;
+        let mut rows_style = StyleBuilder::new().relative().size(100.0, 80.0).build();
+        rows_style.clip = Clip::Bounds;
         let container = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
-                .style(Style {
-                    inner,
-                    clip: Clip::Bounds,
-                })
+                .style(rows_style)
                 .id("rows")
                 .build(tree, root)
                 .expect("container")
@@ -2277,6 +2230,7 @@ mod p11_fix_tests {
         paint::{
             color::Color,
             style::{Clip, PaintSpec, Style},
+            style_builder::StyleBuilder,
         },
         text::{TextAlign, TextDirection, TextStyle},
         window::FrameOutcome,
@@ -2290,15 +2244,7 @@ mod p11_fix_tests {
     }
 
     fn percent_style() -> Style {
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::percent(1.0),
-            height: taffy::style::Dimension::percent(1.0),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size_full().build()
     }
 
     fn mount(
@@ -2385,18 +2331,11 @@ mod p11_fix_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        inner.position = taffy::style::Position::Relative;
+        let mut viewport_style = StyleBuilder::new().relative().size(200.0, 100.0).build();
+        viewport_style.clip = Clip::Bounds;
         let container = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
-                .style(Style {
-                    inner,
-                    clip: Clip::Bounds,
-                })
+                .style(viewport_style)
                 .id("viewport")
                 .build(tree, root)
                 .expect("container")
@@ -2449,18 +2388,11 @@ mod p11_fix_tests {
         let mut app = TestApp::new();
         app.enable_a11y_capture();
         let window = app.window_id();
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(200.0),
-            height: taffy::style::Dimension::length(100.0),
-        };
-        inner.position = taffy::style::Position::Relative;
+        let mut viewport_style = StyleBuilder::new().relative().size(200.0, 100.0).build();
+        viewport_style.clip = Clip::Bounds;
         let container = mount(&mut app, move |tree, root| {
             NodeBuilder::boxed()
-                .style(Style {
-                    inner,
-                    clip: Clip::Bounds,
-                })
+                .style(viewport_style)
                 .id("viewport")
                 .build(tree, root)
                 .expect("container")
@@ -2623,16 +2555,9 @@ mod p11_fix_tests {
     fn text_run_fixture(app: &mut TestApp, text: &'static str, style: TextStyle) -> NodeId {
         let window = app.window_id();
         let root = app.app().window(window).expect("window").tree().root();
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: taffy::style::Dimension::length(240.0),
-            height: taffy::style::Dimension::length(24.0),
-        };
+        let input_style = StyleBuilder::new().size(240.0, 24.0).build();
         let input = NodeBuilder::boxed()
-            .style(Style {
-                inner,
-                clip: Clip::None,
-            })
+            .style(input_style)
             .a11y(A11yOverride {
                 role: Some(A11yRole::TextInput),
                 label: Some(SmolStr::new_static("搜索")),

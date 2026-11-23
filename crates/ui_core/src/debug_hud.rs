@@ -12,6 +12,7 @@ use crate::{
         color::Color,
         primitive::Border,
         style::{PaintSpec, Style},
+        style_builder::StyleBuilder,
     },
     text::{TextStyle, TextWrap},
     window::{FrameIndex, Window},
@@ -285,24 +286,12 @@ pub(crate) fn finish_frame(state: &mut DebugHudState) {
 }
 
 fn panel_style() -> Style {
-    use taffy::{
-        geometry::{Rect as TaffyRect, Size as TaffySize},
-        style::{Dimension, LengthPercentageAuto, Position},
-    };
-
-    let mut style = Style::default();
-    style.inner.position = Position::Absolute;
-    style.inner.inset = TaffyRect {
-        left: LengthPercentageAuto::auto(),
-        right: LengthPercentageAuto::length(MARGIN),
-        top: LengthPercentageAuto::length(MARGIN),
-        bottom: LengthPercentageAuto::auto(),
-    };
-    style.inner.size = TaffySize {
-        width: Dimension::length(WIDTH),
-        height: Dimension::length(HEIGHT),
-    };
-    style
+    StyleBuilder::new()
+        .absolute()
+        .right(MARGIN)
+        .top(MARGIN)
+        .size(WIDTH, HEIGHT)
+        .build()
 }
 
 fn panel_paint() -> PaintSpec {
@@ -442,16 +431,19 @@ mod tests {
         use taffy::style::{Dimension, LengthPercentageAuto, Position};
 
         let style = panel_style();
-        assert_eq!(style.inner.position, Position::Absolute);
-        assert_eq!(style.inner.inset.left, LengthPercentageAuto::auto());
+        assert_eq!(style.inner().position, Position::Absolute);
+        assert_eq!(style.inner().inset.left, LengthPercentageAuto::auto());
         assert_eq!(
-            style.inner.inset.right,
+            style.inner().inset.right,
             LengthPercentageAuto::length(MARGIN)
         );
-        assert_eq!(style.inner.inset.top, LengthPercentageAuto::length(MARGIN));
-        assert_eq!(style.inner.inset.bottom, LengthPercentageAuto::auto());
-        assert_eq!(style.inner.size.width, Dimension::length(WIDTH));
-        assert_eq!(style.inner.size.height, Dimension::length(HEIGHT));
+        assert_eq!(
+            style.inner().inset.top,
+            LengthPercentageAuto::length(MARGIN)
+        );
+        assert_eq!(style.inner().inset.bottom, LengthPercentageAuto::auto());
+        assert_eq!(style.inner().size.width, Dimension::length(WIDTH));
+        assert_eq!(style.inner().size.height, Dimension::length(HEIGHT));
     }
 
     #[test]

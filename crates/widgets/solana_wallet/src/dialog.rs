@@ -22,7 +22,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle},
     window::WindowId,
 };
@@ -40,7 +40,6 @@ use ui_kit::{
         size::{UnifiedSizable, UnifiedSize},
         spinner::Spinner,
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{cx::WidgetCx, error::TranslatedError, status::WidgetAction};

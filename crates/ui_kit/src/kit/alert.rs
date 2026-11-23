@@ -18,7 +18,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextAlign, TextStyle},
     window::WindowId,
 };
@@ -28,7 +28,6 @@ use crate::{
         button::{Button, stretch_button},
         input::InputNode,
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -883,7 +882,7 @@ mod tests {
             .parent()
             .expect("error column");
         assert_eq!(
-            tree.get(column).expect("column").style().inner.gap.height,
+            tree.get(column).expect("column").style().inner().gap.height,
             taffy::style::LengthPercentage::length(4.0),
             "输入框与错误行的列间距 4 px（旧 gap_1）"
         );

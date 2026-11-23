@@ -5,9 +5,9 @@ use ui_core::{
     error::EngineError,
     event::Event,
     node::{id::NodeId, signal::Signal},
+    paint::style_builder::StyleBuilder,
     window::WindowId,
 };
-use ui_kit::style_builder::StyleBuilder;
 
 use super::{
     intent::Intent,

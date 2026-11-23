@@ -23,6 +23,7 @@ use ui_core::{
         color::{Color, ColorResolver},
         primitive::{Border, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     text::TextStyle,
     window::WindowId,
@@ -33,7 +34,6 @@ use crate::{
         interactive::Interactive,
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ToggleColors, handle::ThemeHandle, role::Role},
 };
 
@@ -253,7 +253,7 @@ impl Toggle {
                     .ok_or(EngineError::UnknownWindow { window })?
                     .tree_mut();
                 let mut style = StyleBuilder::new().min_width_0().build();
-                style.inner.flex_shrink = 1.0;
+                style.flex_shrink(1.0);
                 let label_node = NodeBuilder::text(label, text_style)
                     .style(style)
                     .bind_style(move |cx| StylePatch {
@@ -732,14 +732,16 @@ mod tests {
         event::{InputEvent, KeyCode, Modifiers, PointerButton},
         math::{Point, Rect, Size},
         node::{builder::NodeBuilder, id::NodeId},
-        paint::color::{Color, ColorResolver},
+        paint::{
+            color::{Color, ColorResolver},
+            style_builder::StyleBuilder,
+        },
         test_support::{app::TestApp, diagnostics::frame_dump},
     };
 
     use super::{Toggle, ToggleKind};
     use crate::{
         kit::test_support::test_app_with_scale,
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle, resolved::Theme, role::Role},
     };
 
@@ -1085,7 +1087,7 @@ mod tests {
                 .expect("root")
                 .style();
             assert_eq!(
-                style.inner.padding.left,
+                style.inner().padding.left,
                 taffy::style::LengthPercentage::length(size.px()),
                 "{size:?} 的左内边距"
             );

@@ -5,7 +5,12 @@ use ui_core::{
     error::EngineError,
     event::Action,
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal},
-    paint::{color::Color, primitive::Border, style::StylePatch},
+    paint::{
+        color::Color,
+        primitive::Border,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::TextStyle,
 };
 use ui_kit::{
@@ -15,7 +20,6 @@ use ui_kit::{
         size::{UnifiedSizable, UnifiedSize},
         toggle::Toggle,
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, resolved::Theme, role::Role},
 };
 use widget::cx::WidgetCx;

@@ -12,7 +12,7 @@ use ui_core::{
     app::App,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
 };
 use ui_kit::{
@@ -21,7 +21,6 @@ use ui_kit::{
         markdown::{parse::parse_document, source::MarkdownAssets},
         table::{Column, ColumnAlign, Table, TableOptions},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

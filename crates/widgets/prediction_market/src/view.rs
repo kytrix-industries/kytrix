@@ -8,14 +8,16 @@ use market_participants_model::prediction::{
 };
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::LengthPercentageAuto;
 use ui_core::{
     app::App,
     error::EngineError,
     event::{Event, InputEvent, PointerButton},
     math::Point,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::TextStyle,
     window::WindowId,
 };
@@ -28,7 +30,6 @@ use ui_kit::{
         select::{Select, SelectItem, SelectOptions},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
@@ -1476,10 +1477,10 @@ impl PredictionMarketWidget {
             .flex_none()
             .width_full()
             .flex_col()
-            .min_height_0()
             .build();
-        area_style.inner.size.height = LengthPercentageAuto::percent(ratio).into();
-        area_style.inner.min_size.height = LengthPercentageAuto::length(MIN_BOOK_HEIGHT);
+        area_style
+            .height_percent(ratio)
+            .min_height_length(MIN_BOOK_HEIGHT);
         let area = NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_BOOK_AREA")
             .style(area_style)
@@ -1673,10 +1674,10 @@ impl PredictionMarketWidget {
                 .flex_none()
                 .width_full()
                 .flex_col()
-                .min_height_0()
                 .build();
-            style.inner.size.height = LengthPercentageAuto::percent(ratio).into();
-            style.inner.min_size.height = LengthPercentageAuto::length(MIN_BOOK_HEIGHT);
+            style
+                .height_percent(ratio)
+                .min_height_length(MIN_BOOK_HEIGHT);
             cx.tree_mut().set_style(area, style)?;
             self.book_style_ratio = Some(ratio);
         }

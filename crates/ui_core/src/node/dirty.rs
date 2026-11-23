@@ -80,7 +80,7 @@ pub(crate) fn depends_on_children(node: &Node) -> bool {
     if node.kind().is_leaf() || node.layout_override().is_some() {
         return false;
     }
-    let size = node.style().inner.size;
+    let size = node.style().inner().size;
     axis_depends_on_children(size.width) || axis_depends_on_children(size.height)
 }
 
@@ -95,16 +95,15 @@ fn axis_depends_on_children(dimension: Dimension) -> bool {
 }
 
 pub(crate) fn affects_parent(node: &Node) -> bool {
-    !matches!(node.style().inner.display, Display::None)
+    !matches!(node.style().inner().display, Display::None)
         && !matches!(
-            node.style().inner.position,
+            node.style().inner().position,
             Position::Absolute | Position::Fixed
         )
 }
 
 #[cfg(test)]
 mod tests {
-    use smol_str::SmolStr;
     use taffy::style::{Dimension, Position};
 
     use super::{DirtyFlags, DirtySet, affects_parent, depends_on_children};
@@ -115,19 +114,13 @@ mod tests {
             id::NodeId,
             tree::{LayoutBox, NodeTree},
         },
-        paint::{
-            canvas::Canvas,
-            style::{Clip, Style},
-        },
+        paint::{canvas::Canvas, style::Style},
     };
 
     fn style_with(width: Dimension, height: Dimension) -> Style {
-        let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size { width, height };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        let mut style = Style::default();
+        style.width(width).height(height);
+        style
     }
 
     fn auto_style() -> Style {
@@ -307,7 +300,7 @@ mod tests {
             style_with(Dimension::length(4.0), Dimension::length(4.0)),
         );
         tree.edit_style_for_test(child, |style| {
-            style.inner.position = Position::Absolute;
+            style.position(Position::Absolute);
         });
         tree.clear_all_dirty_for_test();
 
@@ -326,7 +319,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let (_root, parent, child) = chain(&mut tree);
         tree.edit_style_for_test(child, |style| {
-            style.inner.display = taffy::style::Display::None;
+            style.display(taffy::style::Display::None);
         });
         tree.clear_all_dirty_for_test();
 
@@ -424,10 +417,7 @@ mod tests {
         let mut tree = NodeTree::new();
         let (root, parent, child) = chain(&mut tree);
         tree.edit_style_for_test(child, |style| {
-            style.inner.size = taffy::geometry::Size {
-                width: Dimension::length(20.0),
-                height: Dimension::length(20.0),
-            };
+            style.size_length(20.0, 20.0);
         });
         assert!(!depends_on_children(tree.get(child).expect("存在")));
         tree.clear_all_dirty_for_test();
@@ -467,13 +457,14 @@ mod tests {
         );
 
         tree.edit_style_for_test(child, |style| {
-            style.inner.position = Position::Fixed;
+            style.position(Position::Fixed);
         });
         assert!(!affects_parent(tree.get(child).expect("存在")));
 
         tree.edit_style_for_test(child, |style| {
-            style.inner.position = Position::Static;
-            style.inner.display = taffy::style::Display::None;
+            style
+                .position(Position::Static)
+                .display(taffy::style::Display::None);
         });
         assert!(!affects_parent(tree.get(child).expect("存在")));
     }

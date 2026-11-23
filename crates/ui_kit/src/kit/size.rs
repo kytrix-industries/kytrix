@@ -1,7 +1,6 @@
-use crate::{
-    style_builder::StyleBuilder,
-    theme::components::{ComponentTokens, ControlSize, SizeTokens},
-};
+use ui_core::paint::style_builder::StyleBuilder;
+
+use crate::theme::components::{ComponentTokens, ControlSize, SizeTokens};
 
 pub type UnifiedSize = ControlSize;
 
@@ -65,9 +64,9 @@ impl UnifiedSizeStyle for StyleBuilder {
 #[cfg(test)]
 mod tests {
     use taffy::style::{Dimension, LengthPercentage};
+    use ui_core::paint::style_builder::StyleBuilder;
 
     use super::{UnifiedSizable, UnifiedSize, UnifiedSizeStyle};
-    use crate::style_builder::StyleBuilder;
 
     const FROZEN_LADDER: [(UnifiedSize, f32, f32, f32, f32, f32); 3] = [
         (UnifiedSize::Small, 20.0, 4.0, 4.0, 12.0, 8.0),
@@ -91,13 +90,13 @@ mod tests {
         let style = StyleBuilder::new()
             .unified_sized(UnifiedSize::Large)
             .build();
-        assert_eq!(style.inner.size.height, Dimension::length(40.0));
-        assert_eq!(style.inner.gap.width, LengthPercentage::length(8.0));
-        assert_eq!(style.inner.gap.height, LengthPercentage::length(8.0));
-        assert_eq!(style.inner.padding.left, LengthPercentage::length(10.0));
-        assert_eq!(style.inner.padding.right, LengthPercentage::length(10.0));
-        assert_eq!(style.inner.padding.top, LengthPercentage::length(0.0));
-        assert_eq!(style.inner.padding.bottom, LengthPercentage::length(0.0));
+        assert_eq!(style.inner().size.height, Dimension::length(40.0));
+        assert_eq!(style.inner().gap.width, LengthPercentage::length(8.0));
+        assert_eq!(style.inner().gap.height, LengthPercentage::length(8.0));
+        assert_eq!(style.inner().padding.left, LengthPercentage::length(10.0));
+        assert_eq!(style.inner().padding.right, LengthPercentage::length(10.0));
+        assert_eq!(style.inner().padding.top, LengthPercentage::length(0.0));
+        assert_eq!(style.inner().padding.bottom, LengthPercentage::length(0.0));
     }
 
     #[test]

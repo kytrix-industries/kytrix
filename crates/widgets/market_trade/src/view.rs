@@ -23,9 +23,10 @@ use ui_core::{
     app::App,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+    paint::style_builder::StyleBuilder,
     window::WindowId,
 };
-use ui_kit::{kit::table::Table, style_builder::StyleBuilder, theme::handle::ThemeHandle};
+use ui_kit::{kit::table::Table, theme::handle::ThemeHandle};
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,

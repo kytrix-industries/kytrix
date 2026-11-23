@@ -17,7 +17,7 @@ use ui_core::{
         builder::NodeBuilder, dependency::ReadCtx, id::NodeId, image::ImageFit, signal::Signal,
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     resources::ResourceId,
     text::{TextStyle, TextWrap},
     window::WindowId,
@@ -34,7 +34,6 @@ use crate::{
         },
         size::UnifiedSize,
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -541,7 +540,7 @@ impl ItemPanel {
             && let Ok(node) = tree.get(surface)
         {
             let mut style = node.style().clone();
-            style.inner.size.width = taffy::style::Dimension::length(target);
+            style.width_length(target);
             tree.set_style(surface, style)?;
         }
         self.inner.state.borrow_mut().width = target;
@@ -896,8 +895,7 @@ impl ItemPanel {
             && let Ok(node) = tree.get(surface)
         {
             let mut style = node.style().clone();
-            style.inner.size.width = taffy::style::Dimension::length(width);
-            style.inner.size.height = taffy::style::Dimension::length(height);
+            style.size_length(width, height);
             tree.set_style(surface, style)?;
         }
         Ok(())

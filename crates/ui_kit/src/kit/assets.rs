@@ -239,7 +239,6 @@ impl std::error::Error for AssetError {}
 mod tests {
     use bytes::Bytes;
     use smol_str::SmolStr;
-    use taffy::style::Dimension;
     use ui_core::{
         app::App,
         math::{Rect, Size},
@@ -433,8 +432,7 @@ mod tests {
         let window = harness.window_id();
         let root = harness.app().window(window).expect("窗口").tree().root();
         let mut style = Style::default();
-        style.inner.size.width = Dimension::length(24.0);
-        style.inner.size.height = Dimension::length(24.0);
+        style.size_length(24.0, 24.0);
         let node = NodeBuilder::image_pending(pending, ImageFit::Contain)
             .style(style)
             .build(

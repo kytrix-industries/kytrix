@@ -23,7 +23,7 @@
 - 单位类型采用 `LogicalPx`（逻辑像素，`f32`）/ `PhysicalPx`（连续物理像素，`f32`）/ `DevicePx`（整数设备像素，`i32`）。
 - `Node::layout().bounds` 严格为逻辑像素，与 DPI 无关；删除布局阶段的设备吸附。
 - 所有逻辑到物理的换算集中到 paint 编码边界；轴对齐矩形与边框在 paint 时按 `pixelSnappedIntRect` 规则吸附。
-- `Style.inner` 私有；`StyleBuilder` / `PaintBuilder` 移入 `ui_core::paint::style`，所有长度参数使用 `LogicalPx`。
+- `Style.inner` 私有；`Style` 提供 typed setter 与 `inner()` 只读访问器（仅 `test-support` 下公开，生产 `pub(crate)`）；`StyleBuilder` / `PaintBuilder` 移入 `ui_core::paint::style_builder`，所有长度参数在 C1 后使用 `LogicalPx`。
 - Canvas 文本改为 `Canvas::push_text(TextContent, origin)` 的引擎配方模式；删除 `App::text_scale`、`App::shape_text`、`ShapedTextHandle` 等应用层 DPI 接口。
 - 不保留旧类型别名、兼容层或过渡实现；全仓一次性迁移。
 
@@ -524,10 +524,12 @@ fn track_metrics(size: UnifiedSize) -> TrackMetrics {
 
 ### 5.4 `StyleBuilder` / `PaintBuilder`
 
-- 将 `crates/ui_kit/src/style_builder.rs` 移入 `crates/ui_core/src/paint/style_builder.rs`。
-- `Style.inner` 改为 `pub(crate)`；外部不再直接写 taffy 字段。
-- `StyleBuilder` 的所有长度方法（`gap`、`padding`、`size`、`min_size`、`max_size`、`inset`、`border` 等）接受 `LogicalPx`；`PaintBuilder` 的 `rounded` / `border` / `shadow` 同样接受 `LogicalPx`。
-- `ui_kit`、widgets、examples 的 `style.inner.size = Dimension::length(...)` 全部迁移到 `StyleBuilder` 或 `Style` 的 typed setter。
+- 将 `crates/ui_kit/src/style_builder.rs` 移入 `crates/ui_core/src/paint/style_builder.rs`（**B1b 已完成**，`ui_kit` 侧删除且无兼容层）。
+- `Style.inner` 字段私有；`inner()` 只读访问器仅在 `test-support`（或 crate 内测试）下公开，生产构建为 `pub(crate)`；外部不再直接写 taffy 字段。
+- `StyleBuilder` 的所有长度方法（`gap`、`padding`、`size`、`min_size`、`max_size`、`inset`、`border` 等）接受 `LogicalPx`；`PaintBuilder` 的 `rounded` / `border` 同样接受 `LogicalPx`。
+- `ui_kit`、widgets、examples 的 `style.inner.size = Dimension::length(...)` 全部迁移到 `StyleBuilder` 或 `Style` 的 typed setter（**B1b 已完成**：ui_kit 63 处 / prediction_market 4 处 / market_participants_ui 7 处）。
+- taffy 枚举（`Dimension` / `LengthPercentageAuto` / `Display` / `Position` / `AlignSelf` / `JustifyContent` / `Overflow`）仍作为 typed setter 入参与只读访问器出现在公开面；消除它们属于 C1 的单位类型与枚举收口，B1 不做。
+- 已知边界（P3-3）：`Style::from_taffy` 是 `#[cfg(test)]` 后门；`grid` / `aspect_ratio` / `flex_wrap` 等 taffy 字段暂无 typed setter，测试直接用 taffy 构造，本阶段不补。
 - `PaintSpec`、`Border`、`ShadowSpec`、`FocusRing` 的像素字段全部 `LogicalPx`。
 
 ### 5.5 widgets / profile_ui / gallery
@@ -601,10 +603,10 @@ DeviceRect = (x, y, x1, y1)
 
 ### 阶段 B：Style 收口
 
-**B1 `StyleBuilder` / `PaintBuilder` 迁入 `ui_core::paint::style`**
+**B1 `StyleBuilder` / `PaintBuilder` 迁入 `ui_core::paint::style_builder`**
 
 - 补齐 typed setter（`display` / `align_self` / 百分比尺寸 / `min_size` / `max_size` / `overflow` / `inset`）。
-- `Style.inner` 降 `pub(crate)`；迁移 `ui_core` 内全部字面量与 taffy 直写。
+- `Style.inner` 字段私有 + `inner()` 只读访问器（`test-support` 外为 `pub(crate)`）；迁移 `ui_core` 内全部字面量与 taffy 直写。
 
 **B2 下游迁移**
 
@@ -706,8 +708,8 @@ Select-String -Path crates/ui_core/src/**,crates/ui_kit/src/** -Pattern 'snap_to
 
 ### 8.4 现有测试基线
 
-- `cargo test -p ui_core --lib --features hud,test-support`：2323 passed / 1 ignored。
-- `cargo test -p ui_kit --lib`：772 passed。
+- `cargo test -p ui_core --lib --features hud,test-support`：2344 passed / 1 ignored。
+- `cargo test -p ui_kit --lib`：765 passed（kit 716 / theme 49；`style_builder` 测试已随模块迁入 `ui_core`）。
 - `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden）。
 - `gui_smoke --ignored`：6 场景 PASS（WARP）。
 - `acceptance -- cpu`：**既有缺陷**，文本帧 p99 ≈ 5.9–7.0 ms > 4 ms 阈值；与本轮重构无关。

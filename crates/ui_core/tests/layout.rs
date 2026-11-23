@@ -1,10 +1,13 @@
 use smol_str::SmolStr;
-use taffy::style::{Dimension, FlexDirection, LengthPercentage, LengthPercentageAuto, Position};
+use taffy::style::{Dimension, FlexDirection, Position};
 use ui_core::{
     interaction::{ScrollAxis, ScrollConfig},
     math::{Point, Rect, Scale, Size},
     node::{builder::NodeBuilder, id::NodeId},
-    paint::style::{Clip, Style},
+    paint::{
+        style::{Clip, Style},
+        style_builder::StyleBuilder,
+    },
     test_support::{app::TestApp, probe::Selector},
     window::WindowOptions,
 };
@@ -21,40 +24,25 @@ fn app() -> TestApp {
 }
 
 fn style(size: Option<Size>, padding: f32, column: bool, gap: f32) -> Style {
-    let edge = LengthPercentage::length(padding);
-    let gap = LengthPercentage::length(gap);
-    let mut inner = taffy::Style::<SmolStr>::DEFAULT;
-    inner.flex_direction = if column {
+    let mut style = StyleBuilder::new()
+        .flex_none()
+        .padding(padding)
+        .gap(gap)
+        .build();
+    style.flex_direction(if column {
         FlexDirection::Column
     } else {
         FlexDirection::Row
-    };
-    inner.flex_shrink = 0.0;
-    inner.padding = taffy::geometry::Rect {
-        left: edge,
-        right: edge,
-        top: edge,
-        bottom: edge,
-    };
-    inner.gap = taffy::geometry::Size {
-        width: gap,
-        height: gap,
-    };
+    });
     if let Some(size) = size {
-        inner.size = taffy::geometry::Size {
-            width: Dimension::length(size.width),
-            height: Dimension::length(size.height),
-        };
+        style.size_length(size.width, size.height);
     }
-    Style {
-        inner,
-        clip: Clip::None,
-    }
+    style
 }
 
 fn panel(width: f32) -> Style {
     let mut style = style(None, 0.0, true, 0.0);
-    style.inner.size.width = Dimension::length(width);
+    style.width(Dimension::length(width));
     style
 }
 
@@ -230,13 +218,8 @@ fn scroll_offset_moves_what_hit_test_sees() {
     let container = mount(&mut app, root, "viewport", viewport);
 
     let mut deep_style = style(Some(Size::new(200.0, 20.0)), 0.0, true, 0.0);
-    deep_style.inner.position = Position::Absolute;
-    deep_style.inner.inset = taffy::geometry::Rect {
-        left: LengthPercentageAuto::length(0.0),
-        top: LengthPercentageAuto::length(150.0),
-        right: LengthPercentageAuto::auto(),
-        bottom: LengthPercentageAuto::auto(),
-    };
+    deep_style.position(Position::Absolute);
+    deep_style.inset_left(0.0).inset_top(150.0);
     mount(&mut app, container, "deep", deep_style);
     let _ = app.drain().expect("布局帧");
 

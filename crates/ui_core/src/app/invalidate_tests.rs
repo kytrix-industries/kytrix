@@ -6,6 +6,7 @@ use crate::{
     paint::{
         color::Color,
         style::{PaintSpec, Style, StylePatch},
+        style_builder::StyleBuilder,
     },
     window::{WindowId, WindowOptions},
 };
@@ -38,18 +39,16 @@ fn paint() -> PaintSpec {
 }
 
 fn positioned(rect: Rect) -> Style {
-    let mut style = Style::default();
-    style.inner.position = taffy::style::Position::Absolute;
-    style.inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(rect.size.width),
-        height: taffy::style::Dimension::length(rect.size.height),
-    };
-    style.inner.inset = taffy::geometry::Rect {
-        left: taffy::style::LengthPercentageAuto::length(rect.origin.x),
-        right: taffy::style::LengthPercentageAuto::length(0.0),
-        top: taffy::style::LengthPercentageAuto::length(rect.origin.y),
-        bottom: taffy::style::LengthPercentageAuto::length(0.0),
-    };
+    let mut style = StyleBuilder::new()
+        .absolute()
+        .size(rect.size.width, rect.size.height)
+        .build();
+    style.inset(
+        taffy::style::LengthPercentageAuto::length(rect.origin.y),
+        taffy::style::LengthPercentageAuto::length(0.0),
+        taffy::style::LengthPercentageAuto::length(0.0),
+        taffy::style::LengthPercentageAuto::length(rect.origin.x),
+    );
     style
 }
 

@@ -48,31 +48,21 @@ pub(crate) fn compute_leaf(tree: &mut NodeTree, node: NodeId, inputs: LayoutInpu
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
-    use taffy::style::Dimension;
-
     use crate::{
         error::EngineError,
         layout::{Axis, LayoutReport, MeasureFn},
         math::{Rect, Size},
         node::{builder::NodeBuilder, id::NodeId, tree::NodeTree},
-        paint::style::{Clip, Style},
+        paint::{style::Style, style_builder::StyleBuilder},
     };
 
     fn fixed(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: Dimension::length(width),
-            height: Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
 
     fn block(width: f32, height: f32) -> Style {
         let mut style = fixed(width, height);
-        style.inner.display = taffy::style::Display::Block;
+        style.display(taffy::style::Display::Block);
         style
     }
 
@@ -197,7 +187,7 @@ mod tests {
         let record = seen.clone();
         let row = {
             let mut style = fixed(200.0, 100.0);
-            style.inner.align_items = taffy::style::AlignItems::FLEX_START;
+            style.align_items(taffy::style::AlignItems::FLEX_START);
             add(&mut tree, root, style)
         };
         let _node = NodeBuilder::boxed()
@@ -472,12 +462,13 @@ mod tests {
         let root = tree.root();
         {
             let mut root_style = fixed(400.0, 400.0);
-            root_style.inner.align_items = taffy::style::AlignItems::FLEX_START;
-            root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+            root_style
+                .align_items(taffy::style::AlignItems::FLEX_START)
+                .flex_direction(taffy::style::FlexDirection::Column);
             tree.set_style(root, root_style).expect("root 存活");
         }
         let mut node_style = fixed(width, 0.0);
-        node_style.inner.size.height = taffy::style::Dimension::auto();
+        node_style.height(taffy::style::Dimension::auto());
         let node = NodeBuilder::boxed()
             .style(node_style)
             .measure(Box::new(move |known, available| {

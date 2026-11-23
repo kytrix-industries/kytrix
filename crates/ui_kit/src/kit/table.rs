@@ -17,7 +17,10 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::{Style, StylePatch},
+    paint::{
+        style::{Style, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::TextStyle,
     window::WindowId,
 };
@@ -27,7 +30,6 @@ use crate::{
         list::{List, ListOptions, RowHeight, Selection, SelectionMode},
         text_value::TextValue,
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -173,10 +175,9 @@ fn span_cell_style(
     };
     if flex > 0.0 {
         let mut style = builder.flex_1().build();
-        style.inner.flex_grow = flex;
-        style.inner.flex_shrink = 1.0;
-        style.inner.flex_basis = Dimension::length(fixed);
-        style.inner.min_size.width = taffy::style::LengthPercentageAuto::length(fixed);
+        style
+            .flex(flex, 1.0, Dimension::length(fixed))
+            .min_width(taffy::style::LengthPercentageAuto::length(fixed));
         style
     } else {
         builder.width(fixed).flex_none().build()
@@ -780,6 +781,7 @@ mod tests {
             id::NodeId,
             tree::{NodeKind, NodeTree},
         },
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
         text::TextStyle,
     };
@@ -793,7 +795,6 @@ mod tests {
             test_support::{a11y_of, assert_single_parent_per_node, frame_a11y, full_a11y},
             text_value::TextValue,
         },
-        style_builder::StyleBuilder,
         theme::{appearance::Appearance, handle::ThemeHandle},
     };
 

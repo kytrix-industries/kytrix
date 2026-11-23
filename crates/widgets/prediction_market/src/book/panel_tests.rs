@@ -10,11 +10,11 @@ use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     interaction::ItemAlign,
     node::{builder::NodeBuilder, id::NodeId},
+    paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
 };
 use ui_kit::{
     kit::motion::DEPTH_ANIMATION_RESPONSE_PER_SECOND,
-    style_builder::StyleBuilder,
     theme::{appearance::Appearance, role::Role},
 };
 use widget::test_support::{CanvasPrimitive, WidgetTestApp};

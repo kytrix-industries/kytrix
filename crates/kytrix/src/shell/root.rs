@@ -79,7 +79,7 @@ impl Shell {
             app,
             window,
             root,
-            ui_kit::style_builder::StyleBuilder::new()
+            ui_core::paint::style_builder::StyleBuilder::new()
                 .flex_col()
                 .flex_1()
                 .min_width_0()
@@ -90,7 +90,7 @@ impl Shell {
             app,
             window,
             page_column,
-            ui_kit::style_builder::StyleBuilder::new()
+            ui_core::paint::style_builder::StyleBuilder::new()
                 .width_full()
                 .height(metrics::TITLE_BAR_HEIGHT)
                 .flex_none()

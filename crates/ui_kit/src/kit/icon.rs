@@ -1,7 +1,6 @@
 use std::fmt;
 
 use smol_str::SmolStr;
-use taffy::style::Dimension;
 use ui_core::{
     a11y::A11yOverride,
     app::App,
@@ -332,8 +331,7 @@ impl IconSpec {
             .factor();
         let resource = self.resource_for(app, window, scale)?;
         let mut style = Style::default();
-        style.inner.size.width = Dimension::length(self.size);
-        style.inner.size.height = Dimension::length(self.size);
+        style.size_length(self.size, self.size);
         NodeBuilder::image(resource.id, ImageFit::Fill)
             .image_modulation(self.color)
             .style(style)
@@ -369,8 +367,7 @@ impl IconSpec {
         let resource = self.resource_for(app, window, scale)?;
         let initial = theme.theme_for(theme.current(app)).role(role);
         let mut style = Style::default();
-        style.inner.size.width = Dimension::length(self.size);
-        style.inner.size.height = Dimension::length(self.size);
+        style.size_length(self.size, self.size);
         let style_theme = theme.clone();
         NodeBuilder::image(resource.id, ImageFit::Fill)
             .image_modulation(initial)

@@ -5,7 +5,10 @@ use crate::{
     error::EngineError,
     math::{Edges, Point, Rect},
     node::{builder::NodeBuilder, dirty::DirtyFlags, id::NodeId, signal::SignalId},
-    paint::style::{Clip, Style, StylePatch},
+    paint::{
+        style::{Clip, Style, StylePatch},
+        style_builder::StyleBuilder,
+    },
 };
 
 fn boxed(tree: &mut NodeTree, parent: NodeId) -> NodeId {
@@ -217,7 +220,7 @@ fn root_style_is_percent_100() {
 
     let tree = NodeTree::new();
     let root = tree.get(tree.root()).expect("root 存在");
-    let size = root.style().inner.size;
+    let size = root.style().inner().size;
 
     assert!(matches!(size.width.expand(), ExpandedDimension::Percent(v) if v == 1.0));
     assert!(matches!(size.height.expand(), ExpandedDimension::Percent(v) if v == 1.0));
@@ -316,10 +319,8 @@ fn remove_drops_cache_and_hoisted_entries() {
 fn node_clip_reads_style() {
     let mut tree = NodeTree::new();
     let root = tree.root();
-    let style = Style {
-        clip: Clip::Bounds,
-        ..Style::default()
-    };
+    let mut style = Style::default();
+    style.clip = Clip::Bounds;
     let node = tree
         .insert_child(root, NodeSpec::new(NodeKind::Box, style, None))
         .expect("插入成功");
@@ -809,15 +810,7 @@ fn node_size_after_p06() {
 }
 
 fn fixed_style(width: f32, height: f32) -> Style {
-    let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-    inner.size = taffy::geometry::Size {
-        width: taffy::style::Dimension::length(width),
-        height: taffy::style::Dimension::length(height),
-    };
-    Style {
-        inner,
-        clip: Clip::None,
-    }
+    StyleBuilder::new().size(width, height).build()
 }
 
 fn layout_to(tree: &mut NodeTree, width: f32, height: f32) {
@@ -855,7 +848,7 @@ fn a_layout_override_is_positioned_against_the_parents_logical_box() {
     let mut tree = NodeTree::new();
     let root = tree.root();
     let mut root_style = fixed_style(100.0, 100.0);
-    root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
+    root_style.flex_direction(taffy::style::FlexDirection::Column);
     tree.set_style(root, root_style).expect("根节点存活");
     let _spacer = NodeBuilder::boxed()
         .style(fixed_style(100.0, 10.25))

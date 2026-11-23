@@ -18,7 +18,10 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope, Transient},
     },
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -29,7 +32,6 @@ use crate::{
         interactive::{Interactive, RolePalette, StateRoles, mount_dynamic_icon},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 
@@ -690,7 +692,7 @@ fn set_tab_max_width(app: &mut App, window: WindowId, node: NodeId) -> Result<()
         .ok_or(EngineError::UnknownWindow { window })?
         .tree_mut();
     let mut style = tree.get(node)?.style().clone();
-    style.inner.max_size.width = LengthPercentageAuto::length(TAB_MAX_WIDTH);
+    style.max_width(LengthPercentageAuto::length(TAB_MAX_WIDTH));
     tree.set_style(node, style)
 }
 
@@ -1128,7 +1130,7 @@ mod tests {
             let icon = tree.get(close).expect("close").children()[0];
             (
                 close,
-                tree.get(icon).expect("icon").style().inner.size.width,
+                tree.get(icon).expect("icon").style().inner().size.width,
             )
         };
         let bounds = harness.app.probe().bounds(close).expect("close bounds");

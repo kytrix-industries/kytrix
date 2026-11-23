@@ -18,7 +18,10 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -32,7 +35,6 @@ use ui_kit::{
         markdown::{parse::parse_document, source::MarkdownAssets},
         table::{Column, ColumnAlign, Table, TableOptions},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 

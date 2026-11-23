@@ -36,7 +36,7 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::{primitive::Border, style::StylePatch},
+    paint::{primitive::Border, style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -48,7 +48,6 @@ use ui_kit::{
         separator::Separator,
         tree::{Tree, TreeItem, TreeOptions},
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{

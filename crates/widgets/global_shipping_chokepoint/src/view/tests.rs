@@ -22,9 +22,10 @@ use ui_core::{
     event::{Action, Event, InputEvent, PointerButton, ScrollPhase, ScrollUnit},
     math::Point,
     node::builder::NodeBuilder,
+    paint::style_builder::StyleBuilder,
     test_support::record::PrimitiveKind,
 };
-use ui_kit::{style_builder::StyleBuilder, theme::appearance::Appearance};
+use ui_kit::theme::appearance::Appearance;
 use widget::{
     protocol::RequestId,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},

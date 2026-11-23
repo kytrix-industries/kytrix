@@ -765,9 +765,9 @@ mod tests {
 
     fn text_style(width: Option<f32>) -> crate::paint::style::Style {
         let mut style = crate::paint::style::Style::default();
-        style.inner.align_self = Some(taffy::style::AlignSelf::START);
+        style.align_self(taffy::style::AlignSelf::START);
         if let Some(width) = width {
-            style.inner.size.width = taffy::style::Dimension::length(width);
+            style.width(taffy::style::Dimension::length(width));
         }
         style
     }

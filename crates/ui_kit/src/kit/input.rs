@@ -27,6 +27,7 @@ use ui_core::{
         color::Color,
         primitive::{Border, Quad, QuadPaint},
         style::{Cursor, StylePatch},
+        style_builder::{PaintBuilder, StyleBuilder},
     },
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
     window::{Window, WindowId},
@@ -34,7 +35,6 @@ use ui_core::{
 
 use crate::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 
@@ -1008,10 +1008,11 @@ pub fn build(
         .overflow_hidden()
         .build();
     if multiline {
-        root_style.inner.min_size.height = LengthPercentageAuto::length(size.height);
-        root_style.inner.align_self = Some(taffy::style::AlignSelf::START);
+        root_style
+            .min_height(LengthPercentageAuto::length(size.height))
+            .align_self(taffy::style::AlignSelf::START);
     } else {
-        root_style.inner.size.height = taffy::style::Dimension::length(size.height);
+        root_style.height_length(size.height);
     }
     let root_paint = PaintBuilder::new()
         .border(border_width, Color::TRANSPARENT)
@@ -1504,8 +1505,8 @@ impl InputNode {
             return changed;
         };
         let mut style = current.style().clone();
-        if style.inner.display != display {
-            style.inner.display = display;
+        if style.display_mode() != display {
+            style.display(display);
             let _ = tree.set_style(node, style);
             changed = true;
         }
@@ -1896,6 +1897,7 @@ mod tests {
             color::{Color, ColorResolver},
             primitive::Primitive,
             style::PaintSpec,
+            style_builder::StyleBuilder,
         },
         test_support::{app::TestApp, record::PrimitiveKind},
         window::WindowId,
@@ -1905,12 +1907,9 @@ mod tests {
         CaretMotion, InputError, InputNode, InputSpec, InputState, build, click_action,
         drag_action, utf8_from_utf16_offset, utf16_len,
     };
-    use crate::{
-        style_builder::StyleBuilder,
-        theme::{
-            appearance::Appearance, components::ControlSize, handle::ThemeHandle, resolved::Theme,
-            role::Role,
-        },
+    use crate::theme::{
+        appearance::Appearance, components::ControlSize, handle::ThemeHandle, resolved::Theme,
+        role::Role,
     };
 
     fn spec() -> InputSpec {
@@ -2141,7 +2140,7 @@ mod tests {
                 .get(node)
                 .expect("节点存在")
                 .style()
-                .inner
+                .inner()
                 .display
         }
 

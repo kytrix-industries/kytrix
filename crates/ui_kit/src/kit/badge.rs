@@ -2,7 +2,12 @@ use smol_str::SmolStr;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::{color::Color, primitive::Border, style::StylePatch},
+    paint::{
+        color::Color,
+        primitive::Border,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::TextStyle,
 };
 
@@ -11,7 +16,6 @@ use crate::{
         size::{UnifiedSizable, UnifiedSize},
         text_value::TextValue,
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 

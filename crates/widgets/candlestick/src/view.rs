@@ -28,18 +28,15 @@ use ui_core::{
     event::{Event, InputEvent, PointerButton},
     math::Point,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     window::WindowId,
 };
-use ui_kit::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        select::{Select, SelectItem, SelectOptions},
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
+use ui_kit::kit::{
+    button::Button,
+    empty_state::EmptyState,
+    select::{Select, SelectItem, SelectOptions},
+    separator::Separator,
+    size::{UnifiedSizable, UnifiedSize},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

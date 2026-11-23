@@ -13,13 +13,11 @@ use ui_core::{
         color::Color,
         primitive::{Border, ClipRect, Quad, QuadPaint},
         style::StylePatch,
+        style_builder::StyleBuilder,
     },
     text::{ShapedTextHandle, TextAlign, TextStyle},
 };
-use ui_kit::{
-    style_builder::StyleBuilder,
-    theme::{resolved::Theme, role::Role},
-};
+use ui_kit::theme::{resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
 
 use crate::model::{HeatMapEntry, PriceDirection, TILE_LIMIT};

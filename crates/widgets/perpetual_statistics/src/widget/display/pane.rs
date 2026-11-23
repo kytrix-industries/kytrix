@@ -18,19 +18,16 @@ use ui_core::{
     error::EngineError,
     event::{Event, InputEvent},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
     window::WindowId,
 };
-use ui_kit::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        icon::IconKind,
-        select::{Select, SelectItem, SelectOptions},
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
+use ui_kit::kit::{
+    button::Button,
+    empty_state::EmptyState,
+    icon::IconKind,
+    select::{Select, SelectItem, SelectOptions},
+    size::{UnifiedSizable, UnifiedSize},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

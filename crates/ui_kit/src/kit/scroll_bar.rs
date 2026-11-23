@@ -17,14 +17,14 @@ use ui_core::{
         signal::{Signal, SignalScope, Transient},
         tree::NodeTree,
     },
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     window::WindowId,
 };
 
-use crate::{
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::handle::ThemeHandle,
-};
+use crate::theme::handle::ThemeHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbarAxis {
@@ -675,14 +675,12 @@ mod ui_tests {
         interaction::{ScrollConfig, ScrollHandle},
         math::Size,
         node::{builder::NodeBuilder, id::NodeId},
+        paint::style_builder::StyleBuilder,
         test_support::app::TestApp,
     };
 
     use super::{ScrollBar, ScrollbarAxis, ScrollbarMode, ScrollbarOptions};
-    use crate::{
-        style_builder::StyleBuilder,
-        theme::{appearance::Appearance, handle::ThemeHandle},
-    };
+    use crate::theme::{appearance::Appearance, handle::ThemeHandle};
 
     const BOX_WIDTH: f32 = 200.0;
     const BOX_HEIGHT: f32 = 100.0;

@@ -400,7 +400,7 @@ impl Harness {
             .root();
         let parent = NodeBuilder::boxed()
             .style(
-                ui_kit::style_builder::StyleBuilder::new()
+                ui_core::paint::style_builder::StyleBuilder::new()
                     .flex_row()
                     .items_center()
                     .padding(8.0)
@@ -491,7 +491,7 @@ impl Harness {
         let root = self.root();
         let slot = NodeBuilder::boxed()
             .style(
-                ui_kit::style_builder::StyleBuilder::new()
+                ui_core::paint::style_builder::StyleBuilder::new()
                     .flex_row()
                     .build(),
             )

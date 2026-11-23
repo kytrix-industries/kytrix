@@ -9,7 +9,10 @@ use ui_core::{
     event::{Action, Event},
     interaction::ScrollHandle,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::{PaintSpec, StylePatch},
+    paint::{
+        style::{PaintSpec, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::TextStyle,
     window::WindowId,
 };
@@ -21,7 +24,6 @@ use ui_kit::{
         list::{List, ListOptions},
         scroll_bar::ScrollBar,
     },
-    style_builder::StyleBuilder,
     theme::{
         appearance::Appearance as ThemeAppearance, components::ControlSize, handle::ThemeHandle,
         role::Role,

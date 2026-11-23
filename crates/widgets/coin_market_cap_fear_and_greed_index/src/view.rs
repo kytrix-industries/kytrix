@@ -9,7 +9,10 @@ use ui_core::{
     app::App,
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::{TextAlign, TextStyle},
 };
 use ui_kit::{
@@ -20,7 +23,6 @@ use ui_kit::{
         size::{UnifiedSizable, UnifiedSize},
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

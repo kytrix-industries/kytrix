@@ -12,12 +12,10 @@ use ui_core::{
     paint::{
         canvas::Canvas,
         primitive::{Primitive, QuadPaint},
+        style_builder::StyleBuilder,
     },
 };
-use ui_kit::{
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, role::Role},
-};
+use ui_kit::theme::{appearance::Appearance, role::Role};
 use widget::{
     cx::WidgetCx,
     protocol::RequestId,

@@ -35,7 +35,7 @@ use ui_core::{
         id::NodeId,
         signal::{Signal, SignalScope},
     },
-    paint::{primitive::Border, style::StylePatch},
+    paint::{primitive::Border, style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -53,7 +53,6 @@ use ui_kit::{
         tab_bar::{IndicatorAnimation, TabBar, TabBarOptions, TabItem},
         tooltip::{Tooltip, TooltipContent, TooltipOptions},
     },
-    style_builder::StyleBuilder,
     theme::{components::ControlSize, role::Role},
 };
 use widget::{

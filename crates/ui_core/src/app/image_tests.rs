@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use smol_str::SmolStr;
-use taffy::style::Dimension;
 
 use crate::{
     a11y::{A11yAction, A11yDiagnostic, A11yDrawKind, A11yOverride, A11yRole},
@@ -12,6 +11,7 @@ use crate::{
     paint::{
         color::{Color, ColorResolver},
         style::{PaintSpec, Style},
+        style_builder::StyleBuilder,
     },
     test_support::{
         app::TestApp,
@@ -40,12 +40,7 @@ fn white() -> PaintSpec {
 }
 
 fn fixed(width: f32, height: f32) -> Style {
-    let mut style = Style::default();
-    style.inner.size = taffy::geometry::Size {
-        width: Dimension::length(width),
-        height: Dimension::length(height),
-    };
-    style
+    StyleBuilder::new().size(width, height).build()
 }
 
 struct Fixture {
@@ -76,8 +71,9 @@ impl Fixture {
         let tree = self.tree_mut();
         let root = tree.root();
         let mut style = tree.get(root).expect("root").style().clone();
-        style.inner.flex_direction = taffy::style::FlexDirection::Column;
-        style.inner.align_items = taffy::style::AlignItems::FLEX_START;
+        style
+            .flex_direction(taffy::style::FlexDirection::Column)
+            .align_items(taffy::style::AlignItems::FLEX_START);
         tree.set_style(root, style).expect("root style");
     }
 

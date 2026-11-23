@@ -5,7 +5,7 @@ use std::{
 };
 
 use smol_str::{SmolStr, format_smolstr};
-use taffy::style::{Dimension, Display};
+use taffy::style::Display;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     app::App,
@@ -19,7 +19,11 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::{primitive::Border, style::StylePatch},
+    paint::{
+        primitive::Border,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -36,7 +40,6 @@ use crate::{
         overlay::{Anchor, AnimationRouter, OverlayError, Placement},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 
@@ -1033,10 +1036,7 @@ impl Select {
             if let Ok(current) = target.tree().get(node) {
                 let mut style = current.style().clone();
                 let side = if desired.is_some() { size } else { 0.0 };
-                style.inner.size = taffy::geometry::Size {
-                    width: Dimension::length(side),
-                    height: Dimension::length(side),
-                };
+                style.size_length(side, side);
                 let _ = target.tree_mut().set_style(node, style);
             }
             if let Some(resource) = resource {
@@ -1137,10 +1137,10 @@ impl Select {
 fn set_display(tree: &mut NodeTree, node: NodeId, display: Display) {
     if let Ok(target) = tree.get(node) {
         let mut style = target.style().clone();
-        if style.inner.display == display {
+        if style.display_mode() == display {
             return;
         }
-        style.inner.display = display;
+        style.display(display);
         let _ = tree.set_style(node, style);
     }
 }
@@ -1232,7 +1232,7 @@ fn build_tag_chip(
 }
 
 fn hidden_style(mut style: ui_core::paint::style::Style) -> ui_core::paint::style::Style {
-    style.inner.display = Display::None;
+    style.display(Display::None);
     style
 }
 
@@ -1414,7 +1414,7 @@ mod tests {
                     if matches!(target.kind(), NodeKind::Image(_))
                         && target
                             .style()
-                            .inner
+                            .inner()
                             .size
                             .width
                             .into_option()
@@ -1460,7 +1460,7 @@ mod tests {
                 .get(node)
                 .expect("节点")
                 .style()
-                .inner
+                .inner()
                 .display
         }
 

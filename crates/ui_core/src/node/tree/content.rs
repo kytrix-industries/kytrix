@@ -629,7 +629,7 @@ pub(crate) fn paint_state(
     inherited_opacity: f32,
 ) -> Option<super::PaintNodeState> {
     let target = tree.arena.get(node)?;
-    let hidden = matches!(target.style.inner.display, taffy::style::Display::None)
+    let hidden = matches!(target.style.inner().display, taffy::style::Display::None)
         || target.style_patch().visible == Some(false);
     let screen_baked = matches!(
         target.kind(),

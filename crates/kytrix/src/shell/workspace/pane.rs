@@ -7,12 +7,15 @@ use ui_core::{
     event::Event,
     math::Rect,
     node::{builder::NodeBuilder, id::NodeId},
-    paint::{primitive::Border, style::StylePatch},
+    paint::{
+        primitive::Border,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     window::WindowId,
 };
 use ui_kit::{
     kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

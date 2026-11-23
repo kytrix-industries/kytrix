@@ -15,7 +15,7 @@ use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::{TextOverflow, TextStyle},
 };
 use ui_kit::{
@@ -26,7 +26,6 @@ use ui_kit::{
         list::{List, ListOptions, SelectionMode},
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

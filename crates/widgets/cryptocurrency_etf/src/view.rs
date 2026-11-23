@@ -9,7 +9,7 @@ use ui_core::{
     error::EngineError,
     event::Event,
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal},
-    paint::style::StylePatch,
+    paint::{style::StylePatch, style_builder::StyleBuilder},
     text::TextStyle,
     window::WindowId,
 };
@@ -21,7 +21,6 @@ use ui_kit::{
         separator::Separator,
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{

@@ -15,7 +15,10 @@ use ui_core::{
     app::{App, TimerId},
     error::EngineError,
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
-    paint::style::{PaintSpec, StylePatch},
+    paint::{
+        style::{PaintSpec, StylePatch},
+        style_builder::StyleBuilder,
+    },
     text::TextStyle,
     window::WindowId,
 };
@@ -25,7 +28,6 @@ use ui_kit::{
         icon::IconKind,
         size::{UnifiedSizable, UnifiedSize},
     },
-    style_builder::StyleBuilder,
     theme::role::Role,
 };
 use widget::{

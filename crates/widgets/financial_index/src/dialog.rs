@@ -19,7 +19,11 @@ use ui_core::{
         signal::{Signal, SignalScope},
         tree::NodeTree,
     },
-    paint::{primitive::Border, style::StylePatch},
+    paint::{
+        primitive::Border,
+        style::StylePatch,
+        style_builder::{PaintBuilder, StyleBuilder},
+    },
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
     window::WindowId,
 };
@@ -36,7 +40,6 @@ use ui_kit::{
         spinner::Spinner,
         tree::{Tree, TreeItem, TreeOptions},
     },
-    style_builder::{PaintBuilder, StyleBuilder},
     theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{

@@ -101,26 +101,18 @@ fn channel_span(a: [u8; 4], b: [u8; 4]) -> u8 {
 
 #[test]
 fn group_opacity_is_a_composite_multiplier_in_the_readback() {
-    use taffy::style::Dimension;
     use ui_core::{
         node::builder::NodeBuilder,
         paint::{
             color::Color,
-            style::{Clip, PaintSpec, Style, StylePatch},
+            style::{PaintSpec, Style, StylePatch},
+            style_builder::StyleBuilder,
         },
         test_support::app::TestApp,
     };
 
     fn sized(width: f32, height: f32) -> Style {
-        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
-        inner.size = taffy::geometry::Size {
-            width: Dimension::length(width),
-            height: Dimension::length(height),
-        };
-        Style {
-            inner,
-            clip: Clip::None,
-        }
+        StyleBuilder::new().size(width, height).build()
     }
     fn white() -> PaintSpec {
         PaintSpec {
