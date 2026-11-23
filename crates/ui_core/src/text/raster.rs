@@ -90,10 +90,6 @@ impl GlyphVariation {
     pub(crate) fn hash(&self) -> u64 {
         self.hash
     }
-
-    fn is_identity(&self) -> bool {
-        self.coords.is_empty() && self.embolden <= 0.0
-    }
 }
 
 pub(crate) fn split_subpixel_x(x: f32) -> (f32, u8) {
@@ -164,10 +160,11 @@ impl GlyphRasterizer {
             }),
         });
         let swash_font = entry.swash_font()?;
-        let mut builder = ctx.builder(swash_font).size(ppem).hint(HINTING);
-        if !variation.is_identity() {
-            builder = builder.normalized_coords(variation.coords.iter());
-        }
+        let builder = ctx
+            .builder(swash_font)
+            .size(ppem)
+            .hint(HINTING)
+            .normalized_coords(variation.coords.iter());
         let mut scaler = builder.build();
         let mut render = Render::new(&[
             Source::ColorOutline(0),
@@ -236,8 +233,47 @@ pub(crate) fn probe_font() -> Option<parley::FontData> {
 }
 
 #[cfg(test)]
+pub(crate) fn probe_variable_font() -> Option<parley::FontData> {
+    use std::borrow::Cow;
+
+    use crate::paint::color::ColorBrush;
+
+    let mut font_cx = parley::FontContext::new();
+    let mut layout_cx: parley::LayoutContext<ColorBrush> = parley::LayoutContext::new();
+    let mut builder = layout_cx.ranged_builder(&mut font_cx, "A", 1.0, true);
+    let families = [
+        "Segoe UI Variable Text",
+        "Segoe UI",
+        "Noto Sans",
+        "DejaVu Sans",
+    ];
+    let family_list: Vec<parley::FontFamilyName<'static>> = families
+        .iter()
+        .map(|name| parley::FontFamilyName::Named(Cow::Owned((*name).to_owned())))
+        .chain([parley::FontFamilyName::Generic(
+            parley::GenericFamily::SansSerif,
+        )])
+        .collect();
+    builder.push_default(parley::StyleProperty::FontFamily(parley::FontFamily::List(
+        Cow::Owned(family_list),
+    )));
+    builder.push_default(parley::StyleProperty::FontSize(16.0));
+    let mut layout = builder.build("A");
+    layout.break_all_lines(None);
+    let font = layout.lines().next()?.items().find_map(|item| match item {
+        parley::PositionedLayoutItem::GlyphRun(run) => Some(run.run().font().clone()),
+        parley::PositionedLayoutItem::InlineBox(_) => None,
+    })?;
+    let variable = swash::FontRef::from_index(font.data.data(), font.index as usize)
+        .is_some_and(|font| font.variations().next().is_some());
+    variable.then_some(font)
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{GlyphRasterizer, GlyphVariation, probe_font, split_subpixel_x};
+    use super::{
+        GlyphRasterizer, GlyphVariation, probe_font, probe_variable_font, split_subpixel_x,
+    };
 
     #[test]
     fn glyph_variation_distinguishes_instances() {
@@ -250,6 +286,55 @@ mod tests {
             plain.hash(),
             GlyphVariation::of(&[], Default::default(), 16.0).hash(),
             "相同参数必须命中同一 tile"
+        );
+    }
+
+    #[test]
+    fn regular_raster_after_bold_does_not_inherit_variation() {
+        let Some(font) = probe_variable_font() else {
+            eprintln!("skip: no variable system font available");
+            return;
+        };
+        let Some(glyph) = first_glyph(&font, 'b') else {
+            eprintln!("skip: no 'b' glyph in the first system font");
+            return;
+        };
+        let bold = GlyphVariation::of(&[16_384], Default::default(), 17.5);
+        let regular = GlyphVariation::default();
+        let mut raster = GlyphRasterizer::new();
+        let bold_image = raster
+            .rasterize(&font, u32::from(glyph), 17.5, 0, &bold)
+            .expect("bold glyph must rasterize");
+        let after_bold = raster
+            .rasterize(&font, u32::from(glyph), 17.5, 0, &regular)
+            .expect("regular glyph after bold must rasterize");
+        let mut fresh = GlyphRasterizer::new();
+        let reference = fresh
+            .rasterize(&font, u32::from(glyph), 17.5, 0, &regular)
+            .expect("fresh regular glyph must rasterize");
+
+        assert_eq!(
+            (
+                after_bold.placement.left,
+                after_bold.placement.top,
+                after_bold.placement.width,
+                after_bold.placement.height
+            ),
+            (
+                reference.placement.left,
+                reference.placement.top,
+                reference.placement.width,
+                reference.placement.height
+            ),
+            "regular glyph must not inherit the previous bold instance"
+        );
+        assert_eq!(
+            after_bold.data, reference.data,
+            "regular glyph coverage must match a fresh rasterizer"
+        );
+        assert_ne!(
+            bold_image.data, reference.data,
+            "the bold instance must differ from regular coverage"
         );
     }
 
