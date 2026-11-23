@@ -33,11 +33,24 @@ impl DamageAccumulator {
         self.full = false;
     }
 
-    pub(crate) fn push(&mut self, bounds: Rect, aa_padding: f32, clip: Option<PhysicalRect>) {
+    pub(crate) fn push_logical(
+        &mut self,
+        bounds: Rect,
+        aa_padding: f32,
+        clip: Option<PhysicalRect>,
+    ) {
+        self.push_device(bounds.to_physical_covering(self.scale), aa_padding, clip);
+    }
+
+    pub(crate) fn push_device(
+        &mut self,
+        rect: PhysicalRect,
+        aa_padding: f32,
+        clip: Option<PhysicalRect>,
+    ) {
         if self.full {
             return;
         }
-        let mut rect = bounds.to_physical_covering(self.scale);
         if rect.is_empty() {
             return;
         }
@@ -46,7 +59,7 @@ impl DamageAccumulator {
         } else {
             aa_padding.max(0.0).ceil() as i32
         };
-        rect = PhysicalRect::new(
+        let mut rect = PhysicalRect::new(
             rect.x0.saturating_sub(pad),
             rect.y0.saturating_sub(pad),
             rect.x1.saturating_add(pad),
@@ -238,7 +251,7 @@ mod tests {
     #[test]
     fn push_uses_covering_not_round() {
         let mut acc = DamageAccumulator::new(scale(2.0));
-        acc.push(rect(10.5, 20.25, 0.25, 0.25), 0.0, None);
+        acc.push_logical(rect(10.5, 20.25, 0.25, 0.25), 0.0, None);
         let (full, count) = finish(&mut acc);
         assert!(!full);
         assert_eq!(count, 1);
@@ -250,9 +263,71 @@ mod tests {
     }
 
     #[test]
+    fn damage_covers_the_unsnapped_rect() {
+        for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let scale = scale(factor);
+            for logical in [
+                Rect::new(10.3, 4.7, 20.4, 9.6),
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                Rect::new(-3.25, 7.9, 16.75, 2.5),
+            ] {
+                let mut acc = DamageAccumulator::new(scale);
+                acc.push_logical(logical, 0.0, None);
+                let (full, count) = finish(&mut acc);
+                assert!(!full);
+                assert_eq!(count, 1);
+
+                let exact = [
+                    logical.min().x * factor,
+                    logical.min().y * factor,
+                    logical.max().x * factor,
+                    logical.max().y * factor,
+                ];
+                let rect = acc.rects()[0];
+                assert!(
+                    rect.x0 <= exact[0].floor() as i32
+                        && rect.y0 <= exact[1].floor() as i32
+                        && rect.x1 >= exact[2].ceil() as i32
+                        && rect.y1 >= exact[3].ceil() as i32,
+                    "{logical:?} at {factor}：damage 必须外扩覆盖未吸附矩形：{rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn push_device_does_not_apply_the_scale() {
+        for factor in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
+            let mut acc = DamageAccumulator::new(scale(factor));
+            let device = PhysicalRect::new(10, 20, 40, 60);
+            acc.push_device(device, 0.0, None);
+            let (full, count) = finish(&mut acc);
+            assert!(!full);
+            assert_eq!(count, 1);
+            assert_eq!(
+                acc.rects(),
+                &[device],
+                "物理输入必须原样进入 damage（factor {factor} 不得再乘一次）"
+            );
+        }
+    }
+
+    #[test]
+    fn push_device_applies_the_physical_padding() {
+        let mut acc = DamageAccumulator::new(scale(2.0));
+        acc.push_device(PhysicalRect::new(10, 20, 30, 40), 2.0, None);
+        assert_eq!(
+            acc.rects(),
+            &[PhysicalRect::new(8, 18, 32, 42)],
+            "AA pad 是物理像素，不得再乘 scale"
+        );
+        let _ = finish(&mut acc);
+    }
+
+    #[test]
     fn push_expands_by_physical_padding() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push(rect(10.0, 10.0, 2.0, 2.0), 2.0, None);
+        acc.push_logical(rect(10.0, 10.0, 2.0, 2.0), 2.0, None);
         #[cfg(feature = "test-support")]
         assert_eq!(acc.rects(), &[PhysicalRect::new(8, 8, 14, 14)]);
         let _ = finish(&mut acc);
@@ -262,7 +337,7 @@ mod tests {
     fn push_intersects_clip() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         let clip = PhysicalRect::new(0, 0, 20, 20);
-        acc.push(rect(10.0, 10.0, 40.0, 40.0), 0.0, Some(clip));
+        acc.push_logical(rect(10.0, 10.0, 40.0, 40.0), 0.0, Some(clip));
         #[cfg(feature = "test-support")]
         assert_eq!(acc.rects(), &[PhysicalRect::new(10, 10, 20, 20)]);
         let _ = finish(&mut acc);
@@ -271,9 +346,9 @@ mod tests {
     #[test]
     fn push_rejects_non_finite_and_negative() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push(rect(f32::NAN, 0.0, 1.0, 1.0), 0.0, None);
-        acc.push(rect(0.0, 0.0, -4.0, 1.0), 0.0, None);
-        acc.push(rect(f32::INFINITY, 0.0, 1.0, 1.0), 0.0, None);
+        acc.push_logical(rect(f32::NAN, 0.0, 1.0, 1.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, -4.0, 1.0), 0.0, None);
+        acc.push_logical(rect(f32::INFINITY, 0.0, 1.0, 1.0), 0.0, None);
         let (full, count) = finish(&mut acc);
         assert!(!full);
         assert_eq!(count, 0);
@@ -282,38 +357,38 @@ mod tests {
     #[test]
     fn merge_overlapping() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        acc.push(rect(2.0, 2.0, 3.0, 3.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(2.0, 2.0, 3.0, 3.0), 0.0, None);
         assert_eq!(finish(&mut acc), (false, 1));
     }
 
     #[test]
     fn merge_adjacent() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        acc.push(rect(10.0, 0.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(10.0, 0.0, 10.0, 10.0), 0.0, None);
         assert_eq!(finish(&mut acc), (false, 1));
     }
 
     #[test]
     fn reject_l_shaped_merge() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        acc.push(rect(10.0, 10.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
+        acc.push_logical(rect(10.0, 10.0, 10.0, 10.0), 0.0, None);
         assert_eq!(finish(&mut acc), (false, 2), "只在一个角相邻 ⇒ 不合并");
     }
 
     #[test]
     fn merge_is_order_independent() {
         let mut a = DamageAccumulator::new(scale(1.0));
-        a.push(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
-        a.push(rect(5.0, 5.0, 10.0, 10.0), 0.0, None);
-        a.push(rect(100.0, 100.0, 5.0, 5.0), 0.0, None);
+        a.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
+        a.push_logical(rect(5.0, 5.0, 10.0, 10.0), 0.0, None);
+        a.push_logical(rect(100.0, 100.0, 5.0, 5.0), 0.0, None);
 
         let mut b = DamageAccumulator::new(scale(1.0));
-        b.push(rect(100.0, 100.0, 5.0, 5.0), 0.0, None);
-        b.push(rect(5.0, 5.0, 10.0, 10.0), 0.0, None);
-        b.push(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
+        b.push_logical(rect(100.0, 100.0, 5.0, 5.0), 0.0, None);
+        b.push_logical(rect(5.0, 5.0, 10.0, 10.0), 0.0, None);
+        b.push_logical(rect(0.0, 0.0, 10.0, 10.0), 0.0, None);
 
         assert_eq!(finish(&mut a), finish(&mut b));
         #[cfg(feature = "test-support")]
@@ -330,13 +405,13 @@ mod tests {
     fn reset_reuses_capacity_and_is_deterministic() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         for index in 0..4 {
-            acc.push(rect((index as f32) * 100.0, 0.0, 5.0, 5.0), 0.0, None);
+            acc.push_logical(rect((index as f32) * 100.0, 0.0, 5.0, 5.0), 0.0, None);
         }
         let first = acc.rects().to_vec();
         acc.reset(scale(1.0));
         assert!(acc.rects().is_empty());
         for index in 0..4 {
-            acc.push(rect((index as f32) * 100.0, 0.0, 5.0, 5.0), 0.0, None);
+            acc.push_logical(rect((index as f32) * 100.0, 0.0, 5.0, 5.0), 0.0, None);
         }
         assert_eq!(acc.rects(), first.as_slice());
         assert_eq!(finish(&mut acc), (false, 4));
@@ -346,14 +421,14 @@ mod tests {
     fn push_after_full_is_ignored() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         acc.push_full();
-        acc.push(rect(0.0, 0.0, 1.0, 1.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 1.0, 1.0), 0.0, None);
         assert_eq!(finish(&mut acc), (true, 0));
     }
 
     #[test]
     fn area_ratio_becomes_full() {
         let mut acc = DamageAccumulator::new(scale(1.0));
-        acc.push(rect(0.0, 0.0, 900.0, 900.0), 0.0, None);
+        acc.push_logical(rect(0.0, 0.0, 900.0, 900.0), 0.0, None);
         let (full, _) = finish(&mut acc);
         assert!(full, "> {FULL_FRAME_AREA_RATIO} 帧面积 ⇒ Full");
     }
@@ -413,7 +488,7 @@ mod tests {
         let mut acc = DamageAccumulator::new(scale);
         let mut expected = Vec::with_capacity(PUSHED);
         for bounds in &pushes {
-            acc.push(*bounds, 1.0, None);
+            acc.push_logical(*bounds, 1.0, None);
             let physical = bounds.to_physical_covering(scale);
             expected.push(PhysicalRect::new(
                 physical.x0 - 1,
@@ -528,7 +603,7 @@ mod tests {
 
             let mut first = DamageAccumulator::new(scale(1.0));
             for push in &pushes {
-                first.push(push.bounds, push.padding, push.clip);
+                first.push_logical(push.bounds, push.padding, push.clip);
             }
             if first.rects().len() > MAX_DAMAGE_RECTS {
                 over_budget_frames += 1;
@@ -568,7 +643,7 @@ mod tests {
             }
             let mut second = DamageAccumulator::new(scale(1.0));
             for push in &shuffled {
-                second.push(push.bounds, push.padding, push.clip);
+                second.push_logical(push.bounds, push.padding, push.clip);
             }
             let second_summary = second.finish(screen);
             assert_eq!(
@@ -592,7 +667,7 @@ mod tests {
     fn sixteen_rects_stay_partial() {
         let mut acc = DamageAccumulator::new(scale(1.0));
         for index in 0..MAX_DAMAGE_RECTS as i32 {
-            acc.push(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
+            acc.push_logical(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
         }
         let screen = PhysicalRect::new(0, 0, 1200, 1000);
         let summary = acc.finish(screen);
@@ -606,7 +681,7 @@ mod tests {
         let mut acc = DamageAccumulator::new(scale(1.0));
         let mut expected = Vec::new();
         for index in 0..(MAX_DAMAGE_RECTS as i32 + 1) {
-            acc.push(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
+            acc.push_logical(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
             expected.push(PhysicalRect::new(index * 59, 20, index * 59 + 58, 120));
         }
         let screen = PhysicalRect::new(0, 0, 1200, 1000);
@@ -628,7 +703,7 @@ mod tests {
         fn run(width: i32, height: i32) -> (bool, i64) {
             let mut acc = DamageAccumulator::new(scale(1.0));
             for index in 0..(MAX_DAMAGE_RECTS as i32 + 1) {
-                acc.push(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
+                acc.push_logical(rect((index * 59) as f32, 20.0, 58.0, 100.0), 0.0, None);
             }
             let summary = acc.finish(PhysicalRect::new(0, 0, width, height));
             (summary.full, coverage_area(&acc))
@@ -655,7 +730,7 @@ mod tests {
         for _ in 0..512 {
             let x = (next() % 1900) as f32;
             let y = (next() % 1060) as f32;
-            acc.push(rect(x, y, 2.0, 2.0), 0.0, None);
+            acc.push_logical(rect(x, y, 2.0, 2.0), 0.0, None);
         }
         let summary = acc.finish(PhysicalRect::new(0, 0, 1920, 1080));
         assert!(summary.full, "512 个散布全帧的小矩形聚合后必然超过 50%");
@@ -669,7 +744,7 @@ mod tests {
         for index in 0..=(MAX_ACCUMULATED_DAMAGE_RECTS as i32) {
             let x = (index % 32) as f32 * 3.0;
             let y = (index / 32) as f32 * 3.0;
-            acc.push(rect(x, y, 1.0, 1.0), 0.0, None);
+            acc.push_logical(rect(x, y, 1.0, 1.0), 0.0, None);
         }
         assert_eq!(
             acc.rects().len(),

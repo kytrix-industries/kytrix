@@ -834,21 +834,7 @@ fn bounds_of(tree: &NodeTree, node: NodeId) -> Rect {
 }
 
 #[test]
-fn device_scale_snaps_committed_bounds_not_taffy_layout() {
-    let mut tree = NodeTree::new();
-    let root = tree.root();
-    let child = NodeBuilder::boxed()
-        .style(fixed_style(10.3, 4.4))
-        .build(&mut tree, root)
-        .expect("挂载成功");
-    tree.set_device_scale(Some(2.0));
-    layout_to(&mut tree, 200.0, 200.0);
-
-    assert_eq!(bounds_of(&tree, child), Rect::new(0.0, 0.0, 10.5, 4.5));
-}
-
-#[test]
-fn device_scale_off_keeps_fractional_layout() {
+fn layout_bounds_equal_the_taffy_layout() {
     let mut tree = NodeTree::new();
     let root = tree.root();
     let child = NodeBuilder::boxed()
@@ -860,95 +846,41 @@ fn device_scale_off_keeps_fractional_layout() {
     assert_eq!(
         bounds_of(&tree, child),
         Rect::new(0.0, 0.0, 10.3, 4.4),
-        "未开启吸附时机 taffy 的布局盒原样保留"
+        "layout bounds 必须与 taffy 布局逐位相同（不得做设备像素吸附）"
     );
 }
 
 #[test]
-fn device_scale_does_not_accumulate_rounding_across_depth() {
-    let mut tree = NodeTree::new();
-    let root = tree.root();
-    let mut parent = root;
-    let mut chain = Vec::new();
-    for _ in 0..3 {
-        let node = NodeBuilder::boxed()
-            .style({
-                let mut style = fixed_style(50.0, 50.0);
-                style.inner.margin = taffy::geometry::Rect {
-                    left: taffy::style::LengthPercentageAuto::length(0.3),
-                    right: taffy::style::LengthPercentageAuto::length(0.0),
-                    top: taffy::style::LengthPercentageAuto::length(0.3),
-                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
-                };
-                style
-            })
-            .build(&mut tree, parent)
-            .expect("挂载成功");
-        chain.push(node);
-        parent = node;
-    }
-    tree.set_device_scale(Some(1.0));
-    layout_to(&mut tree, 200.0, 200.0);
-
-    let origins: Vec<f32> = chain
-        .iter()
-        .map(|node| bounds_of(&tree, *node).origin.x)
-        .collect();
-    assert_eq!(
-        origins,
-        vec![0.0, 1.0, 1.0],
-        "每层边界只做一次舍入（不是父的已舍入值 + 偏移的链式舍入）"
-    );
-}
-
-#[test]
-fn a_layout_override_is_positioned_against_the_parents_snapped_box() {
+fn a_layout_override_is_positioned_against_the_parents_logical_box() {
     let mut tree = NodeTree::new();
     let root = tree.root();
     let mut root_style = fixed_style(100.0, 100.0);
     root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
     tree.set_style(root, root_style).expect("根节点存活");
     let _spacer = NodeBuilder::boxed()
-        .style(fixed_style(100.0, 10.3))
+        .style(fixed_style(100.0, 10.25))
         .build(&mut tree, root)
         .expect("挂载成功");
     let parent = NodeBuilder::boxed()
         .style(fixed_style(20.0, 20.0))
         .build(&mut tree, root)
         .expect("挂载成功");
+    let over = Rect::new(0.5, 0.75, 5.0, 5.0);
     let child = NodeBuilder::boxed()
-        .layout_override(Rect::new(0.0, 0.3, 5.0, 5.0))
+        .layout_override(over)
         .build(&mut tree, parent)
         .expect("挂载成功");
-    tree.set_device_scale(Some(1.0));
     layout_to(&mut tree, 100.0, 100.0);
 
-    assert_eq!(bounds_of(&tree, parent).origin.y, 10.0);
+    let parent_origin = bounds_of(&tree, parent).origin;
     assert_eq!(
-        bounds_of(&tree, child).origin.y,
-        10.0,
-        "布局覆盖必须相对父的已吸附盒定位，不能相对未吸附的布局原点"
+        parent_origin.y, 10.25,
+        "父盒原点必须保留 taffy 的小数布局值"
     );
-}
-
-#[test]
-fn device_scale_change_republishes_bounds() {
-    let mut tree = NodeTree::new();
-    let root = tree.root();
-    let child = NodeBuilder::boxed()
-        .style(fixed_style(10.3, 4.4))
-        .build(&mut tree, root)
-        .expect("挂载成功");
-    layout_to(&mut tree, 200.0, 200.0);
-    assert_eq!(bounds_of(&tree, child).size.width, 10.3);
-
-    tree.set_device_scale(Some(1.0));
-    layout_to(&mut tree, 200.0, 200.0);
-
     assert_eq!(
-        bounds_of(&tree, child).size.width,
-        10.0,
-        "开启/切换吸附比例后必须重新提交全部边界"
+        bounds_of(&tree, child).origin,
+        parent_origin + over.origin,
+        "布局覆盖必须相对父的未吸附逻辑原点定位"
     );
 }
 

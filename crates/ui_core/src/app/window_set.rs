@@ -190,12 +190,8 @@ pub(crate) fn create_window(app: &mut App, mut options: WindowOptions) -> Window
         .expect("window handle space exhausted (u32::MAX windows created)");
     let scope = app.store.new_scope();
     app.window_scopes.insert(id, scope);
-    let scale = options.scale;
     let mut window = Window::new(id, options);
     window.tree_mut().bind_window(id);
-    window
-        .tree_mut()
-        .set_device_scale((scale.factor() != 1.0).then_some(scale.factor()));
     app.windows.insert(id, window);
     id
 }

@@ -311,8 +311,7 @@ impl Window {
         let scale = options.scale;
         let surface = covering_surface(options.size, scale);
         let state = WindowState::for_decorations(options.decorations);
-        let mut tree = NodeTree::new();
-        tree.set_device_scale((scale.factor() != 1.0).then_some(scale.factor()));
+        let tree = NodeTree::new();
         Self {
             id,
             options,

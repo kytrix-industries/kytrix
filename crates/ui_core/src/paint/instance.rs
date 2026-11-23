@@ -766,22 +766,6 @@ fn aabb_to_rect(aabb: [f32; 4]) -> [f32; 4] {
     [aabb[0], aabb[1], aabb[2] - aabb[0], aabb[3] - aabb[1]]
 }
 
-fn snap_rect_clip_to_pixels(rect: [f32; 4]) -> [f32; 4] {
-    if !(rect[2] > 0.0 && rect[3] > 0.0) {
-        return [rect[0].floor(), rect[1].floor(), 0.0, 0.0];
-    }
-    let lo_x = rect[0].floor();
-    let lo_y = rect[1].floor();
-    let hi_x = (rect[0] + rect[2]).ceil();
-    let hi_y = (rect[1] + rect[3]).ceil();
-    let snapped = [lo_x, lo_y, hi_x - lo_x, hi_y - lo_y];
-    if snapped.iter().all(|value| value.is_finite()) {
-        snapped
-    } else {
-        rect
-    }
-}
-
 fn transformed_aabb(transform: Transform, rect: Rect) -> [f32; 4] {
     let far = Point::new(
         rect.origin.x + rect.size.width,
@@ -1683,7 +1667,22 @@ impl LaneEncoder<'_> {
     fn push_clip(&mut self, clip: crate::paint::primitive::ClipRect) -> Result<(), EngineError> {
         self.saved.push(self.state.clone());
         let factor = self.scale.factor();
-        let rect = clip.rect.to_physical_f32(self.scale);
+        let logical = clip.rect;
+        let rect = if logical.is_finite() && logical.size.width > 0.0 && logical.size.height > 0.0 {
+            physical_to_bounds(logical.to_physical_covering(self.scale))
+        } else {
+            let x = if logical.origin.x.is_finite() {
+                (logical.origin.x * factor).floor()
+            } else {
+                0.0
+            };
+            let y = if logical.origin.y.is_finite() {
+                (logical.origin.y * factor).floor()
+            } else {
+                0.0
+            };
+            [x, y, 0.0, 0.0]
+        };
         let radii = normalize_corner_radius(
             clip.corner_radius.map(|radius| radius * factor),
             rect[2],
@@ -1723,7 +1722,11 @@ impl LaneEncoder<'_> {
 
     fn rebuild_rect_chain(&mut self) {
         let rect_entry = if self.state.has_rect {
-            let rect = snap_rect_clip_to_pixels(aabb_to_rect(self.state.rect_aabb));
+            let rect = aabb_to_rect(self.state.rect_aabb);
+            debug_assert!(
+                rect.iter().all(|value| value.fract() == 0.0),
+                "矩形 clip 链的每条边必须是整数物理像素：{rect:?}"
+            );
             Some(self.chain_entry(None, ClipKind::Rect, rect, [0.0; 4]))
         } else {
             None
@@ -1748,6 +1751,10 @@ impl LaneEncoder<'_> {
         rect: [f32; 4],
         corner_radius: [f32; 4],
     ) -> ClipChainId {
+        debug_assert!(
+            rect.iter().all(|value| value.fract() == 0.0),
+            "clip 链的物理边界必须是整数：{rect:?}"
+        );
         let key = (
             parent.map_or(0, |parent| parent.0),
             kind.gpu(),
@@ -1903,7 +1910,7 @@ impl LaneEncoder<'_> {
     }
 
     fn emit_quad(&mut self, quad: &crate::paint::primitive::Quad) {
-        let bounds = quad.bounds.to_physical_f32(self.scale);
+        let bounds = physical_to_bounds(quad.bounds.to_physical(self.scale));
         if bounds[2] <= 0.0 || bounds[3] <= 0.0 {
             return;
         }
@@ -1913,7 +1920,7 @@ impl LaneEncoder<'_> {
             bounds[2],
             bounds[3],
         );
-        let half_min = 0.5 * bounds[2].min(bounds[3]);
+        let short_side = bounds[2].min(bounds[3]);
         let (color0, color1, border_width, gradient) = match &quad.paint {
             QuadPaint::Solid { fill, border } => {
                 let width = border.map_or(0.0, |border| {
@@ -1924,7 +1931,7 @@ impl LaneEncoder<'_> {
                     border.map_or(LinearPremulRgba::TRANSPARENT, |border| {
                         self.colors.resolve(&self.resolver, border.color)
                     }),
-                    width.clamp(0.0, half_min),
+                    width.clamp(0.0, short_side),
                     GRADIENT_NONE,
                 )
             }
@@ -2066,7 +2073,7 @@ mod tests {
         CLIP_KIND_RECT, CLIP_KIND_ROUNDED, ClipChain, ClipChainId, ClipKind, ClipState,
         DrawIndexedArgs, GRADIENT_HORIZONTAL, GRADIENT_RADIAL, GRADIENT_VERTICAL, GpuPrimitive,
         InstanceEncoder, KIND_GLYPH, KIND_QUAD, KIND_SHADOW, MAX_CLIP_ITEMS, SHADOW_SIGMA_MIN,
-        SHADOW_SIGMA_SCALE, draw_indexed_params, normalize_corner_radius, snap_rect_clip_to_pixels,
+        SHADOW_SIGMA_SCALE, draw_indexed_params, normalize_corner_radius,
     };
     use crate::{
         error::EngineError,
@@ -2077,7 +2084,7 @@ mod tests {
             color::{Color, ColorResolver},
             geometry::GeometryId,
             primitive::{
-                Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind,
+                Border, ClipOp, ClipRect, GeometryDraw, GlyphRun, Gradient, GradientKind, Image,
                 PositionedGlyph, Primitive, Quad, QuadPaint, Shadow,
             },
             scene::{MAX_CLIP_DEPTH, Scene},
@@ -2529,8 +2536,20 @@ mod tests {
     }
 
     #[test]
-    fn rect_and_rounded_clip_with_the_same_bounds_do_not_darken_the_edge() {
-        let scene = scene_with(|scene, lane| {
+    fn rect_and_rounded_clips_agree_at_their_shared_boundary() {
+        let pure_rect = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(0.0, 0.0, 29.75, 29.75),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            assert!(scene.push(lane, quad_primitive(solid())));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        let with_rounded = scene_with(|scene, lane| {
             push_clip(
                 scene,
                 lane,
@@ -2551,32 +2570,50 @@ mod tests {
             assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
             assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
         });
-        let buffer = encode(&scene);
-        let instance = buffer.instances[0];
-        assert_eq!(instance.params1[3], 2.0);
-        let head = buffer.clips[instance.params1[0] as usize];
-        assert_eq!(head.kind, ClipKind::Rounded);
-        let root = buffer.clips[head.parent.expect("圆角项挂在矩形项下面").index()];
-        assert_eq!(root.kind, ClipKind::Rect, "矩形项 = scissor，必须是链根");
-        assert_eq!(root.parent, None);
-        assert_eq!(root.corner_radius, [0.0; 4]);
-        assert_eq!(root.rect, [0.0, 0.0, 60.0, 60.0]);
-        assert_eq!(head.rect, [0.0, 0.0, 59.5, 59.5]);
-        let coverage = clip_coverage(
-            &buffer.clips,
-            ClipChainId(instance.params1[0] as u32),
-            (59.5, 30.5),
+        let rect_buffer = encode(&pure_rect);
+        let rounded_buffer = encode(&with_rounded);
+        let rect_head = ClipChainId(rect_buffer.instances[0].params1[0] as u32);
+        let rounded_instance = rounded_buffer.instances[0];
+        let rounded_head = ClipChainId(rounded_instance.params1[0] as u32);
+        assert_eq!(
+            rounded_instance.params1[3], 2.0,
+            "矩形 + 圆角两层都要参与 AA"
         );
+        let rect_root = rect_buffer.clips[rect_head.index()];
+        let rounded_root = rounded_buffer.clips[rounded_head.index()];
+        assert_eq!(rounded_root.kind, ClipKind::Rounded);
+        let rounded_scissor = rounded_root.parent.expect("圆角项挂在矩形项下面");
+        assert_eq!(
+            rounded_buffer.clips[rounded_scissor.index()].kind,
+            ClipKind::Rect
+        );
+        assert_eq!(
+            rect_root.rect,
+            rounded_buffer.clips[rounded_scissor.index()].rect
+        );
+
+        for pixel in [(59.5f32, 30.5f32), (30.5, 59.5), (0.5, 30.5), (30.5, 0.5)] {
+            let straight = clip_coverage(&rect_buffer.clips, rect_head, pixel);
+            let rounded = clip_coverage(&rounded_buffer.clips, rounded_head, pixel);
+            assert_eq!(
+                straight, rounded,
+                "直线边上的像素 {pixel:?} 不得因叠加圆角 clip 而二次扣减 AA：{straight} vs {rounded}"
+            );
+            assert!(straight > 0.0, "{pixel:?} 在 clip 内");
+        }
+        let corner_straight = clip_coverage(&rect_buffer.clips, rect_head, (59.5, 59.5));
+        let corner_rounded = clip_coverage(&rounded_buffer.clips, rounded_head, (59.5, 59.5));
         assert!(
-            (coverage - 0.5).abs() < 1e-4,
-            "同边界的矩形 + 圆角 clip 只能乘一次 AA（0.5），实际 {coverage}"
+            corner_rounded < corner_straight,
+            "圆角必须真的削掉角：{corner_rounded} vs {corner_straight}"
         );
-        let outside = clip_coverage(
-            &buffer.clips,
-            ClipChainId(instance.params1[0] as u32),
-            (60.5, 30.5),
-        );
-        assert_eq!(outside, 0.0);
+        for pixel in [(60.5f32, 30.5f32), (30.5, 60.5)] {
+            assert_eq!(
+                clip_coverage(&rounded_buffer.clips, rounded_head, pixel),
+                0.0,
+                "{pixel:?} 在 clip 外"
+            );
+        }
     }
 
     #[test]
@@ -2620,31 +2657,179 @@ mod tests {
     }
 
     #[test]
-    fn rect_clip_snaps_outward_to_integer_pixels() {
-        assert_eq!(
-            snap_rect_clip_to_pixels([10.3, 4.7, 20.4, 9.6]),
-            [10.0, 4.0, 21.0, 11.0]
-        );
-        assert_eq!(
-            snap_rect_clip_to_pixels([-3.25, -0.75, 5.5, 2.25]),
-            [-4.0, -1.0, 7.0, 3.0]
-        );
-        assert_eq!(
-            snap_rect_clip_to_pixels([8.0, 8.0, 140.0, 90.0]),
-            [8.0, 8.0, 140.0, 90.0]
-        );
-        assert_eq!(
-            snap_rect_clip_to_pixels([10.6, 0.0, -0.2, 5.0]),
-            [10.0, 0.0, 0.0, 0.0]
-        );
-        assert_eq!(
-            snap_rect_clip_to_pixels([4.0, 4.0, 0.0, 10.0]),
-            [4.0, 4.0, 0.0, 0.0]
-        );
-        assert_eq!(
-            snap_rect_clip_to_pixels([3.0e38, 0.0, 3.0e38, 10.0]),
-            [3.0e38, 0.0, 3.0e38, 10.0]
-        );
+    fn rect_clips_cover_the_logical_rect_with_integer_pixels() {
+        let cases = [
+            (rect(5.15, 2.35, 10.2, 4.8), [10.0, 4.0, 21.0, 11.0]),
+            (rect(-1.625, -0.375, 2.75, 1.125), [-4.0, -1.0, 7.0, 3.0]),
+            (rect(4.0, 4.0, 70.0, 45.0), [8.0, 8.0, 140.0, 90.0]),
+        ];
+        for (logical, expected) in cases {
+            let scene = scene_with(|scene, lane| {
+                push_clip(
+                    scene,
+                    lane,
+                    ClipRect {
+                        rect: logical,
+                        corner_radius: [0.0; 4],
+                    },
+                );
+                assert!(scene.push(lane, quad_primitive(solid())));
+                assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            });
+            let buffer = encode(&scene);
+            let head = ClipChainId(buffer.instances[0].params1[0] as u32);
+            let clip = buffer.clips[head.index()].rect;
+            assert_eq!(
+                clip, expected,
+                "clip {logical:?} 必须 floor/ceil 到整数物理像素"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_rect_and_rounded_clip_chains_stay_on_integer_physical_pixels() {
+        let scene = scene_with(|scene, lane| {
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(1.3, 2.7, 30.35, 20.15),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(3.45, 4.55, 17.85, 9.25),
+                    corner_radius: [2.5; 4],
+                },
+            );
+            push_clip(
+                scene,
+                lane,
+                ClipRect {
+                    rect: rect(5.7, 6.1, 40.05, 30.95),
+                    corner_radius: [0.0; 4],
+                },
+            );
+            assert!(scene.push(lane, quad_primitive(solid())));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+        });
+        for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let buffer = encode_at(&scene, factor);
+            let instance = buffer.instances[0];
+            let mut cursor = Some(ClipChainId(instance.params1[0] as u32));
+            let mut kinds = Vec::new();
+            while let Some(id) = cursor {
+                let entry = buffer.clips[id.index()];
+                for value in entry.rect {
+                    assert_eq!(
+                        value.fract(),
+                        0.0,
+                        "factor {factor}：clip 链 {kinds:?} 的物理边界必须全是整数：{:?}",
+                        entry.rect
+                    );
+                }
+                kinds.push(entry.kind);
+                cursor = entry.parent;
+            }
+            assert_eq!(
+                kinds,
+                [ClipKind::Rounded, ClipKind::Rect],
+                "factor {factor}：圆角项 + 合并后的矩形项"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_extent_clips_at_fractional_origins_clip_everything() {
+        let zero_sized = [
+            rect(10.3, 4.7, 0.0, 10.0),
+            rect(10.3, 4.7, 10.0, 0.0),
+            rect(10.3, 4.7, 0.0, 0.0),
+            rect(-3.25, 7.9, 0.0, 20.0),
+        ];
+        for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            for logical in zero_sized {
+                let scene = scene_with(|scene, lane| {
+                    push_clip(
+                        scene,
+                        lane,
+                        ClipRect {
+                            rect: logical,
+                            corner_radius: [0.0; 4],
+                        },
+                    );
+                    assert!(scene.push(lane, quad_primitive(solid())));
+                    assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+                });
+                let buffer = encode_at(&scene, factor);
+                let instance = buffer.instances[0];
+                let head = ClipChainId(instance.params1[0] as u32);
+                let rect = buffer.clips[head.index()].rect;
+                assert_eq!(
+                    (rect[2], rect[3]),
+                    (0.0, 0.0),
+                    "{logical:?} at {factor}：零尺寸 clip 必须写成 w = h = 0（全裁），实际 {rect:?}"
+                );
+                assert_eq!(
+                    instance.clip_rect[2] * instance.clip_rect[3],
+                    0.0,
+                    "{logical:?} at {factor}：clip_rect 不得残留可绘制面积：{:?}",
+                    instance.clip_rect
+                );
+                for pixel in [(10.5f32, 5.5f32), (10.5, 20.5), (0.5, 0.5)] {
+                    assert_eq!(
+                        clip_coverage(&buffer.clips, head, pixel),
+                        0.0,
+                        "{logical:?} at {factor}：{pixel:?} 必须被全裁（不得漏 1 px）"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_size_rounded_clip_clips_everything() {
+        for factor in [1.25f32, 1.5] {
+            let logical = rect(10.3, 4.7, 0.0, 10.0);
+            let scene = scene_with(|scene, lane| {
+                push_clip(
+                    scene,
+                    lane,
+                    ClipRect {
+                        rect: logical,
+                        corner_radius: [2.0; 4],
+                    },
+                );
+                assert!(scene.push(lane, quad_primitive(solid())));
+                assert!(scene.push(lane, Primitive::Clip(ClipOp::Pop)));
+            });
+            let buffer = encode_at(&scene, factor);
+            let instance = buffer.instances[0];
+            let head = ClipChainId(instance.params1[0] as u32);
+            let rect = buffer.clips[head.index()].rect;
+            assert_eq!(
+                (rect[2], rect[3]),
+                (0.0, 0.0),
+                "factor {factor}：零尺寸圆角 clip 也必须全裁：{rect:?}"
+            );
+            assert_eq!(
+                buffer.clips[head.index()].corner_radius,
+                [0.0; 4],
+                "归零尺寸后半径随之归零"
+            );
+            for pixel in [(10.5f32, 5.5f32), (11.5, 5.5), (10.5, 20.5)] {
+                assert_eq!(
+                    clip_coverage(&buffer.clips, head, pixel),
+                    0.0,
+                    "factor {factor}：{pixel:?} 必须被全裁"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2959,7 +3144,7 @@ mod tests {
                     assert!(scene.push(
                         lane,
                         Primitive::Quad(Quad {
-                            bounds: rect(offset, offset, 20.0, 10.0).snap_to_device(factor),
+                            bounds: rect(offset, offset, 20.0, 10.0),
                             corner_radius: [0.0; 4],
                             paint: QuadPaint::Solid {
                                 fill: Color::WHITE,
@@ -3009,6 +3194,254 @@ mod tests {
             buffer.instances[0].params0[0], 1.0,
             "0.25 dp 边框在 125% 下也必须画出 1 物理像素"
         );
+    }
+
+    #[test]
+    fn quads_snap_to_device_pixels() {
+        for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            for (x, y, width, height) in [
+                (10.25f32, 4.7f32, 20.4f32, 9.6f32),
+                (0.0, 0.0, 1.0, 1.0),
+                (-3.3, 7.9, 16.75, 2.5),
+                (0.3, 0.3, 0.4, 0.4),
+            ] {
+                let logical = rect(x, y, width, height);
+                let scene = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Quad(Quad {
+                            bounds: logical,
+                            corner_radius: [0.0; 4],
+                            paint: QuadPaint::Solid {
+                                fill: Color::WHITE,
+                                border: None,
+                            },
+                        }),
+                    ));
+                });
+                let buffer = encode_at(&scene, factor);
+                let Some(instance) = buffer.instances.first() else {
+                    assert!(
+                        width * factor < 1.0 || height * factor < 1.0,
+                        "{logical:?} at {factor}：跨度 ≥ 1 物理像素的 Quad 不得消失"
+                    );
+                    continue;
+                };
+                let [px, py, pw, ph] = instance.bounds;
+                assert_eq!(px, (x * factor).round(), "左边界 round");
+                assert_eq!(py, (y * factor).round(), "上边界 round");
+                assert_eq!(
+                    px + pw,
+                    ((x + width) * factor).round(),
+                    "右边界必须由完整右坐标 round 后相减"
+                );
+                assert_eq!(
+                    py + ph,
+                    ((y + height) * factor).round(),
+                    "下边界必须由完整下坐标 round 后相减"
+                );
+                let exact = width * factor;
+                assert!(
+                    (pw - exact).abs() <= 1.0 + f32::EPSILON,
+                    "{logical:?} at {factor}：吸附宽度与未吸附值最多差 1 物理像素（{pw} vs {exact}）"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_and_quad_share_physical_edges() {
+        let tile = AtlasTile {
+            atlas: AtlasKind::Image,
+            page: 0,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            generation: 0,
+            slot: 0,
+            slot_epoch: 0,
+        };
+        for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            for (x, y, width, height) in [
+                (10.25f32, 4.7f32, 20.4f32, 9.6f32),
+                (0.1, 0.9, 3.3, 7.7),
+                (-2.6, 5.15, 12.8, 6.45),
+            ] {
+                let logical = rect(x, y, width, height);
+                let quad = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Quad(Quad {
+                            bounds: logical,
+                            corner_radius: [0.0; 4],
+                            paint: QuadPaint::Solid {
+                                fill: Color::WHITE,
+                                border: None,
+                            },
+                        }),
+                    ));
+                });
+                let image = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Image(Image {
+                            bounds: logical,
+                            tile,
+                            modulation: Color::WHITE,
+                        }),
+                    ));
+                });
+                let quad_bounds = encode_at(&quad, factor).instances[0].bounds;
+                let image_bounds = encode_at(&image, factor).instances[0].bounds;
+                assert_eq!(
+                    quad_bounds, image_bounds,
+                    "{logical:?} at {factor}：Quad 与 Image 必须落在同一物理边界上"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borders_are_integer_device_pixels() {
+        for factor in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
+            for offset in [0.0f32, 0.1, 0.25, 0.4, 0.49, 0.5, 0.75, 0.9] {
+                let scene = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Quad(Quad {
+                            bounds: rect(offset, offset, 20.0, 10.0),
+                            corner_radius: [0.0; 4],
+                            paint: QuadPaint::Solid {
+                                fill: Color::TRANSPARENT,
+                                border: Some(Border {
+                                    width: 1.0,
+                                    color: Color::BLACK,
+                                }),
+                            },
+                        }),
+                    ));
+                });
+                let instance = encode_at(&scene, factor).instances[0];
+                let [px, py, pw, ph] = instance.bounds;
+                let width = instance.params0[0];
+                assert_eq!(
+                    width.fract(),
+                    0.0,
+                    "1 dp 边框在 {factor}× / offset {offset} 下必须是整数物理像素"
+                );
+                assert!(width >= 1.0, "边框必须至少 1 物理像素：{width}");
+                assert!(
+                    width <= pw.min(ph),
+                    "边框不得超出短边：width {width}, quad {pw}×{ph}"
+                );
+                for inner in [px + pw - width, py + ph - width] {
+                    assert_eq!(inner.fract(), 0.0, "右/下内边界必须是整数物理像素：{inner}");
+                }
+                assert!(
+                    px + pw - width >= px && py + ph - width >= py,
+                    "右/下内边界不得越过左/上外边界：outer ({px},{py}) size ({pw},{ph}) width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_one_physical_pixel_short_side_quad_is_all_border() {
+        for factor in [1.0f32, 2.0, 3.0] {
+            for offset in [0.0f32, 0.3, 0.7] {
+                let logical_height = 1.0 / factor;
+                let scene = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Quad(Quad {
+                            bounds: rect(offset + 10.0, offset + 10.0, 20.0, logical_height),
+                            corner_radius: [0.0; 4],
+                            paint: QuadPaint::Solid {
+                                fill: Color::TRANSPARENT,
+                                border: Some(Border {
+                                    width: 1.0,
+                                    color: Color::BLACK,
+                                }),
+                            },
+                        }),
+                    ));
+                });
+                let instance = encode_at(&scene, factor).instances[0];
+                let [_, _, pw, ph] = instance.bounds;
+                assert_eq!(ph, 1.0, "短边必须恰好 1 物理像素（factor {factor}）");
+                assert_eq!(
+                    instance.params0[0], 1.0,
+                    "短边 1 物理像素的 Quad 整块都是边框（不得被 clamp 到半个像素）：{pw}×{ph}"
+                );
+                assert_eq!(
+                    instance.params0[0].fract(),
+                    0.0,
+                    "边框宽度必须是整数物理像素"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stroke_width_is_phase_independent_at_fractional_scales() {
+        for factor in [1.25f32, 1.5, 1.75] {
+            let mut observed_width = None;
+            for offset in [0.0f32, 0.1, 0.25, 0.4, 0.49, 0.5, 0.6, 0.75, 0.9] {
+                let scene = scene_with(|scene, lane| {
+                    assert!(scene.push(
+                        lane,
+                        Primitive::Quad(Quad {
+                            bounds: rect(offset, offset, 20.0, 10.0),
+                            corner_radius: [0.0; 4],
+                            paint: QuadPaint::Solid {
+                                fill: Color::TRANSPARENT,
+                                border: Some(Border {
+                                    width: 1.0,
+                                    color: Color::BLACK,
+                                }),
+                            },
+                        }),
+                    ));
+                });
+                let instance = encode_at(&scene, factor).instances[0];
+                let [px, py, pw, ph] = instance.bounds;
+                let width = instance.params0[0];
+                let exact_outer = offset * factor;
+                let exact_inner = (offset + 1.0) * factor;
+                assert_eq!(
+                    px,
+                    exact_outer.round(),
+                    "外边界必须吸到最近的整数物理像素：offset {offset} at {factor}"
+                );
+                assert_eq!(
+                    (px + width).fract(),
+                    0.0,
+                    "内边界必须是整数物理像素：offset {offset} at {factor}"
+                );
+                assert!(
+                    ((px + width) - exact_inner).abs() <= 1.0 + f32::EPSILON,
+                    "内边界与精确位置最多差 1 物理像素：offset {offset} at {factor}"
+                );
+                assert_eq!(
+                    pw,
+                    ((offset + 20.0) * factor).round() - px,
+                    "右边界由完整右坐标 round 后相减"
+                );
+                assert_eq!(
+                    ph,
+                    ((offset + 10.0) * factor).round() - py,
+                    "下边界由完整下坐标 round 后相减"
+                );
+                match observed_width {
+                    None => observed_width = Some(width),
+                    Some(want) => assert_eq!(
+                        width, want,
+                        "边框宽度必须与相位无关：offset {offset} at {factor}"
+                    ),
+                }
+            }
+        }
     }
 
     #[test]

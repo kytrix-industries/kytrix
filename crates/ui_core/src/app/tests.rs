@@ -438,6 +438,88 @@ fn scale_change_relays_the_same_snapshot_at_the_new_ppem() {
 }
 
 #[test]
+fn dpi_change_rerasterizes_text_only() {
+    let (_rt, mut app, window, node) = text_app("hello world", Some(400.0));
+    let _ = refresh(&mut app, window);
+    let _ = layout(&mut app, window);
+    let first = text_layout(&mut app, window);
+    assert!(first.laid > 0, "前置：首帧必须光栅一次");
+
+    let (epoch_before, width_before, laid_width_before, measured_before, bounds_before) = {
+        let window_ref = app.window(window).expect("窗口存在");
+        let tree = window_ref.tree();
+        (
+            window_ref.scale_epoch(),
+            tree.text_content_width(node),
+            tree.text_line(node).expect("快照").width,
+            tree.text_measured_size(node).expect("测量尺寸"),
+            tree.get(node).expect("节点").layout().bounds,
+        )
+    };
+    clear_dirty(&mut app, window);
+
+    app.window_mut(window)
+        .expect("窗口存在")
+        .set_scale(crate::math::Scale::new(2.0).expect("finite scale"));
+    {
+        let window_ref = app.window(window).expect("窗口存在");
+        let root = window_ref.tree().root();
+        assert!(
+            !window_ref
+                .tree()
+                .get(root)
+                .expect("root")
+                .dirty()
+                .contains(DirtyFlags::LAYOUT),
+            "DPI 变化本身不得标根 LAYOUT"
+        );
+    }
+    let _ = refresh(&mut app, window);
+    let _ = layout(&mut app, window);
+    let second = text_layout(&mut app, window);
+
+    let window_ref = app.window(window).expect("窗口存在");
+    let tree = window_ref.tree();
+    assert_eq!(
+        window_ref.scale_epoch(),
+        epoch_before + 1,
+        "DPI 变化必须进步 scale_epoch"
+    );
+    assert!(
+        second.rasterized > 0,
+        "DPI 变化必须按新 ppem 重新光栅文本（复用旧 tile 是错的）"
+    );
+    let width_after = tree.text_content_width(node);
+    let laid_width_after = tree.text_line(node).expect("快照").width;
+    assert_eq!(
+        width_after.to_bits(),
+        width_before.to_bits(),
+        "文本可用宽度是逻辑像素，不得随 DPI 变化"
+    );
+    assert_eq!(
+        laid_width_after.to_bits(),
+        laid_width_before.to_bits(),
+        "文本布局宽度不得随 DPI 变化"
+    );
+    let measured_after = tree.text_measured_size(node).expect("测量尺寸");
+    assert_eq!(
+        measured_after.width.to_bits(),
+        measured_before.width.to_bits(),
+        "文本 measure 宽度不得随 DPI 变化"
+    );
+    assert_eq!(
+        measured_after.height.to_bits(),
+        measured_before.height.to_bits(),
+        "文本 measure 高度不得随 DPI 变化"
+    );
+    assert_eq!(
+        tree.get(node).expect("节点").layout().bounds,
+        bounds_before,
+        "文本节点的 layout bounds 不得随 DPI 变化"
+    );
+}
+
+#[test]
 fn digit_fast_path_hit_rate_is_observable() {
     let (_rt, mut app, window, _node) = text_app("1,234.56", None);
     let report = refresh(&mut app, window);

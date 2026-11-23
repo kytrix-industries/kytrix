@@ -41,18 +41,32 @@ fn scene_starts_without_lanes() {
 }
 
 #[test]
-fn set_scale_marks_root_layout() {
+fn dpi_change_does_not_invalidate_layout() {
     let mut window = window();
-    window.tree_mut().clear_all_dirty_for_test();
-    let scale = Scale::new(2.0).expect("合法比例");
-
-    window.set_scale(scale);
-
-    assert_eq!(window.scale(), scale);
     let root = window.tree().root();
+    let _ = window.compute_layout().expect("布局成功");
+    window.tree_mut().clear_all_dirty_for_test();
+    let bounds_before = window.tree().get(root).expect("root 存在").layout().bounds;
+    let epoch = window.scale_epoch();
+
+    window.set_scale(Scale::new(2.0).expect("合法比例"));
+
     let flags = window.tree().get(root).expect("root 存在").dirty();
-    assert!(flags.contains(DirtyFlags::LAYOUT));
-    assert!(flags.contains(DirtyFlags::PAINT));
+    assert!(
+        !flags.contains(DirtyFlags::LAYOUT),
+        "DPI 变化不得标根 LAYOUT（实际 {flags:?}）"
+    );
+    assert!(
+        !window.tree().has_layout_work(),
+        "DPI 变化不得留下待布局工作"
+    );
+    assert_eq!(
+        window.tree().get(root).expect("root 存在").layout().bounds,
+        bounds_before,
+        "DPI 变化不得改变 layout bounds"
+    );
+    assert!(window.full_damage_pending, "DPI 变化必须标整帧重绘");
+    assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 精确递增 1");
 }
 
 #[test]
@@ -292,13 +306,13 @@ fn set_size_and_set_scale_keep_a_platform_written_surface() {
     assert_eq!(window.frame_rect(), PhysicalRect::new(0, 0, 999, 777));
     assert!(window.full_damage_pending, "DPI 变化仍必须整帧重绘");
     assert!(
-        window
+        !window
             .tree()
             .get(root)
             .expect("root 存在")
             .dirty()
             .contains(DirtyFlags::LAYOUT),
-        "DPI 变化仍必须标根 LAYOUT"
+        "DPI 变化不得标根 LAYOUT"
     );
     assert_eq!(window.scale_epoch(), epoch + 1, "scale_epoch 照常递增");
 
@@ -344,7 +358,7 @@ fn window_size_is_root_available_space() {
 }
 
 #[test]
-fn dpi_scale_only_shifts_logical_boxes_by_device_snapping() {
+fn dpi_change_does_not_move_logical_boxes() {
     use crate::{
         math::Rect,
         node::builder::NodeBuilder,
@@ -377,22 +391,87 @@ fn dpi_scale_only_shifts_logical_boxes_by_device_snapping() {
         .expect("挂载成功");
     let _ = window.compute_layout().expect("布局成功");
     let before = window.tree().get(child).expect("存在").layout().bounds;
+    assert_eq!(before, Rect::new(0.0, 0.0, 10.5, 3.25));
 
-    window.set_scale(Scale::new(1.5).expect("合法比例"));
+    for factor in [1.5f32, 2.0] {
+        window.set_scale(Scale::new(factor).expect("合法比例"));
+        assert!(
+            window.tree_mut().invalidate_layout(root),
+            "前置：必须真的请求重排，否则缓存命中下测不到 DPI 相关 measure"
+        );
+        let report = window.compute_layout().expect("布局成功");
+        assert!(report.laid_out > 0, "DPI {factor} 下必须真的重排过");
+
+        let after = window.tree().get(child).expect("存在").layout().bounds;
+        assert_eq!(
+            after, before,
+            "DPI {factor} 下 layout bounds 必须逐位不变（{after:?} vs {before:?}）"
+        );
+    }
+}
+
+#[test]
+fn layout_is_identical_at_every_device_scale() {
+    use crate::{
+        node::builder::NodeBuilder,
+        paint::style::{Clip, Style},
+    };
+
+    fn fixed(width: f32, height: f32) -> Style {
+        let mut inner = taffy::Style::<smol_str::SmolStr>::DEFAULT;
+        inner.size = taffy::geometry::Size {
+            width: taffy::style::Dimension::length(width),
+            height: taffy::style::Dimension::length(height),
+        };
+        Style {
+            inner,
+            clip: Clip::None,
+        }
+    }
+
+    let mut window = Window::new(
+        WindowId::for_test(1),
+        WindowOptions {
+            size: Size::new(120.0, 60.0),
+            ..WindowOptions::default()
+        },
+    );
+    let root = window.tree().root();
+    let mut column = fixed(100.0, 50.0);
+    column.inner.flex_direction = taffy::style::FlexDirection::Column;
+    let column = NodeBuilder::boxed()
+        .style(column)
+        .build(window.tree_mut(), root)
+        .expect("挂载成功");
+    let child = NodeBuilder::boxed()
+        .style(fixed(10.5, 3.25))
+        .build(window.tree_mut(), column)
+        .expect("挂载成功");
     let _ = window.compute_layout().expect("布局成功");
 
-    let after = window.tree().get(child).expect("存在").layout().bounds;
-    assert_eq!(
-        after,
-        before.snap_to_device(1.5),
-        "提交盒 = 未吸附逻辑盒的设备像素吸附（与 `Rect::snap_to_device` 同一实现）"
-    );
-    assert_eq!(before, Rect::new(0.0, 0.0, 10.5, 3.25), "scale=1 不做吸附");
-    assert!(
-        (after.size.width - before.size.width).abs() <= 1.0 / 1.5 + f32::EPSILON
-            && (after.size.height - before.size.height).abs() <= 1.0 / 1.5 + f32::EPSILON,
-        "逻辑布局盒与 scale 无关：差异不超过一个设备像素（{after:?} vs {before:?}）"
-    );
+    let snapshot = |window: &Window| -> Vec<crate::node::tree::LayoutBox> {
+        [root, column, child]
+            .map(|node| window.tree().get(node).expect("存在").layout())
+            .to_vec()
+    };
+    let reference = snapshot(&window);
+
+    for factor in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+        window.set_scale(Scale::new(factor).expect("合法比例"));
+        let root = window.tree().root();
+        assert!(
+            window.tree_mut().invalidate_layout(root),
+            "前置：必须真的请求重排，否则测不到 DPI 相关的 measure"
+        );
+        let report = window.compute_layout().expect("布局成功");
+        assert!(report.laid_out > 0, "DPI {factor} 下必须真的重排过");
+
+        assert_eq!(
+            snapshot(&window),
+            reference,
+            "DPI {factor} 下 LayoutBox 必须逐位相同"
+        );
+    }
 }
 
 #[test]

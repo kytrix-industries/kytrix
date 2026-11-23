@@ -135,24 +135,6 @@ impl Rect {
             && self.size.height.is_finite()
     }
 
-    #[must_use]
-    pub fn snap_to_device(self, scale: f32) -> Self {
-        if !scale.is_finite() || scale <= 0.0 || !self.is_finite() {
-            return self;
-        }
-        let x0 = snap_scalar(self.origin.x, scale);
-        let y0 = snap_scalar(self.origin.y, scale);
-        let x1 = snap_scalar(self.origin.x + self.size.width, scale);
-        let y1 = snap_scalar(self.origin.y + self.size.height, scale);
-        Self {
-            origin: Point { x: x0, y: y0 },
-            size: Size {
-                width: x1 - x0,
-                height: y1 - y0,
-            },
-        }
-    }
-
     pub fn contains(self, point: Point) -> bool {
         let max = self.max();
         !self.is_empty()
@@ -595,15 +577,6 @@ fn snap_physical(value: f32) -> f32 {
     let shifted = value + 0.5;
     if shifted.is_finite() {
         shifted.floor()
-    } else {
-        value
-    }
-}
-
-fn snap_scalar(value: f32, scale: f32) -> f32 {
-    let physical = value * scale;
-    if physical.is_finite() {
-        snap_physical(physical) / scale
     } else {
         value
     }
@@ -1169,44 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn snap_rounds_edges_not_sizes() {
-        let snapped = Rect::new(0.0, 0.0, 10.3, 4.4).snap_to_device(2.0);
-        assert_eq!(snapped, Rect::new(0.0, 0.0, 10.5, 4.5));
-
-        let fractional = Rect::new(3.3, 0.7, 2.6, 1.2).snap_to_device(1.0);
-        assert_eq!(fractional, Rect::new(3.0, 1.0, 3.0, 1.0));
-
-        let edge_only = Rect::new(0.3, 0.0, 0.3, 0.3).snap_to_device(1.0);
-        assert_eq!(
-            edge_only,
-            Rect::new(0.0, 0.0, 1.0, 0.0),
-            "必须吸附右/下**边界**（0.6 → 1），而不是把宽度 0.3 单独圆整成 0"
-        );
-    }
-
-    #[test]
-    fn snap_keeps_adjacent_edges_coincident() {
-        let left = Rect::new(0.0, 0.0, 10.3, 5.0).snap_to_device(1.0);
-        let right = Rect::new(10.3, 0.0, 9.7, 5.0).snap_to_device(1.0);
-        assert_eq!(left.max().x, right.min().x);
-        assert_eq!(left.size.width + right.size.width, 20.0);
-    }
-
-    #[test]
-    fn snap_is_idempotent_and_defensive() {
-        let rect = Rect::new(1.3, 2.7, 3.1, 4.9);
-        let once = rect.snap_to_device(1.5);
-        assert_eq!(once.snap_to_device(1.5), once, "吸附必须幂等");
-        let nan = Rect::new(f32::NAN, 0.0, 1.0, 1.0).snap_to_device(1.5);
-        assert!(
-            nan.origin.x.is_nan() && nan.origin.y == 0.0 && nan.size.width == 1.0,
-            "非有限矩形原样返回（不制造半吊子吸附）：{nan:?}"
-        );
-        assert_eq!(rect.snap_to_device(0.0), rect, "非法 scale 原样返回");
-        assert_eq!(rect.snap_to_device(f32::NAN), rect);
-    }
-
-    #[test]
     fn transform_inverse_roundtrips_points() {
         let transform = Transform::translate(12.0, -7.0)
             .then(Transform::scale(2.0, 0.5))
@@ -1301,28 +1236,6 @@ mod tests {
         assert_eq!(snap_stroke_width(1.0, f32::INFINITY), 0.0);
         let huge = snap_stroke_width(1e30, 1.25);
         assert!(huge.is_finite() && huge >= 1.0);
-    }
-
-    #[test]
-    fn stroke_width_is_phase_independent_at_fractional_scales() {
-        for factor in [1.25f32, 1.5, 1.75] {
-            let snapped = snap_stroke_width(1.0, factor);
-            for offset in [0.0f32, 0.1, 0.25, 0.4, 0.49, 0.5, 0.6, 0.75, 0.9] {
-                let committed = Rect::new(offset, offset, 20.0, 10.0).snap_to_device(factor);
-                let outer_px = committed.origin.x * factor;
-                let inner_px = outer_px - snapped;
-                assert_eq!(
-                    outer_px.fract(),
-                    0.0,
-                    "布局提交的外边界必须是整数物理像素：offset {offset} at {factor}"
-                );
-                assert_eq!(
-                    inner_px.fract(),
-                    0.0,
-                    "边框内边界必须是整数物理像素：offset {offset} at {factor}"
-                );
-            }
-        }
     }
 
     #[test]

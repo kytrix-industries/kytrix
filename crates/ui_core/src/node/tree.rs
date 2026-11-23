@@ -310,9 +310,7 @@ pub struct NodeTree {
     arena: Arena<Node>,
     root: NodeId,
     window: Option<crate::window::WindowId>,
-    device_scale: Option<f32>,
     hit_test_skips: std::cell::Cell<u64>,
-    raw_origins: Vec<Point>,
     layout_cache: ahash::HashMap<NodeId, taffy::Cache>,
     text_slots: Vec<Option<TextSlot>>,
     debug_ids: Vec<Option<SmolStr>>,
@@ -384,9 +382,6 @@ impl NodeTree {
     #[must_use]
     pub(crate) fn window_tag(&self) -> u32 {
         arena::window_tag(self)
-    }
-    pub(crate) fn set_device_scale(&mut self, scale: Option<f32>) {
-        layout::set_device_scale(self, scale)
     }
 
     pub fn get(&self, node: NodeId) -> Result<&Node, EngineError> {

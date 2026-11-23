@@ -46,7 +46,7 @@ pub(crate) fn paint_frame(
         window.full_damage_pending = false;
     }
     if let Some(pending) = window.pending_damage.take() {
-        window.damage.push(pending, 1.0, None);
+        window.damage.push_logical(pending, 1.0, None);
     }
     if !has_damage && !window.needs_node_repaint() && removed.is_empty() {
         return Ok(PaintReport {

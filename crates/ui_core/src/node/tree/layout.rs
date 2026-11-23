@@ -214,17 +214,6 @@ pub(crate) fn take_invalid_measure(tree: &mut NodeTree) -> Option<EngineError> {
     tree.invalid_measure.take()
 }
 
-pub(crate) fn set_device_scale(tree: &mut NodeTree, scale: Option<f32>) {
-    let scale = scale.filter(|scale| scale.is_finite() && *scale > 0.0);
-    if tree.device_scale == scale {
-        return;
-    }
-    tree.device_scale = scale;
-    tree.raw_origins.clear();
-    let root = tree.root;
-    tree.invalidate_layout(root);
-}
-
 pub(crate) fn absolutize(tree: &mut NodeTree) {
     let epoch = tree.layout_epoch;
     tree.place_subtree(tree.root, Point::ZERO, epoch, true, false);
@@ -253,13 +242,9 @@ pub(crate) fn place_subtree(
             .map_or(target.local, |over| over.rect)
     };
     let abs = Rect::from_origin_size(reference + local.origin, local.size);
-    let committed = match tree.device_scale {
-        Some(scale) => abs.snap_to_device(scale),
-        None => abs,
-    };
     let old = target.layout;
     let children = target.children.clone();
-    let changed = committed != old.bounds;
+    let changed = abs != old.bounds;
     let fresh = target.laid_out_epoch == epoch;
     if hidden {
         if let Some(target) = tree.arena.get_mut(node) {
@@ -267,8 +252,7 @@ pub(crate) fn place_subtree(
         }
         tree.dirty_layout.remove(node);
     }
-    let raw_changed = tree.device_scale.is_some() && raw_origin(tree, node) != Some(abs.origin);
-    if !force && !fresh && !changed && !raw_changed {
+    if !force && !fresh && !changed {
         return;
     }
 
@@ -281,9 +265,9 @@ pub(crate) fn place_subtree(
             tree.geometry_damage_escalation = true;
         }
         if let Some(target) = tree.arena.get_mut(node) {
-            target.damage = target.damage.union(old.bounds).union(committed);
+            target.damage = target.damage.union(old.bounds).union(abs);
             target.layout = LayoutBox {
-                bounds: committed,
+                bounds: abs,
                 border: target.local_border,
             };
             target.dirty.remove(DirtyFlags::REUSABLE);
@@ -307,12 +291,7 @@ pub(crate) fn place_subtree(
         {
             continue;
         }
-        let reference = if tree.layout_override_of(child).is_some() {
-            committed.origin
-        } else {
-            abs.origin
-        };
-        tree.place_subtree(child, reference, epoch, false, children_hidden);
+        tree.place_subtree(child, abs.origin, epoch, false, children_hidden);
     }
     for child in hoisted.iter().copied() {
         if tree.layout_override_of(child).is_some() {
@@ -321,7 +300,7 @@ pub(crate) fn place_subtree(
         tree.place_subtree(child, abs.origin, epoch, false, layout_leaf);
     }
 
-    let mut union = hit_envelope(tree, node, committed);
+    let mut union = hit_envelope(tree, node, abs);
     for child in children.iter().copied() {
         union = union.union(subtree_bounds(tree, child));
     }
@@ -329,22 +308,6 @@ pub(crate) fn place_subtree(
         union = union.union(subtree_bounds(tree, *child));
     }
     store_subtree_bounds(tree, node, union);
-    store_raw_origin(tree, node, abs.origin);
-}
-
-fn raw_origin(tree: &NodeTree, node: NodeId) -> Option<Point> {
-    tree.raw_origins.get(node.index() as usize).copied()
-}
-
-fn store_raw_origin(tree: &mut NodeTree, node: NodeId, origin: Point) {
-    if tree.device_scale.is_none() {
-        return;
-    }
-    let index = node.index() as usize;
-    if tree.raw_origins.len() <= index {
-        tree.raw_origins.resize(index + 1, Point::ZERO);
-    }
-    tree.raw_origins[index] = origin;
 }
 
 fn store_subtree_bounds(tree: &mut NodeTree, node: NodeId, bounds: Rect) {

@@ -946,7 +946,8 @@ bitflags! { pub struct DirtyFlags: u8 {   // 5 个已用位（u8 余 3 位保留
 | 文本内容（导致 measure 变化）              | `LAYOUT + PAINT + A11Y`                                | ✅ 冒泡到第一个不受影响的祖先 | 新旧 AABB 并集               |
 | 字体 / 字号 / 主题色 / 语言                | `LAYOUT + PAINT + A11Y`，失效所有读过 Theme 信号的节点 | ✅                            | 批量，超阈值退化为全帧       |
 | 子节点增删 / 顺序变化                      | `LAYOUT + PAINT + A11Y`（顺序变化另由 paint pass 记 order rebuild） | ✅        | 子树包围盒                   |
-| 窗口尺寸 / DPI                             | 根 `LAYOUT` + 全部 offscreen 重建                      | 根向下                        | 全帧                         |
+| 窗口尺寸                                  | 根 `LAYOUT` + 全部 offscreen 重建                      | 根向下                        | 全帧                         |
+| DPI                                        | 只重光栅 / 重选资源变体，**不重排**                    | ❌                            | 全帧                         |
 | 滚动偏移（`Transient`）                    | 只改 uniform / clip，不改 lane 内容                    | ❌                            | scroll rect（Windows）或全帧 |
 | `Geometry` uniform（相机 / 缩放）          | `PAINT` only（变换烘在 lane 图元里，顶点缓冲不动）    | ❌                            | geometry 包围盒              |
 | 无障碍语义（`A11yOverride` / `A11yPatch`） | `A11Y` only，不产生视觉 damage                         | ❌                            | 无                           |
@@ -1056,7 +1057,8 @@ D22）；**禁止**在异步任务里直接写状态或改节点（I6）。**没
 | 滚动偏移 / 悬浮位置 / 拖拽位移 | `Transient<T>`，paint 阶段只读、不登记依赖、不标 dirty                                          | 每帧变化若入依赖图会导致每帧全量失效；实际只改 uniform / clip / scissor |
 | 动画（缓动 / 淡入淡出）        | `App::animate(window, AnimatedValue::{Scalar, Color}, &[NodeId], AnimationSpec { duration, easing })` 每 tick 推进 `Transient` 并给**显式注册的节点**标 `BIND + PAINT`；`t >= 1` 即停帧（`App::animations_running` 可轮询） | 避免把时间信号接进 `dependents`；`Easing` 只有 `Linear` / `EaseOutCubic`（补曲线是可选增量，不是本批范围） |
 | 行情推送（高频、多面板共享）   | 普通 `Signal<Quote>`，按面板订阅粒度拆分信号；`Derived` 做派生指标                              | 细粒度收益正来自「改一个报价只失效读它的面板」                          |
-| 窗口 resize / DPI              | 引擎内部事件，根 `LAYOUT`，不走 `Signal`                                                        | 与业务状态无关                                                          |
+| 窗口 resize                    | 引擎内部事件，根 `LAYOUT`，不走 `Signal`                                                        | 与业务状态无关                                                          |
+| DPI 变化                       | 引擎内部事件，只重光栅 / 重选资源变体，**不重排**，不走 `Signal`                                | 与业务状态无关（布局全为逻辑像素）                                      |
 | 一次性定时器（v2.3 / E10）     | `App::after` / `after_scoped(delay, cb)`：到期派发一次，等待期**零帧**、不进连续帧集合、无新线程（I3） | 替代「用动画时钟轮询」；旧 `on_frame` 轮询每帧出帧 |
 | 动画完成回投（v2.3 / E10）     | `App::on_animation_complete(handler)` **单槽**（后注册覆盖），`AnimationCompletion{ id, kind }`；自然完成**同帧内**派发（tick 后、样式/布局/绘制前）并 `Dispatcher::wake` 一次；帧外终止（`Cancelled`/`Replaced`/`Released`/0 ms `Finished`）在**下一帧入口**派发 | kit 的 `AnimationRouter` 是应用层**唯一**注册者（§12.4），引擎不提供多播/路由类型 |
 
@@ -1434,7 +1436,8 @@ app.write(&disabled, true);   // → 一个节点 → 一个 lane → 一个 dam
 | hover / 焦点 / 滚动 / 拖拽 / 动画 | `Transient` 或受管动画 `App::animate`（§3.7），不进依赖图 |
 | 高频变化（实时报价涨跌色） | 普通 `Signal`，按面板 / 字段粒度拆分，避免一个报价失效所有面板 |
 | 主题 / 字体栈 / 语言切换 | 批量语义信号，所有读过它们的节点失效；超阈值时 damage 退化为全帧（§5.7） |
-| 窗口尺寸 / DPI | 布局输入，走根 `LAYOUT`（§8.2），**VBO 不重建** |
+| 窗口尺寸 | 布局输入，走根 `LAYOUT`（§8.2），**VBO 不重建** |
+| DPI | 只重光栅 / 重选资源变体，**不重排**，**VBO 不重建** |
 | 结构变化（列表增删、虚拟窗口滚动） | 子树 `LAYOUT + PAINT`（§3.4），与动态属性通道分开 |
 
 `full-refresh oracle`（§3.8）与 L1 布局测试（§6.2）用于证明「没有漏掉任何应更新的节点」。
@@ -1542,7 +1545,8 @@ pub struct GeometryDesc {
 | `App::set_geometry_transform(window, node, matrix)` | 只更新该节点 per-draw uniform（顶点不动） | 每帧 ~0 B 顶点上传 |
 | `App::update_geometry_vertices(id, range, bytes)` / `App::update_geometry_indices(id, range, bytes)` | 就地替换被触碰的 **4 KiB 页**（页级 COW），重扫受影响块 AABB，revision+1，自动标脏绑定节点 | 只上传变化页 |
 | `App::truncate_geometry(id, vertices, indices)` | 成对缩短（K 线滑窗删头）；增长走 `update_geometry_*` | 只上传变化的尾块 |
-| `resize` / `dpi change` | 重布局 + uniform + 重建渲染目标，**不重建 VBO** | 消除 17.5 ms/次 |
+| `resize` | 重布局 + uniform + 重建渲染目标，**不重建 VBO** | 消除 17.5 ms/次 |
+| `dpi change` | 重光栅 / 重选资源变体 + uniform + 重建渲染目标，**不重排、不重建 VBO** | 消除 17.5 ms/次 |
 | `App::geometry_mut().release(id)` | 显式释放；GPU 缓冲走 retire 队列延迟释放，没有 `Drop` 实现 | I4 |
 
 - **range 契约**：`range.start <= len`；`range.end > len` 视为尾随追加；空 range = no-op
@@ -2375,8 +2379,8 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
   **三端 `Window::set_drag_regions` 都生效**（语义不同，见 §8.6.2）。**应用层唯一入口**是引擎 API；`HWND` / `NSWindow` /
   `xdg_toplevel` 不出引擎（I9）。
 - **DPI**：平台事件（Win32 `WM_DPICHANGED` / macOS `backingScaleFactor` 变更 / Wayland `wl_output` scale +
-  `wp_fractional_scale_v1`）→ `scale` 写入引擎 → 根 `LAYOUT` + offscreen 重建 + 全部文本 measure 版本递增；**VBO 不重建**
-  （§5.5）。
+  `wp_fractional_scale_v1`）→ `scale` 写入引擎 → **不重排**（布局全为逻辑像素，与 DPI 无关）+ 全量 damage + offscreen 重建 +
+  全部文本重新光栅；**VBO 不重建**（§5.5）。
 - **外观**：平台外观变更（Win32 `WM_SETTINGCHANGE` + 注册表 / macOS `NSApp.effectiveAppearance` / Linux 桌面设置或
   xdg-desktop-portal）→ 写 `Signal<Appearance>`，只失效读过它的节点（D16）。主题解析走引擎 `ColorResolver`（§5.8）。
 
@@ -2493,8 +2497,9 @@ app.set_title(window, SmolStr::new_static("Kytrix — BTC/USDT"))?;
 #### 8.6.5 DPI、全屏与安全区
 
 - **DPI**：拖动区与自绘 header 的坐标全为**逻辑像素**；`WM_DPICHANGED` / `backingScaleFactor` / `wl_output.scale` 变化时引擎更新
-  `Window::scale()` 并使根 `LAYOUT` 失效，应用重新布局 header 即可（不需要自己换算物理像素，I11）。**canvas 文本**的句柄按
-  窗口 DPI 光栅（`App::text_scale`，§11.1）：DPI 变化 / 跨屏移动 / 多窗口不同 DPI 后应用必须重新 `shape_text` 并重建 Canvas。
+  `Window::scale()` 且**不重排布局**（逻辑布局与 DPI 无关，吸附只在 paint 边界完成，I11），应用不需要也不应该重排 header。
+  **canvas 文本**的句柄按窗口 DPI 光栅（`App::text_scale`，§11.1）：DPI 变化 / 跨屏移动 / 多窗口不同 DPI 后应用必须重新
+  `shape_text` 并重建 Canvas。
 - **全屏**：Linux 全屏时 `WindowState.fullscreen == true` ⇒ 应用**不画**标题栏（此时没有窗口装饰语义）；macOS 原生全屏
   （`FullScreenPrimary`）下交通灯由 AppKit 隐藏/浮现，应用按 `WindowState` 或安全区变化重排。**Windows 不支持全屏控制**
   （§8.6.1：`ToggleFullscreen` → `UnsupportedWindowCapability { capability: "fullscreen window control" }`，

@@ -1220,67 +1220,6 @@ mod tests {
     }
 
     #[test]
-    fn device_snapping_descends_when_only_the_subpixel_reference_moved() {
-        let mut tree = NodeTree::new();
-        let root = tree.root();
-        let mut root_style = fixed(200.0, 200.0);
-        root_style.inner.flex_direction = taffy::style::FlexDirection::Column;
-        tree.set_style(root, root_style).expect("root 存活");
-        let spacer = add(&mut tree, root, fixed(200.0, 10.0));
-        let container = add(&mut tree, root, fixed(100.0, 100.0));
-        let mid = NodeBuilder::boxed()
-            .style({
-                let mut style = fixed(80.0, 80.0);
-                style.inner.margin = taffy::geometry::Rect {
-                    left: taffy::style::LengthPercentageAuto::length(0.0),
-                    right: taffy::style::LengthPercentageAuto::length(0.0),
-                    top: taffy::style::LengthPercentageAuto::length(0.15),
-                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
-                };
-                style
-            })
-            .build(&mut tree, container)
-            .expect("挂载成功");
-        let leaf = NodeBuilder::boxed()
-            .style({
-                let mut style = fixed(50.0, 10.0);
-                style.inner.margin = taffy::geometry::Rect {
-                    left: taffy::style::LengthPercentageAuto::length(0.0),
-                    right: taffy::style::LengthPercentageAuto::length(0.0),
-                    top: taffy::style::LengthPercentageAuto::length(0.3),
-                    bottom: taffy::style::LengthPercentageAuto::length(0.0),
-                };
-                style
-            })
-            .build(&mut tree, mid)
-            .expect("挂载成功");
-        tree.set_device_scale(Some(1.0));
-        let _ = layout(&mut tree, 200.0, 200.0);
-        assert_eq!(bounds(&tree, container).origin.y, 10.0);
-        assert_eq!(bounds(&tree, mid).origin.y, 10.0, "10.15 吸附到 10");
-        assert_eq!(bounds(&tree, leaf).origin.y, 10.0, "10.45 吸附到 10");
-
-        tree.set_style(spacer, fixed(200.0, 10.2)).expect("存活");
-        let _ = layout(&mut tree, 200.0, 200.0);
-
-        assert_eq!(
-            bounds(&tree, container).origin.y,
-            10.0,
-            "container 的吸附盒没有变"
-        );
-        assert_eq!(
-            bounds(&tree, mid).origin.y,
-            10.0,
-            "mid 的吸附盒也没有变（这正是早期退出的陷阱）"
-        );
-        assert_eq!(
-            bounds(&tree, leaf).origin.y,
-            11.0,
-            "孙子的边界跨过半像素时必须重贴（否则提交盒错位 1px）"
-        );
-    }
-
-    #[test]
     fn an_invalid_measure_is_recoverable_without_an_external_invalidation() {
         use std::rc::Rc;
 

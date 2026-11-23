@@ -520,11 +520,12 @@ fn hide_subtree(context: &mut PaintContext<'_>, node: NodeId, clip: &ClipContext
     context.tree.clear_clip_key(node);
     context.tree.set_reusable(node);
     context.tree.clear_paint(node);
-    context.damage.push(damage_rect, 1.0, clip.covering);
+    context.damage.push_logical(damage_rect, 1.0, clip.covering);
+    push_painted_shadow(context, &previous_content, total, clip.covering);
     if !previous_content.screen.is_empty() {
         context
             .damage
-            .push(previous_content.screen, 1.0, clip.covering);
+            .push_logical(previous_content.screen, 1.0, clip.covering);
     }
     for child in children {
         hide_subtree(context, child, clip, child_offset);
@@ -637,11 +638,12 @@ fn rebuild_lane(
         opacity,
     };
     emitter.emit(context);
+    push_painted_shadow(context, &previous_content, total, clip.covering);
 
     if !previous_content.screen.is_empty() {
         context
             .damage
-            .push(previous_content.screen, 1.0, clip.covering);
+            .push_logical(previous_content.screen, 1.0, clip.covering);
     }
 
     for _ in inner_clips.iter().rev() {
@@ -785,7 +787,7 @@ fn clear_geometry_lanes(
         };
         let damage = geometry_chunk_damage(geometry_transform, previous.bounds, total);
         if !damage.is_empty() {
-            context.damage.push(damage, 1.0, clip.covering);
+            context.damage.push_logical(damage, 1.0, clip.covering);
         }
     }
     let mut order_changed = false;
@@ -814,7 +816,7 @@ fn clear_geometry_lanes(
     if !node_damage.is_empty() {
         context
             .damage
-            .push(node_damage.translate(negate(total)), 1.0, clip.covering);
+            .push_logical(node_damage.translate(negate(total)), 1.0, clip.covering);
         context.rebuilt += 1;
     }
     context.tree.set_reusable(node);
@@ -856,7 +858,9 @@ fn paint_geometry_node(
     let node_damage = if state.reusable {
         node_damage
     } else {
-        node_damage.union(painted_content(context.tree, context.scene, node, context.scale).content)
+        let painted = painted_content(context.tree, context.scene, node, context.scale);
+        push_painted_shadow(context, &painted, total, clip.covering);
+        node_damage.union(painted.content)
     };
     let visible = patch.visible.unwrap_or(true);
     let old_lanes = context.tree.lane_count(node);
@@ -1002,7 +1006,7 @@ fn paint_geometry_node(
             ));
         }
         if !damage.is_empty() {
-            context.damage.push(damage, 1.0, clip.covering);
+            context.damage.push_logical(damage, 1.0, clip.covering);
         }
         let revision = snapshot
             .as_ref()
@@ -1048,7 +1052,7 @@ fn paint_geometry_node(
         if let Some(previous) = context.baked_scratch.get(chunk) {
             let damage = geometry_chunk_damage(geometry_transform, previous.bounds, total);
             if !damage.is_empty() {
-                context.damage.push(damage, 1.0, clip.covering);
+                context.damage.push_logical(damage, 1.0, clip.covering);
             }
         }
         context.scene.release_lane(lane);
@@ -1149,11 +1153,14 @@ fn negate(offset: Point) -> Point {
 struct PaintedContent {
     content: Rect,
     screen: Rect,
+    shadow: Option<(Rect, f32)>,
 }
 
 fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -> PaintedContent {
     let mut content = Rect::default();
     let mut screen = Rect::default();
+    let mut shadow_spill: Option<(Rect, f32)> = None;
+    let factor = scale.factor();
     for index in 0..tree.lane_count(node) {
         let Some(lane) = tree.lane_at(node, index) else {
             continue;
@@ -1172,12 +1179,17 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -
                 Primitive::Image(image) => content = content.union(image.bounds),
                 Primitive::Quad(quad) => content = content.union(quad.bounds),
                 Primitive::Shadow(shadow) => {
-                    let sigma = (shadow.blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
+                    let blur = shadow.blur.max(0.0) * factor;
+                    let sigma = (blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
                         .max(crate::paint::instance::SHADOW_SIGMA_MIN);
-                    let pad = (crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * scale.factor()
-                        + 1.0)
-                        / scale.factor();
-                    content = content.union(shadow.rect.translate(shadow.offset).outset(pad));
+                    let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0;
+                    let rect = shadow.rect.translate(shadow.offset);
+                    shadow_spill = Some(match shadow_spill {
+                        Some((previous, previous_pad)) => {
+                            (previous.union(rect), previous_pad.max(pad))
+                        }
+                        None => (rect, pad),
+                    });
                 }
                 Primitive::Path(_) | Primitive::Geometry(_) | Primitive::Clip(_) => {}
             }
@@ -1186,6 +1198,20 @@ fn painted_content(tree: &NodeTree, scene: &Scene, node: NodeId, scale: Scale) -
     PaintedContent {
         content: content.translate(tree.lane_offset(node)),
         screen,
+        shadow: shadow_spill.map(|(rect, pad)| (rect.translate(tree.lane_offset(node)), pad)),
+    }
+}
+
+fn push_painted_shadow(
+    context: &mut PaintContext<'_>,
+    painted: &PaintedContent,
+    total: Point,
+    clip: Option<PhysicalRect>,
+) {
+    if let Some((rect, pad)) = painted.shadow {
+        context
+            .damage
+            .push_logical(rect.translate(negate(total)), pad, clip);
     }
 }
 
@@ -1198,7 +1224,7 @@ impl PrimitiveEmitter {
     fn push_damage(&self, context: &mut PaintContext<'_>, bounds: Rect, aa_padding: f32) {
         context
             .damage
-            .push(bounds.translate(self.damage_shift), aa_padding, self.clip);
+            .push_logical(bounds.translate(self.damage_shift), aa_padding, self.clip);
     }
 
     fn emit(&mut self, context: &mut PaintContext<'_>) {
@@ -1231,9 +1257,11 @@ impl PrimitiveEmitter {
                 corner_radius: radii.map(|radius| (radius + shadow.spread).max(0.0)),
             };
             self.push(context, Primitive::Shadow(primitive));
-            let sigma = (primitive.blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
+            let factor = self.scale.factor();
+            let blur = primitive.blur * factor;
+            let sigma = (blur * crate::paint::instance::SHADOW_SIGMA_SCALE)
                 .max(crate::paint::instance::SHADOW_SIGMA_MIN);
-            let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma * self.scale.factor() + 1.0;
+            let pad = crate::paint::instance::SHADOW_PAD_SIGMAS * sigma + 1.0;
             self.push_damage(context, primitive.rect.translate(primitive.offset), pad);
         }
 
@@ -1338,7 +1366,7 @@ impl PrimitiveEmitter {
     fn emit_node_damage(&mut self, context: &mut PaintContext<'_>) {
         if self.emitted > 0 || !self.node_damage.is_empty() {
             let damage = self.node_damage.translate(negate(self.offset));
-            context.damage.push(damage, 1.0, self.clip);
+            context.damage.push_logical(damage, 1.0, self.clip);
         }
     }
 
@@ -1404,7 +1432,7 @@ impl PrimitiveEmitter {
                 };
                 context.stale_canvas_runs += stale_runs;
                 self.push(context, Primitive::Canvas(canvas));
-                context.damage.push(canvas_bounds, 1.0, self.clip);
+                context.damage.push_logical(canvas_bounds, 1.0, self.clip);
             }
             Content::Text(line) => {
                 if let Some(line) = line {
@@ -1652,10 +1680,6 @@ mod tests {
         },
     };
 
-    fn scale() -> Scale {
-        Scale::new(1.0).expect("合法 scale")
-    }
-
     fn frame() -> PhysicalRect {
         PhysicalRect::new(0, 0, 400, 300)
     }
@@ -1671,14 +1695,20 @@ mod tests {
         resources: Option<crate::resources::ResourceCache>,
         geometry: crate::paint::geometry_store::GeometryStore,
         focused: Option<crate::node::id::NodeId>,
+        scale: Scale,
     }
 
     impl Harness {
         fn new() -> Self {
+            Self::with_scale(1.0)
+        }
+
+        fn with_scale(factor: f32) -> Self {
+            let scale = Scale::new(factor).expect("合法 scale");
             Self {
                 tree: NodeTree::new(),
                 scene: Scene::empty(),
-                damage: DamageAccumulator::new(scale()),
+                damage: DamageAccumulator::new(scale),
                 order: Vec::new(),
                 scroll_slots: Vec::new(),
                 scroll_slot_nodes: Vec::new(),
@@ -1686,11 +1716,12 @@ mod tests {
                 resources: None,
                 geometry: crate::paint::geometry_store::GeometryStore::new(),
                 focused: None,
+                scale,
             }
         }
 
         fn try_paint(&mut self) -> Result<super::PaintReport, crate::error::EngineError> {
-            self.damage.reset(scale());
+            self.damage.reset(self.scale);
             self.order.clear();
             let geometry = &self.geometry;
             let mut pass = PaintPass {
@@ -1698,7 +1729,7 @@ mod tests {
                 geometry,
                 scene: &mut self.scene,
                 damage: &mut self.damage,
-                scale: scale(),
+                scale: self.scale,
                 frame: frame(),
                 order: &mut self.order,
                 focused: self.focused,
@@ -1720,7 +1751,7 @@ mod tests {
             &mut self,
             dirty: &[crate::node::id::NodeId],
         ) -> Result<super::PaintReport, crate::error::EngineError> {
-            self.damage.reset(scale());
+            self.damage.reset(self.scale);
             self.tree.mark_paint_closure(dirty);
             let geometry = &self.geometry;
             let mut pass = PaintPass {
@@ -1728,7 +1759,7 @@ mod tests {
                 geometry,
                 scene: &mut self.scene,
                 damage: &mut self.damage,
-                scale: scale(),
+                scale: self.scale,
                 frame: frame(),
                 order: &mut self.order,
                 focused: self.focused,
@@ -2749,7 +2780,7 @@ mod tests {
         assert_ne!(first_rect, second_rect, "前缀矩形必须随 clip 容器更新");
         assert_eq!(
             h.tree.clip_key(child),
-            Some((1, Some(second_rect.to_physical_covering(scale()))))
+            Some((1, Some(second_rect.to_physical_covering(Scale::ONE))))
         );
     }
 
@@ -4177,6 +4208,65 @@ mod tests {
             .expect("阴影");
         assert_eq!(shadow.rect, bounds.outset(-5.0), "负 spread 收缩投影盒");
         assert_eq!(shadow.corner_radius, [3.0; 4], "半径随负 spread 减小");
+    }
+
+    #[test]
+    fn shadow_damage_pad_is_computed_in_physical_space() {
+        use crate::paint::instance::{SHADOW_PAD_SIGMAS, SHADOW_SIGMA_MIN, SHADOW_SIGMA_SCALE};
+
+        for (factor, blur) in [(1.5f32, 0.2f32), (2.0, 0.2), (1.5, 0.0), (2.0, 0.0)] {
+            let mut h = Harness::with_scale(factor);
+            let root = h.tree.root();
+            let node = NodeBuilder::boxed()
+                .style(fixed_style(100.0, 20.0))
+                .paint(PaintSpec {
+                    background: Color::WHITE,
+                    shadows: Shadows::from(ShadowSpec {
+                        offset: Point::ZERO,
+                        blur,
+                        spread: 0.0,
+                        color: Color::BLACK,
+                    }),
+                    ..PaintSpec::default()
+                })
+                .build(&mut h.tree, root)
+                .expect("挂载");
+            layout_all(&mut h.tree);
+            let _ = h.paint();
+
+            let scale = Scale::new(factor).expect("scale");
+            let physical_blur = blur * factor;
+            let sigma = (physical_blur * SHADOW_SIGMA_SCALE).max(SHADOW_SIGMA_MIN);
+            let pad_physical = SHADOW_PAD_SIGMAS * sigma + 1.0;
+
+            let painted = super::painted_content(&h.tree, &h.scene, node, scale);
+            let (shadow_rect, painted_pad) =
+                painted.shadow.expect("painted_content 必须记录阴影外溢");
+            assert_eq!(
+                painted_pad, pad_physical,
+                "factor {factor} blur {blur}：shadow pad 必须是纯物理像素"
+            );
+            let legacy_sigma = (blur * SHADOW_SIGMA_SCALE).max(SHADOW_SIGMA_MIN);
+            let legacy_pad = SHADOW_PAD_SIGMAS * legacy_sigma * factor + 1.0;
+            assert_ne!(
+                pad_physical, legacy_pad,
+                "factor {factor} blur {blur}：新旧公式必须给出不同 pad（否则测试无法区分）"
+            );
+
+            let physical = shadow_rect.to_physical_covering(scale);
+            let pad = pad_physical.ceil() as i32;
+            let expected = PhysicalRect::new(
+                physical.x0 - pad,
+                physical.y0 - pad,
+                physical.x1 + pad,
+                physical.y1 + pad,
+            );
+            assert_eq!(
+                h.damage.rects(),
+                &[expected],
+                "factor {factor} blur {blur}：damage 必须覆盖 emit_shadow 的 pad 扩张范围"
+            );
+        }
     }
 
     #[test]
