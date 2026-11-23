@@ -291,10 +291,8 @@ pub(crate) fn place_subtree(
         tree.moved_nodes.insert(node);
         tree.dirty_settle.insert(node);
         let _ = tree.mark_paint(node);
-    } else if fresh {
-        if let Some(target) = tree.arena.get_mut(node) {
-            target.layout.border = target.local_border;
-        }
+    } else if fresh && let Some(target) = tree.arena.get_mut(node) {
+        target.layout.border = target.local_border;
     }
 
     let hoisted: SmallVec<[NodeId; 2]> = if tree.hoisted.is_empty() {

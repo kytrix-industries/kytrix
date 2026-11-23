@@ -902,18 +902,18 @@ fn shared_instance(
 }
 
 fn pick_hardware_adapter(factory: &IDXGIFactory4) -> Result<IDXGIAdapter1, EngineError> {
-    if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
-        if let Ok(adapter) = unsafe {
+    if let Ok(factory6) = factory.cast::<IDXGIFactory6>()
+        && let Ok(adapter) = unsafe {
             factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
                 0,
                 DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
             )
-        } {
-            let desc = unsafe { adapter.GetDesc1() }
-                .map_err(|error| init_error_from("GetDesc1", error))?;
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
-                return Ok(adapter);
-            }
+        }
+    {
+        let desc =
+            unsafe { adapter.GetDesc1() }.map_err(|error| init_error_from("GetDesc1", error))?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            return Ok(adapter);
         }
     }
     let mut index = 0u32;

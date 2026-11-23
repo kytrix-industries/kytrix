@@ -662,9 +662,8 @@ impl CatalogShared {
                 }
             }
         }
-        match registrations {
-            Some(registrations) => routes.extend(registrations),
-            None => {}
+        if let Some(registrations) = registrations {
+            routes.extend(registrations);
         }
         let claimed = CatalogRouteRequirements::new(routes.iter().flat_map(|registration| {
             registration

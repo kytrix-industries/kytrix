@@ -536,10 +536,10 @@ async fn run_stream<S>(
     if !publish_status(&publisher, OrderBookStatus::Connecting).await {
         return;
     }
-    if let Err(error) = run_stream_once(&source, &spec, &publisher).await {
-        if publish_status(&publisher, OrderBookStatus::Error(error)).await {
-            publisher.cancelled().await;
-        }
+    if let Err(error) = run_stream_once(&source, &spec, &publisher).await
+        && publish_status(&publisher, OrderBookStatus::Error(error)).await
+    {
+        publisher.cancelled().await;
     }
 }
 

@@ -87,9 +87,20 @@ impl TimeFrame {
 }
 
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub enum Adjustment {
+    #[default]
     #[serde(rename = "none")]
     None,
     #[serde(rename = "forward")]
@@ -102,12 +113,6 @@ impl Adjustment {
             Self::None => "none",
             Self::Forward => "forward",
         }
-    }
-}
-
-impl Default for Adjustment {
-    fn default() -> Self {
-        Self::None
     }
 }
 

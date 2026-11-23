@@ -85,13 +85,13 @@ pub(crate) fn depends_on_children(node: &Node) -> bool {
 }
 
 fn axis_depends_on_children(dimension: Dimension) -> bool {
-    match dimension.expand() {
+    !matches!(
+        dimension.expand(),
         ExpandedDimension::Length(_)
-        | ExpandedDimension::Percent(_)
-        | ExpandedDimension::Stretch
-        | ExpandedDimension::Calc(_) => false,
-        _ => true,
-    }
+            | ExpandedDimension::Percent(_)
+            | ExpandedDimension::Stretch
+            | ExpandedDimension::Calc(_)
+    )
 }
 
 pub(crate) fn affects_parent(node: &Node) -> bool {

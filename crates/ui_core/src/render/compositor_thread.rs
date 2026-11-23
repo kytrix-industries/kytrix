@@ -279,10 +279,8 @@ impl CompositorHandle {
             .join
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if join.is_some() {
-            if let Some(handle) = join.take() {
-                let _ = handle.join();
-            }
+        if let Some(handle) = join.take() {
+            let _ = handle.join();
         }
         self.shared.inbox.reopen();
         let shared = Arc::clone(&self.shared);
