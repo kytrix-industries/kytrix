@@ -1,0 +1,734 @@
+# ui_core 逻辑像素 / 物理像素边界重构设计
+
+状态：设计稿（本轮不修改代码）
+范围：`ui_core`、`ui_kit` 以及依赖这两个 crate 的应用层 API
+决策记录：2026-11-23
+
+## 0. 结论
+
+问题确实存在，而且根因不只在 `ui_kit`。
+
+当前 `ui_core` 只有“逻辑像素的隐式约定”和“物理像素的局部类型”，没有把两者作为不可混用的单位系统：
+
+1. `math::Point/Size/Rect` 是裸 `f32`，名字里没有逻辑像素；`PhysicalRect` 是独立的 `i32` 四边类型，但 `PhysicalBounds`、`[f32; 4]`、`[i32; 4]` 又各自承担物理坐标。单位语义靠命名、注释和调用者记忆维持。
+2. 布局阶段已经在做设备像素吸附：`NodeTree::device_scale` + `place_subtree` 把每个节点的绝对逻辑盒吸附到设备像素网格，导致公开的 `Node::layout().bounds` 本身随 DPI 变化。这与设计文档 I11“只在 paint / present 边界做一次换算”相反。
+3. 绘制阶段没有统一换算策略：Quad 使用不取整的 `to_physical_f32`，Image/Glyph 使用逐边取整的 `to_physical`，Damage 使用外扩的 `to_physical_covering`，Clip 又先 `to_physical_f32` 再单独 `snap_rect_clip_to_pixels`。同一个逻辑矩形在不同 primitive 上会得到不同的物理矩形。
+4. `ui_kit` 为了补偿上述行为，直接读取 `Window::scale()` 并在组件内做设备像素运算。`Toggle` 是最典型的例子：`device_length` / `device_length_with_parity` / `sync_knob` / `sync_ring` / `sync_mark` 在物理像素空间计算，再除以 scale 写回逻辑 `LayoutOverride`；`Brand` / `IconSpec` / `Interactive::mount_dynamic_icon` / `Menu::IconCache` 也都直接读取窗口 scale 选择 SVG 栅格。
+5. 更多组件虽然不显式乘 scale，但会读取 `layout().bounds`（TabBar、ScrollBar、Input、ColorPicker、Overlay、Dialog、List、Markdown 等）。由于 bounds 已经被布局阶段吸附，这些组件的几何逻辑同样隐式依赖 DPI，只是问题更隐蔽。
+
+因此，用户提出的方向——`ui_kit` 只使用逻辑像素，`ui_core` 只在绘制边界统一换算为物理像素——是成立的，也是 WebKit/Blink、Qt、GPUI、egui、Flutter 等成熟框架的通用做法。
+
+本设计采用以下已确认决策：
+
+- 单位类型采用 `LogicalPx`（逻辑像素，`f32`）/ `PhysicalPx`（连续物理像素，`f32`）/ `DevicePx`（整数设备像素，`i32`）。
+- `Node::layout().bounds` 严格为逻辑像素，与 DPI 无关；删除布局阶段的设备吸附。
+- 所有逻辑到物理的换算集中到 paint 编码边界；轴对齐矩形与边框在 paint 时按 `pixelSnappedIntRect` 规则吸附。
+- `Style.inner` 私有；`StyleBuilder` / `PaintBuilder` 移入 `ui_core::paint::style`，所有长度参数使用 `LogicalPx`。
+- Canvas 文本改为 `Canvas::push_text(TextContent, origin)` 的引擎配方模式；删除 `App::text_scale`、`App::shape_text`、`ShapedTextHandle` 等应用层 DPI 接口。
+- 不保留旧类型别名、兼容层或过渡实现；全仓一次性迁移。
+
+### 0.1 落地决策（2026-11-23 拍板）
+
+| 项 | 决策 |
+|---|---|
+| 分支 | 直接在 `main` 上连续提交 |
+| 提交可编译性 | 允许阶段内部中间提交暂时不编译；每个阶段收口必须 `cargo check --workspace --all-targets` + 相关测试全绿 |
+| 落地顺序 | **行为先行、类型后行**：先用 `f32` 完成“布局去吸附 + paint 吸附 + damage/shadow pad 物理化”，golden 只重基一次；随后类型迁移必须是零像素 diff 的机械改造 |
+| Golden | 维持 42 张三端基线，不扩全矩阵；行为阶段期间允许红，行为阶段收口后单批三端重基并逐图说明 |
+| 命名 | 四边整数矩形主名 `DeviceRect`（`PhysicalRect` 让给连续物理矩形，即 `Rect<PhysicalPx>`） |
+| Canvas 文本 | 纳入既有 text pass，不给 `PaintPass` 加文本服务（见 §4.5） |
+| Damage AA pad | `aa_padding: PhysicalPx` 独立参数 |
+| a11y 边界 | `to_covering_device_rect` |
+| `ShapedLine` 等 | 全部降 `pub(crate)` |
+| `Menu::IconCache` | 直接删除组件级缓存，依赖 `ResourceCache` 去重 |
+| Canvas 文本断言 | frame/quad 记录断言，不新增 golden |
+| `ResourceImage` | 字段私有，只暴露 `logical_size(): Size<LogicalPx>` |
+| `App::resources_mut` | 一并收口，应用只能走逻辑资源 API |
+| 异步资源 owner | 本轮一并修“异步插入不登记 owner 导致关窗不回收” |
+| Dicebear 头像 | 走引擎 SVG 资源，删除 `profile_ui` 的 `image`/`resvg`/`usvg` 依赖 |
+| examples 物理观测 | 加 `required-features`，物理观测放 test-support 面 |
+| 小数 DPI 对称性 | 接受最多 1 物理像素偏差 |
+| 验收口径 | 三端 headless + golden + Windows 真窗口人工验收；`acceptance -- cpu` 文本帧阈值记为既有缺陷排除 |
+| 提交格式 | `type(scope): 中文摘要` + 中文正文（问题/改动/验证），不加 AI 署名 |
+
+## 1. 现状核查
+
+### 1.1 单位类型现状
+
+| 位置 | 当前实现 | 问题 |
+|---|---|---|
+| `crates/ui_core/src/math.rs:6-101` | `Point { x: f32, y: f32 }`、`Size { width: f32, height: f32 }`、`Rect { origin: Point, size: Size }` | 名字没有逻辑像素，任何 `f32` 物理值都能传进来 |
+| `crates/ui_core/src/math.rs:507-581` | `PhysicalRect { x0: i32, y0: i32, x1: i32, y1: i32 }` | 这是唯一带“物理”语义的矩形；但 `PhysicalBounds` 又在 `paint/instance.rs:248-254` 重复定义 |
+| `crates/ui_core/src/paint/instance.rs:53-62` | `GpuPrimitive.bounds: [f32; 4]` | 物理像素，但类型只是裸数组 |
+| `crates/ui_core/src/paint/instance.rs:198-207` | `FrameOp::bounds: PhysicalBounds` | 与 `PhysicalRect` 语义重复 |
+| `crates/ui_core/src/paint/primitive.rs:25-112` | `Quad.bounds: Rect`、`Image.bounds: Rect`、`Shadow.rect: Rect`、`ClipRect.rect: Rect`、`PositionedGlyph.position: Point` | 全部是裸逻辑 `f32`，没有编译器约束 |
+| `crates/ui_core/src/text.rs:143-157` | `TextStyle.size: f32`、`letter_spacing: f32` | 文本字号/字距是逻辑像素，但没有单位类型 |
+| `crates/ui_core/src/text.rs:748-757` | `ShapedLine.width/height: f32`、`scale: f32` | 逻辑尺寸与光栅 scale 混在同一个公开结构里 |
+
+结论：`ui_core` 目前最多只能算“有两个命名类型 `Rect` 和 `PhysicalRect`”，并没有明确的 `LogicalPx` / `PhysicalPx` 类型边界。
+
+### 1.2 布局阶段已经提前物理化
+
+`NodeTree` 保存 `device_scale: Option<f32>`（`crates/ui_core/src/node/tree.rs:313`），并且：
+
+- `Window::set_scale` 调用 `tree.set_device_scale(...)`，随后 `invalidate_layout(root)`（`crates/ui_core/src/window/scale.rs:8-21`）。
+- `place_subtree` 对每个节点计算 `abs` 后，再执行 `abs.snap_to_device(scale)`，把 `committed` 写入 `target.layout.bounds`（`crates/ui_core/src/node/tree/layout.rs:255-296`）。
+- `LayoutOverride` 子节点在最新提交中被特殊处理为相对父节点的 `committed.origin` 定位，而不是相对 `abs.origin`（`crates/ui_core/src/node/tree/layout.rs:307-315`，提交 `9cd7a1f8`）。
+
+现有测试直接把这个行为钉死：
+
+- `crates/ui_core/src/window/tests.rs:347-396`：`dpi_scale_only_shifts_logical_boxes_by_device_snapping`
+- `crates/ui_core/src/node/tree/tests.rs:837-865`：`device_scale_snaps_committed_bounds_not_taffy_layout`
+- `crates/ui_core/src/node/tree/tests.rs:904-932`：`a_layout_override_is_positioned_against_the_parents_snapped_box`
+
+这意味着 `Node::layout().bounds` 不是纯逻辑布局结果，而是“逻辑值但已对齐设备像素”的提交盒。所有读取它的应用代码（包括 `ui_kit` 的 Toggle、TabBar、ScrollBar、Input、ColorPicker 等）都隐式依赖当前 DPI。
+
+### 1.3 绘制阶段的换算方法不一致
+
+`Rect` 当前有四个公开的物理化方法，语义不同（`crates/ui_core/src/math.rs:238-303`）：
+
+| 方法 | 取整规则 | 当前使用点 |
+|---|---|---|
+| `to_physical_f32` | 不取整，直接 × factor | Quad、Shadow、Clip |
+| `to_physical` | 每条边取整 | Image、Glyph |
+| `to_physical_rounded` | origin 与 size 分别取整 | 少量平台尺寸计算 |
+| `to_physical_covering` | floor 左上、ceil 右下 | Damage、Clip covering |
+
+具体调用点：
+
+- Quad：`crates/ui_core/src/paint/instance.rs:1905-1953`，`quad.bounds.to_physical_f32(self.scale)`
+- Shadow：`crates/ui_core/src/paint/instance.rs:1955-1980`，不取整
+- Image：`crates/ui_core/src/paint/instance.rs:1982-2011`，`image.bounds.to_physical(self.scale)`
+- Glyph：`crates/ui_core/src/paint/instance.rs:2013-2035`，`Rect::from_origin_size(glyph.position, glyph.size).to_physical(self.scale)`
+- Clip：`crates/ui_core/src/paint/instance.rs:1683-1718`，先 `to_physical_f32`，矩形 clip 再 `snap_rect_clip_to_pixels`（`crates/ui_core/src/paint/instance.rs:769-783`）
+- Damage：`crates/ui_core/src/render/damage.rs:36-53`，`bounds.to_physical_covering(self.scale)`
+
+同一个逻辑矩形在 Quad 与 Image 上可能相差 0.25 到 1 个物理像素。例如逻辑 `x = 10.3`、`width = 10.0`、DPI = 1.25：
+
+- Quad：`12.875 .. 25.375`（不取整）
+- Image：`13 .. 25`（逐边取整）
+- Damage：`12 .. 26`（外扩覆盖）
+
+这会产生背景与图片错位、边框边缘发虚、同一容器内的图片与背景 1px 缝等问题。`paint/pass.rs:1174-1180` 还在逻辑空间里反向计算 shadow pad（`(物理 pad × scale + 1) / scale`），而 `render/damage.rs:36-48` 的 `aa_padding` 又是物理像素，单位在函数签名里是混用的。
+
+### 1.4 ui_kit 的 DPI 渗透
+
+| 组件 / 文件 | 当前行为 | 具体位置 |
+|---|---|---|
+| `Toggle` | 读取窗口 scale，用 `device_length` / `device_length_with_parity` 在物理空间算 track/knob/ring/mark，再除回逻辑写 `LayoutOverride` | `crates/ui_kit/src/kit/toggle.rs:341-485`、`576-583`、`735` |
+| `Brand` | 读取窗口 scale，`frame * scale` 后调用 `insert_owned_at_size` 生成物理位图 | `crates/ui_kit/src/kit/brand.rs:142-209` |
+| `IconSpec` | 读取窗口 scale，传给 `insert_owned_svg_for_display` | `crates/ui_kit/src/kit/icon.rs:328-408` |
+| `Interactive::mount_dynamic_icon` | 读取窗口 scale 传资源接口 | `crates/ui_kit/src/kit/interactive.rs:749-759` |
+| `Menu::IconCache` | 缓存键包含 `scale_bits`，每次 resolve 读取窗口 scale | `crates/ui_kit/src/kit/menu.rs:48-93` |
+| `TabBar` | `indicator_target` 读取 `row/tab.layout().bounds`，这些都是 DPI 吸附后的值 | `crates/ui_kit/src/kit/tab_bar.rs:593-607` |
+| `ScrollBar` | thumb rect 基于 `track.layout().bounds` 计算 | `crates/ui_kit/src/kit/scroll_bar.rs:305-332`、`390-437` |
+| `Input` | caret/selection canvas 基于 `text.layout().bounds` 与 `window.text_caret_rect` 计算 | `crates/ui_kit/src/kit/input.rs:1676-1728`、`1761-1770` |
+| `ColorPicker` | palette/hit/geometry 都基于 `layout().bounds` | `crates/ui_kit/src/kit/color_picker.rs:1108-1198`、`2170` |
+| `Overlay` / `Dialog` / `Dropdown` / `Select` / `List` / `Markdown` | 读取 layout bounds 作为定位或尺寸输入 | `overlay.rs:372,813`、`dialog.rs:704`、`dropdown.rs:788`、`select.rs:1129`、`list.rs:909`、`markdown/view.rs:177` |
+
+Toggle 的实现尤其说明问题：一个开关组件为了在 1x/1.25x/1.5x/2x 下对齐物理像素，增加了约 200 行设备空间计算与专门的 DPI 测试。这是把 `ui_core` 的职责错误地下沉到了 `ui_kit`。
+
+### 1.5 直接后果
+
+1. **应用层无法获得稳定的逻辑几何**：`Node::layout().bounds` 随 DPI 变化，任何基于 layout 的自绘、命中、缓存键、位置计算都会随 DPI 改变。
+2. **同一逻辑矩形得到不同物理矩形**：Quad/Image/Glyph/Clip/Damage 各自取整，1px 线条和图片边缘在不同组件上表现不一致。
+3. **Canvas 内的细线没有布局吸附兜底**：布局吸附只作用于节点盒；Canvas 内的 caret、underline、separator 等 quad 仍然按 `to_physical_f32` 绘制，在 1.25/1.5 等 DPI 下会出现 1.25px/1.5px 的模糊线。
+4. **DPI 变化强制重排**：`Window::set_scale` 调用 `invalidate_layout(root)`，而逻辑布局输入并没有变化；这是不必要的全树布局成本，也会让布局结果随 DPI 改变。
+5. **文本与布局盒可能不一致**：`text_content_width` 来自 taffy 的未吸附尺寸，`LayoutBox.bounds` 却是吸附后的尺寸；文本 caret / 选区由未吸附宽度计算，再叠加吸附后的 origin，可能产生亚像素到 1px 的偏差。
+6. **测试把错误行为固化**：`ui_kit::toggle` 的测试直接断言物理像素方形/居中；这些断言实际上是在测试 ui_kit 自己补偿出来的结果，而不是引擎的绘制契约。
+
+### 1.6 与设计文档的矛盾
+
+- `crates/ui_core/design/custom-gui-engine-design.md:199`（I11）写明“所有几何以逻辑像素存储、以物理像素绘制：只在 paint / present 边界做一次缩放与舍入”。
+- 同文件 `:1171-1172`（§4.4）写明“布局与 `LayoutBox` 全用逻辑像素 `f32`；在 paint 生成 `GpuPrimitive.bounds` 时统一乘 scale 并 round”。
+- 但实现中 `NodeTree::device_scale` + `snap_to_device` 已在布局阶段吸附；`Window::set_scale` 还会让根 LAYOUT 失效（`:2377-2378`），与“布局不依赖 DPI”矛盾。
+- `crates/ui_core/design/custom-gui-engine-design.md:2495-2497` 又把 `Window::scale()` 作为应用可见 API，并要求 canvas 文本按 `App::text_scale` 重新 shape，进一步把 DPI 暴露给应用层。
+- `.docs/gui-migration/assess/01-ui-core-api.md:533-537` 也写了“布局全用逻辑像素，物理化只在 paint”，但该文档没有覆盖后来加入的布局吸附实现。
+
+## 2. 主流框架调研
+
+| 框架 | 单位模型 | 与本设计的对应关系 |
+|---|---|---|
+| WebKit / Blink | `LayoutUnit` 用 1/64 逻辑像素做布局和 hit test；paint 时用 `pixelSnappedIntRect` 对齐设备像素，边框保持整数像素；矩形尺寸不单独 round，而是“位置与尺寸一起 snap” | 直接采用 `pixelSnappedIntRect` 算法；布局保持 `LogicalPx`，paint 输出 `DevicePx` |
+| Chromium / Blink 坐标空间 | 明确区分 Physical Pixels、Device Independent Pixels (DIP)、CSS Pixels；`window.devicePixelRatio` 是 CSS px 与物理 px 的比值 | 应用层只看到 `LogicalPx`，`DevicePixelRatio` 只在引擎内部 |
+| Qt | 应用和控件几何使用 device-independent pixels；QPainter 自动按 device pixel ratio 绘制；QImage/QPixmap 是原始物理像素并带 DPR 元数据 | `ui_kit` 不读 DPR；图片资源接口按逻辑尺寸注册，引擎选择物理变体 |
+| GPUI | `Pixels`（逻辑）/ `ScaledPixels`（物理连续）/ `DevicePixels`（物理整数）三种类型；`Bounds<Pixels>::scale` → `Bounds<ScaledPixels>` → `Bounds<DevicePixels>` | 采用同样的三层单位模型和转换方向 |
+| egui | 形状和布局使用 points；`pixels_per_point` 只在 tessellation / feathering 时使用；feathering 以物理像素定义再换算到 points | 边框、AA pad 等物理常量只在 paint 内部换算，不进入组件 |
+| Flutter | `ViewConfiguration` 同时提供 physical constraints 与 logical constraints；`toMatrix()` 应用 `devicePixelRatio`；`RenderParagraph.devicePixelRatio` 变化时重新生成文字位图 | 文本按窗口 DPR 重新栅格化；布局和 Canvas 逻辑坐标不变 |
+
+调研结论：用户的直觉是正确的，这不是某个框架的偏好，而是高 DPI 桌面/移动 UI 的通用分层方式。真正需要额外设计的是“细线/小控件在 paint 时如何吸附”，而不是让每个组件自己乘 DPI。
+
+### 2.1 候选方案比较
+
+| 方案 | 做法 | 结论 |
+|---|---|---|
+| A. 逻辑 Scene + paint 边界换算（本设计） | 全链路 `LogicalPx`，`InstanceEncoder` 统一乘以 DPR 并按 primitive 类型吸附 | 采用。与 WebKit/GPUI/Qt 的做法一致，DPI 变化不重排，应用层无 DPI |
+| B. 保留布局吸附，只是禁止 ui_kit 读 scale | 引擎继续把 layout 吸附到设备像素；ui_kit 改读纯逻辑布局快照 | 不采用。需要同时维护“逻辑布局”和“提交布局”两套几何，且 hit/a11y/damage 容易再次分叉，违背单一真相 |
+| C. 在 Scene 之前把整棵树铺成物理像素场景 | 布局后立刻生成物理 Scene，应用 Canvas 也按 DPR 烘焙 | 不采用。DPI 变化会让所有 Canvas/缓存失效，应用无法保持逻辑坐标，且文本/路径必须整体重建 |
+| D. 完全不吸附，全部依赖 AA | 逻辑坐标直接乘 DPR，不做 pixelSnappedIntRect | 不采用。1px 边框、caret、分隔线在 1.25/1.5 下会发虚，金融桌面 UI 不可接受 |
+
+方案 A 的代价是：paint 需要知道每种 primitive 的物理化与吸附规则，且 golden 会变化；但这些规则本来就是引擎应当统一拥有的，而不是散落在 ui_kit。
+
+## 3. 目标架构
+
+### 3.1 三套单位类型
+
+```rust
+pub struct LogicalPx(f32);      // 逻辑像素，布局/API/Canvas/Geometry 的唯一长度单位
+pub struct PhysicalPx(f32);   // 连续物理像素，paint 内部用于 SDF/阴影/几何 AABB
+pub struct DevicePx(i32);     // 整数设备像素，damage/scissor/atlas/实例 bounds
+
+pub struct Point<T> { pub x: T, pub y: T }
+pub struct Size<T> { pub width: T, pub height: T }
+pub struct Rect<T> { pub origin: Point<T>, pub size: Size<T> }
+pub struct Edges<T> { pub top: T, pub right: T, pub bottom: T, pub left: T }
+```
+
+配套别名：
+
+```rust
+pub type LogicalPoint = Point<LogicalPx>;
+pub type LogicalSize = Size<LogicalPx>;
+pub type LogicalRect = Rect<LogicalPx>;
+
+pub type PhysicalPoint = Point<PhysicalPx>;
+pub type PhysicalSize = Size<PhysicalPx>;
+pub type PhysicalRect = Rect<PhysicalPx>;
+
+pub struct DeviceRect {
+    pub x0: DevicePx,
+    pub y0: DevicePx,
+    pub x1: DevicePx,
+    pub y1: DevicePx,
+}
+```
+
+说明：
+
+- `LogicalPx` / `PhysicalPx` 是 `f32` 长度；`DevicePx` 是 `i32` 整数。`PhysicalPx` 与 `DevicePx` 不能相互隐式转换。
+- `DevicePixelRatio` 是唯一的 DPI 类型：
+
+```rust
+pub struct DevicePixelRatio(f32);
+
+impl DevicePixelRatio {
+    pub const ONE: Self;
+    pub fn new(factor: f32) -> Option<Self>;
+    pub fn factor(self) -> f32;
+
+    pub fn to_physical(self, value: LogicalPx) -> PhysicalPx;
+    pub fn to_logical(self, value: PhysicalPx) -> LogicalPx;
+    pub fn to_physical_rect(self, rect: LogicalRect) -> PhysicalRect;
+    pub fn to_device_rect(self, rect: LogicalRect) -> DeviceRect;
+    pub fn to_covering_device_rect(self, rect: LogicalRect) -> DeviceRect;
+    pub fn stroke_width(self, width: LogicalPx) -> PhysicalPx;
+}
+```
+
+- `DeviceRect` 保持四边 `x0/y0/x1/y1` 的整数矩形语义，用于 damage、scissor、atlas、a11y 等“边缘必须精确”的场景；`Rect<LogicalPx>` / `Rect<PhysicalPx>` 使用 origin + size。这样既保留现有 damage 代码的边界运算，又让逻辑/连续物理矩形有类型。
+- 删除 `PhysicalBounds`（`paint/instance.rs`），统一使用 `DeviceRect`。
+- `Scale` 这个名字被 `DevicePixelRatio` 取代，避免与 `Transform::scale` 混淆。
+
+### 3.2 单向边界
+
+| 层 | 允许的单位 | 允许的 DPI 感知 | 说明 |
+|---|---|---|---|
+| `ui_kit` / widgets / app code | `LogicalPx` | 否 | 不导入 `DevicePixelRatio`，不调用 `Window::scale`，不乘/除 DPI |
+| `ui_core::layout` / `NodeTree` / `Style` / `TextStyle` | `LogicalPx` | 否 | 布局输入输出全部逻辑像素；不得保存 device scale |
+| `ui_core::paint::Scene` / `Primitive` / `Canvas` / `Geometry` | `LogicalPx` | 否 | 图元几何是绝对窗口逻辑像素 |
+| `ui_core::paint::PaintPass` | `LogicalPx` + `DevicePixelRatio` | 只在生成 damage/clip covering 时 | 不修改布局盒，只把逻辑覆盖区换算为物理 damage |
+| `ui_core::paint::InstanceEncoder` | `LogicalPx` → `PhysicalPx` / `DevicePx` | 是，唯一换算点 | 所有 primitive 在这里完成缩放、吸附、物理 bounds 生成 |
+| `ui_core::render::*` | `PhysicalPx` / `DevicePx` | 否 | GPU payload、swapchain、atlas、scissor 只接收物理值 |
+| `ui_core::platform::*` | `DevicePx`（原生）↔ `LogicalPx`（事件） | 是，平台边界 | 指针、窗口尺寸、IME caret 在这里换算 |
+| `ui_core::a11y` | `DevicePx` | 是，a11y 边界 | AccessKit 需要屏幕物理坐标 |
+| `ui_core::resources` | 逻辑资源句柄 + 内部物理变体 | 是，资源内部 | 应用只给逻辑尺寸；引擎按窗口 DPR 选择物理变体 |
+
+### 3.3 新增/改写的不变量
+
+在 `crates/ui_core/design/custom-gui-engine-design.md` 的 I11 基础上补充：
+
+- **I11-1（应用层无 DPI）**：`ui_kit`、widgets、`profile_ui` 等应用代码不得读取 `DevicePixelRatio`，不得在像素几何计算中乘除 DPI。
+- **I11-2（布局纯逻辑）**：`LayoutBox`、`LayoutOverride`、`HitShape`、`Canvas.bounds`、`Primitive` 的几何字段只允许 `LogicalPx`；同一棵树在不同 DPR 下布局结果逐位相同。
+- **I11-3（单一换算边界）**：`LogicalPx → PhysicalPx/DevicePx` 只发生在 `InstanceEncoder`（绘制）与平台/资源/a11y 边界；`paint` 之内不得出现组件级 scale 参数。
+- **I11-4（物理类型封闭）**：`PhysicalPx`/`DevicePx` 只出现在 `render`、`platform`、`a11y`、`resources` 变体和 test-support 的物理观测面；不进入 `Style`、`PaintSpec`、`TextStyle`、`Canvas`、`Primitive`。
+- **I11-5（无兼容别名）**：删除旧的非泛型 `Point/Size/Rect`（改为 `Point<T>/Size<T>/Rect<T>`）、`Scale`、`snap_to_device`、`to_physical_*`、`Window::scale` 等名字，不保留过渡 API。
+
+## 4. ui_core 具体改造
+
+### 4.1 `math.rs` / 单位层
+
+1. 新增 `LogicalPx`、`PhysicalPx`、`DevicePx`、`Point<T>`、`Size<T>`、`Rect<T>`、`Edges<T>`、`DevicePixelRatio`。
+2. `Rect<LogicalPx>` 提供 `translate/inset/outset/union/intersect/contains`；`DeviceRect` 提供 `x0/y0/x1/y1/width/height/union/intersect`。
+3. `Rect<PhysicalPx>::snap()` 返回 `DeviceRect`，实现 WebKit `pixelSnappedIntRect`：
+
+```text
+x  = round(x0)
+y  = round(y0)
+x1 = round(x0 + width)
+y1 = round(y0 + height)
+width  = x1 - x
+height = y1 - y
+```
+
+4. 删除：
+   - `Rect::snap_to_device`
+   - `Rect::to_physical_f32`
+   - `Rect::to_physical`
+   - `Rect::to_physical_rounded`
+   - `Rect::to_physical_covering`
+   - `snap_stroke_width`
+   - `Scale`
+5. `DevicePixelRatio` 中保留 `to_covering_device_rect`（floor/ceil）用于 damage/clip；`to_device_rect`（逐边 round）用于图形；`to_physical_rect`（不取整）用于 SDF/阴影；`stroke_width` 负责边框宽度。
+6. 为了约束逻辑长度构造，提供 `LogicalPx::new(f32)` / `px(f32)` helper；不为 `f32` 实现隐式 `Into<LogicalPx>`，避免物理裸值直接冒充逻辑值。
+7. `Transform` 的平移分量改为 `LogicalPx`，矩阵系数保持 `f32`（无量纲）；`GeometryDesc.bounds: Rect<LogicalPx>`，顶点字节仍按逻辑像素解释。
+
+### 4.2 `layout` / `NodeTree`
+
+1. `LayoutBox` 改为：
+
+```rust
+pub struct LayoutBox {
+    pub bounds: Rect<LogicalPx>,
+    pub border: Edges<LogicalPx>,
+}
+```
+
+2. 删除 `NodeTree.device_scale`、`raw_origins`、`set_device_scale`、`snap_to_device` 调用。`place_subtree` 统一使用未吸附的 `abs.origin` 作为子节点 reference；不再有 `layout_override_of(child)` 的特殊分支。
+3. `LayoutOverride.rect` 改为 `Rect<LogicalPx>`，语义固定为“相对父 border box 的逻辑像素矩形”。
+4. `Window::set_scale` 不再调用 `invalidate_layout(root)`；DPI 变化只：
+   - 更新 `Window::device_pixel_ratio`
+   - `full_damage_pending = true`
+   - `tree.mark_all_text_dirty()`
+   - `a11y.note_bounds_changed()`
+   - 非平台写入时重算 surface covering 尺寸
+5. 删除 `NodeTree` 中为设备吸附服务的 `raw_changed` / `raw_origin` 逻辑。
+6. 更新 `crates/ui_core/src/window/tests.rs`、`crates/ui_core/src/node/tree/tests.rs`：把“DPI 改变 layout bounds”改成“DPI 改变不影响 layout bounds”。
+
+### 4.3 `paint/pass.rs`
+
+1. `PaintPass.scale: DevicePixelRatio`；`frame: DeviceRect`；`scroll_slots: Vec<ScrollSlot>`，其中：
+   - `ScrollSlot.offset: Point<LogicalPx>`
+   - `ScrollSlot.viewport: DeviceRect`
+2. `ClipContext` 的 `covering` 保持 `DeviceRect`，通过 `rect.to_covering_device_rect(context.scale)` 计算。
+3. `DamageAccumulator` 只接受物理输入：
+   - `push_device(rect: DeviceRect, aa_padding: PhysicalPx, clip: Option<DeviceRect>)`
+   - `push_logical(bounds: Rect<LogicalPx>, aa_padding: PhysicalPx, clip: Option<DeviceRect>)` 作为方便的转换入口，内部仍转换为 `DeviceRect`。
+4. `painted_content` / `emit_decorations` 的 shadow pad 计算全部在物理空间进行：`blur.to_physical(dpr)` + `SHADOW_PAD_SIGMAS`，不再出现 `(物理 pad × scale + 1) / scale`。
+5. B 阶段（typed）后 `push_logical` 的 `aa_padding` 改为 `PhysicalPx`，逻辑 bounds 仅作为转换入口。
+
+### 4.4 `paint/instance.rs` / render
+
+1. `InstanceEncoder::encode` 成为唯一 `LogicalPx → PhysicalPx/DevicePx` 入口。
+2. `GpuPrimitive.bounds` 字段保留 `#[repr(C)]` 的 `[f32;4]` 布局以维持 shader 契约，但由 `Rect<PhysicalPx>` 生成；`params0.w`（AA pad）为 `PhysicalPx`。
+3. `PhysicalBounds` 删除，`FrameOp::bounds` 使用 `DeviceRect`。
+4. Primitive 换算规则：
+
+| Primitive | 换算 | 吸附 |
+|---|---|---|
+| `Quad`（Solid/Gradient/Border/FocusRing） | `quad.bounds.to_physical_rect(dpr)` | `snap()` → `DevicePx` 边界；边框宽度 `dpr.stroke_width(border.width)`；圆角 `radius × dpr` 保持 `PhysicalPx` |
+| `Shadow` | `shadow.rect.translate(offset).to_physical_rect(dpr)` | 不吸附；blur 为 `PhysicalPx` |
+| `Image` | `image.bounds.to_device_rect(dpr)` | 逐边 round（pixelSnappedIntRect） |
+| `GlyphRun` | `Rect::from_origin_size(position,size).to_device_rect(dpr)` | 逐边 round；文本光栅位置本身已是整数物理像素 |
+| `Clip` | `clip.rect.to_covering_device_rect(dpr)` | 矩形 clip floor/ceil；圆角 clip 矩形 floor/ceil，半径 `PhysicalPx` |
+| `Path` | `path.bounds.to_covering_device_rect(dpr)` 作 damage AABB | 顶点不吸附 |
+| `Geometry` | `GeometryDraw.transform` 保持逻辑；可见 AABB `to_covering_device_rect` | 顶点不吸附 |
+| `Canvas` | 内部每一项按上表处理 | 同上 |
+
+5. `GpuPrimitive` / `FrameOp` / `DeviceRect` / `PhysicalPx` 只出现在 `render` 内部以及 `platform` / `a11y` 的物理边界；`Primitive` / `Scene` 仍是逻辑像素。
+6. `RootUniform.frame.params.x` 仍用于 Geometry 顶点着色器的逻辑→物理缩放；这是 render 内部唯一的 DPR 值。
+
+### 4.5 文本与 Canvas 文本
+
+1. `TextStyle.size`、`letter_spacing`、`TextStyleExtras.word_spacing` 改为 `LogicalPx`；`line_height` 作为无量纲倍数保留 `f32`。
+2. `TextContent`、`InlineBoxSpec.size`、`TextDecoration.rect` 全部 `LogicalPx`。
+3. 删除公开的 `ShapedLine` / `ShapedTextLine` / `ShapedTextItem` / `ShapedTextHandle` / `App::shape_text` / `App::shaped_inline_boxes` / `App::text_scale` / `App::set_text_scale` / `App::clear_text_scale_override`；这些结构全部降 `pub(crate)`。
+4. `Canvas` 新增：
+
+```rust
+pub fn push_text(&mut self, content: TextContent, origin: Point<LogicalPx>) -> bool;
+```
+
+   Canvas 内只保存逻辑文本配方（`TextContent` + 逻辑原点），不保存按某个 DPI 光栅化的字形 tile。
+
+5. **Canvas 文本纳入既有 text pass，不给 `PaintPass` 加文本服务。** 理由：`TextContext` / `GlyphRasterizer` / `GlyphAtlas` / `AtlasAllocator` 全在 `App` 上；`InstanceEncoder` 跑在 compositor 线程；且 atlas 上传发生在 paint **之前**，任何“paint 期才光栅化”的方案都会让新 tile 晚一帧上传，必须额外补帧。
+
+   数据模型：
+
+```rust
+pub struct CanvasText {
+    pub content: TextContent,
+    pub origin: Point<LogicalPx>,
+}
+
+enum Primitive {
+    Text(Arc<CanvasText>),
+}
+
+pub(crate) struct ResolvedCanvasText {
+    key: CanvasTextKey,
+    lines: Vec<Rc<ShapedLine>>,
+}
+
+pub(crate) struct CanvasTextKey {
+    canvas_generation: u32,
+    dpr_bits: u32,
+    atlas_generation: u32,
+    glyph_eviction_epoch: u32,
+}
+```
+
+   帧内流程（`App::frame`）：
+
+   - `refresh_styles` → `refresh_text`（节点文本 shaping，缓存键不含 DPR）→ `refresh_images` → `layout` → `layout_text`（节点文本光栅）；
+   - **新增 `resolve_canvas_text(window)`**：按绘制顺序遍历该窗口的 canvas 节点（含嵌套 canvas），对每个 `Primitive::Text` 配方走 `TextContext::shape_cached`（键不含 DPR）+ 按窗口 DPR 光栅化，写入 `Window::canvas_text: HashMap<NodeId, ResolvedCanvasText>`；key 命中即跳过；
+   - `upload_atlas_pages`；
+   - `paint_frame`：`PaintPass` 的 `Content::Canvas` 分支按同一遍历顺序把 `Primitive::Text` 替换成 `Primitive::GlyphRun`（只做“配方 → 已解析结果”替换，不含任何 DPR 逻辑）。
+6. 文本缓存键：`(text hash, style, max_width, font_stack_version)`，**不包含 DPR**；字形图集键包含量化 ppem。DPI 变化只让 `CanvasTextKey.dpr_bits` 失配，重光栅文本，不重建 `Arc<Canvas>`，也不让应用改任何 cache key。
+7. 节点文本路径保持逻辑 shaping + 逻辑布局宽度；`TextPass` 只在光栅阶段使用窗口 DPR。`Window::set_scale` 标记所有文本 dirty，但不让布局失效。
+8. 删除的安全网（因为配方不再由应用持有）：`Canvas::without_stale_glyph_runs`、`PaintReport::stale_canvas_runs`、`Window::note_stale_canvas_followup`、`App` 中的 stale-canvas 补帧分支、`TextDiagnostic::CanvasTextStale`、`Canvas::push_shaped_text`、`App::shape_text`、`App::text_scale`、`App::set_text_scale`、`App::clear_text_scale_override`、`App::shaped_inline_boxes`、`EngineError::InvalidTextScale`。
+
+### 4.6 资源 / 图片
+
+1. `ResourceImage` 改为字段私有 + 只暴露逻辑尺寸：
+
+```rust
+pub struct ResourceImage {
+    id: ResourceId,
+    tile: AtlasTile,
+    physical_size: Size<DevicePx>,
+}
+
+impl ResourceImage {
+    pub fn id(&self) -> ResourceId;
+    pub fn tile(&self) -> AtlasTile;
+    pub fn logical_size(&self, dpr: DevicePixelRatio) -> Size<LogicalPx>;
+}
+```
+
+   `logical_size` 的 `dpr` 参数只供引擎内部与 test-support 使用；应用侧改用 `Window` 无关的 `App::resource_logical_size(window, image)`。
+
+2. `ResourceCache` 的 scale 参数方法改为 `pub(crate)`，只允许 `App` / `Window` 内部使用；`App::resources_mut` 一并收口，应用只能走逻辑资源 API。
+3. 新增逻辑资源 API：
+
+```rust
+impl App {
+    pub fn insert_svg_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: &[u8],
+        logical: Size<LogicalPx>,
+    ) -> Result<ResourceImage, EngineError>;
+
+    pub fn insert_bitmap_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: &[u8],
+        logical: Size<LogicalPx>,
+    ) -> Result<ResourceImage, EngineError>;
+
+    pub fn insert_svg_async_for_window(
+        &mut self,
+        window: WindowId,
+        bytes: Bytes,
+        logical: Size<LogicalPx>,
+    ) -> PendingResource;
+}
+```
+
+4. 物理目标尺寸为 `ceil(logical × dpr)`（与现有 `resolve_target` 的向上取整一致），保证不会因为向下取整而模糊。
+5. `ImageContent.intrinsic` 保持 `Size<LogicalPx>`；引擎在 DPI 变化时用 `physical_size / dpr` 重新计算内在逻辑尺寸。
+6. `ResourceCache::reselect` 内部按窗口 DPR 选择变体；应用不再持有 `scale`、不再维护 `scale_bits` 缓存键。
+
+### 4.7 `window` / `app` / `platform` / `a11y`
+
+1. `Window::size()` / `set_size()` / `WindowOptions.size` 全部 `Size<LogicalPx>`；`WindowOptions.scale` 从生产 API 删除，测试用 `TestApp::with_scale` 注入。
+2. `Window::scale()` / `set_scale()` / `scale_epoch()` 从公开 API 删除；`set_scale` 保留 `pub(crate)` 给平台层，`device_pixel_ratio` 为引擎内部字段。
+3. `Event::DpiChanged` 只保留 `dpi: u32`（诊断信息）；删除 `scale` 字段。应用不需要也不应该接收 DPI 比例来做几何。
+4. `App::note_window_dpi`、`default_text_scale`、`text_scale_override` 删除；`TextScale` 若未来要支持无障碍字号，作为独立应用级字号倍率而不是 DPI。
+5. 平台层：
+   - 指针事件、窗口 resize、IME caret、拖拽区域继续在平台边界做 `DevicePx → LogicalPx` 换算。
+   - 窗口 surface / swapchain / present 保持 `DevicePx`。
+6. `a11y::A11yNode.bounds` / `A11yTree` 使用 `DeviceRect`；`a11y::mapping::bounds_of` 使用 `DevicePixelRatio::to_covering_device_rect`。
+
+### 4.8 公开 API 删除清单
+
+以下旧接口全部删除，不保留别名或兼容层：
+
+- 旧的非泛型 `math::{Point, Size, Rect}` 与 `math::Scale`（替换为 `Point<T>/Size<T>/Rect<T>` 和 `DevicePixelRatio`）
+- `Rect::{snap_to_device, to_physical_f32, to_physical, to_physical_rounded, to_physical_covering}`
+- `math::snap_stroke_width`（算法移入 `DevicePixelRatio::stroke_width`）
+- `Window::{scale, set_scale, scale_epoch}`（`set_scale` 降为 `pub(crate)`）
+- `WindowOptions.scale`
+- `Event::DpiChanged.scale`
+- `App::{shape_text, shaped_inline_boxes, text_scale, set_text_scale, clear_text_scale_override}`
+- `text::{ShapedLine, ShapedTextLine, ShapedTextItem, ShapedTextHandle, ShapedGlyphRun, ShapedInlineBox, ShapedDecoration}`（全部降 `pub(crate)`）
+- `Canvas::{push_shaped_text, without_stale_glyph_runs}`
+- `Window::note_stale_canvas_followup`、`PaintReport::stale_canvas_runs`、`TextDiagnostic::CanvasTextStale`
+- `EngineError::InvalidTextScale`
+- `ResourceCache::{insert_for_display, insert_svg_for_display, insert_owned_svg_for_display, insert_owned_at_size, insert_at_size, insert_async_at_size}` 的公开面
+- `App::resources_mut`（应用只能走逻辑资源 API）
+- `PhysicalBounds`（合并到 `DeviceRect`）
+
+## 5. ui_kit / 应用层改造
+
+### 5.1 Toggle 简化
+
+删除：
+
+- `window_scale`
+- `device_length`
+- `device_length_with_parity`
+- `TrackMetrics` 中的 `inset` 物理换算
+- `sync_knob` / `sync_ring` / `sync_mark` 中的 `× scale`、`round`、`/ scale`
+
+改为：
+
+```rust
+struct TrackMetrics {
+    width: LogicalPx,
+    height: LogicalPx,
+    radius: LogicalPx,
+    inset: LogicalPx,
+}
+
+fn track_metrics(size: UnifiedSize) -> TrackMetrics {
+    let height = size.icon_size() * 1.25;
+    TrackMetrics {
+        width: height * 1.9,
+        height,
+        radius: height / 2.0,
+        inset: LogicalPx::new(2.0),
+    }
+}
+```
+
+`sync_knob` 直接在逻辑空间计算 `offset = inset + mix * travel`，写回 `Rect<LogicalPx>`；`sync_ring` / `sync_mark` 使用静态逻辑矩形。物理像素对齐由 `InstanceEncoder` 的 `Quad` 吸附完成。
+
+结果：Toggle 中约 200 行 DPI 专用计算与辅助函数被删除，组件回到普通逻辑布局规模；不再有 DPI 专用测试。小数 DPI 下允许最多 1 物理像素的居中偏差（WebKit/CSS 的常规行为）。若产品要求严格对称，设计系统使用 4 的倍数的逻辑尺寸（1.25/1.5/1.75/2/2.5/3 下均为整数物理像素），而不是把 DPI 带回组件。
+
+### 5.2 资源类组件
+
+- `Brand::resource_for`：调用 `App::insert_bitmap_for_window(window, bytes, frame)`，`frame: Size<LogicalPx>`。
+- `IconSpec::resource_for` / `mount_dynamic_icon`：调用 `App::insert_svg_for_window(window, bytes, Size<LogicalPx>)`。
+- `Menu::IconCache`：直接删除组件级缓存，依赖 `ResourceCache` 的 `ContentKey` 去重。
+- `AssetImages::request`：增加 `window: WindowId` 参数并调用逻辑资源 API。
+- 所有 `window.scale()` 调用从 `ui_kit/src` 消失；grep 门禁见 §8。
+
+### 5.3 读取 layout bounds 的组件
+
+`TabBar`、`ScrollBar`、`Input`、`ColorPicker`、`Overlay`、`Dialog`、`List`、`Markdown`、`Spinner` 等不再做任何物理换算：
+
+- `track.layout().bounds`、`text.layout().bounds` 现在纯粹是逻辑像素；
+- Canvas 文本用 `Canvas::push_text`，不再读 `App::text_scale`；
+- 需要像素级对齐的细线（caret、underline、separator）由 `InstanceEncoder` 的 Quad snap 处理，应用只需要画逻辑矩形。
+
+### 5.4 `StyleBuilder` / `PaintBuilder`
+
+- 将 `crates/ui_kit/src/style_builder.rs` 移入 `crates/ui_core/src/paint/style_builder.rs`。
+- `Style.inner` 改为 `pub(crate)`；外部不再直接写 taffy 字段。
+- `StyleBuilder` 的所有长度方法（`gap`、`padding`、`size`、`min_size`、`max_size`、`inset`、`border` 等）接受 `LogicalPx`；`PaintBuilder` 的 `rounded` / `border` / `shadow` 同样接受 `LogicalPx`。
+- `ui_kit`、widgets、examples 的 `style.inner.size = Dimension::length(...)` 全部迁移到 `StyleBuilder` 或 `Style` 的 typed setter。
+- `PaintSpec`、`Border`、`ShadowSpec`、`FocusRing` 的像素字段全部 `LogicalPx`。
+
+### 5.5 widgets / profile_ui / gallery
+
+- `widgets/**`：所有 `App::text_scale()` 缓存键、`ShapedTextHandle::scale()`、`Canvas::push_shaped_text` 迁移到 `Canvas::push_text` + 逻辑文本；文本缓存键不再包含 `text_scale`。
+- `widgets/x`、`profile_ui`：`insert_owned_svg_for_display` / `insert_owned_at_size` 改为 `App` 逻辑资源 API；`profile_ui` 的 Dicebear 头像改为引擎 SVG 资源（`App::insert_svg_async_for_window`，逻辑尺寸 `56×56`），删除 `rasterize_avatar_svg` 与 `image` / `resvg` / `usvg` 三个依赖。
+- `ui_kit/examples/gallery`：删除 `window.scale()` 的状态行；`Event::DpiChanged` 分支只读 `dpi`。
+- `kytrix` 外壳的 `WindowOptions` 不再传 scale；平台事件自动决定。
+
+### 5.6 测试迁移
+
+- `ui_kit::toggle` 的物理像素断言全部删除，改为：
+  - 逻辑 `LayoutOverride` 几何断言（`Rect<LogicalPx>`）；
+  - `ui_core` 的 `FrameRecord`/`PhysicalFrameRecord` 断言（物理边界为整数、尺寸正确）；
+  - 1.25/1.5/2.0 的像素快照或 quad 记录断言。
+- `ui_kit::brand` / `icon` 的 `scale` 测试迁移到 `ui_core::resources` 的变体测试；ui_kit 只断言逻辑尺寸和资源存在。
+- `ui_core` 增加 DPI 不改变 layout 的测试、Quad/Image/Clip 物理边界测试、Canvas 文本 DPI 重光栅测试。
+
+## 6. 像素吸附规则
+
+采用 WebKit `pixelSnappedIntRect` 作为统一规则：
+
+```text
+给定逻辑矩形 L 和 DPR s：
+P = L × s                          // PhysicalPx，连续
+x  = round(P.x)
+y  = round(P.y)
+x1 = round(P.x + P.width)
+y1 = round(P.y + P.height)
+DeviceRect = (x, y, x1, y1)
+```
+
+- 左/上边 round，右/下边由完整右/下坐标 round 后相减得到；不单独 round 宽高。这样相邻元素的共享边界会落在同一物理像素上，不会产生缝隙。
+- `Quad` 的背景、渐变、边框、焦点环都使用该规则；边框宽度再用 `stroke_width` 取整且至少 1 物理像素。
+- `Image` / `Glyph` 使用同一规则；文本位图自身已经是整数物理像素。
+- `Clip` / `Damage` 使用 `floor` 左上、`ceil` 右下的外扩规则，保证不裁掉内容。
+- `Shadow` / `Path` / `Geometry` 不吸附顶点；阴影模糊和几何抗锯齿保持连续。
+- 圆角半径按 `radius × dpr` 保持 `PhysicalPx`，不强制整数；极小半径由 `normalize_corner_radius` 按外框尺寸 clamp。
+- 物理跨度 <1 物理像素、整块经 round 退化为空的填充/渐变 `Quad` 不绘制；边框在正常尺寸 Quad 上由 `stroke_width` 保底 ≥1 物理像素。
+- 边框宽度先按 `stroke_width` 取整且至少 1 物理像素，再 clamp 到 `min(宽, 高)`：短边 1 物理像素的 Quad 上边框宽度 clamp 到短边（内盒归零），shader 不会反转内边界；中心线仍按 AA 计算约 50% alpha。
+- 小数 DPI 下轴对齐矩形最多产生 1 物理像素的尺寸/位置偏差，这是 CSS/WebKit 的既定取舍；不以此为由在 `ui_kit` 内做设备空间补偿。
+- 圆角 clip 的矩形按 floor/ceil 外扩，其 AA 边在分数 DPI 下最多外移 1 物理像素（矩形 clip 无此偏差）。
+
+## 7. 迁移计划
+
+按“行为先行、类型后行”落地：先让行为契约正确（布局纯逻辑、paint 单一换算、吸附规则统一），golden 只重基一次；再做单位类型迁移，此时必须证明像素零 diff。
+
+每一步都以编译器和测试为门禁；不在中间状态保留旧 API 兼容层。
+
+### 阶段 A：行为重构（`f32` 类型不变）
+
+**A1 布局纯逻辑 + paint 吸附 + damage/shadow pad 物理化**
+
+- 删除 `NodeTree.device_scale` / `raw_origins` / `set_device_scale`。
+- 删除 `place_subtree` 的 `committed` / `snap_to_device` / `layout_override` 特判；`LayoutOverride` 统一相对父节点的未吸附 `abs.origin`。
+- `Window::set_scale` 只做 DPR / 全量 damage / 文本 dirty / a11y 通知 / surface 尺寸，不再 `invalidate_layout`。
+- `InstanceEncoder`：Quad 改 `pixelSnappedIntRect`、边框 `stroke_width`、Image/Glyph 逐边 round、Clip/Damage 外扩、Shadow/Path/Geometry 不吸附。
+- `DamageAccumulator` 只接受物理输入（`DeviceRect` + `PhysicalPx` AA pad）；shadow pad 全部在物理空间计算。
+- 重写 layout/DPI 测试；新增 §8.1 的物理边界测试。
+- 收口门禁：`cargo check --workspace --all-targets`、`cargo test -p ui_core --lib`、`cargo test -p ui_kit --lib`。
+
+**A2 Golden 重基（三端）**
+
+- 逐图确认并说明预期变化区域。矩形 clip 预期**零变化**（实测逐像素一致）；变化区是圆角 clip 与文本/布局派生几何。零变化结论必须以 `Tolerance::EXACT` 或逐图 diff 验证——默认容差不足以证明零变化。
+- 收口门禁：`cargo test -p ui_core --features test-support --test snapshot`（三端）。
+
+**A3 `ui_kit::Toggle` 去 DPI**
+
+- 删除 `window_scale` / `device_length` / `device_length_with_parity` / 设备空间 `sync_*`。
+- 4 个 DPI 测试改写为逻辑几何断言。
+
+### 阶段 B：Style 收口
+
+**B1 `StyleBuilder` / `PaintBuilder` 迁入 `ui_core::paint::style`**
+
+- 补齐 typed setter（`display` / `align_self` / 百分比尺寸 / `min_size` / `max_size` / `overflow` / `inset`）。
+- `Style.inner` 降 `pub(crate)`；迁移 `ui_core` 内全部字面量与 taffy 直写。
+
+**B2 下游迁移**
+
+- `ui_kit` / `widgets` / `*_ui` / `kytrix` 全部迁到 `ui_core` 的 builder 与 typed setter；删除下游 `taffy` 依赖。
+
+### 阶段 C：单位类型
+
+**C1 `ui_core` 单位层**
+
+- 新增 `LogicalPx` / `PhysicalPx` / `DevicePx` / `DevicePixelRatio` / `Point<T>` / `Size<T>` / `Rect<T>` / `Edges<T>` / `DeviceRect`。
+- 删除非泛型 `Point/Size/Rect`、`Scale`、`to_physical_*`、`snap_to_device`、`snap_stroke_width`、`PhysicalBounds`。
+- 全部几何字段单位化；`#[repr(C)]` 与 `size_of` 基线逐条复核。
+- 收口门禁：`cargo check -p ui_core --all-features --all-targets`、`cargo test -p ui_core --lib`、golden 零 diff（证明类型迁移无行为变化）。
+
+**C2 下游单位类型迁移**
+
+- 按 crate 逐个迁移，每个 crate 收口自己的 `cargo test -p <crate>`。
+
+### 阶段 D：资源逻辑 API
+
+**D1 引擎侧**
+
+- `ResourceCache` scale 方法降 `pub(crate)`；`App::resources_mut` 收口。
+- 新增 `App::insert_{svg,bitmap,svg_async,bitmap_async}_for_window`。
+- `ResourceImage` 字段私有 + `logical_size()`。
+- 修异步资源 owner 登记。
+
+**D2 应用侧**
+
+- `Brand` / `Icon` / `Interactive` / `Menu` / `AssetImages` / `widgets/x` 迁逻辑 API。
+- `Menu::IconCache` 删除。
+- `profile_ui` Dicebear 走引擎 SVG 资源，删 `image` / `resvg` / `usvg`。
+
+### 阶段 E：Canvas 文本
+
+**E1 引擎侧**
+
+- `Canvas::push_text(TextContent, origin)` + `Primitive::Text(Arc<CanvasText>)`。
+- `Window::canvas_text` 解析表 + `App::resolve_canvas_text(window)`（在 `upload_atlas_pages` 之前）。
+- `PaintPass` 做配方 → `GlyphRun` 替换。
+- 删除 `App::shape_text` / `text_scale` / `set_text_scale` / `clear_text_scale_override` / `shaped_inline_boxes`、`ShapedTextHandle`、`Canvas::push_shaped_text`、`without_stale_glyph_runs`、`stale_canvas_runs`、`note_stale_canvas_followup`、`TextDiagnostic::CanvasTextStale`、`EngineError::InvalidTextScale`。
+
+**E2 widgets 迁移**
+
+- 7 个图表 widget 与 `widget` crate 迁 `push_text`；删除 `ChartTextCache.scale` 等 DPI 失效判据。
+
+### 阶段 F：DPI 公开面收口
+
+- 删除 `Window::{scale, set_scale, scale_epoch}` 公开面、`WindowOptions.scale`、`Event::DpiChanged.scale`、`App::{note_window_dpi, default_text_scale, text_scale_override}`。
+- 平台层内部化 DPR；新增 test-support 的 `TestApp::with_scale` / `TestApp::set_dpr` / `SnapshotCase.scale`。
+- `ui_core` examples 加 `required-features`，物理观测收敛到 test-support 面。
+- 全仓 grep 旧 API 为 0。
+
+### 阶段 G：验收
+
+- `cargo +nightly fmt --all -- --check`
+- `cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace`
+- `cargo test -p ui_core --features test-support --test snapshot`（按新基线）
+- `cargo test -p ui_core --features test-support --test gui_smoke -- --ignored`
+- `acceptance -- cpu` 文本帧阈值记为既有缺陷，不作为本轮门禁。
+
+## 8. 测试与验收
+
+### 8.1 必须新增的测试
+
+| 测试 | 断言 |
+|---|---|
+| `layout_is_identical_at_every_device_scale` | 同一棵树在 1/1.25/1.5/1.75/2/3 下 `LayoutBox.bounds` 逐位相同 |
+| `quads_snap_to_device_pixels` | 1.25/1.5 下 Quad 的物理 `x/y/x1/y1` 全为整数，且比未吸附版本最多差 1 物理像素 |
+| `image_and_quad_share_physical_edges` | 同一逻辑矩形上的 Image 与 Quad 物理边界一致 |
+| `borders_are_integer_device_pixels` | 1/1.25/1.5/2/3 下边框宽度为整数物理像素且 ≥1 |
+| `damage_covers_the_unsnapped_rect` | Damage 使用外扩规则，覆盖 Quad 未吸附/吸附后的所有边界 |
+| `dpi_change_does_not_invalidate_layout` | `set_scale` 后根没有 LAYOUT 脏位，layout bounds 不变 |
+| `dpi_change_rerasterizes_text_only` | 文本 tile 换代但文本布局宽度不变 |
+| `canvas_text_does_not_rebuild_on_dpi_change` | 同一 `Arc<Canvas>` 在 DPI 变化后仍可绘制，文本按新 DPR 重光栅（阶段 A4/E1 落地） |
+| `ui_kit_has_no_device_scale_dependency` | grep 门禁（见 §8.3）（阶段 A4/E1 落地） |
+| `toggle_logical_geometry_is_stable_at_every_dpi` | Toggle 的 layout override 逻辑几何与 DPI 无关（阶段 A4/E1 落地） |
+
+`SnapshotCase.scale` / `TestApp::with_scale` / `TestApp::set_dpr` 只作为 test-support 的 DPR 注入入口保留，不进入生产公开 API。
+
+### 8.2 视觉验收
+
+- 1× / 1.25× / 1.5× / 1.75× / 2× / 3× 六档 DPI。
+- 逐项检查：1px 边框、分隔线、输入框 caret、Toggle 开关/复选/单选、ScrollBar thumb、TabBar indicator、Progress、图标。
+- 比较同一 UI 在 1.25/1.5 下的物理像素截图：边界应落在整数设备像素上；除字符/图形 AA 外不允许 1px 缝或双线。
+- 圆角 clip 在分数 DPI 下 AA 边最多外移 1 物理像素（矩形 clip 零偏差），该处需人工验收确认不影响圆角容器边缘观感。
+- Golden 基线变更必须逐图说明预期变化区域；不允许只“bless 掉”差异。
+- macOS 无屏幕录制 TCC 授权、Linux 无 compositor，三端真窗口截图不可用；像素证据由三端 golden 与 Windows 真窗口人工验收承担。
+
+### 8.3 静态门禁
+
+```powershell
+Select-String -Path crates/ui_kit/src/**,crates/widgets/**,crates/profile_ui/src/** -Pattern 'Window::scale|\.scale\(\)\.factor|device_length|device_length_with_parity|text_scale|shape_text|push_shaped_text'
+Select-String -Path crates/ui_core/src/**,crates/ui_kit/src/** -Pattern 'snap_to_device|to_physical_f32|to_physical_rounded|to_physical_covering|snap_stroke_width'
+```
+
+两个门禁在阶段 F 后都必须是 0（测试代码里的纯逻辑 scale 常量除外，需明确白名单）。
+
+### 8.4 现有测试基线
+
+- `cargo test -p ui_core --lib --features hud,test-support`：2323 passed / 1 ignored。
+- `cargo test -p ui_kit --lib`：772 passed。
+- `cargo test -p ui_core --features test-support --test snapshot`：11 passed（WARP 14 张 golden）。
+- `gui_smoke --ignored`：6 场景 PASS（WARP）。
+- `acceptance -- cpu`：**既有缺陷**，文本帧 p99 ≈ 5.9–7.0 ms > 4 ms 阈值；与本轮重构无关。
+- Golden 数量与三端目标保持不变（42 张）。
+
+## 9. 风险与取舍
+
+1. **迁移面大**：ui_core 中几何 token 约 4.2k 处（含测试），ui_kit 约 0.94k 处，widgets 约 1.8k 处。采用一次性类型迁移，编译器可发现绝大多数问题；禁止用 `as f32` 静默绕过。
+2. **Golden 会变**：布局不再吸附、Quad 改为 paint 吸附必然产生像素基线变化。行为阶段收口时一次性重基并逐图确认。
+3. **文本改造风险最高**：`Canvas::push_text` 改的是帧内阶段顺序（新增 `resolve_canvas_text` 在 `upload_atlas_pages` 之前），影响文本缓存、图集淘汰、IME/caret 路径；必须单独一批实现和回归。
+4. **`Style.inner` 私有化的迁移成本**：实测 `style.inner` 写入点 274 处（ui_core 166 / ui_kit 100 / widgets 4 / market_participants_ui 4），其中约 30 处是非长度字段（`display` / `align_self` / 百分比尺寸），必须在阶段 B1 一并补齐 typed setter。
+5. **性能**：单位类型全部 `#[repr(transparent)]`，零运行时开销；`Canvas::push_text` 每帧按 key 命中跳过，目标不高于当前 `shape_text` 稳态成本。
+6. **小数 DPI 的对称性**：不保证 Toggle 等装饰形状绝对对称；这是 WebKit/CSS 的既定取舍。若产品验收要求严格对称，应使用 4 的倍数逻辑尺寸或另立“设备对齐组”设计，不应回到组件内 DPI 计算。
+7. **examples 依赖 DPI 做证据**：`frameless_smoke` / `p1_win_placement_evidence` / `acceptance/windowed` 需要 `Window::scale`，删除公开面后改为 `required-features = ["test-support"]` + test-support 物理观测面。
+
+## 10. 参考资料
+
+- Chromium Blink Coordinate Spaces: https://www.chromium.org/developers/design-documents/blink-coordinate-spaces/
+- WebKit LayoutUnit 与 pixelSnappedIntRect: https://trac.webkit.org/wiki/LayoutUnit
+- Qt High DPI（device-independent pixels / QPainter / QImage DPR）: https://doc.qt.io/qt-6.8/highdpi.html
+- GPUI geometry（Pixels / ScaledPixels / DevicePixels）: https://github.com/zed-industries/zed/blob/main/crates/gpui/src/geometry.rs
+- egui tessellator（pixels_per_point / feathering）: https://github.com/emilk/egui/blob/master/crates/epaint/src/tessellator.rs
+- Flutter ViewConfiguration（physical/logical constraints、devicePixelRatio、toMatrix）: https://api.flutter.dev/flutter/rendering/ViewConfiguration-class.html
+- Flutter RenderParagraph.devicePixelRatio（DPI 变化重生成文本位图）: https://api.flutter.dev/flutter/rendering/RenderParagraph/devicePixelRatio.html
