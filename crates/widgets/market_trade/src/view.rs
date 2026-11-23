@@ -4,7 +4,6 @@ use app_config::{
     settings::Config,
     widget::{WidgetConfig, WidgetConfigSchemaVersion},
 };
-use base_ui::{kit::table::Table, style_builder::StyleBuilder, theme::handle::ThemeHandle};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use instrument_selector_ui::{
     host::SelectorHost,
@@ -26,6 +25,7 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     window::WindowId,
 };
+use ui_kit::{kit::table::Table, style_builder::StyleBuilder, theme::handle::ThemeHandle};
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
     category::WidgetCategory,

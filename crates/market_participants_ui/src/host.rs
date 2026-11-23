@@ -1,14 +1,14 @@
 use std::{fmt, rc::Rc, sync::Arc};
 
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
 use futures::future::BoxFuture;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::connector::{MarketParticipantsConnector, VenueLoadError};
 use market_participants_model::identifier::VenueId;
 use ui_core::app::App;
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
+};
 use widget::services::WidgetServices;
 
 pub trait VenueDirectory: Send + Sync + 'static {

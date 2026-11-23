@@ -1,17 +1,6 @@
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        select::{Select, SelectItem, SelectOptions},
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
@@ -23,6 +12,17 @@ use ui_core::{
     paint::style::StylePatch,
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        select::{Select, SelectItem, SelectOptions},
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, WidgetBinding, WidgetRpcResult},
@@ -1128,8 +1128,8 @@ impl CryptocurrencyEtfWidget {
             .placeholder(placeholder);
         let window = cx.window();
         let key = cx.unique_key(key_suffix);
-        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
-        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
+        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
             move |app, chosen| {
                 hand_over_select(requests, kind, window, app, &chosen);

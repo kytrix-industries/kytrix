@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
-use base_ui::theme::appearance::Appearance;
 use ui_core::paint::color::Color;
+use ui_kit::theme::appearance::Appearance;
 
 pub(super) const SHIP_TYPES: [ShipType; 20] = [
     ShipType::Tanker,

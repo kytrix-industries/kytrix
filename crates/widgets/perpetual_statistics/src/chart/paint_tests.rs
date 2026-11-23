@@ -316,11 +316,11 @@ fn the_line_mesh_should_skip_a_repeated_point() {
 #[test]
 fn every_series_should_be_read_in_a_role_of_its_own() {
     let roles = [
-        (Series::Amount, base_ui::theme::role::Role::ChartSeries0),
-        (Series::Value, base_ui::theme::role::Role::ChartSeries1),
-        (Series::Long, base_ui::theme::role::Role::MarketUp),
-        (Series::Short, base_ui::theme::role::Role::MarketDown),
-        (Series::Ratio, base_ui::theme::role::Role::FgDefault),
+        (Series::Amount, ui_kit::theme::role::Role::ChartSeries0),
+        (Series::Value, ui_kit::theme::role::Role::ChartSeries1),
+        (Series::Long, ui_kit::theme::role::Role::MarketUp),
+        (Series::Short, ui_kit::theme::role::Role::MarketDown),
+        (Series::Ratio, ui_kit::theme::role::Role::FgDefault),
     ];
     let mut seen = Vec::new();
     for (series, role) in roles {
@@ -328,17 +328,17 @@ fn every_series_should_be_read_in_a_role_of_its_own() {
         assert!(!seen.contains(&role), "{series:?} names a role of its own");
         seen.push(role);
     }
-    let theme = base_ui::theme::resolved::Theme::of(base_ui::theme::appearance::Appearance::Light);
+    let theme = ui_kit::theme::resolved::Theme::of(ui_kit::theme::appearance::Appearance::Light);
     assert_eq!(
         Series::Long.color(&theme),
-        theme.role(base_ui::theme::role::Role::MarketUp),
+        theme.role(ui_kit::theme::role::Role::MarketUp),
         "a series is drawn in the colour its role resolves to"
     );
 }
 
 #[test]
 fn a_tooltip_should_be_sized_from_the_component_ladder() {
-    let theme = base_ui::theme::resolved::Theme::of(base_ui::theme::appearance::Appearance::Light);
+    let theme = ui_kit::theme::resolved::Theme::of(ui_kit::theme::appearance::Appearance::Light);
     let style = tooltip_style(theme.tokens());
 
     assert_eq!(style.font_size, theme.tokens().small.font_size);

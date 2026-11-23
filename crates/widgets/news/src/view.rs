@@ -1,7 +1,18 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+use kytrix_service_provider::auth::constants::ACCOUNT_ORIGIN;
+use serde::{Deserialize, Serialize};
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    a11y::A11yPatch,
+    error::EngineError,
+    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
+    paint::style::StylePatch,
+    text::{TextOverflow, TextStyle},
+};
+use ui_kit::{
     kit::{
         badge::Badge,
         button::Button,
@@ -13,17 +24,6 @@ use base_ui::{
     },
     style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
-};
-use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
-use kytrix_service_provider::auth::constants::ACCOUNT_ORIGIN;
-use serde::{Deserialize, Serialize};
-use smol_str::{SmolStr, format_smolstr};
-use ui_core::{
-    a11y::A11yPatch,
-    error::EngineError,
-    node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
-    text::{TextOverflow, TextStyle},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding},
@@ -1006,11 +1006,11 @@ mod tests {
         time_zone::DataTimeZone,
         widget::{VersionedWidgetConfig, decode_or_default},
     };
-    use base_ui::theme::appearance::Appearance;
     use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use network::transport::error::TransportError;
     use ui_core::event::ActionSource;
+    use ui_kit::theme::appearance::Appearance;
     use widget::{protocol::RequestId, test_support::WidgetTestApp};
 
     use super::*;

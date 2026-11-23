@@ -1,9 +1,5 @@
 use std::rc::Rc;
 
-use base_ui::kit::{
-    button::Button,
-    size::{UnifiedSizable, UnifiedSize},
-};
 use i18n::translate::Translate;
 use market_participants_connector::catalog::store::Catalog;
 use market_participants_model::{
@@ -11,6 +7,10 @@ use market_participants_model::{
 };
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
+use ui_kit::kit::{
+    button::Button,
+    size::{UnifiedSizable, UnifiedSize},
+};
 use widget::{
     error::{ListingErrorPresentation, TranslatedError},
     venue::{VenueDisplay as _, route_display_string},

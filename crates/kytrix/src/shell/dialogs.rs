@@ -1,19 +1,19 @@
 use std::rc::Rc;
 
-use base_ui::{
-    kit::{
-        alert::AlertBuilder,
-        dialog::{Dialog, DialogBuilder},
-        input::{self, InputSpec, InputState},
-    },
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
     event::Event,
     node::signal::{Signal, SignalScope},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        alert::AlertBuilder,
+        dialog::{Dialog, DialogBuilder},
+        input::{self, InputSpec, InputState},
+    },
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 
 use super::ui;

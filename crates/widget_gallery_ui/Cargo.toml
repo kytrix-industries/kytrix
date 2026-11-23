@@ -5,7 +5,7 @@ publish.workspace = true
 edition.workspace = true
 
 [dependencies]
-base_ui = { workspace = true }
+ui_kit = { workspace = true }
 i18n = { workspace = true }
 log = { workspace = true }
 smol_str = { workspace = true }

@@ -5,22 +5,6 @@ use std::{
 };
 
 use ahash::{HashSet, HashSetExt};
-use base_ui::{
-    kit::{
-        button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
-        empty_state::EmptyState,
-        input::{self, InputNode, InputSpec, InputState},
-        list::{List, ListOptions},
-        overlay::OverlayError,
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-        spinner::Spinner,
-        tree::{Tree, TreeItem, TreeOptions},
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::engine::{FinancialIndexTopic, KytrixServiceError};
 use smol_str::{SmolStr, format_smolstr};
@@ -38,6 +22,22 @@ use ui_core::{
     paint::{primitive::Border, style::StylePatch},
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogError},
+        empty_state::EmptyState,
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions},
+        overlay::OverlayError,
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+        tree::{Tree, TreeItem, TreeOptions},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, WidgetBinding},
@@ -1486,7 +1486,6 @@ mod tests {
     };
 
     use ahash::{HashSet, HashSetExt};
-    use base_ui::kit::{button::Button, dialog::Dialog, input::InputNode, list::List, tree::Tree};
     use i18n::language::codes::LanguageCode;
     use kytrix_proto::types::v1 as proto_types;
     use kytrix_service_provider::service::engine::FinancialIndexTopic;
@@ -1497,6 +1496,7 @@ mod tests {
         node::id::NodeId,
         test_support::diagnostics::signal_slot_stats,
     };
+    use ui_kit::kit::{button::Button, dialog::Dialog, input::InputNode, list::List, tree::Tree};
     use widget::{cx::WidgetCx, test_support::WidgetTestApp};
 
     use super::*;
@@ -2574,8 +2574,8 @@ mod tests {
         let (mut selector, _) = selector(&mut harness, source, &[]);
         sync(&mut harness, &mut selector);
         let filter = input(&selector);
-        let click = Action::Custom(format_smolstr!("base_ui.input.{}.click", filter.spec.name));
-        let drag = Action::Custom(format_smolstr!("base_ui.input.{}.drag", filter.spec.name));
+        let click = Action::Custom(format_smolstr!("ui_kit.input.{}.click", filter.spec.name));
+        let drag = Action::Custom(format_smolstr!("ui_kit.input.{}.drag", filter.spec.name));
         assert!(
             harness.app().has_action_handler(&click),
             "the filter registers its click"

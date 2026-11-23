@@ -1,12 +1,3 @@
-use base_ui::{
-    kit::{
-        button::Button,
-        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
-        toggle::Toggle,
-    },
-    style_builder::StyleBuilder,
-    theme::role::Role,
-};
 use i18n::language::codes::LanguageCode;
 use ui_core::{
     error::EngineError,
@@ -19,6 +10,15 @@ use ui_core::{
         signal::{Signal, SignalScope},
     },
     paint::{color::Color, style::StylePatch},
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
+        toggle::Toggle,
+    },
+    style_builder::StyleBuilder,
+    theme::role::Role,
 };
 use widget::cx::WidgetCx;
 

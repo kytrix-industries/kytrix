@@ -6,7 +6,27 @@ use std::{
     time::Duration,
 };
 
-use base_ui::{
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::{App, Application},
+    event::{Action, ActionSource, Event, InputEvent},
+    interaction::ScrollConfig,
+    math::{Point, Rect, Size},
+    node::{
+        builder::NodeBuilder,
+        id::NodeId,
+        signal::Signal,
+        tree::{NodeKind, NodeTree},
+    },
+    paint::{
+        color::{Color, ColorResolver},
+        primitive::Border,
+        style::{PaintSpec, Style, StylePatch},
+    },
+    text::{TextStyle, TextWrap},
+    window::{WindowId, WindowOptions},
+};
+use ui_kit::{
     kit::{
         alert::AlertBuilder,
         badge::Badge,
@@ -38,26 +58,6 @@ use base_ui::{
     },
     style_builder::{PaintBuilder, StyleBuilder},
     theme::{appearance::Appearance, components::ControlSize, handle::ThemeHandle, role::Role},
-};
-use smol_str::{SmolStr, format_smolstr};
-use ui_core::{
-    app::{App, Application},
-    event::{Action, ActionSource, Event, InputEvent},
-    interaction::ScrollConfig,
-    math::{Point, Rect, Size},
-    node::{
-        builder::NodeBuilder,
-        id::NodeId,
-        signal::Signal,
-        tree::{NodeKind, NodeTree},
-    },
-    paint::{
-        color::{Color, ColorResolver},
-        primitive::Border,
-        style::{PaintSpec, Style, StylePatch},
-    },
-    text::{TextStyle, TextWrap},
-    window::{WindowId, WindowOptions},
 };
 
 const WINDOW_W: f32 = 1200.0;
@@ -508,7 +508,7 @@ impl Gallery {
         let muted = initial.role(Role::FgMuted);
 
         let window = app.create_window(WindowOptions {
-            title: SmolStr::new_static("Kytrix · base_ui kit gallery (P2-6b)"),
+            title: SmolStr::new_static("Kytrix · ui_kit kit gallery (P2-6b)"),
             size: Size::new(WINDOW_W, WINDOW_H),
             background: canvas,
             ..WindowOptions::default()
@@ -544,7 +544,7 @@ impl Gallery {
             app,
             window,
             header,
-            "Kytrix · base_ui kit gallery",
+            "Kytrix · ui_kit kit gallery",
             18.0,
             700,
             Role::FgDefault,

@@ -4,10 +4,6 @@ use std::{
     time::Duration,
 };
 
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
 use futures::{
     future::BoxFuture,
     task::{Context as TaskContext, noop_waker},
@@ -23,6 +19,10 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::{appearance::Appearance, handle::ThemeHandle},
 };
 use widget::{frame::FrameRouter, services::WidgetServices};
 
@@ -355,7 +355,7 @@ impl Harness {
         self.drain();
     }
 
-    pub(crate) fn click_button(&mut self, button: &base_ui::kit::button::Button) {
+    pub(crate) fn click_button(&mut self, button: &ui_kit::kit::button::Button) {
         let node = button.node().expect("the button is built");
         self.click(node);
     }

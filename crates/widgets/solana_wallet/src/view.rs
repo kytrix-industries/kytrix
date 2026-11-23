@@ -1,17 +1,6 @@
 use std::sync::Arc;
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        icon::IconKind,
-        list::{List, ListOptions, SelectionMode},
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     engine::KytrixServiceError,
@@ -28,6 +17,17 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::{TextOverflow, TextStyle},
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::IconKind,
+        list::{List, ListOptions, SelectionMode},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -1325,13 +1325,13 @@ mod tests {
         time_zone::DataTimeZone,
         widget::{VersionedWidgetConfig, decode_or_default},
     };
-    use base_ui::kit::button::Button;
     use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
     use kytrix_service_provider::service::solana_wallet::{
         SolanaWalletMutationOutcome, SolanaWalletSelection,
     };
     use network::transport::error::TransportError;
     use ui_core::event::{Action, ActionSource};
+    use ui_kit::kit::button::Button;
     use widget::{protocol::RequestId, test_support::WidgetTestApp};
 
     use super::*;

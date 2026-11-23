@@ -1,7 +1,6 @@
 use std::{cell::Cell, rc::Rc};
 
 use app_config::settings::{AccountConfig, AccountWalletKind, Config};
-use base_ui::style_builder::StyleBuilder;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use ui_core::{
@@ -9,6 +8,7 @@ use ui_core::{
     math::Point,
     node::{builder::NodeBuilder, id::NodeId},
 };
+use ui_kit::style_builder::StyleBuilder;
 use widget::{
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     test_support::WidgetTestApp,

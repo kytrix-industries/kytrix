@@ -1,19 +1,5 @@
 use std::{cell::RefCell, rc::Rc};
 
-use base_ui::{
-    kit::{
-        alert::AlertBuilder,
-        dialog::{Dialog, DialogBuilder},
-        input::{self, InputNode, InputSpec, InputState},
-        list::{List, ListOptions},
-        scroll_bar::ScrollBar,
-    },
-    style_builder::StyleBuilder,
-    theme::{
-        appearance::Appearance as ThemeAppearance, components::ControlSize, handle::ThemeHandle,
-        role::Role,
-    },
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -26,6 +12,20 @@ use ui_core::{
     paint::style::{PaintSpec, StylePatch},
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        alert::AlertBuilder,
+        dialog::{Dialog, DialogBuilder},
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions},
+        scroll_bar::ScrollBar,
+    },
+    style_builder::StyleBuilder,
+    theme::{
+        appearance::Appearance as ThemeAppearance, components::ControlSize, handle::ThemeHandle,
+        role::Role,
+    },
 };
 
 use crate::{

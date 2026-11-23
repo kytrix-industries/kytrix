@@ -6,7 +6,6 @@ use std::{
 };
 
 use app_config::{time_zone::DataTimeZone, widget::VersionedWidgetConfig};
-use base_ui::theme::{appearance::Appearance, role::Role};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use instrument_selector_ui::instrument_selector::offers_route;
 use market_participants_connector::{
@@ -40,6 +39,7 @@ use ui_core::{
     paint::color::Color,
     test_support::diagnostics::signal_slot_stats,
 };
+use ui_kit::theme::{appearance::Appearance, role::Role};
 use widget::{
     cx::WidgetCx, error::TranslatedError, protocol::RequestId, rpc::RpcCallError,
     test_support::WidgetTestApp, view::WidgetView,

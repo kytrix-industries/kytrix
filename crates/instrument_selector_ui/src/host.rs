@@ -1,14 +1,14 @@
 use std::{rc::Rc, sync::Arc};
 
 use app_config::settings::Config;
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::catalog::store::Catalog;
 use time::UtcOffset;
 use ui_core::app::App;
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
+};
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::prediction_translation::LocalTranslator;

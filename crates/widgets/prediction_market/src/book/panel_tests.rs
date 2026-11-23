@@ -1,10 +1,5 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
-use base_ui::{
-    kit::motion::DEPTH_ANIMATION_RESPONSE_PER_SECOND,
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, role::Role},
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_model::{
     decimal::Fraction,
@@ -16,6 +11,11 @@ use ui_core::{
     interaction::ItemAlign,
     node::{builder::NodeBuilder, id::NodeId},
     test_support::record::PrimitiveKind,
+};
+use ui_kit::{
+    kit::motion::DEPTH_ANIMATION_RESPONSE_PER_SECOND,
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, role::Role},
 };
 use widget::test_support::{CanvasPrimitive, WidgetTestApp};
 

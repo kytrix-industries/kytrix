@@ -512,7 +512,7 @@ pub(super) fn frame_meshes(
 
 #[cfg(test)]
 mod tests {
-    use base_ui::theme::{appearance::Appearance, resolved::Theme};
+    use ui_kit::theme::{appearance::Appearance, resolved::Theme};
 
     use super::*;
     use crate::{

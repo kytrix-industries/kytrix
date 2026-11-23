@@ -1,4 +1,3 @@
-use base_ui::theme::{resolved::Theme, role::Role};
 use bytes::Bytes;
 use ui_core::{
     app::App,
@@ -11,6 +10,7 @@ use ui_core::{
     },
     text::TextStyle,
 };
+use ui_kit::theme::{resolved::Theme, role::Role};
 
 use super::{
     axes::{

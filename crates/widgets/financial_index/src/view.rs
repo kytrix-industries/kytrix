@@ -7,17 +7,6 @@ use std::{
 
 use ahash::{HashMap, HashMapExt};
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        list::{List, ListOptions, SelectionMode},
-        size::UnifiedSizable,
-        table::{Column, ColumnAlign, Table, TableOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     connector::KytrixServiceConnector,
@@ -32,6 +21,17 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::{primitive::Border, style::StylePatch},
     text::{TextAlign, TextOverflow, TextStyle, TextWrap},
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        list::{List, ListOptions, SelectionMode},
+        size::UnifiedSizable,
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

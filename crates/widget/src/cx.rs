@@ -1,10 +1,6 @@
 use std::rc::Rc;
 
 use app_config::settings::Config;
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use tokio::runtime::Handle;
@@ -18,6 +14,10 @@ use ui_core::{
         tree::NodeTree,
     },
     window::WindowId,
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
 };
 
 use super::{frame::FrameRouter, services::WidgetServices};
@@ -196,7 +196,6 @@ mod tests {
     use std::rc::Rc;
 
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
-    use base_ui::kit::button::Button;
     use smol_str::format_smolstr;
     use ui_core::{
         event::Action,
@@ -204,6 +203,7 @@ mod tests {
         node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
         paint::canvas::Canvas,
     };
+    use ui_kit::kit::button::Button;
 
     use crate::{cx::WidgetCx, test_support::WidgetTestApp};
 

@@ -9,11 +9,11 @@ use app_config::{
     settings::Language,
 };
 use app_config_provider::store::ConfigPersistenceError;
-use base_ui::kit::size::UnifiedSize;
 use i18n::language::codes::LanguageCode;
 use market_participants_model::identifier::VenueId;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::event::{Action, KeyCode};
+use ui_kit::kit::size::UnifiedSize;
 
 use crate::{
     pages::venues::credentials::{

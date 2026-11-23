@@ -685,23 +685,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "base_ui"
-version = "0.0.3"
-dependencies = [
- "ahash",
- "bytes",
- "color",
- "comrak",
- "image",
- "resvg",
- "smol_str",
- "taffy",
- "tokio",
- "ui_core",
- "usvg",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.73.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1092,7 +1075,6 @@ version = "0.0.3"
 dependencies = [
  "app_config",
  "app_config_provider",
- "base_ui",
  "futures",
  "i18n",
  "instrument_selector_ui",
@@ -1108,6 +1090,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -1309,7 +1292,6 @@ name = "coin_market_cap_fear_and_greed_index"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "bytes",
  "i18n",
  "kytrix_proto",
@@ -1320,6 +1302,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -1651,7 +1634,6 @@ name = "cryptocurrency_etf"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "bytes",
  "i18n",
  "kytrix_proto",
@@ -1663,6 +1645,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -2200,7 +2183,6 @@ name = "ethereum_wallet"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "i18n",
  "kytrix_service_provider",
  "log",
@@ -2211,6 +2193,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -2323,7 +2306,6 @@ name = "financial_calendar"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "i18n",
  "kytrix_proto",
  "kytrix_service_provider",
@@ -2334,6 +2316,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -2343,7 +2326,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "i18n",
  "kytrix_proto",
  "kytrix_service_provider",
@@ -2355,6 +2337,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -2469,7 +2452,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "market_participants_connector",
@@ -2479,6 +2461,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -2703,7 +2686,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "bytes",
  "i18n",
  "kytrix_service_provider",
@@ -2716,6 +2698,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -2978,7 +2961,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "log",
@@ -2991,6 +2973,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -3243,7 +3226,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "i18n",
  "log",
  "market_participants_connector",
@@ -3253,6 +3235,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -3572,7 +3555,6 @@ dependencies = [
  "ai_translator",
  "app_config",
  "app_config_provider",
- "base_ui",
  "bytes",
  "download_provider",
  "embed-resource",
@@ -3590,6 +3572,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "updater_ui",
  "url",
  "widget",
@@ -3877,7 +3860,6 @@ name = "market_participants_ui"
 version = "0.0.3"
 dependencies = [
  "ahash",
- "base_ui",
  "futures",
  "i18n",
  "log",
@@ -3888,6 +3870,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -3896,7 +3879,6 @@ name = "market_trade"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "instrument_selector_ui",
@@ -3909,6 +3891,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -4069,7 +4052,6 @@ name = "news"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "bytes",
  "i18n",
  "kytrix_service_provider",
@@ -4081,6 +4063,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -4622,7 +4605,6 @@ name = "order_book"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "instrument_selector_ui",
@@ -4635,6 +4617,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -4820,7 +4803,6 @@ name = "pentagon_pizza_index"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "i18n",
  "kytrix_proto",
  "kytrix_service_provider",
@@ -4831,6 +4813,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -4845,7 +4828,6 @@ name = "perpetual_statistics"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "bytes",
  "i18n",
  "instrument_selector_ui",
@@ -4859,6 +4841,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -5100,7 +5083,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "instrument_selector_ui",
@@ -5115,6 +5097,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -5201,7 +5184,6 @@ version = "0.0.3"
 dependencies = [
  "app_config",
  "base64 0.23.1",
- "base_ui",
  "bytes",
  "dicebear-core",
  "dicebear-styles",
@@ -5218,6 +5200,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "url",
  "usvg",
  "widget",
@@ -6136,7 +6119,6 @@ dependencies = [
  "ahash",
  "app_config",
  "app_config_provider",
- "base_ui",
  "download_provider",
  "i18n",
  "log",
@@ -6147,6 +6129,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "ui_core",
+ "ui_kit",
  "url",
  "widget",
 ]
@@ -6322,7 +6305,6 @@ name = "solana_wallet"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "i18n",
  "kytrix_service_provider",
  "log",
@@ -6333,6 +6315,7 @@ dependencies = [
  "time",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -6949,6 +6932,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ui_kit"
+version = "0.0.3"
+dependencies = [
+ "ahash",
+ "bytes",
+ "color",
+ "comrak",
+ "image",
+ "resvg",
+ "smol_str",
+ "taffy",
+ "tokio",
+ "ui_core",
+ "usvg",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7021,7 +7021,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "bytes",
  "cargo-packager-updater",
  "download_provider",
@@ -7042,6 +7041,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ui_core",
+ "ui_kit",
  "url",
  "widget",
 ]
@@ -7151,7 +7151,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "log",
@@ -7162,6 +7161,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -7312,7 +7312,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "futures",
  "i18n",
  "instrument_selector_ui",
@@ -7325,6 +7324,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -7430,7 +7430,6 @@ dependencies = [
  "ahash",
  "app_config",
  "app_config_provider",
- "base_ui",
  "bytes",
  "i18n",
  "kytrix_service_provider",
@@ -7446,6 +7445,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ui_core",
+ "ui_kit",
 ]
 
 [[package]]
@@ -7453,11 +7453,11 @@ name = "widget_gallery_ui"
 version = "0.0.3"
 dependencies = [
  "app_config",
- "base_ui",
  "i18n",
  "log",
  "smol_str",
  "ui_core",
+ "ui_kit",
  "widget",
 ]
 
@@ -7852,7 +7852,6 @@ version = "0.0.3"
 dependencies = [
  "ahash",
  "app_config",
- "base_ui",
  "bytes",
  "const-hex",
  "dirs 7.0.0",
@@ -7870,6 +7869,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ui_core",
+ "ui_kit",
  "url",
  "uuid",
  "widget",

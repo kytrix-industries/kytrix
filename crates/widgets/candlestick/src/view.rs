@@ -1,16 +1,6 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        select::{Select, SelectItem, SelectOptions},
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-};
 use i18n::{t_smol, translate::Translate};
 use instrument_selector_ui::{
     host::SelectorHost,
@@ -40,6 +30,16 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::style::StylePatch,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        select::{Select, SelectItem, SelectOptions},
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -1727,7 +1727,7 @@ impl CandlestickWidget {
         let mut settings = Button::new(cx.app_mut(), theme.clone(), key)
             .ghost()
             .with_unified_size(UnifiedSize::Small)
-            .icon(base_ui::kit::icon::IconKind::Faders)
+            .icon(ui_kit::kit::icon::IconKind::Faders)
             .a11y_label(label.clone())
             .tooltip_text(label)
             .selected(self.panel_open)
@@ -1766,7 +1766,7 @@ impl CandlestickWidget {
         &self,
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
-        theme: &base_ui::theme::handle::ThemeHandle,
+        theme: &ui_kit::theme::handle::ThemeHandle,
     ) -> Result<Option<Select>, EngineError> {
         let translate = cx.translate().clone();
         let offered = self.offered_adjustments();
@@ -1788,8 +1788,8 @@ impl CandlestickWidget {
         let options = SelectOptions::default()
             .size(UnifiedSize::Small)
             .placeholder(t_smol!(translate, adjustment_key(self.config.adjustment)));
-        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
-        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
+        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let select = Select::new(cx.app_mut(), theme.clone(), layer, router, key, options)
             .on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {
@@ -1817,7 +1817,7 @@ impl CandlestickWidget {
         &self,
         cx: &mut WidgetCx<'_>,
         parent: NodeId,
-        theme: &base_ui::theme::handle::ThemeHandle,
+        theme: &ui_kit::theme::handle::ThemeHandle,
     ) -> Result<Select, EngineError> {
         let translate = cx.translate().clone();
         let requests = self.requests;
@@ -1844,8 +1844,8 @@ impl CandlestickWidget {
             .size(UnifiedSize::Small)
             .label(t_smol!(translate, "widget.candlestick.timeframe"))
             .placeholder(SmolStr::new_static(self.config.timeframe.label()));
-        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
-        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
+        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let select = Select::new(cx.app_mut(), theme.clone(), layer, router, key, options)
             .on_change(move |app, chosen| {
                 let Some(id) = chosen.first() else {

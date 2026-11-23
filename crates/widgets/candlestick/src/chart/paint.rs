@@ -1,9 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::{
-    style_builder::StyleBuilder,
-    theme::{components::ChartColors, resolved::Theme, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::{
     catalog::display::catalog::DisplaySnapshot, market::timeframe::TimeFrame,
@@ -29,6 +25,10 @@ use ui_core::{
         style::StylePatch,
     },
     text::TextStyle,
+};
+use ui_kit::{
+    style_builder::StyleBuilder,
+    theme::{components::ChartColors, resolved::Theme, role::Role},
 };
 use widget::cx::WidgetCx;
 
@@ -2187,7 +2187,6 @@ impl ChartPainter<'_, '_> {
 mod tests {
     use std::{str::FromStr, sync::Arc};
 
-    use base_ui::theme::{appearance::Appearance, resolved::Theme};
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::catalog::test_support;
     use market_participants_model::{
@@ -2200,6 +2199,7 @@ mod tests {
         },
     };
     use ui_core::test_support::record::PrimitiveKind;
+    use ui_kit::theme::{appearance::Appearance, resolved::Theme};
     use widget::test_support::{CanvasPrimitive, WidgetTestApp};
 
     use super::*;

@@ -12,10 +12,6 @@ use app_config_provider::{
     notification::ConfigNotification,
     store::{ConfigPersistenceError, ConfigRecovery, ConfigStore},
 };
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
 use i18n::{embedded, translate::Translate};
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use market_participants_connector::{
@@ -30,6 +26,10 @@ use settings_ui::{
 };
 use tokio::runtime::Handle;
 use ui_core::{app::App, node::signal::Signal};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::{appearance::Appearance, handle::ThemeHandle},
+};
 use updater_ui::updater::UpdaterDeps;
 use widget::{frame::FrameRouter, services::WidgetServices};
 use widget_registry::{catalogue, registry::WidgetRegistry};

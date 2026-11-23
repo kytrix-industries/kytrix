@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use base_ui::{
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    event::Event,
+    node::signal::{Signal, SignalScope},
+};
+use ui_kit::{
     kit::{
         input::{self as kit_input, InputNode, InputSpec, InputState},
         size::UnifiedSize,
     },
     theme::handle::ThemeHandle,
-};
-use smol_str::{SmolStr, format_smolstr};
-use ui_core::{
-    event::Event,
-    node::signal::{Signal, SignalScope},
 };
 use widget::cx::WidgetCx;
 

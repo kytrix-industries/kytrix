@@ -2,16 +2,6 @@ use std::{cell::RefCell, convert::Infallible, rc::Rc, sync::Arc};
 
 use ahash::{AHashMap, AHashSet};
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        list::{List, ListOptions, SelectionMode},
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::connector::MarketParticipantsConnector;
 use market_participants_model::{
@@ -29,6 +19,16 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::{Cursor, StylePatch},
     text::{TextOverflow, TextStyle},
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        list::{List, ListOptions, SelectionMode},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

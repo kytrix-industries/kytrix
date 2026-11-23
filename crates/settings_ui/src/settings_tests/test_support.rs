@@ -10,10 +10,6 @@ use app_config::{
     network::{ProxyAuthorizationConfig, ProxyConfig},
     settings::{AccountConfig, AccountWalletKind, Config},
 };
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle},
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use ui_core::{
@@ -23,6 +19,10 @@ use ui_core::{
     node::{id::NodeId, tree::NodeKind},
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle},
 };
 use widget::{frame::FrameRouter, services::WidgetServices};
 

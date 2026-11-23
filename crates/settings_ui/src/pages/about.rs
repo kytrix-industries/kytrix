@@ -1,7 +1,7 @@
-use base_ui::{style_builder::StyleBuilder, theme::role::Role};
 use i18n::translate::Translate;
 use smol_str::SmolStr;
 use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
+use ui_kit::{style_builder::StyleBuilder, theme::role::Role};
 
 use crate::{
     host::SettingsHost,

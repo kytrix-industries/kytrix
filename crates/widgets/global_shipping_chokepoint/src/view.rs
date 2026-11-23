@@ -1,13 +1,6 @@
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        select::{Select, SelectItem, SelectOptions},
-        size::UnifiedSize,
-    },
-    style_builder::StyleBuilder,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::{
     auth::constants::ACCOUNT_ORIGIN,
@@ -26,6 +19,13 @@ use ui_core::{
     error::EngineError,
     event::{Event, InputEvent, PointerButton},
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
+};
+use ui_kit::{
+    kit::{
+        select::{Select, SelectItem, SelectOptions},
+        size::UnifiedSize,
+    },
+    style_builder::StyleBuilder,
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -716,8 +716,8 @@ impl GlobalShippingChokepointWidget {
         let translate = cx.translate().clone();
         let key = cx.unique_key(FILTER_KEY_SUFFIX);
         let theme = cx.theme().clone();
-        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
-        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
+        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let options = SelectOptions::default()
             .size(UnifiedSize::Small)
             .label(t_smol!(

@@ -1,10 +1,10 @@
-use base_ui::theme::{appearance::Appearance, resolved::Theme};
 use smol_str::SmolStr;
 use ui_core::{
     math::{Point, Rect},
     paint::geometry::{GeometryPipeline, IndexType, Topology},
     test_support::app::TestApp,
 };
+use ui_kit::theme::{appearance::Appearance, resolved::Theme};
 
 use super::{
     axes::{ChartLayout, marker_bounds, value_y},

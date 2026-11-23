@@ -1,15 +1,6 @@
 use std::{borrow::Cow, cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use ahash::HashMap;
-use base_ui::{
-    kit::{
-        list::SelectionMode,
-        markdown::{parse::parse_document, source::MarkdownAssets},
-        table::{Column, ColumnAlign, Table, TableOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::catalog::{display::catalog::DisplaySnapshot, store::Catalog};
 use market_participants_model::{
@@ -23,6 +14,15 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
+};
+use ui_kit::{
+    kit::{
+        list::SelectionMode,
+        markdown::{parse::parse_document, source::MarkdownAssets},
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     cx::WidgetCx,

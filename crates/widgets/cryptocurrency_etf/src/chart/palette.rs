@@ -1,5 +1,5 @@
-use base_ui::theme::{components::ComponentTokens, resolved::Theme};
 use ui_core::{math::Size, paint::color::Color};
+use ui_kit::theme::{components::ComponentTokens, resolved::Theme};
 
 pub(crate) const AXIS_FONT_SIZE: f32 = 10.0;
 pub(crate) const AXIS_LINE_HEIGHT: f32 = 14.0;

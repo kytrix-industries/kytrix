@@ -9,18 +9,6 @@ use app_config::{
     settings::Config,
     widget::{WidgetConfig, WidgetConfigSchemaVersion},
 };
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        list::SelectionMode,
-        select::{Select, SelectItem, SelectOptions},
-        size::{UnifiedSizable, UnifiedSize},
-        table::{Column, ColumnAlign, Table, TableOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
@@ -33,6 +21,18 @@ use ui_core::{
     paint::style::{PaintSpec, StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        list::SelectionMode,
+        select::{Select, SelectItem, SelectOptions},
+        size::{UnifiedSizable, UnifiedSize},
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -1443,7 +1443,6 @@ mod tests {
         settings::{AccountConfig, AccountWalletKind, Config},
         time_zone::DataTimeZone,
     };
-    use base_ui::theme::appearance::Appearance;
     use kytrix_proto::types::v1 as proto_types;
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use ui_core::{
@@ -1451,6 +1450,7 @@ mod tests {
         node::{builder::NodeBuilder, tree::NodeKind},
         paint::color::Color,
     };
+    use ui_kit::theme::appearance::Appearance;
     use widget::{rpc::RpcCallError, test_support::WidgetTestApp};
 
     use super::*;
@@ -2615,7 +2615,7 @@ mod tests {
         for (index, column) in table.columns().iter().enumerate() {
             assert_eq!(
                 column.width,
-                base_ui::kit::table::ColumnWidth::Flex(COLUMN_WEIGHTS[index]),
+                ui_kit::kit::table::ColumnWidth::Flex(COLUMN_WEIGHTS[index]),
                 "column {index} keeps its declared width weight"
             );
             assert_eq!(column.align, ColumnAlign::Start);
@@ -2640,7 +2640,7 @@ mod tests {
         );
         assert_eq!(
             options.row_height,
-            base_ui::kit::list::RowHeight::Fixed(30.0)
+            ui_kit::kit::list::RowHeight::Fixed(30.0)
         );
     }
 

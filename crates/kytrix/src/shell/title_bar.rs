@@ -1,8 +1,3 @@
-use base_ui::{
-    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::StyleBuilder,
-    theme::handle::ThemeHandle,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_ui::{host::MarketParticipantsHost, menu::MarketParticipants};
 use profile_ui::profile::ProfileMenu;
@@ -14,6 +9,11 @@ use ui_core::{
     math::Rect,
     node::id::NodeId,
     window::{WindowId, WindowState},
+};
+use ui_kit::{
+    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
+    style_builder::StyleBuilder,
+    theme::handle::ThemeHandle,
 };
 use updater_ui::{indicator::UpdateIndicator, updater::Updater};
 

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use base_ui::{kit::size::UnifiedSize, style_builder::StyleBuilder};
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
@@ -19,6 +18,7 @@ use ui_core::{
     },
     text::{ShapedTextHandle, TextSlant, TextStyle},
 };
+use ui_kit::{kit::size::UnifiedSize, style_builder::StyleBuilder};
 use widget::cx::WidgetCx;
 
 use crate::{
@@ -1103,12 +1103,12 @@ fn hover_values(details: &VesselDetails, translate: &Translate) -> [SmolStr; 16]
 mod tests {
     use std::rc::Rc;
 
-    use base_ui::theme::appearance::Appearance;
     use i18n::{language::codes::LanguageCode, translate::Translate};
     use ui_core::{
         node::builder::NodeBuilder, paint::primitive::Primitive,
         test_support::record::PrimitiveKind,
     };
+    use ui_kit::theme::appearance::Appearance;
     use widget::test_support::{CanvasPrimitive, WidgetTestApp};
 
     use super::*;
@@ -1242,7 +1242,7 @@ mod tests {
         let theme = harness.app.services().theme.theme_for(Appearance::Light);
         assert_eq!(
             first.color,
-            Some(theme.role(base_ui::theme::role::Role::ChartMapOcean))
+            Some(theme.role(ui_kit::theme::role::Role::ChartMapOcean))
         );
         assert!(
             primitives

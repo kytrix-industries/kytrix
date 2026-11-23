@@ -6,15 +6,6 @@ use std::{
 };
 
 use app_config::settings::Config;
-use base_ui::{
-    kit::{
-        list::SelectionMode,
-        spinner::Spinner,
-        table::{Column, ColumnAlign, Table, TableOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::account::shared::{OrderKind, PositionDirection};
 use market_participants_model::{
@@ -35,6 +26,15 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
+};
+use ui_kit::{
+    kit::{
+        list::SelectionMode,
+        spinner::Spinner,
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{cx::WidgetCx, time_zone::data_time_zone};
 

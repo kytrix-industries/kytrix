@@ -1,7 +1,7 @@
-use base_ui::theme::{
+use ui_core::{math::Size, paint::color::Color};
+use ui_kit::theme::{
     appearance::Appearance, components::ComponentTokens, resolved::Theme, role::Role,
 };
-use ui_core::{math::Size, paint::color::Color};
 
 use super::palette::{flow, tooltip_style};
 

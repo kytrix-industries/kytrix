@@ -2,15 +2,6 @@ use std::{cell::RefCell, collections::BTreeMap, mem, rc::Rc, sync::Arc};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::handle::ThemeHandle,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use instrument_selector_ui::{
     host::SelectorHost,
@@ -32,6 +23,15 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::style::StylePatch,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::handle::ThemeHandle,
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

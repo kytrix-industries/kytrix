@@ -5,7 +5,6 @@ use app_config::{
     time_zone::DataTimeZone,
     widget::{VersionedWidgetConfig, decode_or_default},
 };
-use base_ui::kit::button::Button;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::{
     engine::{
@@ -20,6 +19,7 @@ use ui_core::{
     math::Point,
     node::{signal::SignalScope, tree::NodeKind},
 };
+use ui_kit::kit::button::Button;
 use url::Url;
 use widget::test_support::WidgetTestApp;
 

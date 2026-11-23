@@ -15,7 +15,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 # Workspace members
-base_ui.workspace = true
+ui_kit.workspace = true
 market_participants_connector.workspace = true
 market_participants_model.workspace = true
 ui_core.workspace = true

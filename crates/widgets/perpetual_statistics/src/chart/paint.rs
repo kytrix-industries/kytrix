@@ -1,4 +1,3 @@
-use base_ui::theme::{resolved::Theme, role::Role};
 use bytes::Bytes;
 use smol_str::SmolStr;
 use ui_core::{
@@ -12,6 +11,7 @@ use ui_core::{
     },
     text::TextStyle,
 };
+use ui_kit::theme::{resolved::Theme, role::Role};
 
 use super::{
     axes::{

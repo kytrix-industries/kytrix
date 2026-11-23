@@ -5,12 +5,12 @@
 >
 > **v2.14 变更摘要（2026-11-23）**：**迁移完成归档**。`gui-engine-migration` 分支 HEAD `752d653`（P0–P6 全部完成；
 > 最终三端验收 P6-2/P6-3/P6-4 见 `.docs/gui-migration/final-report.md`）。本版做四件事：
-> ① **版本头与代码状态改为「迁移完成」**：全仓单一自研引擎（`ui_core` 引擎 + `base_ui`（`theme/` + `kit/` +
+> ① **版本头与代码状态改为「迁移完成」**：全仓单一自研引擎（`ui_core` 引擎 + `ui_kit`（`theme/` + `kit/` +
 > `style_builder.rs`）+ `widget` 契约层 + `widget_registry`/`widget_gallery_ui` + 六个 `*_ui` + `kytrix` 外壳）；
 > 依赖树 **零 `gpui`**（`Cargo.lock` 1,136→**760** 包；`gpui*`/`wgpu`/`x11rb`/`winit` 全 0），迁移期过渡开关
 > `KYTRIX_UI_CORE_MANIFEST` **已删除**（P5-3 `f1ff4944`）、`widget_tokio_runtime` **整 crate 删除**（P5-1 `61c08fb`）、
-> 旧 `base_ui` 顶层模块 **37 个模块/目录 25,471 行已删除**（P5-2 `6239b84`）。
-> ② **§12 按最终实现回写**：除 P2 的 `base_ui`/kit 形态外，补 **kytrix 组合根 / 外壳 / 页面接线**（§12.11）与
+> 旧 `ui_kit` 顶层模块 **37 个模块/目录 25,471 行已删除**（P5-2 `6239b84`）。
+> ② **§12 按最终实现回写**：除 P2 的 `ui_kit`/kit 形态外，补 **kytrix 组合根 / 外壳 / 页面接线**（§12.11）与
 > **验收构建 feature 形状 + 引擎 `automation` 面（E25）+ `--acceptance` 自检**（§12.12）；§12.1/§12.5/§12.6/§12.7/§12.10
 > 的迁移期表述改为终态事实（旧模块已删、不再需要环境变量、旧依赖已去）。
 > ③ **新增 §14「迁移收口」**：依赖树零 gpui、分层与依赖方向、三端验收方式与结论、验收构建 feature 形状、质量数据、
@@ -85,12 +85,12 @@
 >
 > **v2.8 变更摘要（2026-11-22）**：**P3-1e（P3-0b 审查 F2：组合根资源槽批）完成**。§13 把三个**应用级组合根单例**放进
 > 冻结契约：① `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` /
-> `animation_router: Rc<AnimationRouter>`（`base_ui::kit::{layer::Layer, overlay::AnimationRouter}` + `widget::frame::FrameRouter`），
+> `animation_router: Rc<AnimationRouter>`（`ui_kit::kit::{layer::Layer, overlay::AnimationRouter}` + `widget::frame::FrameRouter`），
 > `WidgetCx` 提供 `layer()` / `frame_router()` / `animation()` 访问器并**删除**独立的 `router` 形参（`WidgetCx::new` 与
 > `AnyWidget::mount` 不再另收 `FrameRouter`——单例只从服务取，杜绝两份真相）；② `WidgetServices::builder(app, runtime,
 > translate, theme, layer, frame_router, animation_router)` 是装配缝（四信号铸在 builder 的一个 scope 里，可选槽用 setter）；
 > ③ `WidgetTestApp` 自建三单例、经 builder 注入并用 `layer()` / `router()` / `animation()` 暴露（测试断言落在组合根实例上，
-> 而不是 widget 可能自建的副本）；④ `base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与
+> 而不是 widget 可能自建的副本）；④ `ui_kit::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与
 > `FrameRouter::installed` 同型，让「完成回调装了哪一个路由」可断言）。裁决依据：`instrument_selector_ui` 的 `SelectorHost`
 > 需要 `Rc<WidgetServices>` + `Layer` + `FrameRouter` + `AnimationRouter`，此前 6 个 selector widget 无合法 host 来源（P3-0b
 > §F2）。测试 156 → **160**。逐条登记 `.docs/gui-migration/design-changes.md` §16。
@@ -118,7 +118,7 @@
 > `App::frame_hook_installed` + `EngineError::FrameHookInstalled`）；§13.8 覆盖口径修正并补齐 4 条缺失测试。contract 变更逐条登记
 > `.docs/gui-migration/design-changes.md` §13。
 > **v2.4 变更摘要（2026-11-22）**：**P3-0（翻译/服务上下文）与 P3-1（widget 契约层冻结）完成**。新增 **§13「widget 契约层规格」**：`crates/widget` 从旧工具包形状冻结为引擎形状（`WidgetView`/`WidgetCx`/`AnyWidget`/`WidgetStatus`/`WidgetSurface`/`FrameRouter`/`WidgetBinding`/`WidgetServices`/`TranslatedError`），`crates/widget` 不再依赖 `gpui-kit`、`crates/widget/src` 零工具包文本；§12.10 的 P3 入口同步 v1.3 批次划分（原 P3-2 的契约层部分并入 P3-1）。
-> **v2.3 变更摘要**（2026-11-21；状态口径经 P2-DOC2 修正）：**P2（`base_ui` / kit）主体完成，P2 期间追加的引擎扩展 E7–E15 全部实现并合入迁移分支
+> **v2.3 变更摘要**（2026-11-21；状态口径经 P2-DOC2 修正）：**P2（`ui_kit` / kit）主体完成，P2 期间追加的引擎扩展 E7–E15 全部实现并合入迁移分支
 > `gui-engine-migration`（**23 个 P2 merge** = 22 个批次 merge + `merge(p2-5)`；HEAD `1b65c9d`；真实窗口缺陷修复批次 **P2-6 在途**）**。本版把 §11 从「E1–E6」扩为 **E1–E15**：新增
 > **§11.9–§11.15**（E7 图片节点 / E8 scoped 键绑定 / E9+E9c a11y 集合语义 / E10+E10c 定时器与唤醒 / E12 浮层 a11y 与模态 /
 > E13 组不透明度与阴影 / E15 角色补齐与集合根上提）与 **§11.16 范围基线、E 编号纪律与不变量影响**；新增
@@ -138,7 +138,7 @@
 > **代码状态**（v2.14 校准）：本文正文与 `crates/ui_core/src` 的 `pub` 面逐项对齐（类型名 / 方法名 / 签名 / 字段以源码为准）；
 > **引擎侧 E1–E21、E23–E25 全部已实现**（§11.1–§11.15；E21 `signal_slot_stats`、E23 canvas 读点、E24 文本换色、
 > E25 `automation` 面分别见 §13.8/§13.9、§6.3/§13.2、§4.5/§11.1、§12.12；**E22 仅登记、未实现**，见 §14.6）；
-> **应用层全部已实现并接线**：`base_ui`（`theme/` + `kit/` + `style_builder.rs`，§12.1–§12.5）、`widget` 契约层（§13）、
+> **应用层全部已实现并接线**：`ui_kit`（`theme/` + `kit/` + `style_builder.rs`，§12.1–§12.5）、`widget` 契约层（§13）、
 > 20 个 widget crate + `widget_registry` / `widget_gallery_ui`、六个 `*_ui` 与 `kytrix` 外壳（§12.11、§14.2）。
 > **迁移已完成**（P0–P6，`gui-engine-migration@752d653`）：gpui 全家桶已从 workspace 与 `Cargo.lock` 彻底删除（§14.1）。
 > Rust 片段分三类，各自必须显式标注：
@@ -147,7 +147,7 @@
 > 2. **E2b 候选 / 已接受残余**——明确标注为**未实现候选或受限项**（§11.2 / §11.8），应用不得依赖；
 > 3. **接口草图**——固定语义与形状、非可编译实现。
 >
-> **P2 迁移口径（历史，P5 已闭合）**：① `base_ui` 当时采取**模块级增量**（新 `theme/` / `kit/` 与旧模块并存）；旧模块已于
+> **P2 迁移口径（历史，P5 已闭合）**：① `ui_kit` 当时采取**模块级增量**（新 `theme/` / `kit/` 与旧模块并存）；旧模块已于
 > **P5-2**（`6239b84`）删除，`src/` 只剩 `kit/`、`theme/`、`style_builder.rs`、`lib.rs`（§12.1）；② 迁移期 `ui_core` 的进程清单与
 > `gpui-pre` 冲突，曾用 `KYTRIX_UI_CORE_MANIFEST=0` 过渡（§12.6），该开关已由 **P5-3**（`f1ff4944`）删除 —— 终态**不存在**该环境变量，
 > `ui_core` 始终编译并链接本仓 PerMonitorV2 清单。
@@ -174,8 +174,8 @@
 | 测试        | D13 / D14 / D20 | 引入像素快照回归并纳入 v1；D8 只约束产品运行时，门禁允许 test-only 软件设备（Windows WARP / Linux lavapipe）；**macOS 用带 Metal 硬件的实机 GPU**，保留「三平台 golden 全通过才允许合入」门禁                             |
 | 运行时      | D21             | **完全移除 `widget_tokio_runtime`**；全仓单一 tokio multi-thread runtime，`main` 创建、`App` 持有 `Handle`                                                                                                                      |
 | 窗口 / 事件 | D22 / D25       | **放弃 winit，引擎自建三平台事件循环**（Win32 / AppKit / **Wayland**）；a11y adapter 直连。**Linux 不支持 X11**，代码与依赖中不存在任何 X11 路径                                                                                |
-| 架构        | D15 / D16       | 引擎 = **核心 + 通用交互机制**（`base_ui` 视觉组件、主题、资源、widget 业务与几何、i18n 留应用层）；编程模型 = **保留式节点树 + 细粒度依赖追踪**，不保留 GPUI 的 `Render` / `IntoElement` / `Styled` / `Entity` / `cx.notify()` |
-| 样式        | D24             | **引擎 `Style` + 应用层薄 `StyleBuilder`**：引擎只暴露 `Style` / `StylePatch` / `bind_style`；`base_ui` 提供覆盖高频组合的薄 builder；静态结构挂载时一次求值，动态属性走 `Signal` 增量通道；无宏 DSL、无兼容形态 builder        |
+| 架构        | D15 / D16       | 引擎 = **核心 + 通用交互机制**（`ui_kit` 视觉组件、主题、资源、widget 业务与几何、i18n 留应用层）；编程模型 = **保留式节点树 + 细粒度依赖追踪**，不保留 GPUI 的 `Render` / `IntoElement` / `Styled` / `Entity` / `cx.notify()` |
+| 样式        | D24             | **引擎 `Style` + 应用层薄 `StyleBuilder`**：引擎只暴露 `Style` / `StylePatch` / `bind_style`；`ui_kit` 提供覆盖高频组合的薄 builder；静态结构挂载时一次求值，动态属性走 `Signal` 增量通道；无宏 DSL、无兼容形态 builder        |
 | 范围        | D9 / D19        | 不做后端 A/B 对照；**指标门槛数值、人月排期与团队投入、合规缺口处理不在本次范围**（指标体系与采集方式仍属设计交付）                                                                                                             |
 
 > D4–D6 / D10 为调研交付与文档流程类定案（指标体系交付、工作量与风险清单、委托建议、报告形态），不构成引擎设计约束，故不在本文展开；本文正文只消费其结论。
@@ -194,15 +194,15 @@
 | I6  | **UI 可见状态只能经 `Signal` 写入**：应用层不得直接改节点字段。**布局 / 绘制 / `bind_*` 求值上下文内**的读取必须经 `ReadCtx::read()` 登记依赖并返回 `SignalRef<T>` **读守卫**（`Rc`；守卫存活期再写同一信号会 panic，必须改用 `App::{write_with, update_with}` 或先 clone 再写）；上下文外的一次性读取用 `App::read`（不登记依赖、不参与失效传播）。`Window::tree_mut()` 的允许集合 = 挂载期 `NodeBuilder::build` / `NodeTree::remove` / `NodeTree::{set_style, set_layout_override, invalidate_measure}`；**不得**直接改节点字段或绑定闭包（§6.10 迁移纪律）。**v2.3 增补的引擎级写入口**（属「引擎 API」而非「应用直改节点」，应用可用）：`Window::set_image_resource`（E7，图片资源替换）、`App::set_a11y_patch`（E15，a11y 增量写，含 `request_frame`）、`App::write_transient`（瞬态值）；三者都由引擎负责置脏与失效传播，不得被当作绕过 `Signal` 的后门 | stale drawing |
 | I7  | **测试 harness 默认无 GPU**：`renderer = None` 是默认配置，CPU 帧记录契约与 device 无关                                                                       | 测试基建无法在门禁复现                              |
 | I8  | **三套 shader 共享字节布局与视觉 golden**：任何 `GpuPrimitive` / uniform / `Color` / 主题色 / 文本栈变更必须触发像素快照回归                                  | 三平台视觉不一致                                    |
-| I9  | **应用层不接触平台 API**：`base_ui` / widgets 只见引擎类型，不见 `HWND` / `MTLDevice` / `VkDevice` / `wl_surface`。自绘标题栏、窗口按钮（最小化/最大化/关闭）、任务栏图标、运行时改标题等**平台能力必须由引擎提供**（§8.6 契约、§11.6 E6 规格）；**不允许**给应用层开平台口子（那会同时违反 I9 与 D15）                                             | 平台差异泄漏到业务 crate                            |
+| I9  | **应用层不接触平台 API**：`ui_kit` / widgets 只见引擎类型，不见 `HWND` / `MTLDevice` / `VkDevice` / `wl_surface`。自绘标题栏、窗口按钮（最小化/最大化/关闭）、任务栏图标、运行时改标题等**平台能力必须由引擎提供**（§8.6 契约、§11.6 E6 规格）；**不允许**给应用层开平台口子（那会同时违反 I9 与 D15）                                             | 平台差异泄漏到业务 crate                            |
 | I10 | **不做静默降级**：D8 检测失败即给出可读错误并退出；不做兼容层、不做 migration、不做软件渲染回退                                                               | 与 D3 / D8 冲突                                     |
 | I11 | **所有几何以逻辑像素存储、以物理像素绘制**：只在 paint / present 边界做一次缩放与舍入                                                                         | 高分屏 1px 缝、AA 抖动                              |
 | I12 | **绘制指令与像素结果分别验证**：CPU 帧记录断言「发了什么」，像素快照断言「画成什么样」。**已知限制**：L3 的 14 个 case（42 张 golden）**不含文字像素**（`test_support/snapshot.rs` 的 `SnapshotScene` 没有 `Glyphs` 变体），因此迁移期（P1–P5）文本正确性由 L2 帧记录（`FrameRecord`/`RenderedFrame`）+ 结构度量断言保证，像素 golden 只作辅助（§6.10）；终态另有三端真机验收复核文本节点数与绘制（`--acceptance` 的 `painted` / `language` 两步，§14.4） | D11 三套独立源无 oracle |
 | I13 | **全仓单一 tokio runtime**（D21）：无第二套 executor、无 GPUI `PlatformDispatcher`、无双运行时桥接；主线程通过显式 `Handle` 提交任务                          | 退回双 executor 分裂与「无 runtime 上下文」panic    |
 | I14 | **窗口 / 事件循环由引擎自有**（D22）：平台层按 `#[cfg(target_os)]` 编译期确定单一实现，不依赖 winit / `accesskit_winit`，不存在可插拔事件循环 trait           | 平台能力受第三方 WndProc / NSTextInputClient 约束   |
-| I15 | **颜色只有引擎一份 `Color` 语义**（D23）：调色板与语义角色留应用层，但解析 / 插值 / 色域 / 到 GPU 的转换只在引擎实现。**现状**：`ColorResolver` 是**零大小（ZST）无状态**类型，只有 `resolve` / `lerp` / `lerp_color` 三个方法，插值空间固定为**线性预乘**（没有可配置的插值空间 / gamut / 版本），返回 `LinearPremulRgba`；base_ui 的 `.hsla`（586 处）与 OKLab 渐变假设**在实现上不成立**，迁移期一律 OKLCH→`Color` 静态解析 + 线性预乘插值                                          | 三套 shader 与文本 / SDF 收到不同空间的值           |
+| I15 | **颜色只有引擎一份 `Color` 语义**（D23）：调色板与语义角色留应用层，但解析 / 插值 / 色域 / 到 GPU 的转换只在引擎实现。**现状**：`ColorResolver` 是**零大小（ZST）无状态**类型，只有 `resolve` / `lerp` / `lerp_color` 三个方法，插值空间固定为**线性预乘**（没有可配置的插值空间 / gamut / 版本），返回 `LinearPremulRgba`；ui_kit 的 `.hsla`（586 处）与 OKLab 渐变假设**在实现上不成立**，迁移期一律 OKLCH→`Color` 静态解析 + 线性预乘插值                                          | 三套 shader 与文本 / SDF 收到不同空间的值           |
 | I16 | **Linux 仅 Wayland**（D25）：`platform/linux/`、`render/linux/`、依赖清单、门禁矩阵中不存在 X11 / XIM / XRandR / `x11rb` / X11 selection 路径。**作用域（v2.14 收口）**：本条在「`ui_core` 依赖闭包」成立（实测 0 X11）；迁移期 **workspace 级**的 `x11rb` 来自 `gpui-pre-linux` / `gpui-fast-linux` / `zed-xim`，已随 **P5-2**（`6239b84`）删除 gpui 系而消失 —— **全仓零 `x11rb` / `winit` / `wgpu` / `gpui` 已由 P5-3 兑现**（`Cargo.lock` 1,136→760 包，§14.1）                  | 违反项目支持范围，产生不受测的第三套输入 / 窗口实现 |
-| I17 | **样式静态结构与动态属性分离**（D24）：静态结构挂载时一次写入 `Style`；动态属性只能经 `Signal` + `bind_style` / `StylePatch` 重算；DSL 只在应用层且保持「薄」。**组件 API 形态（v2.1 口径）**：`base_ui` 组件只允许 ①接受 `Style` / `PaintSpec` 整值（挂载时一次）或 ②接受 `impl FnOnce(&mut StyleBuilder) -> Style` 的**挂载期**闭包；运行期变体必须声明为 `bind_style` + `StylePatch` 闭包；**不复活** `Styled` / `refine_style` / `.when()` 形态（§4.9） | 把 GPUI「每帧重建整棵 Element 树」的缺陷带进新引擎  |
+| I17 | **样式静态结构与动态属性分离**（D24）：静态结构挂载时一次写入 `Style`；动态属性只能经 `Signal` + `bind_style` / `StylePatch` 重算；DSL 只在应用层且保持「薄」。**组件 API 形态（v2.1 口径）**：`ui_kit` 组件只允许 ①接受 `Style` / `PaintSpec` 整值（挂载时一次）或 ②接受 `impl FnOnce(&mut StyleBuilder) -> Style` 的**挂载期**闭包；运行期变体必须声明为 `bind_style` + `StylePatch` 闭包；**不复活** `Styled` / `refine_style` / `.when()` 形态（§4.9） | 把 GPUI「每帧重建整棵 Element 树」的缺陷带进新引擎  |
 
 ### 0.3 术语与符号
 
@@ -234,7 +234,7 @@
 ```mermaid
 flowchart TB
     subgraph APP["应用层（D15：不在引擎内）"]
-        A1["base_ui 设计系统<br/>按钮/输入/弹窗/菜单/表格"]
+        A1["ui_kit 设计系统<br/>按钮/输入/弹窗/菜单/表格"]
         A2["主题语义色 / 调色板 / 深浅色 / i18n"]
         A3["图标·品牌图·预览图·WAV 资源"]
         A4["Widget 业务与几何<br/>K线/地图/订单簿/…"]
@@ -267,7 +267,7 @@ flowchart TB
     E2 -.->|" 增量 TreeUpdate "| E8
 ```
 
-**依赖方向单向**：应用层 → 引擎 → 基础件。引擎不反向引用任何 `base_ui` / widget 类型；应用层不得出现 `windows::` /
+**依赖方向单向**：应用层 → 引擎 → 基础件。引擎不反向引用任何 `ui_kit` / widget 类型；应用层不得出现 `windows::` /
 `objc2::` / `ash::` / `wayland_client::`（I9）。
 
 ### 1.2 Crate / 模块划分
@@ -411,19 +411,19 @@ pub(crate) use windows as backend;
 
 **E2b 候选（未实现，仅登记，不得依赖）**：Canvas / standalone shaping 不绘制装饰与行内盒；节点文本路径的 InlineBox 命中只读访问面（`App::shaped_inline_boxes` 只覆盖 standalone handle）。详见 §11.2。
 
-**明确留在应用层**：`base_ui` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、**55** 个 Phosphor SVG + 7 品牌 PNG + 23
+**明确留在应用层**：`ui_kit` 全部设计系统模块与主题语义色 / 调色板 / 深浅色映射、**55** 个 Phosphor SVG + 7 品牌 PNG + 23
 预览图 + WAV、`IconKind → path` 映射、全部 widget 业务与几何、i18n、widget 注册表，以及 **D24 的薄 `StyleBuilder`**。
 引擎只提供「资源字节 → GPU 图集」与「颜色值 → GPU 值」的机制，不持有资源文件或调色板。
 
-> **P2 已落地的应用层部分**（v2.3，§12）：`base_ui` 的 `theme/`（`Palette` 61 → `RoleColors` **64 角色** → `ComponentTokens` →
+> **P2 已落地的应用层部分**（v2.3，§12）：`ui_kit` 的 `theme/`（`Palette` 61 → `RoleColors` **64 角色** → `ComponentTokens` →
 > `Theme` → `ThemeHandle`）与 `kit/`（33 个组件模块）已在 `ui_core` 之上实现；**薄 builder 的方法面已定稿为
-> `StyleBuilder` 35 个 + `PaintBuilder` 6 个**（§12.3）。旧 `base_ui` 模块（`style/`、顶层组件文件、旧 `markdown/`）仍在，
+> `StyleBuilder` 35 个 + `PaintBuilder` 6 个**（§12.3）。旧 `ui_kit` 模块（`style/`、顶层组件文件、旧 `markdown/`）仍在，
 > **P2-5 当时不删（旧模块推迟到 P5）**；旧模块已由 **P5-2**（`6239b84`）删除，只留 `theme/` / `kit/` / `style_builder.rs`（§12.1 / §12.7）。
 
-> **`base_ui::StyleBuilder` 的落点（v2.1 新增要求；v2.3 已兑现）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
-> `base_ui` 必须自己新建。**P2-1a 已交付**：`crates/base_ui/Cargo.toml` 已含 `ui_core = { workspace = true }` 与
+> **`ui_kit::StyleBuilder` 的落点（v2.1 新增要求；v2.3 已兑现）**：引擎**不提供** builder（`Style` 只有 `Default`，无构造器/访问器），
+> `ui_kit` 必须自己新建。**P2-1a 已交付**：`crates/ui_kit/Cargo.toml` 已含 `ui_core = { workspace = true }` 与
 > `taffy = { workspace = true }`（根 `Cargo.toml` 的 `[workspace.dependencies]` 已补 `ui_core` 行），
-> `StyleBuilder`（**35 方法** → `Style`）与 `PaintBuilder`（**6 方法** → `PaintSpec`）落在 `crates/base_ui/src/style_builder.rs`
+> `StyleBuilder`（**35 方法** → `Style`）与 `PaintBuilder`（**6 方法** → `PaintSpec`）落在 `crates/ui_kit/src/style_builder.rs`
 > （§4.9.5、§12.3）。
 
 ### 1.4 所有权与线程模型
@@ -1090,7 +1090,7 @@ D22）；**禁止**在异步任务里直接写状态或改节点（I6）。**没
 ### 3.10 与应用层的契约
 
 ```rust
-// 应用层（base_ui）视角：只在挂载时声明结构，之后只写 Signal
+// 应用层（ui_kit）视角：只在挂载时声明结构，之后只写 Signal
 let window = app.create_window(WindowOptions { title: SmolStr::new_static("Kytrix"), ..WindowOptions::default() });
 let price: Signal<f64> = app.signal(0.0);
 let label = NodeBuilder::text("--", typography_body())          // 构造函数带参：text(文本, TextStyle)
@@ -1259,7 +1259,7 @@ line_break / font_variations / decoration；**不含 color / alignment**）+ **�
 
 ### 4.7 行内流
 
-`base_ui/src/markdown/inline_flow.rs` 的自研行内流（链接下划线、`kbd` 盒、行内图片、折行）是必须保留的业务资产。设计上把它从「GPUI
+`ui_kit/src/markdown/inline_flow.rs` 的自研行内流（链接下划线、`kbd` 盒、行内图片、折行）是必须保留的业务资产。设计上把它从「GPUI
 `Element` 实现」改造成**纯数据管线**：
 
 ```text
@@ -1293,14 +1293,14 @@ Markdown AST → Vec<InlineFragment>（Text | Link | Kbd | Image）
 | `StylePatch` | **动态属性增量**（8 字段）：`background` / `foreground` / `border` / `opacity`（v2.3 起为**组不透明度**）/ `visible` / `interactive` / `cursor` / `affects_layout` | `Node.style_patch`（`bind_style` 上次求值结果） | 每帧按依赖求值（`App::refresh_styles`） | `BIND` → 值变才 `PAINT`（`affects_layout` ⇒ 追加 `LAYOUT`） |
 
 **引擎不提供**任何构造器 / 访问器 / 链式 DSL / 宏 / `Styled` 形状的 trait；`Style` 只有 `Default`。布局属性由应用**直接构造
-`taffy::Style<SmolStr>` 再包一层**（`base_ui` 需自行声明 `taffy = { workspace = true }`，版本由 workspace 精确钉住）。
+`taffy::Style<SmolStr>` 再包一层**（`ui_kit` 需自行声明 `taffy = { workspace = true }`，版本由 workspace 精确钉住）。
 
 #### 4.9.1 三层职责边界
 
 | 层 | 职责 |
 |---|---|
 | **引擎** | 三个样式类型 + `bind_style` 依赖追踪入口 + `Color` / `ColorResolver`；**不做** DSL、不持有主题语义 |
-| **应用层 `base_ui`** | ① 薄 `StyleBuilder`（只覆盖高频组合：间距 / 尺寸 / 颜色 / flex 常用组合）② 主题语义色 / 调色板 / 深浅色映射 ③ `typography_*` 之类的 `TextStyle` 预设 |
+| **应用层 `ui_kit`** | ① 薄 `StyleBuilder`（只覆盖高频组合：间距 / 尺寸 / 颜色 / flex 常用组合）② 主题语义色 / 调色板 / 深浅色映射 ③ `typography_*` 之类的 `TextStyle` 预设 |
 
 **薄 builder 的硬边界**（写进 code review 约定，防止长成通用 DSL；迁移期（P2）曾有 13 处 `impl Styled`、14 处 `refine_style`、
 30 处 `.when(` 需按此重写，P5-2 删除旧模块后归零 —— 见 §6.10「禁止为过测试留兼容层」）：
@@ -1363,7 +1363,7 @@ pub struct StylePatch {
 }
 
 // 挂载期：静态结构 + 静态绘制 + 动态补丁（三个入口，各司其职）
-let panel_style = StyleBuilder::new().flex_col().gap(8.0).px(16.0).build();   // base_ui 薄 builder → Style（值）
+let panel_style = StyleBuilder::new().flex_col().gap(8.0).px(16.0).build();   // ui_kit 薄 builder → Style（值）
 let panel_paint = PaintSpec {
     background: theme.role(Role::SurfaceRaised),                              // 挂载时解析成 Color
     corner_radius: [6.0; 4],
@@ -1383,7 +1383,7 @@ let panel = NodeBuilder::boxed()
     .build(tree, parent)?;
 ```
 
-> `StyleBuilder` 在 **`base_ui`**，不在引擎：`NodeBuilder::style` 收的是**整值** `Style`。引擎侧没有任何 builder 方法，
+> `StyleBuilder` 在 **`ui_kit`**，不在引擎：`NodeBuilder::style` 收的是**整值** `Style`。引擎侧没有任何 builder 方法，
 > 也没有 `Style::new` / 布局字段访问器。
 
 #### 4.9.4 动态属性的失效流程（以 `disabled` 为例）
@@ -1439,15 +1439,15 @@ app.write(&disabled, true);   // → 一个节点 → 一个 lane → 一个 dam
 
 `full-refresh oracle`（§3.8）与 L1 布局测试（§6.2）用于证明「没有漏掉任何应更新的节点」。
 
-#### 4.9.5 `base_ui::StyleBuilder` 落点（v2.1 新增要求）
+#### 4.9.5 `ui_kit::StyleBuilder` 落点（v2.1 新增要求）
 
 | 项 | 内容 |
 |---|---|
-| 依赖前置 | `crates/base_ui/Cargo.toml` 增加 `ui_core = { workspace = true }` + `taffy = { workspace = true }`；根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补 |
-| 交付位置 | **P2-1a 的首个交付物**，先于任何 `base_ui` 组件迁移（`style` 被约 100 处引用） |
+| 依赖前置 | `crates/ui_kit/Cargo.toml` 增加 `ui_core = { workspace = true }` + `taffy = { workspace = true }`；根 `Cargo.toml` 的 `[workspace.dependencies]` 目前**没有 `ui_core` 行**，需先补 |
+| 交付位置 | **P2-1a 的首个交付物**，先于任何 `ui_kit` 组件迁移（`style` 被约 100 处引用） |
 | 方法面 | **已定稿（v2.3 / P2-1a）**：`StyleBuilder` **35 个方法**（含 `new` / `build`；flex 方向 / `gap` / padding / `size` / `clip` / 布局 `border` …）+ `PaintBuilder` **6 个方法**（`new` / `background` / `rounded` / `border` / `shadow` / `build`）；两个 builder 拆开是因为 `Style` / `PaintSpec` 是两条独立失效通道（§12.3）。布局 `border` 与绘制 `border` **必须成对书写**（前者占位不画像素、后者画线不参与布局） |
 | 禁止 | `Styled` / `StyleRefinement` / `refine_style` / `.when()` / `.map()` / 宏；不得返回可继续链式修改的对象 |
-| 验收 | `base_ui` 内 `.when(`（30 处 / 13 文件）与 `refine_style`（14 处）全部改写成 `bind_style` + `Signal`，**不留兼容层** |
+| 验收 | `ui_kit` 内 `.when(`（30 处 / 13 文件）与 `refine_style`（14 处）全部改写成 `bind_style` + `Signal`，**不留兼容层** |
 
 ---
 
@@ -1595,7 +1595,7 @@ pub struct GeometryDesc {
 - **目标**：典型场景 `draw_calls_per_frame ≤ 8`（uber-quad + geometry）；遮挡区域由 damage 剔除，不生成 `Primitive`。
 - 运行时**不做** SVG 光栅：**55** 个图标必须在**应用层构建期**转成路径数据（`Geometry`）或预生成 PNG 图集；引擎不依赖
   `usvg` / `resvg`。**迁移前引擎基线的「图标构建期转换」尚未落地**（无 `svg_build.rs`、`ResourceCache` 只收 PNG/JPEG/WebP），
-  迁移时它是 `base_ui` 的交付项（P2-1b 迁入项，§10.2）。
+  迁移时它是 `ui_kit` 的交付项（P2-1b 迁入项，§10.2）。
 
 ### 5.7 脏矩形合成
 
@@ -1621,7 +1621,7 @@ scroll hint，其余平台走全帧拷贝。
 | 层                   | 职责                                                                                                                                                                                                                         |
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **引擎**             | 一等 `Color` 枚举（`Srgb` / `LinearSrgb` / `DisplayP3` / `Oklab` / `Oklch`，5 变体）与 `ColorResolver`（**零大小无状态**：`resolve` / `lerp` / `lerp_color`；插值空间固定**线性预乘**、返回 `LinearPremulRgba`）→ `GpuPrimitive.color0/color1`；`contract.md` 含颜色空间条款 |
-| **应用层 `base_ui`** | `style/` 的**调色板与语义角色**（D15 / I15）；`Oklch` 改为引擎 `Color` 或薄别名；`Hsla` 退出主链路；主题 `resolve` 调用引擎 `ColorResolver`                                                                                  |
+| **应用层 `ui_kit`** | `style/` 的**调色板与语义角色**（D15 / I15）；`Oklch` 改为引擎 `Color` 或薄别名；`Hsla` 退出主链路；主题 `resolve` 调用引擎 `ColorResolver`                                                                                  |
 
 依赖：`color 0.3.3` 从应用层提升为**引擎依赖**（Apache-2.0 OR MIT，`no_std`）。它提供
 `ColorSpaceTag::{Oklch, Oklab, Srgb, LinearSrgb, DisplayP3}`、`DynamicColor::convert/interpolate`、
@@ -1721,22 +1721,22 @@ impl Canvas {
 | 任意 GPU 命令插入 / 应用持有 GPU buffer、uniform | 与 **I4**（GPU 资源只经延迟销毁）直接矛盾：应用持有的资源生命周期无法纳入 `RetireQueue` 的 `FrameIndex` 队列 |
 | 扩一整套自定义 pipeline 的视觉基线 | 与 **I8** 冲突：现有 L3 只有 14 个 case（42 张 golden），重开基线等于重做像素回归 |
 
-**消费者核实**（统计范围 = 下列应用层 crate（不含 `ui_core`）：`crates/base_ui`、`crates/kytrix`、`crates/widgets/*`、
+**消费者核实**（统计范围 = 下列应用层 crate（不含 `ui_core`）：`crates/ui_kit`、`crates/kytrix`、`crates/widgets/*`、
 其余 `crates/*_ui`；递归 `*.rs`，排除 `target/` 与 `.git/`）：**371 个 `.rs`**；对 `shader` / `wgpu` / `VertexBuffer` /
-`render_pipeline`（不区分大小写）的**代码引用为 0**；唯一命中是 `crates/base_ui/src/color_picker.rs:1195` 一处注释
-（“no gradient shader”）。复现命令（PowerShell，已去重；`*_ui` 排除 `base_ui` 以免重复计数）：
+`render_pipeline`（不区分大小写）的**代码引用为 0**；唯一命中是 `crates/ui_kit/src/color_picker.rs:1195` 一处注释
+（“no gradient shader”）。复现命令（PowerShell，已去重；`*_ui` 排除 `ui_kit` 以免重复计数）：
 
 ```powershell
-$ui = Get-ChildItem crates -Directory | Where-Object { $_.Name -like '*_ui' -and $_.Name -ne 'base_ui' }
-$roots = @('crates/base_ui','crates/kytrix') + $ui.FullName + (Get-ChildItem crates/widgets -Directory).FullName
+$ui = Get-ChildItem crates -Directory | Where-Object { $_.Name -like '*_ui' -and $_.Name -ne 'ui_kit' }
+$roots = @('crates/ui_kit','crates/kytrix') + $ui.FullName + (Get-ChildItem crates/widgets -Directory).FullName
 $files = Get-ChildItem -Path $roots -Recurse -File -Filter *.rs |
          Where-Object { $_.FullName -notmatch '[\/](target|\.git)[\/]' }
 $files.Count
 $files | Select-String -Pattern 'shader|wgpu|VertexBuffer|render_pipeline'
 ```
 
-结果：**371** / **1 条**（`base_ui/src/color_picker.rs:1195`）。**若把 `base_ui` 同时经 `*_ui` 通配再计入一次**，会得到
-449 个文件 / 2 条命中 —— 那是重复计数的假象（base_ui 的 78 个文件被数两次），不是额外消费者。
+结果：**371** / **1 条**（`ui_kit/src/color_picker.rs:1195`）。**若把 `ui_kit` 同时经 `*_ui` 通配再计入一次**，会得到
+449 个文件 / 2 条命中 —— 那是重复计数的假象（ui_kit 的 78 个文件被数两次），不是额外消费者。
 GPUI 本身也不向应用暴露自定义 pipeline，因此**没有任何 widget 依赖自有 shader / GPU 缓冲**。应用自绘的典型场景（图表、地图、
 K 线）已能由 `Canvas::push_*` + 静态 `Geometry`（两种 `GeometryPipeline`：`Ui` / `Textured`）覆盖。
 
@@ -2108,7 +2108,7 @@ P0-2 的 `065ae66` / `80637ab` 合入 `ee2a80f`；退出码由 `xtask/tests/gate
 ### 7.1 归属与设计依据
 
 D15 把「无障碍树」划入引擎内化清单：a11y 需要**节点树的几何、焦点、绘制序、可见性**，这四者只有引擎掌握。若留给应用层，各
-`base_ui` 模块与 widget 都要各造一套，且自绘组件（K 线 / 地图 / `Canvas`）会直接缺失角色。
+`ui_kit` 模块与 widget 都要各造一套，且自绘组件（K 线 / 地图 / `Canvas`）会直接缺失角色。
 
 ### 7.2 版本与 crate 清单
 
@@ -2408,11 +2408,11 @@ platform/                     # 模块本身私有：应用只见 AppHandle 与 
 
 ### 8.5 资源、图标与主题（应用层保留）
 
-- 引擎提供 `ResourceCache`：字节 → 解码 → GPU 句柄 / `AtlasTile`，含远程图片的磁盘缓存；资源**文件**在 `base_ui`。
+- 引擎提供 `ResourceCache`：字节 → 解码 → GPU 句柄 / `AtlasTile`，含远程图片的磁盘缓存；资源**文件**在 `ui_kit`。
 - **55 个 Phosphor SVG**（v2.3 更正：v2.2 及更早写「54」是**文档错误**；`IconKind::COUNT = 55`）的转换**不在引擎内**
   （引擎不依赖 `usvg` / `resvg` / `tiny-skia`）：应用层在**构建期**把它们转成
   路径数据（`GeometryDesc`）或预生成 PNG；品牌 PNG / 预览 PNG 走 `image 0.25` + 图集（`ResourceCache` 只收 PNG / JPEG / WebP）。
-  **P2-1b 已落地**：`crates/base_ui/build.rs` 用 build-dependency `resvg`/`usvg` **0.46.0** 把 SVG 光栅化成
+  **P2-1b 已落地**：`crates/ui_kit/build.rs` 用 build-dependency `resvg`/`usvg` **0.46.0** 把 SVG 光栅化成
   `OUT_DIR/icons/<stem>-48.png` / `-96.png` 并生成 `built.rs`（两档覆盖 1×/2×、3× 有余量；确定性来自固定缩放与无时间戳；
   透明像素 RGB=255 的 white matte 修复避免预乘暗边）。详见 §12.5。
 - 主题语义色、调色板、深浅色映射、i18n 全在应用层；引擎只暴露 `Color` / `ColorResolver` / 混合模式 / `TextStyle` 接口。
@@ -2651,8 +2651,8 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | E12 | 浮层 a11y 角色 + 模态作用域（§11.13） | a11y oracle + 输入过滤测试 | ✅ 已完成（merge `f76d75d`） |
 | | E13 | 组不透明度 + 多层阴影（§11.14） | golden 零 diff + damage 残影回归 | ✅ 已完成（merge `07f319d`，含 E13b） |
 | | E15 | a11y 角色补齐 + 容器角色 + 集合根语义上提（§11.15） | a11y oracle + 变异 | ✅ 已完成（merge `7ad630f`，含 E15b） |
-| **P2 base_ui** | P2-0 | 迁移期 manifest 过渡开关（`KYTRIX_UI_CORE_MANIFEST`，`xtask gates` **按命令**注入；§12.6） | `cargo test -p base_ui` + `xtask gates` 全绿 | ✅ 已完成（`3adc5d7` / `e0d3f7b` → merge `3ed24a7`；开关已由 P5-3 删除） |
-| | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（**35**）/`PaintBuilder`（**6**，§12.3）+ `.hsla` 全删 + 64 角色×2 外观基线（§12.2） | `cargo test -p base_ui` + gallery 出帧 | ✅ 已完成（`05f52e0` / `6e4d413` → merge `828bf53`） |
+| **P2 ui_kit** | P2-0 | 迁移期 manifest 过渡开关（`KYTRIX_UI_CORE_MANIFEST`，`xtask gates` **按命令**注入；§12.6） | `cargo test -p ui_kit` + `xtask gates` 全绿 | ✅ 已完成（`3adc5d7` / `e0d3f7b` → merge `3ed24a7`；开关已由 P5-3 删除） |
+| | P2-1a | 主题与颜色基座 + 薄 `StyleBuilder`（**35**）/`PaintBuilder`（**6**，§12.3）+ `.hsla` 全删 + 64 角色×2 外观基线（§12.2） | `cargo test -p ui_kit` + gallery 出帧 | ✅ 已完成（`05f52e0` / `6e4d413` → merge `828bf53`） |
 | | P2-1b / 1b2 | 资产与基础件（icon/assets/brand/size/format/motion/animation/join + `test_support`；旧 M4 遗留的「图标构建期转换」用 resvg 0.46 落地，§12.5） | 同上 | ✅ 已完成（`eb464f6` / `e9aeda4` → merge `8ed4714`；white matte 修复 + 110 PNG 全像素校验） |
 | | P2-1b3 / 1b3b | E7 采用：删 `kit/image_node.rs` 绕行，Icon/Brand/Assets 改用 `NodeKind::Image`（§11.9） | 同上 | ✅ 已完成（`3b3b752` / `fc4fd14` → merge `bbd75e4`；含装饰图免诊断判据） |
 | | P2-2 | 容器与列表（`static_sized_list` / `scroll_bar` / `table` / `tree` / `deque_*`；`grid_list` 删；用 E3） | 同上 + E3 | ✅ 已完成（`de475b6` / `5b154e2` → merge `6eeac52`；含 E8 与 `column_span`） |
@@ -2663,7 +2663,7 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | P2-4c / 4c2 / 4c3 | 菜单/下拉/选择/上下文菜单（共享条目面板、`PanelWidth::Exact`、行命中壳焦点） | 同上 | ✅ 已完成（`95dc808` / `1f34ea6` → merge `3ce9593`） |
 | | P2-4d1 / 4d1b | 对话框（`Dialog` / `DialogBuilder`；焦点/模态/Esc 走引擎，`OverlaySurface::dialog()`） | 同上 | ✅ 已完成（`252384e` / `9094b1c` → merge `cda7d09`） |
 | | P2-4d2 / 4d2b | 颜色选择器（144 色板 + HSLA 滑条走 `Canvas`；双层阴影回填） | 同上 | ✅ 已完成（`25f0d8b` / `58eddec` → merge `b855b21`） |
-| | P2-5 | base_ui 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | ✅ 已合入（`cd607d0` → merge `1b65c9d`；`M3` 达成）；旧模块已由 **P5-2**（`6239b84`）删除；真实窗口缺陷由 **P2-6** 修复批跟进后关闭 |
+| | P2-5 | ui_kit 收口：examples 收敛为 `gallery` + 三端真实验收；**旧模块 `style/`/顶层组件/旧 `markdown/` 的删除推迟到 P5**（§12.7） | gallery 出帧 + 三端验收 | ✅ 已合入（`cd607d0` → merge `1b65c9d`；`M3` 达成）；旧模块已由 **P5-2**（`6239b84`）删除；真实窗口缺陷由 **P2-6** 修复批跟进后关闭 |
 | **P3 widget 契约 + 20 widgets** | P3-1 | 契约层搬运 + `view`/`any`/`status` 重写 + `WidgetCx`/`AnyWidget` 定稿 | 契约测试 + 签名冻结评审 | ✅ 已完成（§13 冻结；P3-1b…P3-1j 逐批补缝，契约测试 131→**183**） |
 | | P3-2 | `surface` / `ui/placeholder` / `binding` + `empty` 标杆 + 运行时 Handle 接线 | 同上 | ✅ 已完成（`974c8f2`，`empty` 8 测试；surface/binding 随 P3-1） |
 | | P3-3 | `widget_registry` + `widget_gallery_ui`（24 条注册表遍历） | 同上 | ✅ 已完成（`e6696b1` registry **28** / `a151ef0` gallery **33**） |
@@ -2672,7 +2672,7 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 | | P4-2 | `instrument_selector_ui` ∥ `settings_ui` | 同上 | ✅ 已完成（`ba60949` settings **233**；selector `86`） |
 | | P4-3 | kytrix 外壳：`main` 启动链、`windows/root/window.rs` 拆分、`components/*`、**自绘标题栏（E6）**、服务注入、i18n | 最小窗口 example 作活体证据（P2–P4 期间 `cargo build -p kytrix` 必红） | ✅ 已完成（`21030cc` → merge `9d92252`；P4-3b `aca1557`、P4-5 接线 `74e8a05` → merge `266f952`；§12.11） |
 | **P5 收口与删除 GPUI** | P5-1 | 删除 `widget_tokio_runtime`（crate + 30 manifest + 全部调用点 → `App` 持有 Handle / `#[tokio::test]`）；workspace 遍历测试与 `clippy.toml` 相关规则清理 | 相关 crate 全绿 + 零 `widget_tokio_runtime` | ✅ 已完成（`61c08fb`：整 crate 删除、6 crate gpui=0、`Runtime::for_test` 105 处/.with_runtime 18/39 引用改 `Handle`） |
-| | P5-2 | 删除 `gpui-kit`（36 crate×2 行 + workspace + dev-deps）；`Cargo.lock` 零 `gpui-*`/`wgpu`；`AGENTS.md` GPUI 约定；`Packager.toml` deb 去 `libxcb1`；examples 与资源收尾；**「零 `x11rb`」判据在此兑现** | 零 `gpui-*`（36）/ 零 `wgpu*`（9）/ 零 `widget_tokio_runtime` / 零 `x11rb` / 零 `winit` | ✅ 已完成（`6239b84`：37 个旧模块/目录 25,471 行删除；`cargo tree -p base_ui \| grep gpui` = 0） |
+| | P5-2 | 删除 `gpui-kit`（36 crate×2 行 + workspace + dev-deps）；`Cargo.lock` 零 `gpui-*`/`wgpu`；`AGENTS.md` GPUI 约定；`Packager.toml` deb 去 `libxcb1`；examples 与资源收尾；**「零 `x11rb`」判据在此兑现** | 零 `gpui-*`（36）/ 零 `wgpu*`（9）/ 零 `widget_tokio_runtime` / 零 `x11rb` / 零 `winit` | ✅ 已完成（`6239b84`：37 个旧模块/目录 25,471 行删除；`cargo tree -p ui_kit \| grep gpui` = 0） |
 | | **P5-3（新增）** | 移除 gpui 全家桶与 `KYTRIX_UI_CORE_MANIFEST` 过渡开关；全仓门禁恢复绿 | `Cargo.lock` 零 `gpui*`；`cargo test --workspace` 全绿 | ✅ 已完成（`f1ff4944`：lock 1,136→**760** 包、gpui 36→0、wgpu/x11rb/winit 清零；8,556 passed） |
 | **P6 三端验收** | P6-1 | **验收构建**（`ai`/`audio` 可选）+ 引擎 `automation` 面（E25）+ `kytrix --acceptance` 7 步自检 | Windows 真实窗口自检 + 两种构建 + 依赖树判据 | ✅ 已完成（`174ea807` → merge `1324430c`；Windows 7/7 PASS，§12.12） |
 | | P6-2 | Windows 真窗口验收：全量/验收两种二进制的启动、自检、截图、存活/关闭 | accept（截图 + 报告 + 退出码） | ✅ 已完成（`14 frames / 193 primitives / 4 texts`；两张 1600×1200 截图，§14.4） |
@@ -2686,8 +2686,8 @@ D18 定案「主干冻结窗口」：约定一段时间内不发布、在主干�
 > **依赖与顺序（以 plan §3 为准）**：P0 → P1 → P2 → P3（契约先于 widgets）→ P4 → P5 → P6；P1 内 E2/E4/E6 的合并点追加
 > 三端 layer 门禁；P2 与 P3.1 可部分并行，P3 的 widget 批次之间完全并行。
 
-**plan 里程碑（plan §2.2，M1–M7）与本表对应**：M1 引擎扩展完成 = P1-E1…E6；M2 base_ui 地基 = P2-1a/P2-1b；
-M3 base_ui 全量 = P2-2…P2-5；M4 widget 契约+标杆 = P3-1…P3-3 + 前 3 个标杆 widget；M5 20 widgets = P3-W1…W9；
+**plan 里程碑（plan §2.2，M1–M7）与本表对应**：M1 引擎扩展完成 = P1-E1…E6；M2 ui_kit 地基 = P2-1a/P2-1b；
+M3 ui_kit 全量 = P2-2…P2-5；M4 widget 契约+标杆 = P3-1…P3-3 + 前 3 个标杆 widget；M5 20 widgets = P3-W1…W9；
 M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M7 之间的删除收口，不单列里程碑）。
 
 **历史：迁移前引擎基线（旧设计 M0–M5，编号已停用）**：
@@ -2707,7 +2707,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 |---|---|---|
 | 旧 M0–M5 | 迁移前基线（不在 plan 批次内） | 见上表；M4/M5 遗留分别进 P2-1b / P2-1a |
 | 旧 M6.0 | P0-2 + P1-E1…E6 | 门禁基座 = P0-2；引擎缺口 = 全部 E1–E6（E2/E6 已裁决必做，均在 P1） |
-| 旧 M6.1 | P2-1a、P2-1b | base_ui 地基 |
+| 旧 M6.1 | P2-1a、P2-1b | ui_kit 地基 |
 | 旧 M6.2 | P3-1、P3-2、P3-3 | widget 契约层 |
 | 旧 M6.3 | P3-W1…W9 | 20 widgets |
 | 旧 M6.4 | P4-1、P4-2 | 六个 `*_ui` |
@@ -2720,12 +2720,12 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 
 | 旧编号 | 来源 | 归入 |
 |---|---|---|
-| B0 门禁基座 / B1 base_ui 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2（门禁；CI 工作流部分按 D-07 取消）+ P0-3（基线确认）+ **P2-1a（`ui_core`/`taffy` 进 `Cargo.toml`，plan P2-1a 已列）**；**B0 的「最小 kytrix example」：plan 未列，建议归 P0-2 或新增 P0-4（当前不存在）**；B1→P2-1a…P2-5（base_ui 全组）；B2→P3-1、P3-2、P3-3；B3→P3-W1…W9；B4→P4-1、P4-2（`widget_gallery_ui` 归 P3-3）；B5→P4-3（E6 能力=P1-E6）；B6→P5-1、P5-2；**B7→P6-1…P6-3** |
+| B0 门禁基座 / B1 ui_kit 基础 / B2 widget 契约 / B3 20 widget / B4 六个 `*_ui` / B5 kytrix 外壳 / B6 运行时收口+删除 / B7 三端验收 | `04` §7.2 | B0→P0-2（门禁；CI 工作流部分按 D-07 取消）+ P0-3（基线确认）+ **P2-1a（`ui_core`/`taffy` 进 `Cargo.toml`，plan P2-1a 已列）**；**B0 的「最小 kytrix example」：plan 未列，建议归 P0-2 或新增 P0-4（当前不存在）**；B1→P2-1a…P2-5（ui_kit 全组）；B2→P3-1、P3-2、P3-3；B3→P3-W1…W9；B4→P4-1、P4-2（`widget_gallery_ui` 归 P3-3）；B5→P4-3（E6 能力=P1-E6）；B6→P5-1、P5-2；**B7→P6-1…P6-3** |
 | P0 引擎增量 / P1 地基 / P2 容器列表 / P3 文本输入 / P4 交互浮层 / P5 外壳联调 | `02` §10.3 | **P0**：G1→P1-E1/E5（引擎 shaping / 点→字符）+ P2-3（应用层编辑状态机）；G3→P2-4（`interactive`/hover 消费；引擎 `InputEvent`/pointer 已实现，**plan 无独立批次**）；G7→P2-4/P2-3（`Canvas`/`set_canvas` 已实现，组件消费方；**plan 无独立批次**）；G4→P1-E3；G5→P2-2；G11→P2-1b；**P1**→P2-1a、P2-1b；**P2**→P2-2；**P3**→P2-3；**P4**→P2-4；**P5（含删除 gpui）**→P4-3（layer 塌缩/kytrix 外壳）+ P2-5（26 examples→gallery/视觉基线）+ **P5-1、P5-2（删除 gpui / widget_tokio_runtime）** |
 | B0 保留文件搬运 / B1 签名定稿+`empty` / B2 `surface`+binding / B3 registry+gallery | `03` §9.4 | B0→P3-1；B1→P3-1（view/any/status）+ P3-2（empty）；B2→P3-2（surface/placeholder/binding）+ P3-W9（watch_list）；B3→P3-3 |
 | R1 volume_heatmap→order_book / R2 perpetual_statistics∥prediction_market / R3 chokepoint / R4 candlestick | `06` §3 | **R1→P3-W4（volume_heatmap/order_book）；R2→P3-W5（perpetual_statistics/prediction_market）；R3→P3-W6（chokepoint）；R4→P3-W7（candlestick）** |
 | B1 标杆 / B2 表格列表族 / B3 钱包族 / B4 自绘族 / B5 x | `07` 0.5/3 节 | B1→P3-2（empty）+ P3-W1（news/force_order）；B2→P3-W2（market_trade/financial_calendar）+ P3-W3（financial_index）+ P3-W9（watch_list）；B3→P3-W8（ethereum_wallet/solana_wallet）+ P3-W9（hyperliquid_wallet）；B4→P3-W2（pentagon_pizza_index）+ P3-W3（coin_market_cap_fear_and_greed_index/cryptocurrency_etf）；B5→P3-W9（x） |
-| T0 摘耦合 / T1 base_ui 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P0-3（5 个纯 crate / 720 免迁移基线登记）+ **P5-1（`Runtime::for_test`→`Handle` 机械改写，提前执行）** + **P5-2（i18n 去 gpui dev-dep；最终删除）**；plan 未单列 T0 前置批次；T1→P2-1a…P2-5；T2→P3-1…P3-3；T3→P3-W1…W9；T4→P4-1、P4-2、P4-3（5 个 `*_ui` + kytrix；其中 **`app_config_provider`/`download_provider`/`kytrix_service_provider`：plan 未列，建议归 P4-3（外壳服务注入）或 P5-2；`market_participants_connector`（纯逻辑/协议）→P4-1**）；T5→随 P1-E1…E6 与 P2/P3 各批落地（不单列批次） |
+| T0 摘耦合 / T1 ui_kit 单测 / T2/T3 widget / T4 外壳 / T5 收尾 | `05` §7.1 | T0→P0-3（5 个纯 crate / 720 免迁移基线登记）+ **P5-1（`Runtime::for_test`→`Handle` 机械改写，提前执行）** + **P5-2（i18n 去 gpui dev-dep；最终删除）**；plan 未单列 T0 前置批次；T1→P2-1a…P2-5；T2→P3-1…P3-3；T3→P3-W1…W9；T4→P4-1、P4-2、P4-3（5 个 `*_ui` + kytrix；其中 **`app_config_provider`/`download_provider`/`kytrix_service_provider`：plan 未列，建议归 P4-3（外壳服务注入）或 P5-2；`market_participants_connector`（纯逻辑/协议）→P4-1**）；T5→随 P1-E1…E6 与 P2/P3 各批落地（不单列批次） |
 
 > 注：表中「plan 未列」= `.docs/gui-migration/plan.md` 没有对应批次；执行前由 Lead 决定并入就近批次或新增 P0-4（当前不存在），
 > 不得自行扩批。其余所有 `P*-*` 批次 ID 均存在于 plan.md。
@@ -2751,7 +2751,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 | GPUI 强类型 `Action` 变体（`Action::TogglePricePanel`）                                                                                    | 改为 `Action::Custom(SmolStr)` 字符串 key + `App::on_action` handler                                                        |
 | `.when(cond, ...)` / 状态驱动样式                                                                                                         | **必须重写**为 `bind_style` + `Signal`（§4.9.4），不能改名了事                                                             |
 | `cx.theme().roles.*.hsla` 现取                                                                                                            | 改为 `ThemeHandle.role(...)` 挂载时经 `ColorResolver` 解析；主题切换走语义信号（§3.4）                                     |
-| `StyledExt` / `StyleRefinement` / `refine_style` / `impl Styled for Button`                                                               | 全部删除；改为 `base_ui` 组件构建函数返回 `NodeId`                                                                         |
+| `StyledExt` / `StyleRefinement` / `refine_style` / `impl Styled for Button`                                                               | 全部删除；改为 `ui_kit` 组件构建函数返回 `NodeId`                                                                         |
 | `.on_click` / `.on_mouse_down` / `cx.listener`                                                                                            | 改为引擎 `Action` + 事件分发（§3.6），不再有 listener 闭包捕获 `Entity`                                                    |
 | `inline_flow.rs` 样式与 `paint_quad` 同体                                                                                                 | 拆成纯函数几何 + `Scene.push_*`，逻辑可移植、API 必重写                                                                    |
 | `.debug_selector()` / `.debug_bounds()`                                                                                                   | 迁移到 `Probe::by_selector`（§6.2）                                                                                        |
@@ -2813,7 +2813,7 @@ M6 kytrix 启动 = P4-1…P4-3；M7 最终验收 = P6-1…P6-3（P5 是 M6 与 M
 | ID | 增量 | 量级 | 受影响不变量 | 阻塞 crate（08 口径） | 分级 | 状态 / 批次 |
 |---|---|---|---|---|---|---|
 | **E1** | 文本 shaping 公开面（`ShapedTextHandle` + `App::shape_text` + `Canvas::push_shaped_text` + InlineBox 读取） | **M** | I2（不加 `Primitive` 变体）、I4（tile 生命周期仍归图集/retire）、I12（非像素断言）、I17 | candlestick / order_book / heatmap / prediction_market / perp / chokepoint + 4 个图表类 | **硬阻塞** | ✅ 已实现（P1-E1） |
-| **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与诊断） | **L** | I2、I17、I12、I8（装饰走普通 `Quad`、不进 shader ⇒ 不触发 golden） | base_ui markdown 全组（empty / news / x） | **必做（D-03 扩展 E2）** | ✅ 已实现（P1-E2） |
+| **E2** | 富文本（多 `TextRun` + 文本装饰 + InlineBox 绘制与诊断） | **L** | I2、I17、I12、I8（装饰走普通 `Quad`、不进 shader ⇒ 不触发 golden） | ui_kit markdown 全组（empty / news / x） | **必做（D-03 扩展 E2）** | ✅ 已实现（P1-E2） |
 | **E3** | 变高虚拟列表（extents 前缀和 + 锚点 + `set_virtual_extents` / `scroll_to_item`） | **M** | I5（行高来自布局，回写必须走同一棵 taffy 树）、I3（锚点补偿不得额外出帧）、I11（全逻辑像素） | news / x / eth/sol 钱包（`DequeUnsizedList`）、6 张表的 wrap 行 | **硬阻塞** | ✅ 已实现（P1-E3） |
 | **E4** | `GeometryDraw.range`（索引元素子区间） | **M** | **I2（唯一契约变更点）**、I4（页级上传不变）、I8（同几何不同 range 的像素覆盖） | global_shipping_chokepoint（LOD 4 档 / 22,876 三角形） | **硬阻塞** | ✅ 已实现（P1-E4） |
 | **E5** | `Window::text_byte_index_at`（点 → 字节索引） | **S** | I6（只读查询，不改状态） | 全部文本输入 / 选择 / 链接命中 | **硬阻塞** | ✅ 已实现（P1-E5） |
@@ -3664,7 +3664,7 @@ impl App {
 `node_summary` 摘要已含 `orientation`，仍缺 `pos_in_set` / `size_of_set`（R-29 D12）。
 
 **残余**：R-29（D9–D12）、R-28（运行期 `set_style` 的 `display:none` 不重发后代 a11y）。
-**拆回 base_ui 后续批的缺口**（不在引擎批）：虚拟容器角色（`List` 语义由 kit 容器显式声明）、`List::set_row_a11y` 接
+**拆回 ui_kit 后续批的缺口**（不在引擎批）：虚拟容器角色（`List` 语义由 kit 容器显式声明）、`List::set_row_a11y` 接
 `ReadCtx`（`kit-menu.md §5/§13.5`，P2-4c2/F27 拆分结论）。
 
 ### 11.16 E7–E15 的不变量影响、错误面与编号纪律
@@ -3697,26 +3697,26 @@ impl App {
 
 ---
 
-## 12. 应用层实现规格（`base_ui` / kit / kytrix 外壳 / 页面接线，已实现）
+## 12. 应用层实现规格（`ui_kit` / kit / kytrix 外壳 / 页面接线，已实现）
 
-> **状态：应用层全部完成并接线**（P2 `base_ui` → P3 契约层 + 20 widgets → P4 六个 `*_ui` + kytrix 外壳 → P5 删除旧引擎 →
-> P6 三端验收）。`base_ui` 只剩 `theme/` + `kit/` + `style_builder.rs`（P5-2 `6239b84` 删除 37 个旧模块/目录共 25,471 行）；
+> **状态：应用层全部完成并接线**（P2 `ui_kit` → P3 契约层 + 20 widgets → P4 六个 `*_ui` + kytrix 外壳 → P5 删除旧引擎 →
+> P6 三端验收）。`ui_kit` 只剩 `theme/` + `kit/` + `style_builder.rs`（P5-2 `6239b84` 删除 37 个旧模块/目录共 25,471 行）；
 > `gpui-kit` 与 gpui 全族已从 workspace / `Cargo.lock` 删除（P5-3 `f1ff4944`）；`KYTRIX_UI_CORE_MANIFEST` 过渡开关已删除
 > （§12.6 只作历史记录，终态不存在该变量）。
 > 本章是**应用层的实现后规格**：模块形态 / 主题基座 / 薄 builder / kit 组件契约 / 构建期资产 / 计划修正 /
 > **kytrix 组合根与外壳接线（§12.11）** / **验收构建与 `--acceptance` 自检（§12.12）**。
 > 引擎侧规格见 §11、widget 契约层见 §13、迁移收口与三端验收结论见 §14；应用层与引擎的边界仍由 §1.3 白名单约束 ——
-> `base_ui` **只见引擎类型**（I9）。
+> `ui_kit` **只见引擎类型**（I9）。
 
 ### 12.1 模块级增量迁移形态（不是兼容层）
 
 | 项 | 事实 |
 |---|---|
-| 新模块 | `crates/base_ui/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/base_ui/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown/` 6 个模块 + `parse_tests`） |
+| 新模块 | `crates/ui_kit/src/theme/`（8 个模块 + `mod.rs`：`appearance` / `color` / `components` / `handle` / `palette` / `resolved` / `role` / `roles`）、`crates/ui_kit/src/kit/`（33 个组件模块 + `mod.rs` + `test_support`（`#[cfg(test)]`）；`kit/markdown/` 6 个模块 + `parse_tests`） |
 | 旧模块（已删除） | 旧 `src/style/`（5 个模块 + `mod.rs`）、`src/` 顶层组件文件、旧 `src/markdown/`（9 文件）共 **37 个模块/目录、25,471 行**，已由 **P5-2**（`6239b84`）删除；`src/` 只剩 `kit/`、`theme/`、`style_builder.rs`、`lib.rs`（§12.7） |
 | 迁移形态裁决 | **模块级增量**：新模块用新路径与新 API，旧模块不改造、不桥接、不 re-export；**不是**公开 API 兼容层（AGENTS §1.1） |
-| 依赖 | `crates/base_ui/Cargo.toml` 运行时只依赖 `ui_core`（构建期 `resvg`/`usvg`/`image`）；`gpui-kit` 已随 P5-2 删除，`grep -r gpui crates/base_ui` = **0**（`cargo tree -p base_ui \| grep gpui` 亦 0） |
-| 测试事实标准 | `cargo test -p base_ui --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **772 passed**（P5-2 后；P2 时点 1,139） |
+| 依赖 | `crates/ui_kit/Cargo.toml` 运行时只依赖 `ui_core`（构建期 `resvg`/`usvg`/`image`）；`gpui-kit` 已随 P5-2 删除，`grep -r gpui crates/ui_kit` = **0**（`cargo tree -p ui_kit \| grep gpui` 亦 0） |
+| 测试事实标准 | `cargo test -p ui_kit --lib`（默认特性；**不再需要任何环境变量** —— `KYTRIX_UI_CORE_MANIFEST` 已删除，§12.6）。终态 **772 passed**（P5-2 后；P2 时点 1,139） |
 
 ### 12.2 主题基座（`theme/`）
 
@@ -3764,11 +3764,11 @@ impl App {
 只能扩展该路由（`AnimationRouter` 的订阅面是 P2-4b3 B3 登记的后续项）。淡出收尾因此可以在 `Finished` **同帧**执行 `close_now`
 （旧的「下一轮 `sync` 观察 progress == 0」路径在真实泵序下不可观察，已删除）。
 
-### 12.5 构建期 SVG 光栅（`base_ui/build.rs`）
+### 12.5 构建期 SVG 光栅（`ui_kit/build.rs`）
 
 | 项 | 规格 |
 |---|---|
-| 依赖 | `crates/base_ui/Cargo.toml` 的 **build-dependencies**：`image` / `resvg` / `usvg`；workspace 钉 **0.46.0**（`default-features = false`；P5 前选此版本是为与 `gpui-pre` 的锁版本一致，gpui 删除后该钉版保持不变） |
+| 依赖 | `crates/ui_kit/Cargo.toml` 的 **build-dependencies**：`image` / `resvg` / `usvg`；workspace 钉 **0.46.0**（`default-features = false`；P5 前选此版本是为与 `gpui-pre` 的锁版本一致，gpui 删除后该钉版保持不变） |
 | 产物 | `OUT_DIR/icons/<stem>-48.png` / `-96.png`（两档覆盖 1×/2×，3× 有 48→96 的余量）+ `OUT_DIR/icons/built.rs`（`IconKind → 路径` 表） |
 | 图标数 | **55**（`kit::icon::IconKind::COUNT = 55`，`ALL: [IconKind; COUNT]` 穷举；枚举文档明写「设计文档写 54，实际 55」） |
 | 确定性 | 固定缩放算法（resvg 解析 AA）+ 固定档位 + 无时间戳；`white matte`：透明像素 RGB **= 255**（否则引擎「先 resize 后预乘」产生最坏 96/255 暗边；110 PNG 全像素校验 + 暗边探针 0/255） |
@@ -3783,7 +3783,7 @@ impl App {
 
 | 项 | 规格（迁移期） |
 |---|---|
-| 现象 | 迁移期 `base_ui` / `widgets/*_ui` 仍依赖 `gpui-pre`，其 `gpui.lib` 也带 `RT_MANIFEST` ID 1 ⇒ 同一 exe 两份清单 ⇒ `link.exe CVT1100: duplicate resource. type:MANIFEST, name:1` |
+| 现象 | 迁移期 `ui_kit` / `widgets/*_ui` 仍依赖 `gpui-pre`，其 `gpui.lib` 也带 `RT_MANIFEST` ID 1 ⇒ 同一 exe 两份清单 ⇒ `link.exe CVT1100: duplicate resource. type:MANIFEST, name:1` |
 | 开关 | `crates/ui_core/build.rs` 读环境变量 `KYTRIX_UI_CORE_MANIFEST`：`"0"` ⇒ **只跳过**进程清单的 rc 编译与链接（其他值/未设置 = 不启用）；清单存在性、DPI 锚点、MSVC 与 rerun 校验**一律照旧**；跳过时打 warning |
 | xtask 注入 | `xtask/src/gates.rs` **按命令**注入（不是按 scope）：按 scope 注入会让 `ui_core` 自己丢清单、125% DPI 用例回归（P2-0b 修复 F0） |
 | 移除（**已执行**） | **P5-3**（`f1ff4944`）：删 `ui_core/build.rs` 的开关分支、`xtask/src/gates.rs` 的注入机制、`spec-deltas/build-transition.md`；4 条验证命令确认「默认清单链接存在 + 锚点校验通过」。变异 M2 复现：env=0 时 frameless DPI 用例红 `(464,281) vs (480,320)`，反向证明清单现在恒在 |
@@ -3791,17 +3791,17 @@ impl App {
 
 ### 12.7 计划修正（P2 期间裁决；权威版本见 `.docs/gui-migration/plan.md` v1.6）
 
-1. **旧 `base_ui` 模块删除 / `gpui-kit` 移除从 P2-5 推迟到 P5（已执行）**：旧模块在 P3/P4 期间仍被消费方（`widgets/*`、`*_ui`、
+1. **旧 `ui_kit` 模块删除 / `gpui-kit` 移除从 P2-5 推迟到 P5（已执行）**：旧模块在 P3/P4 期间仍被消费方（`widgets/*`、`*_ui`、
    `kytrix`）引用，**只有等 P3/P4 迁完才能删**；P2-5 因此只做 `gallery` 收尾。删除由 **P5-2**（`6239b84`，37 个模块/目录、
    25,471 行）与 **P5-3**（`f1ff4944`，`gpui-kit` / `rust-embed` 出 workspace 与 `Cargo.lock`）完成。
-2. **P2-5 = `gallery` + 三端真实验收**：`crates/base_ui/examples/gallery`（ui_core 之上的主题 + 全部组件）作活体证据；
+2. **P2-5 = `gallery` + 三端真实验收**：`crates/ui_kit/examples/gallery`（ui_core 之上的主题 + 全部组件）作活体证据；
    Windows 真窗口出帧 + Probe 断言，mac/Linux 离屏；`M3` 随该批达成。
 3. **P2 实际批次比 plan v1.1 多**：新增 `P2-0` / `P2-1b3` / `P2-2e` / `P2-4a3` / `P2-4c2` / `P2-4c3` / `P2-4d1b` / `P2-4d2b`
    等收尾批（plan v1.2 §3 已补全，§10.2 表同步）。
 4. **E 编号纪律**：E11 = 被 E10 吸收（不单列）；E14（`Dismiss` 前置回调）与 E16（`node_screen_rect` / `anchor_rect`）**未实现**、
    只登记；**E15 专指 a11y 角色批**，不得再用于其它缺口。
-5. **门禁口径**：引擎批合入后必须同时 `cargo check -p base_ui --all-targets`（教训：E12 的 `OverlayOptions.a11y` 新字段曾让
-   迁移分支 `base_ui` 连续两批不可编译）；手工跑 `ui_core` 测试前必须清除 `KYTRIX_UI_CORE_MANIFEST=0` 残留（否则 frameless
+5. **门禁口径**：引擎批合入后必须同时 `cargo check -p ui_kit --all-targets`（教训：E12 的 `OverlayOptions.a11y` 新字段曾让
+   迁移分支 `ui_kit` 连续两批不可编译）；手工跑 `ui_core` 测试前必须清除 `KYTRIX_UI_CORE_MANIFEST=0` 残留（否则 frameless
    DPI 用例假红），门禁统一走 `xtask gates`（per-command 注入）。
 
 ### 12.8 文档一致性修正（v2.3 逐条纠正，均有源码依据）
@@ -3819,7 +3819,7 @@ impl App {
 | 9 | `Separator` 的 AccessKit 映射未说明 | 引擎枚举 `Separator` → AccessKit `Role::Splitter`（**引擎无 `Splitter` 变体**） | `a11y/mapping.rs` 注释 + 映射测试 |
 | 10 | 台账/登记稿写 `MenuItemCheckbox` | **`MenuItemCheckBox`**（大写 `B`，AccessKit 0.25 口径） | `a11y.rs` 变体 + 注释「登记文档里写作 `MenuItemCheckbox`」 |
 | 11 | E9 审查稿「`a11y.rs` 注释原写 32 个变体」 | **不成立**：32 的唯一出处是本文档 §7.4 旧文 | `a11y.rs` 全文无该计数的字样；`mig-e9-review.md` §8.3-9 同结论 |
-| 12 | 「迁移期 `ui_core` 的 `[workspace.dependencies]` 没有 `ui_core` 行」（§1.3） | 已补齐（P2-1a） | 根 `Cargo.toml` 的 `[workspace.dependencies]` 含 `ui_core`；`base_ui` 已引用 |
+| 12 | 「迁移期 `ui_core` 的 `[workspace.dependencies]` 没有 `ui_core` 行」（§1.3） | 已补齐（P2-1a） | 根 `Cargo.toml` 的 `[workspace.dependencies]` 含 `ui_core`；`ui_kit` 已引用 |
 
 ### 12.9 P2 测试与门禁事实（里程碑证据）
 
@@ -3827,11 +3827,11 @@ impl App {
 |---|---|
 | `ui_core --lib`（`--features hud,test-support`） | **2274 passed / 0 failed / 1 ignored**（P2 起点 2151 ⇒ **+123**；`.review/mig-e15b-lib.log`；= P2-5 门禁基线 2250（`mig-p2-5-g4-ui_core.log`）+ E15 **+24**，合并树同值） |
 | `ui_core --test snapshot` | **11 passed**，42 张 golden（3 平台 × 14）**全程零 diff、零重建** |
-| `base_ui --lib` | **1099 passed**（P2 起点 417 ⇒ **+682**；`.review/mig-p2-5-g3-base_ui.log`；口径 = P2-4d2 时点 1029 + P2-4a3/4c2/4c3 **+70**，E15 不改 kit 测试数） |
+| `ui_kit --lib` | **1099 passed**（P2 起点 417 ⇒ **+682**；`.review/mig-p2-5-g3-ui_kit.log`；口径 = P2-4d2 时点 1029 + P2-4a3/4c2/4c3 **+70**，E15 不改 kit 测试数） |
 | 引擎批测试增量（逐批，**各批分支基线、并行分支互不可比**） | E7 19 / E7b +1（2170→2171）· E8 +12（2163，+E8b 3 = 2166）· E9 2159 · E9c +4（2199）· E10 2213→2218 · E12 +7（2202）· **E13 2209**（golden 零 diff + 像素读回）· E15 2266 → E15b **2274**（= 合并树值） |
 | 变异测试 | P2 各批审查累计变异 **60+** 项（E7 3/3、E8 6/6、E9 2/2、E9c 2/2、E10 8/8、E12 3/3、E13 8/10、E15 4/4 等，绝大多数红） |
 | 三端 | Windows 本机 fast/层末；macOS / Linux 远端 quick + 层末 layer；`timer_smoke` 三端 PASS（Win +415.79 / mac +404.63 / Linux +400.79 ms） |
-| 里程碑 | **M2（base_ui 地基）达成** = P2-1a + P2-1b；**M3** 随 P2-5 `gallery` 合入（`1b65c9d`）达成；真实窗口缺陷修复由 **P2-6**（在途）跟进 |
+| 里程碑 | **M2（ui_kit 地基）达成** = P2-1a + P2-1b；**M3** 随 P2-5 `gallery` 合入（`1b65c9d`）达成；真实窗口缺陷修复由 **P2-6**（在途）跟进 |
 
 ### 12.10 残余与后续入口（迁移后）
 
@@ -3848,7 +3848,7 @@ impl App {
 ### 12.11 kytrix 应用外壳：组合根、启动时序与页面接线（P4-3 / P4-5 实现后规格）
 
 **落点**：`crates/kytrix/src/**`（21 文件 / 6,224 行 / 80 测试；P4-3 提交 `21030cc`，P4-5 接线 `74e8a05`，P4-3b 修复 `aca1557`）。
-外壳**不持有**引擎能力：所有绘制、布局、输入、a11y、定时器、帧路由都来自 `ui_core` + `base_ui::kit` + `widget` 契约层。
+外壳**不持有**引擎能力：所有绘制、布局、输入、a11y、定时器、帧路由都来自 `ui_core` + `ui_kit::kit` + `widget` 契约层。
 
 **组合根（`composition.rs`，全进程唯一一次装配）**：
 
@@ -4060,9 +4060,9 @@ impl<'a> WidgetCx<'a> {
     pub fn unique_key(&self, suffix: &str) -> SmolStr;
 
     // 组合根三单例（应用级唯一；widget 不得自建，见 §13.9 R-10）
-    pub fn layer(&self) -> &base_ui::kit::layer::Layer;
+    pub fn layer(&self) -> &ui_kit::kit::layer::Layer;
     pub fn frame_router(&self) -> &FrameRouter;
-    pub fn animation(&self) -> &base_ui::kit::overlay::AnimationRouter;
+    pub fn animation(&self) -> &ui_kit::kit::overlay::AnimationRouter;
 
     pub fn window_mut(&mut self) -> &mut ui_core::window::Window;      // 自绘族直通
     pub fn set_canvas(&mut self, node: NodeId, canvas: Canvas) -> Result<bool, EngineError>;
@@ -4248,9 +4248,9 @@ pub struct WidgetServices {
     pub open_url: Rc<dyn Fn(&str)>,                                  // 应用层 Command
     pub sound: Rc<dyn Fn(&'static str) -> Option<Bytes>>,            // 应用层音效字节
     pub reduce_motion: Signal<bool>,                                 // 应用层无障碍设置镜像
-    pub layer: Rc<base_ui::kit::layer::Layer>,                       // 组合根唯一：浮层层序
+    pub layer: Rc<ui_kit::kit::layer::Layer>,                       // 组合根唯一：浮层层序
     pub frame_router: Rc<FrameRouter>,                               // 组合根唯一：App::on_frame 单槽
-    pub animation_router: Rc<base_ui::kit::overlay::AnimationRouter>, // 组合根唯一：完成回调单槽
+    pub animation_router: Rc<ui_kit::kit::overlay::AnimationRouter>, // 组合根唯一：完成回调单槽
     pub runtime: tokio::runtime::Handle,
 }
 impl WidgetServices {
@@ -4264,9 +4264,9 @@ impl WidgetServices {
         runtime: tokio::runtime::Handle,
         translate: Translate,
         theme: ThemeHandle,
-        layer: Rc<base_ui::kit::layer::Layer>,
+        layer: Rc<ui_kit::kit::layer::Layer>,
         frame_router: Rc<FrameRouter>,
-        animation_router: Rc<base_ui::kit::overlay::AnimationRouter>,
+        animation_router: Rc<ui_kit::kit::overlay::AnimationRouter>,
     ) -> WidgetServicesBuilder<'_>;
 }
 pub struct WidgetServicesBuilder<'a>;   // 私有字段；每个 setter 消费并返回 self
@@ -4301,8 +4301,8 @@ impl WidgetTestApp {
     pub fn services(&self) -> &WidgetServices;
     pub fn services_rc(&self) -> &Rc<WidgetServices>;    // 宿主取同一实例（P3-1f）
     pub fn router(&self) -> &FrameRouter;                     // 组合根那一个，经 builder 注入
-    pub fn layer(&self) -> &base_ui::kit::layer::Layer;       // 同上（测试断言落在宿主实例上）
-    pub fn animation(&self) -> &base_ui::kit::overlay::AnimationRouter;  // 同上
+    pub fn layer(&self) -> &ui_kit::kit::layer::Layer;       // 同上（测试断言落在宿主实例上）
+    pub fn animation(&self) -> &ui_kit::kit::overlay::AnimationRouter;  // 同上
     pub fn window(&self) -> WindowId;  pub fn root(&self) -> NodeId;
     pub fn status(&self) -> WidgetStatus;  pub fn scope(&self) -> SignalScope;
     pub fn with_cx<R>(&mut self, body: impl FnOnce(&mut WidgetCx<'_>) -> R) -> R;
@@ -4577,7 +4577,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 | R-7 | P3-1b 对 P3-1 冻结面的增量 | 相对 `2e4d3d6` 的必须变更（W1 开工前收口）：`WidgetCx::config` → `config_ref`（不克隆；`Arc<Config>` 出口删除）、新增 `account`/`window_mut`/`set_canvas`；`WidgetServices` 6 → 10 字段；`Notice::is_markdown`；`FrameRouter::new/install` → `Result`；引擎新增 `App::frame_hook_installed` 与 `EngineError::FrameHookInstalled`；`WidgetTestApp` 新增 `with_translate`/`try_mount`/`tree`/`a11y_hidden` 等并删除假 `recovery_action`。P3-1b 之前没有下游代码（W 批未开工），故不构成迁移负担，登记于 design-changes §13 |
 | R-8 | P3-1c 对 P3-1b 冻结面的增量 | `WidgetServices` 新增 `catalog_generation: Signal<u64>`（目录已发布世代：组合根写、`WidgetSurface` 根读；widget 在 `sync` 比较后重跑 `load`，等待目录、无正文的 widget 也会被唤醒——「目录变更 → 重跑 `load`」的唯一通法）；`MarkdownNode::mount` → `Result<Self, EngineError>`（N5：富文本占位的失败面统一）；mount 的 surface 失败释放 scope（N4）；`WidgetTestApp::try_mount_in_scope`（失败路径观测缝）。W 批仍未开工，故不构成迁移负担，登记于 design-changes §14 |
 | R-9 | P3-1d 对 P3-1c 冻结面的增量 | `Notice::is_markdown` 由 `const fn(&self)` 改为 `fn(&self, &Translate)`（判定基于解析后的目录值；契约只增语义、不删变体）；`WidgetTestApp` 新增注入构造器 `with_market_participants`/`with_kytrix_service`/`with_open_url`/`with_sound` 与 `drain_runtime`/`run_until_idle`，宿主改为拥有 `WidgetServices.runtime` 的 current-thread runtime（App 引擎 runtime 不变）；`WidgetSurface` 根新增 `services.config` 依赖锚点；`crates/widget` 增两个 test-only dev-dependency（`app_config_provider`/`widget_tokio_runtime`，供 headless 目录连接器注入测试）。W 批未开工，不构成迁移负担，登记于 design-changes §15 |
-| R-10 | P3-1e 对 P3-1d 冻结面的增量（P3-0b §F2 裁决） | `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` / `animation_router: Rc<AnimationRouter>`——三个组合根单例的**唯一**注入点，`SelectorHost` 因此可从 `&WidgetServices` + `cx` 访问器组装（此前 6 个 selector widget 无合法 host 来源）；`WidgetServices::builder(app, runtime, translate, theme, layer, frame_router, animation_router)` 为装配缝（四信号铸在一个 scope，可选槽用 setter）；`WidgetCx` 新增 `layer()`/`frame_router()`/`animation()` 并**删除** `router()` 与独立 router 字段（`WidgetCx::new` 5→4 参数，`AnyWidget::mount`/`mount_in_scope` 去掉 `&FrameRouter` 形参：单例只从服务取，杜绝两份真相）；`WidgetTestApp` 自建三单例、经 builder 注入并增 `layer()`/`animation()` 访问器（`router()` 保留，返回宿主实例）；`base_ui::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与 `FrameRouter::installed` 同型）。测试 156 → 160。W 批未开工，不构成迁移负担，登记于 design-changes §16 |
+| R-10 | P3-1e 对 P3-1d 冻结面的增量（P3-0b §F2 裁决） | `WidgetServices` 新增 `layer: Rc<Layer>` / `frame_router: Rc<FrameRouter>` / `animation_router: Rc<AnimationRouter>`——三个组合根单例的**唯一**注入点，`SelectorHost` 因此可从 `&WidgetServices` + `cx` 访问器组装（此前 6 个 selector widget 无合法 host 来源）；`WidgetServices::builder(app, runtime, translate, theme, layer, frame_router, animation_router)` 为装配缝（四信号铸在一个 scope，可选槽用 setter）；`WidgetCx` 新增 `layer()`/`frame_router()`/`animation()` 并**删除** `router()` 与独立 router 字段（`WidgetCx::new` 5→4 参数，`AnyWidget::mount`/`mount_in_scope` 去掉 `&FrameRouter` 形参：单例只从服务取，杜绝两份真相）；`WidgetTestApp` 自建三单例、经 builder 注入并增 `layer()`/`animation()` 访问器（`router()` 保留，返回宿主实例）；`ui_kit::kit::overlay::AnimationRouter` 增 `installed()` 观测面（与 `FrameRouter::installed` 同型）。测试 156 → 160。W 批未开工，不构成迁移负担，登记于 design-changes §16 |
 | R-11 | P3-1f 对 P3-1e 冻结面的增量 | `WidgetCx` 改为持有 `&Rc<WidgetServices>`、新增 `services_rc()`（`WidgetCx::new` 的 `services` 形参由 `&WidgetServices` 改为 `&Rc<WidgetServices>`；`AnyWidget` 与 `WidgetTestApp` 本来就持 `Rc`，mount / 测试调用点形状不变），`WidgetTestApp` 增 `services_rc()` 观测面——widget 在 `body` 里构造**拥有服务聚合的宿主**（`SelectorHost`）时取组合根那一个 `Rc`，不重建聚合；静态文案重建通法由 §13.10 冻结；事件过滤应用义务由 §13.11 冻结（引擎面 E21：`App::drain_events_where` + `test_support::diagnostics::signal_slot_stats`，P3-0b2 越界改 `ui_core` 已获 Lead 批准并登记 `ledger.md`）。测试 160 → 161。W 批未开工，不构成迁移负担，登记于 design-changes §17 |
 | R-12 | P3-1g 对 P3-1f 冻结面的增量（测试装置；无引擎面变更） | `WidgetTestApp` 增 `advance(Duration) -> bool`（推进**引擎时钟** + 一轮 `router.tick` + `TestApp::drain`，返回本轮是否提交像素）与观测面 `frame_index()` / `frame_requests()` / `rendered()`。E10 定时器 deadline 只在引擎钟推进后到期：**不读 wall clock、不真实 sleep**；到期回调在帧入口派发、写入参与同一帧；未到期轮是空闲轮（I3：不出帧、不增长帧请求）。`TestApp::advance` 已存在，本批**不改 `ui_core`**；`crates/widgets/**` 也未改——W2c 分支自建的 `ClockHost`（`TestApp` + `WidgetServices::builder` + 假墙钟）在合入后删除、改用本装置；W2b 的倒计时 timer 缺口（`test-ledger/w2-pizza.md` §8：到期 → 回调 → 再武装不可自动化）可据此补测（widget 自己的「现在」仍由测试写那个状态）。测试 161 → 164，登记于 design-changes §18 |
 | R-13 | P3-1h 对 P3-1g 冻结面的增量（纯增量；`WidgetCx::new` 形状不变） | §13.2 新增 `WidgetCx::unique_key(&self, suffix: &str) -> SmolStr`：格式 `"{suffix}@{scope}"`，scope 取上下文**已持有**的 `SignalScope` 下标——不新增 `instance_id` 形参（`WidgetCx::new` 仍 4 参数，W1/W2 已迁移 widget 的测试夹具零返工）；引擎 `new_scope` 只追加 scope 槽、从不回收下标，故同一 App 内实例前缀唯一、release 后也不复用。语义 / 生命周期 / 释放配对见 §13.3，静态块重建的 key 稳定性见 §13.10；硬规则见 `crates/widgets/AGENTS.md` §1-11 / §5 / §9 / §11 / §15.5。`WidgetTestApp` 本身已支持两个 `mount` 实例并存，本批只补契约测试。测试 164 → 170。**残余（不阻断）**：① 已迁移 W1/W2 代码里的常量 / 按 parent 手拼的 kit key 由各自 W 批改为 `unique_key`（登记 AGENTS §15.5，本批不改 `crates/widgets/**`）；② 前缀是 **App 内**实例身份，不得持久化 / 跨进程 / 跨 App 复用（instance id 与 scope 下标都不是稳定业务身份）；③ 同一实例内「同后缀 = 同 key」由调用方保证后缀按控件位置唯一，契约不检测重复后缀。不改 `ui_core`，登记于 design-changes §19 |
@@ -4625,7 +4625,7 @@ presentation 信号，不能只删节点）；`Widget::new` 返回 `Err` 时先 
 **应用义务**（冻结）：
 
 1. **组合根 / pane 是全量 `drain_events` 的唯一所有者**：它取走事件，再按窗口把需要的部分交给 widget 的 `dispatch`。
-2. 只拥有「自己窗口的文本 / 按键 / IME」的消费者（模态对话框的输入框、`base_ui::kit::input` 的宿主）**必须**用
+2. 只拥有「自己窗口的文本 / 按键 / IME」的消费者（模态对话框的输入框、`ui_kit::kit::input` 的宿主）**必须**用
    `drain_events_where(|target, event| target == 自己窗口 && is_text_input(event))`，并在需要时附加「自己是该窗口的
    modal scope」条件；**不得**用 `drain_events()`——它会把其它窗口、指针 / 尺寸 / 焦点 / 关闭等事件一并吞掉，多窗场景丢键。
 3. 消费者关闭（`finish` / release）后**不得再取任何事件**；它自己的输入组件 release 时摘掉已挂的 handler。
@@ -4711,30 +4711,30 @@ kytrix（外壳）         widget_gallery_ui        market_participants_ui / pro
                        │                        │
                        └───────────┬────────────┴──────────┐
                                    ▼                       ▼
-                    base_ui（设计系统：theme/ 64 角色 · kit/ 33 组件族 · style_builder 35+6 · build.rs 55 图标）
+                    ui_kit（设计系统：theme/ 64 角色 · kit/ 33 组件族 · style_builder 35+6 · build.rs 55 图标）
                                    │
                                    ▼
                     ui_core（引擎：app/window/layout/text/paint/geometry/render×3/a11y/platform；
                               features: test-support / hud / automation）
 ```
 
-- **单向依赖**：上层只见下层；`base_ui` **只见引擎类型**（I9）；`widget` 只见 `ui_core` + `base_ui::{kit,theme,style_builder}` + `i18n`；
+- **单向依赖**：上层只见下层；`ui_kit` **只见引擎类型**（I9）；`widget` 只见 `ui_core` + `ui_kit::{kit,theme,style_builder}` + `i18n`；
   `*_ui` / `kytrix` 只见三者 + 业务服务 crate。`pub trait` 全仓仍为 **0**（组件用五段式约定，不用 trait）。
 - **workspace**：**42 个成员**（基线 43，`widget_tokio_runtime` 已删）；`crates/` 下 **23 个顶层目录**（含 `widgets/`，其下 **20 个 widget crate**）。
 - **零 gpui（判据与实测）**：
   - `Cargo.lock`：**760 包**（迁移前 1,136；`name = "gpui*"` **36 → 0**，`wgpu` / `x11rb` / `winit` 亦 **0**）；根 `Cargo.toml` 无
     `gpui-kit`、无 `rust-embed`。
-  - `cargo tree -p kytrix -e normal` / `-p base_ui` / workspace：**0 行 gpui**（P5-2 起 `base_ui` 首批树级 0；P5-3 全仓 0）。
+  - `cargo tree -p kytrix -e normal` / `-p ui_kit` / workspace：**0 行 gpui**（P5-2 起 `ui_kit` 首批树级 0；P5-3 全仓 0）。
   - `crates/**` 的 `*.rs` / `*.toml`：仅 **11 条文档注释**把 GPUI 作为设计先例/对照提及（如「与 GPUI 的 borrow guard 同思路」），
     **无 import、无依赖、无工具包 API**。
-  - `KYTRIX_UI_CORE_MANIFEST` 环境变量、`widget_tokio_runtime` crate、旧 `base_ui` 顶层模块（37 个模块/目录 25,471 行）**均不存在**。
+  - `KYTRIX_UI_CORE_MANIFEST` 环境变量、`widget_tokio_runtime` crate、旧 `ui_kit` 顶层模块（37 个模块/目录 25,471 行）**均不存在**。
 - **唯一外部 GUI 相关依赖**：平台原生 `windows` / `objc2`+`metal`+`accesskit_macos` / `wayland-*`+`vulkan`、文本 `parley`/`swash`、
-  布局 `taffy`、a11y `accesskit*`、三角化 `lyon`（只有 20 widget 用）、构建期 `resvg`/`usvg`/`image`（只 base_ui 用）。
+  布局 `taffy`、a11y `accesskit*`、三角化 `lyon`（只有 20 widget 用）、构建期 `resvg`/`usvg`/`image`（只 ui_kit 用）。
 
 ### 14.2 应用层最终形态
 
 组合根、启动时序、自绘标题栏、侧栏/页面/pane/画廊接线与每帧顺序见 **§12.11**；验收构建 feature 形状与 `--acceptance` 自检见 **§12.12**。
-一句话概括：**`ui_core` 提供全部 GUI 能力，`base_ui` 提供设计系统，`widget` 冻结契约，`kytrix` 只做装配与产品逻辑**；
+一句话概括：**`ui_core` 提供全部 GUI 能力，`ui_kit` 提供设计系统，`widget` 冻结契约，`kytrix` 只做装配与产品逻辑**；
 整个应用只有 **一条** `App::on_frame` 注册者（组合根的 `Rc<FrameRouter>`）与 **一条** `App::on_animation_complete` 注册者
 （`Rc<AnimationRouter>`）。
 
@@ -4779,7 +4779,7 @@ kytrix（外壳）         widget_gallery_ui        market_participants_ui / pro
 | `cargo test --workspace`（默认特性） | **8,581 passed / 0 failed / 36 ignored**（102 个测试二进制） | `.review/mig-p6-1-test-workspace.log`（P6-1 合并后；P5-3 时 8,556） |
 | `ui_core --lib`（`--features hud,test-support`） | **2,305 passed / 1 ignored**；`--test snapshot` **11 passed**，42 张 golden（3 平台 × 14）零 diff | `.review/mig-e24-g3-test.log`、E24 / P3-1j 台账 |
 | `ui_core` 自动化面 | **6** 条（`automation` feature，不依赖 test-support） | `test-ledger/p6-1.md` §2 |
-| `base_ui --lib` | **772**（kit 715 / theme 49 / style_builder 8；P2 时点 1,139，P5-2 随旧模块删 −367） | `test-ledger/p5-2.md` |
+| `ui_kit --lib` | **772**（kit 715 / theme 49 / style_builder 8；P2 时点 1,139，P5-2 随旧模块删 −367） | `test-ledger/p5-2.md` |
 | `widget` 契约层 | **183**（P3-1 起点 131） | §13.8 |
 | `widget_registry` / `widget_gallery_ui` | **28** / **33** | `test-ledger/p3-3a.md` / `p3-3b.md` |
 | 20 个 widget crate | 8（`empty`）… **353**（`candlestick`）；合计 **2,644** | `test-ledger/*.md`、`mig-p6-1-test-workspace.log` |

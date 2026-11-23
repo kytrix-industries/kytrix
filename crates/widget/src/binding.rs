@@ -438,12 +438,12 @@ mod tests {
                 .expect("the test runtime builds");
             let mut app = App::new(runtime.handle().clone());
             let window = app.create_window(WindowOptions::default());
-            let theme = base_ui::theme::handle::ThemeHandle::new(
+            let theme = ui_kit::theme::handle::ThemeHandle::new(
                 &mut app,
-                base_ui::theme::appearance::Appearance::Light,
+                ui_kit::theme::appearance::Appearance::Light,
             );
-            let layer = Rc::new(base_ui::kit::layer::Layer::new());
-            let animation_router = Rc::new(base_ui::kit::overlay::AnimationRouter::new());
+            let layer = Rc::new(ui_kit::kit::layer::Layer::new());
+            let animation_router = Rc::new(ui_kit::kit::overlay::AnimationRouter::new());
             let router =
                 Rc::new(FrameRouter::new(&mut app).expect("the fixture owns the frame hook slot"));
             let services = Rc::new(

@@ -2,9 +2,9 @@ use std::io;
 
 use app_config::settings::{Appearance, Language};
 use app_config_provider::store::ConfigPersistenceError;
-use base_ui::theme::appearance::Appearance as ThemeAppearance;
 use i18n::t_smol;
 use ui_core::event::{Action, KeyCode};
+use ui_kit::theme::appearance::Appearance as ThemeAppearance;
 
 use crate::{session::SettingsWriteError, settings_tests::test_support::Harness};
 

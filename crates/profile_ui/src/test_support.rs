@@ -6,10 +6,6 @@ use std::{
 };
 
 use app_config::settings::{AccountConfig, AccountWalletKind, Config};
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
 use futures::future::BoxFuture;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use kytrix_service_provider::auth::{
@@ -27,6 +23,10 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, tree::NodeKind},
     test_support::{app::TestApp, diagnostics::SignalSlotStats},
     window::{WindowId, WindowOptions},
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::{appearance::Appearance, handle::ThemeHandle},
 };
 use widget::{frame::FrameRouter, services::WidgetServices};
 use zeroize::Zeroizing;
@@ -400,7 +400,7 @@ impl Harness {
             .root();
         let parent = NodeBuilder::boxed()
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .flex_row()
                     .items_center()
                     .padding(8.0)
@@ -491,7 +491,7 @@ impl Harness {
         let root = self.root();
         let slot = NodeBuilder::boxed()
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .flex_row()
                     .build(),
             )

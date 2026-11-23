@@ -4,12 +4,12 @@ use app_config::{
     settings::{Config, Language},
     translation::{DownloadSite, TranslationModel},
 };
-use base_ui::kit::icon::IconKind;
 use download_provider::error::DownloadFailure;
 use i18n::{language::codes::LanguageCode, t_smol};
 use smol_str::SmolStr;
 use tempfile::TempDir;
 use ui_core::event::{Event, InputEvent, KeyCode};
+use ui_kit::kit::icon::IconKind;
 
 use crate::{
     pages::translation::table::{RowAction, size_text, speed_text, whole_percent},

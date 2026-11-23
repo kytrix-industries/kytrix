@@ -1,5 +1,5 @@
 use app_config::settings::Appearance;
-use base_ui::theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle};
+use ui_kit::theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle};
 
 pub fn apply(
     preference: Appearance,
@@ -28,7 +28,7 @@ pub fn appearance_of(preference: Appearance, system_dark: bool) -> ThemeAppearan
 #[cfg(test)]
 mod tests {
     use app_config::settings::Appearance;
-    use base_ui::theme::appearance::Appearance as ThemeAppearance;
+    use ui_kit::theme::appearance::Appearance as ThemeAppearance;
 
     use super::appearance_of;
 

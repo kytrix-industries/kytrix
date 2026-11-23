@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::{style_builder::StyleBuilder, theme::appearance::Appearance};
 use i18n::language::codes::LanguageCode;
 use market_participants_model::decimal::Quantity;
 use smol_str::SmolStr;
@@ -11,6 +10,7 @@ use ui_core::{
     paint::primitive::Primitive,
     window::WindowId,
 };
+use ui_kit::{style_builder::StyleBuilder, theme::appearance::Appearance};
 use widget::test_support::WidgetTestApp;
 
 use super::{canvas::Chart, open_interest::OpenInterestChart, paint::Hover, rect::RectExt};

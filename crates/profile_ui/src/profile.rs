@@ -1,17 +1,6 @@
 use std::{rc::Rc, sync::Arc};
 
 use app_config::settings::AccountConfig;
-use base_ui::kit::{
-    button::Button,
-    dialog::{Dialog, DialogError},
-    layer::{Band, LayerSlot},
-    overlay::{
-        Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions, OverlaySurface,
-        Placement,
-    },
-    size::UnifiedSizable,
-    tooltip::{Tooltip, TooltipContent, TooltipOptions},
-};
 use i18n::{t_smol, translate::Translate};
 use kytrix_service_provider::auth::{constants::ACCOUNT_ORIGIN, model::PlanCode};
 use smol_str::{SmolStr, format_smolstr};
@@ -30,6 +19,17 @@ use ui_core::{
     },
     resources::PendingResource,
     window::WindowId,
+};
+use ui_kit::kit::{
+    button::Button,
+    dialog::{Dialog, DialogError},
+    layer::{Band, LayerSlot},
+    overlay::{
+        Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayError, OverlayOptions, OverlaySurface,
+        Placement,
+    },
+    size::UnifiedSizable,
+    tooltip::{Tooltip, TooltipContent, TooltipOptions},
 };
 use widget::error::TranslatedError;
 
@@ -1212,7 +1212,7 @@ impl TriggerBuild<'_> {
         let face = NodeBuilder::boxed()
             .id(TRIGGER_AVATAR_ID)
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .size(face_size, face_size)
                     .items_center()
                     .justify_center()
@@ -1230,7 +1230,7 @@ impl TriggerBuild<'_> {
             Some(texture) => {
                 NodeBuilder::image_pending(texture.pending, ui_core::node::image::ImageFit::Cover)
                     .style(
-                        base_ui::style_builder::StyleBuilder::new()
+                        ui_kit::style_builder::StyleBuilder::new()
                             .size(face_size, face_size)
                             .build(),
                     )
@@ -1244,14 +1244,14 @@ impl TriggerBuild<'_> {
                     )?;
             }
             None => {
-                base_ui::kit::icon::IconSpec::new(base_ui::kit::icon::IconKind::User)
+                ui_kit::kit::icon::IconSpec::new(ui_kit::kit::icon::IconKind::User)
                     .with_size(face_size)
                     .build_themed(
                         app,
                         self.window,
                         face,
                         self.host.theme(),
-                        base_ui::theme::role::Role::FgMuted,
+                        ui_kit::theme::role::Role::FgMuted,
                     )
                     .map_err(|error| trigger_icon_error(self.window, error))?;
             }
@@ -1279,9 +1279,9 @@ fn trigger_on_click(
     }
 }
 
-fn trigger_icon_error(window: WindowId, error: base_ui::kit::icon::IconError) -> EngineError {
+fn trigger_icon_error(window: WindowId, error: ui_kit::kit::icon::IconError) -> EngineError {
     match error {
-        base_ui::kit::icon::IconError::Node(error) => error,
+        ui_kit::kit::icon::IconError::Node(error) => error,
         _ => EngineError::UnknownWindow { window },
     }
 }
@@ -1334,7 +1334,6 @@ fn overlay_error(window: WindowId, error: OverlayError) -> EngineError {
 mod tests {
     use std::time::Duration;
 
-    use base_ui::kit::{layer::Band, size::UnifiedSize};
     use i18n::{language::codes::LanguageCode, t_smol};
     use kytrix_service_provider::auth::{
         constants::ACCOUNT_ORIGIN,
@@ -1342,6 +1341,7 @@ mod tests {
     };
     use smol_str::SmolStr;
     use ui_core::{math::Size, node::tree::NodeKind};
+    use ui_kit::kit::{layer::Band, size::UnifiedSize};
     use widget::error::TranslatedError;
 
     use super::{MenuEvent, ProfileMenu};

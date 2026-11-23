@@ -1,4 +1,4 @@
-use base_ui::kit::icon::IconKind;
+use ui_kit::kit::icon::IconKind;
 use widget::descriptor::WidgetDescriptor;
 
 const WIDGET_ICONS: &[(&str, IconKind)] = &[
@@ -88,7 +88,7 @@ pub fn icon_for_path(path: &str) -> Option<IconKind> {
 mod tests {
     use std::collections::HashSet;
 
-    use base_ui::kit::icon::IconKind;
+    use ui_kit::kit::icon::IconKind;
 
     use super::{FALLBACK, MISSING_ICONS, WIDGET_ICONS, icon_for, icon_for_path};
 

@@ -1,10 +1,6 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use app_config::settings::Config;
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::catalog::{
     batch::CatalogEntry,
@@ -25,6 +21,10 @@ use ui_core::{
     paint::style::StylePatch,
     test_support::app::TestApp,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::{appearance::Appearance, handle::ThemeHandle},
 };
 use widget::{frame::FrameRouter, services::WidgetServices};
 

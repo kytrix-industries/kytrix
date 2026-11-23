@@ -1,9 +1,4 @@
 use app_config::{widget::VersionedWidgetConfig, workspace::WorkspaceWidget};
-use base_ui::{
-    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -14,6 +9,11 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::{primitive::Border, style::StylePatch},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     any::AnyWidget, config::WidgetConfigChange, services::WidgetServices, view::HeaderGroup,

@@ -37,7 +37,7 @@ tokio = { workspace = true }
 # Workspace members
 app_config = { workspace = true }
 app_config_provider = { workspace = true }
-base_ui = { workspace = true }
+ui_kit = { workspace = true }
 download_provider = { workspace = true }
 instrument_selector_ui = { workspace = true }
 kytrix_service_provider = { workspace = true }

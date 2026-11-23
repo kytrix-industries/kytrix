@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::{style_builder::StyleBuilder, theme::appearance::Appearance};
 use i18n::{t_smol, translate::Translate};
 use market_participants_model::listing::rules::ListingPrecision;
 use time::UtcOffset;
@@ -11,6 +10,7 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch},
 };
+use ui_kit::{style_builder::StyleBuilder, theme::appearance::Appearance};
 use widget::cx::WidgetCx;
 
 use super::{

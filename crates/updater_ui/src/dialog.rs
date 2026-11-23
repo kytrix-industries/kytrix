@@ -4,21 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use base_ui::{
-    kit::{
-        button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
-        overlay::OverlayError,
-        progress::Progress,
-        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
-        separator::Separator,
-        size::UnifiedSize,
-        spinner::Spinner,
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -35,6 +20,21 @@ use ui_core::{
     paint::style::StylePatch,
     text::{TextAlign, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogError},
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        overlay::OverlayError,
+        progress::Progress,
+        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
+        separator::Separator,
+        size::UnifiedSize,
+        spinner::Spinner,
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::services::WidgetServices;
 

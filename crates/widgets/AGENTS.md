@@ -1,6 +1,6 @@
 # Widget 开发规范（P3 契约）
 
-本文件适用于 `crates/widgets/**`，以 **`crates/widget`（P3-1 冻结契约）** 与 **`crates/base_ui/src/kit`（引擎化组件）** 为准。
+本文件适用于 `crates/widgets/**`，以 **`crates/widget`（P3-1 冻结契约）** 与 **`crates/ui_kit/src/kit`（引擎化组件）** 为准。
 框架接口看 `crates/widget/src/{view,cx,any,surface,status,frame,binding,services}.rs`；展示规则唯一实现在
 `crates/widget/src/surface.rs`。参考实现随 W 批迁移逐步更新（`force_order` 的表格与状态上报、`news` 的 binding 与
 header 声音按钮、`perpetual_statistics` 的一 crate 多 widget 布局）。
@@ -39,7 +39,7 @@ header 声音按钮、`perpetual_statistics` 的一 crate 多 widget 布局）�
    `min_height_0` 起步。
 5. **失败与中性文案是两个出口**：`WidgetState::failed`（终态 + 恢复控件）与 `WidgetState::waiting`（没有内容时的中性引导）。
    **不用等待报「错」**，也不为「空数据」造等待文案 —— 空快照是正文里的「暂无数据」。
-6. **空快照不是空状态**：拿到空表 / 空列表 / 空图时，正文里要画 `base_ui::kit::empty_state` + `common.no_data`（表格用
+6. **空快照不是空状态**：拿到空表 / 空列表 / 空图时，正文里要画 `ui_kit::kit::empty_state` + `common.no_data`（表格用
    kit `Table` 的空态能力），不能留一块白。
 7. **不自行创建上游连接、不 spawn 长期任务、不引入 DI / capability registry**。依赖以具体类型经构造函数注入 `service.rs`。
 8. **持久化选项自己读回（`config()`）并上报（`config_change.publish(app)`）**；改了字段不上报，改动只活在内存里。
@@ -262,10 +262,10 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 
 - `Notice::message("widget.x.y")`：一条没有参数的目录文案。**它可能是富文本**：目录把若干 widget 自己的文案写成
   `<p align="center">…</p>`（`widget.news.logged_out`、`widget.empty.hint` 等），surface 会按内容判断并交给
-  `base_ui::kit::markdown` 画，widget 不需要（也不能）自己标记。
+  `ui_kit::kit::markdown` 画，widget 不需要（也不能）自己标记。
 - `Notice::MarketNotLoaded { venues, supported }`：`venues` 是自己在等的市场（只是状态身份，句子不读它），`supported` 是句子
   列出来的、本组件能读的全部市场（从静态定义表取，与用户选了什么无关）。句子 `common.market_not_loaded` 由 `widget::venue`
-  供给；它**是富文本**（对齐段落 + `<kbd>` 图标 + 一行一个市场名和 logo），surface 用 `base_ui::kit::markdown` 画，
+  供给；它**是富文本**（对齐段落 + `<kbd>` 图标 + 一行一个市场名和 logo），surface 用 `ui_kit::kit::markdown` 画，
   widget 不拼文本、不插值、不自己渲染。
 - **判断口径是「解析后的目录值」**：`Notice::is_markdown(&Translate)` 解析当前语言的文案，含 HTML 标签 / markdown 链接、
   图片 / `**强调**` / 行内代码就是富文本，否则是一句话。同一 key 在不同语言可以一边富文本、一边纯文本。widget 侧只报
@@ -319,7 +319,7 @@ cx.handle() / cx.spawn(future) / cx.runtime()
 - **颜色必须经 `ThemeHandle` 在 `bind_style` 里读**（G3）：挂载期把 `theme.role(..)` 拷成常量，换外观后颜色会留在旧主题。
   `bind_style` 闭包里用 `read` 作为 `ThemeHandle::role` 的读上下文。整段 markdown / 逐 run 颜色的静态载荷由
   `MarkdownNode::sync` 按外观重建——widget 正文里的富文本用 `MarkdownNode` 而不是自己挂死颜色。
-- 尺寸 / 字号取 `base_ui::theme` 的令牌或 kit 组件的尺寸档，不写字面 px。
+- 尺寸 / 字号取 `ui_kit::theme` 的令牌或 kit 组件的尺寸档，不写字面 px。
 
 ---
 
@@ -450,7 +450,7 @@ if generation != self.seen {
 - 被隐藏的 spinner 不空转：占位切到正文时框架释放占位组件，widget 不需要操心；**widget 自己动画**时只在有可见位移时
   `request_frame`，收敛立刻停，`reduce_motion` 为真直接落终值。
 - 调试选择器：框架占用 `WIDGET_SURFACE` / `WIDGET_SLOT` / `WIDGET_CONTENT` / `WIDGET_PLACEHOLDER` / `WIDGET_BANNER` 与
-  `widget.{placeholder,banner}.action.*`；富文本 notice 的根是 `MARKDOWN`；kit / base_ui 组件有自己的选择器；widget 自媒体
+  `widget.{placeholder,banner}.action.*`；富文本 notice 的根是 `MARKDOWN`；kit / ui_kit 组件有自己的选择器；widget 自媒体
   用 `TEST_*` 或自有前缀。
 
 ---
@@ -810,8 +810,8 @@ W1a2 追加登记的两处 `list` 代价：① **`List::push` 每条都重建可
 
 ### 15.4 正文 / 次要文本排版令牌（theme 后续批）
 
-`base_ui::theme` 目前只有**控件尺寸阶梯**（`theme/components.rs` 的 `SizeTokens.font_size = 12/14`），**没有正文排版
-令牌**；W1a 的正文因此写了字面 px（标题 / 内容 `13.0`、时间 `11.0`），既违反 §7「尺寸 / 字号取 `base_ui::theme` 令牌或
+`ui_kit::theme` 目前只有**控件尺寸阶梯**（`theme/components.rs` 的 `SizeTokens.font_size = 12/14`），**没有正文排版
+令牌**；W1a 的正文因此写了字面 px（标题 / 内容 `13.0`、时间 `11.0`），既违反 §7「尺寸 / 字号取 `ui_kit::theme` 令牌或
 kit 尺寸档，不写字面 px」，也与旧实现漂移（旧：标题 / 内容走主题正文档，时间 `text_xs()` = 12 px）。
 
 W1a2 的当前写法：`UnifiedSize::Medium.text_size()`（14，标题 / 内容）/ `UnifiedSize::Small.text_size()`（12，时间）——
@@ -841,7 +841,7 @@ P3-1h 冻结 `cx.unique_key` 后，**已迁移**代码里两类写法要在各�
 
 ### 15.6 `kit::tooltip` 内容没有宽度上限（kit 后续批）
 
-旧 `base_ui::tooltip` 的内容是调用方自己给的容器（W3a 的旧实现是 `div().max_w(px(320.0)).text_xs()`），所以长句在窄 pane 里按
+旧 `ui_kit::tooltip` 的内容是调用方自己给的容器（W3a 的旧实现是 `div().max_w(px(320.0)).text_xs()`），所以长句在窄 pane 里按
 320 px 换行。`kit::tooltip` 的 `TooltipContent` 只带文本，面板样式没有宽度选项（`kit/tooltip.rs` 的面板只有 padding / 背景 /
 圆角），长句按 pane 宽度换行，换行位置与旧实现不同。**登记 kit 后续批**：`TooltipOptions` 增 `max_width`（或让
 `TooltipContent` 带布局选项）；在此之前 W 批只登记偏差，不自己给浮层再包一层容器（W3a 的 `info_history` / `info_yearly`

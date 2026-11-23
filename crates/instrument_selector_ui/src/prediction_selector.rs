@@ -8,23 +8,6 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use app_config::settings::Language;
-use base_ui::{
-    kit::{
-        badge::Badge,
-        button::Button,
-        dialog::{Dialog, DialogBuilder},
-        empty_state::EmptyState,
-        icon::IconKind,
-        input::{self, InputNode, InputSpec, InputState},
-        select::{Select, SelectItem, SelectOptions},
-        size::{UnifiedSizable, UnifiedSize},
-        spinner::Spinner,
-        tab_bar::{IndicatorAnimation, TabBar, TabBarOptions, TabItem},
-        tooltip::{Tooltip, TooltipContent, TooltipOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::{
     market::{
@@ -55,6 +38,23 @@ use ui_core::{
     paint::{primitive::Border, style::StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        badge::Badge,
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        empty_state::EmptyState,
+        icon::IconKind,
+        input::{self, InputNode, InputSpec, InputState},
+        select::{Select, SelectItem, SelectOptions},
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+        tab_bar::{IndicatorAnimation, TabBar, TabBarOptions, TabItem},
+        tooltip::{Tooltip, TooltipContent, TooltipOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, role::Role},
 };
 use widget::{
     error::TranslatedError,

@@ -65,7 +65,7 @@ GPUI + 一次性整体重写 + 四项目标」约束下，后者折价、前者�
 
 | 委托项       | 报告建议                                                             | 核心理由                                                                                             |
 |--------------|----------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| 引擎职责边界 | ✅ **D15 已定案：核心 + 通用交互机制**（视觉组件/主题/资源留应用层） | 符合 `AGENTS.md` 模块化；避免把 25,710 行 `base_ui` 塞进引擎重演「通用框架膨胀」                     |
+| 引擎职责边界 | ✅ **D15 已定案：核心 + 通用交互机制**（视觉组件/主题/资源留应用层） | 符合 `AGENTS.md` 模块化；避免把 25,710 行 `ui_kit` 塞进引擎重演「通用框架膨胀」                     |
 | GPU 后端     | **三平台原生：D3D12 / Metal / Vulkan**（D7 已定案）                  | 无抽象上限、完整 bindless 与 Windows 原生局部 present；共享 `Scene` 数据契约控制三份代码漂移（§5.9） |
 | 编程模型     | ✅ **D16 已定案：完全重设计（保留式节点树 + 细粒度依赖追踪）**       | 从根上避免 GPUI `notify` 导致的整树重建；与「一次性整体重写、无兼容层」一致                          |
 
@@ -103,7 +103,7 @@ GPUI + 一次性整体重写 + 四项目标」约束下，后者折价、前者�
 | D12 | Q17：文本栈单选                                | **Parley 0.12** + `Fontique` + `HarfRust` + `Skrifa` + `ICU4X`；字形光栅与图集由引擎自建。不选 `cosmic-text` 主链路                                                                                                     |
 | D13 | Q18：像素快照回归                              | **引入**，纳入 v1：三平台离屏渲染 + 图像 diff + golden 入库，作为 RK12 / 三套 shader 一致性的 oracle                                                                                                                    |
 | D14 | Q19：CI 像素回归的渲染设备（D13 与 D8 的交界） | **允许 test-only 软件设备**：Windows WARP / Linux lavapipe / macOS 软件 Metal；**D8 只约束产品运行时**，产品二进制不提供任何软件回退。CI 成本低、可复现，但需接受软件光栅与真实 GPU 的 AA 差异（golden 按设备类型分组） |
-| D15 | Q1：引擎职责边界                               | **按报告建议**：核心 + 通用交互机制；视觉组件 / 主题 / 图标字体等资源留在应用层 `base_ui`（§5.2）                                                                                                                       |
+| D15 | Q1：引擎职责边界                               | **按报告建议**：核心 + 通用交互机制；视觉组件 / 主题 / 图标字体等资源留在应用层 `ui_kit`（§5.2）                                                                                                                       |
 | D16 | Q3：编程模型                                   | **按报告建议**：完全重设计 —— 保留式节点树 + 细粒度依赖追踪（tracked reads），不保留 GPUI 的 `Render`/`IntoElement`/`Entity`/`cx.notify()` API 形状（§5.3）                                                             |
 | D17 | Q5：字体策略                                   | **按报告建议（选项 A）**：继续用系统字体 + `Fontique`/`Parley` 回退，明确 zh-CN CJK 字体栈；**零二进制体积增长**，不要求三平台像素级一致，不内化 OFL 字体（§8.2）                                                       |
 | D18 | Q7：一次性重写的发布窗口                       | **主干冻结窗口**：约定一段时间内不发布、集中重写主干；**不选**长期特性分支方案，**双栈/适配层渐进替换仍排除**（§9.1）                                                                                                   |
@@ -128,7 +128,7 @@ GPUI + 一次性整体重写 + 四项目标」约束下，后者折价、前者�
 - **D14 追加（D8 边界澄清）**：**D8 的「不提供 GLES / 软件 / 无 GPU 回退」仅约束产品运行时二进制**。测试基建允许使用 test-only
   软件渲染设备（WARP / lavapipe / 软件 Metal），这类设备**不编译进发布物、不作为启动兜底、不进入 `cfg` 产品分支**。golden
   需按「设备类型」分组，避免软件光栅与真实 GPU 的 AA 差异造成误报。
-- **D15 追加**：引擎只内化「行为」（窗口/事件/节点树/布局/文本/绘制/交互机制/无障碍/测试 harness）；`base_ui` 视觉组件、主题语义色、54
+- **D15 追加**：引擎只内化「行为」（窗口/事件/节点树/布局/文本/绘制/交互机制/无障碍/测试 harness）；`ui_kit` 视觉组件、主题语义色、54
   图标 + 品牌图 + 预览图 + WAV、`IconKind → path`、widget 业务与几何、i18n 全部留在应用层。
 - **D16 追加**：不追求 GPUI API 兼容；`Canvas` / `Geometry` 作为一等图元逃生口，让 K 线/地图不必挤进 box 树。
 - **D17 追加**：不内化字体文件、不做子集化工具链；CJK 字体栈需写成显式配置（PingFang SC / Microsoft YaHei / Noto Sans CJK
@@ -143,7 +143,7 @@ GPUI + 一次性整体重写 + 四项目标」约束下，后者折价、前者�
 |------------------------------------------------------------------------------------|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 不保留向后兼容、不加兼容层 / migration / fallback                                  | ✅ 一致        | D3 明确一次性重写；PoC 是**独立旁路原型**，不是兼容层                                                                                                                     |
 | 保持简单、不做预防性抽象                                                           | ⚠️ 需警惕      | 三套 renderer 按 `#[cfg(target_os)]` 分模块、**编译期确定单一后端**；共享的是 `Scene` / `GpuPrimitive` 数据契约，**不是**可插拔 renderer trait 或运行时后端枚举（§5.9.1） |
-| 保持模块化、禁止巨型文件                                                           | ✅ 一致        | §6.1 给出 crate/模块拆分；现有 `candlestick/chart/paint.rs` 5,793 行、`base_ui/color_picker.rs` 4,052 行应在重写时按职责拆开                                              |
+| 保持模块化、禁止巨型文件                                                           | ✅ 一致        | §6.1 给出 crate/模块拆分；现有 `candlestick/chart/paint.rs` 5,793 行、`ui_kit/color_picker.rs` 4,052 行应在重写时按职责拆开                                              |
 | 优先复用成熟方案、先查官方文档                                                     | ✅ 一致        | §3 全部基于一手资料核对版本/成熟度；§11 选型矩阵                                                                                                                          |
 | 强类型错误、强类型 JSON、SmolStr、ahash、Bytes                                     | ✅ 一致        | 引擎新增类型须沿用；本报告不引入 `serde_json::Value` 等                                                                                                                   |
 | 测试组织（unit 在 `src/` 同模块 / integration 在 `tests/`）                        | ✅ 一致        | §6.8 的 headless harness 按此组织                                                                                                                                         |
@@ -235,11 +235,11 @@ flowchart LR
 | 依赖 `gpui-kit` 的 crate         | **36**（其中 6 个 crate 完全不依赖）                                                                                                                                                  |
 | 全仓自写 `.rs`                   | **770 个 / 440,128 行**                                                                                                                                                               |
 | UI 相关 crate `src/`             | **370 个 / 262,460 行**（约 60%）                                                                                                                                                     |
-| 最大单文件                       | `candlestick/src/view.rs` 7,528、`watch_list/src/view.rs` 6,497、`candlestick/src/chart/paint.rs` 5,793、`base_ui/src/color_picker.rs` 4,052（大文件多含 60–75% 内联测试）            |
+| 最大单文件                       | `candlestick/src/view.rs` 7,528、`watch_list/src/view.rs` 6,497、`candlestick/src/chart/paint.rs` 5,793、`ui_kit/src/color_picker.rs` 4,052（大文件多含 60–75% 内联测试）            |
 | 测试属性                         | `#[gpui_kit::test]` **1,609**、`#[test]` 2,946、`#[tokio::test]` 813                                                                                                                  |
 | 测试探针                         | `debug_bounds` 1,212、`debug_selector` 390、`run_until_parked` 561、`TestAppContext` 2,069、`VisualTestContext` 345                                                                   |
 | 截图/像素快照断言                | **0**（无 `assert_snapshot!` / `insta::` / `assert_image` 等）                                                                                                                        |
-| 嵌入资源 `crates/base_ui/assets` | 85 个文件 / 约 **760,746 B**：54 个 Phosphor SVG（23,135 B）+ 7 品牌 PNG（18,896 B）+ 23 widget 预览 PNG（372,745 B）+ 1 WAV（345,970 B）                                             |
+| 嵌入资源 `crates/ui_kit/assets` | 85 个文件 / 约 **760,746 B**：54 个 Phosphor SVG（23,135 B）+ 7 品牌 PNG（18,896 B）+ 23 widget 预览 PNG（372,745 B）+ 1 WAV（345,970 B）                                             |
 | **字体资产**                     | **0 个** `.ttf/.otf/.woff*`；无 `load_fonts` / 字体名常量 / 字体回退配置，完全依赖系统字体（`zed-font-kit 0.14.1-zed`：Win DirectWrite / macOS CoreText / Linux FreeType+FontConfig） |
 | 平台特定代码                     | 仅 4 类：Windows `.ico` 资源、macOS 标题栏拖拽、系统代理发现、更新器安装路径；**无托盘 / 原生菜单 / 注册表 / 开机自启 / OS 通知**                                                     |
 | 发布矩阵                         | windows-x64/arm64(NSIS)、macos-x64/arm64(app,dmg)、linux-x64/arm64(deb,appimage)                                                                                                      |
@@ -248,11 +248,11 @@ flowchart LR
 
 | #  | 耦合点                     | 证据（相对路径）                                                                                                                                                                                |
 |----|----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 1  | `Element` 生命周期 / Taffy | `crates/kytrix/src/windows/root/components/workspace/layout.rs:68,166-257`（注释 `PERF: Keep the recursive split topology out of Taffy`）；`crates/base_ui/src/markdown/inline_flow.rs:386-728` |
+| 1  | `Element` 生命周期 / Taffy | `crates/kytrix/src/windows/root/components/workspace/layout.rs:68,166-257`（注释 `PERF: Keep the recursive split topology out of Taffy`）；`crates/ui_kit/src/markdown/inline_flow.rs:386-728` |
 | 2  | 文本塑形 / 字形缓存        | 多处 `window.text_system().shape_line(...)`；`crates/widgets/volume_heatmap/src/chart.rs:139-228` 自建 `ShapedLine` 缓存                                                                        |
 | 3  | 绘制 API                   | `canvas` / `paint_quad` / `paint_path` / `paint_layer` / `ContentMask` / `PathBuilder` / `FillRule`；`candlestick/src/chart/paint.rs`、`global_shipping_chokepoint/src/{scene,paint}.rs`        |
-| 4  | 资源源 / SVG / 图片        | `crates/base_ui/src/assets.rs`（29 行 `AssetSource` + `rust-embed`）；`icon.rs` 的 `IconKind → path` 映射                                                                                       |
-| 5  | 状态契约                   | `Global` + `cx.refresh_windows()`（`base_ui/src/style/theme.rs:27-55`）；`widget/src/view.rs:9-13` 依赖 entity-backed view 身份做缓存                                                           |
+| 4  | 资源源 / SVG / 图片        | `crates/ui_kit/src/assets.rs`（29 行 `AssetSource` + `rust-embed`）；`icon.rs` 的 `IconKind → path` 映射                                                                                       |
+| 5  | 状态契约                   | `Global` + `cx.refresh_windows()`（`ui_kit/src/style/theme.rs:27-55`）；`widget/src/view.rs:9-13` 依赖 entity-backed view 身份做缓存                                                           |
 | 6  | 虚拟列表 / 滚动            | `uniform_list` / `ScrollHandle` / `ScrollbarMode`                                                                                                                                               |
 | 7  | 窗口 / 标题栏              | `WindowOptions` / `TitlebarOptions` / `app_owns_titlebar_drag` / `WindowControlArea` / `WindowAppearance`                                                                                       |
 | 8  | 剪贴板                     | `ClipboardItem` + `write_to_clipboard` / `read_from_clipboard`                                                                                                                                  |
@@ -263,10 +263,10 @@ flowchart LR
 
 - `candlestick/src/chart/paint.rs`：**约 70–80% 是纯数值/几何/格式化**，绘制入口集中在 `chart_canvas` + `paint_chart` +
   `ChartPainter`，收益/成本比最好。
-- `base_ui/src/markdown/inline_flow.rs`：**约 900+ 行折行/测量/对齐算法可移植**，但需先抽出「文本塑形 / 宽度测量 / 像素」接口层；约
+- `ui_kit/src/markdown/inline_flow.rs`：**约 900+ 行折行/测量/对齐算法可移植**，但需先抽出「文本塑形 / 宽度测量 / 像素」接口层；约
   400 行 Element/命中盒/事件代码必须重写。
 - `workspace/layout.rs`：**约一半可移植**（`split_child_bounds` 等纯几何），替换 Element 生命周期与像素对齐接口即可。
-- `base_ui/src/button.rs`：**约 95% 必须重写**（几乎全是 `IntoElement`/`RenderOnce`/`Styled`/`InteractiveElement` 绑定）。
+- `ui_kit/src/button.rs`：**约 95% 必须重写**（几乎全是 `IntoElement`/`RenderOnce`/`Styled`/`InteractiveElement` 绑定）。
 - 现成范式：`.docs/global-shipping-chokepoint-osm-roads-plan.md:556` 已提出「把 `paint_map` 拆成返回 `MapLayers` 的纯函数（不碰
   `Window`），测试只断言几何/顺序，绘制层只做无逻辑转发」——这正是重写时应推广的分层方式。
 
@@ -313,7 +313,7 @@ flowchart LR
 
 | 你最初的想法                                             | 现状事实                                                                                                                                               |
 |----------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 「不需要通用 GUI 框架，组件能否直接内化进引擎」          | 组件库 `base_ui` 是自建的（25,710 行），`gpui-component` 的 75+ 组件**根本没启用**；真正通用且未用的是 `gpui-pre` 引擎本身。D2 已排除内化 GPUI 代码    |
+| 「不需要通用 GUI 框架，组件能否直接内化进引擎」          | 组件库 `ui_kit` 是自建的（25,710 行），`gpui-component` 的 75+ 组件**根本没启用**；真正通用且未用的是 `gpui-pre` 引擎本身。D2 已排除内化 GPUI 代码    |
 | 「字体、图标能否内化进引擎」                             | 图标极小（54 SVG / 23 KB）且已 `rust-embed` 内嵌；**字体完全空白**（0 资产、0 配置），全靠系统字体。两者都可内化，但归属需要按 §5.2 的边界决定         |
 | 「尽可能用最新稳定 GPU 技术，通过 shader 优化 GUI 绘制」 | GPUI 已 shader 化（§2.2）。真正可提升的是：静态 VBO + uniform、自定义 draw call、bindless 图集、compute 路径光栅化、脏矩形局部重绘、HDR/色彩管理（§7） |
 
@@ -537,11 +537,11 @@ D8 的现代基线收敛，但仍需真实硬件验证（RK5 / RK12）。
 | 归属           | 内容                                                                                                                                                                                                                                                                                                                                                                  |
 |----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **引擎内化**   | 应用/窗口生命周期、事件循环与命中测试、**保留式节点树与依赖追踪**、布局引擎 + 自定义 measure/root 逃生口、文本塑形与字体回退、字形图集、统一 `Scene`/Primitive 契约与实例缓冲、**静态几何 VBO 与自定义 `Geometry` 图元**、三平台 device/管线/同步/present、图集与资源缓存、**脏矩形与图层合成**、焦点/滚动/虚拟列表/浮层/动画 tick、无障碍树、纯 CPU 无头测试 harness |
-| **应用层保留** | `base_ui` 视觉组件与设计系统（按钮/输入/弹窗/菜单/表格/颜色选择器…）、主题语义色与深浅色、54 图标 + 品牌图 + widget 预览图 + WAV、`IconKind → path` 映射、所有 widget 业务与几何逻辑、i18n、widget 注册/目录                                                                                                                                                          |
+| **应用层保留** | `ui_kit` 视觉组件与设计系统（按钮/输入/弹窗/菜单/表格/颜色选择器…）、主题语义色与深浅色、54 图标 + 品牌图 + widget 预览图 + WAV、`IconKind → path` 映射、所有 widget 业务与几何逻辑、i18n、widget 注册/目录                                                                                                                                                          |
 
 **理由**：
 
-1. `AGENTS.md` §1.3 要求清晰模块边界。把 25,710 行 `base_ui` 塞进引擎，等于重新造一个「通用组件框架」，正是 D1 想摆脱的东西。
+1. `AGENTS.md` §1.3 要求清晰模块边界。把 25,710 行 `ui_kit` 塞进引擎，等于重新造一个「通用组件框架」，正是 D1 想摆脱的东西。
 2. `gpui-kit` 自身的分层哲学（行为归 `gpui-base`，表现归 `gpui-component`）也支持这一刀。
 3. 交互机制（焦点、滚动、虚拟列表、浮层、命中盒）**必须**在引擎内，否则 1,609 个测试与所有组件都要各自实现一遍，反而更重。
 4. 资源只有约 761 KB，放应用层几乎零成本；放引擎会让引擎与业务图标耦合（新 widget 加图标就要改引擎）。
@@ -582,7 +582,7 @@ D8 的现代基线收敛，但仍需真实硬件验证（RK5 / RK12）。
 ```mermaid
 flowchart TB
 subgraph APP[应用层 crates/*_ui, widgets/*]
-A1[base_ui 设计系统<br/>按钮/输入/弹窗/菜单/表格]
+A1[ui_kit 设计系统<br/>按钮/输入/弹窗/菜单/表格]
 A2[主题语义色 / 深浅色]
 A3[图标/品牌/预览图/WAV 资源]
 A4[Widget 业务与几何<br/>K线/地图/订单簿/…]
@@ -1021,13 +1021,13 @@ flowchart LR
   lane。
 - 帧调度：事件 → 状态写入 → dirty 计算 → 局部布局 → lane 复用/重建 → damage rect 合并 → GPU 提交。空闲无帧。
 - **不引入** GPUI 式 `Global + refresh_windows()` 广播；主题/语言切换走显式语义信号，只让读取过它们的节点失效。这一条同时解决
-  `base_ui/src/style/theme.rs` 里「Global 不是一等 observable」的痛点。
+  `ui_kit/src/style/theme.rs` 里「Global 不是一等 observable」的痛点。
 
 ### 6.4 文本与字体
 
 - 文本模块职责：字体枚举/回退（Fontique 或 cosmic-text 的 fontdb）、塑形、断行/bidi、字形轮廓与光栅、图集与 `ShapedLine` 缓存。
 - **必须保留现有能力**：`ShapedLine` 按 `text + color + font_size + TextStyle` 命中的缓存（多个图表 widget 在用），以及
-  `base_ui/src/markdown/inline_flow.rs` 的自定义行内流（链接下划线、kbd 盒、行内图片、折行）。设计上把「测量宽度 / 塑形 /
+  `ui_kit/src/markdown/inline_flow.rs` 的自定义行内流（链接下划线、kbd 盒、行内图片、折行）。设计上把「测量宽度 / 塑形 /
   片段放置」抽成不依赖 Window 的纯函数——这正是 `.docs/.../osm-roads-plan.md:556` 的既有范式。
 - **补齐现有已知限制**（`inline_flow.rs:23-56`）：文本可选中/复制、a11y 角色、行内图片基线对齐、kbd 参与折行、右对齐行尾空白。
 
@@ -1168,7 +1168,7 @@ D3D12 timestamp query / Vulkan `vkCmdWriteTimestamp` / Metal GPU counters，各�
 
 ### 8.1 「现有组件能否直接内化到 GUI 引擎？」
 
-- **事实**：`base_ui` 是仓库自建设计系统（39 个 `pub mod` / 25,710 行），`gpui-component` 的 75+ 组件**从未启用**（
+- **事实**：`ui_kit` 是仓库自建设计系统（39 个 `pub mod` / 25,710 行），`gpui-component` 的 75+ 组件**从未启用**（
   `default-features = false`）。所谓「现在使用的那些组件」主要是自研的，少量交互引擎（InputState / Table / Tree / Tabs /
   Scrollbar / Tooltip / HoverCard / Progress）来自 `gpui_kit::base`。
 - **法律上**：`gpui-kit` / `gpui-pre` / `gpui-base` 均为 Apache-2.0，项目为 GPLv3（Apache-2.0 与 GPLv3
@@ -1180,10 +1180,10 @@ D3D12 timestamp query / Vulkan `vkCmdWriteTimestamp` / Metal GPU counters，各�
 ### 8.2 「字体、图标等等，能否直接内化进引擎？」
 
 - **图标**：54 个 Phosphor SVG（23 KB）+ 7 品牌 PNG（19 KB）+ 23 预览 PNG（373 KB）+ 1 WAV（346 KB），已通过 `rust-embed` 编译进二进制。
-  **可以内化，但不建议**：放在应用层的 `base_ui` 更合理（新增 widget 图标不必改引擎）；引擎只内化「资源→GPU 图集」的机制。
+  **可以内化，但不建议**：放在应用层的 `ui_kit` 更合理（新增 widget 图标不必改引擎）；引擎只内化「资源→GPU 图集」的机制。
     - **技术升级建议**：把这 54 个 SVG 在**构建期**编译成路径/SDF 数据（或预生成图集），运行时不再走 `resvg` CPU
       光栅化；这是「shader 化」在图标上真正能拿到的收益。
-    - **合规缺口**：`crates/base_ui/assets/icons/phosphoricons` 下**没有 LICENSE / 署名文件**；Phosphor Icons 上游为
+    - **合规缺口**：`crates/ui_kit/assets/icons/phosphoricons` 下**没有 LICENSE / 署名文件**；Phosphor Icons 上游为
       MIT（【二手】多方许可清单一致），分发时应补齐 MIT 文本与版权声明。
 - **字体**：**当前是空白**——0 个字体文件、0 个字体名常量、无 `load_fonts`、无字体回退配置，完全依赖系统字体。因此「内化字体」不是「搬进来」，而是「从零建立字体策略」。
     - ✅ **选项 A（D17 已定案「按建议」）**：继续用系统字体 + `Fontique` / `Parley` 回退（D12 已锁定 Parley 系），明确 zh-CN 的
@@ -1227,7 +1227,7 @@ draw call、bindless 图集、脏矩形、compute 路径，以及构建期 SVG �
 3. **节点树与依赖追踪**：布局（taffy + 逃生口）、命中测试、焦点/滚动/浮层。
 4. **文本与资源**：shaping + 图集 + 图标构建期转换 + `ResourceCache`。
 5. **无头测试 harness**：探针 / 事件注入 / 帧同步；先迁移 1–2 个 crate 的测试验证语义等价。
-6. **UI 层重写**：按「纯函数 + 无逻辑绘制转发」范式，先 `base_ui` 基础组件，再 `widget` 契约，再各 `*_ui` 页面，最后 20 个
+6. **UI 层重写**：按「纯函数 + 无逻辑绘制转发」范式，先 `ui_kit` 基础组件，再 `widget` 契约，再各 `*_ui` 页面，最后 20 个
    widget（K 线/地图优先，因为收益最大）。
 7. **平台层收尾**：三平台标题栏、剪贴板、深浅色、无障碍、安装包资源、6 个 CI target。
 8. **删除**：`gpui-kit` 依赖（含 36 个 crate 的 dev-dependency `test-support`）、`Cargo.lock` 中整套 `gpui-*` 包族、
@@ -1343,12 +1343,12 @@ draw call、bindless 图集、脏矩形、compute 路径，以及构建期 SVG �
 | 节点树 + 细粒度依赖追踪                                             | **XL**     | 正确性（stale drawing）、布局子树复用、命中盒                                                                                       | 参考 Xilem/Masonry pass 与 `zed#63800` 思路           |
 | 布局（taffy + 逃生口）                                              | M          | 分栏拓扑、Markdown 行内流测量闭包                                                                                                   | `layout.rs` 几何算法、`inline_flow.rs` 折行算法       |
 | 文本（Parley shaping / Fontique 回退 / 自建图集 / ShapedLine 缓存） | **XL**     | CJK 回退、emoji、Markdown 行内混排、字形缓存失效                                                                                    | 现有 `ShapedLine` 缓存策略、`i18n` 语料               |
-| 交互机制（焦点/滚动/虚拟列表/浮层/动画）                            | L          | 弹层堆叠、tooltip 定位、拖拽分栏                                                                                                    | `base_ui` 39 个模块的语义                             |
+| 交互机制（焦点/滚动/虚拟列表/浮层/动画）                            | L          | 弹层堆叠、tooltip 定位、拖拽分栏                                                                                                    | `ui_kit` 39 个模块的语义                             |
 | 资源 / 图标构建期转换                                               | S          | SVG→路径/SDF 工具链                                                                                                                 | 54 个 SVG 已就位                                      |
 | 平台层（device/present/标题栏/剪贴板/IME/外观/无障碍）              | M ×3 平台  | 三套同步与资源生命周期、macOS 交通灯、Windows 图标资源、Linux Wayland/X11                                                           | 现有 4 类平台代码                                     |
 | 三套 shader 编译链与视觉 golden 对齐                                | M          | DXC / Metal / SPIR-V 三套工具链接入 CI；`GpuPrimitive` 字节布局与视觉参数一致性回归                                                 | —                                                     |
 | 无头测试 harness                                                    | **XL**     | 1,609 个测试语义迁移、无 `debug_bounds` 依赖                                                                                        | 2,946 + 813 个可保留测试                              |
-| UI 层全量重写（36 crates / 26 万行）                                | **最大项** | 逐个文件按 §9.3 判定；`base_ui` 25,710 行                                                                                           | 70–80% 图表/几何逻辑可移植                            |
+| UI 层全量重写（36 crates / 26 万行）                                | **最大项** | 逐个文件按 §9.3 判定；`ui_kit` 25,710 行                                                                                           | 70–80% 图表/几何逻辑可移植                            |
 | 像素快照回归基建（D13 / D14）                                       | M          | 三平台离屏渲染、golden 按设备类型分目录、diff 容差、test-only 软件设备接入 CI                                                       | —                                                     |
 | 6 平台 CI / 打包 / 回归                                             | M          | ARM64、deb 依赖、安装包图标                                                                                                         | 现有 `release.yml` / `Packager.toml`                  |
 

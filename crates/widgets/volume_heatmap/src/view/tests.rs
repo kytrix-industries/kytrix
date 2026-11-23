@@ -5,7 +5,6 @@ use std::{
 };
 
 use app_config::{settings::Config, time_zone::DataTimeZone};
-use base_ui::theme::appearance::Appearance;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_model::{
     decimal::Quantity, identifier::VenueId, listing::route::VenueRoute, routing::CapabilityId,
@@ -17,6 +16,7 @@ use ui_core::{
     node::{builder::NodeBuilder, tree::NodeKind},
     paint::canvas::Canvas,
 };
+use ui_kit::theme::appearance::Appearance;
 use widget::{
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
     test_support::WidgetTestApp,

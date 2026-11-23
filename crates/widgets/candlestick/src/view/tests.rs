@@ -7,7 +7,6 @@ use std::{
 };
 
 use app_config::{time_zone::DataTimeZone, widget::VersionedWidgetConfig};
-use base_ui::style_builder::StyleBuilder;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use market_participants_connector::{
     catalog::{
@@ -41,6 +40,7 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::SignalScope},
     test_support::record::PrimitiveKind,
 };
+use ui_kit::style_builder::StyleBuilder;
 use widget::{
     binding::Inbound,
     config::WidgetConfigChange,

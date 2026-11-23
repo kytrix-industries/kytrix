@@ -23,7 +23,7 @@ tokio-util.workspace = true
 
 # Workspace members
 app_config.workspace = true
-base_ui.workspace = true
+ui_kit.workspace = true
 kytrix_service_provider.workspace = true
 market_participants_connector.workspace = true
 market_participants_model.workspace = true

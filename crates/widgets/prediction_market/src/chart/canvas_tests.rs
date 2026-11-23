@@ -1,6 +1,5 @@
 use std::{rc::Rc, sync::Arc};
 
-use base_ui::theme::{appearance::Appearance, role::Role};
 use i18n::{embedded, language::codes::LanguageCode, translate::Translate};
 use market_participants_model::{
     decimal::{Fraction, Ratio},
@@ -13,6 +12,7 @@ use ui_core::{
     test_support::record::PrimitiveKind,
     window::WindowId,
 };
+use ui_kit::theme::{appearance::Appearance, role::Role};
 use widget::test_support::WidgetTestApp;
 
 use super::{canvas::ChartCanvas, geometry::ChartLayout};
@@ -151,7 +151,7 @@ impl ChartHarness {
     fn resize(&mut self, width: f32, height: f32) {
         let page = self.page;
         self.app.with_cx(|cx| {
-            let style = base_ui::style_builder::StyleBuilder::new()
+            let style = ui_kit::style_builder::StyleBuilder::new()
                 .width(width)
                 .height(height)
                 .flex_col()
@@ -183,7 +183,7 @@ fn page(app: &mut WidgetTestApp, width: f32, height: f32) -> NodeId {
         NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_CANVAS_PAGE")
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .width(width)
                     .height(height)
                     .flex_col()

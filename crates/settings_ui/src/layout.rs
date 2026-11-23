@@ -1,11 +1,3 @@
-use base_ui::{
-    kit::{
-        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
-        select::{Select, SelectItem, SelectOptions},
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
-};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     a11y::{A11yOverride, A11yRole},
@@ -20,6 +12,14 @@ use ui_core::{
     },
     text::{TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
+        select::{Select, SelectItem, SelectOptions},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 
 use crate::host::SettingsHost;

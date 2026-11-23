@@ -1,11 +1,4 @@
 use app_config::settings::Config;
-use base_ui::{
-    kit::{
-        list::SelectionMode,
-        table::{Column, ColumnAlign, TableOptions},
-    },
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{t_smol, translate::Translate};
 use market_participants_connector::catalog::{display::catalog::DisplaySnapshot, store::Catalog};
 use market_participants_model::{
@@ -18,6 +11,13 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
+};
+use ui_kit::{
+    kit::{
+        list::SelectionMode,
+        table::{Column, ColumnAlign, TableOptions},
+    },
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::time_zone::data_time_zone;
 

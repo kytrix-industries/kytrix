@@ -171,7 +171,7 @@ fn rasterize(stem: &str, tree: &usvg::Tree, side: u32) -> Vec<u8> {
 
 fn write_manifest(out_dir: &Path, built: &[String]) {
     let mut manifest = String::from(
-        "// 由 crates/base_ui/build.rs 生成：全部已光栅化图标的 stem（字母序）。不要手改。\npub const \
+        "// 由 crates/ui_kit/build.rs 生成：全部已光栅化图标的 stem（字母序）。不要手改。\npub const \
          BUILT_ICON_FILES: &[&str] = &[\n",
     );
     for stem in built {
@@ -186,5 +186,5 @@ fn write_manifest(out_dir: &Path, built: &[String]) {
 }
 
 fn fail(message: &str) -> ! {
-    panic!("base_ui/build.rs: {message}");
+    panic!("ui_kit/build.rs: {message}");
 }

@@ -1,5 +1,5 @@
-use base_ui::theme::{resolved::Theme, role::Role};
 use ui_core::paint::color::Color;
+use ui_kit::theme::{resolved::Theme, role::Role};
 
 use crate::ship::{SHIP_TYPE_COUNT, colours};
 
@@ -42,7 +42,7 @@ impl MapColors {
 
 #[cfg(test)]
 mod tests {
-    use base_ui::theme::appearance::Appearance;
+    use ui_kit::theme::appearance::Appearance;
 
     use super::*;
 

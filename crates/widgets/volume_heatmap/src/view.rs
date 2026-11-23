@@ -1,17 +1,6 @@
 use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        icon::IconKind,
-        select::{Select, SelectItem, SelectOptions},
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::role::Role,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::{
     connector::MarketParticipantsConnector,
@@ -30,6 +19,17 @@ use ui_core::{
     paint::style::StylePatch,
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::IconKind,
+        select::{Select, SelectItem, SelectOptions},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::role::Role,
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -936,8 +936,8 @@ impl VolumeHeatMapWidget {
         let window = cx.window();
         let key = cx.unique_key(VENUE_KEY_SUFFIX);
         let theme = cx.theme().clone();
-        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
-        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
+        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
             move |app, chosen| {
                 let Some(id) = chosen.first() else {

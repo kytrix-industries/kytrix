@@ -1,14 +1,5 @@
 use std::{borrow::Cow, sync::Arc};
 
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
-        spinner::Spinner,
-    },
-    theme::role::Role,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -18,6 +9,15 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::style::StylePatch,
     text::TextStyle,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        spinner::Spinner,
+    },
+    theme::role::Role,
 };
 
 use crate::{
@@ -32,7 +32,7 @@ struct EmbeddedAssets;
 
 impl MarkdownAssets for EmbeddedAssets {
     fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
-        base_ui::kit::assets::bytes(path).map(Cow::Borrowed)
+        ui_kit::kit::assets::bytes(path).map(Cow::Borrowed)
     }
 }
 

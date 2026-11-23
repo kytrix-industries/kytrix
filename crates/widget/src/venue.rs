@@ -25,11 +25,11 @@ impl VenueDisplay for VenueId {
 
     fn asset_path(&self) -> &'static str {
         match self {
-            Self::Binance => base_ui::kit::brand::BINANCE,
-            Self::Hyperliquid => base_ui::kit::brand::HYPERLIQUID,
-            Self::Longbridge => base_ui::kit::brand::LONGBRIDGE,
-            Self::Okx => base_ui::kit::brand::OKX,
-            Self::Polymarket => base_ui::kit::brand::POLYMARKET,
+            Self::Binance => ui_kit::kit::brand::BINANCE,
+            Self::Hyperliquid => ui_kit::kit::brand::HYPERLIQUID,
+            Self::Longbridge => ui_kit::kit::brand::LONGBRIDGE,
+            Self::Okx => ui_kit::kit::brand::OKX,
+            Self::Polymarket => ui_kit::kit::brand::POLYMARKET,
         }
     }
 
@@ -204,10 +204,10 @@ mod tests {
     #[test]
     fn every_venue_should_state_the_logo_its_brand_draws() {
         for (venue, path) in [
-            (VenueId::Binance, base_ui::kit::brand::BINANCE),
-            (VenueId::Okx, base_ui::kit::brand::OKX),
-            (VenueId::Hyperliquid, base_ui::kit::brand::HYPERLIQUID),
-            (VenueId::Longbridge, base_ui::kit::brand::LONGBRIDGE),
+            (VenueId::Binance, ui_kit::kit::brand::BINANCE),
+            (VenueId::Okx, ui_kit::kit::brand::OKX),
+            (VenueId::Hyperliquid, ui_kit::kit::brand::HYPERLIQUID),
+            (VenueId::Longbridge, ui_kit::kit::brand::LONGBRIDGE),
         ] {
             assert_eq!(venue.asset_path(), path, "{venue} states its own logo");
             assert_eq!(
@@ -224,12 +224,12 @@ mod tests {
             (
                 LanguageCode::En,
                 ["Binance", "OKX"],
-                base_ui::kit::brand::BINANCE,
+                ui_kit::kit::brand::BINANCE,
             ),
             (
                 LanguageCode::ZhCn,
                 ["币安", "欧易"],
-                base_ui::kit::brand::BINANCE,
+                ui_kit::kit::brand::BINANCE,
             ),
         ] {
             let notice = Notice::MarketNotLoaded {

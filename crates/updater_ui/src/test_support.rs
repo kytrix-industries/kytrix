@@ -6,10 +6,6 @@ use std::{
 };
 
 use ahash::AHashMap;
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::{appearance::Appearance, handle::ThemeHandle},
-};
 use download_provider::{
     request::DownloadRequest,
     task::{DownloadEvent, DownloadId, DownloadStatus, DownloadTask},
@@ -20,6 +16,10 @@ use ui_core::{
     node::{id::NodeId, tree::NodeTree},
     test_support::app::TestApp,
     window::{WindowId, WindowOptions},
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::{appearance::Appearance, handle::ThemeHandle},
 };
 use url::Url;
 use widget::{frame::FrameRouter, services::WidgetServices};

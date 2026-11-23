@@ -7,7 +7,7 @@ edition.workspace = true
 [dependencies]
 app_config = { workspace = true }
 base64 = { workspace = true }
-base_ui = { workspace = true }
+ui_kit = { workspace = true }
 bytes = { workspace = true }
 dicebear-core = { workspace = true }
 dicebear-styles = { workspace = true, features = ["gaze"] }

@@ -6,14 +6,6 @@ use std::{
 };
 
 use app_config::translation::{DownloadSite, TranslationModel};
-use base_ui::{
-    kit::{
-        input::{self, InputNode, InputSpec, InputState},
-        select::{Select, SelectItem, SelectOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, role::Role},
-};
 use i18n::{t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -23,6 +15,14 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::style::PaintSpec,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        input::{self, InputNode, InputSpec, InputState},
+        select::{Select, SelectItem, SelectOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, role::Role},
 };
 
 use super::table::TranslationTable;

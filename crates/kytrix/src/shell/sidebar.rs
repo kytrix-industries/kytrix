@@ -1,9 +1,4 @@
 use app_config::ui::SidebarMode;
-use base_ui::{
-    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -12,6 +7,11 @@ use ui_core::{
     event::Event,
     node::{id::NodeId, signal::Signal},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{button::Button, icon::IconKind, size::UnifiedSizable},
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 
 use super::{

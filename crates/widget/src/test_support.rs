@@ -1,9 +1,5 @@
 use std::{rc::Rc, sync::Arc, time::Duration};
 
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, translate::Translate, translator::types::I18n};
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
@@ -33,6 +29,10 @@ use ui_core::{
         record::{PrimitiveKind, PrimitiveRecord},
     },
     window::{FrameIndex, WindowId},
+};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
 };
 
 use crate::{
@@ -122,7 +122,7 @@ impl WidgetTestApp {
     pub fn with_translate(translate: Translate) -> Self {
         let mut app = TestApp::new();
         let window = app.window_id();
-        let theme = ThemeHandle::new(app.app_mut(), base_ui::theme::appearance::Appearance::Light);
+        let theme = ThemeHandle::new(app.app_mut(), ui_kit::theme::appearance::Appearance::Light);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -818,7 +818,6 @@ mod tests {
     };
 
     use app_config_provider::notification::ConfigNotification;
-    use base_ui::theme::{appearance::Appearance, role::Role};
     use bytes::Bytes;
     use i18n::language::codes::LanguageCode;
     use market_participants_connector::{
@@ -842,6 +841,7 @@ mod tests {
         test_support::record::PrimitiveKind,
         text::TextStyle,
     };
+    use ui_kit::theme::{appearance::Appearance, role::Role};
 
     use super::{CanvasPrimitive, FixtureFailure, WaitingWidget, WidgetTestApp};
     use crate::{

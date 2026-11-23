@@ -1,5 +1,16 @@
 use app_config::settings::AccountWalletKind;
-use base_ui::{
+use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
+use kytrix_service_provider::auth::model::PlanCode;
+use smol_str::{SmolStr, format_smolstr};
+use ui_core::{
+    app::App,
+    error::EngineError,
+    node::{builder::NodeBuilder, id::NodeId, image::ImageFit, signal::Signal, tree::NodeTree},
+    paint::style::StylePatch,
+    text::{TextStyle, TextWrap},
+    window::WindowId,
+};
+use ui_kit::{
     kit::{
         badge::Badge,
         brand::{Brand, BrandKind},
@@ -12,17 +23,6 @@ use base_ui::{
     },
     style_builder::StyleBuilder,
     theme::{handle::ThemeHandle, role::Role},
-};
-use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
-use kytrix_service_provider::auth::model::PlanCode;
-use smol_str::{SmolStr, format_smolstr};
-use ui_core::{
-    app::App,
-    error::EngineError,
-    node::{builder::NodeBuilder, id::NodeId, image::ImageFit, signal::Signal, tree::NodeTree},
-    paint::style::StylePatch,
-    text::{TextStyle, TextWrap},
-    window::WindowId,
 };
 
 use crate::{account::SignedInAccount, host::ProfileHost, profile::FaceTexture};
@@ -474,16 +474,16 @@ fn tree_mut(app: &mut App, window: WindowId) -> Result<&mut NodeTree, EngineErro
         .tree_mut())
 }
 
-fn icon_error(window: WindowId, error: base_ui::kit::icon::IconError) -> EngineError {
+fn icon_error(window: WindowId, error: ui_kit::kit::icon::IconError) -> EngineError {
     match error {
-        base_ui::kit::icon::IconError::Node(error) => error,
+        ui_kit::kit::icon::IconError::Node(error) => error,
         _ => EngineError::UnknownWindow { window },
     }
 }
 
-fn brand_error(window: WindowId, error: base_ui::kit::brand::BrandError) -> EngineError {
+fn brand_error(window: WindowId, error: ui_kit::kit::brand::BrandError) -> EngineError {
     match error {
-        base_ui::kit::brand::BrandError::Node(error) => error,
+        ui_kit::kit::brand::BrandError::Node(error) => error,
         _ => EngineError::UnknownWindow { window },
     }
 }

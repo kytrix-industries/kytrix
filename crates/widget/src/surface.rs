@@ -1,8 +1,3 @@
-use base_ui::{
-    kit::button::Button,
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::role::Role,
-};
 use i18n::language::codes::LanguageCode;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -13,6 +8,11 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::style::StylePatch,
     text::TextStyle,
+};
+use ui_kit::{
+    kit::button::Button,
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::role::Role,
 };
 
 use crate::{
@@ -295,7 +295,7 @@ fn build_placeholder(
 fn build_shell(
     cx: &mut WidgetCx<'_>,
     root: NodeId,
-    theme: base_ui::theme::handle::ThemeHandle,
+    theme: ui_kit::theme::handle::ThemeHandle,
     presentation: ui_core::node::signal::Signal<Presentation>,
 ) -> Result<(NodeId, NodeId, NodeId), EngineError> {
     let slot_theme = theme;

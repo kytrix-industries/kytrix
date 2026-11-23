@@ -4,25 +4,6 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use base_ui::{
-    kit::{
-        alert::AlertBuilder,
-        brand::{Brand, BrandKind},
-        button::Button,
-        dialog::{Dialog, DialogBuilder},
-        icon::{IconKind, IconSpec},
-        interactive::Interactive,
-        layer::Band,
-        overlay::{
-            Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayOptions, OverlaySurface, Placement,
-        },
-        size::{UnifiedSizable, UnifiedSize},
-        spinner::Spinner,
-        tooltip::{Tooltip, TooltipContent, TooltipOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::connector::VenueLoadError;
 use market_participants_model::identifier::VenueId;
@@ -41,6 +22,25 @@ use ui_core::{
     paint::style::StylePatch,
     text::{TextOverflow, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        alert::AlertBuilder,
+        brand::{Brand, BrandKind},
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        icon::{IconKind, IconSpec},
+        interactive::Interactive,
+        layer::Band,
+        overlay::{
+            Anchor, DismissPolicy, Overlay, OverlayA11y, OverlayOptions, OverlaySurface, Placement,
+        },
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+        tooltip::{Tooltip, TooltipContent, TooltipOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::InteractiveVariant, handle::ThemeHandle, role::Role},
 };
 use widget::{error::TranslatedError, venue::VenueDisplay};
 

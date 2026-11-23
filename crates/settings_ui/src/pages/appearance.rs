@@ -1,8 +1,8 @@
 use app_config::settings::{Appearance, Language};
-use base_ui::kit::select::Select;
 use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
+use ui_kit::kit::select::Select;
 
 use crate::{
     host::SettingsHost,

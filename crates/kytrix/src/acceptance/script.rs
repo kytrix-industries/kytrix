@@ -8,7 +8,6 @@ use app_config::{
     settings::{Appearance, Language},
     ui::SidebarMode,
 };
-use base_ui::theme::appearance::Appearance as ThemeAppearance;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
     app::App,
@@ -21,6 +20,7 @@ use ui_core::{
     },
     window::{FrameIndex, WindowId},
 };
+use ui_kit::theme::appearance::Appearance as ThemeAppearance;
 
 use super::report::Report;
 use crate::{

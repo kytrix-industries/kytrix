@@ -1,9 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::{
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, role::Role},
-};
 use i18n::t_smol;
 use ui_core::{
     a11y::{A11yOverride, A11yPatch, A11yRole},
@@ -11,6 +7,10 @@ use ui_core::{
     math::{Point, Rect},
     node::{builder::NodeBuilder, id::NodeId},
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch},
+};
+use ui_kit::{
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, role::Role},
 };
 use widget::cx::WidgetCx;
 

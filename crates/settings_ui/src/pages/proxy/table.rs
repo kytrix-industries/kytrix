@@ -4,19 +4,6 @@ use app_config::{
     network::{ProxyAuthorizationConfig, ProxyConfig},
     settings::Config,
 };
-use base_ui::{
-    kit::{
-        alert::AlertBuilder,
-        button::Button,
-        dialog::{Dialog, DialogBuilder},
-        icon::IconKind,
-        list::SelectionMode,
-        markdown::{parse::parse_document, source::MarkdownAssets},
-        table::{Column, ColumnAlign, Table, TableOptions},
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -34,6 +21,19 @@ use ui_core::{
     paint::style::StylePatch,
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        alert::AlertBuilder,
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        icon::IconKind,
+        list::SelectionMode,
+        markdown::{parse::parse_document, source::MarkdownAssets},
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
 
 use crate::{

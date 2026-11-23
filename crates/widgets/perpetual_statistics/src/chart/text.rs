@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::kit::format::group_digits;
 use market_participants_model::decimal::{Price, Quantity, Tick};
 use smol_str::{SmolStr, format_smolstr};
 use time::{OffsetDateTime, UtcOffset};
@@ -9,6 +8,7 @@ use ui_core::{
     paint::color::Color,
     text::{ShapedTextHandle, TextAlign, TextStyle},
 };
+use ui_kit::kit::format::group_digits;
 
 pub(crate) const TEXT_CACHE_CAPACITY: usize = 192;
 pub(crate) const DECIMAL_SCALE: f64 = 1_000_000_000_000_000_000.0;

@@ -1,9 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::{
-    style_builder::StyleBuilder,
-    theme::{resolved::Theme, role::Role},
-};
 use i18n::t_smol;
 use smol_str::SmolStr;
 use ui_core::{
@@ -19,6 +15,10 @@ use ui_core::{
         style::StylePatch,
     },
     text::{ShapedTextHandle, TextAlign, TextStyle},
+};
+use ui_kit::{
+    style_builder::StyleBuilder,
+    theme::{resolved::Theme, role::Role},
 };
 use widget::cx::WidgetCx;
 
@@ -679,7 +679,6 @@ fn contains_half_open(bounds: Rect, position: Point) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use base_ui::theme::appearance::Appearance;
     use market_participants_model::decimal::Quantity;
     use ui_core::{
         math::Point,
@@ -687,6 +686,7 @@ mod tests {
         paint::primitive::Primitive,
         window::WindowId,
     };
+    use ui_kit::theme::appearance::Appearance;
     use widget::test_support::WidgetTestApp;
 
     use super::*;

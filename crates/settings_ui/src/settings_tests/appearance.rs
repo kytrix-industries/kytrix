@@ -1,5 +1,5 @@
 use app_config::settings::{Appearance, Language};
-use base_ui::theme::appearance::Appearance as ThemeAppearance;
+use ui_kit::theme::appearance::Appearance as ThemeAppearance;
 
 use crate::settings_tests::test_support::Harness;
 

@@ -12,7 +12,7 @@ audio = ["dep:rodio"]
 
 [dependencies]
 app_config = { workspace = true }
-base_ui = { workspace = true }
+ui_kit = { workspace = true }
 bytes = { workspace = true }
 i18n = { workspace = true }
 kytrix_service_provider = { workspace = true }

@@ -1,10 +1,5 @@
 use std::{cell::RefCell, rc::Rc};
 
-use base_ui::{
-    kit::separator::Separator,
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, role::Role},
-};
 use smol_str::SmolStr;
 use ui_core::{
     app::App,
@@ -17,6 +12,11 @@ use ui_core::{
     },
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::separator::Separator,
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
 
 use super::intent::{Intent, IntentQueue};

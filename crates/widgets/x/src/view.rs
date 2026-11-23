@@ -11,17 +11,6 @@ use app_config::{
     settings::Config as SettingsConfig,
     widget::{WidgetConfig, WidgetConfigSchemaVersion},
 };
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        icon::{IconKind, RasterTier, raster},
-        list::{List, ListOptions, SelectionMode},
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
-};
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::{
@@ -46,6 +35,17 @@ use ui_core::{
     },
     paint::{color::Color, style::StylePatch},
     text::{TextAlign, TextOverflow, TextRun, TextStyle},
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::{IconKind, RasterTier, raster},
+        list::{List, ListOptions, SelectionMode},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding},

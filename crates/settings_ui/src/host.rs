@@ -1,12 +1,12 @@
 use std::rc::Rc;
 
 use app_config::settings::Config;
-use base_ui::{
+use i18n::{language::codes::LanguageCode, translate::Translate};
+use ui_core::{app::App, window::WindowId};
+use ui_kit::{
     kit::{layer::Layer, overlay::AnimationRouter},
     theme::handle::ThemeHandle,
 };
-use i18n::{language::codes::LanguageCode, translate::Translate};
-use ui_core::{app::App, window::WindowId};
 use widget::{frame::FrameRouter, services::WidgetServices};
 
 use crate::{

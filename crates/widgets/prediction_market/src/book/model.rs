@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use base_ui::kit::format::group_digits;
 use market_participants_model::{
     decimal::{Fraction, Price, Quantity, Ratio, Tick},
     prediction::{PredictionBookLevel, PredictionOrderBook},
 };
 use smol_str::{SmolStr, format_smolstr};
+use ui_kit::kit::format::group_digits;
 
 pub(crate) const GROUPING_MULTIPLIERS: [u32; 3] = [1, 10, 100];
 

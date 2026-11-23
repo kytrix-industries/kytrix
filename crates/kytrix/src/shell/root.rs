@@ -3,7 +3,6 @@ use std::{
     rc::Rc,
 };
 
-use base_ui::theme::role::Role;
 use i18n::t_smol;
 use smol_str::SmolStr;
 use ui_core::{
@@ -13,6 +12,7 @@ use ui_core::{
     math::Size,
     window::{Decorations, WindowId, WindowOptions},
 };
+use ui_kit::theme::role::Role;
 use widget::frame::RouteId;
 
 use super::{
@@ -79,7 +79,7 @@ impl Shell {
             app,
             window,
             root,
-            base_ui::style_builder::StyleBuilder::new()
+            ui_kit::style_builder::StyleBuilder::new()
                 .flex_col()
                 .flex_1()
                 .min_width_0()
@@ -90,7 +90,7 @@ impl Shell {
             app,
             window,
             page_column,
-            base_ui::style_builder::StyleBuilder::new()
+            ui_kit::style_builder::StyleBuilder::new()
                 .width_full()
                 .height(metrics::TITLE_BAR_HEIGHT)
                 .flex_none()

@@ -5,17 +5,6 @@ use std::{
     sync::Arc,
 };
 
-use base_ui::{
-    kit::{
-        dialog::{Dialog, DialogBuilder},
-        input::{self, InputNode, InputSpec, InputState},
-        list::{List, ListOptions, SelectionMode},
-        separator::Separator,
-        tree::{Tree, TreeItem, TreeOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::{t_smol, translate::Translate};
 use market_participants_connector::{
     catalog::{batch::CatalogEntry, display::catalog::DisplayResolver},
@@ -50,6 +39,17 @@ use ui_core::{
     paint::{primitive::Border, style::StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        dialog::{Dialog, DialogBuilder},
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions, SelectionMode},
+        separator::Separator,
+        tree::{Tree, TreeItem, TreeOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{
     frame::{RouteId, WeakRouter},

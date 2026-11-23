@@ -1751,11 +1751,11 @@ impl InputNode {
 }
 
 fn click_action(spec: &InputSpec) -> Action {
-    Action::Custom(format_smolstr!("base_ui.input.{}.click", spec.name))
+    Action::Custom(format_smolstr!("ui_kit.input.{}.click", spec.name))
 }
 
 fn drag_action(spec: &InputSpec) -> Action {
-    Action::Custom(format_smolstr!("base_ui.input.{}.drag", spec.name))
+    Action::Custom(format_smolstr!("ui_kit.input.{}.drag", spec.name))
 }
 
 fn text_local_point(tree: &NodeTree, hit: HitResult, text: NodeId) -> Option<Point> {
@@ -2825,7 +2825,7 @@ mod tests {
     #[test]
     fn blur_dispatches_the_submit_action_when_the_switch_is_on() {
         let hits = Rc::new(Cell::new(0u32));
-        let submit = Action::Custom(SmolStr::new_static("base_ui.input.blur.submit"));
+        let submit = Action::Custom(SmolStr::new_static("ui_kit.input.blur.submit"));
         let mut spec = spec();
         spec.submit = Some(submit.clone());
         let mut harness = harness(spec, focused_state("50"));
@@ -2939,7 +2939,7 @@ mod tests {
 
     #[test]
     fn key_events_route_through_dispatch_and_enter_submits() {
-        let submit = Action::custom("base_ui.input.submit");
+        let submit = Action::custom("ui_kit.input.submit");
         let mut harness = harness(
             InputSpec {
                 submit: Some(submit.clone()),
@@ -3003,7 +3003,7 @@ mod tests {
         };
         assert_eq!(
             format!("{:?}", click_action(&spec)),
-            "Custom(\"base_ui.input.account.email.click\")"
+            "Custom(\"ui_kit.input.account.email.click\")"
         );
     }
 
@@ -3195,7 +3195,7 @@ mod tests {
 
     #[test]
     fn repeated_enter_does_not_submit_again() {
-        let submit = Action::custom("base_ui.input.submit.repeat");
+        let submit = Action::custom("ui_kit.input.submit.repeat");
         let mut harness = harness(
             InputSpec {
                 submit: Some(submit.clone()),

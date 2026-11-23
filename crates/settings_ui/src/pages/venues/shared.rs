@@ -7,10 +7,10 @@ use app_config::{
     },
     settings::Config,
 };
-use base_ui::{kit::select::Select, theme::handle::ThemeHandle};
 use market_participants_model::identifier::VenueId;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{app::App, error::EngineError, event::Event, window::WindowId};
+use ui_kit::{kit::select::Select, theme::handle::ThemeHandle};
 
 use crate::{
     host::SettingsHost,

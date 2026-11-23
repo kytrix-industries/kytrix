@@ -1,15 +1,6 @@
 use std::rc::Rc;
 
 use app_config::translation::{DownloadSite, TranslationModel};
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
-};
 use download_provider::error::DownloadFailure;
 use i18n::{t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
@@ -20,6 +11,15 @@ use ui_core::{
     paint::style::{PaintSpec, StylePatch},
     text::{TextOverflow, TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{appearance::Appearance, handle::ThemeHandle, role::Role},
 };
 
 use crate::{

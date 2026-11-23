@@ -210,7 +210,7 @@ fn page(harness: &mut WidgetTestApp) -> NodeId {
         NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_PAGE")
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .width(PAGE.0)
                     .height(PAGE.1)
                     .flex_col()
@@ -226,7 +226,7 @@ fn group(harness: &mut WidgetTestApp, parent: NodeId) -> NodeId {
         NodeBuilder::boxed()
             .id("TEST_PREDICTION_MARKET_HEADER_GROUP")
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .flex_row()
                     .build(),
             )

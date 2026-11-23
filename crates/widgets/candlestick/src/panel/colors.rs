@@ -1,10 +1,3 @@
-use base_ui::{
-    kit::{
-        color_picker::{ColorPicker, ColorPickerLabels},
-        size::UnifiedSize,
-    },
-    theme::handle::ThemeHandle,
-};
 use i18n::{t_smol, translate::Translate};
 use ui_core::{
     error::EngineError,
@@ -12,6 +5,13 @@ use ui_core::{
     node::{id::NodeId, signal::Signal},
     paint::color::Color,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        color_picker::{ColorPicker, ColorPickerLabels},
+        size::UnifiedSize,
+    },
+    theme::handle::ThemeHandle,
 };
 use widget::cx::WidgetCx;
 

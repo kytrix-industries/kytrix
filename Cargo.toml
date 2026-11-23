@@ -6,7 +6,7 @@ members = [
     "crates/kytrix",
     "crates/ui_core",
     "crates/llama_sys",
-    "crates/base_ui",
+    "crates/ui_kit",
     "crates/i18n",
     "crates/network",
     "crates/market_participants_model",
@@ -124,7 +124,7 @@ llama_sys = { path = "crates/llama_sys" }
 log = "0.4.35"
 longbridge-proto = "5.3.0"
 # W6：`global_shipping_chokepoint` 的海岸线资产要在装载期三角化（偶奇填充、带洞）。
-# 只有该 widget 消费 lyon；引擎与 base_ui 都不做 tessellation（设计 §5.5）。
+# 只有该 widget 消费 lyon；引擎与 ui_kit 都不做 tessellation（设计 §5.5）。
 lyon = "1.0.19"
 # P13 图片色彩管理（D-8）：image 0.25.10 的**非可选**依赖（`Cargo.lock` 已在 0.8.1），
 # 这里只是把它提到直接依赖；不引入新的编译单元。
@@ -236,7 +236,7 @@ rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false }
 rmp-serde = "1.3.1"
 rodio = { version = "0.23.0", default-features = false }
-# P2-1b：`base_ui` 的 build.rs 在**构建期**把 Phosphor SVG 光栅化成白色字形 PNG（设计 §8.5 / §5.6：
+# P2-1b：`ui_kit` 的 build.rs 在**构建期**把 Phosphor SVG 光栅化成白色字形 PNG（设计 §8.5 / §5.6：
 # 引擎不依赖 usvg / resvg，图标转换归应用层）。resvg 与 usvg 同版 0.46.0，只引入一对编译单元；
 # 关掉默认特性（text / system-fonts / raster-images）——图标是纯路径，不需要字体与内嵌位图解码。
 resvg = { version = "0.46.0", default-features = false }
@@ -292,7 +292,7 @@ ai_provider = { path = "crates/ai_provider" }
 ai_translator = { path = "crates/ai_translator" }
 app_config = { path = "crates/app_config" }
 app_config_provider = { path = "crates/app_config_provider" }
-base_ui = { path = "crates/base_ui" }
+ui_kit = { path = "crates/ui_kit" }
 candlestick = { path = "crates/widgets/candlestick" }
 coin_market_cap_fear_and_greed_index = { path = "crates/widgets/coin_market_cap_fear_and_greed_index" }
 cryptocurrency_etf = { path = "crates/widgets/cryptocurrency_etf" }

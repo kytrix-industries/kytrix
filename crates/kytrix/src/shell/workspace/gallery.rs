@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
-use base_ui::theme::role::Role;
 use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
+use ui_kit::theme::role::Role;
 use widget::identity::WidgetId;
 use widget_gallery_ui::gallery::{WidgetGallery, WidgetGalleryEvent};
 
@@ -32,7 +32,7 @@ impl GalleryPage {
             window,
             parent,
             WORKSPACE_PAGES,
-            base_ui::style_builder::StyleBuilder::new()
+            ui_kit::style_builder::StyleBuilder::new()
                 .absolute()
                 .top(0.0)
                 .left(0.0)
@@ -46,7 +46,7 @@ impl GalleryPage {
             app,
             window,
             root,
-            base_ui::style_builder::StyleBuilder::new()
+            ui_kit::style_builder::StyleBuilder::new()
                 .absolute()
                 .top(0.0)
                 .left(0.0)

@@ -5,23 +5,6 @@ use std::{
     sync::Arc,
 };
 
-use base_ui::{
-    kit::{
-        assets,
-        button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
-        icon::IconKind,
-        input::{self, InputNode, InputSpec, InputState},
-        list::{List, ListOptions, SelectionMode},
-        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
-        overlay::OverlayError,
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-        spinner::Spinner,
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::ethereum_wallet::{
     EthereumWalletSelection, ethereum_wallet_address,
@@ -42,6 +25,23 @@ use ui_core::{
     paint::style::StylePatch,
     text::{TextOverflow, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        assets,
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogError},
+        icon::IconKind,
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions, SelectionMode},
+        markdown::{parse::parse_document, source::MarkdownAssets, view::MarkdownNode},
+        overlay::OverlayError,
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{cx::WidgetCx, error::TranslatedError, status::WidgetAction};
 

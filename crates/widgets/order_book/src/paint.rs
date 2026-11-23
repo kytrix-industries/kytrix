@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::{style_builder::StyleBuilder, theme::handle::ThemeHandle};
 use ui_core::{
     error::EngineError,
     math::Rect,
@@ -12,6 +11,7 @@ use ui_core::{
         style::StylePatch,
     },
 };
+use ui_kit::{style_builder::StyleBuilder, theme::handle::ThemeHandle};
 use widget::cx::WidgetCx;
 
 use super::model::{GroupedLevel, WINDOW_SIZES, interpolated_ratio};

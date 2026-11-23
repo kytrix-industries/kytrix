@@ -4,10 +4,6 @@ use app_config::{
     settings::{AccountConfig, AccountWalletKind, Config},
     time_zone::DataTimeZone,
 };
-use base_ui::{
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::engine::KytrixServiceError;
 use ui_core::{
@@ -17,6 +13,10 @@ use ui_core::{
         canvas::Canvas,
         primitive::{Primitive, QuadPaint},
     },
+};
+use ui_kit::{
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, role::Role},
 };
 use widget::{
     cx::WidgetCx,
@@ -266,7 +266,7 @@ fn band_fills(canvas: &Canvas) -> Vec<ui_core::paint::color::Color> {
         .collect()
 }
 
-fn band_colours(theme: &base_ui::theme::resolved::Theme) -> Vec<ui_core::paint::color::Color> {
+fn band_colours(theme: &ui_kit::theme::resolved::Theme) -> Vec<ui_core::paint::color::Color> {
     [
         Role::FearGreedExtremeFear,
         Role::FearGreedFear,
@@ -1278,7 +1278,7 @@ fn the_gauge_should_read_its_colours_from_the_theme() {
     frame(&mut harness, &mut pane);
 
     let canvas = gauge_canvas(&harness, &pane);
-    let theme = base_ui::theme::resolved::Theme::of(Appearance::Light);
+    let theme = ui_kit::theme::resolved::Theme::of(Appearance::Light);
     assert_eq!(
         band_fills(&canvas),
         band_colours(&theme),
@@ -1308,7 +1308,7 @@ fn a_dark_appearance_should_repaint_the_gauge() {
     let light_canvas = gauge_canvas(&harness, &pane);
     assert_eq!(
         band_fills(&light_canvas),
-        band_colours(&base_ui::theme::resolved::Theme::of(Appearance::Light)),
+        band_colours(&ui_kit::theme::resolved::Theme::of(Appearance::Light)),
         "the frame a light pane prepared is drawn in the light roles"
     );
 
@@ -1322,7 +1322,7 @@ fn a_dark_appearance_should_repaint_the_gauge() {
     let dark_canvas = gauge_canvas(&harness, &pane);
     assert_eq!(
         band_fills(&dark_canvas),
-        band_colours(&base_ui::theme::resolved::Theme::of(Appearance::Dark)),
+        band_colours(&ui_kit::theme::resolved::Theme::of(Appearance::Dark)),
         "the dark appearance repaints the bands in the dark roles"
     );
     assert!(

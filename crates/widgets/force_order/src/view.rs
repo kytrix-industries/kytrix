@@ -4,14 +4,6 @@ use app_config::{
     settings::Config,
     widget::{WidgetConfig, WidgetConfigSchemaVersion},
 };
-use base_ui::{
-    kit::{
-        list::SelectionMode,
-        table::{Column, ColumnAlign, Table, TableOptions},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::{
     catalog::store::Catalog, connector::MarketParticipantsConnector, market::error::MarketError,
@@ -30,6 +22,14 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal, tree::NodeTree},
     paint::style::StylePatch,
     text::TextStyle,
+};
+use ui_kit::{
+    kit::{
+        list::SelectionMode,
+        table::{Column, ColumnAlign, Table, TableOptions},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -701,10 +701,6 @@ mod tests {
     };
 
     use app_config::time_zone::DataTimeZone;
-    use base_ui::{
-        kit::{layer::Layer, list::RowHeight, overlay::AnimationRouter, table::ColumnWidth},
-        theme::appearance::Appearance,
-    };
     use market_participants_connector::{
         catalog::{batch::CatalogEntry, error::CatalogError, test_support},
         market::domain::DisconnectReason,
@@ -725,6 +721,10 @@ mod tests {
         node::{signal::SignalScope, tree::NodeKind},
         paint::color::Color,
         window::{WindowId, WindowOptions},
+    };
+    use ui_kit::{
+        kit::{layer::Layer, list::RowHeight, overlay::AnimationRouter, table::ColumnWidth},
+        theme::appearance::Appearance,
     };
     use widget::{
         error::TranslatedError, frame::FrameRouter, rpc::RpcCallError, services::WidgetServices,

@@ -15,16 +15,6 @@ use app_config::{
     },
     settings::Config,
 };
-use base_ui::{
-    kit::{
-        alert::AlertBuilder,
-        button::Button,
-        dialog::{Dialog, DialogBuilder},
-        input::{self, InputNode, InputSpec, InputState},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::translate::Translate;
 use market_participants_model::identifier::VenueId;
 use smol_str::{SmolStr, format_smolstr};
@@ -40,6 +30,16 @@ use ui_core::{
     paint::style::{PaintSpec, StylePatch},
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        alert::AlertBuilder,
+        button::Button,
+        dialog::{Dialog, DialogBuilder},
+        input::{self, InputNode, InputSpec, InputState},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::venue::VenueDisplay;
 

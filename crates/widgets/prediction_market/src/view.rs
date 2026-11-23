@@ -1,18 +1,6 @@
 use std::{mem, rc::Rc, sync::Arc};
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        layer::Layer,
-        overlay::AnimationRouter,
-        select::{Select, SelectItem, SelectOptions},
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use instrument_selector_ui::{host::SelectorHost, prediction_selector::PredictionEventSelector};
 use market_participants_model::prediction::{
@@ -30,6 +18,18 @@ use ui_core::{
     paint::style::StylePatch,
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        layer::Layer,
+        overlay::AnimationRouter,
+        select::{Select, SelectItem, SelectOptions},
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

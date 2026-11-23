@@ -1,8 +1,5 @@
 use std::fmt;
 
-use base_ui::kit::{
-    brand::BrandError, dialog::DialogError, icon::IconError, overlay::OverlayError,
-};
 use i18n::translate::Translate;
 use market_participants_connector::{
     catalog::error::CatalogError, connector::VenueLoadError, error::MarketParticipantError,
@@ -10,6 +7,7 @@ use market_participants_connector::{
 use market_participants_model::display::lexical::scope_display_code;
 use smol_str::SmolStr;
 use ui_core::error::EngineError;
+use ui_kit::kit::{brand::BrandError, dialog::DialogError, icon::IconError, overlay::OverlayError};
 use widget::{error::TranslatedError, venue::VenueDisplay};
 
 #[derive(Debug)]

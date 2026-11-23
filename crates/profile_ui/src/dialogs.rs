@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
-use base_ui::kit::{
+use smol_str::SmolStr;
+use ui_core::app::App;
+use ui_kit::kit::{
     alert::AlertBuilder,
     dialog::{Dialog, DialogBuilder},
 };
-use smol_str::SmolStr;
-use ui_core::app::App;
 
 use crate::host::ProfileHost;
 

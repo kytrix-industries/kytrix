@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::theme::{resolved::Theme, role::Role};
 use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -14,6 +13,7 @@ use ui_core::{
     },
     text::{ShapedTextHandle, TextStyle},
 };
+use ui_kit::theme::{resolved::Theme, role::Role};
 
 use super::{
     canvas::{PreparedChart, SeriesMeshes},

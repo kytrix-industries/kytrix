@@ -6,23 +6,6 @@ use std::{
 };
 
 use ahash::AHashMap as HashMap;
-use base_ui::{
-    kit::{
-        alert::AlertBuilder,
-        badge::Badge,
-        button::Button,
-        dialog::{Dialog, DialogBuilder, DialogClose, DialogError},
-        icon::{IconKind, RasterTier, raster},
-        input::{self, InputNode, InputSpec, InputState},
-        list::{List, ListOptions, SelectionMode},
-        overlay::OverlayError,
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-        spinner::Spinner,
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::x::{XApiError, XProfile, XSelection, XSelectionStatus};
 use smol_str::{SmolStr, format_smolstr};
@@ -43,6 +26,23 @@ use ui_core::{
     paint::{color::Color, style::StylePatch},
     text::{TextAlign, TextOverflow, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        alert::AlertBuilder,
+        badge::Badge,
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogClose, DialogError},
+        icon::{IconKind, RasterTier, raster},
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions, SelectionMode},
+        overlay::OverlayError,
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+        spinner::Spinner,
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{cx::WidgetCx, error::TranslatedError, rpc::RpcCallError, status::WidgetAction};
 

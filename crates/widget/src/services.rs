@@ -1,16 +1,16 @@
 use std::rc::Rc;
 
 use app_config::settings::Config;
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
 use bytes::Bytes;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use kytrix_service_provider::service::connector::KytrixServiceConnector;
 use market_participants_connector::connector::MarketParticipantsConnector;
 use tokio::runtime::Handle;
 use ui_core::{app::App, node::signal::Signal};
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
+};
 
 use crate::frame::FrameRouter;
 
@@ -186,13 +186,6 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use app_config::settings::{Appearance, Config};
-    use base_ui::{
-        kit::{
-            layer::{Band, Layer},
-            overlay::{Anchor, AnimationRouter, Overlay, OverlayOptions},
-        },
-        theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle},
-    };
     use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
     use smol_str::{SmolStr, format_smolstr};
     use tokio::runtime::Handle;
@@ -206,6 +199,13 @@ mod tests {
             signal::{Signal, SignalScope},
         },
         text::TextStyle,
+    };
+    use ui_kit::{
+        kit::{
+            layer::{Band, Layer},
+            overlay::{Anchor, AnimationRouter, Overlay, OverlayOptions},
+        },
+        theme::{appearance::Appearance as ThemeAppearance, handle::ThemeHandle},
     };
 
     use super::WidgetServices;

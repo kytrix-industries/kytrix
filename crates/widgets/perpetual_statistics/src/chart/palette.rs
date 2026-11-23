@@ -1,6 +1,6 @@
-use base_ui::theme::{components::ComponentTokens, resolved::Theme, role::Role};
 use smol_str::SmolStr;
 use ui_core::{math::Size, paint::color::Color};
+use ui_kit::theme::{components::ComponentTokens, resolved::Theme, role::Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Series {

@@ -1,13 +1,3 @@
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        size::{UnifiedSizable, UnifiedSize},
-        toggle::Toggle,
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
-};
 use i18n::t_smol;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -17,6 +7,16 @@ use ui_core::{
     node::{builder::NodeBuilder, dependency::ReadCtx, id::NodeId, signal::Signal},
     paint::{color::Color, primitive::Border, style::StylePatch},
     text::TextStyle,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        size::{UnifiedSizable, UnifiedSize},
+        toggle::Toggle,
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
 };
 use widget::cx::WidgetCx;
 

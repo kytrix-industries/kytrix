@@ -8,7 +8,6 @@ use app_config::{
     settings::{AccountConfig, AccountWalletKind, Config},
     time_zone::DataTimeZone,
 };
-use base_ui::{style_builder::StyleBuilder, theme::appearance::Appearance};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use kytrix_service_provider::service::{
     engine::{ErrorCode, KytrixServiceError},
@@ -25,6 +24,7 @@ use ui_core::{
     node::builder::NodeBuilder,
     test_support::record::PrimitiveKind,
 };
+use ui_kit::{style_builder::StyleBuilder, theme::appearance::Appearance};
 use widget::{
     protocol::RequestId,
     status::{Notice, WidgetAction, WidgetState, WidgetStatus},
@@ -899,7 +899,7 @@ fn the_map_should_be_a_canvas_over_the_sea_and_the_land() {
         .expect("the sea is the canvas' first quad");
     assert_eq!(
         first_quad.color,
-        Some(theme.role(base_ui::theme::role::Role::ChartMapOcean)),
+        Some(theme.role(ui_kit::theme::role::Role::ChartMapOcean)),
         "the sea is painted from the map ocean role"
     );
     assert!(
@@ -954,7 +954,7 @@ fn switching_the_appearance_should_repaint_the_map() {
         .and_then(|primitive| primitive.color);
     assert_eq!(
         ocean,
-        Some(dark.role(base_ui::theme::role::Role::ChartMapOcean))
+        Some(dark.role(ui_kit::theme::role::Role::ChartMapOcean))
     );
 }
 

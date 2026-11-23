@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::theme::components::ChartColors;
 use market_participants_connector::market::timeframe::TimeFrame;
 use market_participants_model::{
     decimal::{Price, ProfitOrLoss, Quantity, Tick},
@@ -13,6 +12,7 @@ use ui_core::{
     paint::color::Color,
     text::{ShapedTextHandle, TextStyle},
 };
+use ui_kit::theme::components::ChartColors;
 
 use crate::{model::CandlePrices, time::format_crosshair_time};
 
@@ -498,7 +498,6 @@ fn format_volume_with_unit(inner: u128, scale: u128, divisor: u128, suffix: &str
 mod tests {
     use std::str::FromStr;
 
-    use base_ui::theme::{appearance::Appearance, resolved::Theme};
     use market_participants_connector::catalog::test_support;
     use market_participants_model::{
         decimal::{Price, Quantity},
@@ -509,6 +508,7 @@ mod tests {
             units::{MarketQuantity, QuantityUnit},
         },
     };
+    use ui_kit::theme::{appearance::Appearance, resolved::Theme};
 
     use super::*;
 

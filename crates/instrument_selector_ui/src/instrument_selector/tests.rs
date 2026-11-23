@@ -1179,7 +1179,7 @@ fn two_panes_confirm_their_own_selector_and_release_only_their_own_handlers() {
             !harness
                 .app()
                 .has_action_handler(&ui_core::event::Action::Custom(format_smolstr!(
-                    "base_ui.input.{filter}.click"
+                    "ui_kit.input.{filter}.click"
                 ))),
             "the filter input's click action is reclaimed"
         );

@@ -1,4 +1,3 @@
-use base_ui::theme::{resolved::Theme, role::Role};
 use bytes::Bytes;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -15,6 +14,7 @@ use ui_core::{
     },
     text::{ShapedTextHandle, TextStyle},
 };
+use ui_kit::theme::{resolved::Theme, role::Role};
 use widget::cx::WidgetCx;
 
 use crate::model::Level;
@@ -301,7 +301,7 @@ impl Gauge {
         parent: NodeId,
     ) -> Result<NodeId, EngineError> {
         let theme = cx.theme().clone();
-        let style = base_ui::style_builder::StyleBuilder::new()
+        let style = ui_kit::style_builder::StyleBuilder::new()
             .flex_1()
             .min_width_0()
             .min_height_0()
@@ -550,7 +550,7 @@ fn circle_quad(center: Point, radius: f32, color: Color) -> Quad {
 
 #[cfg(test)]
 mod tests {
-    use base_ui::theme::appearance::Appearance;
+    use ui_kit::theme::appearance::Appearance;
 
     use super::*;
     use crate::model::Level;

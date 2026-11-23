@@ -1,12 +1,12 @@
 use std::rc::Rc;
 
-use base_ui::kit::{
-    button::Button,
-    size::{UnifiedSizable, UnifiedSize},
-};
 use market_participants_model::prediction::PredictionEventRef;
 use smol_str::SmolStr;
 use ui_core::{app::App, error::EngineError, node::id::NodeId, window::WindowId};
+use ui_kit::kit::{
+    button::Button,
+    size::{UnifiedSizable, UnifiedSize},
+};
 
 use crate::{host::SelectorHost, prediction_selector::PredictionEventSelector};
 

@@ -5,21 +5,6 @@ use std::{
     sync::Arc,
 };
 
-use base_ui::{
-    kit::{
-        button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
-        empty_state::EmptyState,
-        icon::IconKind,
-        input::{self, InputNode, InputSpec, InputState},
-        list::{List, ListOptions, SelectionMode},
-        overlay::OverlayError,
-        separator::Separator,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_model::identifier::WalletAddress;
 use smol_str::{SmolStr, format_smolstr};
@@ -39,6 +24,21 @@ use ui_core::{
     paint::style::StylePatch,
     text::{TextOverflow, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogError},
+        empty_state::EmptyState,
+        icon::IconKind,
+        input::{self, InputNode, InputSpec, InputState},
+        list::{List, ListOptions, SelectionMode},
+        overlay::OverlayError,
+        separator::Separator,
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 use widget::{cx::WidgetCx, error::TranslatedError};
 

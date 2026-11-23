@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use base_ui::{
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::account::{
     domain::HyperliquidUserFill, shared::HyperliquidFillDirection,
@@ -32,6 +28,10 @@ use ui_core::{
         style::StylePatch,
     },
     text::{ShapedTextHandle, TextStyle},
+};
+use ui_kit::{
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, resolved::Theme, role::Role},
 };
 use widget::cx::WidgetCx;
 
@@ -1702,7 +1702,7 @@ mod tests {
             self.app.canvas_primitives(self.node)
         }
 
-        fn change_appearance(&mut self, appearance: base_ui::theme::appearance::Appearance) {
+        fn change_appearance(&mut self, appearance: ui_kit::theme::appearance::Appearance) {
             let theme = self.app.services().theme.clone();
             assert!(
                 theme.set_appearance(self.app.app_mut(), appearance),
@@ -1858,7 +1858,7 @@ mod tests {
         let theme = harness.app.services().theme.clone();
         let requests = harness.app.frame_requests();
 
-        harness.change_appearance(base_ui::theme::appearance::Appearance::Dark);
+        harness.change_appearance(ui_kit::theme::appearance::Appearance::Dark);
         assert!(
             harness.app.frame_requests() > requests,
             "an appearance switch invalidates the canvas node and schedules the frame"
@@ -1872,7 +1872,7 @@ mod tests {
             "the redraw prepared a canvas of its own"
         );
         let expected = theme
-            .theme_for(base_ui::theme::appearance::Appearance::Dark)
+            .theme_for(ui_kit::theme::appearance::Appearance::Dark)
             .role(Role::MarketUp);
         assert!(
             harness
@@ -1941,7 +1941,7 @@ mod tests {
                             .app
                             .services()
                             .theme
-                            .theme_for(base_ui::theme::appearance::Appearance::Light)
+                            .theme_for(ui_kit::theme::appearance::Appearance::Light)
                             .role(Role::SurfaceOverlay),
                     )
             }),

@@ -5,18 +5,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        icon::IconSpec,
-        input::{self, InputNode, InputSpec, InputState},
-        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
-        separator::Separator,
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -35,6 +23,18 @@ use ui_core::{
     paint::{color::Color, primitive::Border, style::StylePatch},
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::IconSpec,
+        input::{self, InputNode, InputSpec, InputState},
+        scroll_bar::{ScrollBar, ScrollbarAxis, ScrollbarOptions},
+        separator::Separator,
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     any::AnyWidget, category::WidgetCategory, descriptor::WidgetDescriptor, identity::WidgetId,
@@ -452,7 +452,7 @@ impl GalleryCore {
             readonly: false,
             disabled: false,
             max_length: None,
-            size: base_ui::theme::components::ControlSize::Medium,
+            size: ui_kit::theme::components::ControlSize::Medium,
             submit: None,
         });
         let state = self.input_state;
@@ -1428,7 +1428,6 @@ mod tests {
     use std::{rc::Rc, time::Instant};
 
     use app_config::widget::WidgetConfig;
-    use base_ui::style_builder::StyleBuilder;
     use i18n::{language::codes::LanguageCode, translate::Translate};
     use smol_str::SmolStr;
     use ui_core::{
@@ -1442,6 +1441,7 @@ mod tests {
         },
         text::TextStyle,
     };
+    use ui_kit::style_builder::StyleBuilder;
     use widget::{
         any::AnyWidget,
         category::WidgetCategory,

@@ -1,4 +1,3 @@
-use base_ui::style_builder::StyleBuilder;
 use settings_ui::settings::SettingsPage;
 use smol_str::SmolStr;
 use ui_core::{
@@ -8,6 +7,7 @@ use ui_core::{
     node::{id::NodeId, signal::Signal},
     window::WindowId,
 };
+use ui_kit::style_builder::StyleBuilder;
 
 use super::{
     intent::Intent,

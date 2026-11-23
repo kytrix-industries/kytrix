@@ -1,14 +1,5 @@
 use std::{cell::RefCell, rc::Rc};
 
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        size::UnifiedSizable as _,
-        tooltip::{Tooltip, TooltipContent, TooltipOptions},
-    },
-    theme::handle::ThemeHandle,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -19,6 +10,15 @@ use ui_core::{
         signal::{Signal, SignalScope},
     },
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        size::UnifiedSizable as _,
+        tooltip::{Tooltip, TooltipContent, TooltipOptions},
+    },
+    theme::handle::ThemeHandle,
 };
 use widget::{frame::RouteId, services::WidgetServices};
 

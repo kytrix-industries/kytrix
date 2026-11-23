@@ -1,10 +1,6 @@
 use std::{cell::Cell, rc::Rc};
 
 use app_config::workspace::{WorkspaceLayout, WorkspaceWidget};
-use base_ui::{
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::handle::ThemeHandle,
-};
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use smol_str::SmolStr;
 use ui_core::{
@@ -16,6 +12,10 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId},
     paint::style::StylePatch,
     window::WindowId,
+};
+use ui_kit::{
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::handle::ThemeHandle,
 };
 use widget::{config::WidgetConfigChange, identity::WidgetId};
 use widget_gallery_ui::gallery::WidgetGalleryEvent;
@@ -496,7 +496,7 @@ impl Stage {
             };
             let mut bar_paint = PaintBuilder::new().build();
             bar_paint.background =
-                ui::color(&self.theme, app, base_ui::theme::role::Role::LineBorder);
+                ui::color(&self.theme, app, ui_kit::theme::role::Role::LineBorder);
             NodeBuilder::boxed()
                 .style(bar_line)
                 .paint(bar_paint)

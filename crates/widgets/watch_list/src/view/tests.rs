@@ -9,7 +9,6 @@ use std::{
 };
 
 use ahash::{HashMap, HashSet};
-use base_ui::{kit::list::SelectionMode, theme::components::InteractiveState};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_connector::{
     catalog::{batch::CatalogEntry, error::CatalogError, store::Catalog, test_support},
@@ -42,6 +41,7 @@ use ui_core::{
     math::Size,
     node::{builder::NodeBuilder, id::NodeId},
 };
+use ui_kit::{kit::list::SelectionMode, theme::components::InteractiveState};
 use widget::{
     config::WidgetConfigChange,
     protocol::RequestId,

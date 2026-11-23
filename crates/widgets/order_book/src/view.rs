@@ -8,19 +8,6 @@ use std::{
 };
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        empty_state::EmptyState,
-        icon::{IconKind, IconSpec},
-        list::{List, ListOptions},
-        motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
-        select::{Select, SelectItem, SelectOptions},
-        separator::Separator,
-        size::UnifiedSize,
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use instrument_selector_ui::{
     host::SelectorHost,
@@ -47,6 +34,19 @@ use ui_core::{
     paint::style::StylePatch,
     text::{TextAlign, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        empty_state::EmptyState,
+        icon::{IconKind, IconSpec},
+        list::{List, ListOptions},
+        motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
+        select::{Select, SelectItem, SelectOptions},
+        separator::Separator,
+        size::UnifiedSize,
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},
@@ -1730,8 +1730,8 @@ impl OrderBookWidget {
             .label(t_smol!(self.translate, spec.aria_key))
             .placeholder(spec.placeholder);
         let key = cx.unique_key(spec.key_suffix);
-        let layer = base_ui::kit::layer::Layer::clone(cx.layer());
-        let router = base_ui::kit::overlay::AnimationRouter::clone(cx.animation());
+        let layer = ui_kit::kit::layer::Layer::clone(cx.layer());
+        let router = ui_kit::kit::overlay::AnimationRouter::clone(cx.animation());
         let kind = spec.kind;
         let select = Select::new(cx.app_mut(), theme, layer, router, key, options).on_change(
             move |app, chosen| {

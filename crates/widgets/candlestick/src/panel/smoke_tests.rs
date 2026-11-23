@@ -1,10 +1,5 @@
 use std::time::Instant;
 
-use base_ui::{
-    kit::size::UnifiedSize,
-    style_builder::StyleBuilder,
-    theme::{appearance::Appearance, resolved::Theme, role::Role},
-};
 use i18n::language::codes::LanguageCode;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -12,6 +7,11 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::color::Color,
     test_support::diagnostics::SignalSlotStats,
+};
+use ui_kit::{
+    kit::size::UnifiedSize,
+    style_builder::StyleBuilder,
+    theme::{appearance::Appearance, resolved::Theme, role::Role},
 };
 use widget::test_support::WidgetTestApp;
 

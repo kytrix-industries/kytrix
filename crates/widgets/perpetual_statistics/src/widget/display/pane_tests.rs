@@ -291,7 +291,7 @@ impl Fixture {
             NodeBuilder::boxed()
                 .id("TEST_PERPETUAL_STATISTICS_BODY")
                 .style(
-                    base_ui::style_builder::StyleBuilder::new()
+                    ui_kit::style_builder::StyleBuilder::new()
                         .width(640.0)
                         .height(360.0)
                         .flex_col()
@@ -371,7 +371,7 @@ impl Fixture {
             NodeBuilder::boxed()
                 .id("TEST_PERPETUAL_STATISTICS_HEADER_HOST")
                 .style(
-                    base_ui::style_builder::StyleBuilder::new()
+                    ui_kit::style_builder::StyleBuilder::new()
                         .width(640.0)
                         .height(32.0)
                         .flex_col()
@@ -1254,7 +1254,7 @@ fn two_panes_should_keep_their_own_header_handlers() {
         NodeBuilder::boxed()
             .id("TEST_TWO_PANES_HEADER")
             .style(
-                base_ui::style_builder::StyleBuilder::new()
+                ui_kit::style_builder::StyleBuilder::new()
                     .width(640.0)
                     .height(64.0)
                     .flex_col()

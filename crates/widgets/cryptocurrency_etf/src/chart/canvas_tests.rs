@@ -1,4 +1,3 @@
-use base_ui::style_builder::StyleBuilder;
 use i18n::language::codes::LanguageCode;
 use ui_core::{
     math::Point,
@@ -6,6 +5,7 @@ use ui_core::{
     paint::primitive::Primitive,
     window::WindowId,
 };
+use ui_kit::style_builder::StyleBuilder;
 use widget::test_support::WidgetTestApp;
 
 use super::{

@@ -6,7 +6,7 @@ Kytrix 自研跨平台 GUI 引擎（主设计：[`design/custom-gui-engine-desig
 > 本 crate `publish = false`：它是产品的一部分，不是独立发布的库。
 >
 > **依赖状态**：`cargo tree` 全域已清零 —— workspace 里**没有** `gpui-*` / `wgpu` / `winit` / Vello；
-> 产品侧（`crates/kytrix`、`base_ui`、各 widget）与引擎一样只依赖本仓自研的 UI 引擎。
+> 产品侧（`crates/kytrix`、`ui_kit`、各 widget）与引擎一样只依赖本仓自研的 UI 引擎。
 
 ## 快速开始
 
@@ -141,7 +141,7 @@ cargo run --release -p ui_core --example snapshot_demo --features test-support -
 
 - 所有依赖在 workspace 根 `Cargo.toml` 声明，本 crate 只 `workspace = true`。
 - **禁止**：`wgpu` / `naga` / `gpui-*` / `winit` / Vello 系 / `cosmic-text` 主链路；
-  `usvg` 不进本 crate（构建期 SVG 归 `base_ui`）。
+  `usvg` 不进本 crate（构建期 SVG 归 `ui_kit`）。
 - `image`（资源解码）与 `criterion`（bench，关默认 features）是 P13 新增的两项；
   `taffy` 是本 crate 既有依赖，P14 起同时作为 **dev-dependency** 供 `tests/layout.rs` 构造样式。
 - 测试基建（`test_support`）只在 `--features test-support` 下编译，发布物零符号。

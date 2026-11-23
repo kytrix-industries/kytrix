@@ -4,17 +4,6 @@ use app_config::{
     network::{ProxyAuthorizationConfig, ProxyConfig, normalize_proxy_host},
     settings::proxy_name_is_reserved,
 };
-use base_ui::{
-    kit::{
-        button::Button,
-        dialog::{Dialog, DialogBuilder, DialogError},
-        input::{self, InputNode, InputSpec, InputState},
-        select::{Select, SelectItem, SelectOptions},
-        separator::Separator,
-    },
-    style_builder::StyleBuilder,
-    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
-};
 use i18n::translate::Translate;
 use smol_str::{SmolStr, format_smolstr};
 use ui_core::{
@@ -30,6 +19,17 @@ use ui_core::{
     paint::style::{Style, StylePatch},
     text::{TextStyle, TextWrap},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        dialog::{Dialog, DialogBuilder, DialogError},
+        input::{self, InputNode, InputSpec, InputState},
+        select::{Select, SelectItem, SelectOptions},
+        separator::Separator,
+    },
+    style_builder::StyleBuilder,
+    theme::{components::ControlSize, handle::ThemeHandle, role::Role},
 };
 
 use crate::{host::SettingsHost, layout, session::SettingsChange};

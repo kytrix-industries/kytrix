@@ -6,15 +6,6 @@ use std::{
 };
 
 use ahash::AHashMap;
-use base_ui::{
-    kit::{
-        empty_state::EmptyState,
-        list::{List, ListOptions, SelectionMode},
-        motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
-    },
-    style_builder::StyleBuilder,
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use market_participants_model::{
     decimal::{Fraction, Tick},
@@ -41,6 +32,15 @@ use ui_core::{
     },
     text::{TextAlign, TextStyle},
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        empty_state::EmptyState,
+        list::{List, ListOptions, SelectionMode},
+        motion::{DEPTH_ANIMATION_SETTLE_EPSILON, depth_animation_progress_after},
+    },
+    style_builder::StyleBuilder,
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::cx::WidgetCx;
 

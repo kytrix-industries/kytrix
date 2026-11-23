@@ -6,15 +6,6 @@ use std::{
 };
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        icon::IconKind,
-        size::{UnifiedSizable, UnifiedSize},
-    },
-    style_builder::StyleBuilder,
-    theme::role::Role,
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::engine::KytrixServiceError;
 use serde::{Deserialize, Serialize};
@@ -27,6 +18,15 @@ use ui_core::{
     paint::style::{PaintSpec, StylePatch},
     text::TextStyle,
     window::WindowId,
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        icon::IconKind,
+        size::{UnifiedSizable, UnifiedSize},
+    },
+    style_builder::StyleBuilder,
+    theme::role::Role,
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding},
@@ -867,13 +867,13 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use app_config::settings::{AccountConfig, AccountWalletKind, Config};
-    use base_ui::theme::{appearance::Appearance, resolved::Theme};
     use i18n::{language::codes::LanguageCode, translate::Translate};
     use kytrix_service_provider::service::engine::KytrixServiceError;
     use ui_core::{
         event::{Action, ActionSource},
         paint::color::Color,
     };
+    use ui_kit::theme::{appearance::Appearance, resolved::Theme};
     use widget::{protocol::RequestId, test_support::WidgetTestApp};
 
     use super::*;

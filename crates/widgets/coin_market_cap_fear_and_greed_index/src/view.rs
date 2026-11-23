@@ -1,17 +1,6 @@
 use std::sync::Arc;
 
 use app_config::widget::{WidgetConfig, WidgetConfigSchemaVersion};
-use base_ui::{
-    kit::{
-        button::Button,
-        empty_state::EmptyState,
-        icon::{IconError, IconKind, IconSpec},
-        size::{UnifiedSizable, UnifiedSize},
-        tooltip::{Tooltip, TooltipContent, TooltipOptions},
-    },
-    style_builder::{PaintBuilder, StyleBuilder},
-    theme::{handle::ThemeHandle, role::Role},
-};
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use kytrix_service_provider::service::engine::KytrixServiceError;
 use serde::{Deserialize, Serialize};
@@ -22,6 +11,17 @@ use ui_core::{
     node::{builder::NodeBuilder, id::NodeId, signal::Signal},
     paint::style::StylePatch,
     text::{TextAlign, TextStyle},
+};
+use ui_kit::{
+    kit::{
+        button::Button,
+        empty_state::EmptyState,
+        icon::{IconError, IconKind, IconSpec},
+        size::{UnifiedSizable, UnifiedSize},
+        tooltip::{Tooltip, TooltipContent, TooltipOptions},
+    },
+    style_builder::{PaintBuilder, StyleBuilder},
+    theme::{handle::ThemeHandle, role::Role},
 };
 use widget::{
     binding::{Inbound, Pending, WidgetBinding, WidgetRpcResult},

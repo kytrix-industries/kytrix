@@ -1,10 +1,6 @@
 use std::{rc::Rc, sync::Arc};
 
 use app_config::settings::{AccountConfig, Config};
-use base_ui::{
-    kit::{layer::Layer, overlay::AnimationRouter},
-    theme::handle::ThemeHandle,
-};
 use futures::future::BoxFuture;
 use i18n::{language::codes::LanguageCode, translate::Translate};
 use kytrix_service_provider::{
@@ -18,6 +14,10 @@ use kytrix_service_provider::{
 use smol_str::SmolStr;
 use tokio::sync::watch;
 use ui_core::app::App;
+use ui_kit::{
+    kit::{layer::Layer, overlay::AnimationRouter},
+    theme::handle::ThemeHandle,
+};
 use widget::{frame::FrameRouter, services::WidgetServices};
 use zeroize::Zeroizing;
 

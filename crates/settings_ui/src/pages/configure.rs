@@ -2,15 +2,15 @@ use app_config::{
     network::{KytrixServiceCapability, ServiceTarget},
     settings::Config,
 };
-use base_ui::{
-    kit::select::{Select, SelectItem},
-    theme::handle::ThemeHandle,
-};
 use i18n::translate::Translate;
 use market_participants_connector::venue::definition::supported_venues;
 use market_participants_model::identifier::VenueId;
 use smol_str::SmolStr;
 use ui_core::{app::App, error::EngineError, event::Event, node::id::NodeId, window::WindowId};
+use ui_kit::{
+    kit::select::{Select, SelectItem},
+    theme::handle::ThemeHandle,
+};
 use widget::venue::VenueDisplay;
 
 use crate::{

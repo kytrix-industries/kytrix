@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use base_ui::style_builder::StyleBuilder;
 use i18n::{language::codes::LanguageCode, t_smol, translate::Translate};
 use smol_str::SmolStr;
 use time::UtcOffset;
@@ -12,6 +11,7 @@ use ui_core::{
     paint::{canvas::Canvas, geometry::GeometryId, style::StylePatch},
     text::ShapedTextHandle,
 };
+use ui_kit::style_builder::StyleBuilder;
 use widget::cx::WidgetCx;
 
 use super::{

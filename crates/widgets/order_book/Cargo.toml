@@ -6,7 +6,7 @@ edition.workspace = true
 
 [dependencies]
 app_config = { workspace = true }
-base_ui = { workspace = true }
+ui_kit = { workspace = true }
 futures = { workspace = true }
 i18n = { workspace = true }
 instrument_selector_ui = { workspace = true }
