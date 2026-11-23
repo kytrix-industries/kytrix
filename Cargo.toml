@@ -275,7 +275,7 @@ unicode-segmentation = "1.13.3"
 # 依赖 0.1.5），这里提为直接依赖，不引入新编译单元。
 unicode-linebreak = "0.1.5"
 url = "2.5.8"
-uuid = "1.29.2"
+uuid = { version = "1.29.2", features = ["v4"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = [
     "client",
