@@ -155,7 +155,7 @@ jobs:
             protobuf-compiler libfuse2 \
             pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
             libasound2-dev libfreetype-dev libfontconfig1-dev \
-            cmake ninja-build libclang-dev
+            cmake libclang-dev
           for lib in /usr/lib/llvm-*/lib/libclang.so; do
             if [ -e "$lib" ]; then
               echo "LIBCLANG_PATH=$(dirname "$lib")" >> "$GITHUB_ENV"
@@ -166,7 +166,7 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
-          brew install protobuf cmake ninja libomp
+          brew install protobuf cmake libomp
           LIBCLANG="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
           if [ -e "$LIBCLANG/libclang.dylib" ]; then
             echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
@@ -176,12 +176,12 @@ jobs:
         run: choco install protoc -y --no-progress
 
       # The x64 Windows job links the local translation model. Its native build
-      # needs CMake, Ninja, libclang for bindgen, and the MSVC environment.
+      # needs CMake, libclang for bindgen, and the MSVC environment.
       - name: Install native tools (Windows x64)
         if: matrix.job == 'windows-x64'
         shell: pwsh
         run: |
-          choco install cmake ninja llvm -y --no-progress
+          choco install cmake llvm -y --no-progress
           $llvm = 'C:\Program Files\LLVM\bin'
           "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$llvm" | Out-File -FilePath $env:GITHUB_PATH -Append

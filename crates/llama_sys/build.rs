@@ -277,12 +277,6 @@ fn build_directory(plan: &Plan, source: &Path, toolchain: &Toolchain) -> PathBuf
         hasher.update(feature.as_bytes());
         hasher.update([0]);
     }
-    hasher.update(if toolchain.ninja.is_some() {
-        b"ninja".as_slice()
-    } else {
-        b"cmake-default".as_slice()
-    });
-    hasher.update([0]);
     if let Some(cuda) = &toolchain.cuda {
         hasher.update(cuda.root.to_string_lossy().as_bytes());
         hasher.update([0]);
@@ -361,7 +355,6 @@ fn target_directory() -> PathBuf {
 
 struct Toolchain {
     cmake: PathBuf,
-    ninja: Option<PathBuf>,
     cmake_version: String,
     cuda: Option<Cuda>,
     vulkan: Option<Vulkan>,
@@ -376,7 +369,6 @@ impl Toolchain {
             "llama_sys: cmake is required; install CMake and put it on PATH or build on a runner \
              with CMake",
         );
-        let ninja = find_in_path("ninja");
         let cmake_version = command_output(&cmake, &["--version"]);
         let cuda = plan.cuda.then(|| Cuda::detect(&plan.target));
         let vulkan = plan.vulkan.then(Vulkan::detect);
@@ -390,7 +382,6 @@ impl Toolchain {
 
         Self {
             cmake,
-            ninja,
             cmake_version,
             cuda,
             vulkan,
@@ -558,18 +549,6 @@ impl Libomp {
 }
 
 fn configure_and_build(plan: &Plan, source: &Path, build: &Path, toolchain: &Toolchain) {
-    if toolchain.ninja.is_some() && build.join("CMakeCache.txt").is_file() {
-        let cache = fs::read_to_string(build.join("CMakeCache.txt")).unwrap_or_default();
-        if !cache.contains("CMAKE_GENERATOR:INTERNAL=Ninja") {
-            fs::remove_dir_all(build).unwrap_or_else(|error| {
-                panic!(
-                    "llama_sys: could not remove the stale CMake tree {}: {error}",
-                    build.display()
-                )
-            });
-        }
-    }
-
     fs::create_dir_all(build).unwrap_or_else(|error| {
         panic!(
             "llama_sys: could not create build directory {}: {error}",
@@ -615,10 +594,6 @@ fn configure_and_build(plan: &Plan, source: &Path, build: &Path, toolchain: &Too
         toolchain_file.display()
     ));
 
-    if let Some(ninja) = &toolchain.ninja {
-        command.arg("-G").arg("Ninja");
-        command.arg(format!("-DCMAKE_MAKE_PROGRAM={}", ninja.display()));
-    }
     if let Some(sccache) = find_in_path("sccache") {
         command
             .arg(format!("-DCMAKE_C_COMPILER_LAUNCHER={}", sccache.display()))

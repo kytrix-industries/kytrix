@@ -17,12 +17,11 @@ is intentionally rejected here; `kytrix` omits the dependency on that target.
 
 - git: the first build initializes the pinned submodule and therefore needs
   network access; later builds reuse the checkout
-- CMake 3.20+ and a C++17 compiler
-- Ninja (recommended; CMake's default generator works too)
+- CMake 3.20+ and a C++17 compiler; CMake picks its default generator, so on
+  Windows the Visual Studio MSVC C++ workload must be installed and on
+  Linux/macOS `make` must be available
 - libclang for bindgen (`LIBCLANG_PATH` if it is not in a standard location)
 - OpenMP: MSVC `vcomp` on Windows, GCC `gomp` on Linux, Homebrew `libomp` on macOS
-- on Windows, a Visual Studio developer shell so CMake's Ninja build can find
-  `cl.exe`, `INCLUDE` and `LIB`
 
 Additional backends:
 
